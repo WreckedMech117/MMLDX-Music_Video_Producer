@@ -119,12 +119,18 @@ Keep optional `PathchSageAttentionKJ` nodes bypassed unless a compatible `sageat
 Run the app on port 8766 with an empty temporary data root, then execute:
 
 ```bash
-MVP_APP_PORT=8766 MVP_DATA_ROOT="$LOCALAPPDATA/Temp/mvp-e2e-data" uv run python run.py
+DATA_ROOT="$LOCALAPPDATA/Temp/mvp-e2e-data"
+MVP_APP_PORT=8766 MVP_DATA_ROOT="$DATA_ROOT" uv run python run.py
 uv run --with selenium python tests/e2e_first_run.py http://127.0.0.1:8766
 uv run --with selenium python tests/e2e_audio_playback.py http://127.0.0.1:8766
+uv run --with selenium python tests/e2e_epic2_surfaces.py http://127.0.0.1:8766 "$DATA_ROOT"
 ```
 
-The test creates a project, enters it, visits every workspace, captures browser logs, and writes artifacts under `test-artifacts/`.
+Each script creates a project, drives it, captures browser logs, fails on any `SEVERE` console entry, and writes artifacts under `test-artifacts/`.
+
+`e2e_first_run.py` visits every workspace. `e2e_audio_playback.py` imports a synthesised WAV, reloads, and asserts playback actually advances. `e2e_epic2_surfaces.py` takes the data-root path as a second argument because it seeds a Director reply by writing the manifest directly — notices can only be produced by a live model, and `PUT /api/projects/{id}` deliberately refuses client-supplied messages, so writing the file is the only way to fixture one without a model.
+
+Note the ordering hazard, which used to make this runbook wrong: `e2e_audio_playback.py` originally waited unconditionally for the new-project dialog, which the app opens only when the data root holds no projects. Run after `e2e_first_run.py` — exactly what this list tells you to do — it timed out and the audio gate silently never ran. It now opens the dialog itself when one is not already open, so the scripts can be run in sequence against one root.
 
 ### Live GPU smokes (manual, cost real GPU minutes)
 

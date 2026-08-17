@@ -43,6 +43,13 @@ def main() -> None:
     result: dict[str, object] = {}
     try:
         driver.get(BASE_URL)
+        # The dialog opens by itself only when the data root holds no projects. Running this
+        # after e2e_first_run.py -- which is exactly what docs/OPERATIONS.md tells you to do --
+        # leaves a project behind, so waiting for it unconditionally timed out and the whole
+        # audio gate silently never ran. Open it ourselves when it is not already open.
+        wait.until(EC.presence_of_element_located((By.ID, "new-project")))
+        if not driver.find_element(By.ID, "project-dialog").get_attribute("open"):
+            driver.find_element(By.ID, "new-project").click()
         wait.until(EC.visibility_of_element_located((By.ID, "project-dialog")))
         driver.find_element(By.CSS_SELECTOR, "#project-form input[name=name]").send_keys(
             "Audio Playback Browser QA"
