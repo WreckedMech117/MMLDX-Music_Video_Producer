@@ -7,7 +7,7 @@ paradigm: 'Manifest-centric layered monolith with explicit workflow adapters'
 scope: 'Brownfield MVP: ratifies the existing 8-module FastAPI + ES-module codebase as the spine and fixes only the deltas Epics 1-7 need'
 status: final
 created: '2026-08-16'
-updated: '2026-08-16'
+updated: '2026-08-17'
 binds: [FR-1..FR-26, NFR-1, NFR-2, Epic-1..Epic-7]
 sources:
   - _bmad-output/planning-artifacts/prds/prd-MusicVideoProducer-2026-08-16/prd.md
@@ -128,7 +128,8 @@ Dependency rule: arrows only point downward/rightward as drawn. `comfy.py`, `dir
 
 - **Binds:** FR-23 (Epic 7, drop-conditioned)
 - **Prevents:** the known blocker — combined exports that regenerate the Shot from creator-specific media
-- **Rule:** `build_ltx_finishing_payload()` in `workflows.py` builds a graph whose **input is the Approved Output file** (uploaded to ComfyUI input), contains zero H3 generation nodes, and includes the audited `ImageResizeKJv2` `divisible_by=16` boundary patch before every LTX image consumer. Job kind `ltx`. A finished result is a new selectable take; approval remains the Director's explicit act. Failure leaves the input Approved Output untouched. Story 7.1's go/no-go spike gates the epic; the PRD drop condition stands.
+- **Rule:** `build_ltx_finishing_payload()` in `workflows.py` builds a graph whose **input is the Approved Output file** (uploaded to ComfyUI input), contains zero H3 generation nodes, and includes the audited `ImageResizeKJv2` `divisible_by=32` boundary patch before every LTX image consumer. Job kind `ltx`. A finished result is a new selectable take; approval remains the Director's explicit act. Failure leaves the input Approved Output untouched. Story 7.1's go/no-go spike gates the epic; the PRD drop condition stands.
+- **Amended 2026-08-17 — divisor 16 → 32, on live evidence.** This rule bound `divisible_by=16` when ratified. The live boundary run (prompt `a64a0460-64e6-4a14-b207-e644bf9bda5d`, `success` in 17 min 36 s) disproved 16: the LTX 2.5 VAE's total spatial compression is 32 (`comfy/sd.py:612-618` sets `crop_input = False` and `downscale_ratio = (…, 32, 32)`), so 16 leaves height 720 (720/32 = 22.5). `ffprobe` on the produced file measured **2496×1408**, exactly 2 × 1248×704 through the subgraph's 2× latent upsample; 16 would have produced 2496×1440. The repo patch, the Director's saved workflow, and `docs/WORKFLOW-MAP.md` all carry 32. Consequence Epic 7 must absorb: the boundary does **not** preserve frame count — 192 in, 185 out (8k+1).
 
 ### AD-13 — Approval is `approved_output`, nothing else `[ADOPTED]`
 

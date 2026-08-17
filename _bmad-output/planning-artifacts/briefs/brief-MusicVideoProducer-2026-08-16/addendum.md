@@ -2,7 +2,7 @@
 title: "Addendum: Music Video Producer Brief"
 status: draft
 created: 2026-08-16
-updated: 2026-08-16
+updated: 2026-08-17
 ---
 
 # Addendum
@@ -68,9 +68,11 @@ This arithmetic should drive the first scale story, and the batching question sh
 
 ## Deferred decision: finishing chain
 
-LTX 2.5 enhancement, SeedVR2, FILM interpolation, and RTX VSR are designed but unproven. One real failure is already diagnosed and patched in an audited reference: SeedVR2 emitted 1250×720, and LTX's VAE rejected width 1250; a KJ resize with `divisible_by=16` normalizes to 1248×720.
+LTX 2.5 enhancement, SeedVR2, FILM interpolation, and RTX VSR were designed but unproven when this brief was written. One real failure was already diagnosed and patched in an audited reference: SeedVR2 emitted 1250×720, and LTX's VAE rejected width 1250; a KJ resize with `divisible_by=32` normalizes to 1248×704.
 
-The blocker is not that failure. It is that the combined exports regenerate H3 from creator-specific media instead of accepting an already-approved take. A standalone adapter that takes an approved take as input is the prerequisite for putting finishing back in scope.
+> **Amended 2026-08-17 — divisor and status, on live evidence.** This paragraph stated `divisible_by=16` normalizing to 1248×720. Both numbers were wrong: the LTX 2.5 VAE's total spatial compression is 32, so 16 clears the 4-pixel patchify but leaves height 720 (720/32 = 22.5). The correct values are **`divisible_by=32` → 1248×704**. The status claim has also been overtaken — the full chain (H3 → SeedVR2 → normalization → LTX 2.5 → FILM → RTX VSR) ran to `success` on live ComfyUI in 17 min 36 s at prompt `a64a0460-64e6-4a14-b207-e644bf9bda5d`; `ffprobe` measured the LTX stage at 2496×1408, exactly 2 × 1248×704 through the subgraph's 2× latent upsample, where 16 would have produced 2496×1440. Two facts the run surfaced that this brief could not have known: the boundary does **not** preserve frame count (192 in, 185 out, an 8k+1 grid), and `keep_proportion: "resize"` stretches rather than crops, taking aspect 1.73611 → 1.77273. Matching amendments in `ARCHITECTURE-SPINE.md` AD-12 and `epics.md`; measured detail in `docs/ROADMAP.md` and `docs/WORKFLOW-MAP.md`.
+
+The blocker is not that failure, and the live run did not remove it. It is that the combined exports regenerate H3 from creator-specific media instead of accepting an already-approved take — which is exactly what that run did. A standalone adapter that takes an approved take as input is still the prerequisite for putting finishing back in scope, so the decision rule below stands unchanged.
 
 Decision rule proposed in the brief: the first complete video ships without upscaling if that standalone adapter is not proven in time. Enhancement is a quality multiplier on a finished pipeline, not a precondition for one.
 

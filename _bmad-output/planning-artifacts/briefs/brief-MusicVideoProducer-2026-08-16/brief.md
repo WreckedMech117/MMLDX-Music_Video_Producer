@@ -101,7 +101,9 @@ Explicitly not served in this version: client and commercial production work, te
 - Being a general video editor. It edits *this* pipeline's output, not arbitrary footage.
 - Mobile and remote access. `[ASSUMPTION]` Local desktop browser only; the app binds to localhost by default.
 
-**Known open boundary.** Finishing — LTX enhancement, SeedVR2, FILM interpolation, RTX VSR — is designed but unproven, and one real failure has already been diagnosed at the LTX dimension boundary. It stays in scope for the first complete version *only* if a standalone route that accepts an approved take proves out; otherwise the first complete video ships without upscaling. That decision is deferred, not dodged.
+**Known open boundary.** Finishing — LTX enhancement, SeedVR2, FILM interpolation, RTX VSR — was designed but unproven when this brief was written, and one real failure had been diagnosed at the LTX dimension boundary. It stays in scope for the first complete version *only* if a standalone route that accepts an approved take proves out; otherwise the first complete video ships without upscaling. That decision is deferred, not dodged.
+
+> **Amended 2026-08-17 — the chain is proven; the boundary condition is not what changed.** The diagnosed failure is fixed and the full chain (H3 → SeedVR2 → normalization → LTX 2.5 → FILM → RTX VSR) ran to `success` on live ComfyUI in 17 min 36 s at prompt `a64a0460-64e6-4a14-b207-e644bf9bda5d`. **The condition in this paragraph still stands unchanged**, because that run used the combined reference graph that regenerates the Shot from creator-specific media — the standalone approved-take route is still unproven, and it is the thing this condition is about. Detail in `docs/WORKFLOW-MAP.md`; divisor amendment in this brief's addendum.
 
 ## Risks and Open Questions
 

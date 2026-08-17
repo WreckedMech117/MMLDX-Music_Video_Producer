@@ -60,7 +60,7 @@ NFR-2: Project state survives crashes and concurrent writes *(implemented — at
 - `workflow_templates/reference_exports/` is immutable audited evidence
 - No Agent OS coupling; GPL Director extension frontend is never copied
 - SongPlanner variants map to `SongPlanner + MiniMax Music 3 - Quality BF16.json` and `...BF16-Known_Lyrics.json`
-- Finishing prerequisite: a standalone LTX adapter accepting an Approved Output; the audited `divisible_by=16` boundary patch already exists
+- Finishing prerequisite: a standalone LTX adapter accepting an Approved Output; the audited `divisible_by=32` boundary patch already exists (was 16 until 2026-08-17; the live run at prompt `a64a0460-64e6-4a14-b207-e644bf9bda5d` measured 2496×1408 = exactly 2 × 1248×704, where 16 would have produced 2496×1440)
 - LM Studio unload assumed available via its local API (PRD assumption; degrade to warning if not)
 
 ### UX Design Requirements
@@ -513,11 +513,13 @@ So that Finishing improves my video instead of regenerating it from creator-spec
 
 **Acceptance Criteria:**
 
-**Given** an Approved Output file and the audited `divisible_by=16` boundary patch
+**Given** an Approved Output file and the audited `divisible_by=32` boundary patch
 **When** the standalone adapter builds its graph
 **Then** the graph's input is the approved take — no H3 regeneration nodes present (FR-23)
 **And** one short live run (explicit GPU confirmation) either completes and is `ffprobe`-verified, or the exact failure is recorded
 **And** the GO/NO-GO outcome and drop-condition consequence are written to `docs/ROADMAP.md`.
+
+> **Amended 2026-08-17 — divisor was `16` in the ratified text.** The live boundary run (prompt `a64a0460-64e6-4a14-b207-e644bf9bda5d`, `success` in 17 min 36 s) disproved 16: the LTX 2.5 VAE's total spatial compression is 32, so 16 leaves height 720 (720/32 = 22.5). `ffprobe` measured **2496×1408**, exactly 2 × 1248×704 through the subgraph's 2× latent upsample; 16 would have given 2496×1440. Two further facts this story must absorb: the boundary does **not** preserve frame count (192 in, 185 out, an 8k+1 grid) so `ffprobe` verification must not assert equal frame counts; and `keep_proportion: "resize"` **stretches** rather than crops, taking aspect 1.7368 → 1.7727. See `docs/WORKFLOW-MAP.md` and ADR AD-12.
 
 ### Story 7.2: Finishing as a Route on Approved Takes
 

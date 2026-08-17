@@ -65,6 +65,15 @@ uv run --with selenium python tests/e2e_audio_playback.py http://127.0.0.1:8766
 
 See `docs/OPERATIONS.md` for the isolated-server setup used by that test.
 
+Live GPU smokes are separate and deliberately manual — they are not pytest-collected and are not part of the gate set above, because each one spends real GPU minutes on your ComfyUI:
+
+```bash
+uv run python tests/smoke_songplanner_app.py http://127.0.0.1:8766 --confirm-gpu
+uv run python tests/smoke_h3_app.py http://127.0.0.1:8766
+```
+
+`smoke_songplanner_app.py` refuses to submit without `--confirm-gpu`, generates two short songs (invented then known-lyrics), and **creates one project per adapter** — a shared project's second run would clobber the first, since every music job targets the same `"song"` slot. Its per-variant JSON on stdout is the only record of which adapter produced which prompt, so keep it. `smoke_h3_app.py` has no cost gate and submits as soon as you run it. Full procedure in `docs/OPERATIONS.md`.
+
 ## Project storage
 
 Each production is stored under:
@@ -93,8 +102,8 @@ data/projects/<project-id>/
 
 ## Honest status
 
-The application currently runs real API-format adapters for Music 3, Flux, Krea multiview, and text-only H3 Director shots.
+The application currently runs real API-format adapters for Music 3, both SongPlanner song generators, Flux, Krea multiview, and text-only H3 Director shots.
 
-The text-only H3 path is the one route verified end to end from this application: on 2026-08-16 a 3.75 second shot rendered through live ComfyUI 0.33.1 and returned a 90-frame video with synchronized audio. Every other route is built and unit-tested but has not produced a real render from this application. Standalone LTX enhancement, post-processing, final assembly, BPM/section analysis, and multi-take approval remain planned. Their controls are disabled or explicitly scoped rather than presented as complete.
+Three routes are verified end to end from this application. The text-only H3 path: on 2026-08-16 a 3.75 second shot rendered through live ComfyUI 0.33.1 and returned a 90-frame video with synchronized audio. Both SongPlanner paths: on 2026-08-17 the invented-lyrics and known-lyrics adapters each produced a real song, measured by `ffprobe` at 29.989 seconds of 44.1 kHz stereo FLAC from a 30 second request — the model resolves its own length, and 30 seconds is the shortest song the workflow accepts. For both songs the ComfyUI `/view` URL the player uses returned decodable FLAC; a browser was not driven, so browser playback of a generated song is not claimed. Every other route is built and unit-tested but has not produced a real render from this application. Post-processing, final assembly, BPM/section analysis, and multi-take approval remain planned. Their controls are disabled or explicitly scoped rather than presented as complete.
 
-Known rough edge: a render that is executing still reports `queued`, because job refresh reads ComfyUI's history rather than its queue.
+The LTX 2.5 enhancement chain deserves its own sentence, because the honest answer is "the chain works, the app cannot drive it yet." On 2026-08-17 the full reference chain — H3 → SeedVR2 → dimension normalization → LTX 2.5 → FILM → RTX VSR — ran to success on live ComfyUI in 17 minutes 36 seconds, ending the failure that had killed three previous runs at the LTX `VAEEncode`. `ffprobe` measured the LTX stage at 2496×1408, exactly twice the normalized 1248×704, which is what confirms the boundary fix. But that run was submitted directly to ComfyUI against the audited reference graph, which regenerates the shot from creator-specific media. **Standalone LTX enhancement from this application is still not implemented** — it needs an adapter that takes an already-approved take as its input, which is roadmap item 7. So the chain is proven; the product feature is not.

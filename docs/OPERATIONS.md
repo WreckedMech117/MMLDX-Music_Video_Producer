@@ -96,9 +96,19 @@ Imported songs are served from the project-contained media endpoint with byte-ra
 
 ### LTX VAE shape mismatch after SeedVR2
 
-SeedVR2 preserves aspect ratio and can emit dimensions that are not valid for the downstream LTX VAE. The observed run completed 192 SeedVR2 frames at 1250×720, then failed at LTX `VAEEncode` because 1250 is not divisible by four. The audited reference adapter inserts a KJ resize after SeedVR2 with `width=0`, `height=0`, and `divisible_by=16`, which produces 1248×720 without changing the intended aspect materially. Standalone LTX submission remains disabled until it accepts an approved take rather than creator-specific source media.
+SeedVR2 preserves aspect ratio and can emit dimensions that are not valid for the downstream LTX VAE. The observed run completed 192 SeedVR2 frames at 1250×720, then failed at LTX `VAEEncode` with `einops.EinopsError: can't divide axis of length 1250 in chunks of 4`. The LTX 2.5 video VAE sets `crop_input=False`, so unlike LTX 2.3 nothing auto-corrects the size.
 
-Keep optional `PathchSageAttentionKJ` nodes bypassed unless a compatible `sageattention` installation has been verified.
+The fix is a KJ resize after SeedVR2 with `width=0`, `height=0`, and `divisible_by=32`, which produces 1248×704. **Use 32, not 16.** The VAE's total spatial compression is 32 (4-pixel patchify plus three stride-2 stages); 16 gives 1248×720 and 720/32 = 22.5, which clears the patchify check but pushes a half cell through the conv stack. The resize must feed every LTX image consumer — `VAEEncode`, `LTXVImgToVideoInplace`, and `GetImageSize` — not just the encoder.
+
+**Verified live 2026-08-17.** Prompt `a64a0460-64e6-4a14-b207-e644bf9bda5d` ran the full reference chain to `success` in 17 min 36 s with no errors. `ffprobe` on the outputs: H3 1056×608 / 192 frames → SeedVR2 1250×720 / 192 frames → LTX 2.5 2496×1408 / 185 frames → FILM + RTX VSR 3744×2112 / 369 frames at 48 fps. The LTX subgraph's 2× latent upsample makes 2496×1408 exactly 2 × 1248×704, so the produced file is the evidence the divisor is right.
+
+**Trap: the boundary does not preserve frame count — 192 in, 185 out.** LTX lands on an 8k+1 grid (185 = 8 × 23 + 1) just as H3 lands on 17k+5. Two consequences when operating this chain: assembly trim math must handle both grids, and a verification step must never assert that LTX output has the same frame count as its input — a shrink is correct behaviour here, not a dropped-frame bug. Measured durations shorten with it: 8.000 s in, 7.708 s out.
+
+**Aspect: the resize stretches, it does not crop.** `keep_proportion: "resize"` resamples straight to the target (`crop="disabled"`), so 1250×720 → 1248×704 is a 2.1% relative horizontal stretch — aspect 1.73611 → 1.77273 (x scale 0.9984, y scale 0.97778). Divisor 16 would have been gentler on aspect (1.73333) but does not divide the VAE stack. Whether the stretch is visible has not been assessed. If it matters, switch to `keep_proportion: "crop"` at `divisible_by=32` rather than back to 16.
+
+Both the repo adapter (`patch_ltx25_dimension_boundary`) and the Director's saved workflow `04 - H3 Music Video - LTX 2.5 READY.json` carry divisor 32. The audited reference export still shows the pre-fix wiring by design; the patch is applied in memory. Standalone LTX submission from the application remains disabled until it accepts an approved take rather than creator-specific source media.
+
+Keep optional `PathchSageAttentionKJ` nodes bypassed unless a compatible `sageattention` installation has been verified — `sageattention` is not installed in ComfyUI's embedded Python, and an enabled node aborts the run with `ModuleNotFoundError: sageattention`.
 
 ### Isolated first-run browser QA
 
@@ -112,6 +122,19 @@ uv run --with selenium python tests/e2e_audio_playback.py http://127.0.0.1:8766
 
 The test creates a project, enters it, visits every workspace, captures browser logs, and writes artifacts under `test-artifacts/`.
 
+### Live GPU smokes (manual, cost real GPU minutes)
+
+These are not pytest-collected and are never run as part of the automated suite. Each spends real GPU minutes on the user-managed ComfyUI. Run from the repo root with the app already serving and ComfyUI already up — neither script ever starts or stops ComfyUI.
+
+```bash
+uv run python tests/smoke_songplanner_app.py http://127.0.0.1:8766 --confirm-gpu
+uv run python tests/smoke_h3_app.py http://127.0.0.1:8766
+```
+
+`smoke_songplanner_app.py` **refuses to submit anything without `--confirm-gpu`** and exits with a usage message instead. It re-runs the `tests/preflight_songplanner.py` audit against the live ComfyUI, then submits exactly two short songs — invented variant first, then known-lyrics. It **creates one project per adapter**, because every `kind=music` job targets `"song"` and a shared project's second run would clobber the first. It prints exactly one JSON block per variant to stdout, and that block is the only record of which adapter produced which prompt ID — nothing in persisted state distinguishes a SongPlanner song from a direct Music 3 song, so capture the output. It `ffprobe`s both the file on disk and the ComfyUI `/view` URL the player actually fetches. Requested duration is not produced duration; the encoder resolves its own length, and the script reports the delta as a fact but fails a variant whose measurement is wildly off the request. It aborts non-zero on stderr — without spending a further generation — on pre-flight problems, ComfyUI being offline, an unexpected response shape, a job error, or the time ceiling.
+
+`smoke_h3_app.py` has **no cost gate**: it takes only an optional base URL and submits an H3 render as soon as it is invoked. Treat running it as the confirmation. Bringing it behind the same `--confirm-gpu` flag is an open cleanup, tracked in `docs/ROADMAP.md`.
+
 ## Quality gates
 
 ```bash
@@ -119,3 +142,5 @@ uv run pytest -q
 uv run ruff check .
 node --check src/music_video_producer/web/assets/app.js
 ```
+
+The live GPU smokes above are **not** part of this gate set; they are run deliberately, by a human, with `--confirm-gpu`.
