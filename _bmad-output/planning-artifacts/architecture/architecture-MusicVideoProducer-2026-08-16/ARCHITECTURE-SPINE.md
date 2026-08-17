@@ -110,7 +110,7 @@ Dependency rule: arrows only point downward/rightward as drawn. `comfy.py`, `dir
 
 - **Binds:** FR-22, FR-24 (Epic 5)
 - **Prevents:** assembly drifting onto ComfyUI, or untrimmed joins accumulating ~11 % grid drift (4.0 s Shot renders 4.458 s)
-- **Rule:** Assembly runs in the app backend via non-blocking ffmpeg subprocess (extending the existing `ffprobe` pattern), never on ComfyUI. Each Approved Output is accurately trimmed to its Shot window, clips are concatenated in Shot order, and the master Song is muxed as the audio track (default policy — see Open). Output lands under the project media dir (`media/exports/`); the file is `ffprobe`-verified after writing, duration within one frame of the Song. Recorded as a `RenderJob` of `kind: "post"` with empty `prompt_id`/`seed` by design, inputs and output in `output_files`/provenance fields, reconciled **locally** — `post` jobs never touch the ComfyUI queue path. Assembly refuses on: any unapproved Shot, a stale take (window changed after approval), gaps/overlaps against the Song — each reported by Shot ID.
+- **Rule:** Assembly runs in the app backend via non-blocking ffmpeg subprocess (extending the existing `ffprobe` pattern), never on ComfyUI. Each Approved Output is accurately trimmed to its Shot window, clips are concatenated in Shot order, and the master Song is muxed as the sole audio track — shot audio is dropped at assembly (decided by the Director 2026-08-16). Output lands under the project media dir (`media/exports/`); the file is `ffprobe`-verified after writing, duration within one frame of the Song. Recorded as a `RenderJob` of `kind: "post"` with empty `prompt_id`/`seed` by design, inputs and output in `output_files`/provenance fields, reconciled **locally** — `post` jobs never touch the ComfyUI queue path. Assembly refuses on: any unapproved Shot, a stale take (window changed after approval), gaps/overlaps against the Song — each reported by Shot ID.
 
 ### AD-10 — SongPlanner adapters share one core
 
@@ -225,8 +225,8 @@ Single-machine, single-user, local-only: `uv run uvicorn` on `127.0.0.1:8765`; C
 
 ## Deferred
 
-- **Assembly audio mix** (Song-only is the default; per-shot audio mixing is open — see memlog OPEN) — creative call, no structural impact.
-- **Delivery resolution/steps policy** (PRD Q2) — parameters already exposed on `H3Request`; a preset is product, not architecture.
+- ~~Assembly audio mix~~ — **decided 2026-08-16: master Song only**; shot audio dropped at assembly. Per-shot opt-in mixing is a possible v2 refinement.
+- ~~Delivery resolution/steps policy~~ — **decided 2026-08-16: two presets** — Draft 640×384/8 steps for cheap full-video passes, Master 1344×768/20 steps (existing `H3Request` defaults) for the real render. The pre-flight modal selects the preset; Regeneration inherits the Shot's last-used preset.
 - **ComfyUI `/ws` wake-up upgrade** — permitted by AD-1 only as a reconciler trigger; build only if 2 s polling is ever felt.
 - **SageAttention enablement** — a measured spike per the addendum; the `disabled` pin stands until a Blackwell-compatible build is verified.
 - **Song residency idle-window behaviour** (how long the warm stack survives a gap) — measure when it matters; AD-6 already avoids defeating it.

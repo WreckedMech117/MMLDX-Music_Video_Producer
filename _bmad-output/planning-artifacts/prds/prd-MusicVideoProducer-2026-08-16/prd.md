@@ -496,11 +496,11 @@ A Project manifest is never left partially written, and concurrent edits do not 
 ## 8. Open Questions
 
 1. ~~Does ComfyUI keep the model stack resident between consecutive prompts of the same kind?~~ **Answered 2026-08-16: yes.** Two identical 107-frame H3 renders submitted back to back took 438 s cold and 288 s warm — the second saved 150 s, or 34%. FR-9 therefore reduces to "do not defeat this behaviour," and no batching machinery needs building. The remaining question is narrower: how long residency survives an idle gap, and whether interleaving a different workflow kind evicts the stack.
-2. What is the resolution and step policy for a delivery-quality render, as opposed to the 640×384/4-step configuration used for verification?
+2. ~~What is the resolution and step policy for a delivery-quality render?~~ **Answered 2026-08-16:** two presets — Draft 640×384/8 steps for cheap full-video timing passes, Master 1344×768/20 steps for delivery. Chosen at the pre-flight modal; Regeneration inherits the Shot's preset.
 3. Should the H3 payload send aligned frames rather than requested frames? `DirectorTimeline.aligned_frames` is computed but unused, and only an on-grid window has been verified.
 4. How is a Shot marked as needing Regeneration — purely by the Director's eye, or assisted by the existing vision inspection?
 5. What storage does a full production consume at delivery resolution, and does anything need pruning?
-6. Does Assembly need audio from the Shots, from the Song, or a mix? Rendered Shots carry their own generated audio.
+6. ~~Does Assembly need audio from the Shots, from the Song, or a mix?~~ **Answered 2026-08-16:** the master Song is the sole audio track; shot audio is dropped at assembly. Per-shot opt-in mixing is a possible v2 refinement.
 7. Which Finishing stages are mandatory versus optional per Shot?
 8. ~~Can SageAttention be enabled?~~ **Answered 2026-08-16.** `sageattention` is not installed in ComfyUI's embedded Python, so the `disabled` pin is currently correct rather than a leftover from an error — enabling it as-is would fail. `triton` and torch 2.7.0+cu128 are present, so the package is installable, and the live node offers `sageattn_qk_int8_pv_fp16_triton` among its options. Remaining question is narrower: is a Blackwell-compatible `sageattention` build available for this torch version, and does it measurably speed up one identical render? That is a spike, not an open design question.
 9. Does LM Studio's local API expose a model-unload operation? FR-10 reduces to a warning if it does not.
