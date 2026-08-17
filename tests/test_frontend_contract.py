@@ -3,6 +3,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from music_video_producer.app import MusicRequest, SongPlannerRequest
+
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
 INDEX_HTML = Path("src/music_video_producer/web/index.html")
 
@@ -138,29 +140,167 @@ def test_preset_field_state_drives_lyrics_visibility_and_duration_cap():
     """
 
     states = run_module(script)
-    assert states["balanced"] == {"lyricsVisible": True, "lyricsRequired": False, "durationMax": 360}
+    # Direct Music 3 keeps its own bounds; both SongPlanner presets report the
+    # M3SongPlanner node's real 30-300 s range and 32-bit seed, matching
+    # SongPlannerRequest so the form can never offer a value the route refuses.
+    # Seed bounds are strings because 2**64-1 is not representable as a JS number.
+    assert states["balanced"] == {
+        "lyricsVisible": True,
+        "lyricsRequired": False,
+        "durationMin": 4,
+        "durationMax": 360,
+        "seedMin": 0,
+        "seedMax": "18446744073709551615",
+    }
     assert states["songplanner-invented"] == {
         "lyricsVisible": False,
         "lyricsRequired": False,
-        "durationMax": 200,
+        "durationMin": 30,
+        "durationMax": 300,
+        "seedMin": 0,
+        "seedMax": "4294967295",
     }
     assert states["songplanner-known"] == {
         "lyricsVisible": True,
         "lyricsRequired": True,
-        "durationMax": 200,
+        "durationMin": 30,
+        "durationMax": 300,
+        "seedMin": 0,
+        "seedMax": "4294967295",
     }
 
 
-def test_sync_music_variant_consumes_the_shared_preset_field_state():
+def test_unknown_preset_is_refused_rather_than_treated_as_direct_music_3():
+    """Falling through would hand a future SongPlanner variant Music 3's bounds and route."""
+    script = """
+      import { musicGenerationPlan, musicPresetFieldState } from './src/music_video_producer/web/assets/api.js';
+      const attempt = (fn) => { try { fn(); return null; } catch (error) { return error.message; } };
+      const results = {};
+      for (const preset of ['songplanner-orchestral', '', undefined, 'BALANCED']) {
+        results[String(preset)] = {
+          plan: attempt(() => musicGenerationPlan({ preset, title: 'T', caption: 'c' })),
+          state: attempt(() => musicPresetFieldState(preset)),
+        };
+      }
+      results.balanced = {
+        plan: attempt(() => musicGenerationPlan({ preset: 'balanced', title: 'T', caption: 'c' })),
+        state: attempt(() => musicPresetFieldState('balanced')),
+      };
+      console.log(JSON.stringify(results));
+    """
+
+    results = run_module(script)
+    for preset in ("songplanner-orchestral", "", "undefined", "BALANCED"):
+        assert "Unknown song preset" in (results[preset]["plan"] or ""), preset
+        assert "Unknown song preset" in (results[preset]["state"] or ""), preset
+    assert results["balanced"] == {"plan": None, "state": None}
+
+
+def model_bound(model, field: str, kind: str):
+    """A Pydantic field's `ge`/`le`, or None when the model imposes no such bound."""
+    for item in model.model_fields[field].metadata:
+        if item.__class__.__name__ == kind:
+            return getattr(item, kind.lower())
+    return None
+
+
+def test_form_numeric_bounds_match_the_route_models():
+    """A UI bound looser than the route's produces an opaque 422; tighter hides a valid range.
+
+    Reading the bounds off the models means neither side can drift without failing
+    here — including the seed ceilings, which differ per route because the planner's
+    seed is 32-bit while the encoder and sampler seeds are 64-bit.
+    """
+    script = """
+      import { musicPresetFieldState } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        songplanner: musicPresetFieldState('songplanner-known'),
+        music: musicPresetFieldState('balanced'),
+      }));
+    """
+    states = run_module(script)
+
+    for endpoint, model in (("songplanner", SongPlannerRequest), ("music", MusicRequest)):
+        assert states[endpoint]["durationMin"] == model_bound(model, "duration", "Ge"), endpoint
+        assert states[endpoint]["durationMax"] == model_bound(model, "duration", "Le"), endpoint
+        assert states[endpoint]["seedMin"] == model_bound(model, "seed", "Ge"), endpoint
+        # int() not float(): 2**64-1 must compare exactly, which is why the JS side
+        # carries these as strings.
+        assert int(states[endpoint]["seedMax"]) == model_bound(model, "seed", "Le"), endpoint
+    # The planner's 32-bit seed is the reason the two presets differ at all.
+    assert int(states["songplanner"]["seedMax"]) == 0xFFFFFFFF
+    assert int(states["music"]["seedMax"]) == 0xFFFFFFFFFFFFFFFF
+
+
+def test_form_field_update_applies_bounds_and_clamps_per_preset():
+    """Executable coverage for the logic syncMusicVariant applies to the DOM.
+
+    The old test only grepped the handler for identifier names, so a mutation that
+    kept the names but inverted a clamp or dropped an assignment survived the suite.
+    """
+    script = """
+      import { musicFormFieldUpdate } from './src/music_video_producer/web/assets/api.js';
+      const cases = {
+        aboveCeiling: musicFormFieldUpdate('songplanner-known', { duration: '360', seed: '5' }),
+        belowFloor: musicFormFieldUpdate('songplanner-invented', { duration: '4', seed: '5' }),
+        inRange: musicFormFieldUpdate('songplanner-known', { duration: '90.5', seed: '5' }),
+        seedAboveCeiling: musicFormFieldUpdate('songplanner-known', { duration: '90', seed: '4294967296' }),
+        backToBalanced: musicFormFieldUpdate('balanced', { duration: '30', seed: '4294967296' }),
+        cleared: musicFormFieldUpdate('balanced', { duration: '', seed: '' }),
+        notANumber: musicFormFieldUpdate('songplanner-known', { duration: 'abc', seed: 'abc' }),
+        absent: musicFormFieldUpdate('songplanner-known'),
+      };
+      console.log(JSON.stringify(cases));
+    """
+
+    cases = run_module(script)
+    assert cases["aboveCeiling"]["numeric"]["duration"] == {"min": 30, "max": 300, "value": 300}
+    assert cases["belowFloor"]["numeric"]["duration"] == {"min": 30, "max": 300, "value": 30}
+    # An in-range fractional value must survive untouched, exactly as typed.
+    assert cases["inRange"]["numeric"]["duration"]["value"] == "90.5"
+    assert cases["seedAboveCeiling"]["numeric"]["seed"]["value"] == "4294967295"
+    # Switching back to a preset with a wider range must not clamp anything down.
+    assert cases["backToBalanced"]["numeric"]["duration"]["value"] == "30"
+    assert cases["backToBalanced"]["numeric"]["seed"]["value"] == "4294967296"
+    # `Number("")` is 0: a cleared box must stay cleared, not acquire the minimum.
+    assert cases["cleared"]["numeric"]["duration"]["value"] == ""
+    assert cases["cleared"]["numeric"]["seed"]["value"] == ""
+    # NaN compares false against both bounds, so it must be left alone rather than
+    # silently passed through as a clamped number.
+    assert cases["notANumber"]["numeric"]["duration"]["value"] == "abc"
+    assert cases["absent"]["numeric"]["duration"]["value"] == ""
+    assert cases["absent"]["numeric"]["seed"]["max"] == "4294967295"
+    assert cases["belowFloor"]["lyricsVisible"] is False
+    assert cases["aboveCeiling"]["lyricsRequired"] is True
+    assert cases["backToBalanced"]["lyricsRequired"] is False
+
+
+def test_duration_input_accepts_fractional_values():
+    """The default step=1 would make the browser refuse durations the route accepts."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    duration = re.search(r'<input name="duration"[^>]*>', markup)
+
+    assert duration, "the Song workspace form no longer has a duration input"
+    assert 'step="any"' in duration.group(0), duration.group(0)
+
+
+def test_sync_music_variant_is_a_thin_applier_over_the_shared_update():
+    """Source-level companion to test_form_field_update_applies_bounds_and_clamps_per_preset.
+
+    The behaviour is asserted there, executably; all this pins is that the handler
+    still delegates instead of re-deriving bounds or preset logic in the DOM layer,
+    where nothing can test it.
+    """
     handler = APP_JS.read_text(encoding="utf-8").split("const syncMusicVariant", 1)[1].split("};", 1)[0]
 
-    assert "musicPresetFieldState(musicForm.elements.preset.value)" in handler
-    assert "fields.lyricsVisible" in handler
-    assert "fields.lyricsRequired" in handler
-    assert "fields.durationMax" in handler
-    # The three-way preset logic must not be re-derived from raw preset strings here.
-    assert "songplanner-known" not in handler
-    assert "songplanner-invented" not in handler
+    assert "musicFormFieldUpdate(musicForm.elements.preset.value" in handler
+    assert "update.lyricsVisible" in handler
+    assert "update.lyricsRequired" in handler
+    assert "update.numeric" in handler
+    # Bounds, clamping and preset logic all belong to api.js, not to this handler.
+    for leaked in ("songplanner-known", "songplanner-invented", "durationMin", "durationMax",
+                   "seedMax", "Number(", "clamp"):
+        assert leaked not in handler, leaked
 
 
 def test_validation_errors_render_readable_field_messages():

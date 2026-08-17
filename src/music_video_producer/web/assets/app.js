@@ -1,4 +1,4 @@
-import { api, comfyOutputUrl, musicGenerationPlan, musicPresetFieldState } from "./api.js";
+import { api, comfyOutputUrl, musicFormFieldUpdate, musicGenerationPlan } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -514,14 +514,23 @@ function bindEvents() {
     catch (error) { toast(error.message, "error"); }
   });
   const musicForm = $("#music-form");
+  // Thin DOM applier: every decision (which bounds, which way to clamp) lives in
+  // musicFormFieldUpdate, which is unit-tested without a browser.
   const syncMusicVariant = () => {
-    const fields = musicPresetFieldState(musicForm.elements.preset.value);
+    const update = musicFormFieldUpdate(musicForm.elements.preset.value, {
+      duration: musicForm.elements.duration.value,
+      seed: musicForm.elements.seed.value,
+    });
     const lyricsField = musicForm.elements.lyrics;
-    lyricsField.closest("label").style.display = fields.lyricsVisible ? "" : "none";
-    lyricsField.disabled = !fields.lyricsVisible;
-    lyricsField.required = fields.lyricsRequired;
-    musicForm.elements.duration.max = fields.durationMax;
-    if (Number(musicForm.elements.duration.value) > fields.durationMax) musicForm.elements.duration.value = fields.durationMax;
+    lyricsField.closest("label").style.display = update.lyricsVisible ? "" : "none";
+    lyricsField.disabled = !update.lyricsVisible;
+    lyricsField.required = update.lyricsRequired;
+    for (const [name, bounds] of Object.entries(update.numeric)) {
+      const field = musicForm.elements[name];
+      field.min = bounds.min;
+      field.max = bounds.max;
+      field.value = bounds.value;
+    }
   };
   syncMusicVariant();
   musicForm.elements.preset.addEventListener("change", syncMusicVariant);

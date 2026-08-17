@@ -345,10 +345,11 @@ def test_songplanner_rejects_out_of_bounds_requests(tmp_path: Path):
     invalid_bodies = (
         {"title": "T", "idea": "   "},  # blank/whitespace idea
         {"title": "   ", "idea": "an idea"},  # whitespace title
-        {"title": "T", "idea": "an idea", "duration": 300},  # duration above 200
+        {"title": "T", "idea": "an idea", "duration": 29},  # below M3SongPlanner's 30 s floor
+        {"title": "T", "idea": "an idea", "duration": 301},  # above M3SongPlanner's 300 s ceiling
         {"title": "T", "idea": "x" * 4001},  # idea above max_length
         {"title": "T", "idea": "an idea", "genre_hint": "g" * 161},  # genre above max_length
-        {"title": "T", "idea": "an idea", "seed": 2**64},  # seed above 64-bit range
+        {"title": "T", "idea": "an idea", "seed": 2**32},  # above M3SongPlanner's 32-bit seed
         {"title": "T", "idea": "an idea", "lyrics": "x" * 8001},  # lyrics above max_length
     )
 
@@ -357,6 +358,129 @@ def test_songplanner_rejects_out_of_bounds_requests(tmp_path: Path):
         assert response.status_code == 422, body
     assert store.get(project.id).jobs == []
     assert store.get(project.id).song is None
+
+
+def test_songplanner_rejects_below_floor_before_reaching_comfy(tmp_path: Path):
+    """A sub-floor duration must fail locally with the bound named, not as an opaque 502."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Floor"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "Too short", "idea": "an idea", "duration": 16},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(
+        "duration" in item["loc"] and "30" in item["msg"] for item in detail
+    ), detail
+    assert comfy.prompts == []
+    assert store.get(project.id).jobs == []
+
+
+def test_songplanner_accepts_the_node_range_endpoints(tmp_path: Path):
+    """30 and 300 are the M3SongPlanner floor and ceiling; both must reach the payload."""
+    client, store, comfy = make_client(tmp_path)
+
+    for duration in (30, 300):
+        project = store.create(Project(name=f"Bound {duration}"))
+        response = client.post(
+            f"/api/projects/{project.id}/generate/songplanner",
+            json={"title": "Bounded", "idea": "an idea", "duration": duration},
+        )
+
+        assert response.status_code == 202, duration
+        planner = next(
+            node for node in comfy.prompts[-1].values() if node["class_type"] == "M3SongPlanner"
+        )
+        assert planner["inputs"]["duration_seconds"] == duration
+
+
+def test_songplanner_accepts_the_planner_seed_ceiling(tmp_path: Path):
+    """4294967295 is M3SongPlanner's 32-bit maximum — the last seed ComfyUI accepts."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Seed ceiling"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "Top seed", "idea": "an idea", "seed": 0xFFFFFFFF},
+    )
+
+    assert response.status_code == 202
+    planner = next(
+        node for node in comfy.prompts[-1].values() if node["class_type"] == "M3SongPlanner"
+    )
+    assert planner["inputs"]["seed"] == 0xFFFFFFFF
+    assert store.get(project.id).jobs[-1].seed == 0xFFFFFFFF
+
+
+def test_music_seed_is_not_narrowed_to_the_planner_ceiling(tmp_path: Path):
+    """Direct Music 3 never touches M3SongPlanner; its encoder and sampler seeds are 64-bit."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Wide seed"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={
+            "title": "Wide",
+            "caption": "industrial synth rock",
+            "duration": 12,
+            "seed": 0xFFFFFFFFFFFFFFFF,
+        },
+    )
+
+    assert response.status_code == 202
+    encoder = next(
+        node
+        for node in comfy.prompts[-1].values()
+        if node["class_type"] == "MiniMaxMusic3TextEncode"
+    )
+    assert encoder["inputs"]["seed"] == 0xFFFFFFFFFFFFFFFF
+
+
+def test_music_rejects_a_seed_past_the_64_bit_ceiling(tmp_path: Path):
+    """`MiniMaxMusic3TextEncode.seed` and `KSampler.seed` stop at 2**64-1.
+
+    "Genuinely 64-bit" is itself a bound: past it ComfyUI refuses the prompt, which
+    reaches the Director as the same opaque 502 the SongPlanner floor produced.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Overflow"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={
+            "title": "Overflow",
+            "caption": "industrial synth rock",
+            "duration": 12,
+            "seed": 2**64,
+        },
+    )
+
+    assert response.status_code == 422
+    assert comfy.prompts == []
+    assert store.get(project.id).jobs == []
+
+
+def test_flux_and_multiview_reject_a_seed_past_the_64_bit_ceiling(tmp_path: Path):
+    """Same shape as the music route: RandomNoise and KSampler seeds are 64-bit, not unbounded."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Overflow assets"))
+
+    flux = client.post(
+        f"/api/projects/{project.id}/generate/flux",
+        json={"name": "Lead", "prompt": "a singer", "seed": 2**64},
+    )
+    multiview = client.post(
+        f"/api/projects/{project.id}/assets/missing/multiview",
+        json={"prompt": "front, side, back", "seed": 2**64},
+    )
+
+    assert flux.status_code == 422
+    # Validation must run before the unknown-asset lookup, or the bound is untested here.
+    assert multiview.status_code == 422
+    assert comfy.prompts == []
 
 
 def test_songplanner_comfy_outage_leaves_project_unchanged(tmp_path: Path):

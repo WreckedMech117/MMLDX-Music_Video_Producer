@@ -324,14 +324,44 @@ def build_h3_reference_payload(
     }
 
 
+# The LTX 2.5 video VAE's total spatial compression; see the normalizer node below
+# for why 32 rather than 16. Kept as one constant so the floor applied here and the
+# divisor handed to ImageResizeKJv2 cannot drift apart.
+LTX25_DIVISOR = 32
+
+
+def normalize_to_divisor(value: int, divisor: int = LTX25_DIVISOR) -> int:
+    """Round ``value`` down to a multiple of ``divisor``, never below one cell.
+
+    ``ImageResizeKJv2`` floors each axis to the divisor (``width -= width %
+    divisor``), so any axis smaller than one cell becomes 0 — a zero-sized resize,
+    not a small one. One divisor cell is the smallest size the LTX VAE boundary can
+    actually accept, so that is the floor.
+    """
+    if divisor < 1:
+        raise ValueError("divisor must be at least 1")
+    if value < 1:
+        raise ValueError("Image axes must be at least 1 pixel")
+    return max(divisor, value - (value % divisor))
+
+
 def patch_ltx25_dimension_boundary(
     template: dict[str, dict[str, Any]],
+    *,
+    source_size: tuple[int, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Patch the audited combined LTX 2.5 export without mutating its source.
 
     This is reference adaptation only; the full combined graph is not exposed
     for submission because it still contains creator-specific media paths and
     multiple expensive output branches.
+
+    ``source_size`` is the SeedVR2 frame size in pixels when the caller knows it.
+    Given it, both axes are normalized here through ``normalize_to_divisor``, so a
+    frame with an axis under the divisor cannot collapse to a zero-sized resize.
+    Left as ``None`` the node keeps deriving the size from its input at runtime
+    (``width``/``height`` 0), which is the export's own behaviour and carries that
+    floor-to-zero risk for sub-divisor frames — pass the size to eliminate it.
     """
     payload = deepcopy(template)
     expected = {
@@ -343,17 +373,30 @@ def patch_ltx25_dimension_boundary(
     for node_id, class_type in expected.items():
         if payload.get(node_id, {}).get("class_type") != class_type:
             raise ValueError(f"Unsupported LTX 2.5 template: missing {node_id} {class_type}")
+    width, height = (
+        (0, 0)
+        if source_size is None
+        else (
+            normalize_to_divisor(source_size[0], LTX25_DIVISOR),
+            normalize_to_divisor(source_size[1], LTX25_DIVISOR),
+        )
+    )
     payload["mvp:ltx-size-normalize"] = {
         "class_type": "ImageResizeKJv2",
         "inputs": {
             "image": ["6112", 0],
-            "width": 0,
-            "height": 0,
+            "width": width,
+            "height": height,
             "upscale_method": "lanczos",
             "keep_proportion": "resize",
             "pad_color": "0, 0, 0",
             "crop_position": "center",
-            "divisible_by": 16,
+            # The LTX 2.5 video VAE's total spatial compression is 32 (a 4-pixel
+            # patchify followed by three stride-2 stages), and it sets
+            # crop_input=False so nothing auto-corrects an odd size. 16 clears
+            # patchify but leaves 720 mid-stack (720/32 = 22.5); 32 divides
+            # exactly at every stage, taking 1250x720 to 1248x704.
+            "divisible_by": LTX25_DIVISOR,
             "device": "cpu",
         },
     }

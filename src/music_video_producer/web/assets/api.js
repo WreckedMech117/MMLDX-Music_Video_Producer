@@ -7,13 +7,27 @@ export function comfyOutputUrl(baseUrl, outputPath) {
   return `${baseUrl.replace(/\/$/, "")}/view?${params}`;
 }
 
+// The presets the Song workspace offers, and which generation route each takes.
+// Nothing may fall through to a default: an unrecognized preset means the markup
+// and this module have drifted, and guessing "direct Music 3" would silently hand
+// a future SongPlanner variant the wrong bounds and the wrong endpoint.
+const SONGPLANNER_PRESETS = new Set(["songplanner-invented", "songplanner-known"]);
+const MUSIC_PRESETS = new Set(["balanced", ...SONGPLANNER_PRESETS]);
+
+function assertKnownPreset(preset) {
+  if (!MUSIC_PRESETS.has(preset)) {
+    throw new Error(`Unknown song preset: ${JSON.stringify(preset)}`);
+  }
+}
+
 // Pure preset → (endpoint, body) mapping for the Song workspace form. Both
 // SongPlanner variants reuse the creative-direction (caption) field as the idea;
 // invented never sends lyrics, known sends the Director's lyric sheet with only
 // its leading/trailing whitespace trimmed (matching the server's constraint) —
-// every interior line, blank line and indent is preserved. Every other preset
-// takes the direct Music 3 path.
+// every interior line, blank line and indent is preserved. Only `balanced` takes
+// the direct Music 3 path.
 export function musicGenerationPlan(data) {
+  assertKnownPreset(data.preset);
   if (data.preset === "songplanner-invented") {
     return {
       endpoint: "songplanner",
@@ -32,16 +46,65 @@ export function musicGenerationPlan(data) {
   };
 }
 
-// Pure preset → lyrics/duration field state for the Song workspace form, kept
+// Pure preset → lyrics/duration/seed field state for the Song workspace form, kept
 // here beside musicGenerationPlan so the routing and the form shape cannot drift
-// apart. Both SongPlanner variants cap duration at the route's 200 s bound; only
-// the known-lyrics cover needs a lyric sheet from the Director.
+// apart. Both SongPlanner variants carry the M3SongPlanner node's real bounds —
+// 30–300 s duration and a 32-bit seed — while direct Music 3 keeps its own 4–360 s
+// duration and the 64-bit seed its encoder and sampler actually accept. Every bound
+// here equals its route model's, asserted by tests/test_frontend_contract.py.
+//
+// Seed bounds are strings: 18446744073709551615 is not representable as a JS
+// number (it rounds to …552000), and an inexact ceiling would refuse or admit
+// seeds the route does not. The HTML `max` attribute is a string anyway.
 export function musicPresetFieldState(preset) {
-  const songplanner = preset === "songplanner-invented" || preset === "songplanner-known";
+  assertKnownPreset(preset);
+  const songplanner = SONGPLANNER_PRESETS.has(preset);
   return {
     lyricsVisible: preset !== "songplanner-invented",
     lyricsRequired: preset === "songplanner-known",
-    durationMax: songplanner ? 200 : 360,
+    durationMin: songplanner ? 30 : 4,
+    durationMax: songplanner ? 300 : 360,
+    seedMin: 0,
+    seedMax: songplanner ? "4294967295" : "18446744073709551615",
+  };
+}
+
+// Clamp a raw form value into [minimum, maximum], leaving anything that is not a
+// finite number exactly as the Director typed it. `Number("")` is 0, so a cleared
+// box must stay cleared rather than silently acquiring the minimum, and NaN must
+// not slip through unclamped just because it compares false against both bounds —
+// the browser's own validation reports those, and inventing a value would submit
+// a number nobody asked for.
+export function clampToBounds(raw, minimum, maximum) {
+  if (raw === "" || raw === null || raw === undefined) return "";
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return raw;
+  if (minimum !== null && minimum !== undefined && value < Number(minimum)) return minimum;
+  if (maximum !== null && maximum !== undefined && value > Number(maximum)) return maximum;
+  return raw;
+}
+
+// Pure preset + current values → exactly what the Song workspace form should show:
+// the lyrics field's visibility/requiredness and each numeric field's bounds and
+// (possibly clamped) value. syncMusicVariant is a thin DOM applier over this, so
+// the clamp direction and the bound assignment are testable without a browser.
+export function musicFormFieldUpdate(preset, current = {}) {
+  const fields = musicPresetFieldState(preset);
+  return {
+    lyricsVisible: fields.lyricsVisible,
+    lyricsRequired: fields.lyricsRequired,
+    numeric: {
+      duration: {
+        min: fields.durationMin,
+        max: fields.durationMax,
+        value: clampToBounds(current.duration, fields.durationMin, fields.durationMax),
+      },
+      seed: {
+        min: fields.seedMin,
+        max: fields.seedMax,
+        value: clampToBounds(current.seed, fields.seedMin, fields.seedMax),
+      },
+    },
   };
 }
 

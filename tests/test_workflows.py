@@ -5,7 +5,9 @@ from pathlib import Path
 import preflight_songplanner
 import pytest
 
+from music_video_producer.app import SongPlannerRequest
 from music_video_producer.workflows import (
+    LTX25_DIVISOR,
     WorkflowCatalog,
     build_flux_payload,
     build_h3_director_payload,
@@ -14,11 +16,83 @@ from music_video_producer.workflows import (
     build_music3_payload,
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
+    normalize_to_divisor,
     patch_ltx25_dimension_boundary,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_EXPORTS = REPO_ROOT / "workflow_templates" / "reference_exports"
+
+
+def recorded_object_info() -> dict:
+    return json.loads((REPO_ROOT / "tests/fixtures/object_info.json").read_text(encoding="utf-8"))
+
+
+def every_builder_payload() -> list[tuple[str, dict]]:
+    """One representative payload from every builder, for cross-adapter guards."""
+    template = json.loads(
+        (REFERENCE_EXPORTS / "h3-ltx25-user-export.json").read_text(encoding="utf-8")
+    )
+    return [
+        *preflight_songplanner.audit_payloads(),
+        ("music3", build_music3_payload(caption="c", lyrics="l", duration=120, seed=0, prefix="p")),
+        (
+            "flux",
+            build_flux_payload(
+                prompt="p", width=1024, height=1024, steps=20, guidance=4.0, seed=0, prefix="p"
+            ),
+        ),
+        ("multiview", build_multiview_payload(image_name="a.png", prompt="p", seed=0, prefix="p")),
+        (
+            "h3-director",
+            build_h3_director_payload(
+                timeline_data='{"segments":[{"id":"s","start":0,"length":120,"prompt":"p"}]}',
+                duration=5.0,
+                requested_frames=120,
+                seed=0,
+                width=1344,
+                height=768,
+                steps=20,
+                prefix="p",
+            ),
+        ),
+        (
+            "h3-reference",
+            build_h3_reference_payload(
+                prompt="<Picture 1>",
+                references=[{"kind": "picture", "file": "a.png"}],
+                duration=8,
+                width=1280,
+                height=720,
+                steps=20,
+                seed=0,
+                prefix="p",
+            ),
+        ),
+        ("ltx25-patched", patch_ltx25_dimension_boundary(template)),
+    ]
+
+
+# Node classes the recorded fixture does not cover, so nothing above range-checks
+# them offline. Recorded explicitly rather than skipped silently: this list is the
+# honest measure of the guard's reach, and it shrinks only when
+# `preflight_songplanner.py --record` is extended past the SongPlanner classes.
+UNRECORDED_CLASSES = frozenset({
+    "BasicGuider", "BasicScheduler", "CFGGuider", "CLIPTextEncode", "ComfyMathExpression",
+    "DualCLIPLoader", "EmptySD3LatentImage", "FluxGuidance", "FrameInterpolate",
+    "FrameInterpolationModelLoader", "GetImageSize", "ImageResizeKJv2", "KSamplerSelect",
+    "Krea2EditGroundedEncode", "Krea2EditModelPatch", "LTXVAudioVAEDecode", "LTXVAudioVAEEncode",
+    "LTXVConcatAVLatent", "LTXVConditioning", "LTXVImgToVideoInplace", "LTXVLatentUpsampler",
+    "LTXVSeparateAVLatent", "LatentUpscaleModelLoader", "LoadImage", "LoraLoaderModelOnly",
+    "ManualSigmas", "MathExpression|pysssss", "MiniMaxH3DirectorCS", "MiniMaxH3MediaLoader",
+    "MiniMaxH3ReferenceSplitter", "MiniMaxH3ReferenceToVideo", "MiniMaxH3SigmaShift",
+    "ModelPreviewOverrideKJ", "ModelSamplingFlux", "PathchSageAttentionKJ", "PrimitiveFloat",
+    "PrimitiveStringMultiline", "RTXVideoSuperResolution", "RandomNoise", "ResolutionSelector",
+    "SamplerCustomAdvanced", "SaveImage", "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
+    "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask", "VAEDecode", "VAEDecodeTiled",
+    "VAEEncode", "VHS_LoadAudio", "VHS_LoadImagePath", "VHS_VideoCombine", "easy cleanGpuUsed",
+    "easy clearCacheAll",
+})
 
 SONGPLANNER_EXPORTS = {
     REFERENCE_EXPORTS
@@ -177,6 +251,132 @@ def test_songplanner_variants_validate_separately_against_recorded_object_info()
         assert preflight_songplanner.validate(label, payload, object_info) == []
 
 
+def test_payload_validation_rejects_numeric_values_outside_the_schema_range():
+    """The guard that would have caught duration=16 offline instead of as a live 502."""
+    object_info = json.loads(
+        Path("tests/fixtures/object_info.json").read_text(encoding="utf-8")
+    )
+
+    below = build_songplanner_invented_payload(
+        idea="too short", genre_hint="", duration=16, seed=0, prefix="range"
+    )
+    above = build_songplanner_invented_payload(
+        idea="too long", genre_hint="", duration=301, seed=0, prefix="range"
+    )
+
+    low_problems = preflight_songplanner.validate("below", below, object_info)
+    high_problems = preflight_songplanner.validate("above", above, object_info)
+    assert any(
+        "duration_seconds=16" in problem and "below the schema minimum 30.0" in problem
+        for problem in low_problems
+    ), low_problems
+    assert any(
+        "duration_seconds=301" in problem and "above the schema maximum 300.0" in problem
+        for problem in high_problems
+    ), high_problems
+
+    # M3SongPlanner's seed is 32-bit even though the encoder and sampler seeds in
+    # the same payload are 64-bit, so the narrow bound must be caught per node.
+    wide_seed = build_songplanner_invented_payload(
+        idea="wide seed", genre_hint="", duration=120, seed=2**32, prefix="range"
+    )
+    seed_problems = preflight_songplanner.validate("seed", wide_seed, object_info)
+    assert [
+        problem for problem in seed_problems if "M3SongPlanner" in problem
+    ] == seed_problems, seed_problems
+    assert any(
+        "seed=4294967296" in problem and "above the schema maximum 4294967295" in problem
+        for problem in seed_problems
+    ), seed_problems
+
+
+def test_numeric_bounds_reads_the_schema_and_ignores_step():
+    object_info = json.loads(
+        Path("tests/fixtures/object_info.json").read_text(encoding="utf-8")
+    )
+    planner = object_info["M3SongPlanner"]["input"]["required"]
+
+    assert preflight_songplanner.numeric_bounds(planner["duration_seconds"]) == (30.0, 300.0)
+    # A combo spec carries no numeric bounds, and off-step values are not a problem:
+    # ComfyUI only rejects min/max violations.
+    assert preflight_songplanner.numeric_bounds(planner["text_encoder"]) == (None, None)
+    off_step = build_songplanner_invented_payload(
+        idea="off step", genre_hint="", duration=37.5, seed=0, prefix="range"
+    )
+    assert preflight_songplanner.validate("off-step", off_step, object_info) == []
+
+
+def test_songplanner_request_bounds_equal_the_recorded_node_schema():
+    """The drift that caused the original bug: route constants versus node schema.
+
+    `SongPlannerRequest`'s numbers exist only because `M3SongPlanner` declares them,
+    so reading both and comparing means neither the hand-written constant nor a
+    re-recorded fixture can move without the other.
+    """
+    planner = recorded_object_info()["M3SongPlanner"]["input"]["required"]
+
+    def route_bound(field: str, kind: str):
+        for item in SongPlannerRequest.model_fields[field].metadata:
+            if item.__class__.__name__ == kind:
+                return getattr(item, kind.lower())
+        raise AssertionError(f"SongPlannerRequest.{field} has no {kind} bound")
+
+    for field, schema_input in (("duration", "duration_seconds"), ("seed", "seed")):
+        minimum, maximum = preflight_songplanner.numeric_bounds(planner[schema_input])
+        assert (minimum, maximum) != (None, None), schema_input
+        assert route_bound(field, "Ge") == minimum, field
+        assert route_bound(field, "Le") == maximum, field
+
+
+def test_every_numeric_songplanner_input_resolves_a_schema_bound():
+    """A bound that disappears upstream must fail loudly, not pass vacuously.
+
+    `numeric_bounds` returning `(None, None)` silently disables the range check for
+    that input, which is indistinguishable from a clean audit — so every numeric
+    literal in both variants has to resolve at least one bound.
+    """
+    object_info = recorded_object_info()
+
+    for label, payload in preflight_songplanner.audit_payloads():
+        assert preflight_songplanner.unbounded_numeric_inputs(label, payload, object_info) == []
+
+
+def test_every_builder_payload_is_range_checked_against_the_fixture():
+    """The guard must not be SongPlanner-only, or the closed gap is only closed here."""
+    object_info = recorded_object_info()
+    uncovered: set[str] = set()
+
+    for label, payload in every_builder_payload():
+        covered = {
+            node_id: node
+            for node_id, node in payload.items()
+            if node["class_type"] in object_info
+        }
+        uncovered |= {
+            node["class_type"] for node in payload.values() if node["class_type"] not in object_info
+        }
+        assert preflight_songplanner.validate(label, covered, object_info) == [], label
+
+    assert uncovered == UNRECORDED_CLASSES
+
+
+def test_range_check_rejects_a_fractional_value_on_an_int_input():
+    """`steps=1.5` sits inside 1-10000 but is not an integer, and INT says it must be."""
+    object_info = recorded_object_info()
+    payload = build_music3_payload(caption="c", lyrics="l", duration=120, seed=0, prefix="p")
+    payload["50"]["inputs"]["steps"] = 1.5
+
+    problems = preflight_songplanner.validate("fractional", payload, object_info)
+
+    assert any(
+        "steps=1.5" in problem and "fractional but the schema declares INT" in problem
+        for problem in problems
+    ), problems
+    # A whole-number float is what ComfyUI itself accepts for an INT, so it is not a defect.
+    payload["50"]["inputs"]["steps"] = 30.0
+    assert preflight_songplanner.validate("integral", payload, object_info) == []
+
+
 def test_songplanner_model_files_are_present_in_recorded_combos():
     object_info = json.loads(
         Path("tests/fixtures/object_info.json").read_text(encoding="utf-8")
@@ -286,8 +486,70 @@ def test_ltx25_reference_patch_normalizes_seedvr2_frames_before_vae():
     normalizer = payload["mvp:ltx-size-normalize"]
     assert normalizer["class_type"] == "ImageResizeKJv2"
     assert normalizer["inputs"]["image"] == ["6112", 0]
-    assert normalizer["inputs"]["divisible_by"] == 16
+    assert normalizer["inputs"]["divisible_by"] == 32
     assert payload["6116:6070"]["inputs"]["pixels"] == ["mvp:ltx-size-normalize", 0]
     assert payload["6116:4970"]["inputs"]["image"] == ["mvp:ltx-size-normalize", 0]
     assert payload["6116:6073"]["inputs"]["image"] == ["mvp:ltx-size-normalize", 0]
     assert template["6116:6070"]["inputs"]["pixels"] == ["6112", 0]
+
+
+def test_ltx25_normalizer_divisor_makes_seedvr2_output_exact_at_every_vae_stage():
+    """The observed SeedVR2 boundary size must divide exactly by the LTX 2.5 VAE's
+    total spatial compression of 32 (4-pixel patchify plus three stride-2 stages).
+    KJNodes with width=0/height=0 keeps the source size and rounds down to the
+    divisor, so 1250x720 must land on 1248x704 -- not the 1248x720 that 16 gives,
+    where 720/32 = 22.5 pushes a half cell through the conv stack.
+    """
+    template = json.loads(
+        (REFERENCE_EXPORTS / "h3-ltx25-user-export.json").read_text(encoding="utf-8")
+    )
+
+    payload = patch_ltx25_dimension_boundary(template)
+    divisor = payload["mvp:ltx-size-normalize"]["inputs"]["divisible_by"]
+
+    observed_width, observed_height = 1250, 720
+    normalized_width = observed_width - (observed_width % divisor)
+    normalized_height = observed_height - (observed_height % divisor)
+
+    assert (normalized_width, normalized_height) == (1248, 704)
+    assert normalized_width % 32 == 0
+    assert normalized_height % 32 == 0
+    assert payload["mvp:ltx-size-normalize"]["inputs"]["width"] == 0
+    assert payload["mvp:ltx-size-normalize"]["inputs"]["height"] == 0
+    assert payload["mvp:ltx-size-normalize"]["inputs"]["keep_proportion"] == "resize"
+
+
+def test_normalize_to_divisor_never_falls_below_one_divisor_cell():
+    """Flooring alone sends a sub-divisor axis to 0 -- a zero-sized resize, not a small one."""
+    assert normalize_to_divisor(1250) == 1248
+    assert normalize_to_divisor(720) == 704
+    assert normalize_to_divisor(LTX25_DIVISOR) == LTX25_DIVISOR
+    for axis in (1, 7, LTX25_DIVISOR - 1):
+        assert normalize_to_divisor(axis) == LTX25_DIVISOR, axis
+    for invalid in (0, -8):
+        with pytest.raises(ValueError, match="at least 1 pixel"):
+            normalize_to_divisor(invalid)
+    with pytest.raises(ValueError, match="divisor"):
+        normalize_to_divisor(64, divisor=0)
+
+
+def test_ltx25_patch_applies_the_divisor_floor_when_the_source_size_is_known():
+    """Given the real frame size the patch normalizes it here, so no axis can reach 0."""
+    template = json.loads(
+        (REFERENCE_EXPORTS / "h3-ltx25-user-export.json").read_text(encoding="utf-8")
+    )
+
+    normal = patch_ltx25_dimension_boundary(template, source_size=(1250, 720))
+    tiny = patch_ltx25_dimension_boundary(template, source_size=(1250, 12))
+
+    assert normal["mvp:ltx-size-normalize"]["inputs"]["width"] == 1248
+    assert normal["mvp:ltx-size-normalize"]["inputs"]["height"] == 704
+    assert tiny["mvp:ltx-size-normalize"]["inputs"]["height"] == LTX25_DIVISOR
+    for payload in (normal, tiny):
+        inputs = payload["mvp:ltx-size-normalize"]["inputs"]
+        assert inputs["width"] % LTX25_DIVISOR == 0
+        assert inputs["height"] % LTX25_DIVISOR == 0
+        assert inputs["width"] >= LTX25_DIVISOR
+        assert inputs["height"] >= LTX25_DIVISOR
+    # The divisor the floor uses and the one the node is handed are the same number.
+    assert normal["mvp:ltx-size-normalize"]["inputs"]["divisible_by"] == LTX25_DIVISOR

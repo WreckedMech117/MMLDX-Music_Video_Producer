@@ -56,7 +56,11 @@ class MusicRequest(BaseModel):
     caption: str = Field(min_length=1)
     lyrics: str = ""
     duration: float = Field(default=120, ge=4, le=360)
-    seed: int = Field(default=0, ge=0)
+    # MiniMaxMusic3TextEncode.seed and KSampler.seed are 64-bit; no planner is
+    # involved, so this is genuinely wider than the SongPlanner route's 32-bit
+    # ceiling. Unbounded is still wrong: ComfyUI refuses anything past 64-bit
+    # at /prompt validation, which reaches the Director as an opaque 502.
+    seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
 
 
 class SongPlannerRequest(BaseModel):
@@ -67,8 +71,15 @@ class SongPlannerRequest(BaseModel):
         Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8000)]
         | None
     ) = None
-    duration: float = Field(default=120, ge=4, le=200)
-    seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
+    # M3SongPlanner.duration_seconds accepts 30–300 s and MiniMaxMusic3TextEncode
+    # .max_duration 0.04–360 s; the intersection is the route's bound. Taken from
+    # the recorded /object_info schema, not from the reference export's literals —
+    # anything outside it is rejected by ComfyUI before a node runs.
+    duration: float = Field(default=120, ge=30, le=300)
+    # M3SongPlanner.seed is 32-bit (max 4294967295) even though the encoder and
+    # KSampler seeds it shares a payload with are 64-bit, so the planner governs
+    # here too. Direct Music 3 never touches the planner and keeps its own range.
+    seed: int = Field(default=0, ge=0, le=0xFFFFFFFF)
 
 
 class FluxRequest(BaseModel):
@@ -79,12 +90,14 @@ class FluxRequest(BaseModel):
     height: int = Field(default=1024, ge=256, le=2048, multiple_of=16)
     steps: int = Field(default=20, ge=1, le=100)
     guidance: float = Field(default=4, ge=0, le=20)
-    seed: int = Field(default=0, ge=0)
+    # RandomNoise.noise_seed is 64-bit; see MusicRequest.seed on why unbounded is wrong.
+    seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
 
 
 class MultiviewRequest(BaseModel):
     prompt: str = Field(min_length=1)
-    seed: int = Field(default=0, ge=0)
+    # KSampler.seed is 64-bit; see MusicRequest.seed on why unbounded is wrong.
+    seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
 
 
 class TimelineRequest(BaseModel):

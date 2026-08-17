@@ -8,10 +8,13 @@ repo root with a live, user-managed ComfyUI (never started or stopped here):
 
 Each payload variant is validated separately: every node class must be
 registered, every payload input name must exist in the class schema, every
-schema-required input must be fed (literal or ``[node, output]`` link), and
-every combo-backed string value (model files included) must appear in the
-combo options — read from ``input[1]["options"]`` (ComfyUI 0.33.1 V3 shape)
-with a fallback to the classic inline list at ``input[0]``. ``--record``
+schema-required input must be fed (literal or ``[node, output]`` link), every
+combo-backed string value (model files included) must appear in the combo
+options — read from ``input[1]["options"]`` (ComfyUI 0.33.1 V3 shape) with a
+fallback to the classic inline list at ``input[0]`` — every numeric literal must
+fall inside its schema's ``min``/``max`` and be integral where the schema declares
+INT, and every numeric literal must resolve at least one bound so a bound that
+disappears upstream fails loudly instead of passing vacuously. ``--record``
 writes the audited ``/object_info`` subset to
 ``tests/fixtures/object_info.json`` only when the audit found zero problems.
 No generation is submitted.
@@ -72,6 +75,41 @@ def combo_options(spec: object) -> list | None:
     return None
 
 
+def declared_type(spec: object) -> str | None:
+    """The declared type name (``"INT"``, ``"FLOAT"``, ``"STRING"``, …) or None.
+
+    A combo input carries a list of options at ``spec[0]`` instead of a type name,
+    so only a string there is a declared type. Range-checking without this cannot
+    tell ``steps=1.5`` from ``steps=1``: both sit inside the schema's 1–10000, but
+    the first is not an integer and the node declares INT.
+    """
+    if isinstance(spec, list) and spec and isinstance(spec[0], str):
+        return spec[0]
+    return None
+
+
+def numeric_bounds(spec: object) -> tuple[float | None, float | None]:
+    """``(min, max)`` from an ``/object_info`` INT/FLOAT input spec.
+
+    ComfyUI carries numeric constraints in the options dict at ``input[1]`` —
+    the same slot V3 combos use for their option list — and rejects any value
+    outside them at ``/prompt`` validation time (``value_smaller_than_min`` /
+    ``value_bigger_than_max``) before a single node executes. Either bound may
+    be absent, in which case that side is unconstrained. ``step`` is
+    deliberately not read: ComfyUI accepts off-step values, so enforcing it
+    here would invent a constraint the server does not have.
+    """
+    if not isinstance(spec, list) or len(spec) < 2 or not isinstance(spec[1], dict):
+        return (None, None)
+    bounds: list[float | None] = []
+    for key in ("min", "max"):
+        value = spec[1].get(key)
+        bounds.append(
+            value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+        )
+    return (bounds[0], bounds[1])
+
+
 def validate(label: str, payload: dict[str, dict], object_info: dict) -> list[str]:
     problems: list[str] = []
     for node_id, node in payload.items():
@@ -90,12 +128,58 @@ def validate(label: str, payload: dict[str, dict], object_info: dict) -> list[st
         for name in sorted(set(required) - names):
             problems.append(f"{where}: required input {name!r} is not fed")
         for name, value in node["inputs"].items():
-            if not isinstance(value, str):
+            spec = input_specs.get(name)
+            if isinstance(value, str):
+                options = combo_options(spec)
+                if options is not None and value not in options:
+                    problems.append(f"{where}: {name}={value!r} not in combo options")
                 continue
-            options = combo_options(input_specs.get(name))
-            if options is not None and value not in options:
-                problems.append(f"{where}: {name}={value!r} not in combo options")
+            # ``[node, output]`` links carry no literal to check, and bools are
+            # ints in Python but BOOLEAN in the schema — neither is a range.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if declared_type(spec) == "INT" and value != int(value):
+                problems.append(
+                    f"{where}: {name}={value!r} is fractional but the schema declares INT"
+                )
+            minimum, maximum = numeric_bounds(spec)
+            if minimum is not None and value < minimum:
+                problems.append(f"{where}: {name}={value!r} is below the schema minimum {minimum!r}")
+            if maximum is not None and value > maximum:
+                problems.append(f"{where}: {name}={value!r} is above the schema maximum {maximum!r}")
     return problems
+
+
+def unbounded_numeric_inputs(label: str, payload: dict[str, dict], object_info: dict) -> list[str]:
+    """Numeric literals whose schema exposes neither ``min`` nor ``max``.
+
+    ``numeric_bounds`` returning ``(None, None)`` makes the range check a silent
+    no-op — and a bound that upstream removes or relocates looks exactly like a
+    clean audit. Every numeric input of both SongPlanner graphs resolves at least
+    one bound today, so reporting the ones that do not turns that failure mode
+    loud instead of vacuous. Kept out of ``validate()`` because an unbounded INT
+    is a gap in this guard's coverage, not a defect in the payload: other adapters
+    may legitimately feed inputs ComfyUI leaves unconstrained.
+    """
+    gaps: list[str] = []
+    for node_id, node in payload.items():
+        class_type = node["class_type"]
+        info = object_info.get(class_type)
+        if info is None:
+            continue
+        specs = {
+            **info.get("input", {}).get("required", {}),
+            **info.get("input", {}).get("optional", {}),
+        }
+        for name, value in node["inputs"].items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if numeric_bounds(specs.get(name)) == (None, None):
+                gaps.append(
+                    f"{label} payload, node {node_id} ({class_type}): {name} resolved no "
+                    f"min/max, so its value is not range-checked"
+                )
+    return gaps
 
 
 def main() -> None:
@@ -115,6 +199,13 @@ def main() -> None:
         problem
         for label, payload in variants
         for problem in validate(label, payload, object_info)
+    ]
+    # A bound that vanished upstream would leave the range check passing vacuously
+    # against live ComfyUI, which is precisely the blind spot this audit closes.
+    problems += [
+        gap
+        for label, payload in variants
+        for gap in unbounded_numeric_inputs(label, payload, object_info)
     ]
     for problem in problems:
         print(f"FAIL {problem}")

@@ -68,7 +68,12 @@
                 <label>Creative direction<textarea name="caption" required rows="4" placeholder="Genre, mood, vocal character, instrumentation and arrangement…"></textarea></label>
                 <label>Lyrics / section plan<textarea name="lyrics" rows="7" maxlength="8000" placeholder="[Intro]&#10;…&#10;&#10;[Verse]&#10;…"></textarea></label>
                 <div class="form-row thirds">
-                  <label>Duration <span>s</span><input name="duration" type="number" min="4" max="360" value="120"></label>
+                  <!-- min/max are the default (Balanced/direct Music 3) preset's bounds; syncMusicVariant
+                       rewrites both from musicFormFieldUpdate on load and on every preset change, so the
+                       SongPlanner presets' 30-300 s node range is never duplicated here. step="any" because
+                       the routes take a float and enforce only min/max — the default step=1 would make the
+                       browser refuse fractional durations ComfyUI accepts. -->
+                  <label>Duration <span>s</span><input name="duration" type="number" step="any" min="4" max="360" value="120"></label>
                   <label>Seed<input name="seed" type="number" min="0" value="0"></label>
                   <label>Preset<select name="preset" title="Generation variant"><option value="balanced">Balanced (direct)</option><option value="songplanner-invented">SongPlanner — invented lyrics</option><option value="songplanner-known">SongPlanner — known lyrics</option></select></label>
                 </div>
