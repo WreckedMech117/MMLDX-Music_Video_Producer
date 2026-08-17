@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from itertools import pairwise
+from typing import Any
 
-from .models import Shot
+from .models import Project, Shot
 
 #: MiniMax H3 is trained primarily for shot windows in this range, in seconds.
 H3_MIN_SHOT_SECONDS = 4.0
@@ -77,3 +78,130 @@ def build_director_timeline(
         aligned_frames=align_h3_frames(requested),
         warnings=warnings,
     )
+
+
+def song_section(project: Project, shot: Shot) -> str:
+    """The song section a Shot sits in, or "" because nothing in this project produces one.
+
+    FR-26 asks for section boundaries *when analysis exists*. None does: there is no BPM or
+    section field on `Song`, `Project` or any other model, the analyse-structure button is a
+    disabled stub, `#bpm-value` and `#sections-value` are hardcoded "Not analyzed", and
+    `#section-track` is never populated. This is therefore one explicit empty branch with a
+    named home for a future analyser, not a fabricated boundary list — and `expansion_input`
+    omits the key rather than sending "" or "unknown", because an absent value must never
+    reach the model as a confident one.
+    """
+    return ""
+
+
+def ordered_shots(project: Project) -> list[Shot]:
+    """The project's Shots in song order — the one ordering the expansion path uses.
+
+    Exported because two places need to agree about it: `expansion_input` numbers the model's
+    entries by this order, and the route labels its notices by the same numbers. Ordering the
+    notices by manifest position instead would describe a different Shot than the `index` the
+    model answered about, for any plan whose manifest order is not its time order.
+
+    The sort is stable, so Shots sharing a start keep their manifest order rather than being
+    silently reshuffled between two calls over the same project.
+    """
+    return sorted(project.shots, key=lambda shot: shot.start)
+
+
+def _neighbour_framing(shot: Shot | None) -> dict[str, Any] | None:
+    """Where a neighbouring Shot sits, as adjacency plus its window.
+
+    Deliberately **not** the neighbour's prompt. On a first expansion — the primary case —
+    every prompt is `""` or the `"New shot"` placeholder, so carrying it would convey nothing
+    exactly when the variance mechanism matters most, while shipping every prompt three times
+    (as `current_prompt`, as one neighbour's `next` and as another's `previous`) against a
+    payload whose whole justification is that it is trimmed. The full entry for a neighbour is
+    in `shots`, reachable by this id or by `index ± 1`; this states the adjacency and the
+    timing, which are real on the first run.
+    """
+    if shot is None:
+        return None
+    return {"shot_id": shot.id, "start": round(shot.start, 3), "end": round(shot.end, 3)}
+
+
+def expansion_input(project: Project) -> dict[str, Any]:
+    """The purpose-built, trimmed input for one whole-plan shot expansion. Pure and I/O-free.
+
+    Whole-plan rather than per-Shot because per-Shot calls cannot see each other, and the
+    variance FR-26 asks for — holding identity, wardrobe, palette and lens fixed while action,
+    framing and energy move — is a property of the plan, not of any one Shot.
+
+    Deliberately *not* `project.model_dump()`. The chat route's dump ships every Shot's
+    `status`, `prompt_id`, `latest_output`, `latest_review` and `approved_output`, and the
+    recorded root cause of Director degradation is rich context: JSON in context begets JSON,
+    which is the failure `document_rejection` exists to catch. Nothing here carries a take, a
+    render id or a review.
+
+    Shots are ordered by `ordered_shots`, so `index` and the neighbours are the Shot's position
+    in the song rather than in the manifest, and the route's notices are numbered by the same
+    call. `song_fraction` is **absent** when there is no Song or its duration is unknown — a
+    fabricated 0.0 would tell the model every shot opens the song — and `section` is absent for
+    the reason `song_section` documents.
+
+    Every key here is described to the model in `EXPANSION_SYSTEM_PROMPT`. A payload whose
+    semantics the model has to infer is a payload whose variance mechanism is hoped for rather
+    than requested, so the two are written to be changed together.
+    """
+    ordered = ordered_shots(project)
+    song_duration = project.song.duration if project.song else 0.0
+    shots: list[dict[str, Any]] = []
+    for index, shot in enumerate(ordered):
+        entry: dict[str, Any] = {
+            "shot_id": shot.id,
+            "index": index,
+            "start": round(shot.start, 3),
+            "end": round(shot.end, 3),
+            "duration": round(shot.duration, 3),
+            # A locked Shot stays in the plan because the model needs the whole through-line to
+            # write around it, and is flagged so it does not spend a slot on one that is never
+            # applied. The chat context keeps the document locks for the same reason.
+            "locked": shot.locked,
+            "current_prompt": shot.prompt,
+            # Descriptive, never gating: expansion writes prompts only, so no window changes
+            # and nothing here can fail. It is direction — a 25 s shot wants different prose
+            # from a 5 s one — reported as a flag over the project's own Shots.
+            "outside_h3_window": not (
+                H3_MIN_SHOT_SECONDS <= shot.duration <= H3_MAX_SHOT_SECONDS
+            ),
+            "neighbours": {
+                key: framing
+                for key, framing in (
+                    ("previous", _neighbour_framing(ordered[index - 1] if index else None)),
+                    (
+                        "next",
+                        _neighbour_framing(
+                            ordered[index + 1] if index + 1 < len(ordered) else None
+                        ),
+                    ),
+                )
+                if framing is not None
+            },
+        }
+        if song_duration > 0:
+            # Clamped, because this is guidance rather than geometry. A Shot can legitimately
+            # sit past the end of a shorter song — nothing retimes Shots when the Song changes,
+            # which is exactly what SONG_REPLACEMENT_CONSEQUENCE promises — and telling the
+            # model a Shot sits at 3.5 of the way through the song is not a fact it can use.
+            # The absolute `start` and `end` above stay unclamped and carry the real timing.
+            entry["song_fraction"] = round(min(1.0, max(0.0, shot.start / song_duration)), 4)
+        section = song_section(project, shot)
+        if section:
+            entry["section"] = section
+        shots.append(entry)
+    payload: dict[str, Any] = {
+        "creative_brief": project.creative_brief,
+        "treatment": project.treatment,
+        "style_bible": project.style_bible,
+        "h3_shot_window": {"min": H3_MIN_SHOT_SECONDS, "max": H3_MAX_SHOT_SECONDS},
+        "shots": shots,
+    }
+    if project.song is not None:
+        # Title and length only. The lyric sheet and the generation caption are the Song's
+        # bulkiest fields and neither says where a Shot sits, which is what this input is for.
+        payload["song"] = {"title": project.song.title, "duration": project.song.duration}
+    return payload

@@ -10,7 +10,7 @@ from typing import Annotated, Any, Literal
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
 from .comfy import ComfyClient, ComfyError
 from .config import Settings
@@ -35,6 +35,8 @@ from .timeline import (
     H3_MIN_SHOT_SECONDS,
     TimelineError,
     build_director_timeline,
+    expansion_input,
+    ordered_shots,
 )
 from .workflows import (
     WorkflowCatalog,
@@ -164,6 +166,71 @@ DOCUMENT_RESTORE_REFUSAL = (
 )
 
 
+# Why an empty plan is refused instead of answered with an empty expansion. Expansion writes a
+# prompt onto Shots that already exist — it never creates, retimes or removes one — so with no
+# Shots there is nothing for a result to be keyed to, and a model call would spend the
+# Director's time to report that nothing happened. Refused before any call, like every other
+# guard in this module.
+EXPANSION_WITHOUT_SHOTS = (
+    "This project has no shots to expand. Expansion writes a prompt onto each existing shot "
+    "and never creates, retimes, or removes one, so add shots to the timeline first."
+)
+
+# What one expansion did, in the sentences it can need. Every one names Shots the Director can
+# go and look at, **by shot id**, because a prompt is free text: a result merged onto the wrong
+# Shot reads as a plausible prompt forever and nothing downstream would fail. `api.js`'s
+# SHOT_EXPANSION_TOAST is the frontend half of the summary; the detail lives here, in the one
+# place that knows which Shots were involved.
+EXPANSION_WRITTEN_NOTICE = "Prompts written for {count} shot(s): {shots}."
+EXPANSION_LOCKED_NOTICE = (
+    "Left unchanged because they are locked: {shots}. A lock only stops the Director — you can "
+    "still write those prompts yourself in the shot inspector, or unlock the shot."
+)
+# A Shot whose prompt something already depends on. Rewriting it is provenance loss of the same
+# class the document recovery slots exist to prevent: an approved take would silently stop
+# matching the prompt it was produced from, and an in-flight render's prompt would diverge from
+# what was actually submitted to ComfyUI. Reported like a lock, and for the same reason —
+# "nothing happened to this Shot" has to say why.
+EXPANSION_RENDERED_NOTICE = (
+    "Left unchanged because a render or a take already depends on the prompt they have: "
+    "{shots}. Rewriting one would leave its take claiming a prompt that never produced it. You "
+    "can still edit those prompts yourself in the shot inspector."
+)
+# An unknown id is reported rather than guessed at and never created as a new Shot. Creating one
+# would invent a window this expansion has no business choosing, and matching it positionally is
+# the exact silent misassignment keying by id exists to prevent.
+EXPANSION_UNKNOWN_NOTICE = (
+    "Discarded: the model returned prompts addressed to {count} id(s) that no shot in this "
+    "project has ({shots}). Nothing was written for them and no shot was created."
+)
+# An omission is reported rather than retried. A retry loop would spend GPU-free but real
+# Director time on a model that already declined once, and the existing prompt is not lost.
+EXPANSION_OMITTED_NOTICE = (
+    "Omitted by the model and therefore unchanged: {shots}. Each kept the prompt it already "
+    "had; run expansion again if you want them written."
+)
+# The model answering for one Shot twice. First answer wins, because two contradictory prompts
+# for one Shot is a self-contradiction the Director has to see rather than a preference for
+# whichever arrived last — and last-write-wins could report the same Shot as both refused and
+# written in one reply.
+EXPANSION_DUPLICATE_NOTICE = (
+    "The model answered more than once for {shots}. The first prompt it gave for each was "
+    "applied and the later ones were ignored, because a shot cannot have two prompts."
+)
+# The refusal, without the refused text. Storing the raw output would write the degraded JSON
+# into the chat thread, which `director_chat` ships back to the model as context on the next
+# turn — so the guard that catches "JSON in context begets JSON" would be the thing feeding it.
+EXPANSION_REJECTED_NOTICE = (
+    "NOT applied to {shot}: {reason}. The returned text is not recorded here, because this "
+    "thread is context for the next Director call and repeating degraded output into it is what "
+    "produces more of it."
+)
+# What the reply says when the model returned no message of its own. `ShotExpansion.message`
+# deliberately has no `min_length`: an empty sentence is not a reason to discard a whole set of
+# good prompts with a 502, but it must not leave the reply as a bare separator either.
+EXPANSION_EMPTY_MESSAGE = "The Director returned no summary of this expansion."
+
+
 def document_change_notice(labels: list[str]) -> str:
     """State which documents this reply replaced, from the one wording above.
 
@@ -194,6 +261,65 @@ def document_restore_notice(document: DocumentName, *, reversible: bool = True) 
     """
     template = DOCUMENT_RESTORE_NOTICE if reversible else DOCUMENT_RESTORE_ONE_WAY_NOTICE
     return template.format(document=DOCUMENT_LABELS[document])
+
+
+def shot_render_provenance(shot: Shot) -> bool:
+    """True when something already depends on this Shot's prompt being what it is.
+
+    A submitted render, a take on disk, an editorial approval, or any status past `draft` all
+    mean the prompt is no longer just an intention — it is the record of what produced, or is
+    producing, a specific piece of media. Rewriting it in place is provenance loss: nothing
+    fails, and afterwards the take and the prompt beside it simply disagree.
+
+    Deliberately *not* sent to the model. The expansion input is trimmed of exactly these
+    fields, and a derived flag would reintroduce the production state that trimming exists to
+    keep out; the cost is that the model may spend a slot on a Shot whose prompt is then
+    discarded, which the reply reports.
+    """
+    return bool(
+        shot.prompt_id or shot.latest_output or shot.approved_output or shot.status != "draft"
+    )
+
+
+def _short(value: str, limit: int = 60) -> str:
+    """Collapse and cap model-controlled text before it is stored in the chat thread.
+
+    A `shot_id` that matched nothing is whatever the model emitted — it can be a paragraph, or
+    carry newlines that break the notice apart. The thread is persisted and is context for the
+    next call, so nothing model-controlled goes into it at unbounded length.
+    """
+    collapsed = " ".join(str(value).split())
+    return collapsed if len(collapsed) <= limit else f"{collapsed[:limit]}…"
+
+
+def expansion_shot_label(index: int, shot: Shot) -> str:
+    """Name a Shot by the one number the model was given: its `index` in `expansion_input`.
+
+    The two orderings differ. `expansion_input` orders by `start`, because that is the Shot's
+    position in the song; the timeline draws clips in manifest order. Numbering notices by the
+    manifest would describe a different Shot than the `index` the model answered about, for
+    every plan whose manifest order is not its time order — so this uses the input's index, and
+    carries the start time and the id, which are unambiguous under either ordering.
+    """
+    return f"shot index {index} at {shot.start:g}s ({shot.id})"
+
+
+def expansion_rejection(prompt: str) -> str:
+    """Why a returned prompt must not be written onto a Shot, or "" when it may.
+
+    Only the JSON-as-prose half of `document_rejection` is meaningful for a prompt, so "" is
+    passed as the existing text to reach exactly that check and nothing else. The 40% ratio
+    floor compares against the *current* prompt, which is `""` on an unexpanded Shot and the
+    "New shot" placeholder on one added in the UI — toothless where it matters, and liable to
+    refuse a legitimate first prompt on a Shot the Director had already written by hand.
+
+    A blank prompt is refused separately. `ExpandedShot` already requires a non-empty string on
+    the wire, but this route must not be the thing that blanks a Shot's prompt if anything ever
+    reaches it with one.
+    """
+    if not prompt.strip():
+        return "the model returned an empty prompt"
+    return document_rejection(prompt, "")
 
 
 def _require_song_replacement_confirmation(project: Project, confirmed: bool) -> None:
@@ -280,16 +406,24 @@ class H3Request(BaseModel):
     ref_image_size: Literal["match", "max"] = "match"
 
 
+# A flag a client omits and a flag a client sends as `null` mean the same thing — "I am not
+# asking for this" — but Pydantic reads the second as a type error and 422s the whole turn, so
+# the Director's message is lost over a field whose *absence* is already the safe default. Both
+# consent flags read `null` as the decline instead. Nothing here loosens anything: the only
+# value whose meaning changes is one that was rejected outright, and it lands on `False`.
+DeclinedIfNull = Annotated[bool, BeforeValidator(lambda value: False if value is None else value)]
+
+
 class DirectorRequest(BaseModel):
     message: str = Field(min_length=1)
-    apply_shots: bool = False
+    apply_shots: DeclinedIfNull = False
     # Per-turn consent to replace the creative documents, mirroring `apply_shots` exactly —
     # same shape, same default, and independent of it. Off by default because consent has to be
     # explicit for the turn being sent: asking "what do you think of this idea?" must not
     # rewrite the Treatment, which is what every reply did before this field existed. It is
     # deliberately not stored on `Project`, so it is neither remembered across turns nor
-    # inherited by another project, and a client that omits it entirely is a decline.
-    apply_documents: bool = False
+    # inherited by another project, and a client that omits or nulls it is a decline.
+    apply_documents: DeclinedIfNull = False
 
 
 class ShotListRequest(BaseModel):
@@ -1177,6 +1311,146 @@ def create_app(
                     )
             merged_shots.extend(project.shots[len(result.shots) :])
             project.shots = merged_shots
+        return store.save(project)
+
+    @app.post("/api/projects/{project_id}/director/expand", response_model=Project)
+    async def expand_shot_prompts(project_id: str) -> Project:
+        """Turn the Treatment, Style Bible and timed Shot windows into a prompt per Shot (FR-26).
+
+        A thin delegator over two pure things: `expansion_input` builds what the model sees, and
+        `expansion_rejection` decides what may be written. Nothing here computes either, so both
+        are testable without a route and the route can be asserted to pass the builder's output
+        verbatim.
+
+        Four properties are load-bearing:
+
+        * **Keyed by shot id, never by position.** The chat route's positional merge is safe
+          enough for start/duration, where a wrong assignment shows up as a visibly wrong
+          window; a prompt is free text, so the same mistake after a concurrent add, delete or
+          split would read as a plausible prompt forever and nothing downstream would fail.
+        * **Nothing is rendered.** Expansion never touches `comfy`, never sets a Shot's
+          `status`, and never queues a job. The prompt lands in the shot inspector, where the
+          Director edits it and then decides about GPU time.
+        * **No retiming.** `start`, `duration` and every window are untouched; only `prompt` is
+          assigned.
+        * **Only draft, unlocked Shots are written.** A lock is the Director's decision; render
+          provenance is a fact about media that already exists. Both are reported rather than
+          silently skipped, because "nothing happened to this Shot" has to say why.
+
+        The empty-plan refusal, the re-read after the await, the 503/502 mapping and the single
+        terminal `store.save` all follow `director_chat`.
+        """
+        # Built from the pre-await snapshot, exactly as the chat prompt is: this is what the
+        # model sees, and it is then thrown away in favour of the re-read below.
+        snapshot = get_project(project_id)
+        if not snapshot.shots:
+            raise HTTPException(status_code=422, detail=EXPANSION_WITHOUT_SHOTS)
+        try:
+            result = await director.expand(expansion_input=expansion_input(snapshot))
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        # Re-read after the await, for the reason `director_chat` documents — and here it is
+        # also what makes id-keying meaningful: a Shot added, deleted or split while the model
+        # was thinking is in this project and not in the snapshot the result answers.
+        project = get_project(project_id)
+        # Re-checked, not assumed from the snapshot: every Shot can be deleted while the model
+        # is thinking, and saving a reply about a plan the pre-call guard would have refused
+        # would leave the thread asserting an expansion of nothing.
+        if not project.shots:
+            raise HTTPException(status_code=422, detail=EXPANSION_WITHOUT_SHOTS)
+        shots_by_id = {shot.id: shot for shot in project.shots}
+        # Labelled from `ordered_shots`, the same call `expansion_input` numbers by, so the
+        # notice and the model are talking about the same Shot under the same number.
+        labels = {
+            shot.id: expansion_shot_label(index, shot)
+            for index, shot in enumerate(ordered_shots(project))
+        }
+        written: list[str] = []
+        locked: list[str] = []
+        rendered: list[str] = []
+        unknown: list[str] = []
+        duplicated: list[str] = []
+        rejected: list[str] = []
+        answered: set[str] = set()
+        for item in result.shots:
+            shot = shots_by_id.get(item.shot_id)
+            if shot is None:
+                # Reported, not created and not guessed at. See EXPANSION_UNKNOWN_NOTICE. The
+                # list is deduplicated because a model looping on one bad id would otherwise
+                # repeat it through the whole notice.
+                if item.shot_id not in unknown:
+                    unknown.append(item.shot_id)
+                continue
+            # First answer wins, before any other check. Last-write-wins would let one Shot be
+            # reported as refused *and* written in the same reply, and there is no reason to
+            # prefer whichever contradiction arrived last.
+            if shot.id in answered:
+                if shot.id not in duplicated:
+                    duplicated.append(shot.id)
+                continue
+            # Answered before the lock, provenance and rejection checks: the model did address
+            # this Shot, so it is not an omission whatever happens to the prompt it sent.
+            answered.add(shot.id)
+            if shot.locked:
+                locked.append(shot.id)
+                continue
+            # After the lock: both mean "not written", but a lock is a decision the Director
+            # made and provenance is a fact about media, so when both apply the lock is the
+            # sentence worth reading — the precedence `director_chat` uses for lock vs consent.
+            if shot_render_provenance(shot):
+                rendered.append(shot.id)
+                continue
+            reason = expansion_rejection(item.prompt)
+            if reason:
+                rejected.append(
+                    EXPANSION_REJECTED_NOTICE.format(shot=labels[shot.id], reason=reason)
+                )
+                continue
+            shot.prompt = item.prompt
+            written.append(shot.id)
+        # A locked or already-rendered Shot the model never answered for is not an omission:
+        # nothing was going to be written for it either way, and telling the Director to "run
+        # expansion again if you want them written" would be advice that can never work.
+        omitted = [
+            shot.id
+            for shot in project.shots
+            if shot.id not in answered and not shot.locked and not shot_render_provenance(shot)
+        ]
+        notices: list[str] = []
+        # What changed goes first, as it does in the chat reply: it is the thing the Director has
+        # to review, and everything below it is an explanation of something that did not happen.
+        if written:
+            notices.append(
+                EXPANSION_WRITTEN_NOTICE.format(
+                    count=len(written), shots=", ".join(labels[shot_id] for shot_id in written)
+                )
+            )
+        for reported, wording in (
+            (locked, EXPANSION_LOCKED_NOTICE),
+            (rendered, EXPANSION_RENDERED_NOTICE),
+            (omitted, EXPANSION_OMITTED_NOTICE),
+            (duplicated, EXPANSION_DUPLICATE_NOTICE),
+        ):
+            if reported:
+                notices.append(
+                    wording.format(shots=", ".join(labels[shot_id] for shot_id in reported))
+                )
+        if unknown:
+            notices.append(
+                EXPANSION_UNKNOWN_NOTICE.format(
+                    count=len(unknown),
+                    shots=", ".join(_short(shot_id) for shot_id in unknown),
+                )
+            )
+        notices.extend(rejected)
+        # A model that returned no sentence of its own must not leave the reply as a bare
+        # separator followed by notices.
+        message = result.message.strip() or EXPANSION_EMPTY_MESSAGE
+        if notices:
+            message = message + "\n\n---\n" + "\n\n".join(notices)
+        project.messages.append(TreatmentMessage(role="assistant", content=message))
         return store.save(project)
 
     @app.get("/api/projects/{project_id}/jobs/{job_id}", response_model=RenderJob)

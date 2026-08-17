@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, comfyOutputUrl, documentChangeToast, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, shotExpansionToast, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -6,6 +6,9 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 let shotSaveChain = Promise.resolve();
 let shotSaveRevision = 0;
+// True for the whole of an expansion call, which is what stops a timeline edit made *during* it
+// from queueing a whole-list shot save that lands afterwards and reverts every prompt written.
+let shotExpansionInFlight = false;
 let waveformLoadRevision = 0;
 
 function toast(message, kind = "info") {
@@ -92,6 +95,15 @@ async function loadProjects(selectId = null) {
 }
 
 async function loadProject(id) {
+  // Ahead of the no-project branch, because both are a change of project: consent given in one
+  // project must never be inherited by the next one loaded, or a document is replaced in a
+  // project the Director was not even looking at when they ticked the box.
+  //
+  // Gated on the project actually changing, because most of this function's callers are refreshes
+  // of the project already on screen -- the queue refresh, both generate paths, multiview, the
+  // queue-ready loop -- and unticking the box there revokes consent the Director gave seconds ago
+  // in the project they are still looking at, with nothing on screen to explain it.
+  if (documentConsentClearedOnLoad(state.project?.id, id)) clearDocumentConsent(applyDocumentsControl());
   if (!id) {
     state.project = null;
     state.audioBuffer = null;
@@ -259,6 +271,23 @@ function markDocumentsSaved() {
 function confirmDiscardingDocumentEdits(question) {
   if (!state.documentsDirty) return true;
   return window.confirm(`${question}\n\n${UNSAVED_DOCUMENT_EDITS_CONSEQUENCE}`);
+}
+
+// The unsaved-edits question, stated for the send that is actually about to happen. Both sends
+// re-render the editors from the server and so discard unsaved typing -- that is why the gate
+// fires either way -- but only a consented send can *replace* a document, and warning about a
+// rewrite that cannot happen deters a send that would write nothing.
+function directorSendQuestion(applyDocuments) {
+  return applyDocuments
+    ? "Send this to the Director? A reply can replace either creative document."
+    : "Send this to the Director? No document will be replaced, but the editors are re-rendered from the text stored on the server.";
+}
+
+// The composer's consent control, or null when the markup does not carry it. The reading and
+// the clearing are pure functions in api.js so they can be executed rather than only grepped;
+// this is the one place that turns the selector into an element.
+function applyDocumentsControl() {
+  return $(APPLY_DOCUMENTS_CONTROL);
 }
 
 function assetImageUrl(asset) {
@@ -509,8 +538,64 @@ async function restoreDocument(documentKey) {
   }
 }
 
+// Write a prompt onto every unlocked shot from the Treatment, the Style bible and the shot
+// windows. It queues nothing: no render is submitted, no shot status changes, and the prompts land
+// in the shot inspector where they stay editable -- which is why the button says so.
+//
+// Silent shot saves are shut out for the whole call, in two halves, because either one alone still
+// loses the prompts. Awaiting the pending chain drains the saves queued *before* the click -- a
+// drag followed immediately by a press would otherwise let a save carrying the old prompts land
+// after the expansion wrote the new ones -- and it is also what makes the server build the model's
+// input from the windows currently on screen. The in-flight flag covers the rest: the call takes
+// multiple seconds, and a drag *during* it would queue exactly the same stale whole-list save,
+// which awaiting something queued earlier cannot prevent. Edits made then are refused out loud
+// rather than dropped.
+//
+// The response also re-renders the document editors, so it is gated on the same unsaved-edits
+// question every other server-overwrites-the-editors path asks, and clears the dirty flags after
+// the editors have been rendered from the server -- exactly as a restore and a Director reply do.
+//
+// The reply is the whole project, so the timeline and the inspector are re-rendered from it rather
+// than patched locally, and the toast is read out of the reply rather than diffed.
+async function expandShotPrompts() {
+  if (!requireProject()) return;
+  if (!state.project.shots.length) return toast(SHOT_EXPANSION_WITHOUT_SHOTS, "error");
+  if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to expand shots into prompts.", "error");
+  if (!confirmDiscardingDocumentEdits("Expand shots into prompts? No document is replaced, but the whole project comes back, so the editors are re-rendered from the text stored on the server.")) return;
+  // The id this call is sent for, captured before any await. `state.project` is rebound by the
+  // response and the project selector stays live throughout, so without this a result for project
+  // A can be written over project B and drawn -- A's shots and A's documents -- under B's name.
+  const projectId = state.project.id;
+  const button = $("#expand-shot-prompts");
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Expanding…";
+  shotExpansionInFlight = true;
+  try {
+    await shotSaveChain;
+    const expanded = await api.expandShots(projectId);
+    // The Director switched projects while the model was thinking. The prompts are written and
+    // saved on the server, so nothing is lost by dropping this reply -- loading that project again
+    // shows them -- whereas applying it here would show one project's work under another's name.
+    if (state.project?.id !== projectId) return;
+    state.project = expanded;
+    markDocumentsSaved();
+    renderAll();
+    toast(shotExpansionToast(state.project));
+  } catch (error) { toast(error.message, "error"); }
+  finally { shotExpansionInFlight = false; button.disabled = false; button.textContent = label; }
+}
+
 function saveShotsSilently() {
   if (!state.project) return Promise.resolve();
+  // Refused, not queued: this save carries the whole shot list as it was before the expansion, so
+  // landing it afterwards reverts every prompt just written while the success toast is still on
+  // screen. Said out loud because the edit really is not saved and the response re-renders the
+  // timeline over it.
+  if (shotExpansionInFlight) {
+    toast(SHOT_EXPANSION_EDIT_BLOCKED, "error");
+    return Promise.resolve();
+  }
   const projectId = state.project.id;
   const shots = structuredClone(state.project.shots);
   const revision = ++shotSaveRevision;
@@ -778,11 +863,12 @@ function bindEvents() {
     // Read from the control, never hardcoded: it is the Director's consent for this turn, and a
     // fixed `true` here would reinstate the unrequested rewrite the flag exists to stop, while a
     // fixed `false` would make the control decorative.
-    const applyDocuments = $(APPLY_DOCUMENTS_CONTROL).checked;
-    // A reply can replace either document, and the whole project comes back -- so the editors
-    // are re-rendered from the server whether or not anything changed. Ask before that
-    // discards typing that was never stored and therefore was never recoverable.
-    if (!confirmDiscardingDocumentEdits("Send this to the Director? A reply can replace either creative document.")) return;
+    const applyDocuments = documentConsent(applyDocumentsControl());
+    // The whole project comes back, so the editors are re-rendered from the server whether or
+    // not anything changed. Ask before that discards typing that was never stored and therefore
+    // was never recoverable -- and ask about the send that is actually happening, since only a
+    // consented one can replace a document.
+    if (!confirmDiscardingDocumentEdits(directorSendQuestion(applyDocuments))) return;
     const before = state.project;
     const button = event.currentTarget.querySelector("button[type=submit]");
     button.disabled = true; button.textContent = "Directing…";
@@ -798,10 +884,11 @@ function bindEvents() {
       // -- and a different remedy -- from a lock or a rejection.
       toast(documentChangeToast(before, state.project, applyDocuments));
     } catch (error) { toast(error.message, "error"); }
-    finally { button.disabled = false; button.textContent = "Send to Director"; }
+    // The consent this turn carried is spent, so the next turn starts from a decline again.
+    finally { clearDocumentConsent(applyDocumentsControl()); button.disabled = false; button.textContent = "Send to Director"; }
   });
   $("#send-treatment").addEventListener("click", () => document.querySelector('[data-panel="treatment"]').click());
-  $("#apply-shot-plan").addEventListener("click", () => toast("Save the treatment, then add or edit shots directly in the Director timeline."));
+  $("#expand-shot-prompts").addEventListener("click", expandShotPrompts);
   $("#add-shot").addEventListener("click", () => {
     if (!requireProject()) return;
     const shots = state.project.shots;

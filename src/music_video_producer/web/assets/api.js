@@ -198,6 +198,34 @@ export const DOCUMENT_CONTROLS = {
 export const APPLY_DOCUMENTS_CONTROL = "#apply-documents";
 export const APPLY_DOCUMENTS_LABEL = "Apply document changes";
 
+// Consent for exactly one turn, read off the composer control. Optional-chained and compared
+// rather than returned raw: the send handler reads this *outside* the try/catch that reports
+// failures, so a bare `.checked` on a missing control would throw past the handler and kill the
+// send with no request, no toast and no error — the control silently deciding to send nothing at
+// all. A control that is not there has given no consent, which is a decline.
+export function documentConsent(control) {
+  return control?.checked === true;
+}
+
+// Consent is per turn *and* per project: it is spent when a turn finishes, and cleared when a
+// project loads. Without the first, one tick applies every later turn with no fresh consent —
+// "on until the Director notices" rather than opt-in. Without the second, consent given in one
+// project is inherited by the next one loaded, replacing a document in a project the Director
+// was not even looking at when they ticked the box.
+export function clearDocumentConsent(control) {
+  if (control) control.checked = false;
+}
+
+// Which project loads clear the consent: the ones that actually change project. `loadProject` is
+// the refresh path as well as the switch path -- the queue refresh, both generate paths, multiview
+// and the queue-ready loop all reload the project already on screen -- and clearing there unticks a
+// box the Director ticked seconds ago, in the project they are still looking at, with no visible
+// cause. Leaving *and* arriving both count: switching to no project at all must not leave consent
+// ticked for whichever project loads next.
+export function documentConsentClearedOnLoad(currentProjectId, nextProjectId) {
+  return (currentProjectId || null) !== (nextProjectId || null);
+}
+
 // One lookup for both tables, throwing rather than returning undefined: a document the
 // server has no field for must fail loudly here instead of rendering "undefined" into a
 // toast or silently binding a control to nothing.
@@ -273,17 +301,99 @@ export const DOCUMENT_NOT_APPLIED_TOAST =
   `No document was written: replacing a document is opt-in per turn. Tick "${APPLY_DOCUMENTS_LABEL}" ` +
   "and ask again to apply one; the reply says what this turn proposed, and that text is not kept.";
 
+// True when the reply itself reports a proposal this turn declined. Keyed on a phrase from the
+// server's own DOCUMENT_NOT_REQUESTED_NOTICE — the DOCUMENT_RESTORE_REFUSAL_MARKER shape, and a
+// contract test asserts it is a real substring of it — because the server is deliberately
+// *silent* in three cases the client cannot see from the project alone: nothing was proposed,
+// the candidate was an echo, and the guard would have refused it anyway. Blaming the opt-in for
+// any of those tells the Director to tick a box and retry a turn that will write nothing either
+// way, and a locked document is a fourth: the lock notice is what the reply carries there, and
+// ticking the box would not apply it.
+export const DOCUMENT_NOT_REQUESTED_MARKER = "Proposed but not applied";
+
+// The last thing the Director was actually told, or `null` when the project carries no reply.
+// Shared by every toast that has to be decided by the reply rather than by a diff: the *last*
+// assistant line decides, because an earlier turn's notice is still in the thread, and a system
+// line is the restore audit trail rather than anything the Director said.
+function assistantReply(project) {
+  const messages = project?.messages;
+  if (!Array.isArray(messages)) return null;
+  const reply = messages.filter((message) => message?.role === "assistant").at(-1);
+  return typeof reply?.content === "string" ? reply.content : null;
+}
+
+export function documentProposalDeclined(project) {
+  return (assistantReply(project) ?? "").includes(DOCUMENT_NOT_REQUESTED_MARKER);
+}
+
 // `applied` is the consent that was actually sent, not a guess: with it off the server writes
-// nothing at all, so the two "nothing changed" cases have different causes and different
-// advice. It defaults to `true` because that is the safe default of the two — a caller that
-// forgets it gets the vaguer sentence, where defaulting to `false` would blame the flag for a
-// lock or a rejection and send the Director to tick a box that was already ticked.
+// no document at all, so the reply cannot have replaced anything whatever the two projects
+// differ by. It defaults to `true` because that is the safe default of the two — a caller that
+// forgets it gets the diff-derived sentence, where defaulting to `false` would blame the flag
+// for a lock or a rejection and send the Director to tick a box that was already ticked.
 export function documentChangeToast(before, after, applied = true) {
+  // A declined turn is decided by the reply, never by the diff. A restore or a hand edit
+  // committed while the Director call was in flight moves the document without this reply
+  // having touched it, and before/after cannot tell the two apart — so the diff would credit
+  // the reply with a replacement that consent made impossible.
+  if (!applied) {
+    return documentProposalDeclined(after) ? DOCUMENT_NOT_APPLIED_TOAST : DOCUMENT_UNCHANGED_TOAST;
+  }
   const changed = Object.keys(DOCUMENT_LABELS).filter(
     (document) => (before?.[document] ?? "") !== (after?.[document] ?? ""),
   );
-  if (!changed.length) return applied ? DOCUMENT_UNCHANGED_TOAST : DOCUMENT_NOT_APPLIED_TOAST;
+  if (!changed.length) return DOCUMENT_UNCHANGED_TOAST;
   return DOCUMENT_CHANGE_TOAST.replace("{documents}", changed.map(documentLabel).join(" and "));
+}
+
+// The one claim both halves of the expansion control make about what pressing it costs. The
+// button's `title` says it before the click and the toast says it after, and a Director deciding
+// whether a "Director" button will spend GPU minutes must not read two different sentences about
+// it. The markup cannot import this, so a contract test asserts the button carries this spelling.
+export const SHOT_EXPANSION_NO_RENDER = "Nothing is rendered";
+
+// Why an empty plan is refused before anything is sent, in the browser's voice. The rule is one
+// rule: app.py's EXPANSION_WITHOUT_SHOTS refuses the same case with the same sentence, and a
+// contract test asserts the two are identical -- two hand-written wordings for one refusal are how
+// the pre-emptive toast starts describing a rule the server no longer has.
+export const SHOT_EXPANSION_WITHOUT_SHOTS =
+  "This project has no shots to expand. Expansion writes a prompt onto each existing shot " +
+  "and never creates, retimes, or removes one, so add shots to the timeline first.";
+
+// Silent shot saves are refused while an expansion is in flight, so the refusal has to be said out
+// loud: the edit is not saved and the response re-renders the timeline over it, and a drag that
+// vanishes with no explanation reads as the app losing work at random.
+export const SHOT_EXPANSION_EDIT_BLOCKED =
+  "Shots are being expanded into prompts, so this timeline edit was not saved -- a save queued now " +
+  "would carry the prompts from before the expansion and revert it. Make the edit again once the " +
+  "prompts land.";
+
+// What one shot expansion did, taken from the reply rather than from a diff of the shots. The
+// server knows which Shots it wrote and says so in EXPANSION_WRITTEN_NOTICE; a diff cannot tell a
+// re-run that wrote the same text from a write that never happened, and would then announce "No
+// shot prompt changed" directly under a reply saying prompts were written for two shots. The toast
+// is the loudest thing on screen, so it says what the reply beside it says.
+export const SHOT_EXPANSION_TOAST =
+  `{count} shot prompt{plural} written by this expansion. ${SHOT_EXPANSION_NO_RENDER}, and every prompt is editable in the shot inspector.`;
+export const SHOT_EXPANSION_UNCHANGED_TOAST =
+  "No shot prompt changed; the reply says what the expansion returned and why none of it was applied.";
+
+// Keyed on the server's own EXPANSION_WRITTEN_NOTICE -- a contract test asserts the count is read
+// back out of a real formatted notice -- so the count in the toast is the count in the reply, by
+// construction. The `shot(s):` tail is part of the match on purpose: the model's own prose sits
+// above the notices in the same message, and a bare "Prompts written for" could appear in it.
+export const SHOT_EXPANSION_WRITTEN_MARKER = "Prompts written for";
+const SHOT_EXPANSION_WRITTEN_PATTERN = new RegExp(`${SHOT_EXPANSION_WRITTEN_MARKER} (\\d+) shot\\(s\\):`);
+
+export function shotExpansionWritten(project) {
+  const match = SHOT_EXPANSION_WRITTEN_PATTERN.exec(assistantReply(project) ?? "");
+  return match ? Number(match[1]) : 0;
+}
+
+export function shotExpansionToast(project) {
+  const written = shotExpansionWritten(project);
+  if (!written) return SHOT_EXPANSION_UNCHANGED_TOAST;
+  return SHOT_EXPANSION_TOAST.replace("{count}", written).replace("{plural}", written === 1 ? "" : "s");
 }
 
 // The consequence of letting the server's text overwrite the editors, stated before any path
@@ -368,6 +478,10 @@ export const api = {
   compileTimeline: (id, body) => request(`/api/projects/${id}/timeline/compile`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateH3: (projectId, shotId, body = {}) => request(`/api/projects/${projectId}/shots/${shotId}/generate/h3`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   directorChat: (id, body) => request(`/api/projects/${id}/director/chat`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // Its own route, and it carries no body: expansion is not a chat turn. The whole input the
+  // model sees is derived on the server from the project itself, so there is nothing here for a
+  // message to travel in — and nothing that could queue a render.
+  expandShots: (id) => request(`/api/projects/${id}/director/expand`, { method: "POST" }),
   job: (projectId, jobId) => request(`/api/projects/${projectId}/jobs/${jobId}`),
   workflows: () => request("/api/workflows"),
 };

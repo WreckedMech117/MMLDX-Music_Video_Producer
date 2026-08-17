@@ -124,7 +124,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .message.system { max-width: 100%; border-color: var(--line-strong); border-left: 3px solid var(--cyan); background: var(--surface-1); color: var(--muted); font-size: 12px; }
 .composer { padding: 12px; border-top: 1px solid var(--line); }
 .composer textarea { margin-bottom: 8px; }
-.composer > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+/* Wraps because the row carries three items now -- the hint, the per-turn document consent and
+   the submit button -- and the chat column is the narrow one in a three-column workspace: with
+   nowrap they squeeze or overflow below roughly 860px, and the control that must be readable to
+   be consent is the one that loses. */
+.composer > div { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
 .composer span { color: var(--dim); font-size: 10px; }
 /* The per-turn document consent sits with the submit button rather than centred between the
    hint and it: it is part of the act of sending, not a caption. */

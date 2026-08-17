@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
     DOCUMENT_LABELS,
+    DOCUMENT_LOCK_NOTICE,
     DOCUMENT_RESTORE_REFUSAL,
     SONG_REPLACEMENT_CONSEQUENCE,
     MusicRequest,
@@ -813,6 +814,259 @@ def test_restore_refusal_is_recognised_and_recovered_from_rather_than_just_toast
     )
 
 
+def test_expansion_reaches_a_real_route_and_sends_no_chat_message_or_render():
+    """Expansion is its own route, carries nothing, and queues nothing — in the client half too.
+
+    Asserted several ways because each could pass alone: the api client POSTs to a route the app
+    really exposes with no body to carry a message in, and the handler touches neither
+    `api.directorChat` nor any generate call. A UI that quietly routed expansion through chat
+    would apply shots positionally and could rewrite the creative documents as a side effect;
+    one that queued a render would spend GPU minutes on prompts nobody has reviewed.
+    """
+    from music_video_producer.app import create_app
+
+    call = API_JS.read_text(encoding="utf-8").split("expandShots:", 1)[1].split("\n", 1)[0]
+
+    url = re.search(r"`([^`]+)`", call)
+    assert url, "api.expandShots no longer builds its URL from a template literal"
+    assert 'method: "POST"' in call
+    # No body, no headers, nothing a message could travel in.
+    assert "body:" not in call, call
+    assert "JSON.stringify" not in call, call
+
+    template = re.sub(r"\$\{[^}]+\}", "{project_id}", url.group(1))
+    assert template in {route.path for route in create_app().routes}, template
+
+    handler = app_js_block("async function expandShotPrompts")
+    assert "api.expandShots(projectId)" in handler
+    assert "directorChat" not in handler
+    # No render is queued from here, in any spelling. The old pattern alternated on
+    # `expandShots\w`, which is not a symbol that exists, so it only ever tested `api.generate`;
+    # the api client is enumerated instead, which no rename or new call can slip past.
+    assert re.findall(r"api\.(\w+)\(", handler) == ["expandShots"], handler
+    for queues in (r"api\.generate\w*", r"generateH3", r"/generate/", r"generate/h3"):
+        assert not re.search(queues, handler), (queues, handler)
+    # The reply is the whole project, so the timeline and the inspector come from the response.
+    assert "renderAll();" in handler
+    assert "shotExpansionToast(state.project)" in handler
+
+    source = APP_JS.read_text(encoding="utf-8")
+    assert '$("#expand-shot-prompts").addEventListener("click", expandShotPrompts);' in source
+
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    button = re.search(r'<button[^>]*id="expand-shot-prompts"[^>]*>[^<]*</button>', markup)
+    assert button, "the expansion action has no button for app.js to bind"
+    # It was a disabled stub; a control the Director cannot press is not an action.
+    assert "disabled" not in button.group(0), button.group(0)
+
+
+def test_the_expansion_control_has_one_name_in_every_layer():
+    """Element id, on-screen label and handler were three different names for one control.
+
+    `#apply-shot-plan` bound `expandShotPrompts` and rendered "Expand shots into prompts", so a
+    grep for any one of them found two thirds of the feature — in a codebase whose per-document
+    controls are driven from a single table precisely so a rename cannot half-land.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+
+    button = re.search(r'<button[^>]*id="expand-shot-prompts"[^>]*>([^<]*)</button>', markup)
+    assert button, "the expansion action has no button for app.js to bind"
+    assert button.group(1).strip() == "Expand shots into prompts", button.group(1)
+
+    # One spelling, everywhere it is reachable: the markup id, both app.js selectors, the handler.
+    assert source.count('$("#expand-shot-prompts")') == 2, source.count('$("#expand-shot-prompts")')
+    assert "async function expandShotPrompts()" in source
+    # And the old name is gone from every layer, including the stylesheet.
+    for layer, text in (("markup", markup), ("app.js", source), ("styles.css", styles)):
+        assert "apply-shot-plan" not in text, layer
+
+
+def test_expansion_wording_is_one_constant_per_layer_rather_than_hand_written_twice():
+    """Two sentences for one rule drift, and the button and the toast already disagreed.
+
+    The empty-plan refusal exists on both sides — the server's 422 and the client's pre-emptive
+    toast — and the "nothing is rendered" claim exists on both halves of the control, where the
+    tooltip said "Nothing is rendered" and the toast said "Nothing was rendered" about the same
+    act. Each is one constant now, and this is what keeps the copies the markup and the server
+    cannot import agreeing with it.
+    """
+    from music_video_producer.app import EXPANSION_WITHOUT_SHOTS
+
+    shared = run_module("""
+      import { SHOT_EXPANSION_NO_RENDER, SHOT_EXPANSION_TOAST, SHOT_EXPANSION_WITHOUT_SHOTS }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        noRender: SHOT_EXPANSION_NO_RENDER,
+        toast: SHOT_EXPANSION_TOAST,
+        withoutShots: SHOT_EXPANSION_WITHOUT_SHOTS,
+      }));
+    """)
+
+    # One refusal for one rule: the browser refuses before sending exactly what the route refuses.
+    assert shared["withoutShots"] == EXPANSION_WITHOUT_SHOTS
+    # And the handler states it from the constant rather than writing its own sentence.
+    handler = app_js_block("async function expandShotPrompts")
+    assert "SHOT_EXPANSION_WITHOUT_SHOTS" in handler
+    assert "add shots to the timeline" not in without_comments(handler).lower()
+
+    # The claim the Director reads before pressing and the one they read afterwards are the same
+    # spelling; the markup cannot import the constant, so this is what holds them together.
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    button = re.search(r'<button[^>]*id="expand-shot-prompts"[^>]*>[^<]*</button>', markup)
+    assert button, "the expansion action has no button for app.js to bind"
+    assert shared["noRender"] in button.group(0), button.group(0)
+    assert shared["noRender"] in shared["toast"], shared["toast"]
+    # No second tense of the same claim anywhere in the two files that carry it.
+    assert "Nothing was rendered" not in markup
+    assert "Nothing was rendered" not in API_JS.read_text(encoding="utf-8")
+
+
+def test_expansion_toast_is_decided_by_the_reply_rather_than_by_a_diff():
+    """A re-run made the loudest thing on screen contradict the reply directly beside it.
+
+    The toast was diff-derived, so expanding twice against a model that returns the same prompts
+    announced "No shot prompt changed" under a server notice saying prompts were written for two
+    shots. The count now comes out of the reply itself — keyed on the server's own
+    EXPANSION_WRITTEN_NOTICE, read back out of a really-formatted one — so the two cannot disagree.
+    """
+    from music_video_producer.app import (
+        EXPANSION_LOCKED_NOTICE,
+        EXPANSION_OMITTED_NOTICE,
+        EXPANSION_WRITTEN_NOTICE,
+    )
+
+    labels = ["shot 01 at 0s (shot_first)", "shot 02 at 5s (shot_second)"]
+    written_two = EXPANSION_WRITTEN_NOTICE.format(count=2, shots=", ".join(labels))
+    written_one = EXPANSION_WRITTEN_NOTICE.format(count=1, shots=labels[0])
+    locked = EXPANSION_LOCKED_NOTICE.format(shots=", ".join(labels))
+    omitted = EXPANSION_OMITTED_NOTICE.format(shots=", ".join(labels))
+    script = f"""
+      import {{ SHOT_EXPANSION_WRITTEN_MARKER, shotExpansionToast, shotExpansionWritten }}
+        from './src/music_video_producer/web/assets/api.js';
+      const notices = {json.dumps({
+        "writtenTwo": written_two,
+        "writtenOne": written_one,
+        "locked": locked,
+        "omitted": omitted,
+    })};
+      const reply = (...contents) => ({{ messages: [
+        {{ role: 'user', content: 'Expand the shots.' }},
+        ...contents.map((content) => ({{ role: 'assistant', content }})),
+      ] }});
+      const message = (...parts) => 'Here is the expansion.\\n\\n---\\n' + parts.join('\\n\\n');
+      console.log(JSON.stringify({{
+        marker: SHOT_EXPANSION_WRITTEN_MARKER,
+        count: shotExpansionWritten(reply(message(notices.writtenTwo))),
+        // The re-run: identical prompts, and the reply still reports them as written.
+        reRun: shotExpansionToast(reply(message(notices.writtenTwo))),
+        one: shotExpansionToast(reply(message(notices.writtenOne))),
+        withOtherNotices: shotExpansionToast(reply(message(notices.writtenOne, notices.locked))),
+        // Nothing written: every one of these leaves the prompts as they were.
+        lockedOnly: shotExpansionToast(reply(message(notices.locked))),
+        omittedOnly: shotExpansionToast(reply(message(notices.omitted))),
+        // An earlier expansion's notice is still in the thread; the last reply decides.
+        onlyEarlier: shotExpansionToast(reply(message(notices.writtenTwo), 'Nothing to change.')),
+        // Model prose is rendered above the notices in the same message, so the match is the
+        // server's whole notice shape rather than a phrase prose could plausibly contain.
+        prose: shotExpansionToast(reply('Prompts written for every shot I could see, I think.')),
+        systemOnly: shotExpansionToast({{ messages: [
+          {{ role: 'system', content: message(notices.writtenTwo) }},
+        ] }}),
+        noMessages: shotExpansionToast({{ messages: [] }}),
+        noProject: shotExpansionToast(null),
+        absent: shotExpansionToast(),
+        nonArray: shotExpansionToast({{ messages: 'nope' }}),
+      }}));
+    """
+
+    toasts = run_module(script)
+    assert toasts["marker"] in written_two, "the toast no longer reads the server's own notice"
+    assert toasts["count"] == 2
+    assert toasts["reRun"].startswith("2 shot prompts written")
+    assert toasts["one"].startswith("1 shot prompt written")
+    assert toasts["withOtherNotices"].startswith("1 shot prompt written")
+    for unchanged in ("lockedOnly", "omittedOnly", "onlyEarlier", "prose", "systemOnly",
+                      "noMessages", "noProject", "absent", "nonArray"):
+        assert "No shot prompt changed" in toasts[unchanged], unchanged
+    # Both things a Director watching a "Director" button needs to know.
+    assert "Nothing is rendered" in toasts["reRun"]
+    assert "editable in the shot inspector" in toasts["reRun"]
+
+    # The handler hands it the response, not a diff: a live `state.project.shots` reference is
+    # mutated by an inspector or timeline edit made during the call, so it could not be diffed
+    # against anyway.
+    handler = app_js_block("async function expandShotPrompts")
+    assert "const before" not in handler, handler
+    assert "shotExpansionToast(state.project)" in handler
+
+
+def test_expansion_shuts_out_the_silent_shot_saves_that_would_revert_it():
+    """`await shotSaveChain` was unpinned, and on its own it is not enough.
+
+    Deleting it left the whole suite green while a drag followed immediately by a press let the
+    stale whole-list save land *after* the expansion and wipe every prompt just written — with the
+    success toast on screen and the reply claiming they were written. Awaiting only drains what was
+    pending at click time, so a drag *during* the multi-second call queues the same stale save; the
+    in-flight flag is what closes that, and it has to be set before the await rather than after.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    handler = app_js_block("async function expandShotPrompts")
+    saver = app_js_block("function saveShotsSilently")
+
+    # Half one: saves queued before the click are drained before the request is sent.
+    assert "await shotSaveChain;" in handler
+    assert handler.index("await shotSaveChain") < handler.index("api.expandShots("), handler
+
+    # Half two: no new save may be queued for the duration, so the flag goes up before the drain
+    # and comes down in `finally`, where a failed or refused expansion also releases it.
+    assert handler.index("shotExpansionInFlight = true;") < handler.index("await shotSaveChain")
+    assert "finally { shotExpansionInFlight = false;" in handler
+    # Only the expansion raises it, or something else silently blocks every timeline save.
+    assert source.count("shotExpansionInFlight = true") == 1, source.count("shotExpansionInFlight = true")
+
+    # The refusal lives in the one function every silent save goes through, ahead of both the
+    # queueing and the dirty flags -- a save that is refused was never pending.
+    assert "shotExpansionInFlight" in saver
+    assert "SHOT_EXPANSION_EDIT_BLOCKED" in saver
+    for later in ("state.shotsDirty = true;", "shotSaveChain = shotSaveChain", "api.saveShots("):
+        assert saver.index("shotExpansionInFlight") < saver.index(later), later
+    # And it is said out loud: the edit really is not saved, and the response re-renders the
+    # timeline over it, so a drag that silently vanishes reads as the app losing work at random.
+    blocked = run_module("""
+      import { SHOT_EXPANSION_EDIT_BLOCKED } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ blocked: SHOT_EXPANSION_EDIT_BLOCKED }));
+    """)["blocked"].lower()
+    assert "not saved" in blocked
+    assert "again" in blocked, blocked
+
+    # Every timeline mutation goes through that one function rather than calling the route itself.
+    assert "api.saveShots(" not in source.replace(saver, ""), "a shot save bypasses saveShotsSilently"
+
+
+def test_expansion_abandons_a_result_for_a_project_that_is_no_longer_loaded():
+    """`state.project = await api.expandShots(...)` reassigned unconditionally after a long await.
+
+    Only the button is disabled during the call — the project selector stays live — so switching
+    projects while the model thinks let project A's result be written over project B, and
+    `renderAll()` then drew A's shots and A's documents under B's name. Nothing is lost by dropping
+    it: the prompts are saved on the server, and loading that project again shows them.
+    """
+    handler = app_js_block("async function expandShotPrompts")
+
+    # The id is captured before any await, and it is the id the request is sent for.
+    assert "const projectId = state.project.id;" in handler
+    assert handler.index("const projectId") < handler.index("await ")
+    assert "api.expandShots(projectId)" in handler
+    # The response is held aside until the guard has run, so a stale result is never assigned.
+    assert "if (state.project?.id !== projectId) return;" in handler
+    assert handler.index("api.expandShots(") < handler.index("state.project?.id !== projectId")
+    assert handler.index("state.project?.id !== projectId") < handler.index("state.project = expanded")
+    for applied in ("renderAll();", "shotExpansionToast(", "markDocumentsSaved();"):
+        assert handler.index("state.project?.id !== projectId") < handler.index(applied), applied
+
+
 def test_chat_toast_reports_what_changed_instead_of_asserting_an_update():
     """The reply states what actually changed; the toast is the loudest thing on screen.
 
@@ -880,11 +1134,176 @@ def test_composer_sends_document_consent_from_its_own_control():
     assert shared["label"] == APPLY_DOCUMENTS_LABEL
     assert shared["label"] in text, text
 
+    # And the row wraps: it carries three items in the workspace's narrow column, and with
+    # nowrap the control that has to be readable to be consent is the one that squeezes.
+    composer_row = re.search(r"\.composer > div \{([^}]*)\}", STYLES_CSS.read_text(encoding="utf-8"))
+    assert composer_row, "the composer's control row no longer has a layout rule"
+    assert "flex-wrap: wrap" in composer_row.group(1), composer_row.group(1)
+
     handler = chat_submit_handler()
-    assert "$(APPLY_DOCUMENTS_CONTROL).checked" in handler
+    assert "const applyDocuments = documentConsent(applyDocumentsControl());" in handler
     assert "apply_documents: applyDocuments" in handler
     # No spelling of a hardcoded consent, in any form -- match the value, not one syntax.
     assert not re.search(r"apply_documents\W{0,4}(true|false)", handler), handler
+
+
+def test_consent_is_read_as_a_decline_when_the_control_is_missing():
+    """The send handler reads the consent *outside* the try/catch that reports failures.
+
+    A bare `.checked` on a missing control therefore throws past the handler and kills the send
+    with no request, no toast and no error -- the control silently deciding to send nothing at
+    all. A control that is not there has given no consent, so absence must read as a decline.
+    """
+    script = """
+      import { documentConsent } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        ticked: documentConsent({ checked: true }),
+        unticked: documentConsent({ checked: false }),
+        missing: documentConsent(null),
+        absent: documentConsent(),
+        // `checked` is a real boolean on a real checkbox; anything else is not consent.
+        truthy: documentConsent({ checked: "yes" }),
+        noProperty: documentConsent({}),
+      }));
+    """
+
+    consent = run_module(script)
+    assert consent["ticked"] is True
+    for declined in ("unticked", "missing", "absent", "truthy", "noProperty"):
+        assert consent[declined] is False, declined
+
+    # And the one place that turns the selector into an element is where the handler gets it.
+    assert "$(APPLY_DOCUMENTS_CONTROL)" in app_js_block("function applyDocumentsControl")
+
+
+def test_consent_is_cleared_after_every_turn_and_on_every_project_change():
+    """Without this the feature's headline claim is false: it is on until the Director notices.
+
+    Nothing else unchecks the box, so one tick applies every later turn with no fresh consent,
+    and the box survives a project switch -- so consent given in one project is inherited by the
+    next one loaded, replacing a document in a project nobody was looking at.
+
+    The round trip is *executed* rather than grepped, because the mutation that matters keeps
+    every identifier and simply does not clear: reading the real control back through the real
+    reader is the only thing that proves the second turn sends `false`.
+    """
+    script = """
+      import { clearDocumentConsent, documentConsent }
+        from './src/music_video_producer/web/assets/api.js';
+      const control = { checked: false };
+      const trail = [];
+      // Turn one: the Director ticks the box and sends.
+      control.checked = true;
+      trail.push(documentConsent(control));
+      clearDocumentConsent(control);
+      // Turn two: nothing was ticked in between, so it must send a decline.
+      trail.push(documentConsent(control));
+      // Clearing an already-clear control, and a control that is not there at all, are both
+      // no-ops rather than throws -- the project-load path runs before any markup is required.
+      clearDocumentConsent(control);
+      const survived = (() => {
+        try { clearDocumentConsent(null); clearDocumentConsent(); return true; }
+        catch (error) { return `THREW: ${error.message}`; }
+      })();
+      console.log(JSON.stringify({ trail: [...trail, documentConsent(control)], survived }));
+    """
+
+    lifecycle = run_module(script)
+    assert lifecycle["trail"] == [True, False, False]
+    assert lifecycle["survived"] is True
+
+    source = APP_JS.read_text(encoding="utf-8")
+    # Cleared in `finally`, so a failed send spends the consent too: the turn is over either
+    # way, and leaving it ticked after an error is the same "on until noticed" behaviour.
+    handler = chat_submit_handler()
+    assert "finally { clearDocumentConsent(applyDocumentsControl());" in handler
+    assert handler.index("api.directorChat(") < handler.index("clearDocumentConsent(")
+
+    # Ahead of loadProject's no-project branch, so switching *away* clears it too rather than
+    # leaving it ticked for whichever project is loaded next. Anchored on the signature, not the
+    # name: `loadProjects` is a different function and would otherwise be the one this reads.
+    load = source.split("async function loadProject(id) {", 1)[1].split("\n}", 1)[0]
+    assert "clearDocumentConsent(applyDocumentsControl());" in load
+    assert load.index("clearDocumentConsent(") < load.index("if (!id)")
+    # And it is a change of project that clears it, not every load -- see
+    # test_a_same_project_refresh_does_not_revoke_consent_the_director_just_gave.
+    assert "documentConsentClearedOnLoad(state.project?.id, id)" in load
+
+    # Exactly these two callers; a third would be a rule nobody stated, and nothing anywhere
+    # ticks the box from code -- consent comes from the Director or not at all.
+    assert source.count("clearDocumentConsent(") == 2
+    assert not re.search(r"apply-documents\"\)\.checked = true|Control\(\)\.checked = true", source)
+
+
+def test_a_same_project_refresh_does_not_revoke_consent_the_director_just_gave():
+    """`loadProject` is the refresh path as well as the switch path.
+
+    Most of its call sites reload the project already on screen — the queue refresh, both generate
+    paths, multiview and the queue-ready loop — so clearing on every load unticked a box the
+    Director had ticked seconds ago, in the project they were still looking at, with nothing on
+    screen to explain it. The direction is safe, but "consent is per project" is what the feature
+    claims and per-refresh is a different rule.
+
+    The decision is a pure function so the refresh case can be executed rather than grepped, and
+    the call sites are read off the source so which loads are refreshes is pinned rather than
+    assumed.
+    """
+    decisions = run_module("""
+      import { documentConsentClearedOnLoad } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        switched: documentConsentClearedOnLoad('project_a', 'project_b'),
+        refreshed: documentConsentClearedOnLoad('project_a', 'project_a'),
+        leaving: documentConsentClearedOnLoad('project_a', ''),
+        arriving: documentConsentClearedOnLoad(null, 'project_a'),
+        firstEver: documentConsentClearedOnLoad(undefined, 'project_a'),
+        neither: documentConsentClearedOnLoad(null, ''),
+        absent: documentConsentClearedOnLoad(),
+      }));
+    """)
+
+    # The whole point: reloading the same project is not a change of project.
+    assert decisions["refreshed"] is False
+    # Nor is arriving at no project from no project; there is nothing to inherit either way.
+    assert decisions["neither"] is False
+    assert decisions["absent"] is False
+    # Leaving *and* arriving both count, or consent given in one project is inherited by the next
+    # one loaded -- including via the no-project branch.
+    for cleared in ("switched", "leaving", "arriving", "firstEver"):
+        assert decisions[cleared] is True, cleared
+
+    source = APP_JS.read_text(encoding="utf-8")
+    # Every call site, read off the source: the declaration, the refreshes that reload the project
+    # already on screen, and the two that can actually change project.
+    arguments = [
+        argument for argument in re.findall(r"loadProject\(([^)]*)\)", source) if argument != "id"
+    ]
+    refreshes = [argument for argument in arguments if argument == "state.project.id"]
+    switches = [argument for argument in arguments if argument != "state.project.id"]
+    assert len(refreshes) >= 5, arguments
+    # A switch is the selector's own value, or the id `loadProjects` resolved; anything else is a
+    # call site nobody classified, and it would silently pick one of the two behaviours.
+    assert set(switches) == {"next", "event.target.value"}, switches
+
+
+def test_the_send_confirmation_describes_the_send_that_is_actually_happening():
+    """Both sends re-render the editors from the server, so the gate fires either way.
+
+    But only a consented send can *replace* a document, and warning that "a reply can replace
+    either creative document" when the box is unchecked deters a send that would write nothing.
+    """
+    question = app_js_block("function directorSendQuestion")
+    assert "applyDocuments" in question
+    consented, declined = question.split("?", 1)[1].split(":", 1)
+    assert "replace either creative document" in consented
+    assert "replace" not in declined.replace("No document will be replaced", "")
+    # The declined sentence still states the loss the dialog exists for, or the Director reads
+    # "nothing will happen" and clicks through the one question that protects unsaved typing.
+    assert "re-rendered from the text stored on the server" in declined
+
+    handler = chat_submit_handler()
+    assert "confirmDiscardingDocumentEdits(directorSendQuestion(applyDocuments))" in handler
+    # The gate is not skipped for a declined turn: the editors are overwritten regardless.
+    assert handler.index("directorSendQuestion") < handler.index("api.directorChat(")
 
 
 def test_document_opt_in_wording_agrees_on_both_sides():
@@ -917,16 +1336,45 @@ def test_a_declined_turn_toast_explains_the_opt_in_instead_of_claiming_a_change(
     Nothing changed for a reason the Director controls, so the toast has to say which box to
     tick -- while a lock or a rejection must keep the vaguer sentence, because sending the
     Director to tick a box that was already ticked points them at the wrong thing.
+
+    Every declined case is decided by the *reply*, not by the diff, and the replies here are
+    built from the server's own sentences rather than hand-copied ones, so a change to either
+    wording lands in this test instead of silently unhooking the toast from the server.
     """
-    script = """
-      import { documentChangeToast } from './src/music_video_producer/web/assets/api.js';
-      const before = { treatment: 'old treatment', style_bible: 'old style bible' };
-      console.log(JSON.stringify({
-        declined: documentChangeToast(before, { ...before }, false),
-        lockedOrRejected: documentChangeToast(before, { ...before }, true),
-        applied: documentChangeToast(before, { ...before, treatment: 'new treatment' }, true),
-        defaulted: documentChangeToast(before, { ...before }),
-      }));
+    declined = document_not_requested_notice(list(DOCUMENT_LABELS.values()))
+    locked = DOCUMENT_LOCK_NOTICE.format(document=DOCUMENT_LABELS["treatment"])
+    replies = {
+        # A real proposal the opt-in is what stopped: the one case that may blame the flag.
+        "proposed": declined,
+        # The server is silent when nothing was proposed, when the candidate was an echo, and
+        # when the guard would have refused it anyway. Blaming the flag for any of those sends
+        # the Director to tick a box and retry a turn that writes nothing either way.
+        "nothingProposed": "Nothing to change.",
+        # And a locked document carries the lock's sentence, not the opt-in's: ticking the box
+        # would not apply it.
+        "lockedOnly": f"Nothing to change.\n\n---\n{locked}",
+    }
+    script = f"""
+      import {{ documentChangeToast }} from './src/music_video_producer/web/assets/api.js';
+      const replies = {json.dumps(replies)};
+      const reply = (content) => ({{ messages: [
+        {{ role: 'user', content: 'Anything to add?' }},
+        {{ role: 'assistant', content }},
+      ] }});
+      const documents = {{ treatment: 'old treatment', style_bible: 'old style bible' }};
+      const project = (content, overrides = {{}}) =>
+        ({{ ...documents, ...overrides, ...reply(content) }});
+      console.log(JSON.stringify({{
+        declined: documentChangeToast(documents, project(replies.proposed), false),
+        declinedNothingProposed: documentChangeToast(documents, project(replies.nothingProposed), false),
+        declinedLockedOnly: documentChangeToast(documents, project(replies.lockedOnly), false),
+        declinedAfterConcurrentRestore: documentChangeToast(
+          documents, project(replies.proposed, {{ treatment: 'the restored treatment' }}), false),
+        declinedNoMessages: documentChangeToast(documents, {{ ...documents }}, false),
+        lockedOrRejected: documentChangeToast(documents, project(replies.lockedOnly), true),
+        applied: documentChangeToast(documents, project('Done.', {{ treatment: 'new treatment' }}), true),
+        defaulted: documentChangeToast(documents, project(replies.proposed)),
+      }}));
     """
 
     toasts = run_module(script)
@@ -936,27 +1384,90 @@ def test_a_declined_turn_toast_explains_the_opt_in_instead_of_claiming_a_change(
     for label in DOCUMENT_LABELS.values():
         assert label not in toasts["declined"], label
     assert "replaced by this reply" not in toasts["declined"].lower()
+
+    # The server's silence, mirrored: no proposal to apply means no box to tick.
+    for silent in ("declinedNothingProposed", "declinedLockedOnly", "declinedNoMessages"):
+        assert "opt-in per turn" not in toasts[silent], silent
+        assert APPLY_DOCUMENTS_LABEL not in toasts[silent], silent
+        assert "no document changed" in toasts[silent], silent
+
+    # A restore or a hand edit committed while the Director call was in flight moves the
+    # document without this reply having touched it. Consent says the reply cannot have written
+    # anything, so the diff must not be allowed to credit it with a replacement.
+    assert toasts["declinedAfterConcurrentRestore"] == toasts["declined"]
+    for label in DOCUMENT_LABELS.values():
+        assert label not in toasts["declinedAfterConcurrentRestore"], label
+
     # Consent was given here: the flag is not what stopped it.
     assert "opt-in per turn" not in toasts["lockedOrRejected"]
     assert "no document changed" in toasts["lockedOrRejected"]
     # An applied change still reports the change.
     assert DOCUMENT_LABELS["treatment"] in toasts["applied"]
-    # A caller that omits the consent gets the vaguer sentence, never the one that blames the
-    # flag for a lock or a rejection.
+    # A caller that omits the consent gets the diff-derived sentence, never the one that blames
+    # the flag for a lock or a rejection.
     assert toasts["defaulted"] == toasts["lockedOrRejected"]
 
     assert "documentChangeToast(before, state.project, applyDocuments)" in chat_submit_handler()
 
 
+def test_the_declined_marker_is_a_real_substring_of_the_servers_own_notice():
+    """The toast's one input the project cannot supply, keyed like every other marker here.
+
+    `documentProposalDeclined` is what stops the toast blaming the opt-in for the three cases
+    the server deliberately says nothing about. Changing it to an equality check, or letting
+    the server's phrasing move, leaves the predicate matching nothing -- and every declined turn
+    silently reverts to the vaguer sentence with no test noticing.
+    """
+    notice = document_not_requested_notice([DOCUMENT_LABELS["treatment"]])
+    script = f"""
+      import {{ DOCUMENT_NOT_REQUESTED_MARKER, documentProposalDeclined }}
+        from './src/music_video_producer/web/assets/api.js';
+      const reply = (content) => ({{ messages: [{{ role: 'assistant', content }}] }});
+      console.log(JSON.stringify({{
+        marker: DOCUMENT_NOT_REQUESTED_MARKER,
+        declined: documentProposalDeclined(reply({json.dumps(notice)})),
+        other: documentProposalDeclined(reply('Nothing to change.')),
+        // The *last* assistant line decides: an earlier declined turn is still in the thread.
+        onlyEarlier: documentProposalDeclined({{ messages: [
+          {{ role: 'assistant', content: {json.dumps(notice)} }},
+          {{ role: 'user', content: 'and now?' }},
+          {{ role: 'assistant', content: 'Nothing to change.' }},
+        ] }}),
+        // A system line is the restore audit trail, never a Director reply.
+        systemOnly: documentProposalDeclined({{ messages: [
+          {{ role: 'system', content: {json.dumps(notice)} }},
+        ] }}),
+        noMessages: documentProposalDeclined({{ messages: [] }}),
+        noProject: documentProposalDeclined(null),
+        absent: documentProposalDeclined(),
+        nonArray: documentProposalDeclined({{ messages: 'nope' }}),
+      }}));
+    """
+
+    result = run_module(script)
+    assert result["marker"] in notice, "the predicate no longer matches the server's own notice"
+    assert result["declined"] is True
+    assert result["other"] is False
+    assert result["onlyEarlier"] is False
+    assert result["systemOnly"] is False
+    for empty in ("noMessages", "noProject", "absent", "nonArray"):
+        assert result[empty] is False, empty
+
+
 def test_editor_overwrites_warn_before_discarding_unsaved_edits_and_clear_the_flags():
     """Unsaved textarea edits are the one loss this feature cannot undo.
 
-    A restore and a Director reply both re-render the editors from the server, and the captured
-    "previous version" is the *stored* text -- so on-screen edits are unrecoverable. Both paths
-    ask first, matching the `window.confirm` precedent on project switch, and both then clear
-    the dirty flags exactly as `saveProject` does: text that matches the server is not dirty,
-    and a project permanently flagged dirty teaches the Director to click through the one
-    question that protects real work.
+    A restore, a Director reply and a shot expansion all re-render the editors from the server,
+    and the captured "previous version" is the *stored* text -- so on-screen edits are
+    unrecoverable. Every such path asks first, matching the `window.confirm` precedent on project
+    switch, and then clears the dirty flags exactly as `saveProject` does: text that matches the
+    server is not dirty, and a project permanently flagged dirty teaches the Director to click
+    through the one question that protects real work.
+
+    Expansion is in this list because it is the path that reached `renderAll()` with no gate at
+    all: the button sits in the document-actions row beside the editors, so "type into the
+    Treatment, then press Expand" is an ordinary gesture, and it discarded the typing silently
+    while leaving the dirty flag set over textareas that had just been overwritten.
     """
     guard = app_js_block("function confirmDiscardingDocumentEdits")
     assert "state.documentsDirty" in guard
@@ -970,6 +1481,7 @@ def test_editor_overwrites_warn_before_discarding_unsaved_edits_and_clear_the_fl
             source.split('$("#chat-form").addEventListener("submit"', 1)[1].split("  });", 1)[0],
             "api.directorChat(",
         ),
+        "expand": (app_js_block("async function expandShotPrompts"), "api.expandShots("),
     }
     for label, (handler, send) in handlers.items():
         assert "confirmDiscardingDocumentEdits(" in handler, label

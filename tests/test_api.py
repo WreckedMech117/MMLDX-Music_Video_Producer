@@ -18,9 +18,10 @@ from music_video_producer.app import (
 )
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.director import DirectorResult
-from music_video_producer.models import Asset, Project, Shot, Song
+from music_video_producer.director import DirectorError, DirectorResult, DirectorUnavailable
+from music_video_producer.models import Asset, Project, Shot, Song, VisionInspectionRecord
 from music_video_producer.store import ProjectStore
+from music_video_producer.timeline import expansion_input
 
 
 class FakeComfy:
@@ -87,11 +88,16 @@ class FakeDirector:
         )()
 
 
-def make_client(tmp_path: Path):
+def make_client(tmp_path: Path, director=None):
+    """The default client. `director` is optional so a test can keep the FakeComfy handle —
+    `make_client_with_director` does not return one, and "no render was queued" is a claim that
+    needs it."""
     settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
     store = ProjectStore(tmp_path)
     comfy = FakeComfy()
-    app = create_app(settings=settings, store=store, comfy=comfy, director=FakeDirector())
+    app = create_app(
+        settings=settings, store=store, comfy=comfy, director=director or FakeDirector()
+    )
     return TestClient(app), store, comfy
 
 
@@ -1034,12 +1040,20 @@ class RevisingDirector(FakeDirector):
 
 
 class RefusingDirector(FakeDirector):
-    """Fails the test if it is called at all — restore must never reach the model."""
+    """Fails the test if it is called at all.
+
+    Restore must never reach the model, and neither must an expansion of a project with no
+    shots — a refusal that still spent a model call is not a refusal.
+    """
 
     def __init__(self):
         self.calls = 0
 
     async def plan(self, message, project_context):
+        self.calls += 1
+        raise AssertionError("the Director was called on a path that must not call it")
+
+    async def expand(self, expansion_input):
         self.calls += 1
         raise AssertionError("the Director was called on a path that must not call it")
 
@@ -1563,31 +1577,53 @@ def test_an_ordinary_question_that_proposed_nothing_says_nothing(tmp_path: Path)
     assert "\n\n---\n" not in saved.messages[-1].content
 
 
-def test_an_omitted_apply_documents_is_a_decline_rather_than_a_write(tmp_path: Path):
+def test_an_omitted_or_null_apply_documents_is_a_decline_rather_than_a_write(tmp_path: Path):
     """A client written before this flag existed sends no `apply_documents` at all.
 
     Reading that as consent would leave exactly the behaviour this story removes in place for
     every such client, so the default has to be the decline -- and it is the model field's own
     default doing it, not a route-level special case.
+
+    An explicit `null` means the same thing to the client that sent it, but Pydantic reads it as
+    a type error: without normalising it the whole turn 422s and the Director's message is lost
+    over a field whose absence is already the safe default.
     """
     client, store = make_client_with_director(tmp_path, RevisingDirector())
-    project = documented_project(store, "Older client")
 
-    response = client.post(
-        f"/api/projects/{project.id}/director/chat", json={"message": "Make it colder"}
-    )
+    for label, body in (
+        ("omitted", {"message": "Make it colder"}),
+        ("null", {"message": "Make it colder", "apply_documents": None, "apply_shots": None}),
+    ):
+        project = documented_project(store, f"Older client ({label})")
 
-    assert response.status_code == 200
-    saved = ProjectStore(tmp_path).get(project.id)
-    assert saved.treatment == project.treatment
-    assert saved.style_bible == project.style_bible
-    assert saved.treatment_previous == ""
-    assert saved.style_bible_previous == ""
-    assert "Proposed but not applied: Treatment, Style bible." in saved.messages[-1].content
-    # Off by default on the model, mirroring `apply_shots` rather than diverging from it.
+        response = client.post(f"/api/projects/{project.id}/director/chat", json=body)
+
+        assert response.status_code == 200, (label, response.text)
+        saved = ProjectStore(tmp_path).get(project.id)
+        assert saved.treatment == project.treatment, label
+        assert saved.style_bible == project.style_bible, label
+        assert saved.treatment_previous == "", label
+        assert saved.style_bible_previous == "", label
+        assert "Proposed but not applied: Treatment, Style bible." in saved.messages[-1].content
+        # The declined turn is still a turn: nothing was applied, so no shots either.
+        assert saved.shots == [], label
+
+    # Off by default on the model, mirroring `apply_shots` rather than diverging from it, and
+    # `null` lands on the same default rather than on a validation error.
     request = DirectorRequest(message="Make it colder")
     assert request.apply_documents is False
     assert request.apply_shots is False
+    nulled = DirectorRequest(message="Make it colder", apply_documents=None, apply_shots=None)
+    assert nulled.apply_documents is False
+    assert nulled.apply_shots is False
+    # Nothing else is loosened: a value that is neither a boolean nor null is still refused.
+    assert (
+        client.post(
+            f"/api/projects/{documented_project(store, 'Bad flag').id}/director/chat",
+            json={"message": "Make it colder", "apply_documents": "yes please"},
+        ).status_code
+        == 422
+    )
 
 
 def test_the_two_apply_flags_are_independent(tmp_path: Path):
@@ -1652,6 +1688,25 @@ def test_a_locked_document_reports_the_lock_even_when_the_turn_declined(tmp_path
     # silently downgraded to "you did not ask".
     assert "Proposed but not applied: Style bible." in notice
     assert DOCUMENT_LABELS["treatment"] not in notice.split("Proposed but not applied:")[1]
+
+    # With *every* document locked there is nothing the consent could have applied, so the
+    # unrequested wording is absent entirely. The browser keys its toast on that phrase, so this
+    # is what stops it blaming the flag for a lock and pointing at a box that would not apply
+    # the document anyway.
+    both = documented_project(store, "Both locked and declined")
+    both.treatment_locked = True
+    both.style_bible_locked = True
+    store.save(both)
+
+    response = client.post(
+        f"/api/projects/{both.id}/director/chat", json={"message": "Rewrite everything"}
+    )
+
+    assert response.status_code == 200
+    locked_notice = ProjectStore(tmp_path).get(both.id).messages[-1].content
+    assert "Treatment is locked" in locked_notice
+    assert "Style bible is locked" in locked_notice
+    assert "Proposed but not applied" not in locked_notice
 
 
 def test_a_declined_turn_is_silent_about_a_candidate_the_guard_would_have_refused(tmp_path: Path):
@@ -1791,6 +1846,721 @@ def test_restore_rejects_an_unknown_document_and_an_unknown_project(tmp_path: Pa
     assert "treatment" in json.dumps(unknown_document.json())
     assert unknown_project.status_code == 404
     assert unknown_project.json()["detail"] == "Project not found"
+
+
+def expansion_result(message: str, shots: list[tuple[str, str]]):
+    """A `ShotExpansion`-shaped reply, in the duck-typed style the other doubles use."""
+    return type(
+        "ShotExpansion",
+        (),
+        {
+            "message": message,
+            "shots": [
+                type("ExpandedShot", (), {"shot_id": shot_id, "prompt": prompt})()
+                for shot_id, prompt in shots
+            ],
+        },
+    )()
+
+
+class ExpandingDirector(FakeDirector):
+    """Answers every Shot in the input it was handed, keyed by that Shot's own id.
+
+    Records each input, which is the only way to assert what actually reached the model —
+    the `RevisingDirector.contexts` pattern, applied to the expansion call.
+    """
+
+    def __init__(self):
+        self.inputs: list[dict] = []
+
+    async def expand(self, expansion_input):
+        self.inputs.append(expansion_input)
+        return expansion_result(
+            "Held identity, wardrobe, palette and lens; moved action, framing and energy.",
+            [
+                (entry["shot_id"], f"Prompt for {entry['shot_id']} at index {entry['index']}")
+                for entry in expansion_input["shots"]
+            ],
+        )
+
+
+class FixedExpansionDirector(FakeDirector):
+    """Returns a fixed result whatever the input says — the model going its own way."""
+
+    def __init__(self, shots: list[tuple[str, str]], message: str = "Expanded the plan."):
+        self.shots = shots
+        self.message = message
+        self.inputs: list[dict] = []
+
+    async def expand(self, expansion_input):
+        self.inputs.append(expansion_input)
+        return expansion_result(self.message, self.shots)
+
+
+class RecordingExpansionDirector(RevisingDirector):
+    """A fixed expansion, plus `RevisingDirector`'s recording of every chat `project_context`.
+
+    Both halves in one double because the guarantee spans them: what an expansion writes into
+    the thread is what the *next* chat turn hands the model.
+    """
+
+    def __init__(self, shots: list[tuple[str, str]]):
+        super().__init__()
+        self.shots = shots
+
+    async def expand(self, expansion_input):
+        return expansion_result("Expanded the plan.", self.shots)
+
+
+class UnavailableExpansionDirector(FakeDirector):
+    async def expand(self, expansion_input):
+        raise DirectorUnavailable(
+            "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
+        )
+
+
+class FailingExpansionDirector(FakeDirector):
+    async def expand(self, expansion_input):
+        raise DirectorError("LLM director returned an invalid response: Expecting value")
+
+
+def planned_project(store: ProjectStore, name: str, *, song: Song | None = None) -> Project:
+    """A timed, unprompted plan: two draft Shots that expansion may legitimately write."""
+    project = store.create(Project(name=name))
+    project.treatment = "Three movements: the corridor, the threshold, the desert."
+    project.style_bible = "Sodium amber, hard backlight, 35mm grain."
+    project.song = song
+    project.shots = [
+        Shot(id="shot_first", start=0, duration=5, prompt="New shot", status="draft"),
+        Shot(id="shot_second", start=10, duration=6, prompt="", status="draft"),
+    ]
+    store.save(project)
+    return store.get(project.id)
+
+
+def give_render_provenance(shot: Shot) -> Shot:
+    """Make a Shot one whose prompt a render and an approved take already depend on."""
+    shot.status = "complete"
+    shot.prompt_id = "render-1"
+    shot.latest_output = "takes/one.mp4"
+    shot.approved_output = "takes/one.mp4"
+    return shot
+
+
+def test_expansion_writes_a_prompt_for_every_shot_keyed_by_id_and_queues_nothing(tmp_path: Path):
+    """FR-26's core: a timed plan becomes a fully prompted one, and nothing is rendered.
+
+    Keyed by id on both sides, so the assertion is per Shot rather than per position — the
+    whole point of the result model carrying `shot_id` at all.
+    """
+    director = ExpandingDirector()
+    client, store, comfy = make_client(tmp_path, director)
+    project = planned_project(store, "Expanded", song=Song(title="Spine", source="imported", duration=120))
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    prompts = {shot.id: shot.prompt for shot in saved.shots}
+    assert prompts["shot_first"] == "Prompt for shot_first at index 0"
+    assert prompts["shot_second"] == "Prompt for shot_second at index 1"
+    # Prompts only: no window moved, no status advanced, no render id invented.
+    assert [(shot.start, shot.duration) for shot in saved.shots] == [(0, 5), (10, 6)]
+    assert [shot.status for shot in saved.shots] == ["draft", "draft"]
+    assert [shot.prompt_id for shot in saved.shots] == ["", ""]
+    # No render, ever. This is the assertion the "Never" line of the spec is about.
+    assert comfy.prompts == []
+    assert saved.jobs == []
+    # One assistant message, saying what changed and naming the shots it changed.
+    assert saved.messages[-1].role == "assistant"
+    notice = saved.messages[-1].content
+    assert notice.startswith("Held identity, wardrobe, palette and lens")
+    assert "Prompts written for 2 shot(s)" in notice
+    for shot_id in ("shot_first", "shot_second"):
+        assert shot_id in notice, shot_id
+    assert len([message for message in saved.messages if message.role == "user"]) == 0
+
+
+def test_expansion_leaves_a_locked_shot_alone_and_reports_it(tmp_path: Path):
+    """`Shot.locked` is the Director's "do not touch this", and expansion honours it."""
+    director = ExpandingDirector()
+    client, store, comfy = make_client(tmp_path, director)
+    project = planned_project(store, "Locked")
+    project.shots[0].locked = True
+    project.shots[0].prompt = "The prompt the Director wrote by hand."
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == "The prompt the Director wrote by hand."
+    assert saved.shots[0].locked is True
+    # The unlocked shot still moves, so the lock is per Shot and not a whole-plan veto.
+    assert saved.shots[1].prompt == "Prompt for shot_second at index 1"
+    notice = saved.messages[-1].content
+    assert "Left unchanged because they are locked" in notice
+    assert "shot_first" in notice.split("Left unchanged because they are locked")[1]
+    # A locked Shot the model *did* answer is not also reported as omitted.
+    assert "Omitted by the model" not in notice
+    assert comfy.prompts == []
+
+
+def test_expansion_discards_a_prompt_addressed_to_an_unknown_shot(tmp_path: Path):
+    """Reported, never guessed at and never created as a new Shot.
+
+    Creating one would invent a window this route has no business choosing, and matching it
+    positionally is the exact silent misassignment keying by id exists to prevent.
+    """
+    director = FixedExpansionDirector(
+        [
+            ("shot_first", "A written prompt for the first shot."),
+            ("shot_ghost", "A prompt for a shot that does not exist."),
+            ("shot_second", "A written prompt for the second shot."),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director)
+    project = planned_project(store, "Unknown id")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert [shot.id for shot in saved.shots] == ["shot_first", "shot_second"]
+    assert saved.shots[0].prompt == "A written prompt for the first shot."
+    assert saved.shots[1].prompt == "A written prompt for the second shot."
+    assert "does not exist" not in json.dumps(saved.model_dump(mode="json")).replace(
+        saved.messages[-1].content, ""
+    )
+    notice = saved.messages[-1].content
+    assert "Discarded" in notice
+    assert "shot_ghost" in notice
+    assert comfy.prompts == []
+
+
+def test_expansion_reports_a_shot_the_model_omitted_and_keeps_its_prompt(tmp_path: Path):
+    """An omission is reported rather than retried, and costs the Shot nothing."""
+    director = FixedExpansionDirector([("shot_first", "A written prompt for the first shot.")])
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Omitted")
+    project.shots[1].prompt = "The prompt the second shot already had."
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == "A written prompt for the first shot."
+    assert saved.shots[1].prompt == "The prompt the second shot already had."
+    notice = saved.messages[-1].content
+    assert "Omitted by the model" in notice
+    assert "shot_second" in notice.split("Omitted by the model")[1]
+    assert "Prompts written for 1 shot(s)" in notice
+
+
+def test_expansion_does_not_apply_a_prompt_that_parses_as_json(tmp_path: Path):
+    """The FR-15 degradation, in its prompt form: JSON in context begets JSON.
+
+    The ratio floor is deliberately not in play — an unexpanded Shot's prompt is `""` or the
+    "New shot" placeholder, so the floor is toothless there and would refuse legitimate first
+    prompts elsewhere. Only the JSON-as-prose check decides.
+    """
+    degraded = '[{"shot":"corridor","camera":"push in"}]'
+    director = FixedExpansionDirector(
+        [("shot_first", degraded), ("shot_second", "Real prose about the threshold.")]
+    )
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Degraded prompt")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == "New shot"
+    assert saved.shots[1].prompt == "Real prose about the threshold."
+    notice = saved.messages[-1].content
+    assert "NOT applied to" in notice
+    assert "the model returned JSON instead of prose" in notice
+    assert "Prompts written for 1 shot(s)" in notice
+    # The refused text itself is *not* stored -- see the dedicated test below for why.
+    assert degraded not in notice
+
+
+def test_expansion_never_rewrites_a_shot_a_render_or_take_already_depends_on(tmp_path: Path):
+    """Provenance loss of the same class the document recovery slots exist to prevent.
+
+    An approved take was produced *from* a prompt. Rewriting that prompt in place fails nothing
+    and afterwards the take and the prompt beside it simply disagree — and an in-flight render's
+    prompt would diverge from what was actually submitted. Each of the four markers is asserted
+    on its own, because any one of them alone is enough to make the prompt a record.
+    """
+    for label, mark in (
+        ("approved", lambda shot: setattr(shot, "approved_output", "takes/one.mp4")),
+        ("rendered", lambda shot: setattr(shot, "latest_output", "takes/one.mp4")),
+        ("submitted", lambda shot: setattr(shot, "prompt_id", "render-1")),
+        ("ready", lambda shot: setattr(shot, "status", "ready")),
+    ):
+        root = tmp_path / label
+        client, store, comfy = make_client(root, ExpandingDirector())
+        project = planned_project(store, f"Provenance {label}")
+        project.shots[0].prompt = "The prompt the approved take was produced from."
+        mark(project.shots[0])
+        store.save(project)
+
+        response = client.post(f"/api/projects/{project.id}/director/expand")
+
+        assert response.status_code == 200, label
+        saved = ProjectStore(root).get(project.id)
+        assert saved.shots[0].prompt == "The prompt the approved take was produced from.", label
+        # The draft shot beside it still moves, so this is per Shot and not a whole-plan veto.
+        assert saved.shots[1].prompt == "Prompt for shot_second at index 1", label
+        notice = saved.messages[-1].content
+        assert "a render or a take already depends on the prompt" in notice, label
+        assert "shot_first" in notice.split("already depends on the prompt")[1], label
+        assert comfy.prompts == [], label
+
+
+def test_a_locked_or_rendered_shot_the_model_skipped_is_not_reported_as_an_omission(
+    tmp_path: Path,
+):
+    """"Run expansion again if you want them written" must never be advice that cannot work.
+
+    A locked Shot and one carrying a take are both never written, whatever the model returns —
+    so listing them among the omissions tells the Director to retry for an outcome no retry can
+    produce. A genuinely omitted draft Shot is still reported.
+    """
+    director = FixedExpansionDirector([])
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Skipped and omitted")
+    project.shots[0].locked = True
+    project.shots.append(give_render_provenance(Shot(id="shot_taken", start=20, duration=5, prompt="Taken")))
+    project.shots.append(Shot(id="shot_draft", start=30, duration=5, prompt="Draft"))
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    notice = ProjectStore(tmp_path).get(project.id).messages[-1].content
+    omissions = notice.split("Omitted by the model")[1]
+    assert "shot_second" in omissions
+    assert "shot_draft" in omissions
+    # Neither the lock nor the take is an omission, and neither is claimed as one.
+    assert "shot_first" not in omissions
+    assert "shot_taken" not in omissions
+    # The model answered for nothing at all, so nothing is claimed as written either.
+    assert "Prompts written for" not in notice
+
+
+def test_a_shot_answered_twice_keeps_the_first_prompt_and_the_contradiction_is_reported(
+    tmp_path: Path,
+):
+    """One Shot cannot have two prompts, and last-write-wins is not a decision.
+
+    It also lets one Shot be reported as refused *and* written in the same reply — the reply
+    contradicting itself about what it did, which is worse than either outcome.
+    """
+    director = FixedExpansionDirector(
+        [
+            ("shot_first", "The first answer, which is the one that counts."),
+            ("shot_first", '[{"second":"answer"}]'),
+            ("shot_first", "A third answer, later still."),
+            ("shot_second", "The only answer for the second shot."),
+        ]
+    )
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Answered twice")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == "The first answer, which is the one that counts."
+    assert saved.shots[1].prompt == "The only answer for the second shot."
+    notice = saved.messages[-1].content
+    assert "answered more than once" in notice
+    assert "shot_first" in notice.split("answered more than once")[1]
+    # Written exactly once, and never also reported as refused: the later JSON answer was
+    # ignored before the guard ever saw it.
+    assert notice.count("Prompts written for 2 shot(s)") == 1
+    assert "NOT applied to" not in notice
+    # And the contradiction is reported once, not once per repeat.
+    assert notice.count("answered more than once") == 1
+
+
+def test_a_repeated_unknown_id_is_reported_once_and_truncated(tmp_path: Path):
+    """The thread is context for the next call, so nothing model-controlled goes in unbounded.
+
+    A model looping on one bad id used to repeat it through the whole notice, and a `shot_id`
+    is whatever the model emitted — it can be a paragraph, or carry newlines that break the
+    notice apart.
+    """
+    sprawling = "shot_" + "x" * 300 + "\nand a second line"
+    director = FixedExpansionDirector(
+        [("shot_ghost", "One."), ("shot_ghost", "Two."), (sprawling, "Three.")]
+    )
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Sprawling id")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    notice = ProjectStore(tmp_path).get(project.id).messages[-1].content
+    assert "addressed to 2 id(s)" in notice
+    assert notice.count("shot_ghost") == 1
+    assert sprawling not in notice
+    assert "…" in notice
+    # The newline never reaches the thread, so the notice stays one readable paragraph.
+    assert "and a second line" not in notice
+
+
+def test_a_refused_prompt_is_reported_without_feeding_itself_back_into_the_next_call(
+    tmp_path: Path,
+):
+    """The guard that catches "JSON in context begets JSON" must not be what supplies the JSON.
+
+    The chat thread is dumped to the model as context on the next Director turn, so a rejection
+    notice that quoted the degraded output would persist it into exactly the context whose
+    richness produced it. Asserted end to end: refuse, then take a chat turn and read what
+    actually reached the model.
+    """
+    degraded = '[{"shot":"corridor","camera":"push in","palette":["amber","teal"]}]'
+    director = RecordingExpansionDirector([("shot_first", degraded)])
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "No feedback loop")
+
+    assert client.post(f"/api/projects/{project.id}/director/expand").status_code == 200
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == "New shot"
+    notice = saved.messages[-1].content
+    # Reported, and the reason is named -- the Director still learns what happened.
+    assert "NOT applied to" in notice
+    assert "the model returned JSON instead of prose" in notice
+    assert notice.endswith("produces more of it.")
+    # But the text itself is nowhere in the stored project at all.
+    assert degraded not in json.dumps(saved.model_dump(mode="json"))
+
+    # And it is therefore not in what the next Director call is handed.
+    assert client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Carry on"}
+    ).status_code == 200
+    assert degraded not in json.dumps(director.contexts[0])
+
+
+def test_deleting_every_shot_during_the_call_is_refused_rather_than_recorded(tmp_path: Path):
+    """The pre-call guard has to hold after the re-read too.
+
+    A plan can be emptied while the model is thinking. Saving a reply about it would leave the
+    thread asserting an expansion of a project that has nothing to expand — the exact state the
+    422 exists to refuse.
+    """
+    store = ProjectStore(tmp_path)
+    project = planned_project(store, "Emptied mid-call")
+
+    class DeletingExpansionDirector(FakeDirector):
+        async def expand(self, expansion_input):
+            during = ProjectStore(tmp_path).get(project.id)
+            during.shots = []
+            ProjectStore(tmp_path).save(during)
+            return expansion_result("Expanded the plan I was given.", [("shot_first", "A prompt.")])
+
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    client = TestClient(
+        create_app(
+            settings=settings,
+            store=store,
+            comfy=FakeComfy(),
+            director=DeletingExpansionDirector(),
+        )
+    )
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 422
+    assert "no shots to expand" in response.json()["detail"]
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots == []
+    # Nothing recorded about a plan that no longer exists, and the deletion is not undone.
+    assert saved.messages == []
+
+
+def test_a_reply_with_no_message_of_its_own_is_not_stored_as_a_bare_separator(tmp_path: Path):
+    """`ShotExpansion.message` has no `min_length` on purpose, so the route carries the floor.
+
+    A missing sentence is not a reason to throw away a whole set of good prompts with a 502 —
+    but it must not leave the thread holding a separator and a notice with nothing above them.
+    """
+    director = FixedExpansionDirector([("shot_first", "A written prompt.")], message="   ")
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "No message")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    # The prompts still landed: the empty sentence cost nothing.
+    assert saved.shots[0].prompt == "A written prompt."
+    content = saved.messages[-1].content
+    assert not content.startswith("\n\n---\n")
+    assert content.startswith("The Director returned no summary")
+
+
+def test_expansion_applies_a_shorter_prompt_rather_than_holding_it_to_the_document_floor(
+    tmp_path: Path,
+):
+    """`expansion_rejection` passes "" as the existing text deliberately, and this pins it.
+
+    Passing the Shot's real prompt instead would bring `document_rejection`'s 40% ratio floor
+    into play, where it is exactly wrong: on an unexpanded Shot the existing text is `""` or
+    `"New shot"`, so the floor is toothless, while on a Shot with a long hand-written prompt it
+    would refuse a tighter, better one. Every other test here uses a placeholder prompt, so
+    that mutation survives all of them.
+    """
+    existing = (
+        "A long hand-written prompt about the corridor, its sodium amber practicals, the "
+        "performer's silver jacket, the slow push on a 35mm lens, and the way the light falls "
+        "across the wall as the camera moves past each doorway in turn."
+    )
+    tighter = "Slow push down the amber corridor, silver jacket, 35mm."
+    assert len(tighter) < 0.4 * len(existing)
+    director = FixedExpansionDirector([("shot_first", tighter)])
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Tighter prompt")
+    project.shots[0].prompt = existing
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == tighter
+    assert "NOT applied to" not in saved.messages[-1].content
+
+
+def test_expansion_rejection_refuses_only_what_it_must():
+    """The decision itself, without a route: the JSON check and nothing else.
+
+    The accepted branch is the one no route test reaches — prose that merely *starts* with a
+    brace is not JSON, and refusing it would silently drop legitimate prompts written in a
+    bracketed house style.
+    """
+    from music_video_producer.app import expansion_rejection
+
+    assert "JSON" in expansion_rejection('[{"style":"moody"}]')
+    assert "JSON" in expansion_rejection('  {"prompt": "a corridor"}  ')
+    assert "empty" in expansion_rejection("")
+    assert "empty" in expansion_rejection("   \n\t ")
+    # Accepted: prose that opens with a bracket, and a short prompt against any existing text.
+    assert expansion_rejection("[Opening] Slow push down the amber corridor.") == ""
+    assert expansion_rejection("{not json, just a stylised opening") == ""
+    assert expansion_rejection("Tight.") == ""
+
+
+def test_the_reply_numbers_a_shot_the_way_the_model_was_told_to(tmp_path: Path):
+    """One number per Shot, across the input and the reply.
+
+    `expansion_input` orders by `start`; the manifest is in whatever order shots were added.
+    Numbering the notices by the manifest would tell the model "index 1" for the Shot the reply
+    calls something else — two schemes for one Shot, in a reply the Director reads beside the
+    timeline. The project here is deliberately built out of time order.
+    """
+    director = ExpandingDirector()
+    client, store, _ = make_client(tmp_path, director)
+    project = store.create(Project(name="Out of order"))
+    project.shots = [
+        Shot(id="shot_late", start=90, duration=5, prompt="Desert", locked=True),
+        Shot(id="shot_early", start=0, duration=5, prompt="Corridor"),
+        Shot(id="shot_middle", start=30, duration=5, prompt="Threshold"),
+    ]
+    store.save(project)
+    assert [shot.id for shot in project.shots] != ["shot_early", "shot_middle", "shot_late"]
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    sent = {entry["shot_id"]: entry["index"] for entry in director.inputs[0]["shots"]}
+    assert sent == {"shot_early": 0, "shot_middle": 1, "shot_late": 2}
+    notice = ProjectStore(tmp_path).get(project.id).messages[-1].content
+    # Every Shot the reply names is numbered by the index the model was given for it.
+    for shot_id, index in sent.items():
+        assert f"shot index {index} at" in notice, shot_id
+        assert f"({shot_id})" in notice.split(f"shot index {index} at")[1][:40], shot_id
+    # The locked Shot is the one whose manifest position (0) differs from its index (2), which
+    # is what makes this test able to fail.
+    assert "shot index 2 at 90s (shot_late)" in notice.split("locked")[1]
+
+
+def test_expansion_of_an_unknown_project_is_a_404(tmp_path: Path):
+    """A missing project is 404 before anything else, as it is on every other route."""
+    director = RefusingDirector()
+    client, _, _ = make_client(tmp_path, director)
+
+    response = client.post("/api/projects/project_deadbeef0000/director/expand")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Project not found"
+    assert director.calls == 0
+
+
+def test_expansion_never_blanks_a_prompt_with_an_empty_one(tmp_path: Path):
+    """An empty prompt is not a prompt, and this route must not be what erases one.
+
+    `ExpandedShot` requires a non-empty string on the wire, so this is the second half of that
+    rule: whatever reaches the merge, a Shot that had a prompt keeps it.
+    """
+    director = FixedExpansionDirector([("shot_first", "   \n\t ")])
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Blank prompt")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == "New shot"
+    notice = saved.messages[-1].content
+    assert "NOT applied to" in notice
+    assert "the model returned an empty prompt" in notice
+    assert "Prompts written for" not in notice
+
+
+def test_expansion_of_a_shotless_project_is_refused_before_any_model_call(tmp_path: Path):
+    """422, naming that there is nothing to expand — and no model call to produce it."""
+    director = RefusingDirector()
+    client, store, _ = make_client(tmp_path, director)
+    project = store.create(Project(name="No shots"))
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 422
+    assert director.calls == 0
+    detail = response.json()["detail"]
+    assert "no shots to expand" in detail
+    # It also says what expansion is, so the refusal is actionable rather than a dead end.
+    assert "never creates, retimes, or removes one" in detail
+    assert ProjectStore(tmp_path).get(project.id).messages == []
+
+
+def test_expansion_maps_an_unreachable_director_to_503_and_a_bad_reply_to_502(tmp_path: Path):
+    """The chat route's mapping, and nothing written on either path."""
+    for status_code, director in (
+        (503, UnavailableExpansionDirector()),
+        (502, FailingExpansionDirector()),
+    ):
+        client, store, comfy = make_client(tmp_path / str(status_code), director)
+        project = planned_project(store, f"Failing {status_code}")
+
+        response = client.post(f"/api/projects/{project.id}/director/expand")
+
+        assert response.status_code == status_code, response.text
+        saved = ProjectStore(tmp_path / str(status_code)).get(project.id)
+        assert [shot.prompt for shot in saved.shots] == ["New shot", ""], status_code
+        assert saved.messages == [], status_code
+        assert comfy.prompts == []
+
+
+def test_expansion_hands_the_pure_builders_output_verbatim_to_the_director(tmp_path: Path):
+    """The acceptance criterion, asserted where it can actually fail.
+
+    "The input includes each Shot's position in the Song" is unfalsifiable against the route
+    alone — the chat dump already carries start and duration. So the position is computed by a
+    named pure builder, asserted directly in tests/test_timeline.py, and asserted *here* to be
+    exactly what the route sent. Anything the route added or dropped fails this.
+    """
+    director = ExpandingDirector()
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Verbatim")
+    # Built before the call: the route writes prompts, so the builder's output over the *saved*
+    # project afterwards is a different payload than the one the model was handed.
+    expected = expansion_input(store.get(project.id))
+
+    assert client.post(f"/api/projects/{project.id}/director/expand").status_code == 200
+
+    assert director.inputs == [expected]
+    sent = director.inputs[0]
+    assert [entry["shot_id"] for entry in sent["shots"]] == ["shot_first", "shot_second"]
+    assert [entry["index"] for entry in sent["shots"]] == [0, 1]
+    assert [entry["start"] for entry in sent["shots"]] == [0, 10]
+    # This project has no Song, so the fraction is absent rather than a fabricated 0.0.
+    assert "song" not in sent
+    for entry in sent["shots"]:
+        assert "song_fraction" not in entry
+
+
+def test_the_expansion_input_carries_no_production_state(tmp_path: Path):
+    """The recorded root cause of Director degradation is rich context.
+
+    The chat route's dump ships every Shot's status, render id, take and review; this input is
+    purpose-built and must not. Asserted by field name *and* by planted value, because a field
+    renamed on the way into the payload would still leak the thing that matters.
+    """
+    director = ExpandingDirector()
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Trimmed")
+    project.shots[1].latest_review = VisionInspectionRecord(summary="A vocalist in silver.")
+    store.save(project)
+
+    assert client.post(f"/api/projects/{project.id}/director/expand").status_code == 200
+
+    serialised = json.dumps(director.inputs[0])
+    for field in ("status", "prompt_id", "latest_output", "latest_review", "approved_output"):
+        assert field not in serialised, field
+    for value in ("complete", "render-1", "takes/one.mp4", "A vocalist in silver"):
+        assert value not in serialised, value
+    # And what it does carry is the creative work the prompts have to embed.
+    assert "Sodium amber" in serialised
+    assert "the corridor, the threshold, the desert" in serialised
+
+
+def test_a_shot_added_during_the_expansion_call_cannot_be_given_another_shots_prompt(
+    tmp_path: Path,
+):
+    """Why the merge is keyed by id and not by position.
+
+    A local model holds the call open for many seconds; a shot added, split or deleted in that
+    window shifts every later position by one. Prompts are free text, so a positional merge
+    would write the corridor's prompt onto the new opening shot and the threshold's onto the
+    corridor — two plausible prompts on the wrong shots, failing nothing, forever.
+    """
+    store = ProjectStore(tmp_path)
+    project = planned_project(store, "Concurrent add")
+
+    class AddingExpansionDirector(FakeDirector):
+        async def expand(self, expansion_input):
+            during = ProjectStore(tmp_path).get(project.id)
+            during.shots.insert(
+                0, Shot(id="shot_inserted", start=0, duration=2, prompt="New shot")
+            )
+            ProjectStore(tmp_path).save(during)
+            return expansion_result(
+                "Expanded the plan I was given.",
+                [
+                    (entry["shot_id"], f"Prompt for {entry['shot_id']}")
+                    for entry in expansion_input["shots"]
+                ],
+            )
+
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    comfy = FakeComfy()
+    client = TestClient(
+        create_app(
+            settings=settings, store=store, comfy=comfy, director=AddingExpansionDirector()
+        )
+    )
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    prompts = {shot.id: shot.prompt for shot in saved.shots}
+    # Each prompt landed on the shot it was addressed to, one position off from where a
+    # positional merge would have put it.
+    assert prompts["shot_first"] == "Prompt for shot_first"
+    assert prompts["shot_second"] == "Prompt for shot_second"
+    # The shot that arrived mid-call was not written for, was not dropped, and is reported.
+    assert prompts["shot_inserted"] == "New shot"
+    assert "Omitted by the model" in saved.messages[-1].content
+    assert "shot_inserted" in saved.messages[-1].content
+    assert comfy.prompts == []
 
 
 def test_running_prompt_is_not_reported_as_queued(tmp_path: Path):

@@ -49,6 +49,35 @@ The model must return one JSON object:
 
 Shot duration validation allows up to 30 seconds for planning, but the system prompt prefers H3's reliable 4–15 second range. Timeline validation warns when a render window falls outside that range.
 
+## Shot expansion contract
+
+`POST /api/projects/{id}/director/expand` is a second, separate call with its own schema. It turns the treatment, the style bible and the existing timed shot windows into one written prompt per shot, in a single whole-plan pass — per-shot calls cannot see each other, and cross-shot variance is the point.
+
+```json
+{
+  "message": "The through-line written across the plan",
+  "shots": [
+    {"shot_id": "shot_ab12cd34ef56", "prompt": "Render-ready prompt for that shot"}
+  ]
+}
+```
+
+`shot_id` is required and is how results are merged: **never by position.** A prompt is free text, so a positional merge after a concurrent add, delete or split would write a plausible prompt onto the wrong shot and nothing downstream would fail.
+
+The input is not the chat route's project dump. `timeline.expansion_input(project)` builds a purpose-built, trimmed payload: the creative brief, treatment and style bible; a `song` block carrying title and duration; the H3 shot window; and per shot its id, ordered index, start, end, duration, current prompt, lock state, an `outside_h3_window` flag, and the neighbouring shots' **id and window** — deliberately not their prompts, which on a first expansion are all `""` or `"New shot"` placeholders anyway, and carrying them would have shipped every prompt three times over in a payload whose stated purpose is to be trimmed. The full neighbour entry stays reachable by id or by `index ± 1`. It carries no `status`, `prompt_id`, `latest_output`, `latest_review` or `approved_output`, because the recorded root cause of Director degradation is rich context.
+
+The index the model is given and the index the reply's notices name are the same one, both derived from `timeline.ordered_shots` — shots sorted by start, which is not necessarily manifest order.
+
+The route takes **no request body** — expansion is over the whole plan, so there is nothing to parameterise. Status codes: **422** when the project has no shots to expand, refused before any model call; **503** when no language model is configured or reachable; **502** when the model replies with something unusable. On any of them nothing is written.
+
+Two slots are **absent rather than fabricated**: `song_fraction` when there is no song or its duration is unknown, and `section` always — nothing in this project analyses song structure, so `timeline.song_section` is a named empty branch rather than an invented boundary list.
+
+Expansion writes prompts only. It never retimes a window, never queues a render, and never rewrites a shot that is either **locked** or **carries render provenance** — anything with a submitted prompt id, a take on disk, an approval, or a status past `draft`. For those, the prompt is no longer an intention but the record of what produced a specific piece of media, so rewriting it in place would leave the take and its prompt quietly disagreeing. Note the consequence: marking a shot `ready` takes it out of expansion's reach.
+
+A returned id matching no shot, a shot the model omitted, a prompt that parses as JSON, and the model answering for the same shot twice are each reported in the reply and not applied — on a duplicate, the first answer wins. The refused text itself is **not** written into the thread: the thread becomes context for the next chat turn, and persisting degraded JSON there would feed the exact failure `document_rejection` exists to catch.
+
+The reply is appended to the project's chat thread as an assistant turn **with no preceding user turn** — expansion is a button, not a question, but it shares the thread because that thread is the audit trail for what the Director wrote. It is therefore visible in the Treatment workspace alongside chat replies, and it becomes part of the context a later chat turn sees.
+
 ## Project context
 
 The director receives the current song metadata, creative documents, assets, shots, and prior messages. Render jobs and internal message IDs/timestamps are omitted to reduce irrelevant context.

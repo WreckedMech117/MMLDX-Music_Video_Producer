@@ -138,7 +138,11 @@
             <div class="document-actions">
               <div class="document-scoped" data-doc-controls="treatment"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-treatment">Lock Treatment</label><button class="quiet-button" id="restore-treatment" disabled>Restore Treatment</button></div>
               <div class="document-scoped" data-doc-controls="style"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-style">Lock Style bible</label><button class="quiet-button" id="restore-style" disabled>Restore Style bible</button></div>
-              <button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="apply-shot-plan" disabled title="Explicit Director plan application is planned">Apply shot plan · planned</button>
+              <!-- The expansion control is one name in three places: this id, its label, and app.js's
+                   expandShotPrompts. Its "Nothing is rendered" claim is api.js's
+                   SHOT_EXPANSION_NO_RENDER, the same spelling the toast carries after the call;
+                   the markup cannot import it, so tests/test_frontend_contract.py asserts both. -->
+              <button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="expand-shot-prompts" title="Write a prompt for every unlocked shot from the Treatment, Style bible and shot windows. Nothing is rendered and no shot window is changed.">Expand shots into prompts</button>
             </div>
           </div>
         </div>
