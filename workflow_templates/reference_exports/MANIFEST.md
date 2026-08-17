@@ -4,6 +4,8 @@ These files are immutable application-side copies of user-exported ComfyUI API g
 
 They are **reference evidence**, not graphs submitted directly by Music Video Producer. Some contain creator-specific media paths, multiple active output branches, or incomplete virtual/shared loader wiring. Runtime adapters in `src/music_video_producer/workflows.py` expose only reviewed semantic controls.
 
+**One deliberate exception to byte-fidelity.** The two `songplanner-*` exports as originally exported carried third-party copyrighted lyrics (W.A.S.P., "Harder Faster") in `55.idea` and `63.text`. Those two text fields — and only those two — were replaced with neutral placeholder prose on 2026-08-17, and the SHA-256 values below are of the replaced files. Every node id, `class_type`, link and model reference is byte-identical to the creator's export, verified field by field, which is what these files are evidence *of*: the adapters are built from the graph topology, never from the Director-supplied text. The creator originals on the ComfyUI machine are unchanged.
+
 | File | SHA-256 | Audit status |
 |---|---|---|
 | `flux-user-export.json` | `0ed08fd477785d1e6661b4ca345a294cddb53074229521483f94837750c70f01` | 15 nodes; complete; matches Flux adapter with optional LoRA loader deliberately omitted |
