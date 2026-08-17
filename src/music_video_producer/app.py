@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
+from .batch import ReadinessReport, readiness_refusal, readiness_report, shot_label
 from .comfy import ComfyClient, ComfyError
 from .config import Settings
 from .director import (
@@ -397,6 +398,22 @@ class TimelineRequest(BaseModel):
     window_start: float = Field(default=0, ge=0)
     window_duration: float = Field(gt=0)
     fps: int = Field(default=24, ge=1, le=120)
+
+
+class TimelineCompileResponse(BaseModel):
+    """What the dry run returns, declared rather than assembled as a bare dict.
+
+    `readiness` is on here because a field with no schema is a field no client can discover and
+    no test can pin: the compile route had no `response_model` at all, so the readiness block it
+    reports would have been invisible in `/openapi.json` and indistinguishable from an accident.
+    It is reported and never enforced — see `compile_timeline`.
+    """
+
+    timeline_data: str
+    requested_frames: int
+    aligned_frames: int
+    warnings: list[str]
+    readiness: ReadinessReport
 
 
 class H3Request(BaseModel):
@@ -1077,8 +1094,10 @@ def create_app(
         shot.latest_review = VisionInspectionRecord(model=settings.llm_model, **result.model_dump())
         return store.save(project)
 
-    @app.post("/api/projects/{project_id}/timeline/compile")
-    def compile_timeline(project_id: str, request: TimelineRequest) -> dict[str, Any]:
+    @app.post(
+        "/api/projects/{project_id}/timeline/compile", response_model=TimelineCompileResponse
+    )
+    def compile_timeline(project_id: str, request: TimelineRequest) -> TimelineCompileResponse:
         project = get_project(project_id)
         try:
             result = build_director_timeline(
@@ -1089,12 +1108,29 @@ def create_app(
             )
         except TimelineError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return {
-            "timeline_data": result.timeline_data,
-            "requested_frames": result.requested_frames,
-            "aligned_frames": result.aligned_frames,
-            "warnings": result.warnings,
-        }
+        return TimelineCompileResponse(
+            timeline_data=result.timeline_data,
+            requested_frames=result.requested_frames,
+            aligned_frames=result.aligned_frames,
+            warnings=result.warnings,
+            # Reported, never enforced. This is the dry run: it queues nothing and costs no GPU
+            # time, so refusing it would block the one cheap way to look at what a plan would
+            # serialise — and it serialises `"prompt": ""` silently today, which is exactly the
+            # thing worth seeing before the expensive call. The gate lives on the paths that
+            # actually submit. The full report, warnings included: this is the one readiness
+            # caller that is not on a hot path and the one whose whole job is to be looked at.
+            readiness=readiness_report(project),
+        )
+
+    @app.get("/api/projects/{project_id}/readiness", response_model=ReadinessReport)
+    def read_readiness(project_id: str) -> ReadinessReport:
+        """The plan's readiness, derived on demand. A thin delegator over `batch`.
+
+        A GET with no body and no side effects, because readiness is not state: it is recomputed
+        from the prompts every time it is asked for, so a client that caches it is the only thing
+        that can hold a stale answer.
+        """
+        return readiness_report(get_project(project_id))
 
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/generate/h3",
@@ -1108,6 +1144,35 @@ def create_app(
         shot = next((item for item in project.shots if item.id == shot_id), None)
         if not shot:
             raise HTTPException(status_code=404, detail="Shot not found")
+        # Before the status check, before either payload branch, and before anything reaches
+        # ComfyUI. Three reasons for that position, and each one is load-bearing:
+        #
+        # Before the *payload*, because the reference branch below interpolates the prompt into
+        # `f"Reference map: {tags}. {shot.prompt}"` — an empty prompt arrives downstream as a
+        # populated string, so every truthiness check past that line passes on exactly the Shots
+        # this refuses. The guard has to read `shot.prompt` itself, here.
+        #
+        # Before the *status* check, because status is not a proxy for readiness. Nothing in the
+        # shipped UI ever writes `ready`, so "must be ready" is reachable only from a hand-rolled
+        # client; a draft Shot with no prompt would otherwise be told to change its status, which
+        # is neither the real problem nor something the Director can act on.
+        #
+        # Via `readiness_report` rather than an inline `shot.prompt.strip()`, because AD-5 has one
+        # implementation of "fit to submit" — the browser's pre-batch check and Epic 4's batch
+        # submission ask the same function, and a second copy here is how a pre-flight starts
+        # saying yes to something this route then refuses.
+        #
+        # `include_warnings=False` because sameness cannot change this answer and the batch loop
+        # calls this route once per Shot: computing the pairwise pass here would run it N times
+        # over the whole plan and discard the result every time.
+        if shot.id in readiness_report(project, include_warnings=False).blocked_ids():
+            raise HTTPException(
+                # Named as the timeline names it. A raw `shot_a1b2c3d4e5f6` appears nowhere in
+                # the interface, so a refusal carrying only that asks the Director to find a Shot
+                # by a string they have never seen.
+                status_code=422,
+                detail=readiness_refusal([shot_label(project, shot)]),
+            )
         if shot.status != "ready":
             raise HTTPException(status_code=422, detail="Shot must be ready before H3 submission")
         if shot.asset_ids or shot.use_song_audio:

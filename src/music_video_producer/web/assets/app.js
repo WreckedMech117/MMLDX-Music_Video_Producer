@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, shotExpansionToast, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -10,6 +10,13 @@ let shotSaveRevision = 0;
 // from queueing a whole-list shot save that lands afterwards and reverts every prompt written.
 let shotExpansionInFlight = false;
 let waveformLoadRevision = 0;
+// The plan's readiness as the server last reported it, or null when nothing has been fetched for
+// the project on screen. Fetched on project load rather than only at the click, because readiness
+// is a cheap GET and a batch the route will certainly refuse must not look submittable until the
+// Director has spent the click on it. Held here rather than on `state` because it is not project
+// data: it is derived, never saved, and never sent back.
+let readinessReport = null;
+let readinessLoadRevision = 0;
 
 function toast(message, kind = "info") {
   const item = document.createElement("div");
@@ -104,6 +111,11 @@ async function loadProject(id) {
   // queue-ready loop -- and unticking the box there revokes consent the Director gave seconds ago
   // in the project they are still looking at, with nothing on screen to explain it.
   if (documentConsentClearedOnLoad(state.project?.id, id)) clearDocumentConsent(applyDocumentsControl());
+  // Whatever readiness this client held belongs to the project being left, and the revision bump
+  // discards an answer still in flight for it. A readiness report drawn under another project's
+  // name would name Shots that are not on screen and count a plan nobody is looking at.
+  readinessReport = null;
+  readinessLoadRevision += 1;
   if (!id) {
     state.project = null;
     state.audioBuffer = null;
@@ -119,6 +131,30 @@ async function loadProject(id) {
   state.shotsDirty = false;
   renderAll();
   loadPersistedWaveform(id);
+  loadReadiness(id);
+}
+
+// Readiness for the project just loaded, fetched rather than computed: this client's copy of the
+// plan can be minutes old, and the answer that matters is the one the route will apply. Not
+// awaited, for the same reason the waveform decode is not -- the workspace must draw immediately
+// -- and guarded by both a revision and the loaded project id, because the selector stays live.
+//
+// A failure is swallowed on purpose. Readiness here is advance notice, never the gate: the route
+// still refuses a blocked submission, so a failed GET must not disable the batch button or put an
+// error on screen for something the Director never asked for.
+async function loadReadiness(projectId) {
+  const revision = ++readinessLoadRevision;
+  if (!projectId) return;
+  try {
+    const report = await api.readiness(projectId);
+    if (revision !== readinessLoadRevision || state.project?.id !== projectId) return;
+    readinessReport = report;
+    renderTimeline();
+    renderJobs();
+    renderReadiness();
+  } catch {
+    // Advance notice only; the server remains the gate.
+  }
 }
 
 function renderAll() {
@@ -127,6 +163,7 @@ function renderAll() {
   renderAssets();
   renderTimeline();
   renderJobs();
+  renderReadiness();
 }
 
 function renderSong() {
@@ -360,7 +397,18 @@ function renderTimeline() {
   $("#timeline-duration").textContent = state.project?.song ? `${formatTime(state.project.song.duration)} master` : "No master song";
   renderRuler(duration, trackWidth);
   const track = $("#shots-track");
-  track.innerHTML = (state.project?.shots || []).map((shot, index) => `<div class="shot-clip ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(index + 1).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span><span class="clip-prompt">${escapeHtml(shot.prompt || "Untitled shot")}</span><span class="resize-handle right"></span></div>`).join("");
+  // An unprompted clip says so, rather than borrowing the "Untitled shot" fallback a real prompt
+  // of that name would also render. Three independent signals, because state is never carried by
+  // colour alone: the flag text in place of the prompt, the dashed border `.no-prompt` gets, and
+  // the clip's accessible name, which is the only one a screen reader announces.
+  //
+  // Every one of those comes out of `shotPromptCell`, which is executed by the contract tests.
+  // The ternaries used to live in this template, where swapping their arms rendered the flag onto
+  // every written clip and the unprompted one empty with the whole suite still green.
+  track.innerHTML = (state.project?.shots || []).map((shot, index) => {
+    const cell = shotPromptCell(shot);
+    return `<div class="shot-clip ${cell.className} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(cell.label)}" aria-label="${escapeHtml(cell.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(index + 1).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span><span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
+  }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
   renderShotInspector();
@@ -433,7 +481,15 @@ function renderShotInspector() {
     return;
   }
   const assets = state.project.assets || [];
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span><div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode"><option value="reference" ${shot.mode === "reference" ? "selected" : ""}>Reference + audio</option><option value="image" ${shot.mode === "image" ? "selected" : ""}>Image to video</option><option value="text" ${shot.mode === "text" ? "selected" : ""}>Text to video</option></select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>References<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !shot.asset_ids.includes(asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shot.asset_ids.map((id) => { const asset = assets.find((item) => item.id === id); if (!asset) return ""; const sameKind = shot.asset_ids.map((ref) => assets.find((item) => item.id === ref)).filter((item) => item && (item.kind === asset.kind || (!["video", "audio"].includes(item.kind) && !["video", "audio"].includes(asset.kind)))); const tag = asset.kind === "video" ? "Video" : asset.kind === "audio" ? "Audio" : "Picture"; return `<button class="quiet-button remove-ref" data-id="${id}">${tag} ${sameKind.indexOf(asset) + 1}: ${escapeHtml(asset.name)} ×</button>`; }).join(" ")}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  // The refusal sends the Director here -- "Write a prompt in the shot inspector" -- so the panel
+  // has to show which Shot is blocked and why, rather than looking like an ordinary shot with an
+  // empty box. The sameness lines are the other half: a near-duplicate pair is only something the
+  // Director can differentiate or accept deliberately if it is named where its prompt is edited.
+  const readiness = shotInspectorReadiness(readinessReport, shot);
+  const readinessHtml = readiness.blocked || readiness.sameness.length
+    ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
+    : "";
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode"><option value="reference" ${shot.mode === "reference" ? "selected" : ""}>Reference + audio</option><option value="image" ${shot.mode === "image" ? "selected" : ""}>Image to video</option><option value="text" ${shot.mode === "text" ? "selected" : ""}>Text to video</option></select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>References<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !shot.asset_ids.includes(asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shot.asset_ids.map((id) => { const asset = assets.find((item) => item.id === id); if (!asset) return ""; const sameKind = shot.asset_ids.map((ref) => assets.find((item) => item.id === ref)).filter((item) => item && (item.kind === asset.kind || (!["video", "audio"].includes(item.kind) && !["video", "audio"].includes(asset.kind)))); const tag = asset.kind === "video" ? "Video" : asset.kind === "audio" ? "Audio" : "Picture"; return `<button class="quiet-button remove-ref" data-id="${id}">${tag} ${sameKind.indexOf(asset) + 1}: ${escapeHtml(asset.name)} ×</button>`; }).join(" ")}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   ["shot-start", "shot-duration", "shot-mode", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
   $("#shot-asset-select").addEventListener("change", (event) => { if (event.target.value) { shot.asset_ids.push(event.target.value); saveShotsSilently(); renderTimeline(); } });
   $$(".remove-ref", inspector).forEach((button) => button.addEventListener("click", () => { shot.asset_ids = shot.asset_ids.filter((id) => id !== button.dataset.id); saveShotsSilently(); renderTimeline(); }));
@@ -471,12 +527,29 @@ function renderJobs() {
   const jobs = state.project?.jobs || [];
   const list = $("#job-list");
   const queueable = (state.project?.shots || []).filter((shot) => shot.status === "ready");
-  $("#queue-ready").disabled = queueable.length === 0;
-  $("#queue-ready").title = queueable.length
-    ? `Queue ${queueable.length} reviewed H3 shot${queueable.length === 1 ? "" : "s"}`
-    : "Mark a shot ready to queue H3";
+  // Both reasons the button can be off, decided in one place: nothing to queue, and a batch the
+  // route will certainly refuse. The second was invisible until the click -- the button was
+  // enabled purely from the ready count -- so a Director spent the click to be told no.
+  const queue = queueButtonState(readinessReport, queueable);
+  $("#queue-ready").disabled = queue.disabled;
+  $("#queue-ready").title = queue.title;
   if (!jobs.length) { list.innerHTML = `<div class="queue-empty">No render jobs for this project.</div>`; return; }
   list.innerHTML = [...jobs].reverse().map((job) => `<div class="job-row" data-job-id="${job.id}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(job.target_id || "—")}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span></div>`).join("");
+}
+
+// The whole report, above the button that acts on it: the counts, every Shot that blocks, and
+// every near-duplicate pair. The warnings half reached no surface at all before this -- the batch
+// check reads only the blocking ids and the compile toast prints the timeline's frame warnings --
+// so the sameness the server computes was invisible to the Director it was computed for.
+//
+// Every line is the server's own sentence, prefixed with which half it came from, so the two kinds
+// are told apart by words rather than only by the colour of a list marker.
+function renderReadiness() {
+  const region = $("#plan-readiness");
+  if (!region) return;
+  const lines = readinessLines(readinessReport);
+  region.classList.toggle("blocked", lines.some((line) => line.kind === "blocking"));
+  region.innerHTML = `<strong>${escapeHtml(readinessSummary(readinessReport))}</strong>${lines.length ? `<ul>${lines.map((line) => `<li class="${line.kind}">${escapeHtml(line.text)}</li>`).join("")}</ul>` : ""}`;
 }
 
 // `notice` so a lock toggle can confirm what it actually changed instead of reporting a
@@ -581,6 +654,9 @@ async function expandShotPrompts() {
     state.project = expanded;
     markDocumentsSaved();
     renderAll();
+    // An expansion writes prompts onto Shots, so the report this client holds describes the plan
+    // as it was before the call -- including blocks it has just resolved.
+    loadReadiness(projectId);
     toast(shotExpansionToast(state.project));
   } catch (error) { toast(error.message, "error"); }
   finally { shotExpansionInFlight = false; button.disabled = false; button.textContent = label; }
@@ -607,6 +683,10 @@ function saveShotsSilently() {
       if (revision === shotSaveRevision) {
         state.shotsDirty = false;
         state.dirty = state.documentsDirty;
+        // Only for the save that settled the burst: a prompt edited in the inspector changes what
+        // blocks and what is a near-duplicate, and a report from before the edit would keep
+        // reporting a block the Director has just fixed.
+        loadReadiness(projectId);
       }
     })
     .catch((error) => { toast(error.message, "error"); });
@@ -893,7 +973,10 @@ function bindEvents() {
     if (!requireProject()) return;
     const shots = state.project.shots;
     const start = shots.length ? Math.max(...shots.map((shot) => shot.start + shot.duration)) : 0;
-    const shot = { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start, duration: Math.min(5, Math.max(.5, projectDuration() - start)), prompt: "New shot", mode: "reference", asset_ids: [], seed: 0, status: "draft", prompt_id: "", approved_output: "", locked: false };
+    // The placeholder comes from the one constant the readiness rule reads, because the server
+    // blocks exactly this string: a second spelling here would create Shots the timeline draws as
+    // prompted and the route then refuses.
+    const shot = { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start, duration: Math.min(5, Math.max(.5, projectDuration() - start)), prompt: PLACEHOLDER_PROMPT, mode: "reference", asset_ids: [], seed: 0, status: "draft", prompt_id: "", approved_output: "", locked: false };
     shots.push(shot); state.selectedShotId = shot.id; saveShotsSilently(); renderTimeline();
   });
   $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + shot.duration; copy.status = "draft"; state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently(); renderTimeline(); });
@@ -934,16 +1017,49 @@ function bindEvents() {
   $("#refresh-jobs").addEventListener("click", refreshJobs);
   $("#cancel-project")?.addEventListener("click", () => $("#project-dialog").close());
   $("#queue-ready").addEventListener("click", async () => {
+    if (!requireProject()) return;
     const shots = state.project.shots.filter((shot) => shot.status === "ready");
     if (!shots.length) return;
-    if (!window.confirm(`Queue ${shots.length} reviewed H3 shot${shots.length === 1 ? "" : "s"}? Reference shots use MiniMax Ultra and can use significant GPU time.`)) return;
+    // The project this batch belongs to, captured before any await. The selector stays live while
+    // the readiness GET is in flight, so without this the Shot ids collected from project A would
+    // be submitted against project B -- renders queued for a plan nobody asked about, on a project
+    // whose readiness was never checked. Same guard the expansion handler carries.
+    const projectId = state.project.id;
     const button = $("#queue-ready");
     button.disabled = true;
+    // How much of the batch the server has already accepted, so a failure partway can say so.
+    let queued = 0;
     try {
-      for (const shot of shots) await api.generateH3(state.project.id, shot.id);
-      await loadProject(state.project.id);
+      // Before the loop, never inside it. The route refuses a blocked Shot per submission, so a
+      // refusal discovered mid-loop would leave every earlier Shot already queued and burning GPU
+      // minutes on a plan that is about to be edited and resubmitted -- a half-submitted batch,
+      // which is the one outcome this check exists to make impossible. Either all of it goes or
+      // none of it does.
+      //
+      // Asked of the server rather than computed here: this client's copy of the project can be
+      // minutes old, and the readiness that matters is the one the route will apply.
+      const report = await api.readiness(projectId);
+      if (state.project?.id !== projectId) return;
+      readinessReport = report;
+      // Only the Shots actually being queued block it -- decided by `batchReadinessBlock`, which is
+      // executed by the contract tests. A blocked draft elsewhere in the plan is not this batch's
+      // problem, and refusing over one would make the button unusable for a plan the Director is
+      // still writing, which is every plan most of the time.
+      const block = batchReadinessBlock(report, shots.map((shot) => shot.id));
+      if (block.refused) { toast(block.message, "error"); return; }
+      // After the check, so the Director is never asked to accept a GPU cost for a batch that
+      // was never going to be sent.
+      if (!window.confirm(`Queue ${shots.length} reviewed H3 shot${shots.length === 1 ? "" : "s"}? Reference shots use MiniMax Ultra and can use significant GPU time.`)) return;
+      for (const shot of shots) { await api.generateH3(projectId, shot.id); queued += 1; }
       toast(`${shots.length} H3 shot${shots.length === 1 ? "" : "s"} queued`);
-    } catch (error) { toast(error.message, "error"); }
+      if (state.project?.id === projectId) await loadProject(projectId);
+    } catch (error) {
+      // What already queued is spending GPU minutes right now. The refusal on its own reads as
+      // "nothing happened", and a Director who believes that edits the plan and submits the whole
+      // batch again -- on top of the half that is already rendering.
+      toast(`${error.message} ${batchQueueProgress(queued, shots.length)}`, "error");
+      if (queued && state.project?.id === projectId) await loadProject(projectId);
+    }
     finally { renderJobs(); }
   });
   window.addEventListener("resize", () => { if (state.audioBuffer) { renderSong(); renderTimeline(); } });

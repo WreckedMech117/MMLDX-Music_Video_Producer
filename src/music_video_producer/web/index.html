@@ -213,8 +213,15 @@
       <section class="panel" id="panel-queue" aria-labelledby="queue-heading">
         <div class="workspace-heading">
           <div><span class="eyebrow">ComfyUI orchestration</span><h1 id="queue-heading">Render queue</h1></div>
-          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="primary-button" id="queue-ready" disabled title="Mark a text-only shot ready to queue H3">Queue ready H3 shots</button></div>
+          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="primary-button" id="queue-ready" disabled title="Mark a shot ready to queue H3">Queue ready H3 shots</button></div>
         </div>
+        <!-- The plan's readiness, directly above the batch button that acts on it: how many shots
+             carry a prompt, every shot that blocks submission, and every near-duplicate pair the
+             server reports. app.js fills it from api.js's readinessLines on project load, so a
+             batch the route would refuse says so before the click rather than after it, and the
+             sameness warnings FR-26 lets the Director differentiate or accept deliberately are
+             visible somewhere at all. Live, because it is rewritten by a fetch nobody triggered. -->
+        <div class="plan-readiness" id="plan-readiness" aria-live="polite"></div>
         <div class="queue-layout">
           <div class="queue-table">
             <div class="queue-header"><span>Job</span><span>Target</span><span>Status</span><span>Seed</span><span>Output</span></div>

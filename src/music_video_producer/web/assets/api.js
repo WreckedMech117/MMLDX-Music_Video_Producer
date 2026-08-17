@@ -396,6 +396,284 @@ export function shotExpansionToast(project) {
   return SHOT_EXPANSION_TOAST.replace("{count}", written).replace("{plural}", written === 1 ? "" : "s");
 }
 
+// Why nothing was submitted, in the browser's voice. `batch.py`'s READINESS_REFUSAL is the server
+// half and a contract test asserts the two templates are identical: the single-Shot route and the
+// whole-batch check refuse for one reason, so a Director who hits it from either side must read
+// one sentence. It is deliberately ASCII, for the reason recorded beside the server's copy.
+//
+// The remedy is its own constant because the refusal is not the only place it is said: the blocked
+// clip's tooltip states the same fix before the click that the refusal states after it, and a
+// Director who reads two different instructions for one problem tries both.
+export const READINESS_REMEDY =
+  "Write a prompt in the shot inspector, or run the Director's shot expansion";
+export const READINESS_REFUSAL =
+  "Not submitted: no prompt on {shots}. An empty prompt spends a full GPU pass and returns " +
+  `noise, so nothing was sent to ComfyUI. ${READINESS_REMEDY}, then submit again.`;
+
+// The plan-level sentence, mirroring batch.py's PLAN_WITHOUT_SHOTS: nothing is wrong with any
+// Shot, there is no Shot. A contract test asserts the two are identical.
+export const PLAN_WITHOUT_SHOTS =
+  "This project has no shots, so there is nothing to submit. Add shots to the timeline first.";
+
+// How many Shots one refusal names before it counts the rest, mirroring batch.py's
+// REFUSAL_NAME_LIMIT. A batch over twenty blocked Shots would otherwise render as an unreadable
+// wall of names in a toast -- and it must render as the *same* wall the server would have sent.
+export const REFUSAL_NAME_LIMIT = 5;
+
+// `names` are display names, not ids: `labels` off the report at the batch check, raw ids only
+// when a caller has nothing better. The server's `readiness_refusal` takes the same, for the same
+// reason -- one sentence, and the caller decides what a Shot is called.
+//
+// An empty list is a designed-for input rather than a caller error: the empty-plan note carries no
+// ids, so every extractor returns `[]` for it, and "no prompt on ." is not a thing to tell anyone.
+export function readinessRefusal(names) {
+  const list = names || [];
+  if (!list.length) return PLAN_WITHOUT_SHOTS;
+  const remaining = list.length - REFUSAL_NAME_LIMIT;
+  const listed = list.slice(0, REFUSAL_NAME_LIMIT).join(", ");
+  return READINESS_REFUSAL.replace("{shots}", remaining > 0 ? `${listed} and ${remaining} more` : listed);
+}
+
+// Every Shot id a readiness report blocks, flattened out of its notes. A note carries the Shots it
+// is about, and the empty-plan note deliberately carries none -- there is no Shot to name -- so an
+// empty plan yields an empty list here rather than a placeholder id nothing can be matched against.
+export function blockedShotIds(report) {
+  return (report?.blocking || []).flatMap((note) => note?.shot_ids || []);
+}
+
+// Every Shot id a readiness report blocks, under the names the Director sees. Positionally
+// aligned with the ids inside each note, and carried by the report rather than derived here: the
+// server names a Shot `SHOT 01 (shot_id)` by its position in the *manifest* while the notes
+// themselves are in song order, so a browser that recomputed the numbering would disagree with the
+// server for any plan whose manifest order is not its time order.
+export function blockedShotLabels(report) {
+  return (report?.blocking || []).flatMap((note) => noteLabels(note));
+}
+
+// One note's display names, falling back to the raw ids for a note that carries none.
+function noteLabels(note) {
+  const ids = note?.shot_ids || [];
+  const labels = note?.labels || [];
+  return ids.map((id, index) => labels[index] || id);
+}
+
+// The prompt with case and whitespace differences removed, mirroring batch.py's `_collapsed`
+// (`" ".join(prompt.lower().split())`). Every emptiness decision below compares collapsed text, so
+// a placeholder that picked up stray spacing on the way through a duplicate is still a placeholder.
+function collapsePrompt(prompt) {
+  return String(prompt ?? "").toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+// The prompt `app.js` writes onto every Shot it creates, and that duplicating a Shot copies.
+// Exported so the creation site and the emptiness rule cannot spell it differently -- and mirroring
+// batch.py's PLACEHOLDER_PROMPT, because the server refuses it.
+export const PLACEHOLDER_PROMPT = "New shot";
+
+// The two reasons a prompt cannot be submitted, in the server's own words: batch.py's
+// SHOT_WITHOUT_PROMPT and SHOT_WITH_PLACEHOLDER_PROMPT, asserted identical by a contract test. Kept
+// as constants rather than reworded here, so the sentence the clip shows before the click is the
+// sentence the report carries after it.
+export const SHOT_WITHOUT_PROMPT =
+  "This shot has no prompt. Submitting it would spend a full GPU pass and return noise.";
+export const SHOT_WITH_PLACEHOLDER_PROMPT =
+  `This shot still carries the "${PLACEHOLDER_PROMPT}" placeholder every new shot is created ` +
+  "with, which is not a prompt anyone wrote. Submitting it would spend a full GPU pass on it.";
+
+// The client half of `batch.prompt_rejection`: why this Shot cannot be submitted, or "" when it
+// can. Mirrored rather than fetched because the timeline redraws on every drag, resize and
+// keystroke and a round trip per redraw would be a request storm -- the server remains the gate,
+// and this decides only what is drawn.
+//
+// The placeholder is treated exactly as blank, and this is the case that matters most: `""` takes
+// a deliberate deletion, while "New shot" arrives by default on every Shot the Director adds. A
+// client that let it through would draw a plan of placeholder clips as fully prompted and then be
+// refused by the route, which is worse than either half alone. Compared after collapse so a copy
+// with stray spacing or different case is caught, while a real prompt that merely *begins* with
+// those words is not.
+export function promptRejection(shot) {
+  const collapsed = collapsePrompt(shot?.prompt);
+  if (!collapsed) return SHOT_WITHOUT_PROMPT;
+  if (collapsed === collapsePrompt(PLACEHOLDER_PROMPT)) return SHOT_WITH_PLACEHOLDER_PROMPT;
+  return "";
+}
+
+export function promptIsMissing(shot) {
+  return Boolean(promptRejection(shot));
+}
+
+// What an unprompted clip says instead of a prompt. The timeline used to fall back to "Untitled
+// shot", which is indistinguishable from a real prompt reading "Untitled shot", so emptiness was
+// invisible until a submission failed. Text rather than a colour, because state is never conveyed
+// by colour alone; the dashed clip border in styles.css is the second, redundant signal.
+export const SHOT_WITHOUT_PROMPT_FLAG = "NO PROMPT";
+// Its own flag, because the two states are different things to be in and the fix differs: nobody
+// has written this Shot yet, versus its text was cleared. The server splits its reasons for the
+// same reason; a placeholder reported as "NO PROMPT" sends the Director looking for a prompt they
+// can see is there.
+export const SHOT_WITH_PLACEHOLDER_FLAG = "PLACEHOLDER";
+
+// What a blocked clip tells the Director when they reach it, before anything is submitted. The
+// flag alone says *that* something is wrong; this says what -- in the server's own sentence -- and
+// how to fix it, in the words the refusal uses afterwards. It is the clip's accessible name as
+// well as its tooltip: until it existed, the whole of a blocked clip's state was a word and a
+// dashed border, neither of which a screen reader announces as a state.
+export function shotPromptHelp(shot) {
+  const rejection = promptRejection(shot);
+  return rejection ? `${rejection} ${READINESS_REMEDY}.` : "";
+}
+
+// Everything the timeline draws for one clip's prompt cell, decided here rather than in the
+// template. The template used to hold the ternaries, and swapping their arms -- stamping NO PROMPT
+// on every *written* clip and rendering the unprompted one empty -- kept every substring the suite
+// asserted, so the one signal that costs a wasted GPU pass could be rendered exactly backwards
+// with the tests green. Executed by tests/test_frontend_contract.py for every state.
+//
+// `label` is the clip's title and accessible name: the help for a blocked shot, and the full
+// prompt otherwise, since the cell itself is clamped to two lines.
+export function shotPromptCell(shot) {
+  const prompt = String(shot?.prompt ?? "");
+  const rejection = promptRejection(shot);
+  if (!rejection) return { blocked: false, text: prompt, className: "", label: prompt };
+  return {
+    blocked: true,
+    text: rejection === SHOT_WITH_PLACEHOLDER_PROMPT ? SHOT_WITH_PLACEHOLDER_FLAG : SHOT_WITHOUT_PROMPT_FLAG,
+    className: "no-prompt",
+    label: shotPromptHelp(shot),
+  };
+}
+
+// Whether a batch may be submitted, given the server's report and the ids actually being queued.
+//
+// The filter is the whole decision, and it is the one that inverts silently: negating it to
+// "blocked *outside* this batch" refuses the button over a blank draft elsewhere in the plan --
+// which is every plan, most of the time -- while letting the batch that really does contain a
+// blocked Shot through, producing exactly the half-submitted batch the check exists to prevent.
+// Both directions are executed as tests rather than grepped for.
+// The refusal names the blocked Shots by the report's own labels, never by id: `SHOT 03 (shot_id)`
+// is what the server would have said and what the timeline draws, and an id alone names something
+// that appears nowhere on screen.
+export function batchReadinessBlock(report, queuedIds = []) {
+  const queued = new Set(queuedIds || []);
+  const blocked = [];
+  const labels = [];
+  for (const note of report?.blocking || []) {
+    const names = noteLabels(note);
+    (note?.shot_ids || []).forEach((id, index) => {
+      if (!queued.has(id)) return;
+      blocked.push(id);
+      labels.push(names[index]);
+    });
+  }
+  return { refused: blocked.length > 0, blocked, labels, message: blocked.length ? readinessRefusal(labels) : "" };
+}
+
+// Why the batch button is off when it is off. Nothing to queue is one reason and a batch the route
+// will certainly refuse is another, and they need different sentences: "mark a shot ready" is
+// useless advice for a batch whose Shots are all ready and one of which has no prompt.
+export const QUEUE_WITHOUT_READY_SHOTS = "Mark a shot ready to queue H3";
+
+export function queueButtonState(report, readyShots = []) {
+  const shots = (readyShots || []).filter(Boolean);
+  if (!shots.length) return { disabled: true, blocked: [], title: QUEUE_WITHOUT_READY_SHOTS };
+  const block = batchReadinessBlock(report, shots.map((shot) => shot?.id));
+  if (block.refused) return { disabled: true, blocked: block.blocked, title: block.message };
+  return {
+    disabled: false,
+    blocked: [],
+    title: `Queue ${shots.length} reviewed H3 shot${shots.length === 1 ? "" : "s"}`,
+  };
+}
+
+// Which half of the report a note came from, said in words. State is never carried by colour
+// alone, and these two lines are otherwise distinguished only by the colour of a list marker --
+// so the kind is part of the sentence.
+export const READINESS_BLOCKING_LABEL = "Blocked";
+export const READINESS_SAMENESS_LABEL = "Near-duplicate";
+
+// Every note in a readiness report, rendered as a line, in the server's own words and under the
+// server's own names for the Shots.
+//
+// The warnings half is the reason this exists. Nothing in the browser read `report.warnings` at
+// all: the batch check reads only the blocking ids and the compile toast prints the timeline's
+// frame warnings, so the near-duplicate pairs the server computes reached no surface a Director
+// could act on -- and FR-26 says they may "differentiate or accept them deliberately", which is
+// not a choice anyone can make about a pair they cannot see.
+//
+// The reason is passed through rather than reworded: it is the one sentence the server wrote for
+// this exact case, and a second wording here is how the browser starts describing a rule the
+// server no longer has. A note that names no Shot -- the empty plan -- names none here either.
+export function readinessLines(report) {
+  const render = (kind, label) => (note) => {
+    const shotIds = note?.shot_ids || [];
+    const names = noteLabels(note);
+    const reason = note?.reason || "";
+    return { kind, shotIds, shots: names, reason, text: names.length ? `${label} - ${names.join(" and ")}: ${reason}` : `${label} - ${reason}` };
+  };
+  return [
+    ...(report?.blocking || []).map(render("blocking", READINESS_BLOCKING_LABEL)),
+    ...(report?.warnings || []).map(render("warning", READINESS_SAMENESS_LABEL)),
+  ];
+}
+
+// The standing one-line state of the plan, above the button that acts on it. Before this the
+// button was enabled purely from the ready-status count, so a batch the server would certainly
+// refuse looked fully submittable until it was clicked and refused.
+export const READINESS_NOT_CHECKED = "Readiness has not been checked for this project yet.";
+// "We did not look" is not "there is nothing to find". The submission route asks for a
+// blocking-only report, so an empty `warnings` list means one of two completely different things
+// and the report says which -- reporting the wrong one would tell the Director their plan has no
+// duplicates on the strength of a pass that never ran.
+export const SAMENESS_NOT_CHECKED = "near-duplicate prompts were not checked";
+
+export function readinessSummary(report) {
+  if (!report) return READINESS_NOT_CHECKED;
+  const total = Number(report.shot_count) || 0;
+  const ready = Number(report.ready_count) || 0;
+  const blocked = blockedShotIds(report).length;
+  const pairs = (report.warnings || []).length;
+  const omitted = Number(report.warnings_omitted) || 0;
+  const parts = [`${ready} of ${total} ${total === 1 ? "shot has" : "shots have"} a prompt`];
+  if (blocked) parts.push(`${blocked} cannot be submitted`);
+  if (report.warnings_computed === false) parts.push(SAMENESS_NOT_CHECKED);
+  // The overflow is counted rather than dropped: a plan with more pairs than the report lists
+  // must not look like a plan with exactly as many as it lists.
+  else if (pairs) parts.push(`${pairs} near-duplicate pair${pairs === 1 ? "" : "s"}${omitted ? ` (${omitted} more not listed)` : ""}`);
+  return `${parts.join("; ")}.`;
+}
+
+// What the shot inspector says about the Shot in front of the Director. The refusal sends them
+// here -- "Write a prompt in the shot inspector" -- and until now the panel said nothing at all
+// about the Shot being blocked, so the instruction led to a screen that looked ordinary.
+//
+// The block is decided from the prompt on screen rather than from the report, because the report
+// is fetched per project load and the textarea is edited between fetches: a Shot the Director has
+// just written a prompt for must stop reading as blocked immediately. Sameness cannot be decided
+// locally -- it is a comparison across the whole plan -- so those lines come from the report.
+export function shotInspectorReadiness(report, shot) {
+  const cell = shotPromptCell(shot);
+  const sameness = shot?.id
+    ? readinessLines(report).filter((line) => line.kind === "warning" && line.shotIds.includes(shot.id))
+    : [];
+  // Whether sameness was looked for at all is a plan-level fact, said once in the readiness
+  // summary rather than repeated on every Shot: the report this client fetches always carries the
+  // pairwise pass, and a per-Shot caveat about a pass that did run is noise beside a prompt.
+  return { blocked: cell.blocked, flag: cell.blocked ? cell.text : "", help: shotPromptHelp(shot), sameness };
+}
+
+// What a batch that failed partway has to say beyond the failure itself. The Shots already
+// accepted are burning GPU minutes right now, and a bare refusal reads as "nothing happened" --
+// so the Director edits and resubmits a plan half of which is already in flight.
+export const BATCH_QUEUE_PROGRESS =
+  "{queued} of {total} shots had already been queued when this failed; what was accepted is " +
+  "already rendering, and the rest was not sent.";
+export const BATCH_QUEUE_NO_PROGRESS = "Nothing was queued, so no GPU time was spent.";
+
+export function batchQueueProgress(queued, total) {
+  const done = Number(queued) || 0;
+  if (!done) return BATCH_QUEUE_NO_PROGRESS;
+  return BATCH_QUEUE_PROGRESS.replace("{queued}", `${done}`).replace("{total}", `${Number(total) || 0}`);
+}
+
 // The consequence of letting the server's text overwrite the editors, stated before any path
 // does it. Recovery captures the *stored* text, so unsaved on-screen edits are the one thing
 // this feature cannot bring back — discarding them silently would reintroduce the exact loss
@@ -476,6 +754,9 @@ export const api = {
   analyzeAsset: (projectId, assetId) => request(`/api/projects/${projectId}/assets/${assetId}/analyze`, { method: "POST" }),
   analyzeLatestTake: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/analyze-latest`, { method: "POST" }),
   compileTimeline: (id, body) => request(`/api/projects/${id}/timeline/compile`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // A GET, and nothing is cached from it: readiness is derived from the prompts on every call, so
+  // the only stale answer possible is one this client held on to.
+  readiness: (id) => request(`/api/projects/${id}/readiness`),
   generateH3: (projectId, shotId, body = {}) => request(`/api/projects/${projectId}/shots/${shotId}/generate/h3`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   directorChat: (id, body) => request(`/api/projects/${id}/director/chat`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // Its own route, and it carries no body: expansion is not a chat turn. The whole input the

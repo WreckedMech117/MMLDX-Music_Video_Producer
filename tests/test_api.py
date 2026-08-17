@@ -16,6 +16,7 @@ from music_video_producer.app import (
     DocumentName,
     create_app,
 )
+from music_video_producer.batch import readiness_refusal
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.director import DirectorError, DirectorResult, DirectorUnavailable
@@ -775,6 +776,291 @@ def test_h3_submission_serializes_multiple_references_and_master_audio(tmp_path:
     assert "<Picture 2> is duet vocalist" in prompt
     assert "<Audio 1> is the master song" in prompt
     assert payload["mvp:condition"]["inputs"]["ref_audios.ref_audio_0"] == ["mvp:split", 15]
+
+
+def unreachable_payload_builder(**kwargs):
+    """A payload builder a blocked submission must never reach. See the two tests below."""
+    raise AssertionError("a payload was built for a shot the readiness gate blocks")
+
+
+def test_h3_refuses_an_unprompted_shot_before_a_payload_or_a_submission(tmp_path: Path, monkeypatch):
+    """The text branch, refused at the route with nothing built and nothing sent.
+
+    Both builders are replaced, not just the one this branch uses: the guard sits before the
+    branch, so a guard that had drifted below it would be caught whichever way the Shot routed.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Blocked"))
+    project.shots = [
+        Shot(id="shot_blank", start=0, duration=5, prompt="   \n\t", mode="text", status="ready")
+    ]
+    store.save(project)
+    monkeypatch.setattr(
+        "music_video_producer.app.build_h3_director_payload", unreachable_payload_builder
+    )
+    monkeypatch.setattr(
+        "music_video_producer.app.build_h3_reference_payload", unreachable_payload_builder
+    )
+
+    response = client.post(f"/api/projects/{project.id}/shots/shot_blank/generate/h3", json={})
+
+    assert response.status_code == 422
+    # Named the way the timeline names it. A bare `shot_blank` appears nowhere on screen, and a
+    # real id is `shot_a1b2c3d4e5f6`; the clip is drawn `SHOT 01`.
+    assert response.json()["detail"] == readiness_refusal(["SHOT 01 (shot_blank)"])
+    assert "SHOT 01" in response.json()["detail"]
+    assert comfy.prompts == []
+    # No job recorded and no status advanced: a refusal must leave the plan exactly as it was.
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.jobs == []
+    assert saved.shots[0].status == "ready"
+    assert saved.shots[0].prompt_id == ""
+
+
+def test_h3_refuses_an_unprompted_reference_shot_in_the_same_words(tmp_path: Path, monkeypatch):
+    """The reference branch, where the prompt is interpolated into a non-empty string.
+
+    `build_h3_reference_payload` is handed `f"Reference map: {tags}. {shot.prompt}"`, so an empty
+    prompt arrives downstream as a populated sentence and every truthiness check past that point
+    passes. This is the branch a gate placed one line too low would silently let through, and it
+    is the branch that costs the most: reference shots run MiniMax Ultra.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Blocked reference"))
+    asset = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "Lead vocalist", "kind": "character"},
+        files={"file": ("lead.png", b"lead-png", "image/png")},
+    ).json()["assets"][0]
+    project = store.get(project.id)
+    project.shots = [
+        Shot(
+            id="shot_blank",
+            start=0,
+            duration=5,
+            prompt="",
+            asset_ids=[asset["id"]],
+            reference_labels={asset["id"]: "lead vocalist"},
+            status="ready",
+        )
+    ]
+    store.save(project)
+    monkeypatch.setattr(
+        "music_video_producer.app.build_h3_reference_payload", unreachable_payload_builder
+    )
+
+    response = client.post(f"/api/projects/{project.id}/shots/shot_blank/generate/h3", json={})
+
+    assert response.status_code == 422
+    # Identical wording to the text branch: one rule, one sentence, whichever way the Shot routes.
+    assert response.json()["detail"] == readiness_refusal(["SHOT 01 (shot_blank)"])
+    assert "Reference map" not in response.json()["detail"]
+    assert comfy.prompts == []
+    assert ProjectStore(tmp_path).get(project.id).jobs == []
+
+
+def test_h3_refuses_a_draft_shot_for_its_prompt_rather_than_for_its_status(tmp_path: Path):
+    """The only kind of unrenderable Shot the shipped application actually produces.
+
+    Nothing in the frontend ever writes `status = "ready"` -- new Shots and duplicates are
+    `draft` -- so `Shot(prompt="", status="draft")` is the real case, and it is the *only* input
+    that can tell the two refusals apart. Both other refusal tests pin `status="ready"` to reach
+    the payload branches, which makes the status check unreachable in them: with those alone, the
+    readiness guard and the status guard could be swapped and the suite would stay green while
+    every Shot the app makes was refused for the wrong reason.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Draft"))
+    project.shots = [Shot(id="shot_draft", start=0, duration=5, prompt="", status="draft")]
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/shots/shot_draft/generate/h3", json={})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == readiness_refusal(["SHOT 01 (shot_draft)"])
+    # The status refusal is the one it must *not* give: it names neither the real problem nor
+    # anything the Director can act on.
+    assert "must be ready" not in response.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_h3_refuses_a_shot_still_carrying_the_new_shot_placeholder(tmp_path: Path):
+    """The commonest unrenderable Shot of all, and one the first cut of this gate let through.
+
+    `app.js` writes `"New shot"` onto every Shot it creates and duplicating one copies it, so a
+    plan arrives at submission carrying the placeholder by default. Reaching `""` instead takes a
+    deliberate deletion. `planned_project` is used because it is the fixture that already had one
+    of each, and it counted the placeholder Shot as ready.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = planned_project(store, "Placeholder")
+
+    response = client.post(f"/api/projects/{project.id}/shots/shot_first/generate/h3", json={})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == readiness_refusal(["SHOT 01 (shot_first)"])
+    assert comfy.prompts == []
+    assert ProjectStore(tmp_path).get(project.id).jobs == []
+
+
+def test_h3_blocks_only_the_unprompted_shot_and_not_its_neighbours(tmp_path: Path):
+    """The gate is per Shot. A plan with one blank prompt must still be able to render the rest.
+
+    Without this, `readiness_report(project).ready` read as the condition -- the obvious wrong
+    implementation -- would refuse every submission in a plan the Director is still writing,
+    which is every plan, most of the time.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Mixed"))
+    project.shots = [
+        Shot(id="shot_written", start=0, duration=5, prompt="A singer turns", mode="text",
+             status="ready"),
+        Shot(id="shot_blank", start=10, duration=5, prompt="", mode="text", status="ready"),
+    ]
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/shots/shot_written/generate/h3", json={})
+
+    assert response.status_code == 202
+    assert len(comfy.prompts) == 1
+
+
+def test_readiness_route_reports_the_plan_and_stores_nothing(tmp_path: Path):
+    """The thin delegator. Readiness is derived on demand, so the GET must not write.
+
+    `planned_project` is the fixture the gate was written against, and it is the whole argument
+    for treating the placeholder as blank: it is a plan a Director would recognise -- one Shot
+    still saying `"New shot"`, one cleared to `""` -- and neither of them can be rendered.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = planned_project(store, "Readiness")
+    before = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+
+    response = client.get(f"/api/projects/{project.id}/readiness")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is False
+    assert [note["shot_ids"] for note in body["blocking"]] == [["shot_first"], ["shot_second"]]
+    assert [note["labels"] for note in body["blocking"]] == [
+        ["SHOT 01 (shot_first)"],
+        ["SHOT 02 (shot_second)"],
+    ]
+    assert body["ready_count"] == 0
+    assert body["shot_count"] == 2
+    assert body["warnings"] == []
+    # Two blanks are trivially identical, and the report says nothing about that -- a warning
+    # that resolves itself the instant either block is acted on would only bury them.
+    assert body["warnings_computed"] is True
+    # Derived, never stored: the manifest is unchanged afterwards and gained no readiness field.
+    after = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+    assert after == before
+    # Asserted against the dump taken *after* the call. Against `before` it could never fail --
+    # a snapshot taken before the route ran cannot show what the route wrote.
+    assert "readiness" not in after
+    assert not any("readiness" in shot for shot in after["shots"])
+    assert comfy.prompts == []
+
+
+def test_h3_asks_only_for_the_blocking_answer_so_a_batch_is_not_quadratic_per_shot(
+    tmp_path: Path, monkeypatch
+):
+    """Sameness cannot change this route's answer, and the batch loop calls it once per Shot.
+
+    Computing the pairwise pass here runs an O(N^2) comparison N times over one batch -- O(N^3)
+    across the batch -- and discards the warnings every time. Asserted by recording what the route
+    asked for, because the refusal is identical either way: nothing else can tell the two apart,
+    which is exactly why it would drift back.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Blocking only"))
+    project.shots = [
+        Shot(id="shot_a", start=0, duration=5, prompt="A singer turns", mode="text",
+             status="ready"),
+        Shot(id="shot_b", start=10, duration=5, prompt="A singer turns", mode="text",
+             status="ready"),
+    ]
+    store.save(project)
+    asked: list[bool] = []
+    real = app_module.readiness_report
+
+    def recording_report(project, *, include_warnings=True):
+        asked.append(include_warnings)
+        return real(project, include_warnings=include_warnings)
+
+    monkeypatch.setattr(app_module, "readiness_report", recording_report)
+
+    response = client.post(f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={})
+
+    assert response.status_code == 202
+    assert asked == [False], "the submission route computed variance warnings it then discarded"
+    assert len(comfy.prompts) == 1
+
+
+def test_readiness_route_404s_for_a_project_that_does_not_exist(tmp_path: Path):
+    client, _, _ = make_client(tmp_path)
+
+    assert client.get("/api/projects/no-such-project/readiness").status_code == 404
+
+
+def test_compile_timeline_reports_readiness_without_refusing_the_dry_run(tmp_path: Path):
+    """The dry run queues nothing, so it reports and does not block.
+
+    It is the one cheap way to see what a plan would serialise -- and what it serialises for an
+    unprompted Shot is `"prompt": ""`, silently, which is exactly the thing worth seeing before
+    the expensive call. Both halves are asserted: the empty prompt still compiles, and the
+    readiness the compile response carries names the Shot that would be refused at submission.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = planned_project(store, "Dry run")
+
+    response = client.post(
+        f"/api/projects/{project.id}/timeline/compile",
+        json={"window_start": 0, "window_duration": 16, "fps": 24},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    segments = json.loads(body["timeline_data"])["segments"]
+    assert [segment["prompt"] for segment in segments] == ["New shot", ""]
+    assert body["readiness"]["ready"] is False
+    assert [note["shot_ids"] for note in body["readiness"]["blocking"]] == [
+        ["shot_first"],
+        ["shot_second"],
+    ]
+    assert comfy.prompts == []
+
+
+def test_the_compile_response_is_typed_so_its_readiness_block_is_discoverable(tmp_path: Path):
+    """A field with no schema is a field no client can find and no contract can pin.
+
+    The compile route had no `response_model` at all, so the readiness block it now reports would
+    have been absent from `/openapi.json` -- indistinguishable from an accidental extra key, and
+    unusable by anything written against the schema.
+    """
+    client, _, _ = make_client(tmp_path)
+
+    schema = client.get("/openapi.json").json()
+    compile_response = schema["paths"]["/api/projects/{project_id}/timeline/compile"]["post"][
+        "responses"
+    ]["200"]["content"]["application/json"]["schema"]
+    name = compile_response["$ref"].rsplit("/", 1)[-1]
+    properties = schema["components"]["schemas"][name]["properties"]
+
+    assert set(properties) == {
+        "timeline_data",
+        "requested_frames",
+        "aligned_frames",
+        "warnings",
+        "readiness",
+    }
+    # And the readiness field resolves to the report's own schema rather than a free-form object.
+    readiness = schema["components"]["schemas"][
+        properties["readiness"]["$ref"].rsplit("/", 1)[-1]
+    ]
+    assert {"ready", "blocking", "warnings", "warnings_computed"} <= set(readiness["properties"])
 
 
 def test_image_asset_vision_inspection_is_persisted(tmp_path: Path):

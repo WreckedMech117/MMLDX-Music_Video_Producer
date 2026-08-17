@@ -13,6 +13,10 @@
   --acid-ink: #15190a;
   --amber: #ffb454;
   --red: #ff6b61;
+  /* The muted red every red-stated *edge* uses -- a blocked clip's border, a failed job's badge.
+     It was the same literal hex written out at each of those sites, which is how one of them
+     drifts; --red itself is the text weight and is too loud for a whole border. */
+  --red-edge: #7f3732;
   --cyan: #6bd0cc;
   --radius: 7px;
   --rail: 94px;
@@ -195,8 +199,14 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .refs-track { min-height: 70px; }
 .shot-clip { position: absolute; top: 12px; height: 82px; min-width: 40px; border: 1px solid #67732f; border-radius: 5px; background: #232919; color: var(--ink); overflow: hidden; user-select: none; }
 .shot-clip.selected { border-color: var(--acid); box-shadow: inset 0 -3px var(--acid); }
+/* A Shot that cannot be submitted, carried by border *style* and by the flag text app.js writes
+   in place of the prompt -- never by colour alone, matching the .job-status precedent. Declared
+   after .selected so a blocked clip stays visibly blocked while selected; selection is still
+   legible there, because .selected also carries an inset shadow this rule does not touch. */
+.shot-clip.no-prompt { border-style: dashed; border-color: var(--red-edge); }
 .shot-clip .clip-id { display: block; padding: 7px 9px 3px; color: var(--acid); font: 9px Consolas, monospace; }
 .shot-clip .clip-prompt { display: -webkit-box; padding: 0 9px; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: 11px; line-height: 1.35; }
+.shot-clip.no-prompt .clip-prompt { color: var(--red); font: 9px Consolas, monospace; letter-spacing: .08em; }
 .resize-handle { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; }
 .resize-handle.left { left: 0; }
 .resize-handle.right { right: 0; }
@@ -204,6 +214,24 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .timeline-playhead { position: absolute; top: 0; bottom: 0; left: 90px; z-index: 8; width: 1px; background: var(--acid); pointer-events: none; }
 .timeline-playhead::before { content: ""; position: absolute; top: 0; left: -4px; border-width: 6px 4px 0; border-style: solid; border-color: var(--acid) transparent transparent; }
 .shot-status { display: inline-block; padding: 3px 6px; border: 1px solid var(--line); color: var(--muted); font: 9px Consolas, monospace; text-transform: uppercase; }
+/* What the inspector says about the selected Shot's readiness: the block the refusal tells the
+   Director to come here and fix, and every near-duplicate pair this Shot is named in. Both states
+   are spelled out in the text -- the flag word and the note's own sentence -- so the edge colour
+   is a second signal rather than the only one. */
+.shot-readiness { margin: 10px 0 4px; padding: 9px 11px; border: 1px solid var(--line-strong); border-left: 3px solid var(--amber); border-radius: var(--radius); background: var(--surface-1); color: var(--muted); font-size: 11px; line-height: 1.5; }
+.shot-readiness.blocked { border-left-color: var(--red-edge); }
+.shot-readiness strong { display: block; margin-bottom: 5px; color: var(--red); font: 9px Consolas, monospace; letter-spacing: .08em; }
+.shot-readiness p { margin: 0 0 6px; font-size: 11px; }
+.shot-readiness p:last-child { margin-bottom: 0; }
+/* The whole readiness report, above the batch button. Blocking and sameness lines are told apart
+   by the words app.js writes into them as well as by the marker colour, because a list where the
+   only difference is red versus amber conveys state by colour alone. */
+.plan-readiness { margin-bottom: 12px; padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--line-strong); border-radius: var(--radius); background: var(--surface-0); color: var(--muted); font-size: 12px; line-height: 1.5; }
+.plan-readiness.blocked { border-left-color: var(--red-edge); }
+.plan-readiness strong { color: var(--ink); font-weight: 600; }
+.plan-readiness ul { display: grid; gap: 6px; margin: 9px 0 0; padding-left: 18px; }
+.plan-readiness li.blocking { color: var(--red); }
+.plan-readiness li.warning { color: var(--amber); }
 .queue-layout { display: grid; grid-template-columns: 1fr 300px; gap: 12px; }
 .queue-table, .finish-stack { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
 .queue-header, .job-row { display: grid; grid-template-columns: 1.4fr 1fr .7fr .6fr 1.2fr; gap: 10px; align-items: center; min-height: 48px; padding: 0 14px; border-bottom: 1px solid var(--line); }
@@ -212,7 +240,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .job-row .job-kind { color: var(--acid); text-transform: uppercase; }
 .job-status { width: fit-content; padding: 3px 6px; border: 1px solid var(--line-strong); color: var(--muted); font: 9px Consolas, monospace; text-transform: uppercase; }
 .job-status.complete { border-color: #61752e; color: var(--acid); }
-.job-status.error { border-color: #7f3732; color: var(--red); }
+.job-status.error { border-color: var(--red-edge); color: var(--red); }
 .finish-stack { padding: 17px; }
 .finish-stack ol { list-style: none; padding: 0; margin: 18px 0; }
 .finish-stack li { display: grid; grid-template-columns: 30px 1fr; align-items: center; min-height: 42px; border-bottom: 1px solid var(--line); }
