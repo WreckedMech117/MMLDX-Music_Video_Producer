@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -180,6 +181,31 @@ def build_songplanner_known_lyrics_payload(
     )
 
 
+#: Frames per second every H3 window is measured in. One constant so the adapter's
+#: seconds-to-frames conversion and the tests that check it cannot drift apart.
+H3_FRAME_RATE = 24
+
+#: The ceilings ``MiniMaxH3DirectorCS`` declares: ``duration_frames``/``end_frame`` cap at
+#: 10000 and ``start_second``/``end_second`` at 1000.0. Above either, ComfyUI rejects the
+#: whole prompt at ``/prompt`` validation and the Director sees an opaque 502 after the
+#: submission round-trip. The text-only path is the one with live render evidence, so it
+#: gets the same local refusal the reference path has.
+H3_DIRECTOR_MAX_FRAMES = 10000
+H3_DIRECTOR_MAX_SECONDS = 1000.0
+
+
+def _finite(name: str, value: float) -> float:
+    """A window value ComfyUI could act on. ``inf`` and ``nan`` are neither.
+
+    Without this, ``inf`` reaches the frame arithmetic and raises ``OverflowError`` —
+    not a ``ValueError`` — so the route's refusal translation misses it and the
+    Director gets a 500 for a number the request model happily accepted.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number of seconds, not {value!r}")
+    return float(value)
+
+
 def build_h3_director_payload(
     *,
     timeline_data: str,
@@ -193,6 +219,25 @@ def build_h3_director_payload(
     start: float = 0,
 ) -> dict[str, dict[str, Any]]:
     """Build the selected text-only H3 Director path with explicit loaders."""
+    _finite("Shot duration", duration)
+    _finite("Shot start", start)
+    # Every window literal this payload sends, against the maximum its node declares for it.
+    # Written as data rather than as one condition because the node caps the frame counts and
+    # the seconds independently: at 24 fps the frame cap binds first, and this stays correct
+    # if that ever stops being true. `tests/preflight_h3_ultra.py` checks each maximum here
+    # against the live schema.
+    for name, value, maximum in (
+        ("duration_frames", requested_frames, H3_DIRECTOR_MAX_FRAMES),
+        ("start_frame", round(start * H3_FRAME_RATE), H3_DIRECTOR_MAX_FRAMES),
+        ("end_frame", round((start + duration) * H3_FRAME_RATE), H3_DIRECTOR_MAX_FRAMES),
+        ("start_second", start, H3_DIRECTOR_MAX_SECONDS),
+        ("end_second", start + duration, H3_DIRECTOR_MAX_SECONDS),
+    ):
+        if value > maximum:
+            raise ValueError(
+                f"A shot from {start:g}s to {start + duration:g}s sends {name}={value:g}, "
+                f"above the H3 Director node's maximum of {maximum:g}"
+            )
     timeline = json.loads(timeline_data)
     segments = timeline.get("segments", [])
     local_prompts = "\n\n".join(str(item.get("prompt", "")) for item in segments)
@@ -227,11 +272,11 @@ def build_h3_director_payload(
                 "clip": ["mvp:clip", 0], "vae": ["mvp:video_vae", 0], "audio_vae": ["mvp:audio_vae", 0],
                 "model": ["mvp:model", 0], "model_ref2va": ["mvp:model_ref", 0],
                 "start_second": start, "end_second": end, "duration_seconds": duration,
-                "start_frame": round(start * 24), "end_frame": round(end * 24), "duration_frames": requested_frames,
+                "start_frame": round(start * H3_FRAME_RATE), "end_frame": round(end * H3_FRAME_RATE), "duration_frames": requested_frames,
                 "timeline_data": json.dumps(timeline, separators=(",", ":")),
                 "local_prompts": local_prompts, "segment_lengths": segment_lengths, "guide_strength": "",
                 "use_custom_audio": False, "use_custom_motion": False, "inpaint_audio": True,
-                "frame_rate": 24, "display_mode": "seconds", "custom_width": width, "custom_height": height,
+                "frame_rate": H3_FRAME_RATE, "display_mode": "seconds", "custom_width": width, "custom_height": height,
                 "resize_method": "crop", "divisible_by": 32, "img_compression": 0, "override_audio": False,
                 "ref_image_size": "match", "shift_video": 12, "shift_audio": 4,
                 "ref_image_notes": "",
@@ -249,6 +294,33 @@ def build_h3_director_payload(
     }
 
 
+#: References the H3 Ultra graph accepts per kind, and the numbers the refusal quotes.
+#:
+#: These are not this adapter's policy: ``MiniMaxH3ReferenceToVideo`` declares them as the
+#: ``max`` of its ``ref_images`` / ``ref_videos`` / ``ref_audios`` autogrow groups, so a tenth
+#: picture has no slot to land in. Named here so ``tests/preflight_h3_ultra.py`` can read the
+#: adapter's numbers and compare them against the live schema's, rather than restating them.
+H3_REFERENCE_LIMITS = {"picture": 9, "video": 3, "audio": 3}
+
+#: Where each kind's slots start in ``MiniMaxH3ReferenceSplitter``'s flat output list, which the
+#: live schema names ``picture_1…9``, ``video_1…3``, ``video_audio_1…3``, ``audio_1…3`` — one
+#: output per slot the limits above allow, in that order. The audit checks these against the
+#: live ``output_name`` list; wiring a reference to the wrong index would feed the conditioner
+#: someone else's media without failing validation.
+H3_SPLIT_OFFSETS = {
+    "picture": 0,
+    "video": H3_REFERENCE_LIMITS["picture"],
+    "video_audio": H3_REFERENCE_LIMITS["picture"] + H3_REFERENCE_LIMITS["video"],
+    "audio": H3_REFERENCE_LIMITS["picture"] + 2 * H3_REFERENCE_LIMITS["video"],
+}
+
+#: The frame ceiling ``MiniMaxH3ReferenceToVideo.length`` declares (about 150 s at 24 fps).
+#: Above it ComfyUI rejects the whole prompt at ``/prompt`` validation with
+#: ``value_bigger_than_max``, which reaches the Director as an opaque 502 after the submission
+#: round-trip; refusing locally costs nothing and names the limit.
+H3_REFERENCE_MAX_FRAMES = 3600
+
+
 def build_h3_reference_payload(
     *,
     prompt: str,
@@ -264,16 +336,34 @@ def build_h3_reference_payload(
     """Build the audited H3 Ultra references-to-video path."""
     counts = {
         kind: sum(1 for item in references if item.get("kind") == kind)
-        for kind in ("picture", "video", "audio")
+        for kind in H3_REFERENCE_LIMITS
     }
-    if counts["picture"] > 9 or counts["video"] > 3 or counts["audio"] > 3:
-        raise ValueError("H3 accepts at most 9 pictures, 3 videos, and 3 standalone audios")
+    for kind, limit in H3_REFERENCE_LIMITS.items():
+        if counts[kind] > limit:
+            # Names the kind that overflowed and the number actually counted, because the
+            # route appends the master song as a further `audio` reference: a Director who
+            # attached exactly three audio Assets and ticked "use song" was previously told
+            # "at most 3 standalone audios" while looking at three of them.
+            song = " (the master song counts as one)" if kind == "audio" else ""
+            raise ValueError(
+                f"H3 accepts at most {limit} {kind} references per shot and this one has "
+                f"{counts[kind]}{song}"
+            )
     if not references:
         raise ValueError("At least one H3 reference is required")
     if ref_image_size not in {"match", "max"}:
         raise ValueError("ref_image_size must be 'match' or 'max'")
-    requested = max(5, round(duration * 24))
+    _finite("Shot duration", duration)
+    requested = max(5, round(duration * H3_FRAME_RATE))
+    # The same 17k+5 grid `timeline.align_h3_frames` rounds to, and asserted to agree with it
+    # over the whole window range in `tests/test_workflows.py`.
     length = requested + (5 - requested % 17) % 17
+    if length > H3_REFERENCE_MAX_FRAMES:
+        raise ValueError(
+            f"A {duration:g}s shot needs {length} frames, above the H3 node's "
+            f"{H3_REFERENCE_MAX_FRAMES}-frame maximum "
+            f"({H3_REFERENCE_MAX_FRAMES / H3_FRAME_RATE:g}s at {H3_FRAME_RATE} fps)"
+        )
     media_state = json.dumps(
         [{**item, "enabled": item.get("enabled", True)} for item in references],
         separators=(",", ":"),
@@ -288,17 +378,23 @@ def build_h3_reference_payload(
     for item in references:
         kind = item.get("kind")
         if kind == "picture":
-            condition_inputs[f"ref_images.ref_image_{picture_index}"] = ["mvp:split", picture_index]
+            condition_inputs[f"ref_images.ref_image_{picture_index}"] = [
+                "mvp:split", H3_SPLIT_OFFSETS["picture"] + picture_index,
+            ]
             picture_index += 1
         elif kind == "video":
-            condition_inputs[f"ref_videos.ref_video_{video_index}"] = ["mvp:split", 9 + video_index]
+            condition_inputs[f"ref_videos.ref_video_{video_index}"] = [
+                "mvp:split", H3_SPLIT_OFFSETS["video"] + video_index,
+            ]
             if item.get("has_audio") and item.get("audio_mode", "paired") == "paired":
                 condition_inputs[f"ref_video_audios.ref_video_audio_{video_index}"] = [
-                    "mvp:split", 12 + video_index,
+                    "mvp:split", H3_SPLIT_OFFSETS["video_audio"] + video_index,
                 ]
             video_index += 1
         elif kind == "audio":
-            condition_inputs[f"ref_audios.ref_audio_{audio_index}"] = ["mvp:split", 15 + audio_index]
+            condition_inputs[f"ref_audios.ref_audio_{audio_index}"] = [
+                "mvp:split", H3_SPLIT_OFFSETS["audio"] + audio_index,
+            ]
             audio_index += 1
         else:
             raise ValueError(f"Unsupported H3 reference kind: {kind}")

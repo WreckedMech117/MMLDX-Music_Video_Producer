@@ -86,6 +86,28 @@ Refresh now consults `/queue` whenever history is still empty, so an executing r
 
 ComfyUI 0.33.1 returns combo inputs as `["COMBO", {"options": [...]}]`. Older code that reads the option list from index `0` gets the string `"COMBO"` and silently reports every model as missing. Read options from `[1]["options"]`, and treat a "everything is missing" result as a parser bug before concluding the models are absent.
 
+### Adapter pre-flight audits
+
+Read-only audits of an adapter's payload against the live schema. They read `/object_info` and nothing else — no graph is submitted, no GPU time is spent — so run them before any live render and after any ComfyUI or custom-node update.
+
+```bash
+uv run python tests/preflight_songplanner.py [base_url] [--record]
+uv run python tests/preflight_h3_ultra.py [base_url] [--record]
+```
+
+Both default to `MVP_COMFY_URL`, then `http://127.0.0.1:8188`. Both print one `FAIL …` line per problem and exit non-zero, or one `OK <nodes> nodes across <variants> variants (<classes> classes) validated against <url>` line.
+
+The shared rules live in `tests/preflight.py`: every node class registered, every fed input name present in the schema, every schema-required input fed, every combo value (model filenames included) among the options, every numeric literal inside its `min`/`max` and integral where the schema says INT, and every numeric literal resolving at least one bound — an input whose bounds vanished upstream is reported rather than silently skipped. Two schema shapes need expanding before that is true of anything richer than SongPlanner's graphs, and both produced *false* failures until the validator learned them:
+
+- **Autogrow groups.** `MiniMaxH3ReferenceToVideo` publishes `ref_images` as a template plus an index range, not as nine keys, so `ref_images.ref_image_0` is not literally in the schema. The validator materialises the `prefix`+index slots and reports only an index past the template's `max`.
+- **Format-conditional inputs.** `VHS_VideoCombine` publishes `crf`, `pix_fmt`, `save_metadata` and `trim_to_audio` under `format`'s options dict, keyed by the selected format. The validator merges the selected format's entries, which is also what makes `crf`'s 0–100 range checkable.
+
+`preflight_h3_ultra.py` additionally compares the adapter's own constants against the live schema: its 9/3/3 per-kind limits against the autogrow maxima, every `mvp:split` output index against the splitter's `output_name` list, its 3600-frame ceiling against `length`'s declared maximum, and its four model filenames against the loaders' combo options.
+
+A positional argument must be an `http(s)://` URL, so a mistyped flag is a usage message rather than a connection error. `--record` merges the audited classes into `tests/fixtures/object_info.json`, which the offline tests validate every builder's payload against. Recording **merges rather than replacing the file**, so one adapter's audit cannot delete another's coverage — but it does overwrite the entry for every class it names, which is how a moved bound gets picked up. The recorder reports changed entries as well as added ones, because a bound that shifts on an already-recorded class would otherwise be written in silently and the offline tests would quietly start agreeing with it. It writes via temp-and-replace, so an interrupted record cannot truncate the fixture both audits share.
+
+One environment note: `F:` has coarse modification-time granularity, so a mutate-then-restore inside the same window can leave a stale `.pyc` that makes a later run execute code you already reverted. Clear `__pycache__` after any mutation experiment, or run with `PYTHONDONTWRITEBYTECODE=1`. and a **failing audit records nothing** — it prints `Fixture NOT recorded: the audit found problems`. After recording, shrink `UNRECORDED_CLASSES` in `tests/test_workflows.py` by exactly the newly recorded names; that list is the honest ledger of which classes nothing range-checks offline, and a test asserts it matches reality.
+
 ### Media preview missing
 
 Refresh the corresponding job first. Generated media paths are copied from Comfy history only after completion.
@@ -138,12 +160,12 @@ These are not pytest-collected and are never run as part of the automated suite.
 
 ```bash
 uv run python tests/smoke_songplanner_app.py http://127.0.0.1:8766 --confirm-gpu
-uv run python tests/smoke_h3_app.py http://127.0.0.1:8766
+uv run python tests/smoke_h3_app.py http://127.0.0.1:8766 --confirm-gpu
 ```
 
 `smoke_songplanner_app.py` **refuses to submit anything without `--confirm-gpu`** and exits with a usage message instead. It re-runs the `tests/preflight_songplanner.py` audit against the live ComfyUI, then submits exactly two short songs — invented variant first, then known-lyrics. It **creates one project per adapter**, because every `kind=music` job targets `"song"` and a shared project's second run would clobber the first. It prints exactly one JSON block per variant to stdout, and that block is the only record of which adapter produced which prompt ID — nothing in persisted state distinguishes a SongPlanner song from a direct Music 3 song, so capture the output. It `ffprobe`s both the file on disk and the ComfyUI `/view` URL the player actually fetches. Requested duration is not produced duration; the encoder resolves its own length, and the script reports the delta as a fact but fails a variant whose measurement is wildly off the request. It aborts non-zero on stderr — without spending a further generation — on pre-flight problems, ComfyUI being offline, an unexpected response shape, a job error, or the time ceiling.
 
-`smoke_h3_app.py` has **no cost gate**: it takes only an optional base URL and submits an H3 render as soon as it is invoked. Treat running it as the confirmation. Bringing it behind the same `--confirm-gpu` flag is an open cleanup, tracked in `docs/ROADMAP.md`.
+Both live-cost smokes now refuse to submit without `--confirm-gpu`, and both run their pre-flight audit before spending anything. `smoke_h3_app.py` aborts in this order: the cost gate before any network call at all, then a health read that stops if ComfyUI is offline, then the audit, and only then a submission — so every refusal is free. One caveat worth knowing: it submits the **Director** graph while the audit covers the **references-to-video** graph, so `MiniMaxH3DirectorCS` and the `fl2va` UNET it alone loads are only partly proven by that check.
 
 ## Quality gates
 

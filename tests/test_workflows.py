@@ -1,12 +1,23 @@
+import copy
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 
+import preflight
+import preflight_h3_ultra
 import preflight_songplanner
 import pytest
 
 from music_video_producer.app import SongPlannerRequest
+from music_video_producer.timeline import align_h3_frames
 from music_video_producer.workflows import (
+    H3_DIRECTOR_MAX_FRAMES,
+    H3_DIRECTOR_MAX_SECONDS,
+    H3_FRAME_RATE,
+    H3_REFERENCE_LIMITS,
+    H3_REFERENCE_MAX_FRAMES,
+    H3_SPLIT_OFFSETS,
     LTX25_DIVISOR,
     WorkflowCatalog,
     build_flux_payload,
@@ -75,22 +86,27 @@ def every_builder_payload() -> list[tuple[str, dict]]:
 
 # Node classes the recorded fixture does not cover, so nothing above range-checks
 # them offline. Recorded explicitly rather than skipped silently: this list is the
-# honest measure of the guard's reach, and it shrinks only when
-# `preflight_songplanner.py --record` is extended past the SongPlanner classes.
+# honest measure of the guard's reach, and it shrinks only when an audit's
+# `--record` is extended past the classes it already covers.
+#
+# `preflight_h3_ultra.py --record` removed the thirteen the H3 Ultra reference graph
+# uses — every `MiniMaxH3*` class except `MiniMaxH3DirectorCS`, which no audited
+# payload builds, plus the sampler, guider, decode and save classes it shares with
+# the Director and LTX graphs. Recording merges, so the SongPlanner classes those
+# thirteen joined are still there.
 UNRECORDED_CLASSES = frozenset({
-    "BasicGuider", "BasicScheduler", "CFGGuider", "CLIPTextEncode", "ComfyMathExpression",
+    "CFGGuider", "CLIPTextEncode", "ComfyMathExpression",
     "DualCLIPLoader", "EmptySD3LatentImage", "FluxGuidance", "FrameInterpolate",
-    "FrameInterpolationModelLoader", "GetImageSize", "ImageResizeKJv2", "KSamplerSelect",
+    "FrameInterpolationModelLoader", "GetImageSize", "ImageResizeKJv2",
     "Krea2EditGroundedEncode", "Krea2EditModelPatch", "LTXVAudioVAEDecode", "LTXVAudioVAEEncode",
     "LTXVConcatAVLatent", "LTXVConditioning", "LTXVImgToVideoInplace", "LTXVLatentUpsampler",
     "LTXVSeparateAVLatent", "LatentUpscaleModelLoader", "LoadImage", "LoraLoaderModelOnly",
-    "ManualSigmas", "MathExpression|pysssss", "MiniMaxH3DirectorCS", "MiniMaxH3MediaLoader",
-    "MiniMaxH3ReferenceSplitter", "MiniMaxH3ReferenceToVideo", "MiniMaxH3SigmaShift",
-    "ModelPreviewOverrideKJ", "ModelSamplingFlux", "PathchSageAttentionKJ", "PrimitiveFloat",
-    "PrimitiveStringMultiline", "RTXVideoSuperResolution", "RandomNoise", "ResolutionSelector",
-    "SamplerCustomAdvanced", "SaveImage", "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
-    "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask", "VAEDecode", "VAEDecodeTiled",
-    "VAEEncode", "VHS_LoadAudio", "VHS_LoadImagePath", "VHS_VideoCombine", "easy cleanGpuUsed",
+    "ManualSigmas", "MathExpression|pysssss",
+    "ModelSamplingFlux", "PrimitiveFloat",
+    "PrimitiveStringMultiline", "RTXVideoSuperResolution", "ResolutionSelector",
+    "SaveImage", "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
+    "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask", "VAEDecodeTiled",
+    "VAEEncode", "VHS_LoadAudio", "VHS_LoadImagePath", "easy cleanGpuUsed",
     "easy clearCacheAll",
 })
 
@@ -248,7 +264,7 @@ def test_songplanner_variants_validate_separately_against_recorded_object_info()
     )
 
     for label, payload in preflight_songplanner.audit_payloads():
-        assert preflight_songplanner.validate(label, payload, object_info) == []
+        assert preflight.validate(label, payload, object_info) == []
 
 
 def test_payload_validation_rejects_numeric_values_outside_the_schema_range():
@@ -264,8 +280,8 @@ def test_payload_validation_rejects_numeric_values_outside_the_schema_range():
         idea="too long", genre_hint="", duration=301, seed=0, prefix="range"
     )
 
-    low_problems = preflight_songplanner.validate("below", below, object_info)
-    high_problems = preflight_songplanner.validate("above", above, object_info)
+    low_problems = preflight.validate("below", below, object_info)
+    high_problems = preflight.validate("above", above, object_info)
     assert any(
         "duration_seconds=16" in problem and "below the schema minimum 30.0" in problem
         for problem in low_problems
@@ -280,7 +296,7 @@ def test_payload_validation_rejects_numeric_values_outside_the_schema_range():
     wide_seed = build_songplanner_invented_payload(
         idea="wide seed", genre_hint="", duration=120, seed=2**32, prefix="range"
     )
-    seed_problems = preflight_songplanner.validate("seed", wide_seed, object_info)
+    seed_problems = preflight.validate("seed", wide_seed, object_info)
     assert [
         problem for problem in seed_problems if "M3SongPlanner" in problem
     ] == seed_problems, seed_problems
@@ -296,14 +312,14 @@ def test_numeric_bounds_reads_the_schema_and_ignores_step():
     )
     planner = object_info["M3SongPlanner"]["input"]["required"]
 
-    assert preflight_songplanner.numeric_bounds(planner["duration_seconds"]) == (30.0, 300.0)
+    assert preflight.numeric_bounds(planner["duration_seconds"]) == (30.0, 300.0)
     # A combo spec carries no numeric bounds, and off-step values are not a problem:
     # ComfyUI only rejects min/max violations.
-    assert preflight_songplanner.numeric_bounds(planner["text_encoder"]) == (None, None)
+    assert preflight.numeric_bounds(planner["text_encoder"]) == (None, None)
     off_step = build_songplanner_invented_payload(
         idea="off step", genre_hint="", duration=37.5, seed=0, prefix="range"
     )
-    assert preflight_songplanner.validate("off-step", off_step, object_info) == []
+    assert preflight.validate("off-step", off_step, object_info) == []
 
 
 def test_songplanner_request_bounds_equal_the_recorded_node_schema():
@@ -322,7 +338,7 @@ def test_songplanner_request_bounds_equal_the_recorded_node_schema():
         raise AssertionError(f"SongPlannerRequest.{field} has no {kind} bound")
 
     for field, schema_input in (("duration", "duration_seconds"), ("seed", "seed")):
-        minimum, maximum = preflight_songplanner.numeric_bounds(planner[schema_input])
+        minimum, maximum = preflight.numeric_bounds(planner[schema_input])
         assert (minimum, maximum) != (None, None), schema_input
         assert route_bound(field, "Ge") == minimum, field
         assert route_bound(field, "Le") == maximum, field
@@ -338,7 +354,7 @@ def test_every_numeric_songplanner_input_resolves_a_schema_bound():
     object_info = recorded_object_info()
 
     for label, payload in preflight_songplanner.audit_payloads():
-        assert preflight_songplanner.unbounded_numeric_inputs(label, payload, object_info) == []
+        assert preflight.unbounded_numeric_inputs(label, payload, object_info) == []
 
 
 def test_every_builder_payload_is_range_checked_against_the_fixture():
@@ -355,7 +371,9 @@ def test_every_builder_payload_is_range_checked_against_the_fixture():
         uncovered |= {
             node["class_type"] for node in payload.values() if node["class_type"] not in object_info
         }
-        assert preflight_songplanner.validate(label, covered, object_info) == [], label
+        # `graph=payload` because `covered` is a subset: a link into a node whose class is
+        # not recorded is a real link, not a dangling one.
+        assert preflight.validate(label, covered, object_info, graph=payload) == [], label
 
     assert uncovered == UNRECORDED_CLASSES
 
@@ -366,7 +384,7 @@ def test_range_check_rejects_a_fractional_value_on_an_int_input():
     payload = build_music3_payload(caption="c", lyrics="l", duration=120, seed=0, prefix="p")
     payload["50"]["inputs"]["steps"] = 1.5
 
-    problems = preflight_songplanner.validate("fractional", payload, object_info)
+    problems = preflight.validate("fractional", payload, object_info)
 
     assert any(
         "steps=1.5" in problem and "fractional but the schema declares INT" in problem
@@ -374,7 +392,7 @@ def test_range_check_rejects_a_fractional_value_on_an_int_input():
     ), problems
     # A whole-number float is what ComfyUI itself accepts for an INT, so it is not a defect.
     payload["50"]["inputs"]["steps"] = 30.0
-    assert preflight_songplanner.validate("integral", payload, object_info) == []
+    assert preflight.validate("integral", payload, object_info) == []
 
 
 def test_songplanner_model_files_are_present_in_recorded_combos():
@@ -389,7 +407,7 @@ def test_songplanner_model_files_are_present_in_recorded_combos():
     )
     for class_type, input_name, filename in expectations:
         spec = object_info[class_type]["input"]["required"][input_name]
-        options = preflight_songplanner.combo_options(spec)
+        options = preflight.combo_options(spec)
         assert filename in options, f"{class_type}.{input_name}: {filename}"
 
 
@@ -472,6 +490,795 @@ def test_h3_reference_payload_maps_multiple_subjects_environment_and_shared_audi
     assert conditioner["length"] == 192
     assert payload["mvp:scheduler"]["inputs"]["steps"] == 20
     assert payload["mvp:save"]["inputs"]["filename_prefix"] == "mvp/duet-chorus"
+
+
+def h3_reference_payload(references: list[dict], **overrides) -> dict:
+    """One reference payload with the boring arguments filled in."""
+    arguments = {
+        "prompt": "p",
+        "references": references,
+        "duration": 8,
+        "width": 1280,
+        "height": 720,
+        "steps": 20,
+        "seed": 0,
+        "prefix": "p",
+    }
+    return build_h3_reference_payload(**{**arguments, **overrides})
+
+
+def h3_references(kind: str, count: int) -> list[dict]:
+    return [{"kind": kind, "file": f"F:/refs/{kind}-{index}"} for index in range(count)]
+
+
+def test_h3_reference_payload_refuses_more_than_the_node_has_slots_for():
+    """The per-kind limits are the node's autogrow maxima, and one past each is refused.
+
+    Exactly at the limit must still build: a refusal that fires one reference early is
+    the same defect wearing the opposite sign, and nothing else asserts the boundary.
+    """
+    for kind, limit in H3_REFERENCE_LIMITS.items():
+        assert h3_reference_payload(h3_references(kind, limit))
+        with pytest.raises(ValueError, match=f"at most {limit} {kind} references"):
+            h3_reference_payload(h3_references(kind, limit + 1))
+    # The message names the kind that overflowed and the number actually counted, quoting
+    # the real limit rather than a hardcoded sentence.
+    with pytest.raises(ValueError, match="at most 9 picture references per shot and this one has 10"):
+        h3_reference_payload(h3_references("picture", 10))
+    # Audio says what is being counted, because the route appends the master song as a
+    # fourth audio reference: the Director attached three and needs to be told that.
+    with pytest.raises(ValueError, match=r"has 4 \(the master song counts as one\)"):
+        h3_reference_payload(h3_references("audio", 4))
+
+
+def test_h3_reference_payload_refuses_a_reference_list_with_nothing_in_it():
+    """The reference graph has no text-only mode: with no media it would sample noise."""
+    with pytest.raises(ValueError, match="At least one H3 reference is required"):
+        h3_reference_payload([])
+
+
+def test_h3_reference_payload_refuses_a_reference_size_the_node_does_not_offer():
+    for rejected in ("", "matched", "MAX", "2048"):
+        with pytest.raises(ValueError, match="ref_image_size must be 'match' or 'max'"):
+            h3_reference_payload(h3_references("picture", 1), ref_image_size=rejected)
+
+
+def test_h3_reference_payload_refuses_a_kind_it_cannot_wire():
+    """An unhandled kind must fail loudly rather than be dropped from the graph.
+
+    Silently skipping it would submit a payload whose prompt still says `<Picture 2>`
+    while only one picture is attached — a full-cost render of the wrong thing.
+    """
+    for unknown in ("image", "text", None):
+        with pytest.raises(ValueError, match="Unsupported H3 reference kind"):
+            h3_reference_payload([{"kind": unknown, "file": "F:/refs/x"}])
+
+
+def test_h3_reference_payload_wires_a_video_and_its_paired_soundtrack():
+    """The `video` kind, which no other test builds, and its optional paired audio."""
+    paired = h3_reference_payload(
+        [
+            {"kind": "video", "file": "F:/refs/take.mp4", "has_audio": True},
+            {"kind": "video", "file": "F:/refs/silent.mp4", "has_audio": False},
+            {"kind": "video", "file": "F:/refs/own.mp4", "has_audio": True, "audio_mode": "separate"},
+        ]
+    )
+
+    conditioner = paired["mvp:condition"]["inputs"]
+    assert conditioner["ref_videos.ref_video_0"] == ["mvp:split", 9]
+    assert conditioner["ref_videos.ref_video_1"] == ["mvp:split", 10]
+    assert conditioner["ref_videos.ref_video_2"] == ["mvp:split", 11]
+    # `paired` is the default reading of a video that has audio; `separate` and a silent
+    # video both leave the soundtrack slot empty, so the video's own audio is not fed.
+    assert conditioner["ref_video_audios.ref_video_audio_0"] == ["mvp:split", 12]
+    assert "ref_video_audios.ref_video_audio_1" not in conditioner
+    assert "ref_video_audios.ref_video_audio_2" not in conditioner
+
+
+def test_h3_reference_payload_carries_the_reference_size_to_the_conditioner():
+    for size in ("match", "max"):
+        payload = h3_reference_payload(h3_references("picture", 1), ref_image_size=size)
+        assert payload["mvp:condition"]["inputs"]["ref_image_size"] == size
+
+
+def test_h3_reference_slots_are_numbered_per_kind_in_attachment_order():
+    """FR-19's determinism at the payload boundary: order in, order out.
+
+    The route numbers its `<Picture N>` tags off the same walk, so this is the half of
+    that promise the builder owns — the Nth picture lands in the Nth picture slot no
+    matter what videos or audios are interleaved with it, and reordering the attachments
+    reorders the slots rather than shuffling media between kinds.
+    """
+    mixed = [
+        {"kind": "picture", "file": "F:/refs/lead.png"},
+        {"kind": "audio", "file": "F:/refs/song.flac"},
+        {"kind": "video", "file": "F:/refs/pan.mp4"},
+        {"kind": "picture", "file": "F:/refs/stage.png"},
+        {"kind": "audio", "file": "F:/refs/room.flac"},
+    ]
+
+    conditioner = h3_reference_payload(mixed)["mvp:condition"]["inputs"]
+    media = json.loads(h3_reference_payload(mixed)["mvp:references"]["inputs"]["media_state"])
+
+    assert [item["file"] for item in media] == [item["file"] for item in mixed]
+    assert conditioner["ref_images.ref_image_0"] == ["mvp:split", 0]
+    assert conditioner["ref_images.ref_image_1"] == ["mvp:split", 1]
+    assert conditioner["ref_videos.ref_video_0"] == ["mvp:split", 9]
+    assert conditioner["ref_audios.ref_audio_0"] == ["mvp:split", 15]
+    assert conditioner["ref_audios.ref_audio_1"] == ["mvp:split", 16]
+
+    reordered = [mixed[3], mixed[4], mixed[2], mixed[0], mixed[1]]
+    swapped = json.loads(h3_reference_payload(reordered)["mvp:references"]["inputs"]["media_state"])
+    assert [item["file"] for item in swapped] == [item["file"] for item in reordered]
+    # Slot 0 now holds what was attached second-to-last, which is what makes the
+    # numbering the Director sees a consequence of the attachment order.
+    assert swapped[0]["file"] == "F:/refs/stage.png"
+
+
+def test_h3_reference_payload_refuses_a_window_past_the_node_frame_ceiling():
+    """Refused here rather than by ComfyUI, which rejects the prompt after the round-trip.
+
+    `length` is capped at 3600 in the live schema; over it, `/prompt` validation returns
+    `value_bigger_than_max` and the route translates that into an opaque 502.
+    """
+    longest = 3592 / 24  # 17 * 211 + 5, the last grid point at or below the ceiling
+    assert h3_reference_payload(h3_references("picture", 1), duration=longest)[
+        "mvp:condition"
+    ]["inputs"]["length"] == H3_REFERENCE_MAX_FRAMES - 8
+
+    with pytest.raises(ValueError, match=f"{H3_REFERENCE_MAX_FRAMES}-frame maximum"):
+        h3_reference_payload(h3_references("picture", 1), duration=longest + 1)
+
+
+def test_h3_director_payload_refuses_a_window_past_the_nodes_own_maxima():
+    """The text-only path had no ceiling at all, and it is the one with live render evidence.
+
+    `MiniMaxH3DirectorCS` caps `duration_frames`, `start_frame` and `end_frame` at 10000 and
+    `start_second`/`end_second` at 1000 s. At 24 fps the frame cap binds first — about 416 s —
+    which is why the refusal names the value it would have sent rather than a single limit.
+    """
+    def director(**overrides):
+        arguments = {
+            "timeline_data": '{"segments":[]}',
+            "duration": 5.0,
+            "requested_frames": 120,
+            "seed": 0,
+            "width": 1344,
+            "height": 768,
+            "steps": 20,
+            "prefix": "p",
+        }
+        return build_h3_director_payload(**{**arguments, **overrides})
+
+    at_limit = director(duration=415.0, requested_frames=align_h3_frames(round(415 * H3_FRAME_RATE)))
+    assert at_limit["2343"]["inputs"]["end_frame"] == 9960
+
+    with pytest.raises(ValueError, match=f"duration_frames={H3_DIRECTOR_MAX_FRAMES + 1}"):
+        director(requested_frames=H3_DIRECTOR_MAX_FRAMES + 1)
+    with pytest.raises(ValueError, match="end_frame=24000"):
+        director(duration=1000.0, requested_frames=120)
+    with pytest.raises(ValueError, match="start_frame"):
+        director(start=500.0, duration=1.0)
+    assert H3_DIRECTOR_MAX_SECONDS == 1000.0
+
+
+def test_neither_h3_builder_accepts_a_window_that_is_not_a_finite_number():
+    """`inf` reaches the frame arithmetic as `OverflowError`, which no route translates.
+
+    The request models bound width, height and steps but leave `Shot.duration` open above,
+    so this is reachable from a stored plan — and it arrives as a 500 rather than a refusal.
+    """
+    for value in (float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite number of seconds"):
+            h3_reference_payload(h3_references("picture", 1), duration=value)
+        with pytest.raises(ValueError, match="finite number of seconds"):
+            build_h3_director_payload(
+                timeline_data='{"segments":[]}',
+                duration=value,
+                requested_frames=120,
+                seed=0,
+                width=1344,
+                height=768,
+                steps=20,
+                prefix="p",
+            )
+
+
+def test_h3_reference_frame_alignment_agrees_with_the_timeline_helper():
+    """Two implementations of H3's 17k+5 grid, asserted to agree instead of assumed to.
+
+    `build_h3_reference_payload` aligns inline while `timeline.align_h3_frames` is what the
+    Director path uses; they are separate arithmetic that must produce the same frame count,
+    because a reference render and a text render of the same Shot landing on different
+    lengths is an assembly-time defect nothing else would catch.
+
+    The frame rate comes from `H3_FRAME_RATE`, the constant the adapter itself converts
+    with, so this compares two *alignments* rather than quietly re-deriving the conversion
+    beside it — a rate change moves the adapter and this test together, and the grid
+    properties below still hold it to something.
+    """
+    checked = 0
+    for eighths in range(1, 1200):
+        duration = eighths / 8  # 0.125 s to 149.875 s, every eighth of a second
+        requested = max(5, round(duration * H3_FRAME_RATE))
+        expected = align_h3_frames(requested)
+        if expected > H3_REFERENCE_MAX_FRAMES:
+            continue
+        payload = h3_reference_payload(h3_references("picture", 1), duration=duration)
+        length = payload["mvp:condition"]["inputs"]["length"]
+        assert length == expected, duration
+        # Independent of both implementations: on the grid, never short of the window, and
+        # never more than one grid step longer than it needs to be.
+        assert length >= 5 and (length - 5) % 17 == 0, duration
+        assert requested <= length < requested + 17, duration
+        checked += 1
+    assert checked > 1100, checked
+
+
+def test_h3_reference_limits_and_wiring_match_the_recorded_node_schema():
+    """The adapter's constants against the schema that produced them, offline.
+
+    The live audit makes the same comparison against the running server; this is the
+    half that runs in CI, so a re-recorded fixture cannot move a bound without the
+    adapter's number moving with it.
+    """
+    object_info = recorded_object_info()
+    conditioner = object_info["MiniMaxH3ReferenceToVideo"]["input"]
+    groups = conditioner["optional"]
+    outputs = object_info["MiniMaxH3ReferenceSplitter"]["output_name"]
+
+    filled = h3_reference_payload(
+        [*h3_references("picture", 9), *h3_references("video", 3), *h3_references("audio", 3)]
+    )["mvp:condition"]["inputs"]
+    for kind, group in (
+        ("picture", "ref_images"), ("video", "ref_videos"), ("audio", "ref_audios")
+    ):
+        template = preflight.autogrow_template(groups[group])
+        prefix, maximum = template.prefix, template.maximum
+        assert maximum == H3_REFERENCE_LIMITS[kind], group
+        # At the limit the adapter fills every slot the schema offers, under the schema's
+        # own names — which pins the count and the naming to the node rather than to a guess.
+        assert {f"{group}.{prefix}{index}" for index in range(maximum)} <= set(filled), group
+
+    assert preflight.numeric_bounds(conditioner["required"]["length"])[1] == H3_REFERENCE_MAX_FRAMES
+    assert outputs[H3_SPLIT_OFFSETS["picture"]] == "picture_1"
+    assert outputs[H3_SPLIT_OFFSETS["video"]] == "video_1"
+    assert outputs[H3_SPLIT_OFFSETS["video_audio"]] == "video_audio_1"
+    assert outputs[H3_SPLIT_OFFSETS["audio"]] == "audio_1"
+    assert len(outputs) == H3_SPLIT_OFFSETS["audio"] + H3_REFERENCE_LIMITS["audio"]
+
+
+def test_recording_a_fixture_keeps_the_classes_another_audit_recorded(tmp_path: Path):
+    """The discipline that keeps `UNRECORDED_CLASSES` honest: recording merges.
+
+    Two audits share one fixture. The recorder used to write a subset derived from its own
+    payloads, so the second audit to run would delete the first's coverage — and the ledger
+    of what is *not* covered would go stale in the direction that looks safe, because the
+    offline checks would simply stop range-checking the dropped classes.
+    """
+    fixture = tmp_path / "object_info.json"
+    fixture.write_text(json.dumps({"M3SongPlanner": {"input": {}}}), encoding="utf-8")
+    live = {"M3SongPlanner": {"input": {"required": {}}}, "MiniMaxH3MediaLoader": {"input": {}}}
+
+    recorded_names = preflight.record_fixture(live, ["MiniMaxH3MediaLoader"], path=fixture)
+
+    recorded = json.loads(fixture.read_text(encoding="utf-8"))
+    assert recorded_names.added == ["MiniMaxH3MediaLoader"]
+    assert recorded_names.changed == []
+    assert recorded_names.classes == ["M3SongPlanner", "MiniMaxH3MediaLoader"]
+    assert set(recorded) == {"M3SongPlanner", "MiniMaxH3MediaLoader"}
+    # A class the audit did not name keeps the entry it already had rather than being
+    # refreshed from a live server the audit never validated it against.
+    assert recorded["M3SongPlanner"] == {"input": {}}
+    with pytest.raises(KeyError, match="not in /object_info"):
+        preflight.record_fixture(live, ["NotInstalled"], path=fixture)
+
+
+def test_every_h3_audit_variant_validates_against_the_recorded_object_info():
+    """Every variant the live audit builds, checked offline against the recorded schema."""
+    object_info = recorded_object_info()
+
+    for label, payload in preflight_h3_ultra.audit_payloads():
+        assert preflight.validate(label, payload, object_info) == [], label
+        assert preflight.unbounded_numeric_inputs(label, payload, object_info) == [], label
+
+
+def test_autogrow_slots_are_understood_and_an_index_past_the_group_is_named():
+    """The first of the two shapes that made this validator lie about a correct graph.
+
+    `ref_images.ref_image_0` is not a schema key — the schema publishes the `ref_images`
+    group's template and index range instead — so a literal name check reported every
+    attached reference as an input that does not exist. It must accept the slots the
+    template describes and reject only an index past its maximum.
+    """
+    object_info = recorded_object_info()
+    payload = h3_reference_payload(h3_references("picture", 9))
+
+    assert preflight.validate("full", payload, object_info) == []
+
+    conditioner = payload["mvp:condition"]["inputs"]
+    conditioner["ref_images.ref_image_9"] = ["mvp:split", 9]
+    conditioner["ref_images.ref_image_x"] = ["mvp:split", 0]
+    problems = preflight.validate("overflow", payload, object_info)
+
+    assert any(
+        "'ref_images.ref_image_9' is slot 9, past ref_images's maximum of 9 slots (0-8)" in problem
+        for problem in problems
+    ), problems
+    assert any(
+        "'ref_images.ref_image_x' does not exist in the schema" in problem for problem in problems
+    ), problems
+    # The group name itself is never fed, so demanding it would be a third false failure.
+    assert not any("required input 'ref_" in problem for problem in problems), problems
+
+
+def test_format_conditional_inputs_are_read_from_the_selected_format():
+    """The second shape: `VHS_VideoCombine` publishes `crf` and friends under `format`.
+
+    They live in `format`'s options dict keyed by the selected format, so a name check
+    reading only `required`/`optional` reported four inputs of a correct save node as
+    absent — and `crf` resolved no bounds, leaving its 0-100 range unchecked. Selecting
+    a different format has to change which inputs exist, or the merge is not reading the
+    selection at all.
+    """
+    object_info = recorded_object_info()
+    payload = h3_reference_payload(h3_references("picture", 1))
+    save = payload["mvp:save"]["inputs"]
+
+    assert preflight.validate("h264", payload, object_info) == []
+
+    save["crf"] = 101
+    assert any(
+        "crf=101" in problem and "above the schema maximum 100" in problem
+        for problem in preflight.validate("crf", payload, object_info)
+    )
+    save["crf"] = 19
+    save["pix_fmt"] = "yuv420p12le"
+    assert any(
+        "pix_fmt='yuv420p12le' not in combo options" in problem
+        for problem in preflight.validate("pix_fmt", payload, object_info)
+    )
+
+    save["pix_fmt"] = "yuv420p"
+    save["format"] = "video/ffv1-mkv"
+    problems = preflight.validate("ffv1", payload, object_info)
+    assert any(
+        "input 'crf' does not exist in the schema" in problem for problem in problems
+    ), problems
+    # `pix_fmt` survives the format change because ffv1-mkv declares one too; `crf` does not.
+    assert not any("pix_fmt" in problem for problem in problems), problems
+
+
+# --- The audit's own logic, driven directly -------------------------------------------
+#
+# Everything below exists because the audit could be gutted while the suite stayed green:
+# `unbounded_numeric_inputs` could return `[]`, `run_audit` could record a *failing* audit
+# over the shared fixture, and each `check_*` could be dropped from the wired tuple, with
+# nothing failing. A pre-flight nothing tests is a pre-flight whose verdict means nothing.
+
+
+def tiny_schema(**inputs) -> dict:
+    """One registered class with the given required inputs and one output."""
+    return {"Tiny": {"input": {"required": inputs}, "output": ["IMAGE"]}}
+
+
+def tiny_payload(**values) -> dict:
+    return {"n1": {"class_type": "Tiny", "inputs": values}}
+
+
+def test_the_unbounded_check_names_an_input_whose_bounds_disappeared():
+    """The positive direction. The check's whole purpose is to fail when a bound vanishes.
+
+    Asserting only that it returns `[]` for today's payloads passes just as well for a
+    function that returns `[]` for everything — which is exactly what it was replaced with
+    to prove the gap, against a fully green suite.
+    """
+    object_info = recorded_object_info()
+    payload = build_music3_payload(caption="c", lyrics="l", duration=120, seed=0, prefix="p")
+
+    assert preflight.unbounded_numeric_inputs("bounded", payload, object_info) == []
+
+    stripped = copy.deepcopy(object_info)
+    del stripped["KSampler"]["input"]["required"]["steps"][1]["min"]
+    del stripped["KSampler"]["input"]["required"]["steps"][1]["max"]
+    gaps = preflight.unbounded_numeric_inputs("stripped", payload, stripped)
+
+    assert [gap for gap in gaps if "steps resolved no min/max" in gap], gaps
+    assert all("KSampler" in gap for gap in gaps), gaps
+    # And the range check really is a no-op for it now, which is what makes the gap a gap.
+    unbounded = build_music3_payload(caption="c", lyrics="l", duration=120, seed=0, prefix="p")
+    unbounded["50"]["inputs"]["steps"] = 10**9
+    assert preflight.validate("stripped", unbounded, stripped) == []
+
+
+def test_a_combo_option_the_audit_cannot_read_is_reported_rather_than_crashing():
+    """A V3 option dict with no `key` used to raise `KeyError` and abort the whole audit."""
+    object_info = tiny_schema(model=["COMBO", {"options": [{"key": "a.safetensors"}, {}]}])
+
+    assert preflight.combo_options(
+        object_info["Tiny"]["input"]["required"]["model"]
+    ) == ["a.safetensors", None]
+    assert preflight.validate("readable", tiny_payload(model="a.safetensors"), object_info) == []
+    problems = preflight.validate("unreadable", tiny_payload(model="b.safetensors"), object_info)
+    assert any("could not be checked" in problem for problem in problems), problems
+
+
+def test_an_unreadable_or_empty_autogrow_group_is_reported_rather_than_assumed():
+    """A template that stopped parsing would otherwise turn every fed slot into a failure."""
+    broken = tiny_schema(group=["COMFY_AUTOGROW_V3", {"template": {"min": 0, "max": 3}}])
+    problems = preflight.validate("broken", tiny_payload(**{"group.slot_0": 1}), broken)
+    assert any("cannot read" in problem for problem in problems), problems
+
+    empty = tiny_schema(
+        group=["COMFY_AUTOGROW_V3", {"template": {"prefix": "slot_", "min": 0, "max": 0}}]
+    )
+    problems = preflight.validate("empty", tiny_payload(**{"group.slot_0": 1}), empty)
+    assert any("offers no slots at all" in problem for problem in problems), problems
+    # The out-of-range message must not offer "0--1" as the acceptable range.
+    assert any("(none)" in problem for problem in problems), problems
+
+
+def test_an_autogrow_group_that_demands_slots_reports_a_payload_feeding_too_few():
+    """`min` is a slot count the node requires, and it was parsed and thrown away."""
+    schema = tiny_schema(
+        group=["COMFY_AUTOGROW_V3", {"template": {"prefix": "slot_", "min": 2, "max": 3}}]
+    )
+
+    assert preflight.validate("enough", tiny_payload(**{"group.slot_0": 1, "group.slot_1": 2}), schema) == []
+    problems = preflight.validate("too-few", tiny_payload(**{"group.slot_0": 1}), schema)
+    assert any("requires at least 2 slot(s) but 1 is fed" in problem for problem in problems), problems
+
+
+def test_a_conditional_selector_that_is_not_a_literal_is_reported():
+    """A linked or omitted `format` silently reinstates the false failures it removed.
+
+    With nothing selected there are no conditional inputs to merge, so `crf` and friends
+    read as inputs that do not exist — the exact eight-failure state, arrived at quietly.
+    """
+    schema = tiny_schema(
+        format=[["mp4"], {"formats": {"mp4": [["crf", "INT", {"min": 0, "max": 100}]]}}]
+    )
+
+    assert preflight.validate("literal", tiny_payload(format="mp4", crf=19), schema) == []
+    linked = {"n1": {"class_type": "Tiny", "inputs": {"format": ["n0", 0], "crf": 19}}}
+    problems = preflight.validate("linked", linked, {**schema, "Src": {"output": ["STRING"]}})
+    assert any("rather than a literal option" in problem for problem in problems), problems
+
+
+def test_a_conditional_input_colliding_with_a_declared_one_is_reported():
+    """Dict order would otherwise decide which spec is enforced, silently."""
+    schema = tiny_schema(
+        crf=["INT", {"min": 0, "max": 10}],
+        format=[["mp4"], {"formats": {"mp4": [["crf", "INT", {"min": 0, "max": 100}]]}}],
+    )
+
+    problems = preflight.validate("collision", tiny_payload(format="mp4", crf=50), schema)
+
+    assert any("declared by the node *and* by format='mp4'" in problem for problem in problems)
+    # The declared spec is the one enforced, and it says 50 is too big.
+    assert any("above the schema maximum 10" in problem for problem in problems), problems
+
+
+def test_a_non_finite_or_non_numeric_literal_is_reported_rather_than_raising():
+    """`inf` used to raise `OverflowError` inside the INT check and abort the audit."""
+    schema = tiny_schema(steps=["INT", {"min": 1, "max": 100}])
+
+    for value in (float("inf"), float("-inf"), float("nan")):
+        problems = preflight.validate("non-finite", tiny_payload(steps=value), schema)
+        assert any("is not a finite number" in problem for problem in problems), value
+
+    problems = preflight.validate("string", tiny_payload(steps="20"), schema)
+    assert any("is a string but the schema declares INT" in problem for problem in problems), problems
+
+
+def test_links_must_reach_a_node_in_the_payload_at_an_output_it_publishes():
+    """The error class the pre-flight exists to catch, and it checked none of it.
+
+    A payload wiring `["ghost", 0]` validated clean, and so did an index past the target's
+    output list — the second being the one that costs a whole render to discover, because
+    ComfyUI runs the graph and hands the model someone else's media.
+    """
+    object_info = recorded_object_info()
+    payload = h3_reference_payload(h3_references("picture", 1))
+
+    assert preflight.validate("wired", payload, object_info) == []
+
+    payload["mvp:condition"]["inputs"]["clip"] = ["ghost", 0]
+    payload["mvp:condition"]["inputs"]["vae"] = ["mvp:video_vae", 7]
+    problems = preflight.validate("dangling", payload, object_info)
+
+    assert any(
+        "clip links to node 'ghost', which is not in this payload" in problem
+        for problem in problems
+    ), problems
+    assert any(
+        "vae links to output 7 of mvp:video_vae (VAELoader), which publishes 1 output(s)" in problem
+        for problem in problems
+    ), problems
+
+
+def test_the_h3_split_indices_are_checked_against_the_splitters_real_output_count():
+    """The wrong-slot risk `H3_SPLIT_OFFSETS` names, caught generically rather than per node."""
+    object_info = recorded_object_info()
+    payload = h3_reference_payload(h3_references("audio", 1))
+
+    payload["mvp:condition"]["inputs"]["ref_audios.ref_audio_0"] = ["mvp:split", 18]
+
+    assert any(
+        "links to output 18 of mvp:split" in problem
+        for problem in preflight.validate("past-the-end", payload, object_info)
+    )
+
+
+def test_recording_a_fixture_reports_a_changed_entry_and_not_only_a_new_one():
+    """A moved bound on an already-recorded class is written in, so it must be reported.
+
+    Only reporting *added* names is how a re-record silently changes what every offline
+    test asserts: the class was already there, so nothing in the output changes, while the
+    schema the tests validate against just moved.
+    """
+    fixture = REPO_ROOT / "tests/fixtures/object_info.json"
+    recorded = json.loads(fixture.read_text(encoding="utf-8"))
+    moved = copy.deepcopy(recorded)
+    moved["M3SongPlanner"]["input"]["required"]["duration_seconds"][1]["max"] = 600.0
+    target = Path(tempfile.mkdtemp()) / "object_info.json"
+    target.write_text(json.dumps(recorded, indent=2, sort_keys=True), encoding="utf-8")
+
+    result = preflight.record_fixture(moved, ["M3SongPlanner", "KSampler"], path=target)
+
+    assert result.added == []
+    assert result.changed == ["M3SongPlanner"]
+    assert json.loads(target.read_text(encoding="utf-8"))["M3SongPlanner"] == moved["M3SongPlanner"]
+
+
+def test_a_corrupt_fixture_fails_by_name_instead_of_as_a_json_error(tmp_path: Path):
+    """Half-written or hand-edited, it must say which file and why."""
+    broken = tmp_path / "object_info.json"
+    broken.write_text('{"M3SongPlanner": {"input": ', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="is not readable JSON"):
+        preflight.read_fixture(broken)
+    with pytest.raises(ValueError, match="is not readable JSON"):
+        preflight.record_fixture({"Tiny": {}}, ["Tiny"], path=broken)
+
+    broken.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="not an object of classes"):
+        preflight.read_fixture(broken)
+
+
+def test_parse_arguments_refuses_an_argument_that_is_not_a_base_url(monkeypatch):
+    """A typo used to become the base URL, so `--recrod` failed as a connection error."""
+    monkeypatch.delenv("MVP_COMFY_URL", raising=False)
+
+    assert preflight.parse_arguments([]) == (preflight.DEFAULT_BASE_URL, False)
+    assert preflight.parse_arguments(["--record"]) == (preflight.DEFAULT_BASE_URL, True)
+    assert preflight.parse_arguments(["http://host:9/"]) == ("http://host:9", False)
+    monkeypatch.setenv("MVP_COMFY_URL", "http://elsewhere:1")
+    assert preflight.parse_arguments([]) == ("http://elsewhere:1", False)
+
+    for argv in (["--recrod"], ["127.0.0.1:8188"], ["http://a", "http://b"]):
+        with pytest.raises(SystemExit) as refused:
+            preflight.parse_arguments(argv)
+        assert "usage:" in str(refused.value), argv
+
+
+def stub_server(object_info: dict):
+    def fetch(base_url: str) -> dict:
+        assert base_url
+        return object_info
+
+    return fetch
+
+
+def test_run_audit_records_only_after_the_audit_passes(tmp_path: Path, capsys):
+    """`run_audit` was executed by nothing but the two scripts.
+
+    Moving the record block above the failure guard — which makes a *failing* audit
+    overwrite the shared fixture, the outcome the docstring and OPERATIONS.md name as the
+    reason for the ordering — kept the whole suite green. So did deleting the line that
+    folds each adapter's `checks` into the problem list, which makes the H3 audit print
+    `OK` while performing none of its comparisons.
+    """
+    object_info = recorded_object_info()
+    fixture = tmp_path / "object_info.json"
+    fixture.write_text('{"Existing": {"input": {}}}\n', encoding="utf-8")
+    before = fixture.read_bytes()
+    clean = [("clean", h3_reference_payload(h3_references("picture", 1)))]
+    broken = copy.deepcopy(clean[0][1])
+    broken["mvp:condition"]["inputs"]["width"] = 10**9
+
+    with pytest.raises(SystemExit) as failed:
+        preflight.run_audit(
+            [("broken", broken)],
+            base_url="http://stub",
+            record=True,
+            fetch=stub_server(object_info),
+            fixture_path=fixture,
+        )
+    assert failed.value.code == 1
+    assert "Fixture NOT recorded" in capsys.readouterr().out
+    assert fixture.read_bytes() == before
+
+    # A failing adapter check must fail the audit exactly like a payload problem does.
+    with pytest.raises(SystemExit):
+        preflight.run_audit(
+            clean,
+            base_url="http://stub",
+            record=True,
+            checks=(lambda info: ["the adapter disagrees with the schema"],),
+            fetch=stub_server(object_info),
+            fixture_path=fixture,
+        )
+    assert "the adapter disagrees" in capsys.readouterr().out
+    assert fixture.read_bytes() == before
+
+    preflight.run_audit(
+        clean,
+        base_url="http://stub",
+        record=True,
+        checks=(lambda info: [],),
+        fetch=stub_server(object_info),
+        fixture_path=fixture,
+    )
+    output = capsys.readouterr().out
+    recorded = json.loads(fixture.read_text(encoding="utf-8"))
+
+    assert "OK 18 nodes across 1 variants" in output
+    assert "Existing" in recorded, "recording merged rather than overwrote"
+    assert "MiniMaxH3ReferenceToVideo" in recorded
+
+
+def test_run_audit_refuses_an_empty_variant_list_and_an_unreachable_server(capsys):
+    """"OK 0 nodes across 0 variants" is not a pass — it is an audit that ran nothing."""
+    with pytest.raises(SystemExit) as empty:
+        preflight.run_audit([], base_url="http://stub", record=False, fetch=stub_server({}))
+    assert empty.value.code == 1
+    assert "no payload variants" in capsys.readouterr().out
+
+    def unreachable(base_url: str) -> dict:
+        raise OSError("connection refused")
+
+    with pytest.raises(SystemExit):
+        preflight.run_audit(
+            [("v", h3_reference_payload(h3_references("picture", 1)))],
+            base_url="http://stub",
+            record=False,
+            fetch=unreachable,
+        )
+    assert "could not read http://stub/object_info" in capsys.readouterr().out
+
+
+def test_the_h3_audit_wires_every_check_it_defines():
+    """A check deleted from the tuple keeps passing its own test while the audit stops running it."""
+    assert set(preflight_h3_ultra.CHECKS) == {
+        preflight_h3_ultra.check_reference_limits,
+        preflight_h3_ultra.check_split_offsets,
+        preflight_h3_ultra.check_frame_ceilings,
+        preflight_h3_ultra.check_model_files,
+        preflight_h3_ultra.check_request_bounds,
+    }
+    assert len(preflight_h3_ultra.CHECKS) == 5
+
+
+def test_each_h3_check_passes_the_real_schema_and_names_a_moved_one():
+    """Both directions for every check, against a schema mutated one bound at a time.
+
+    The nearest thing before this re-implemented one comparison inline against the
+    *fixture*, which only changes when someone re-records — so it pinned the adapter to a
+    file rather than to the server, and the check functions themselves ran nowhere.
+    """
+    schema = recorded_object_info()
+    for check in preflight_h3_ultra.CHECKS:
+        assert check(schema) == [], check.__name__
+
+    limits = copy.deepcopy(schema)
+    limits["MiniMaxH3ReferenceToVideo"]["input"]["optional"]["ref_images"][1]["template"]["max"] = 8
+    assert any(
+        "ref_images offers 8 slots" in problem
+        for problem in preflight_h3_ultra.check_reference_limits(limits)
+    )
+    # A group promoted from `optional` to `required` upstream is a schema change to notice,
+    # not one that should make the check report a false failure.
+    promoted = copy.deepcopy(schema)
+    inputs = promoted["MiniMaxH3ReferenceToVideo"]["input"]
+    inputs["required"]["ref_images"] = inputs["optional"].pop("ref_images")
+    assert preflight_h3_ultra.check_reference_limits(promoted) == []
+
+    outputs = copy.deepcopy(schema)
+    names = outputs["MiniMaxH3ReferenceSplitter"]["output_name"]
+    names[9], names[15] = names[15], names[9]
+    assert any(
+        "rather than 'video_1'" in problem
+        for problem in preflight_h3_ultra.check_split_offsets(outputs)
+    )
+
+    ceiling = copy.deepcopy(schema)
+    ceiling["MiniMaxH3DirectorCS"]["input"]["required"]["end_frame"][1]["max"] = 5000
+    assert any(
+        "MiniMaxH3DirectorCS.end_frame declares a maximum of 5000" in problem
+        for problem in preflight_h3_ultra.check_frame_ceilings(ceiling)
+    )
+
+    models = copy.deepcopy(schema)
+    # `VAELoader` is a classic node: its options are the inline list at spec[0].
+    models["VAELoader"]["input"]["required"]["vae_name"][0] = [
+        option
+        for option in models["VAELoader"]["input"]["required"]["vae_name"][0]
+        if "minimax_h3_video_vae" not in str(option)
+    ]
+    assert any(
+        "minimax_h3_video_vae_fp16.safetensors is not installed" in problem
+        for problem in preflight_h3_ultra.check_model_files(models)
+    )
+
+    request = copy.deepcopy(schema)
+    request["BasicScheduler"]["input"]["required"]["steps"][1]["max"] = 10
+    assert any(
+        "H3Request.steps accepts 100" in problem
+        for problem in preflight_h3_ultra.check_request_bounds(request)
+    )
+
+
+def test_the_h3_audit_covers_both_h3_graphs():
+    """The text-only Director graph is the one H3 path with live render evidence.
+
+    It was audited by nothing: `MiniMaxH3DirectorCS` was in no audited payload, so its
+    literals were range-checked neither live nor offline, and the two graphs share every
+    loader and sampler class — a model file renamed under one is renamed under both.
+    """
+    classes = {
+        node["class_type"]
+        for _, payload in preflight_h3_ultra.audit_payloads()
+        for node in payload.values()
+    }
+
+    assert {"MiniMaxH3DirectorCS", "MiniMaxH3ReferenceToVideo"} <= classes
+    assert classes <= set(recorded_object_info()), classes - set(recorded_object_info())
+
+
+def test_the_h3_audit_reads_its_model_files_out_of_the_payloads():
+    """Restating the filenames would leave a renamed loader confirming the old file.
+
+    The four are asserted by name here — that is the audit's headline claim — but the
+    *audit* derives them from what the payloads actually load, so a repointed loader
+    changes what is checked instead of being checked against a stale literal.
+    """
+    files = preflight_h3_ultra.model_files(preflight_h3_ultra.audit_payloads())
+
+    assert {filename for _, _, filename in files} == {
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        "minimax_h3_video_vae_fp16.safetensors",
+        "minimax_h3_audio_vae_fp32.safetensors",
+    }
+    assert {class_type for class_type, _, _ in files} == {"UNETLoader", "CLIPLoader", "VAELoader"}
+
+
+def test_the_h3_audit_variants_reach_both_ends_of_every_request_bound():
+    """A single safe midpoint satisfies the schema wherever the bound moves.
+
+    All five original variants sent 1280x720x20 steps, so the range check on those inputs
+    would have passed unchanged if the node had halved its maximum — the check existed and
+    proved nothing.
+    """
+    conditioners = [
+        node["inputs"]
+        for _, payload in preflight_h3_ultra.audit_payloads()
+        for node in payload.values()
+        if node["class_type"] in {"MiniMaxH3ReferenceToVideo", "MiniMaxH3DirectorCS"}
+    ]
+    widths = {inputs.get("width", inputs.get("custom_width")) for inputs in conditioners}
+    schedulers = {
+        node["inputs"]["steps"]
+        for _, payload in preflight_h3_ultra.audit_payloads()
+        for node in payload.values()
+        if node["class_type"] == "BasicScheduler"
+    }
+
+    for field, seen in (("width", widths), ("steps", schedulers)):
+        assert preflight_h3_ultra.request_bound(field, "Ge") in seen, field
+        assert preflight_h3_ultra.request_bound(field, "Le") in seen, field
 
 
 def test_ltx25_reference_patch_normalizes_seedvr2_frames_before_vae():

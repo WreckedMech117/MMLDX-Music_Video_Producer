@@ -136,6 +136,8 @@ This path is verified live. On 2026-08-16 a 3.75 s window at 640×384 and 4 step
 - Attached asset order determines `<Picture N>`, `<Video N>`, and `<Audio N>` numbering. Stable labels are compiled into the prompt, and the project master song can be included as a standalone audio reference.
 - Local paths are resolved only from contained project media or contained ComfyUI output.
 - `ref_image_size=match` is the default. `max` remains available for higher identity fidelity at substantially higher cost.
+- **Frame ceiling:** `MiniMaxH3ReferenceToVideo.length` is `min 5, max 3600` — exactly 150 s at 24 fps. Note the node's own tooltip puts its **trained** range at roughly 124–362 frames (about 5–15 s), so a window between 362 and 3600 frames is accepted by validation while being far outside what the model was trained for; the adapter refuses only the hard maximum. The adapter refuses above it locally as a 422 rather than letting ComfyUI reject the prompt at validation time and surface as an opaque 502. The nine/three/three limits and the `mvp:split` output indices are likewise the node's own — the autogrow maxima of `ref_images`/`ref_videos`/`ref_audios`, and the splitter's `picture_1…9`, `video_1…3`, `video_audio_1…3`, `audio_1…3` outputs.
+- **Pre-flight:** `tests/preflight_h3_ultra.py` audits five payload variants, the four model files, and those constants against live `/object_info`; it passed on 2026-08-17 (`OK 90 nodes across 5 variants (17 classes)`). It reads combo options from `[1]["options"]`, expands `COMFY_AUTOGROW_V3` groups into their numbered slots, and merges `VHS_VideoCombine`'s format-conditional inputs — without the last two it reported eight failures on a correct graph. No graph is submitted; the audit is not evidence of a render.
 
 ## Vision continuity inspection
 
@@ -189,6 +191,6 @@ The Director's saved editor workflow was repaired in place on 2026-08-17: node `
 | Krea multiview | yes | yes | yes | one-step sheet previously | yes |
 | Director compile | yes | start/length timing | yes | live compiler accepts timing scaffold | timeline only |
 | H3 text-only shot render | yes | explicit 15-node adapter | yes | **live render verified end to end 2026-08-16** | yes |
-| H3 Ultra reference/audio shot | yes | explicit 18-node adapter | yes | live schema/classes and real vision path verified | yes |
+| H3 Ultra reference/audio shot | yes | explicit 18-node adapter | yes | **schema-audited live 2026-08-17** by `tests/preflight_h3_ultra.py` — all 17 classes, 4 model files, limits and wiring confirmed; **no render has ever been submitted** | yes |
 | LTX 2.5 enhance | yes | combined export audited + boundary patch | yes | **full reference chain ran clean live 2026-08-17**; boundary passed at 1248×704 | no |
 | SeedVR2/RTX/FILM | yes | pending | no | **all three stages ran live 2026-08-17** inside the reference chain | no |

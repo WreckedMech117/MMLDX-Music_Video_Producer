@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
@@ -41,6 +42,11 @@ def build_director_timeline(
 ) -> DirectorTimeline:
     if window_start < 0 or window_duration <= 0 or fps <= 0:
         raise TimelineError("Timeline window and fps must be positive")
+    # `inf` and `nan` clear the positivity check above and then raise `OverflowError` or
+    # `ValueError` inside `round()`, which is not `TimelineError`, so the route's refusal
+    # translation misses them and a client sees a 500 for a window it was allowed to send.
+    if not math.isfinite(window_start) or not math.isfinite(window_duration):
+        raise TimelineError("Timeline window must be a finite number of seconds")
     ordered = sorted(shots, key=lambda shot: shot.start)
     for previous, current in pairwise(ordered):
         if current.start < previous.end - 1e-6:

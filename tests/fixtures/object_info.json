@@ -1,4 +1,134 @@
 {
+  "BasicGuider": {
+    "api_node": false,
+    "category": "model/sampling/guiders",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "Basic Guider",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "conditioning": [
+          "CONDITIONING",
+          {}
+        ],
+        "model": [
+          "MODEL",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "model",
+        "conditioning"
+      ]
+    },
+    "is_input_list": false,
+    "name": "BasicGuider",
+    "output": [
+      "GUIDER"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "GUIDER"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_custom_sampler",
+    "search_aliases": null
+  },
+  "BasicScheduler": {
+    "api_node": false,
+    "category": "model/sampling/schedulers",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "denoise": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 1.0,
+            "min": 0.0,
+            "step": 0.01
+          }
+        ],
+        "model": [
+          "MODEL",
+          {}
+        ],
+        "scheduler": [
+          "COMBO",
+          {
+            "multiselect": false,
+            "options": [
+              "simple",
+              "sgm_uniform",
+              "karras",
+              "exponential",
+              "ddim_uniform",
+              "beta",
+              "normal",
+              "linear_quadratic",
+              "kl_optimal",
+              "bong_tangent",
+              "beta57"
+            ]
+          }
+        ],
+        "steps": [
+          "INT",
+          {
+            "default": 20,
+            "max": 10000,
+            "min": 1
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "model",
+        "scheduler",
+        "steps",
+        "denoise"
+      ]
+    },
+    "is_input_list": false,
+    "name": "BasicScheduler",
+    "output": [
+      "SIGMAS"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "SIGMAS"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_custom_sampler",
+    "search_aliases": null
+  },
   "CLIPLoader": {
     "category": "model/loaders",
     "description": "Recipes:\nsd: clip-l\nstable cascade: clip-g\nsd3: t5 xxl / clip-g / clip-l\nstable audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\nhidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B\njoyimage: qwen3-vl 8B\nlens: gpt-oss-20b\npixeldit: gemma 2 2B elm\nminimax: MiniMax H3 Qwen3-VL or Music3 Qwen/RVQ",
@@ -392,6 +522,116 @@
       "img2img"
     ]
   },
+  "KSamplerSelect": {
+    "api_node": false,
+    "category": "model/sampling/samplers",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "sampler_name": [
+          "COMBO",
+          {
+            "multiselect": false,
+            "options": [
+              "euler",
+              "euler_cfg_pp",
+              "euler_ancestral",
+              "euler_ancestral_cfg_pp",
+              "heun",
+              "heunpp2",
+              "exp_heun_2_x0",
+              "exp_heun_2_x0_sde",
+              "dpm_2",
+              "dpm_2_ancestral",
+              "lms",
+              "dpm_fast",
+              "dpm_adaptive",
+              "dpmpp_2s_ancestral",
+              "dpmpp_2s_ancestral_cfg_pp",
+              "dpmpp_sde",
+              "dpmpp_sde_gpu",
+              "dpmpp_2m",
+              "dpmpp_2m_cfg_pp",
+              "dpmpp_2m_sde",
+              "dpmpp_2m_sde_gpu",
+              "dpmpp_2m_sde_heun",
+              "dpmpp_2m_sde_heun_gpu",
+              "dpmpp_3m_sde",
+              "dpmpp_3m_sde_gpu",
+              "ddpm",
+              "lcm",
+              "ipndm",
+              "ipndm_v",
+              "deis",
+              "res_multistep",
+              "res_multistep_cfg_pp",
+              "res_multistep_ancestral",
+              "res_multistep_ancestral_cfg_pp",
+              "gradient_estimation",
+              "gradient_estimation_cfg_pp",
+              "er_sde",
+              "seeds_2",
+              "seeds_3",
+              "sa_solver",
+              "sa_solver_pece",
+              "ddim",
+              "uni_pc",
+              "uni_pc_bh2",
+              "legacy_rk",
+              "rk",
+              "rk_beta",
+              "deis_3m_ode",
+              "deis_2m_ode",
+              "deis_3m",
+              "deis_2m",
+              "res_6s_ode",
+              "res_5s_ode",
+              "res_3s_ode",
+              "res_2s_ode",
+              "res_3m_ode",
+              "res_2m_ode",
+              "res_6s",
+              "res_5s",
+              "res_3s",
+              "res_2s",
+              "res_3m",
+              "res_2m"
+            ]
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "sampler_name"
+      ]
+    },
+    "is_input_list": false,
+    "name": "KSamplerSelect",
+    "output": [
+      "SAMPLER"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "SAMPLER"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_custom_sampler",
+    "search_aliases": null
+  },
   "M3SongPlanner": {
     "api_node": false,
     "category": "M3/SongPlanner",
@@ -606,6 +846,837 @@
       "music3"
     ]
   },
+  "MiniMaxH3DirectorCS": {
+    "api_node": false,
+    "category": "MiniMax H3",
+    "deprecated": false,
+    "description": "Visual timeline for MiniMax H3. Segments become a storyboard prompt with [0s-1.5s] shot markers, timeline images become first/last keyframes (fl2va) or <Picture i> references (ref2va), the reference-video track becomes <Video k>, and audio clips become <Audio j> plus a muxable audio output. Retake Mode regenerates a marked range of a base video between its own surrounding frames.",
+    "dev_only": false,
+    "display_name": "MiniMax H3 Director",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "audio_vae": [
+          "VAE",
+          {
+            "tooltip": "minimax_h3_audio_vae. Only needed when audio references are used (ref2va)."
+          }
+        ],
+        "custom_height": [
+          "INT",
+          {
+            "default": 0,
+            "max": 8192,
+            "min": 0,
+            "step": 1,
+            "tooltip": "Output height. See custom_width."
+          }
+        ],
+        "custom_width": [
+          "INT",
+          {
+            "default": 0,
+            "max": 8192,
+            "min": 0,
+            "step": 1,
+            "tooltip": "Output width. With height set too this is a BOX: 'maintain aspect ratio' keeps the first image's aspect inside it. 0 = derive from the image."
+          }
+        ],
+        "display_mode": [
+          "COMBO",
+          {
+            "default": "seconds",
+            "multiselect": false,
+            "options": [
+              "frames",
+              "seconds"
+            ],
+            "tooltip": "Show the ruler and segment ranges in frames or seconds."
+          }
+        ],
+        "divisible_by": [
+          "INT",
+          {
+            "default": 32,
+            "max": 256,
+            "min": 1,
+            "step": 1,
+            "tooltip": "Snap output dimensions to this multiple. H3 needs 32."
+          }
+        ],
+        "duration": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "forceInput": true,
+            "tooltip": "Automation (connection-only). Render length in SECONDS."
+          }
+        ],
+        "end": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "forceInput": true,
+            "tooltip": "Automation (connection-only). Window end in SECONDS."
+          }
+        ],
+        "frame_rate": [
+          "FLOAT",
+          {
+            "default": 24,
+            "max": 240,
+            "min": 1,
+            "step": 1,
+            "tooltip": "Timeline editing rate. Output is always 24 fps; times are converted via seconds."
+          }
+        ],
+        "global_prompt": [
+          "STRING",
+          {
+            "default": "",
+            "forceInput": true,
+            "multiline": true,
+            "tooltip": "Conditions the whole video: style, scene, characters. Written above the storyboard."
+          }
+        ],
+        "height": [
+          "INT",
+          {
+            "default": 0,
+            "forceInput": true,
+            "tooltip": "Automation (connection-only). Output height. See width."
+          }
+        ],
+        "img_compression": [
+          "INT",
+          {
+            "default": 0,
+            "max": 100,
+            "min": 0,
+            "step": 1,
+            "tooltip": "H.264 CRF baked into each keyframe. 0 = off (recommended for H3)."
+          }
+        ],
+        "inpaint_audio": [
+          "BOOLEAN",
+          {
+            "default": true,
+            "tooltip": "Unused on H3 \u2014 audio is generated jointly with the video and cannot be inpainted."
+          }
+        ],
+        "model": [
+          "MODEL",
+          {
+            "display_name": "model (t2v/i2v)",
+            "lazy": true,
+            "tooltip": "The fl2va weights (minimax_h3_fl2va_*), used when the toolbar is on 'Refs OFF'. Connect both models and the node loads whichever the toolbar switch calls for \u2014 the other one is never read from disk."
+          }
+        ],
+        "model_ref2va": [
+          "MODEL",
+          {
+            "display_name": "model (ref2v)",
+            "lazy": true,
+            "tooltip": "The ref2va weights (minimax_h3_ref2va_*), used when the toolbar is on 'Refs ON'. Optional \u2014 with only one model connected that one is used either way."
+          }
+        ],
+        "override_audio": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Use the reference video's own soundtrack as the timeline audio."
+          }
+        ],
+        "ref_image_notes": [
+          "STRING",
+          {
+            "default": "",
+            "multiline": true,
+            "tooltip": "One line per image on 'ref_images', describing what it is: 'the kitchen set', 'a storyboard reference for the opening'. Without a line the picture is still numbered but the prompt says nothing about it. Blank lines count, so line 3 always belongs to the third image."
+          }
+        ],
+        "ref_image_size": [
+          "COMBO",
+          {
+            "default": "match",
+            "multiselect": false,
+            "options": [
+              "match",
+              "max"
+            ],
+            "tooltip": "ref2va only. 'match' scales references to the output pixel area (fast); 'max' keeps a 2048 px short edge for identity, at real speed cost."
+          }
+        ],
+        "ref_images": [
+          "IMAGE",
+          {
+            "tooltip": "Extra <Picture i> references (single image or batch), appended after the character slots. ref2va only."
+          }
+        ],
+        "resize_method": [
+          "COMBO",
+          {
+            "default": "crop",
+            "multiselect": false,
+            "options": [
+              "maintain aspect ratio",
+              "stretch to fit",
+              "pad",
+              "pad green",
+              "crop"
+            ],
+            "tooltip": "How timeline images are fitted to the output canvas."
+          }
+        ],
+        "shift_audio": [
+          "FLOAT",
+          {
+            "default": 3.0,
+            "max": 100.0,
+            "min": 0.01,
+            "step": 0.01,
+            "tooltip": "Audio flow sigma shift (H3 default 3.0)."
+          }
+        ],
+        "shift_video": [
+          "FLOAT",
+          {
+            "default": 12.0,
+            "max": 100.0,
+            "min": 0.01,
+            "step": 0.01,
+            "tooltip": "Video flow sigma shift (H3 default 12.0)."
+          }
+        ],
+        "start": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "forceInput": true,
+            "tooltip": "Automation (connection-only). Window start in SECONDS."
+          }
+        ],
+        "use_custom_audio": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "ON: timeline audio clips are used as <Audio j> references (ref2va). The mixdown is always available on combined_audio regardless."
+          }
+        ],
+        "use_custom_motion": [
+          "BOOLEAN",
+          {
+            "default": true,
+            "tooltip": "ON: the reference-video track feeds <Video k> references (ref2va)."
+          }
+        ],
+        "width": [
+          "INT",
+          {
+            "default": 0,
+            "forceInput": true,
+            "tooltip": "Automation (connection-only). Output width in pixels, overriding the settings panel's Width. Wire a resolution node here; leave it unconnected to use the panel."
+          }
+        ]
+      },
+      "required": {
+        "clip": [
+          "CLIP",
+          {
+            "tooltip": "Qwen3-VL-32B MiniMax text encoder (CLIPLoader type 'minimax')."
+          }
+        ],
+        "duration_frames": [
+          "INT",
+          {
+            "default": 120,
+            "max": 10000,
+            "min": 1,
+            "step": 1,
+            "tooltip": "Render length in timeline frames (at the timeline's frame_rate)."
+          }
+        ],
+        "duration_seconds": [
+          "FLOAT",
+          {
+            "default": 5.0,
+            "max": 1000.0,
+            "min": 0.1,
+            "step": 0.01,
+            "tooltip": "Render length in seconds. Snapped up to H3's 17k+5 frame grid at 24 fps."
+          }
+        ],
+        "end_frame": [
+          "INT",
+          {
+            "default": 120,
+            "max": 10000,
+            "min": 1,
+            "step": 1,
+            "tooltip": "End of the render window, in timeline frames."
+          }
+        ],
+        "end_second": [
+          "FLOAT",
+          {
+            "default": 5.0,
+            "max": 1000.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "End of the render window, in seconds."
+          }
+        ],
+        "guide_strength": [
+          "STRING",
+          {
+            "default": "",
+            "multiline": false,
+            "tooltip": "Auto-populated from the timeline editor. H3 has no per-keyframe strength, so it is ignored."
+          }
+        ],
+        "local_prompts": [
+          "STRING",
+          {
+            "default": "",
+            "multiline": true,
+            "tooltip": "Auto-populated from the timeline editor."
+          }
+        ],
+        "segment_lengths": [
+          "STRING",
+          {
+            "default": "",
+            "multiline": false,
+            "tooltip": "Auto-populated from the timeline editor (pixel-space frame counts)."
+          }
+        ],
+        "start_frame": [
+          "INT",
+          {
+            "default": 0,
+            "max": 10000,
+            "min": 0,
+            "step": 1,
+            "tooltip": "Start of the render window, in timeline frames."
+          }
+        ],
+        "start_second": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "max": 1000.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "Start of the render window, in seconds."
+          }
+        ],
+        "timeline_data": [
+          "STRING",
+          {
+            "default": "",
+            "multiline": false,
+            "tooltip": "JSON state of the timeline editor (auto-managed; do not edit by hand)."
+          }
+        ],
+        "vae": [
+          "VAE",
+          {
+            "tooltip": "minimax_h3_video_vae \u2014 encodes keyframes and references."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "model",
+        "model_ref2va",
+        "audio_vae",
+        "global_prompt",
+        "use_custom_audio",
+        "use_custom_motion",
+        "inpaint_audio",
+        "frame_rate",
+        "display_mode",
+        "custom_width",
+        "custom_height",
+        "resize_method",
+        "divisible_by",
+        "img_compression",
+        "override_audio",
+        "ref_image_size",
+        "shift_video",
+        "shift_audio",
+        "ref_images",
+        "ref_image_notes",
+        "start",
+        "end",
+        "duration",
+        "width",
+        "height"
+      ],
+      "required": [
+        "clip",
+        "vae",
+        "start_second",
+        "end_second",
+        "duration_seconds",
+        "start_frame",
+        "end_frame",
+        "duration_frames",
+        "timeline_data",
+        "local_prompts",
+        "segment_lengths",
+        "guide_strength"
+      ]
+    },
+    "is_input_list": false,
+    "name": "MiniMaxH3DirectorCS",
+    "output": [
+      "MODEL",
+      "CONDITIONING",
+      "LATENT",
+      "AUDIO",
+      "FLOAT",
+      "INT",
+      "INT",
+      "INT",
+      "STRING",
+      "STRING"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "model",
+      "positive",
+      "latent",
+      "combined_audio",
+      "fps",
+      "width",
+      "height",
+      "length",
+      "prompt",
+      "retake_info"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null,
+      "Joint video+audio latent. Wire to SamplerCustomAdvanced.",
+      "Timeline audio mixdown. Wire into CreateVideo to replace the generated audio.",
+      "Always 24.0 \u2014 H3's native output rate. Wire into CreateVideo.",
+      null,
+      null,
+      "Frame count actually generated (snapped to the 17k+5 grid).",
+      "The compiled storyboard prompt that was encoded.",
+      "JSON describing the retake window. Wire into MiniMax H3 Retake Stitch to splice the result back into the base video. Empty when retake is off."
+    ],
+    "price_badge": null,
+    "python_module": "custom_nodes.ComfyUI-MiniMaxH3-Director",
+    "search_aliases": null
+  },
+  "MiniMaxH3MediaLoader": {
+    "category": "conditioning/video_models",
+    "description": "Load MiniMax H3 reference media by drag-and-drop or file picker. Wire 'references' to the Prompt Builder, and to the Reference Splitter when you also want individual slots for MiniMaxH3ReferenceToVideo. A video's soundtrack can be split off and paired with it automatically.",
+    "display_name": "Fantastic H3 Media Loader",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "prompt": "PROMPT",
+        "unique_id": "UNIQUE_ID"
+      },
+      "required": {
+        "media_state": [
+          "STRING",
+          {
+            "default": "[]",
+            "multiline": false
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "prompt",
+        "unique_id"
+      ],
+      "required": [
+        "media_state"
+      ]
+    },
+    "is_input_list": false,
+    "name": "MiniMaxH3MediaLoader",
+    "output": [
+      "H3_REFS"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "references"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-Fantastic-MiniMaxH3-PromptBuilder",
+    "search_aliases": []
+  },
+  "MiniMaxH3ReferenceSplitter": {
+    "category": "conditioning/video_models",
+    "description": "Split a MiniMax H3 references bundle into individual picture / video / video_audio / audio slots for MiniMaxH3ReferenceToVideo.",
+    "display_name": "Fantastic H3 Reference Splitter",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "references": [
+          "H3_REFS"
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "references"
+      ]
+    },
+    "is_input_list": false,
+    "name": "MiniMaxH3ReferenceSplitter",
+    "output": [
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "IMAGE",
+      "AUDIO",
+      "AUDIO",
+      "AUDIO",
+      "AUDIO",
+      "AUDIO",
+      "AUDIO"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "picture_1",
+      "picture_2",
+      "picture_3",
+      "picture_4",
+      "picture_5",
+      "picture_6",
+      "picture_7",
+      "picture_8",
+      "picture_9",
+      "video_1",
+      "video_2",
+      "video_3",
+      "video_audio_1",
+      "video_audio_2",
+      "video_audio_3",
+      "audio_1",
+      "audio_2",
+      "audio_3"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-Fantastic-MiniMaxH3-PromptBuilder",
+    "search_aliases": []
+  },
+  "MiniMaxH3ReferenceToVideo": {
+    "api_node": false,
+    "category": "model/conditioning/minimax",
+    "deprecated": false,
+    "description": "<Picture i> / <Video k> / <Audio j> reference conditioning for MiniMax H3. Use the same tags when prompting.",
+    "dev_only": false,
+    "display_name": "MiniMax H3 Reference to Video",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "ref_audios": [
+          "COMFY_AUTOGROW_V3",
+          {
+            "template": {
+              "input": {
+                "required": {
+                  "ref_audio": [
+                    "AUDIO",
+                    {
+                      "tooltip": "Standalone reference audio"
+                    }
+                  ]
+                }
+              },
+              "max": 3,
+              "min": 0,
+              "prefix": "ref_audio_"
+            }
+          }
+        ],
+        "ref_images": [
+          "COMFY_AUTOGROW_V3",
+          {
+            "template": {
+              "input": {
+                "required": {
+                  "ref_image": [
+                    "IMAGE",
+                    {
+                      "tooltip": "Reference image (downscaled to 2048 short edge if larger, never upscaled)"
+                    }
+                  ]
+                }
+              },
+              "max": 9,
+              "min": 0,
+              "prefix": "ref_image_"
+            }
+          }
+        ],
+        "ref_video_audios": [
+          "COMFY_AUTOGROW_V3",
+          {
+            "template": {
+              "input": {
+                "required": {
+                  "ref_video_audio": [
+                    "AUDIO",
+                    {
+                      "tooltip": "Soundtrack of the same-numbered reference video"
+                    }
+                  ]
+                }
+              },
+              "max": 3,
+              "min": 0,
+              "prefix": "ref_video_audio_"
+            }
+          }
+        ],
+        "ref_videos": [
+          "COMFY_AUTOGROW_V3",
+          {
+            "template": {
+              "input": {
+                "required": {
+                  "ref_video": [
+                    "IMAGE",
+                    {
+                      "tooltip": "Reference video frames at 24 fps (2-15s)"
+                    }
+                  ]
+                }
+              },
+              "max": 3,
+              "min": 0,
+              "prefix": "ref_video_"
+            }
+          }
+        ]
+      },
+      "required": {
+        "audio_vae": [
+          "VAE",
+          {}
+        ],
+        "clip": [
+          "CLIP",
+          {}
+        ],
+        "height": [
+          "INT",
+          {
+            "default": 768,
+            "max": 16384,
+            "min": 32,
+            "step": 32
+          }
+        ],
+        "length": [
+          "INT",
+          {
+            "default": 124,
+            "max": 3600,
+            "min": 5,
+            "step": 17,
+            "tooltip": "Frame count at 24 fps, (124 = ~5s, trained range is ~124-362)"
+          }
+        ],
+        "prompt": [
+          "STRING",
+          {
+            "dynamicPrompts": true,
+            "multiline": true
+          }
+        ],
+        "ref_image_size": [
+          "COMBO",
+          {
+            "default": "match",
+            "multiselect": false,
+            "options": [
+              "match",
+              "max"
+            ],
+            "tooltip": "Reference image sizing. 'match' scales each ref (down only, keeping aspect) to the generation's pixel area; 'max' uses the reference pipeline's 2048px short edge for best identity fidelity. Reference tokens ride through every sampling step, so 'max' can be several times slower."
+          }
+        ],
+        "vae": [
+          "VAE",
+          {}
+        ],
+        "width": [
+          "INT",
+          {
+            "default": 1344,
+            "max": 16384,
+            "min": 32,
+            "step": 32
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "ref_images",
+        "ref_videos",
+        "ref_video_audios",
+        "ref_audios"
+      ],
+      "required": [
+        "clip",
+        "vae",
+        "audio_vae",
+        "prompt",
+        "width",
+        "height",
+        "length",
+        "ref_image_size"
+      ]
+    },
+    "is_input_list": false,
+    "name": "MiniMaxH3ReferenceToVideo",
+    "output": [
+      "CONDITIONING",
+      "LATENT"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "positive",
+      "LATENT"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_minimax_h3",
+    "search_aliases": null
+  },
+  "MiniMaxH3SigmaShift": {
+    "api_node": false,
+    "category": "model/patch/minimax",
+    "deprecated": false,
+    "description": "Set the video/audio flow shifts.",
+    "dev_only": false,
+    "display_name": "ModelSamplingMiniMaxH3",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "model": [
+          "MODEL",
+          {}
+        ],
+        "shift_audio": [
+          "FLOAT",
+          {
+            "default": 3.0,
+            "max": 100.0,
+            "min": 0.01,
+            "step": 0.01
+          }
+        ],
+        "shift_video": [
+          "FLOAT",
+          {
+            "default": 12.0,
+            "max": 100.0,
+            "min": 0.01,
+            "step": 0.01
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "model",
+        "shift_video",
+        "shift_audio"
+      ]
+    },
+    "is_input_list": false,
+    "name": "MiniMaxH3SigmaShift",
+    "output": [
+      "MODEL"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "MODEL"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_minimax_h3",
+    "search_aliases": [
+      "sigma shift",
+      "minimax shift"
+    ]
+  },
   "MiniMaxMusic3TextEncode": {
     "api_node": false,
     "category": "model/conditioning/minimax music",
@@ -710,6 +1781,299 @@
     ],
     "price_badge": null,
     "python_module": "comfy_extras.nodes_minimax_music",
+    "search_aliases": null
+  },
+  "ModelPreviewOverrideKJ": {
+    "api_node": false,
+    "category": "KJNodes/sampling",
+    "deprecated": false,
+    "description": "Adds a dedicated live-preview frame on this node, with overridable max resolution. Default ComfyUI preview caps at 512px; this node sends its own preview straight to a DOM widget on the node so pixel-space models (Chroma Radiance, ZImage, HiDream-O1, \u2026) can be previewed at full sampler resolution.",
+    "dev_only": false,
+    "display_name": "Model Preview Override",
+    "essentials_category": null,
+    "experimental": true,
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "unique_id": [
+          "UNIQUE_ID"
+        ]
+      },
+      "optional": {
+        "vae": [
+          "VAE",
+          {
+            "tooltip": "Optional LTX VAE for true-RGB previews. TAEHV-LTX = fast tiny decode (VAE pinned to GPU). Any other LTX VAE = full-quality decode via vae.decode() \u2014 MUCH slower per step."
+          }
+        ]
+      },
+      "required": {
+        "jpeg_quality": [
+          "INT",
+          {
+            "default": 80,
+            "max": 100,
+            "min": 30,
+            "step": 1,
+            "tooltip": "JPEG quality for the live preview transport."
+          }
+        ],
+        "max_resolution": [
+          "INT",
+          {
+            "default": 1024,
+            "max": 8192,
+            "min": 0,
+            "step": 8,
+            "tooltip": "Max preview side in pixels for the live widget. 0 = full sampler resolution (no downscale)."
+          }
+        ],
+        "model": [
+          "MODEL",
+          {
+            "tooltip": "Model to attach the preview override to."
+          }
+        ],
+        "preview_fps": [
+          "INT",
+          {
+            "default": 12,
+            "max": 60,
+            "min": 1,
+            "step": 1,
+            "tooltip": "Playback FPS for the animated WebP preview. Ignored when preview_frames=1."
+          }
+        ],
+        "preview_frames": [
+          "INT",
+          {
+            "default": 1,
+            "max": 1024,
+            "min": 1,
+            "step": 1,
+            "tooltip": "Frames to sample from each video step's latent for animated preview. 1 = single frame (current behavior, fastest). >1 = animated WebP playing back at preview_fps. Only applies to video models (5D latents); ignored for image models."
+          }
+        ],
+        "suppress_default_preview": [
+          "BOOLEAN",
+          {
+            "default": true,
+            "tooltip": "Suppress the standard sampler-node preview overlay while sampling, so only this node's frame updates. Progress bar still advances normally."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "unique_id"
+      ],
+      "optional": [
+        "vae"
+      ],
+      "required": [
+        "model",
+        "max_resolution",
+        "jpeg_quality",
+        "suppress_default_preview",
+        "preview_frames",
+        "preview_fps"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ModelPreviewOverrideKJ",
+    "output": [
+      "MODEL"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "MODEL"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      "Model with preview override attached."
+    ],
+    "price_badge": null,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": null
+  },
+  "PathchSageAttentionKJ": {
+    "category": "KJNodes/experimental",
+    "description": "Experimental node for patching attention mode. This doesn't use the model patching system and thus can't be disabled without running the node again with 'disabled' option.",
+    "display_name": "Patch Sage Attention KJ",
+    "experimental": true,
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "allow_compile": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Allow the use of torch.compile for the sage attention function, requires latest sageattn 2.2.0 or higher."
+          }
+        ]
+      },
+      "required": {
+        "model": [
+          "MODEL"
+        ],
+        "sage_attention": [
+          [
+            "disabled",
+            "auto",
+            "sageattn_qk_int8_pv_fp16_cuda",
+            "sageattn_qk_int8_pv_fp16_triton",
+            "sageattn_qk_int8_pv_fp8_cuda",
+            "sageattn_qk_int8_pv_fp8_cuda++",
+            "sageattn3",
+            "sageattn3_per_block_mean"
+          ],
+          {
+            "default": false,
+            "tooltip": "Patch the attention of the model passing through this node to use sageattn. To revert, run this node again with the disabled option. Requires the sageattention library to be installed."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "allow_compile"
+      ],
+      "required": [
+        "model",
+        "sage_attention"
+      ]
+    },
+    "is_input_list": false,
+    "name": "PathchSageAttentionKJ",
+    "output": [
+      "MODEL"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "MODEL"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": []
+  },
+  "RandomNoise": {
+    "api_node": false,
+    "category": "model/sampling/noise",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "noise_seed": [
+          "INT",
+          {
+            "control_after_generate": true,
+            "default": 0,
+            "max": 18446744073709551615,
+            "min": 0
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "noise_seed"
+      ]
+    },
+    "is_input_list": false,
+    "name": "RandomNoise",
+    "output": [
+      "NOISE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "NOISE"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_custom_sampler",
+    "search_aliases": null
+  },
+  "SamplerCustomAdvanced": {
+    "api_node": false,
+    "category": "model/sampling/custom",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "guider": [
+          "GUIDER",
+          {}
+        ],
+        "latent_image": [
+          "LATENT",
+          {}
+        ],
+        "noise": [
+          "NOISE",
+          {}
+        ],
+        "sampler": [
+          "SAMPLER",
+          {}
+        ],
+        "sigmas": [
+          "SIGMAS",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "noise",
+        "guider",
+        "sampler",
+        "sigmas",
+        "latent_image"
+      ]
+    },
+    "is_input_list": false,
+    "name": "SamplerCustomAdvanced",
+    "output": [
+      "LATENT",
+      "LATENT"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "output",
+      "denoised_output"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_custom_sampler",
     "search_aliases": null
   },
   "SaveAudioAdvanced": {
@@ -901,6 +2265,56 @@
     "python_module": "nodes",
     "search_aliases": []
   },
+  "VAEDecode": {
+    "category": "model/latent",
+    "description": "Decodes latent images back into pixel space images.",
+    "display_name": "VAE Decode",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "samples": [
+          "LATENT",
+          {
+            "tooltip": "The latent to be decoded."
+          }
+        ],
+        "vae": [
+          "VAE",
+          {
+            "tooltip": "The VAE model used for decoding the latent."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "samples",
+        "vae"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VAEDecode",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "IMAGE"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      "The decoded image."
+    ],
+    "python_module": "nodes",
+    "search_aliases": [
+      "decode",
+      "decode latent",
+      "latent to image",
+      "render latent"
+    ]
+  },
   "VAEDecodeAudio": {
     "api_node": false,
     "category": "model/latent",
@@ -1001,6 +2415,511 @@
     ],
     "output_node": false,
     "python_module": "nodes",
+    "search_aliases": []
+  },
+  "VHS_VideoCombine": {
+    "category": "Video Helper Suite \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "description": "Video Combine \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62<div style=\"font-size: 0.8em\"><div id=VHS_shortdesc>Combine an image sequence into a video</div></div><div style=\"font-size: 0.8em\"><div vhs_title=\"Inputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Inputs: <div vhs_title=\"images\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">images: The images to be turned into a video</div></div><div vhs_title=\"audio\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">audio: (optional) audio to add to the video</div></div><div vhs_title=\"meta_batch\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">meta_batch: (optional) Connect to a Meta Batch manager to divide extremely long image sequences into sub batches. See the documentation for Meta Batch Manager</div></div><div vhs_title=\"vae\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">vae: (optional) If provided, the node will take latents as input instead of images. This drastically reduces the required RAM (not VRAM) when working with long (100+ frames) sequences<div style=\"font-size: 1em\">Unlike on Load Video, this isn't always a strict upgrade over using a standalone VAE Decode.</div><div style=\"font-size: 1em\">If you have multiple Video Combine outputs, then the VAE decode will be performed for each output node increasing execution time</div><div style=\"font-size: 1em\">If you make any change to output settings on the Video Combine (such as changing the output format), the VAE decode will be performed again as the decoded result is (by design) not cached</div></div></div></div></div><div vhs_title=\"Widgets\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Widgets: <div vhs_title=\"frame_rate\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">frame_rate: The frame rate which will be used for the output video. Consider converting this to an input and connecting this to a Load Video with Video Info(Loaded)->fps. When including audio, failure to properly set this will result in audio desync</div></div><div vhs_title=\"loop_count\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">loop_count: The number of additional times the video should repeat. Can cause performance issues when used with long (100+ frames) sequences</div></div><div vhs_title=\"filename_prefix\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">filename_prefix: A prefix to add to the name of the output filename. This can include subfolders or format strings.</div></div><div vhs_title=\"format\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">format: The output format to use. Formats starting with, 'image' are saved with PIL, but formats starting with 'video' utilize the video_formats system. 'video' options require ffmpeg and selecting one frequently adds additional options to the node.</div></div><div vhs_title=\"pingpong\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">pingpong: Play the video normally, then repeat the video in reverse so that it 'pingpongs' back and forth. This is frequently used to minimize the appearance of skips on very short animations.</div></div><div vhs_title=\"save_output\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">save_output: Specifies if output files should be saved to the output folder, or the temporary output folder</div></div><div vhs_title=\"videopreview\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">videopreview: Displays a preview for the processed result. If advanced previews is enabled, the output is always converted to a format viewable from the browser. If the video has audio, it will also be previewed when moused over. Additional preview options can be accessed with right click.</div></div></div></div><div vhs_title=\"Common Format Widgets\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Common Format Widgets: <div vhs_title=\"crf\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">crf: Determines how much to prioritize quality over filesize. Numbers vary between formats, but on each format that includes it, the default value provides visually loss less output</div></div><div vhs_title=\"pix_fmt\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">pix_fmt: The pixel format to use for output. Alternative options will often have higher quality at the cost of increased file size and reduced compatibility with external software.<div style=\"font-size: 1em\"><div vhs_title=\"yuv420p\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">yuv420p: The most common and default format</div></div><div vhs_title=\"yuv420p10le\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">yuv420p10le: Use 10 bit color depth. This can improve color quality when combined with 16bit input color depth</div></div><div vhs_title=\"yuva420p\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">yuva420p: Include transparency in the output video</div></div></div></div></div><div vhs_title=\"input_color_depth\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">input_color_depth: VHS supports outputting 16bit images. While this produces higher quality output, the difference usually isn't visible without postprocessing and it significantly increases file size and processing time.</div></div><div vhs_title=\"save_metadata\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">save_metadata: Determines if metadata for the workflow should be included in the output video file</div></div></div></div></div>",
+    "display_name": "Video Combine \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "extra_pnginfo": "EXTRA_PNGINFO",
+        "prompt": "PROMPT",
+        "unique_id": "UNIQUE_ID"
+      },
+      "optional": {
+        "audio": [
+          "AUDIO"
+        ],
+        "meta_batch": [
+          "VHS_BatchManager"
+        ],
+        "vae": [
+          "VAE"
+        ]
+      },
+      "required": {
+        "filename_prefix": [
+          "STRING",
+          {
+            "default": "AnimateDiff"
+          }
+        ],
+        "format": [
+          [
+            "image/gif",
+            "image/webp",
+            "video/16bit-png",
+            "video/8bit-png",
+            "video/av1-webm",
+            "video/ffmpeg-gif",
+            "video/ffv1-mkv",
+            "video/h264-mp4",
+            "video/h265-mp4",
+            "video/nvenc_av1-mp4",
+            "video/nvenc_h264-mp4",
+            "video/nvenc_hevc-mp4",
+            "video/ProRes",
+            "video/webm"
+          ],
+          {
+            "formats": {
+              "image/webp": [
+                [
+                  "lossless",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ]
+              ],
+              "video/ProRes": [
+                [
+                  "profile",
+                  [
+                    "lt",
+                    "standard",
+                    "hq",
+                    "4444",
+                    "4444xq"
+                  ],
+                  {
+                    "default": "hq"
+                  }
+                ]
+              ],
+              "video/av1-webm": [
+                [
+                  "pix_fmt",
+                  [
+                    "yuv420p10le",
+                    "yuv420p"
+                  ]
+                ],
+                [
+                  "crf",
+                  "INT",
+                  {
+                    "default": 23,
+                    "max": 100,
+                    "min": 0,
+                    "step": 1
+                  }
+                ],
+                [
+                  "input_color_depth",
+                  [
+                    "8bit",
+                    "16bit"
+                  ]
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ]
+              ],
+              "video/ffmpeg-gif": [
+                [
+                  "dither",
+                  [
+                    "bayer",
+                    "heckbert",
+                    "floyd_steinberg",
+                    "sierra2",
+                    "sierra2_4a",
+                    "sierra3",
+                    "burkes",
+                    "atkinson",
+                    "none"
+                  ],
+                  {
+                    "default": "sierra2_4a"
+                  },
+                  "[0:v] split [a][b]; [a] palettegen=reserve_transparent=on:transparency_color=ffffff [p]; [b][p] paletteuse=dither=$val"
+                ]
+              ],
+              "video/ffv1-mkv": [
+                [
+                  "level",
+                  [
+                    "0",
+                    "1",
+                    "3"
+                  ],
+                  {
+                    "default": "3"
+                  }
+                ],
+                [
+                  "coder",
+                  [
+                    "0",
+                    "1",
+                    "2"
+                  ],
+                  {
+                    "default": "1"
+                  }
+                ],
+                [
+                  "context",
+                  [
+                    "0",
+                    "1"
+                  ],
+                  {
+                    "default": "1"
+                  }
+                ],
+                [
+                  "gop_size",
+                  "INT",
+                  {
+                    "default": 1,
+                    "max": 300,
+                    "min": 1,
+                    "step": 1
+                  }
+                ],
+                [
+                  "slices",
+                  [
+                    "4",
+                    "6",
+                    "9",
+                    "12",
+                    "16",
+                    "20",
+                    "24",
+                    "30"
+                  ],
+                  {
+                    "default": "16"
+                  }
+                ],
+                [
+                  "slicecrc",
+                  [
+                    "0",
+                    "1"
+                  ],
+                  {
+                    "default": "1"
+                  }
+                ],
+                [
+                  "pix_fmt",
+                  [
+                    "rgba64le",
+                    "bgra",
+                    "yuv420p",
+                    "yuv422p",
+                    "yuv444p",
+                    "yuva420p",
+                    "yuva422p",
+                    "yuva444p",
+                    "yuv420p10le",
+                    "yuv422p10le",
+                    "yuv444p10le",
+                    "yuv420p12le",
+                    "yuv422p12le",
+                    "yuv444p12le",
+                    "yuv420p14le",
+                    "yuv422p14le",
+                    "yuv444p14le",
+                    "yuv420p16le",
+                    "yuv422p16le",
+                    "yuv444p16le",
+                    "gray",
+                    "gray10le",
+                    "gray12le",
+                    "gray16le"
+                  ],
+                  {
+                    "default": "rgba64le"
+                  }
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ],
+                [
+                  "trim_to_audio",
+                  "BOOLEAN",
+                  {
+                    "default": false
+                  }
+                ]
+              ],
+              "video/h264-mp4": [
+                [
+                  "pix_fmt",
+                  [
+                    "yuv420p",
+                    "yuv420p10le"
+                  ]
+                ],
+                [
+                  "crf",
+                  "INT",
+                  {
+                    "default": 19,
+                    "max": 100,
+                    "min": 0,
+                    "step": 1
+                  }
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ],
+                [
+                  "trim_to_audio",
+                  "BOOLEAN",
+                  {
+                    "default": false
+                  }
+                ]
+              ],
+              "video/h265-mp4": [
+                [
+                  "pix_fmt",
+                  [
+                    "yuv420p10le",
+                    "yuv420p"
+                  ]
+                ],
+                [
+                  "crf",
+                  "INT",
+                  {
+                    "default": 22,
+                    "max": 100,
+                    "min": 0,
+                    "step": 1
+                  }
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ]
+              ],
+              "video/nvenc_av1-mp4": [
+                [
+                  "pix_fmt",
+                  [
+                    "yuv420p",
+                    "p010le"
+                  ]
+                ],
+                [
+                  "bitrate",
+                  "INT",
+                  {
+                    "default": 10,
+                    "max": 999,
+                    "min": 1,
+                    "step": 1
+                  }
+                ],
+                [
+                  "megabit",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ]
+              ],
+              "video/nvenc_h264-mp4": [
+                [
+                  "pix_fmt",
+                  [
+                    "yuv420p",
+                    "p010le"
+                  ]
+                ],
+                [
+                  "bitrate",
+                  "INT",
+                  {
+                    "default": 10,
+                    "max": 999,
+                    "min": 1,
+                    "step": 1
+                  }
+                ],
+                [
+                  "megabit",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ]
+              ],
+              "video/nvenc_hevc-mp4": [
+                [
+                  "pix_fmt",
+                  [
+                    "yuv420p",
+                    "p010le"
+                  ]
+                ],
+                [
+                  "bitrate",
+                  "INT",
+                  {
+                    "default": 10,
+                    "max": 999,
+                    "min": 1,
+                    "step": 1
+                  }
+                ],
+                [
+                  "megabit",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ]
+              ],
+              "video/webm": [
+                [
+                  "pix_fmt",
+                  [
+                    "yuv420p",
+                    "yuva420p"
+                  ]
+                ],
+                [
+                  "crf",
+                  "INT",
+                  {
+                    "default": 20,
+                    "max": 100,
+                    "min": 0,
+                    "step": 1
+                  }
+                ],
+                [
+                  "save_metadata",
+                  "BOOLEAN",
+                  {
+                    "default": true
+                  }
+                ],
+                [
+                  "trim_to_audio",
+                  "BOOLEAN",
+                  {
+                    "default": false
+                  }
+                ]
+              ]
+            }
+          }
+        ],
+        "frame_rate": [
+          "FLOAT",
+          {
+            "default": 8,
+            "min": 1,
+            "step": 1
+          }
+        ],
+        "images": [
+          "IMAGE"
+        ],
+        "loop_count": [
+          "INT",
+          {
+            "default": 0,
+            "max": 100,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "pingpong": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ],
+        "save_output": [
+          "BOOLEAN",
+          {
+            "default": true
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "prompt",
+        "extra_pnginfo",
+        "unique_id"
+      ],
+      "optional": [
+        "audio",
+        "meta_batch",
+        "vae"
+      ],
+      "required": [
+        "images",
+        "frame_rate",
+        "loop_count",
+        "filename_prefix",
+        "format",
+        "pingpong",
+        "save_output"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VHS_VideoCombine",
+    "output": [
+      "VHS_FILENAMES"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "Filenames"
+    ],
+    "output_node": true,
+    "python_module": "custom_nodes.ComfyUI-VideoHelperSuite",
     "search_aliases": []
   }
 }

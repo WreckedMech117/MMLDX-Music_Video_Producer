@@ -1430,17 +1430,23 @@ def create_app(
                 )
             except TimelineError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
-            payload = build_h3_director_payload(
-                timeline_data=timeline.timeline_data,
-                duration=shot.duration,
-                requested_frames=timeline.aligned_frames,
-                seed=shot.seed,
-                width=request.width,
-                height=request.height,
-                steps=request.steps,
-                start=shot.start,
-                prefix=f"music-video-producer/{project_id}/shots/{shot.id}-h3",
-            )
+            try:
+                payload = build_h3_director_payload(
+                    timeline_data=timeline.timeline_data,
+                    duration=shot.duration,
+                    requested_frames=timeline.aligned_frames,
+                    seed=shot.seed,
+                    width=request.width,
+                    height=request.height,
+                    steps=request.steps,
+                    start=shot.start,
+                    prefix=f"music-video-producer/{project_id}/shots/{shot.id}-h3",
+                )
+            # The same translation the reference branch has. Without it the Director node's
+            # own ceilings — 10000 frames, a 1000 s timeline — and a non-finite window reach
+            # the client as a 500 instead of a refusal naming the limit.
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:

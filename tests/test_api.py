@@ -43,6 +43,7 @@ from music_video_producer.director import (
 from music_video_producer.models import (
     NOTICE_RAW_LIMIT,
     Asset,
+    AssetKind,
     MessageNotice,
     NoticeKind,
     Project,
@@ -53,6 +54,11 @@ from music_video_producer.models import (
 )
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import expansion_input
+from music_video_producer.workflows import (
+    H3_DIRECTOR_MAX_FRAMES,
+    H3_REFERENCE_MAX_FRAMES,
+    build_h3_reference_payload,
+)
 
 
 class FakeComfy:
@@ -808,6 +814,395 @@ def test_h3_submission_serializes_multiple_references_and_master_audio(tmp_path:
     assert payload["mvp:condition"]["inputs"]["ref_audios.ref_audio_0"] == ["mvp:split", 15]
 
 
+def upload_asset(client, project_id: str, name: str, kind: str, filename: str) -> dict:
+    """One uploaded reference Asset, returned as its own record rather than the whole list."""
+    response = client.post(
+        f"/api/projects/{project_id}/assets/upload",
+        data={"name": name, "kind": kind},
+        files={"file": (filename, f"{name}-bytes".encode(), "application/octet-stream")},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["assets"][-1]
+
+
+def reference_shot(store, project_id: str, **fields) -> str:
+    """A ready, prompted Shot with the given reference wiring. Returns its id."""
+    project = store.get(project_id)
+    shot = Shot(
+        start=0,
+        duration=5,
+        prompt="The vocalists perform the chorus together.",
+        status="ready",
+        **fields,
+    )
+    project.shots = [shot]
+    store.save(project)
+    return shot.id
+
+
+def submit_h3(client, project_id: str, shot_id: str, **body):
+    return client.post(
+        f"/api/projects/{project_id}/shots/{shot_id}/generate/h3", json=body
+    )
+
+
+def test_h3_reference_tags_are_numbered_per_kind_in_attachment_order(tmp_path: Path):
+    """FR-19's determinism at the route: a fixed attachment order gives fixed tags.
+
+    Mixed kinds interleaved on purpose — the picture after the video is `<Picture 2>`, not
+    `<Picture 3>` — because one counter shared across kinds would number the prompt's tags
+    differently from the per-kind slots the conditioner is wired to, and the model would be
+    told to look at media it was never handed.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Numbering"))
+    lead = upload_asset(client, project.id, "Lead vocalist", "character", "lead.png")
+    pan = upload_asset(client, project.id, "Camera pan", "video", "pan.mp4")
+    stage = upload_asset(client, project.id, "Stage", "setting", "stage.png")
+    room = upload_asset(client, project.id, "Room tone", "audio", "room.flac")
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Duet", "duration": "5"},
+        files={"file": ("duet.flac", b"fLaCfake", "audio/flac")},
+    )
+    order = [lead["id"], pan["id"], stage["id"], room["id"]]
+    shot_id = reference_shot(store, project.id, asset_ids=order, use_song_audio=True)
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+
+    conditioner = comfy.prompts[-1]["mvp:condition"]["inputs"]
+    assert conditioner["prompt"].startswith(
+        "Reference map: <Picture 1> is Lead vocalist; <Video 1> is Camera pan; "
+        "<Picture 2> is Stage; <Audio 1> is Room tone; "
+        "<Audio 2> is the master song for synchronization."
+    )
+    assert conditioner["ref_images.ref_image_0"] == ["mvp:split", 0]
+    assert conditioner["ref_images.ref_image_1"] == ["mvp:split", 1]
+    assert conditioner["ref_videos.ref_video_0"] == ["mvp:split", 9]
+    assert conditioner["ref_audios.ref_audio_0"] == ["mvp:split", 15]
+    assert conditioner["ref_audios.ref_audio_1"] == ["mvp:split", 16]
+
+    # Reordering the attachments reorders the tags: the numbering is a fact about the
+    # attachment order, not about the Asset library's order or the ids.
+    reordered = reference_shot(
+        store, project.id, asset_ids=[stage["id"], lead["id"], *order[1:2], room["id"]],
+        use_song_audio=True,
+    )
+    assert submit_h3(client, project.id, reordered).status_code == 202
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["prompt"].startswith(
+        "Reference map: <Picture 1> is Stage; <Picture 2> is Lead vocalist; "
+        "<Video 1> is Camera pan; <Audio 1> is Room tone; "
+        "<Audio 2> is the master song for synchronization."
+    )
+
+
+def test_h3_routes_to_the_reference_payload_only_when_something_is_attached(tmp_path: Path):
+    """FR-20's routing rule, as the pair it is — each asserting the other's marker is absent.
+
+    The condition is `shot.asset_ids or shot.use_song_audio`, and `Shot.mode` is never
+    consulted, so a Shot that says `mode="text"` while carrying an Asset still renders as a
+    reference shot. Asserting only that the expected node is present would pass for a
+    payload that carried both branches' nodes.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Routing"))
+    lead = upload_asset(client, project.id, "Lead", "character", "lead.png")
+
+    attached = reference_shot(store, project.id, asset_ids=[lead["id"]], mode="text")
+    assert submit_h3(client, project.id, attached).status_code == 202
+    reference_payload = comfy.prompts[-1]
+    classes = {node["class_type"] for node in reference_payload.values()}
+    assert "MiniMaxH3ReferenceToVideo" in classes
+    assert "MiniMaxH3MediaLoader" in classes
+    assert "MiniMaxH3DirectorCS" not in classes
+
+    bare = reference_shot(store, project.id, mode="reference")
+    assert submit_h3(client, project.id, bare).status_code == 202
+    text_payload = comfy.prompts[-1]
+    classes = {node["class_type"] for node in text_payload.values()}
+    assert "MiniMaxH3DirectorCS" in classes
+    assert "MiniMaxH3ReferenceToVideo" not in classes
+    assert "MiniMaxH3MediaLoader" not in classes
+
+
+def test_h3_song_only_shot_routes_to_the_reference_payload(tmp_path: Path):
+    """`use_song_audio` alone, with no Assets: the song is a reference like any other."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Song only"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Duet", "duration": "5"},
+        files={"file": ("duet.flac", b"fLaCfake", "audio/flac")},
+    )
+    shot_id = reference_shot(store, project.id, asset_ids=[], use_song_audio=True)
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+
+    payload = comfy.prompts[-1]
+    conditioner = payload["mvp:condition"]["inputs"]
+    media = json.loads(payload["mvp:references"]["inputs"]["media_state"])
+    assert [item["kind"] for item in media] == ["audio"]
+    assert media[0]["label"] == "master song"
+    assert conditioner["ref_audios.ref_audio_0"] == ["mvp:split", 15]
+    assert "<Audio 1> is the master song for synchronization" in conditioner["prompt"]
+
+
+def test_h3_refuses_a_reference_whose_file_is_gone_before_anything_is_submitted(tmp_path: Path):
+    """Both file resolutions, in the wording they already use. Nothing reaches ComfyUI."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Missing media"))
+    lead = upload_asset(client, project.id, "Lead vocalist", "character", "lead.png")
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Duet", "duration": "5"},
+        files={"file": ("duet.flac", b"fLaCfake", "audio/flac")},
+    )
+    shot_id = reference_shot(store, project.id, asset_ids=[lead["id"]], use_song_audio=True)
+    project = store.get(project.id)
+    asset_file = store.project_dir(project.id) / project.assets[0].path
+    song_file = store.project_dir(project.id) / project.song.path
+    asset_file.unlink()
+
+    missing_asset = submit_h3(client, project.id, shot_id)
+
+    assert missing_asset.status_code == 404
+    assert missing_asset.json()["detail"] == "Asset media was not found: Lead vocalist"
+
+    asset_file.write_bytes(b"restored")
+    song_file.unlink()
+    missing_song = submit_h3(client, project.id, shot_id)
+
+    assert missing_song.status_code == 404
+    assert missing_song.json()["detail"] == "Song media was not found"
+    assert comfy.prompts == []
+
+
+def test_h3_refuses_more_references_than_the_node_has_slots_for(tmp_path: Path):
+    """The per-kind limit as a 422 through the route, not as a 502 from ComfyUI."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Too many"))
+    assets = [
+        upload_asset(client, project.id, f"Picture {index}", "image", f"picture-{index}.png")
+        for index in range(10)
+    ]
+    shot_id = reference_shot(store, project.id, asset_ids=[asset["id"] for asset in assets])
+
+    response = submit_h3(client, project.id, shot_id)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "H3 accepts at most 9 picture references per shot and this one has 10"
+    )
+    assert comfy.prompts == []
+
+
+def test_h3_counts_the_master_song_against_the_audio_limit_and_says_so(tmp_path: Path):
+    """The boundary the route actually produces: three audio Assets *plus* the song.
+
+    The song is appended as a fourth `audio` reference, so this is the one over-limit
+    case a Director can reach while looking at exactly three attached audio Assets. A
+    refusal reading "at most 3 standalone audios" sends them counting the wrong things,
+    which is why the message says what was counted.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Song over the limit"))
+    assets = [
+        upload_asset(client, project.id, f"Stem {index}", "audio", f"stem-{index}.flac")
+        for index in range(3)
+    ]
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Master", "duration": "5"},
+        files={"file": ("master.flac", b"fLaCfake", "audio/flac")},
+    )
+    ids = [asset["id"] for asset in assets]
+
+    # Three attached audio Assets and no song is exactly at the limit and must submit.
+    at_limit = reference_shot(store, project.id, asset_ids=ids)
+    assert submit_h3(client, project.id, at_limit).status_code == 202
+
+    over = reference_shot(store, project.id, asset_ids=ids, use_song_audio=True)
+    response = submit_h3(client, project.id, over)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "H3 accepts at most 3 audio references per shot and this one has 4 "
+        "(the master song counts as one)"
+    )
+    assert len(comfy.prompts) == 1
+
+
+def test_every_asset_kind_maps_to_the_reference_kind_the_graph_expects(tmp_path: Path):
+    """The `video`/`audio`/else mapping, over every kind the model actually allows.
+
+    Driven off `AssetKind` rather than a hand-written list: the fallback sends anything
+    that is not video or audio into a *picture* slot, so a kind added to the model later
+    would silently burn one — and a picture slot spent on a non-image is a reference the
+    model is told to look at and cannot use. This fails the day a new kind appears.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Kinds"))
+    expected = {"video": "video", "audio": "audio"}
+    files = {"video": "clip.mp4", "audio": "stem.flac"}
+    for kind in get_args(AssetKind):
+        asset = upload_asset(
+            client, project.id, f"{kind} reference", kind, files.get(kind, "still.png")
+        )
+        shot_id = reference_shot(store, project.id, asset_ids=[asset["id"]])
+
+        assert submit_h3(client, project.id, shot_id).status_code == 202, kind
+
+        media = json.loads(comfy.prompts[-1]["mvp:references"]["inputs"]["media_state"])
+        assert [item["kind"] for item in media] == [expected.get(kind, "picture")], kind
+
+
+def test_h3_refuses_a_window_past_the_node_frame_ceiling(tmp_path: Path):
+    """A Shot longer than the node's `length` maximum, refused locally and named."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Too long"))
+    lead = upload_asset(client, project.id, "Lead", "character", "lead.png")
+    project = store.get(project.id)
+    shot = Shot(
+        start=0,
+        duration=200,  # 4800 frames at 24 fps, well past the 3600 the node accepts
+        prompt="A very long take.",
+        status="ready",
+        asset_ids=[lead["id"]],
+    )
+    project.shots = [shot]
+    store.save(project)
+
+    response = submit_h3(client, project.id, shot.id)
+
+    assert response.status_code == 422
+    assert f"{H3_REFERENCE_MAX_FRAMES}-frame maximum" in response.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_h3_refuses_a_reference_size_the_node_does_not_offer(tmp_path: Path):
+    """Refused by `H3Request`'s `Literal`, before the route body runs.
+
+    Asserting only the status code would pass with the builder's own guard deleted *and*
+    with the `Literal` widened to `str`, because a 422 is also what a dozen other refusals
+    return. The detail is what says which of them happened: this one names the field and
+    the two values, and never reaches `build_h3_reference_payload` at all — the builder's
+    matching guard is covered in `tests/test_workflows.py`, where it is reachable.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Bad size"))
+    lead = upload_asset(client, project.id, "Lead", "character", "lead.png")
+    shot_id = reference_shot(store, project.id, asset_ids=[lead["id"]])
+
+    response = submit_h3(client, project.id, shot_id, ref_image_size="2048")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "ref_image_size"]
+    assert set(detail[0]["ctx"]["expected"].split(" or ")) == {"'match'", "'max'"}
+    assert comfy.prompts == []
+
+
+def test_h3_refuses_a_text_only_window_past_the_director_nodes_maxima(tmp_path: Path):
+    """The text-only branch had no ceiling, and it is the one with live render evidence.
+
+    Both refusals are 422s naming the value that would have been sent, rather than the
+    opaque 502 a `/prompt` validation failure arrives as after the submission round-trip.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Long text shot"))
+    project.shots = [
+        Shot(start=0, duration=500, prompt="A very long take.", status="ready"),
+        Shot(start=400, duration=20, prompt="A take that ends past the ceiling.", status="ready"),
+        Shot(start=500, duration=5, prompt="A shot far down the song.", status="ready"),
+    ]
+    store.save(project)
+
+    refusals = [
+        submit_h3(client, project.id, shot.id).json()["detail"] for shot in project.shots
+    ]
+
+    assert all(f"maximum of {H3_DIRECTOR_MAX_FRAMES}" in detail for detail in refusals), refusals
+    # Each names the literal that would have gone out, which is what tells a Director
+    # whether the window is too long or merely too far down the song.
+    assert "duration_frames=12007" in refusals[0]
+    assert "end_frame=10080" in refusals[1]
+    assert "start_frame=12000" in refusals[2]
+    assert comfy.prompts == []
+
+
+def test_a_window_that_is_not_a_finite_number_is_refused_rather_than_raising(tmp_path: Path):
+    """`1e999` parses to `inf`, clears `gt=0`, and then raises inside `round()`.
+
+    `OverflowError` is not `TimelineError`, so the compile route's translation missed it and
+    the client got a 500 for a window its own request model accepted. This is the one route
+    that takes a window straight from the request body, which makes it the reachable case;
+    both builders carry the same guard, unit-tested in `tests/test_workflows.py`, because a
+    stored Shot cannot hold `inf` — pydantic serialises it to `null` and the manifest then
+    refuses to load, which is a separate hole in a separate story.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Infinite window"))
+    project.shots = [Shot(start=0, duration=5, prompt="A take.", status="ready")]
+    store.save(project)
+
+    infinite = client.post(
+        f"/api/projects/{project.id}/timeline/compile",
+        content=json.dumps({"window_start": 0, "window_duration": 1e999}),
+        headers={"content-type": "application/json"},
+    )
+    finite = client.post(
+        f"/api/projects/{project.id}/timeline/compile",
+        json={"window_start": 0, "window_duration": 5},
+    )
+
+    assert infinite.status_code == 422
+    assert infinite.json()["detail"] == "Timeline window must be a finite number of seconds"
+    assert finite.status_code == 200
+
+
+def test_h3_translates_every_reference_builder_refusal_into_a_422(tmp_path: Path, monkeypatch):
+    """The blanket `except ValueError` around the builder, checked against the real refusals.
+
+    Each message is produced by *calling* the builder rather than by copying its wording, so
+    a reworded refusal cannot leave this test asserting a sentence the code no longer says.
+    Two of the four are unreachable through the route as it stands — the route never passes an
+    empty reference list or a kind it did not itself map — and that is exactly why they are
+    driven this way: the translation is what is under test, not the reachability.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Refusals"))
+    lead = upload_asset(client, project.id, "Lead", "character", "lead.png")
+    shot_id = reference_shot(store, project.id, asset_ids=[lead["id"]])
+    valid = {
+        "prompt": "p", "duration": 5, "width": 1280, "height": 720,
+        "steps": 20, "seed": 0, "prefix": "p",
+    }
+    refusals = (
+        {**valid, "references": [{"kind": "picture"}] * 10},
+        {**valid, "references": []},
+        {**valid, "references": [{"kind": "picture"}], "ref_image_size": "2048"},
+        {**valid, "references": [{"kind": "sculpture"}]},
+        {**valid, "references": [{"kind": "picture"}], "duration": 200},
+    )
+
+    for arguments in refusals:
+        with pytest.raises(ValueError) as raised:
+            build_h3_reference_payload(**arguments)
+        message = str(raised.value)
+
+        def refusing_builder(*_, _message=message, **__):
+            raise ValueError(_message)
+
+        monkeypatch.setattr(
+            "music_video_producer.app.build_h3_reference_payload", refusing_builder
+        )
+        response = submit_h3(client, project.id, shot_id)
+
+        assert response.status_code == 422, message
+        assert response.json()["detail"] == message
+    assert comfy.prompts == []
+
+
 def unreachable_payload_builder(**kwargs):
     """A payload builder a blocked submission must never reach. See the two tests below."""
     raise AssertionError("a payload was built for a shot the readiness gate blocks")
@@ -1160,6 +1555,45 @@ def test_character_asset_can_be_promoted_to_krea_multiview(tmp_path: Path):
     saved = store.get(project.id)
     assert saved.jobs[-1].kind == "multiview"
     assert saved.assets[-1].parent_id == asset_id
+
+
+def test_promotion_records_its_parent_and_leaves_the_source_asset_untouched(tmp_path: Path):
+    """FR-18: the new Asset points back at its source, and the source is *unchanged*.
+
+    Promotion is additive by design — a new Asset with `parent_id` set — so the source keeps
+    its own name, path, prompt and id. Asserting only `parent_id` would pass just as happily
+    for a route that moved the source's path onto the child or rewrote its name, which is why
+    this reads the persisted record before and after and compares the serialized bytes.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Promotion"))
+    uploaded = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "Mara", "kind": "character"},
+        files={"file": ("mara.png", b"png-data", "image/png")},
+    ).json()
+    asset_id = uploaded["assets"][0]["id"]
+    manifest = store.manifest_path(project.id)
+    before = json.dumps(json.loads(manifest.read_text(encoding="utf-8"))["assets"][0])
+    source_file = store.project_dir(project.id) / uploaded["assets"][0]["path"]
+    source_bytes = source_file.read_bytes()
+
+    response = client.post(
+        f"/api/projects/{project.id}/assets/{asset_id}/multiview",
+        json={"prompt": "Preserve Mara in face, front, side and back views", "seed": 77},
+    )
+
+    assert response.status_code == 202
+    persisted = json.loads(manifest.read_text(encoding="utf-8"))["assets"]
+    assert len(persisted) == 2
+    assert json.dumps(persisted[0]) == before
+    assert source_file.read_bytes() == source_bytes
+    child = persisted[1]
+    assert child["parent_id"] == asset_id
+    assert child["source"] == "krea-multiview"
+    assert child["id"] != asset_id
+    # The source is what was uploaded to ComfyUI, and it was read rather than moved.
+    assert comfy.uploads == [source_bytes]
 
 
 def test_multiview_rejects_asset_paths_outside_project_media(tmp_path: Path):

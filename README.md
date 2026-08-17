@@ -69,10 +69,10 @@ Live GPU smokes are separate and deliberately manual — they are not pytest-col
 
 ```bash
 uv run python tests/smoke_songplanner_app.py http://127.0.0.1:8766 --confirm-gpu
-uv run python tests/smoke_h3_app.py http://127.0.0.1:8766
+uv run python tests/smoke_h3_app.py http://127.0.0.1:8766 --confirm-gpu
 ```
 
-`smoke_songplanner_app.py` refuses to submit without `--confirm-gpu`, generates two short songs (invented then known-lyrics), and **creates one project per adapter** — a shared project's second run would clobber the first, since every music job targets the same `"song"` slot. Its per-variant JSON on stdout is the only record of which adapter produced which prompt, so keep it. `smoke_h3_app.py` has no cost gate and submits as soon as you run it. Full procedure in `docs/OPERATIONS.md`.
+`smoke_songplanner_app.py` refuses to submit without `--confirm-gpu`, generates two short songs (invented then known-lyrics), and **creates one project per adapter** — a shared project's second run would clobber the first, since every music job targets the same `"song"` slot. Its per-variant JSON on stdout is the only record of which adapter produced which prompt, so keep it. `smoke_h3_app.py` is gated the same way and runs the H3 pre-flight audit before submitting. Full procedure in `docs/OPERATIONS.md`.
 
 ## Project storage
 
