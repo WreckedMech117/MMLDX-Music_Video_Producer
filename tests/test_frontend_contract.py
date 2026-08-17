@@ -7,12 +7,14 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from music_video_producer.app import (
+    APPLY_DOCUMENTS_LABEL,
     DOCUMENT_LABELS,
     DOCUMENT_RESTORE_REFUSAL,
     SONG_REPLACEMENT_CONSEQUENCE,
     MusicRequest,
     SongPlannerRequest,
     _require_song_replacement_confirmation,
+    document_not_requested_notice,
     document_restore_notice,
 )
 from music_video_producer.models import Project, Shot, Song
@@ -80,6 +82,26 @@ def document_controls() -> dict:
       import { DOCUMENT_CONTROLS } from './src/music_video_producer/web/assets/api.js';
       console.log(JSON.stringify(DOCUMENT_CONTROLS));
     """)
+
+
+def document_opt_in() -> dict:
+    """api.js's half of the per-turn document consent: the control, its label, its toast."""
+    return run_module("""
+      import { APPLY_DOCUMENTS_CONTROL, APPLY_DOCUMENTS_LABEL, DOCUMENT_NOT_APPLIED_TOAST }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        control: APPLY_DOCUMENTS_CONTROL,
+        label: APPLY_DOCUMENTS_LABEL,
+        toast: DOCUMENT_NOT_APPLIED_TOAST,
+      }));
+    """)
+
+
+def chat_submit_handler() -> str:
+    """The source of the chat composer's submit handler, which no import can reach."""
+    return APP_JS.read_text(encoding="utf-8").split(
+        '$("#chat-form").addEventListener("submit"', 1
+    )[1].split("  });", 1)[0]
 
 
 def test_async_project_submit_keeps_stable_form_reference():
@@ -825,13 +847,105 @@ def test_chat_toast_reports_what_changed_instead_of_asserting_an_update():
             assert label not in toasts[unchanged], (unchanged, label)
     assert "Treatment" in toasts["firstEverFill"]
 
-    handler = APP_JS.read_text(encoding="utf-8").split(
-        '$("#chat-form").addEventListener("submit"', 1
-    )[1].split("  });", 1)[0]
+    handler = chat_submit_handler()
     assert "const before = state.project;" in handler
-    assert "documentChangeToast(before, state.project)" in handler
+    assert "documentChangeToast(before, state.project" in handler
     # The old unconditional claim is gone from the whole module, in any handler.
     assert "Treatment updated" not in APP_JS.read_text(encoding="utf-8")
+
+
+def test_composer_sends_document_consent_from_its_own_control():
+    """Off by default, per turn, and read from the checkbox rather than hardcoded.
+
+    A fixed `true` reinstates the unrequested rewrite the flag exists to stop, and a fixed
+    `false` makes the control decorative -- either mutation leaves every route test green,
+    because the server stays perfectly correct about a flag the browser never sends honestly.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    shared = document_opt_in()
+
+    # Consent belongs to the turn being sent, so the control lives in the composer rather than
+    # the document actions row, which is per-document and persistent.
+    composer = re.search(r'<form class="composer" id="chat-form">.*?</form>', markup, re.DOTALL)
+    assert composer, "the chat composer form is no longer where app.js binds it"
+    element_id = shared["control"].removeprefix("#")
+    checkbox = re.search(rf'<input type="checkbox" id="{element_id}"[^>]*>', composer.group(0))
+    assert checkbox, f"no #{element_id} checkbox in the chat composer for app.js to read"
+    # Nothing remembers consent, so the markup must not preset it either.
+    assert "checked" not in checkbox.group(0), checkbox.group(0)
+
+    # The markup's own wording is the one both notices quote; the markup cannot import the
+    # constant, so this test is what keeps the three copies agreeing.
+    text = " ".join(re.sub(r"<[^>]+>", " ", composer.group(0)).split())
+    assert shared["label"] == APPLY_DOCUMENTS_LABEL
+    assert shared["label"] in text, text
+
+    handler = chat_submit_handler()
+    assert "$(APPLY_DOCUMENTS_CONTROL).checked" in handler
+    assert "apply_documents: applyDocuments" in handler
+    # No spelling of a hardcoded consent, in any form -- match the value, not one syntax.
+    assert not re.search(r"apply_documents\W{0,4}(true|false)", handler), handler
+
+
+def test_document_opt_in_wording_agrees_on_both_sides():
+    """One sentence per side for a declined turn, mirrored.
+
+    The thread line names *which* documents were proposed; the toast is the loudest thing on
+    screen and says why none of them landed. Two independently written wordings would describe
+    one event differently, and either could quietly stop naming the control that applies it.
+    """
+    notice = document_not_requested_notice([DOCUMENT_LABELS["treatment"]])
+    browser = document_opt_in()["toast"]
+
+    for wording in (APPLY_DOCUMENTS_LABEL, "opt-in per turn"):
+        assert wording in notice, wording
+        assert wording in browser, wording
+    # The server's half names the documents, which is the half the client cannot know.
+    assert DOCUMENT_LABELS["treatment"] in notice
+    # Neither side claims a write, and neither promises recovery for text that was never
+    # stored -- a declined proposal is not kept anywhere.
+    for claim in ("Replaced by this reply", "can be restored"):
+        assert claim not in notice, claim
+        assert claim not in browser, claim
+    assert "not kept" in notice
+    assert "not kept" in browser
+
+
+def test_a_declined_turn_toast_explains_the_opt_in_instead_of_claiming_a_change():
+    """"No document changed" is true of a declined turn and useless.
+
+    Nothing changed for a reason the Director controls, so the toast has to say which box to
+    tick -- while a lock or a rejection must keep the vaguer sentence, because sending the
+    Director to tick a box that was already ticked points them at the wrong thing.
+    """
+    script = """
+      import { documentChangeToast } from './src/music_video_producer/web/assets/api.js';
+      const before = { treatment: 'old treatment', style_bible: 'old style bible' };
+      console.log(JSON.stringify({
+        declined: documentChangeToast(before, { ...before }, false),
+        lockedOrRejected: documentChangeToast(before, { ...before }, true),
+        applied: documentChangeToast(before, { ...before, treatment: 'new treatment' }, true),
+        defaulted: documentChangeToast(before, { ...before }),
+      }));
+    """
+
+    toasts = run_module(script)
+    assert "opt-in per turn" in toasts["declined"]
+    assert APPLY_DOCUMENTS_LABEL in toasts["declined"]
+    # It must not claim a document moved, in either direction.
+    for label in DOCUMENT_LABELS.values():
+        assert label not in toasts["declined"], label
+    assert "replaced by this reply" not in toasts["declined"].lower()
+    # Consent was given here: the flag is not what stopped it.
+    assert "opt-in per turn" not in toasts["lockedOrRejected"]
+    assert "no document changed" in toasts["lockedOrRejected"]
+    # An applied change still reports the change.
+    assert DOCUMENT_LABELS["treatment"] in toasts["applied"]
+    # A caller that omits the consent gets the vaguer sentence, never the one that blames the
+    # flag for a lock or a rejection.
+    assert toasts["defaulted"] == toasts["lockedOrRejected"]
+
+    assert "documentChangeToast(before, state.project, applyDocuments)" in chat_submit_handler()
 
 
 def test_editor_overwrites_warn_before_discarding_unsaved_edits_and_clear_the_flags():

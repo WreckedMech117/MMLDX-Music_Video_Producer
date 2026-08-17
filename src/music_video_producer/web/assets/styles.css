@@ -126,6 +126,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .composer textarea { margin-bottom: 8px; }
 .composer > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .composer span { color: var(--dim); font-size: 10px; }
+/* The per-turn document consent sits with the submit button rather than centred between the
+   hint and it: it is part of the act of sending, not a caption. */
+.composer .lock-toggle { margin-left: auto; }
 .document-column { display: grid; grid-template-rows: auto 1fr auto; }
 .document-tabs { display: flex; border-bottom: 1px solid var(--line); }
 .document-tabs button { min-height: 43px; border: 0; border-bottom: 2px solid transparent; padding: 0 17px; background: transparent; color: var(--muted); }

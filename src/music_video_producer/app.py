@@ -113,6 +113,31 @@ DOCUMENT_LOCK_NOTICE = (
     "document yourself, restore a kept version, or unlock it in the Treatment workspace."
 )
 
+# What the chat composer's per-turn consent control is called, quoted by the notice below so
+# the Director is told exactly what to tick. `api.js`'s APPLY_DOCUMENTS_LABEL and the label in
+# `index.html` are the other two copies, and a contract test asserts all three agree: a notice
+# naming a control that no longer exists is worse than no notice at all.
+APPLY_DOCUMENTS_LABEL = "Apply document changes"
+
+# The one wording for a document replacement the Director did not ask for. `apply_documents`
+# is off by default, so an ordinary question — "what do you think of this idea?" — must not
+# rewrite the Treatment; this says which documents the reply wanted to change instead.
+#
+# Emitted only when the candidate would genuinely have changed something and would genuinely
+# have been applied, exactly as DOCUMENT_LOCK_NOTICE is: a reply that echoed the current text
+# back proposed nothing, and a candidate the guard would have refused anyway would not have
+# landed even with consent — telling the Director to tick the box and ask again would then be
+# a false instruction.
+#
+# It also says the proposed text is not kept, because it is not: nothing new is persisted and
+# there is no proposal slot, exactly as a declined shot list has none.
+DOCUMENT_NOT_REQUESTED_NOTICE = (
+    "Proposed but not applied: {documents}. Replacing a document is opt-in per turn, so "
+    "nothing was written and no previous version was recorded. Tick "
+    f'"{APPLY_DOCUMENTS_LABEL}" '
+    "beside the composer and ask again to apply it; the text proposed here is not kept."
+)
+
 # The one wording for a restore, and for refusing one. `api.js`'s DOCUMENT_RESTORE_NOTICE
 # and DOCUMENT_RESTORE_REFUSAL_MARKER are the frontend halves, so the toast the Director
 # reads and the message stored in the thread cannot drift apart.
@@ -152,6 +177,11 @@ def document_change_notice(labels: list[str]) -> str:
 def document_first_draft_notice(labels: list[str]) -> str:
     """State which documents this reply filled from blank. See DOCUMENT_FIRST_DRAFT_NOTICE."""
     return DOCUMENT_FIRST_DRAFT_NOTICE.format(documents=", ".join(labels))
+
+
+def document_not_requested_notice(labels: list[str]) -> str:
+    """Name the documents a declined reply proposed. See DOCUMENT_NOT_REQUESTED_NOTICE."""
+    return DOCUMENT_NOT_REQUESTED_NOTICE.format(documents=", ".join(labels))
 
 
 def document_restore_notice(document: DocumentName, *, reversible: bool = True) -> str:
@@ -253,6 +283,13 @@ class H3Request(BaseModel):
 class DirectorRequest(BaseModel):
     message: str = Field(min_length=1)
     apply_shots: bool = False
+    # Per-turn consent to replace the creative documents, mirroring `apply_shots` exactly —
+    # same shape, same default, and independent of it. Off by default because consent has to be
+    # explicit for the turn being sent: asking "what do you think of this idea?" must not
+    # rewrite the Treatment, which is what every reply did before this field existed. It is
+    # deliberately not stored on `Project`, so it is neither remembered across turns nor
+    # inherited by another project, and a client that omits it entirely is a decline.
+    apply_documents: bool = False
 
 
 class ShotListRequest(BaseModel):
@@ -1051,6 +1088,7 @@ def create_app(
         notices: list[str] = []
         replaced: list[str] = []
         first_drafts: list[str] = []
+        not_requested: list[str] = []
         for field, label in DOCUMENT_LABELS.items():
             candidate = getattr(result, field)
             existing = getattr(project, field)
@@ -1071,6 +1109,19 @@ def create_app(
                 if not reason:
                     notices.append(DOCUMENT_LOCK_NOTICE.format(document=label))
                 continue
+            # Consent is the second "do not write, and say why" gate, and it sits *after* the
+            # lock deliberately: a lock is durable state the Director set and a flag is one
+            # turn, so when both apply "locked" is the sentence worth reading — and it must
+            # keep saying locked rather than merely unrequested, or unticking the box would
+            # quietly relabel a protection as an oversight.
+            #
+            # It carries the lock's silence rule for the same reason: a candidate the guard
+            # would have refused anyway would not have landed with consent either, so
+            # reporting it as merely unrequested would invite a retry that also refuses.
+            if not request.apply_documents:
+                if not reason:
+                    not_requested.append(label)
+                continue
             if reason:
                 notices.append(f"{label} was NOT replaced: {reason}. Raw output: {candidate[:400]}")
                 continue
@@ -1090,6 +1141,10 @@ def create_app(
             notices.insert(0, document_first_draft_notice(first_drafts))
         if replaced:
             notices.insert(0, document_change_notice(replaced))
+        # One grouped statement rather than one per document: a declined turn wrote nothing, so
+        # the Director needs the list and the reason once, not the same paragraph twice.
+        if not_requested:
+            notices.append(document_not_requested_notice(not_requested))
         if request.apply_shots and not result.shots:
             notices.append(
                 "No shot plan was applied: the model returned an empty shot list. "

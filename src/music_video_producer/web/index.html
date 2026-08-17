@@ -115,9 +115,14 @@
             <div class="chat-thread" id="chat-thread">
               <div class="empty-thread"><strong>Direct the video naturally</strong><p>Describe narrative, energy, references, camera language, what to avoid, and where the performance should feel literal or abstract.</p></div>
             </div>
+            <!-- Consent to replace the creative documents belongs to the turn being sent, so the
+                 control lives in the composer rather than the document actions row, and starts
+                 unchecked on every load: nothing remembers it. Its label is api.js's
+                 APPLY_DOCUMENTS_LABEL and app.py's, which quotes it in the reply that names what
+                 a declined turn proposed; tests/test_frontend_contract.py asserts all three. -->
             <form class="composer" id="chat-form">
               <textarea name="message" rows="3" placeholder="The verses should feel claustrophobic, then the chorus breaks into a huge sodium-lit desert…"></textarea>
-              <div><span>Structured output stays editable before rendering.</span><button class="primary-button" type="submit">Send to Director</button></div>
+              <div><span>Structured output stays editable before rendering.</span><label class="lock-toggle" title="Off by default: the reply names what it proposed to change instead of replacing the Treatment or Style bible"><input type="checkbox" id="apply-documents">Apply document changes</label><button class="primary-button" type="submit">Send to Director</button></div>
             </form>
           </div>
           <div class="document-column">

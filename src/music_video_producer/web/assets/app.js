@@ -1,4 +1,4 @@
-import { DOCUMENT_CONTROLS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, comfyOutputUrl, documentChangeToast, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, comfyOutputUrl, documentChangeToast, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -775,6 +775,10 @@ function bindEvents() {
     const message = field.value.trim();
     if (!message) return;
     if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to enable conversational planning.", "error");
+    // Read from the control, never hardcoded: it is the Director's consent for this turn, and a
+    // fixed `true` here would reinstate the unrequested rewrite the flag exists to stop, while a
+    // fixed `false` would make the control decorative.
+    const applyDocuments = $(APPLY_DOCUMENTS_CONTROL).checked;
     // A reply can replace either document, and the whole project comes back -- so the editors
     // are re-rendered from the server whether or not anything changed. Ask before that
     // discards typing that was never stored and therefore was never recoverable.
@@ -783,14 +787,16 @@ function bindEvents() {
     const button = event.currentTarget.querySelector("button[type=submit]");
     button.disabled = true; button.textContent = "Directing…";
     try {
-      state.project = await api.directorChat(state.project.id, { message, apply_shots: false });
+      state.project = await api.directorChat(state.project.id, { message, apply_shots: false, apply_documents: applyDocuments });
       field.value = "";
       markDocumentsSaved();
       renderAll();
       // Derived from what the documents actually are now, not asserted. A locked document, a
       // candidate the guard rejected and an identical rewrite all leave the text as it was,
-      // and the most prominent feedback on screen must not contradict the reply itself.
-      toast(documentChangeToast(before, state.project));
+      // and the most prominent feedback on screen must not contradict the reply itself. The
+      // consent is passed in because a declined turn's "nothing changed" has a different cause
+      // -- and a different remedy -- from a lock or a rejection.
+      toast(documentChangeToast(before, state.project, applyDocuments));
     } catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; button.textContent = "Send to Director"; }
   });

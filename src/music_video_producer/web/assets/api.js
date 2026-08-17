@@ -187,6 +187,17 @@ export const DOCUMENT_CONTROLS = {
   },
 };
 
+// The chat composer's per-turn consent to replace the creative documents, sent as the route's
+// `apply_documents`. One selector and one label because three copies — the markup's checkbox,
+// the handler that reads it, and the sentence the server's notice quotes — are how a rename
+// leaves the reply telling the Director to tick a control that no longer exists. The label is
+// app.py's APPLY_DOCUMENTS_LABEL, asserted against the markup by a contract test.
+//
+// Unchecked by default, and nothing persists it: consent is for the turn being sent, never
+// remembered across turns or projects.
+export const APPLY_DOCUMENTS_CONTROL = "#apply-documents";
+export const APPLY_DOCUMENTS_LABEL = "Apply document changes";
+
 // One lookup for both tables, throwing rather than returning undefined: a document the
 // server has no field for must fail loudly here instead of rendering "undefined" into a
 // toast or silently binding a control to nothing.
@@ -253,12 +264,25 @@ export const DOCUMENT_CHANGE_TOAST =
   "{documents} replaced by this reply; existing shots preserved and the previous version kept.";
 export const DOCUMENT_UNCHANGED_TOAST =
   "The Director replied and no document changed; the reply says what it proposed and why it was not applied.";
+// The declined turn is its own sentence rather than the one above, because "no document
+// changed" is true but useless here: nothing changed for a reason the Director controls, and
+// the toast is the one place to say which box to tick. Mirrors app.py's
+// DOCUMENT_NOT_REQUESTED_NOTICE, whose thread line names *which* documents were proposed;
+// both sides say "opt-in per turn" and both name the control, asserted by a contract test.
+export const DOCUMENT_NOT_APPLIED_TOAST =
+  `No document was written: replacing a document is opt-in per turn. Tick "${APPLY_DOCUMENTS_LABEL}" ` +
+  "and ask again to apply one; the reply says what this turn proposed, and that text is not kept.";
 
-export function documentChangeToast(before, after) {
+// `applied` is the consent that was actually sent, not a guess: with it off the server writes
+// nothing at all, so the two "nothing changed" cases have different causes and different
+// advice. It defaults to `true` because that is the safe default of the two — a caller that
+// forgets it gets the vaguer sentence, where defaulting to `false` would blame the flag for a
+// lock or a rejection and send the Director to tick a box that was already ticked.
+export function documentChangeToast(before, after, applied = true) {
   const changed = Object.keys(DOCUMENT_LABELS).filter(
     (document) => (before?.[document] ?? "") !== (after?.[document] ?? ""),
   );
-  if (!changed.length) return DOCUMENT_UNCHANGED_TOAST;
+  if (!changed.length) return applied ? DOCUMENT_UNCHANGED_TOAST : DOCUMENT_NOT_APPLIED_TOAST;
   return DOCUMENT_CHANGE_TOAST.replace("{documents}", changed.map(documentLabel).join(" and "));
 }
 

@@ -8,9 +8,11 @@ from typing import get_args
 from fastapi.testclient import TestClient
 
 from music_video_producer.app import (
+    APPLY_DOCUMENTS_LABEL,
     DIRECTOR_CONTEXT_EXCLUDE,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
+    DirectorRequest,
     DocumentName,
     create_app,
 )
@@ -873,7 +875,11 @@ def test_director_chat_persists_treatment_and_editable_shots(tmp_path: Path):
 
     response = client.post(
         f"/api/projects/{project.id}/director/chat",
-        json={"message": "Make the chorus feel like release", "apply_shots": True},
+        json={
+            "message": "Make the chorus feel like release",
+            "apply_shots": True,
+            "apply_documents": True,
+        },
     )
 
     assert response.status_code == 200
@@ -951,7 +957,7 @@ def test_director_never_overwrites_a_document_with_json(tmp_path: Path):
 
     response = client.post(
         f"/api/projects/{project.id}/director/chat",
-        json={"message": "Make it moodier", "apply_shots": True},
+        json={"message": "Make it moodier", "apply_shots": True, "apply_documents": True},
     )
 
     assert response.status_code == 200
@@ -1108,7 +1114,8 @@ def test_applied_replacement_keeps_the_previous_version_and_names_what_changed(t
     project = documented_project(store, "Recoverable")
 
     response = client.post(
-        f"/api/projects/{project.id}/director/chat", json={"message": "Make it colder"}
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Make it colder", "apply_documents": True},
     )
 
     assert response.status_code == 200
@@ -1133,7 +1140,8 @@ def test_repeat_replacement_keeps_only_the_immediately_previous_version(tmp_path
     for message in ("Colder", "Colder still"):
         assert (
             client.post(
-                f"/api/projects/{project.id}/director/chat", json={"message": message}
+                f"/api/projects/{project.id}/director/chat",
+                json={"message": message, "apply_documents": True},
             ).status_code
             == 200
         )
@@ -1159,7 +1167,8 @@ def test_locked_document_is_not_replaced_and_records_no_previous_version(tmp_pat
     store.save(project)
 
     response = client.post(
-        f"/api/projects/{project.id}/director/chat", json={"message": "Rewrite everything"}
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Rewrite everything", "apply_documents": True},
     )
 
     assert response.status_code == 200
@@ -1411,7 +1420,8 @@ def test_identical_candidate_neither_spends_the_slot_nor_claims_a_change(tmp_pat
     store.save(project)
 
     response = client.post(
-        f"/api/projects/{project.id}/director/chat", json={"message": "Anything to add?"}
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Anything to add?", "apply_documents": True},
     )
 
     assert response.status_code == 200
@@ -1438,7 +1448,8 @@ def test_first_draft_into_a_blank_document_promises_no_recovery(tmp_path: Path):
     store.save(project)
 
     response = client.post(
-        f"/api/projects/{project.id}/director/chat", json={"message": "Draft the look"}
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Draft the look", "apply_documents": True},
     )
 
     assert response.status_code == 200
@@ -1469,7 +1480,10 @@ def test_lock_notice_is_silent_unless_the_candidate_would_have_changed_something
     project.treatment_locked = True
     store.save(project)
 
-    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "Anything?"})
+    client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Anything?", "apply_documents": True},
+    )
 
     echoed = ProjectStore(tmp_path).get(project.id).messages[-1].content
     assert "is locked" not in echoed
@@ -1482,13 +1496,187 @@ def test_lock_notice_is_silent_unless_the_candidate_would_have_changed_something
     project.style_bible_locked = True
     store.save(project)
 
-    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "Moodier"})
+    client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Moodier", "apply_documents": True},
+    )
 
     degraded = ProjectStore(tmp_path).get(project.id)
     assert "Style bible is locked" not in degraded.messages[-1].content
     assert "Style bible was NOT replaced" not in degraded.messages[-1].content
     assert degraded.style_bible == project.style_bible
     assert degraded.style_bible_previous == ""
+
+
+def test_a_declined_turn_writes_nothing_and_names_what_it_proposed(tmp_path: Path):
+    """The consent this story adds: asking a question must not rewrite the Treatment.
+
+    Story 2.1 made an unrequested rewrite visible and reversible; it was still not *consented*,
+    because every turn replaced both documents whatever the Director actually asked for. Shot
+    application already required `apply_shots`; the more valuable artefacts did not.
+    """
+    client, store = make_client_with_director(tmp_path, RevisingDirector())
+    project = documented_project(store, "Declined")
+    project.treatment_previous = "The genuinely recoverable treatment."
+    project.style_bible_previous = "The genuinely recoverable style bible."
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "What do you think of this idea?", "apply_documents": False},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == project.treatment
+    assert saved.style_bible == project.style_bible
+    # The recovery slot is written only when a document is actually replaced, so a declined
+    # proposal must not spend it -- doing so would annihilate the recoverable version over a
+    # turn that wrote nothing at all.
+    assert saved.treatment_previous == "The genuinely recoverable treatment."
+    assert saved.style_bible_previous == "The genuinely recoverable style bible."
+    notice = saved.messages[-1].content
+    assert "Proposed but not applied: Treatment, Style bible." in notice
+    assert "opt-in per turn" in notice
+    # And it says how to apply it, by the control's real name rather than a description of it.
+    assert APPLY_DOCUMENTS_LABEL in notice
+    assert "Replaced by this reply" not in notice
+    # Nothing new is persisted: there is no proposal slot, and the declined text is gone
+    # exactly as a declined shot list is today.
+    assert "Treatment revision 1" not in json.dumps(saved.model_dump(mode="json"))
+
+
+def test_an_ordinary_question_that_proposed_nothing_says_nothing(tmp_path: Path):
+    """Consent without noise. A reply that echoed the current text back proposed no change,
+    so a declined turn must not carry a paragraph about documents it never wanted to touch.
+    """
+    client, store = make_client_with_director(tmp_path, EchoDirector())
+    project = documented_project(store, "Ordinary question")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "What do you think?"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.messages[-1].content == "Nothing to change."
+    assert "\n\n---\n" not in saved.messages[-1].content
+
+
+def test_an_omitted_apply_documents_is_a_decline_rather_than_a_write(tmp_path: Path):
+    """A client written before this flag existed sends no `apply_documents` at all.
+
+    Reading that as consent would leave exactly the behaviour this story removes in place for
+    every such client, so the default has to be the decline -- and it is the model field's own
+    default doing it, not a route-level special case.
+    """
+    client, store = make_client_with_director(tmp_path, RevisingDirector())
+    project = documented_project(store, "Older client")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Make it colder"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == project.treatment
+    assert saved.style_bible == project.style_bible
+    assert saved.treatment_previous == ""
+    assert saved.style_bible_previous == ""
+    assert "Proposed but not applied: Treatment, Style bible." in saved.messages[-1].content
+    # Off by default on the model, mirroring `apply_shots` rather than diverging from it.
+    request = DirectorRequest(message="Make it colder")
+    assert request.apply_documents is False
+    assert request.apply_shots is False
+
+
+def test_the_two_apply_flags_are_independent(tmp_path: Path):
+    """One consent per artefact kind. Ticking either must not imply the other."""
+    client, store = make_client_with_director(tmp_path, FakeDirector())
+    shots_only = documented_project(store, "Shots only")
+
+    response = client.post(
+        f"/api/projects/{shots_only.id}/director/chat",
+        json={"message": "Plan the shots", "apply_shots": True, "apply_documents": False},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(shots_only.id)
+    assert saved.shots[0].prompt == "A widening corridor"
+    assert saved.treatment == shots_only.treatment
+    assert saved.style_bible == shots_only.style_bible
+    assert saved.treatment_previous == ""
+    assert "Proposed but not applied: Treatment, Style bible." in saved.messages[-1].content
+
+    documents_only = documented_project(store, "Documents only")
+
+    response = client.post(
+        f"/api/projects/{documents_only.id}/director/chat",
+        json={"message": "Rewrite the treatment", "apply_shots": False, "apply_documents": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(documents_only.id)
+    assert saved.shots == []
+    assert saved.treatment.startswith("Confinement")
+    assert saved.treatment_previous == documents_only.treatment
+    assert "Replaced by this reply: Treatment, Style bible." in saved.messages[-1].content
+    assert "Proposed but not applied" not in saved.messages[-1].content
+
+
+def test_a_locked_document_reports_the_lock_even_when_the_turn_declined(tmp_path: Path):
+    """Locks take precedence over consent, and keep their own sentence.
+
+    Both mean "not written", but a lock is durable state the Director set and the flag is one
+    turn: reporting a locked document as merely unrequested would relabel a protection as an
+    oversight, and would tell the Director that ticking a box will apply it -- it will not.
+    """
+    client, store = make_client_with_director(tmp_path, RevisingDirector())
+    project = documented_project(store, "Locked and declined")
+    project.treatment_locked = True
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Rewrite everything"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == project.treatment
+    assert saved.style_bible == project.style_bible
+    assert saved.treatment_previous == ""
+    assert saved.style_bible_previous == ""
+    notice = saved.messages[-1].content
+    assert "Treatment is locked" in notice
+    # The unlocked document is the only one the unrequested wording claims, so the lock is not
+    # silently downgraded to "you did not ask".
+    assert "Proposed but not applied: Style bible." in notice
+    assert DOCUMENT_LABELS["treatment"] not in notice.split("Proposed but not applied:")[1]
+
+
+def test_a_declined_turn_is_silent_about_a_candidate_the_guard_would_have_refused(tmp_path: Path):
+    """The lock notice's silence rule, applied to consent for the same reason.
+
+    A degraded candidate would not have landed with consent either, so naming it as merely
+    unrequested would invite a retry that refuses identically -- and the rejection notice's own
+    "was NOT replaced ... Raw output:" dump is diagnostics about a write nobody asked for.
+    """
+    client, store = make_client_with_director(tmp_path, DegradedDirector())
+    project = documented_project(store, "Declined and degraded")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Make it moodier"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == project.treatment
+    assert saved.style_bible == project.style_bible
+    notice = saved.messages[-1].content
+    # The treatment would genuinely have been applied, so it is named.
+    assert "Proposed but not applied: Treatment." in notice
+    assert DOCUMENT_LABELS["style_bible"] not in notice
+    assert "was NOT replaced" not in notice
 
 
 def test_a_lock_set_during_the_llm_call_is_honoured_rather_than_reverted(tmp_path: Path):
@@ -1511,7 +1699,8 @@ def test_a_lock_set_during_the_llm_call_is_honoured_rather_than_reverted(tmp_pat
     client = TestClient(app)
 
     response = client.post(
-        f"/api/projects/{project.id}/director/chat", json={"message": "Rewrite it all"}
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Rewrite it all", "apply_documents": True},
     )
 
     assert response.status_code == 200
