@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+
+class ComfyError(RuntimeError):
+    """A downstream ComfyUI transport or execution error."""
+
+
+@dataclass(slots=True)
+class Submission:
+    prompt_id: str
+    number: int | None = None
+
+
+@dataclass(slots=True)
+class HistoryResult:
+    prompt_id: str
+    status: str
+    outputs: list[dict[str, Any]] = field(default_factory=list)
+    error: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+class ComfyClient:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout,
+            transport=transport,
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        try:
+            response = await self._client.request(method, path, **kwargs)
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as error:
+            detail = error.response.text[:500]
+            raise ComfyError(f"ComfyUI returned {error.response.status_code}: {detail}") from error
+        except httpx.HTTPError as error:
+            raise ComfyError(f"Cannot reach ComfyUI at {self.base_url}: {error}") from error
+
+    @staticmethod
+    def _json(response: httpx.Response) -> Any:
+        try:
+            return response.json()
+        except ValueError as error:
+            raise ComfyError("ComfyUI returned invalid JSON") from error
+
+    async def health(self) -> dict[str, Any]:
+        try:
+            response = await self._request("GET", "/system_stats")
+            payload = self._json(response)
+        except ComfyError as error:
+            return {"online": False, "url": self.base_url, "error": str(error)}
+        return {"online": True, "url": self.base_url, "stats": payload}
+
+    async def submit(self, prompt: dict[str, Any], *, client_id: str | None = None) -> Submission:
+        body: dict[str, Any] = {"prompt": prompt}
+        if client_id:
+            body["client_id"] = client_id
+        response = await self._request("POST", "/prompt", json=body)
+        payload = self._json(response)
+        prompt_id = payload.get("prompt_id") if isinstance(payload, dict) else None
+        if not prompt_id:
+            raise ComfyError("ComfyUI prompt response did not contain a prompt_id")
+        return Submission(prompt_id=prompt_id, number=payload.get("number"))
+
+    async def queue(self) -> dict[str, Any]:
+        return self._json(await self._request("GET", "/queue"))
+
+    async def object_info(self) -> dict[str, Any]:
+        return self._json(await self._request("GET", "/object_info"))
+
+    async def history(self, prompt_id: str) -> HistoryResult:
+        payload = self._json(await self._request("GET", f"/history/{quote(prompt_id)}"))
+        entry = payload.get(prompt_id)
+        if not entry:
+            return HistoryResult(prompt_id=prompt_id, status="queued", raw=payload)
+        status_data = entry.get("status", {})
+        status = status_data.get("status_str", "complete" if entry.get("outputs") else "running")
+        if status == "success":
+            status = "complete"
+        outputs: list[dict[str, Any]] = []
+        for node_id, node_outputs in entry.get("outputs", {}).items():
+            for media_key in ("images", "audio", "gifs", "video"):
+                for item in node_outputs.get(media_key, []):
+                    outputs.append({"node_id": node_id, "kind": media_key, **item})
+        error = ""
+        for message in status_data.get("messages", []):
+            if len(message) == 2 and message[0] == "execution_error":
+                data = message[1]
+                error = f"{data.get('node_type', 'Node')}: {data.get('exception_message', 'error')}"
+                break
+        return HistoryResult(
+            prompt_id=prompt_id,
+            status=status,
+            outputs=outputs,
+            error=error,
+            raw=entry,
+        )
+
+    async def upload(self, filename: str, content: bytes, content_type: str) -> dict[str, Any]:
+        files = {"image": (filename, content, content_type)}
+        data = {"type": "input", "overwrite": "false"}
+        return self._json(await self._request("POST", "/upload/image", files=files, data=data))
+
+    def output_url(self, item: dict[str, Any]) -> str:
+        filename = quote(str(item["filename"]))
+        subfolder = quote(str(item.get("subfolder", "")))
+        media_type = quote(str(item.get("type", "output")))
+        return f"{self.base_url}/view?filename={filename}&subfolder={subfolder}&type={media_type}"

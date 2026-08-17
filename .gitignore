@@ -1,0 +1,12 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+data/projects/
+!data/.gitkeep
+.DS_Store
+Thumbs.db
+test-artifacts/
+_bmad-output/

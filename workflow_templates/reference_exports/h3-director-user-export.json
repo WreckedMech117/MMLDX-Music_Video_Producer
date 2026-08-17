@@ -1,0 +1,214 @@
+{
+  "2343": {
+    "inputs": {
+      "start_second": 0,
+      "end_second": 10,
+      "duration_seconds": 10,
+      "start_frame": 0,
+      "end_frame": 240,
+      "duration_frames": 240,
+      "timeline_data": "{\"mainTrackEnabled\":true,\"audioTrackEnabled\":true,\"motionTrackEnabled\":true,\"propHeight\":90,\"globalPropHeight\":126,\"showFilenames\":true,\"showPromptZones\":true,\"overrideAudio\":false,\"inpaint_audio\":true,\"global_prompt\":\"A single continuous cinematic take. Preserve subject identity, scene geometry, camera position, lighting and motion continuity throughout. No cut unless a new shot is deliberately added.\\nAudio: continuous synchronized ambience and action sounds without a restart.\",\"retake_global_prompt\":\"\",\"overall_soundscape\":\"\",\"non_diegetic_music\":\"\",\"prompt_override\":\"\",\"prompt_override_on\":false,\"retakeMode\":false,\"retakeStart\":48,\"retakeLength\":48,\"retakePrompt\":\"\",\"retakeStrength\":1,\"retakeVideo\":null,\"normalStartFrame\":0,\"normalDurationFrames\":240,\"reference_mode\":\"OFF\",\"prompt_format\":\"minimax\",\"analyzeProvider\":\"ollama\",\"analyzeBaseUrl\":\"\",\"analyzeModel\":\"\",\"summary\":\"\",\"task_type_override\":\"\",\"subjectSlotCount\":3,\"subjects\":[{\"images\":[],\"description\":\"\",\"shortName\":\"\",\"kind\":\"person\",\"retention\":\"fully_preserved\",\"retentionNote\":\"\"},{\"images\":[],\"description\":\"\",\"shortName\":\"\",\"kind\":\"person\",\"retention\":\"fully_preserved\",\"retentionNote\":\"\"},{\"images\":[],\"description\":\"\",\"shortName\":\"\",\"kind\":\"person\",\"retention\":\"fully_preserved\",\"retentionNote\":\"\"}],\"segments\":[{\"id\":\"seg0\",\"start\":0,\"length\":240,\"prompt\":\"the action develops naturally across one continuous shot, with stable camera position, consistent lighting and no scene change\",\"type\":\"text\",\"isEndFrame\":false}],\"motionSegments\":[],\"audioSegments\":[]}",
+      "local_prompts": "the action develops naturally across one continuous shot, with stable camera position, consistent lighting and no scene change",
+      "segment_lengths": "240",
+      "guide_strength": "",
+      "use_custom_audio": true,
+      "use_custom_motion": true,
+      "inpaint_audio": true,
+      "frame_rate": 24,
+      "display_mode": "seconds",
+      "custom_width": 1344,
+      "custom_height": 768,
+      "resize_method": "crop",
+      "divisible_by": 32,
+      "img_compression": 0,
+      "override_audio": false,
+      "ref_image_size": "match",
+      "shift_video": 12,
+      "shift_audio": 4,
+      "ref_image_notes": "",
+      "minimax_settings_ui": "",
+      "timeline_ui": "",
+      "minimax_prompt_preview": "",
+      "model": [
+        "2350",
+        0
+      ],
+      "model_ref2va": [
+        "2349",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3DirectorCS",
+    "_meta": {
+      "title": "MiniMax H3 Director"
+    }
+  },
+  "2344": {
+    "inputs": {
+      "max_resolution": 1024,
+      "jpeg_quality": 80,
+      "suppress_default_preview": true,
+      "preview_frames": 12,
+      "preview_fps": 12,
+      "model": [
+        "2343",
+        0
+      ]
+    },
+    "class_type": "ModelPreviewOverrideKJ",
+    "_meta": {
+      "title": "Model Preview Override"
+    }
+  },
+  "2345": {
+    "inputs": {
+      "sampler_name": "res_multistep"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "2346": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 20,
+      "denoise": 1,
+      "model": [
+        "2344",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "2347": {
+    "inputs": {
+      "noise_seed": 69420
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "2348": {
+    "inputs": {
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "MiMx-H3-DIRECTOR",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "2351:2174",
+        0
+      ],
+      "audio": [
+        "2351:2175",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine 🎥🅥🅗🅢"
+    }
+  },
+  "2349": {
+    "inputs": {
+      "PowerLoraLoaderHeaderWidget": {
+        "type": "PowerLoraLoaderHeaderWidget"
+      },
+      "➕ Add Lora": ""
+    },
+    "class_type": "Power Lora Loader (rgthree)",
+    "_meta": {
+      "title": "Power Lora Loader (rgthree)"
+    }
+  },
+  "2350": {
+    "inputs": {
+      "PowerLoraLoaderHeaderWidget": {
+        "type": "PowerLoraLoaderHeaderWidget"
+      },
+      "➕ Add Lora": ""
+    },
+    "class_type": "Power Lora Loader (rgthree)",
+    "_meta": {
+      "title": "Power Lora Loader (rgthree)"
+    }
+  },
+  "2351:2175": {
+    "inputs": {
+      "samples": [
+        "2351:2173",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE Decode Audio"
+    }
+  },
+  "2351:2173": {
+    "inputs": {
+      "noise": [
+        "2347",
+        0
+      ],
+      "guider": [
+        "2351:2170",
+        0
+      ],
+      "sampler": [
+        "2345",
+        0
+      ],
+      "sigmas": [
+        "2346",
+        0
+      ],
+      "latent_image": [
+        "2343",
+        2
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "2351:2174": {
+    "inputs": {
+      "samples": [
+        "2351:2173",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "2351:2170": {
+    "inputs": {
+      "model": [
+        "2344",
+        0
+      ],
+      "conditioning": [
+        "2343",
+        1
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "Basic Guider"
+    }
+  }
+}

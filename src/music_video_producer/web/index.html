@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Music Video Producer</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23141618'/%3E%3Cpath d='M16 18h8l8 15 8-15h8v28h-7V29l-9 17-9-17v17h-7z' fill='%23d4f75e'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand" aria-label="Music Video Producer">
+        <span class="brand-mark">MVP</span>
+        <span class="brand-name">Music Video Producer</span>
+      </div>
+      <div class="project-switcher">
+        <label class="sr-only" for="project-select">Current project</label>
+        <select id="project-select"><option value="">No project</option></select>
+        <button class="icon-button" id="new-project" title="New project" aria-label="New project">＋</button>
+      </div>
+      <div class="transport-mini" aria-label="Global transport">
+        <button class="icon-button" id="jump-start" title="Jump to start" disabled>│◀</button>
+        <button class="transport-play" id="global-play" title="Play master audio" disabled>▶</button>
+        <time id="global-time">00:00.000</time>
+      </div>
+      <div class="system-state">
+        <span class="status-dot checking" id="comfy-dot"></span>
+        <span id="comfy-label">Checking ComfyUI</span>
+        <button class="quiet-button" id="save-project">Save</button>
+      </div>
+    </header>
+
+    <nav class="rail" aria-label="Production workspaces">
+      <button class="rail-item active" data-panel="song"><span class="rail-index">01</span><span>Song</span></button>
+      <button class="rail-item" data-panel="treatment"><span class="rail-index">02</span><span>Treatment</span></button>
+      <button class="rail-item" data-panel="assets"><span class="rail-index">03</span><span>Assets</span></button>
+      <button class="rail-item" data-panel="timeline"><span class="rail-index">04</span><span>Timeline</span></button>
+      <button class="rail-item" data-panel="queue"><span class="rail-index">05</span><span>Queue</span></button>
+    </nav>
+
+    <main class="workspace">
+      <section class="panel active" id="panel-song" aria-labelledby="song-heading">
+        <div class="workspace-heading">
+          <div><span class="eyebrow">Source audio</span><h1 id="song-heading">Song workspace</h1></div>
+          <div class="heading-meta" id="song-meta">No song loaded</div>
+        </div>
+        <div class="song-layout">
+          <div class="song-controls">
+            <article class="tool-block">
+              <div class="block-heading"><h2>Import master</h2><span>WAV · FLAC · MP3</span></div>
+              <label class="drop-zone" id="song-drop">
+                <input id="song-file" type="file" accept="audio/wav,audio/flac,audio/mpeg,.wav,.flac,.mp3">
+                <strong>Drop a completed song</strong>
+                <span>or choose an audio file</span>
+              </label>
+              <label>Title<input id="import-title" autocomplete="off" placeholder="Track title"></label>
+              <button class="primary-button full" id="import-song">Import song</button>
+            </article>
+
+            <div class="or-rule"><span>or create locally</span></div>
+
+            <article class="tool-block accent-block">
+              <div class="block-heading"><h2>MiniMax Music 3</h2><span>SongPlanner pipeline</span></div>
+              <form id="music-form">
+                <label>Title<input name="title" required placeholder="Night Signal"></label>
+                <label>Creative direction<textarea name="caption" required rows="4" placeholder="Genre, mood, vocal character, instrumentation and arrangement…"></textarea></label>
+                <label>Lyrics / section plan<textarea name="lyrics" rows="7" placeholder="[Intro]&#10;…&#10;&#10;[Verse]&#10;…"></textarea></label>
+                <div class="form-row thirds">
+                  <label>Duration <span>s</span><input name="duration" type="number" min="4" max="360" value="120"></label>
+                  <label>Seed<input name="seed" type="number" min="0" value="0"></label>
+                  <label>Preset<select name="preset" disabled title="Additional API presets are planned"><option>Balanced</option></select></label>
+                </div>
+                <button class="primary-button full" type="submit">Queue song generation</button>
+              </form>
+            </article>
+          </div>
+
+          <div class="song-stage">
+            <div class="waveform-header">
+              <div><span class="source-badge" id="song-source">EMPTY</span><strong id="song-title">Load or generate a song</strong></div>
+              <div class="waveform-actions"><button class="quiet-button" id="analyze-song" disabled title="Automatic structure analysis is planned">Analyze structure · planned</button><button class="quiet-button" id="send-treatment" disabled>Build treatment →</button></div>
+            </div>
+            <audio id="master-audio" class="master-audio" controls preload="metadata"></audio>
+            <div class="waveform-shell">
+              <canvas id="waveform" width="1200" height="300"></canvas>
+              <div class="playhead" id="song-playhead"></div>
+              <div class="waveform-empty" id="waveform-empty"><b>Waveform appears here</b><span>Song duration sets the master timeline.</span></div>
+            </div>
+            <div class="time-ruler"><span>00:00</span><span id="quarter-time">—</span><span id="half-time">—</span><span id="three-quarter-time">—</span><span id="end-time">—</span></div>
+            <div class="analysis-strip">
+              <div><span>Duration</span><strong id="duration-value">—</strong></div>
+              <div><span>BPM</span><strong id="bpm-value">Not analyzed</strong></div>
+              <div><span>Sections</span><strong id="sections-value">Not analyzed</strong></div>
+              <div><span>Timeline</span><strong id="timeline-value">Waiting for song</strong></div>
+            </div>
+            <div class="production-note"><span>PRODUCTION NOTE</span><p>Imported songs and Music 3 outputs are equal first-class sources. Generation is never required to begin a video.</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-treatment" aria-labelledby="treatment-heading">
+        <div class="workspace-heading">
+          <div><span class="eyebrow">Conversational direction</span><h1 id="treatment-heading">Story & treatment</h1></div>
+          <div class="heading-meta" id="llm-state">LLM not configured</div>
+        </div>
+        <div class="treatment-layout">
+          <div class="chat-column">
+            <div class="chat-thread" id="chat-thread">
+              <div class="empty-thread"><strong>Direct the video naturally</strong><p>Describe narrative, energy, references, camera language, what to avoid, and where the performance should feel literal or abstract.</p></div>
+            </div>
+            <form class="composer" id="chat-form">
+              <textarea name="message" rows="3" placeholder="The verses should feel claustrophobic, then the chorus breaks into a huge sodium-lit desert…"></textarea>
+              <div><span>Structured output stays editable before rendering.</span><button class="primary-button" type="submit">Send to Director</button></div>
+            </form>
+          </div>
+          <div class="document-column">
+            <div class="document-tabs"><button class="active" data-doc="brief">Brief</button><button data-doc="treatment">Treatment</button><button data-doc="style">Style bible</button></div>
+            <label class="document-editor active" data-doc-panel="brief"><span>Creative brief</span><textarea id="creative-brief" placeholder="Core idea, emotional arc, audience, constraints…"></textarea></label>
+            <label class="document-editor" data-doc-panel="treatment"><span>Treatment</span><textarea id="treatment-text" placeholder="The structured treatment appears here…"></textarea></label>
+            <label class="document-editor" data-doc-panel="style"><span>Visual continuity</span><textarea id="style-bible" placeholder="Color, lenses, lighting, wardrobe, locations, continuity rules…"></textarea></label>
+            <div class="document-actions"><button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="apply-shot-plan" disabled title="Explicit Director plan application is planned">Apply shot plan · planned</button></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-assets" aria-labelledby="assets-heading">
+        <div class="workspace-heading">
+          <div><span class="eyebrow">Visual continuity</span><h1 id="assets-heading">Character & asset library</h1></div>
+          <div class="heading-actions"><button class="quiet-button" id="upload-asset-button">Upload asset</button><input id="asset-file" type="file" accept="image/*,video/*,audio/*" hidden></div>
+        </div>
+        <div class="asset-layout">
+          <aside class="generator-panel">
+            <div class="block-heading"><h2>Flux image generation</h2><span>Characters · settings</span></div>
+            <form id="flux-form">
+              <label>Name<input name="name" required placeholder="Lead performer"></label>
+              <label>Asset type<select name="kind"><option value="character">Character</option><option value="setting">Setting</option><option value="prop">Prop</option><option value="style">Style reference</option></select></label>
+              <label>Prompt<textarea name="prompt" rows="8" required placeholder="Full visual prompt, identity details, wardrobe, environment and lighting…"></textarea></label>
+              <div class="form-row">
+                <label>Aspect<select name="aspect"><option value="1024x1024">1:1</option><option value="1344x768">16:9</option><option value="768x1344">9:16</option><option value="1216x832">3:2</option></select></label>
+                <label>Seed<input name="seed" type="number" min="0" value="0"></label>
+              </div>
+              <div class="form-row">
+                <label>Steps<input name="steps" type="number" min="1" max="100" value="20"></label>
+                <label>Guidance<input name="guidance" type="number" min="0" max="20" step="0.1" value="4"></label>
+              </div>
+              <button class="primary-button full" type="submit">Generate with Flux</button>
+            </form>
+            <p class="pipeline-hint">Character → Flux concept → select approved image → Krea multiview → shot references</p>
+          </aside>
+          <div class="library-panel">
+            <div class="library-toolbar">
+              <div class="segmented" id="asset-filters"><button class="active" data-filter="all">All</button><button data-filter="character">Characters</button><button data-filter="setting">Settings</button><button data-filter="prop">Props</button><button data-filter="style">Style</button></div>
+              <input id="asset-search" type="search" placeholder="Search library">
+            </div>
+            <div class="asset-grid" id="asset-grid"><div class="library-empty"><strong>No assets yet</strong><span>Generate a character or setting with Flux, or upload existing media.</span></div></div>
+          </div>
+          <aside class="inspector" id="asset-inspector">
+            <span class="eyebrow">Inspector</span><h2>Select an asset</h2><p>Review provenance, generate multiview references, and attach approved assets to shots.</p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="panel timeline-panel" id="panel-timeline" aria-labelledby="timeline-heading">
+        <div class="workspace-heading compact">
+          <div><span class="eyebrow">Music-aware edit</span><h1 id="timeline-heading">Director timeline</h1></div>
+          <div class="timeline-tools"><button class="quiet-button" id="add-shot">＋ Shot</button><button class="quiet-button" id="split-shot">Split</button><button class="quiet-button" id="duplicate-shot">Duplicate</button><button class="danger-button" id="delete-shot">Delete</button><span class="divider"></span><button class="quiet-button" id="zoom-out">−</button><span id="zoom-label">100%</span><button class="quiet-button" id="zoom-in">＋</button></div>
+        </div>
+        <div class="timeline-layout">
+          <div class="timeline-main">
+            <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
+            <div class="timeline-scroll" id="timeline-scroll">
+              <div class="timeline-canvas" id="timeline-canvas">
+                <div class="timeline-ruler" id="timeline-ruler"></div>
+                <div class="track section-track"><div class="track-label">SECTIONS</div><div class="track-content" id="section-track"></div></div>
+                <div class="track waveform-track"><div class="track-label">MASTER</div><div class="track-content"><canvas id="timeline-waveform" height="78"></canvas></div></div>
+                <div class="track shots-track"><div class="track-label">SHOTS</div><div class="track-content" id="shots-track"></div></div>
+                <div class="track refs-track"><div class="track-label">REFERENCES</div><div class="track-content" id="refs-track"></div></div>
+                <div class="timeline-playhead" id="timeline-playhead"></div>
+              </div>
+            </div>
+          </div>
+          <aside class="shot-inspector" id="shot-inspector">
+            <span class="eyebrow">Shot inspector</span><h2>No shot selected</h2><p>Add a shot to begin. Shots are rendered independently in H3's reliable 4–15 second range.</p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-queue" aria-labelledby="queue-heading">
+        <div class="workspace-heading">
+          <div><span class="eyebrow">ComfyUI orchestration</span><h1 id="queue-heading">Render queue</h1></div>
+          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="primary-button" id="queue-ready" disabled title="Mark a text-only shot ready to queue H3">Queue ready H3 shots</button></div>
+        </div>
+        <div class="queue-layout">
+          <div class="queue-table">
+            <div class="queue-header"><span>Job</span><span>Target</span><span>Status</span><span>Seed</span><span>Output</span></div>
+            <div id="job-list"><div class="queue-empty">No render jobs for this project.</div></div>
+          </div>
+          <aside class="finish-stack">
+            <span class="eyebrow">Planned finishing route</span><h2>Per-shot pipeline</h2>
+            <ol><li><b>01</b><span>MiniMax H3 generation</span></li><li><b>02</b><span>SeedVR2 normalization</span></li><li><b>03</b><span>LTX 2.5 enhancement</span></li><li><b>04</b><span>FILM → RTX VSR</span></li><li><b>05</b><span>Timeline assembly</span></li></ol>
+            <p>Stages are optional and versioned. Approved outputs are never overwritten.</p>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="project-dialog">
+    <form method="dialog" id="project-form">
+      <span class="eyebrow">New production</span><h2>Create project</h2><p>A self-contained manifest and media workspace will be created locally.</p>
+      <label>Project name<input name="name" required autofocus placeholder="Untitled music video"></label>
+      <div class="dialog-actions"><button id="cancel-project" value="cancel" class="quiet-button" type="button">Cancel</button><button value="default" class="primary-button" type="submit">Create project</button></div>
+    </form>
+  </dialog>
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

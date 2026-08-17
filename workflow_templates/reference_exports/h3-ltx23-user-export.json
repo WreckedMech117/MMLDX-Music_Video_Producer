@@ -1,0 +1,888 @@
+{
+  "115": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 0.4,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "Resolution Selector (Size)"
+    }
+  },
+  "119": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "120": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "121": {
+    "inputs": {
+      "samples": [
+        "125",
+        0
+      ],
+      "vae": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE Decode Audio"
+    }
+  },
+  "122": {
+    "inputs": {
+      "samples": [
+        "125",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "123": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "124": {
+    "inputs": {
+      "scheduler": "beta",
+      "steps": 4,
+      "denoise": 1,
+      "model": [
+        "5960",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "125": {
+    "inputs": {
+      "noise": [
+        "129",
+        0
+      ],
+      "guider": [
+        "126",
+        0
+      ],
+      "sampler": [
+        "123",
+        0
+      ],
+      "sigmas": [
+        "124",
+        0
+      ],
+      "latent_image": [
+        "136",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "126": {
+    "inputs": {
+      "model": [
+        "5960",
+        0
+      ],
+      "conditioning": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "Basic Guider"
+    }
+  },
+  "127": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "128": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "129": {
+    "inputs": {
+      "noise_seed": 416764316764
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "131": {
+    "inputs": {
+      "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+      "values.a": [
+        "132",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "Math Expression"
+    }
+  },
+  "132": {
+    "inputs": {
+      "value": 8
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "(input:duration) Duration"
+    }
+  },
+  "136": {
+    "inputs": {
+      "prompt": [
+        "138",
+        0
+      ],
+      "width": [
+        "115",
+        0
+      ],
+      "height": [
+        "115",
+        1
+      ],
+      "length": [
+        "131",
+        1
+      ],
+      "ref_image_size": "match",
+      "clip": [
+        "128",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ],
+      "audio_vae": [
+        "120",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "6090",
+        0
+      ],
+      "ref_audios.ref_audio_0": [
+        "6095",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "_meta": {
+      "title": "MiniMax H3 Reference to Video"
+    }
+  },
+  "138": {
+    "inputs": {
+      "value": "subject_definitions:\n<Subject 1> is the man whose appearance comes from <Picture 1>: a Black man in his mid-twenties to early thirties with deep warm dark brown skin, an athletic solid build with broad shoulders, short twisted dreadlock-like sections on top with cropped dark hair, a trimmed short beard and mustache, a strong jawline, intense dark brown eyes, wearing a light grey heathered graphic t-shirt with bold yellow text, olive khaki cargo shorts, black Adidas sneakers with white 3-stripe branding, white crew socks, and a thick gold-tone chain necklace with pendant. An olive green hooded utility field jacket is draped on the bench behind him.\n<Subject 2> is the underground boxing gym environment with concrete walls, a regulation boxing ring under a single suspended industrial lamp, heavy bags along the left wall, a speed bag on the right, wooden benches, and worn rubber matting.\n<Audio 1> is the hip-hop music track providing the piano loop, boom-bap drums, and vocal rhythm.\n\nsummary:\n[reference generation + audio reference] The target video shows <Subject 1> sitting on a bench in <Subject 2>, wrapping his hands with white cloth. He begins rapping the opening line while wrapping, then lifts his eyes to camera. The scene uses <Audio 1> for the piano loop and vocal cadence.\n\nretention_analysis:\n<Subject 1> (appears in [Shot 1]): fully_preserved - the man's facial features, dreadlocks, beard, grey graphic tee, gold chain, cargo shorts, sneakers, and the hand-wrapping action are retained.\n<Subject 2> (appears in [Shot 1]): fully_preserved - the underground gym with ring, heavy bags, lamp, concrete walls, and rubber matting are retained.\n<Audio 1>: reference - the music track's piano loop and vocal rhythm guide the opening delivery.\n\ndetailed_description:\nThe target video uses a cinematic low-light style with a single hard overhead light source, deep shadow contrast, and a muted palette of concrete grey, warm amber, and blue window light.\n[Shot 1] A medium shot, camera mounted on a tripod at seated eye level, frames <Subject 1> from the waist up as he sits on a worn wooden bench at the edge of the ring light's cone. The single industrial lamp above the ring casts a hard warm cone of amber light downward, illuminating the ring and a circle of rubber matting around it. The rest of the gym falls into deep shadow. <Subject 1> wears a light grey heathered graphic t-shirt with bold yellow text, olive khaki cargo shorts, black Adidas sneakers with white 3-stripe branding and white crew socks, and a thick gold-tone chain necklace with pendant. His olive hooded jacket is draped over the bench behind him. His short twisted dreadlocks catch the overhead light. The trimmed beard is defined by the hard downward light. He holds a roll of white hand wraps. His right hand extends, palm up, and he begins wrapping — cloth circling the wrist, threading between fingers, pulling tight with practiced precision. His expression is focused on the wraps. The camera holds steady as a piano loop enters the soundscape. At 00:03.000, his lips move — he delivers the opening line while wrapping, voice low and deliberate: *\"Check the blueprint.\"* His eyes lift from his hands and lock directly into the camera lens. The gold chain catches the overhead light. His jaw sets beneath the trimmed beard. The wrapping continues, methodical, as the boom-bap drums kick in.\n\noverall_soundscape:\nThe underground gym has a tight, dry room tone — concrete walls absorb sound, creating an intimate closeness. The cloth wraps produce a soft dry rustle as they circle his wrist. The piano loop enters as a clean sample. The boom-bap drums — heavy kick and sharp snare — drop in on his held gaze.\n\nnon_diegetic_music:\nA looping piano riff plays a slightly melancholic yet triumphant chord progression, entering softly during the hand-wrapping. The boom-bap drum pattern — heavy thumping kick, sharp crisp snare on the 2 and 4, steady swung hi-hats — enters at full volume as the camera locks onto his gaze, driving the tempo at approximately 90 BPM."
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "(input:prompt) Text Prompt"
+    }
+  },
+  "142": {
+    "inputs": {
+      "sage_attention": "disabled",
+      "allow_compile": false,
+      "model": [
+        "5959",
+        0
+      ]
+    },
+    "class_type": "PathchSageAttentionKJ",
+    "_meta": {
+      "title": "Patch Sage Attention KJ"
+    }
+  },
+  "5645": {
+    "inputs": {
+      "frame_rate": [
+        "5650",
+        0
+      ],
+      "loop_count": 0,
+      "filename_prefix": "minimax-h3-music/vid",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": false,
+      "images": [
+        "122",
+        0
+      ],
+      "audio": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Output 2 (Output)"
+    }
+  },
+  "5650": {
+    "inputs": {
+      "value": 24
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Float"
+    }
+  },
+  "5959": {
+    "inputs": {
+      "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+      "strength_model": 0.7,
+      "model": [
+        "127",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "5960": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 6,
+      "model": [
+        "142",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "ModelSamplingMiniMaxH3"
+    }
+  },
+  "5980": {
+    "inputs": {
+      "image": "",
+      "custom_width": 0,
+      "custom_height": 0
+    },
+    "class_type": "VHS_LoadImagePath",
+    "_meta": {
+      "title": "Load Image (Path) 🎥🅥🅗🅢"
+    }
+  },
+  "6084": {
+    "inputs": {
+      "seed": 42,
+      "resolution": 720,
+      "max_resolution": 0,
+      "batch_size": 5,
+      "uniform_batch_size": false,
+      "color_correction": "lab",
+      "temporal_overlap": 0,
+      "prepend_frames": 0,
+      "input_noise_scale": 0,
+      "latent_noise_scale": 0,
+      "offload_device": "cpu",
+      "enable_debug": false,
+      "image": [
+        "6092",
+        0
+      ],
+      "dit": [
+        "6085",
+        0
+      ],
+      "vae": [
+        "6086",
+        0
+      ]
+    },
+    "class_type": "SeedVR2VideoUpscaler",
+    "_meta": {
+      "title": "SeedVR2 Video Upscaler (v2.5.24)"
+    }
+  },
+  "6085": {
+    "inputs": {
+      "model": "seedvr2_ema_7b_fp16.safetensors",
+      "device": "cuda:0",
+      "blocks_to_swap": 0,
+      "swap_io_components": false,
+      "offload_device": "none",
+      "cache_model": false,
+      "attention_mode": "sdpa"
+    },
+    "class_type": "SeedVR2LoadDiTModel",
+    "_meta": {
+      "title": "SeedVR2 (Down)Load DiT Model"
+    }
+  },
+  "6086": {
+    "inputs": {
+      "model": "ema_vae_fp16.safetensors",
+      "device": "cuda:0",
+      "encode_tiled": false,
+      "encode_tile_size": 1024,
+      "encode_tile_overlap": 128,
+      "decode_tiled": false,
+      "decode_tile_size": 1024,
+      "decode_tile_overlap": 128,
+      "tile_debug": "false",
+      "offload_device": "none",
+      "cache_model": false
+    },
+    "class_type": "SeedVR2LoadVAEModel",
+    "_meta": {
+      "title": "SeedVR2 (Down)Load VAE Model"
+    }
+  },
+  "6088": {
+    "inputs": {
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "minimax-h3-music/vid",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": false,
+      "images": [
+        "6084",
+        0
+      ],
+      "audio": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Output 2 (Output)"
+    }
+  },
+  "6090": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "upscale_method": "nvidia_rtx_vsr",
+      "keep_proportion": "pad",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 2,
+      "device": "cpu",
+      "image": [
+        "5980",
+        0
+      ]
+    },
+    "class_type": "ImageResizeKJv2",
+    "_meta": {
+      "title": "Resize Image v2"
+    }
+  },
+  "6092": {
+    "inputs": {
+      "anything": [
+        "6093",
+        0
+      ]
+    },
+    "class_type": "easy clearCacheAll",
+    "_meta": {
+      "title": "Clear Cache All"
+    }
+  },
+  "6093": {
+    "inputs": {
+      "anything": [
+        "122",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "Clean VRAM Used"
+    }
+  },
+  "6095": {
+    "inputs": {
+      "audio_file": "",
+      "seek_seconds": 0,
+      "duration": 8
+    },
+    "class_type": "VHS_LoadAudio",
+    "_meta": {
+      "title": "Load Audio (Path)🎥🅥🅗🅢"
+    }
+  },
+  "6122": {
+    "inputs": {
+      "anything": [
+        "6146:5561",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "Clean VRAM Used"
+    }
+  },
+  "6123": {
+    "inputs": {
+      "anything": [
+        "6122",
+        0
+      ]
+    },
+    "class_type": "easy clearCacheAll",
+    "_meta": {
+      "title": "Clear Cache All"
+    }
+  },
+  "6125": {
+    "inputs": {
+      "expression": "a*2",
+      "a": [
+        "5650",
+        0
+      ]
+    },
+    "class_type": "MathExpression|pysssss",
+    "_meta": {
+      "title": "Math Expression 🐍"
+    }
+  },
+  "6126": {
+    "inputs": {
+      "frame_rate": [
+        "6125",
+        1
+      ],
+      "loop_count": 0,
+      "filename_prefix": "minimax-h3-music/vid-vfi",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "6129",
+        0
+      ],
+      "audio": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Output 2 (Output)"
+    }
+  },
+  "6127": {
+    "inputs": {
+      "multiplier": 2,
+      "interp_model": [
+        "6128",
+        0
+      ],
+      "images": [
+        "6123",
+        0
+      ]
+    },
+    "class_type": "FrameInterpolate",
+    "_meta": {
+      "title": "Run Frame Interpolation Model"
+    }
+  },
+  "6128": {
+    "inputs": {
+      "model_name": "film_net_fp16.safetensors"
+    },
+    "class_type": "FrameInterpolationModelLoader",
+    "_meta": {
+      "title": "Load Frame Interpolation Model"
+    }
+  },
+  "6129": {
+    "inputs": {
+      "resize_type": "scale by multiplier",
+      "resize_type.scale": 1.5,
+      "quality": "ULTRA",
+      "images": [
+        "6127",
+        0
+      ]
+    },
+    "class_type": "RTXVideoSuperResolution",
+    "_meta": {
+      "title": "RTX Video Super Resolution"
+    }
+  },
+  "6132": {
+    "inputs": {
+      "vae_name": "LTX23_video_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "6133": {
+    "inputs": {
+      "ckpt_name": "ltx2\\ltx-2.3-22b-dev.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "6134": {
+    "inputs": {
+      "ckpt_name": "ltx2\\ltx-2.3-22b-dev.safetensors"
+    },
+    "class_type": "LTXVAudioVAELoader",
+    "_meta": {
+      "title": "Load LTXV Audio VAE"
+    }
+  },
+  "6138": {
+    "inputs": {
+      "anything": [
+        "6142",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "Clean VRAM Used"
+    }
+  },
+  "6142": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "largest_size": 1280,
+      "image": [
+        "6084",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToMaxDimension",
+    "_meta": {
+      "title": "Scale Image to Max Dimension"
+    }
+  },
+  "6143": {
+    "inputs": {
+      "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+      "strength_model": 1,
+      "model": [
+        "6133",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "6148": {
+    "inputs": {
+      "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+      "ckpt_name": "ltx2\\ltx-2.3-22b-dev.safetensors",
+      "device": "default"
+    },
+    "class_type": "LTXAVTextEncoderLoader",
+    "_meta": {
+      "title": "Load LTXV Audio Text Encoder"
+    }
+  },
+  "6152": {
+    "inputs": {
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "minimax-h3-music/vid",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "6146:5561",
+        0
+      ],
+      "audio": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Output 2 (Output)"
+    }
+  },
+  "6146:5533": {
+    "inputs": {
+      "noise_seed": 42
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "6146:5534": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "6146:5542",
+        0
+      ],
+      "positive": [
+        "6146:5551",
+        0
+      ],
+      "negative": [
+        "6146:5551",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider"
+    }
+  },
+  "6146:5535": {
+    "inputs": {
+      "sampler_name": "res_2s"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "6146:5550": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "6148",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "6146:5551": {
+    "inputs": {
+      "frame_rate": [
+        "5650",
+        0
+      ],
+      "positive": [
+        "6146:5550",
+        0
+      ],
+      "negative": [
+        "6146:5550",
+        0
+      ]
+    },
+    "class_type": "LTXVConditioning",
+    "_meta": {
+      "title": "LTXVConditioning"
+    }
+  },
+  "6146:5553": {
+    "inputs": {
+      "temporal_tile_size": 56,
+      "temporal_overlap": 24,
+      "guiding_strength": 1,
+      "temporal_overlap_cond_strength": 0.5,
+      "cond_image_strength": 1,
+      "horizontal_tiles": 1,
+      "vertical_tiles": 1,
+      "spatial_overlap": 1,
+      "adain_factor": 0,
+      "guiding_start_step": 0,
+      "guiding_end_step": 1000,
+      "optional_cond_image_indices": "0",
+      "model": [
+        "6146:5542",
+        0
+      ],
+      "vae": [
+        "6133",
+        2
+      ],
+      "noise": [
+        "6146:5533",
+        0
+      ],
+      "sampler": [
+        "6146:5535",
+        0
+      ],
+      "sigmas": [
+        "6146:5548",
+        0
+      ],
+      "guider": [
+        "6146:5534",
+        0
+      ],
+      "latents": [
+        "6146:5545",
+        0
+      ],
+      "optional_guiding_latents": [
+        "6146:5545",
+        0
+      ]
+    },
+    "class_type": "LTXVLoopingSampler",
+    "_meta": {
+      "title": "🅛🅣🅧 LTXV Looping Sampler"
+    }
+  },
+  "6146:5561": {
+    "inputs": {
+      "anything": [
+        "6146:5540",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "Clean VRAM Used"
+    }
+  },
+  "6146:5540": {
+    "inputs": {
+      "spatial_tiles": 4,
+      "spatial_overlap": 4,
+      "temporal_tile_length": 16,
+      "temporal_overlap": 1,
+      "last_frame_fix": false,
+      "working_device": "auto",
+      "working_dtype": "auto",
+      "vae": [
+        "6133",
+        2
+      ],
+      "latents": [
+        "6146:5553",
+        0
+      ]
+    },
+    "class_type": "LTXVSpatioTemporalTiledVAEDecode",
+    "_meta": {
+      "title": "🅛🅣🅧 LTXV Spatio Temporal Tiled VAE Decode"
+    }
+  },
+  "6146:5545": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 500,
+      "temporal_overlap": 4,
+      "pixels": [
+        "6138",
+        0
+      ],
+      "vae": [
+        "6133",
+        2
+      ]
+    },
+    "class_type": "VAEEncodeTiled",
+    "_meta": {
+      "title": "VAE Encode (Tiled)"
+    }
+  },
+  "6146:5548": {
+    "inputs": {
+      "sigmas": "0.909375, 0.725, 0.421875, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "ManualSigmas"
+    }
+  },
+  "6146:5542": {
+    "inputs": {
+      "lora_name": "ltx-2-19b-ic-lora-detailer.safetensors",
+      "strength_model": 0.5,
+      "model": [
+        "6143",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  }
+}
