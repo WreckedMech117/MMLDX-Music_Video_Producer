@@ -23,6 +23,7 @@ from .director import (
 )
 from .models import (
     Asset,
+    MessageNotice,
     Project,
     RenderJob,
     Shot,
@@ -83,7 +84,14 @@ DocumentName = Literal["treatment", "style_bible"]
 # into the prompt by omission. See `director_chat` for why that matters.
 DIRECTOR_CONTEXT_EXCLUDE: dict[str, Any] = {
     "jobs": True,
-    "messages": {"__all__": {"id", "created_at"}},
+    # `notices` goes out whole, and that is the invariant Story 2.2 established extended to this
+    # route. A notice's `raw` field holds the degraded output a refusal is about, and this dump is
+    # what the *next* Director call is handed — so leaving it in would make the guard that catches
+    # "JSON in context begets JSON" the thing supplying it. The list is dropped rather than the
+    # `raw` field inside it for two reasons: every notice's sentence is already in `content`, so
+    # keeping the structured copy would echo a second copy of each one into the prompt; and a
+    # nested path stops covering a field that is later renamed or added beside it, silently.
+    "messages": {"__all__": {"id", "created_at", "notices"}},
     **{f"{field}_previous": True for field in DOCUMENT_LABELS},
 }
 
@@ -167,6 +175,122 @@ DOCUMENT_RESTORE_REFUSAL = (
 )
 
 
+# The one separator between a reply's own prose and the notices attached to it, and the one way
+# the notices are joined to each other. Both routes wrote these out for themselves, byte-identical
+# and unshared. `api.js`'s NOTICE_SEPARATOR and NOTICE_JOIN are the frontend halves and a contract
+# test asserts they are identical, because the browser strips exactly this tail rather than
+# *searching* the message for `---`: the Director's own prose can contain that sequence, and so can
+# the raw model output a notice is about, and a search would split one notice into two blocks with
+# the model's degraded text presented as a protective refusal.
+NOTICE_SEPARATOR = "\n\n---\n"
+NOTICE_JOIN = "\n\n"
+
+# What a reply says when the model returned no sentence of its own. `DirectorResult.message` has
+# no `min_length` and deliberately keeps none — an empty sentence is not a reason to fail a turn
+# that legitimately replaced a document — but without a fallback the stored reply begins with a
+# bare separator, and that reply is context for the next call. The expansion route has had this
+# guard since Story 2.2; the chat route never did.
+CHAT_EMPTY_MESSAGE = "The Director returned no message with this reply."
+
+# The refusal that keeps a document, and until now the only notice with no wording of its own: an
+# inline f-string that pasted 400 characters of the model's own degraded output into `content` —
+# into the thread `director_chat` hands straight back to the model as context on the next turn.
+# The output now travels in the notice's `raw` field, which that dump excludes, so it can be read
+# without being fed back.
+DOCUMENT_REJECTED_NOTICE = (
+    "{document} was NOT replaced: {reason}. The document you have is unchanged. The text the "
+    "model returned is kept beside this notice for inspection and is left out of the next "
+    "Director call's context."
+)
+# ...and the same refusal when there is nothing behind the disclosure. A blank or whitespace-only
+# candidate is refused by the ratio floor like any other, and `MessageNotice` stores blank as
+# blank, so the sentence above would offer an inspection of an empty box. That is the same class
+# of false sentence this story rewrote `EXPANSION_REJECTED_NOTICE` to remove, and writing it here
+# while removing it there would be no improvement at all.
+DOCUMENT_REJECTED_EMPTY_NOTICE = (
+    "{document} was NOT replaced: {reason}. The document you have is unchanged. The model "
+    "returned no text for it, so there is nothing to inspect."
+)
+
+# Consent was given for a shot plan and none arrived. Says the timeline is untouched, because
+# "no shot plan was applied" on its own reads like something might have been removed.
+SHOT_PLAN_EMPTY_NOTICE = (
+    "No shot plan was applied: the model returned an empty shot list. "
+    "Existing shots are unchanged."
+)
+
+# FR-15's last clause, and the half of the recorded 2026-08-16 defect nothing ever reported: the
+# reply's prose described a four-beat sequence while `shots` came back empty, so the Director was
+# told work had been done that was never applied and no shot plan existed to review.
+#
+# Ungated on `apply_shots` deliberately. The browser hardcodes that flag to `false`, so gating this
+# on it would put the notice exactly where no Director can reach it — and the mismatch is a fact
+# about the reply contradicting itself, which is true whether or not shots would have been applied.
+#
+# Two wordings, chosen on what the project actually holds. "The existing shots are unchanged" is
+# reassurance about work that exists; said to a project with no shots at all it is both false and
+# the opposite of the point, which is that the plan the Director has just been told about does not
+# exist anywhere.
+SHOT_CLAIM_MISMATCH_NOTICE = (
+    "The reply describes a shot plan but returned an empty shot list, so nothing was written to "
+    "the timeline and the existing shots are unchanged. Ask again if you want the plan itself."
+)
+SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE = (
+    "The reply describes a shot plan but returned an empty shot list, and this project still has "
+    "no shots at all. Nothing was written to the timeline. Ask again if you want the plan itself."
+)
+
+# A Shot outside the renderable window. Reported, never corrected: the Shot is still applied and
+# the Director decides whether to split it, trim it, or leave it.
+SHOT_WINDOW_NOTICE = (
+    "Proposed {duration:g}s shot at {start:g}s falls outside MiniMax H3's reliable "
+    "{minimum:g}-{maximum:g}s window; split or trim it before rendering."
+)
+
+# Whether a reply's prose claims to have *produced* a shot plan. Every part of this is narrowing,
+# because the first cut matched `\bshots?\b` anywhere and therefore fired on "I did not add any
+# shots" and "the shots you have are fine" — a notice that appears on ordinary conversation about
+# an existing timeline is one the Director learns to scroll past, which is the failure this whole
+# story is about.
+#
+# Three rules, each earning its place:
+#
+# * **A claim of authorship, not a mention.** One of these verbs has to appear before the noun,
+#   within one sentence, so describing shots is not the same as claiming to have written them.
+# * **A denial anywhere in the sentence skips it.** "I have not written any shots" contains a
+#   perfectly good claim as a substring, and the safe reading of a negated sentence is silence.
+# * **Anything other than the word "shot" must be a counted structure *and* name a plan.** The
+#   recorded defect said "Splitting your vision into a four-beat sequence" and never used the word
+#   shot, so beats and cuts have to count — but "written the treatment in two parts" is ordinary
+#   document vocabulary and must not, which is what the plan word after the count decides.
+_CLAIM_VERB = (
+    r"(?:add(?:s|ed|ing)?|writ(?:e|es|ten|ing)|wrote|split(?:s|ting)?|break(?:s|ing)?|broke|"
+    r"broken|cut(?:s|ting)?|creat(?:e|es|ed|ing)|draft(?:s|ed|ing)?|plan(?:s|ned|ning)?|"
+    r"build(?:s|ing)?|built|lay(?:s|ing)?|laid|map(?:s|ped|ping)?|storyboard(?:s|ed|ing)?|"
+    r"here (?:are|is))"
+)
+_COUNT = r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+_STRUCTURE_NOUN = r"(?:beat|part|section|segment|scene|cut|chapter|block)"
+_PLAN_NOUN = r"(?:sequence|plan|breakdown|storyboard|montage|edit|shot list|shots?)"
+#: A sentence containing any of these is read as saying what did *not* happen, and skipped.
+_NOTICE_DENIAL = re.compile(
+    r"\b(?:no|not|never|nothing|none|without|cannot|unchanged|untouched|kept|left alone|"
+    r"\w+n't)\b",
+    re.IGNORECASE,
+)
+_SHOT_CLAIM_PATTERNS = (
+    re.compile(rf"\b{_CLAIM_VERB}\b[^.!?]{{0,60}}?\bshots?\b", re.IGNORECASE),
+    re.compile(
+        rf"\b{_CLAIM_VERB}\b[^.!?]{{0,60}}?\b{_COUNT}[\s-]{_STRUCTURE_NOUN}s?\b"
+        rf"[^.!?]{{0,40}}?\b{_PLAN_NOUN}\b",
+        re.IGNORECASE,
+    ),
+)
+#: Sentence boundaries, so a denial in one sentence cannot silence a claim in another and a claim
+#: cannot be assembled out of two unrelated ones.
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
 # Why an empty plan is refused instead of answered with an empty expansion. Expansion writes a
 # prompt onto Shots that already exist — it never creates, retimes or removes one — so with no
 # Shots there is nothing for a result to be keyed to, and a model call would spend the
@@ -218,14 +342,22 @@ EXPANSION_DUPLICATE_NOTICE = (
     "The model answered more than once for {shots}. The first prompt it gave for each was "
     "applied and the later ones were ignored, because a shot cannot have two prompts."
 )
-# The refusal, without the refused text. Storing the raw output would write the degraded JSON
-# into the chat thread, which `director_chat` ships back to the model as context on the next
-# turn — so the guard that catches "JSON in context begets JSON" would be the thing feeding it.
+# The refusal, with the refused text carried out of band. Writing the raw output into the reply
+# would put the degraded JSON in the chat thread, which `director_chat` ships back to the model as
+# context on the next turn — so the guard that catches "JSON in context begets JSON" would be the
+# thing feeding it. That is why the text was dropped entirely when this notice was written, and
+# why it no longer has to be: it now travels in the notice's `raw` field, which
+# `DIRECTOR_CONTEXT_EXCLUDE` keeps out of that dump, so the Director can read what was refused
+# without the model ever seeing it again.
 EXPANSION_REJECTED_NOTICE = (
-    "NOT applied to {shot}: {reason}. The returned text is not recorded here, because this "
-    "thread is context for the next Director call and repeating degraded output into it is what "
-    "produces more of it."
+    "NOT applied to {shot}: {reason}. The returned text is kept beside this notice for "
+    "inspection and is left out of the context of the next Director call, because repeating "
+    "degraded output into it is what produces more of it."
 )
+# ...and the same refusal when the model returned nothing to keep. `expansion_rejection` refuses a
+# blank prompt in exactly those words, so promising an inspection of it would offer a disclosure
+# onto an empty box — the false sentence the wording above was rewritten to stop making.
+EXPANSION_REJECTED_EMPTY_NOTICE = "NOT applied to {shot}: {reason}. There is no returned text."
 # What the reply says when the model returned no message of its own. `ShotExpansion.message`
 # deliberately has no `min_length`: an empty sentence is not a reason to discard a whole set of
 # good prompts with a 502, but it must not leave the reply as a bare separator either.
@@ -280,6 +412,65 @@ def shot_render_provenance(shot: Shot) -> bool:
     return bool(
         shot.prompt_id or shot.latest_output or shot.approved_output or shot.status != "draft"
     )
+
+
+def prose_claims_shots(message: str) -> bool:
+    """True when a reply's prose claims to have produced a shot plan. See `_SHOT_CLAIM_PATTERNS`.
+
+    Sentence by sentence, because both narrowing rules are about sentences: a denial silences the
+    one it is in and no other, and a claim may not be assembled out of a verb in one sentence and
+    a noun in the next.
+
+    Read only when the structured list came back empty, so a reply that *did* return shots is
+    never inspected for what it says about them.
+    """
+    for sentence in _SENTENCE_BREAK.split(message or ""):
+        if _NOTICE_DENIAL.search(sentence):
+            continue
+        if any(pattern.search(sentence) for pattern in _SHOT_CLAIM_PATTERNS):
+            return True
+    return False
+
+
+def shot_claim_mismatch_notice(existing_shots: int) -> MessageNotice:
+    """Report a reply that describes a plan it did not return, in the words that are true.
+
+    A project that already has Shots is a different situation from one that has none: the first
+    can be reassured that its timeline is untouched, and telling the second the same thing would
+    describe shots it does not have, in the one reply that has just led the Director to believe
+    they exist.
+    """
+    wording = (
+        SHOT_CLAIM_MISMATCH_NOTICE if existing_shots else SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE
+    )
+    return MessageNotice(kind="flag", text=wording)
+
+
+def rejection_notice(kept: str, empty: str, *, raw: str, **fields: object) -> MessageNotice:
+    """A refusal, worded for whether there is genuinely anything behind its disclosure.
+
+    `MessageNotice` stores a blank or whitespace-only `raw` as `""`, so this reads the stored
+    value rather than the candidate: the sentence offered to the Director and the disclosure the
+    client renders are then decided by the same fact.
+    """
+    notice = MessageNotice(kind="refusal", text=kept.format(**fields), raw=raw)
+    if notice.raw:
+        return notice
+    return MessageNotice(kind="refusal", text=empty.format(**fields))
+
+
+def assistant_reply(prose: str, notices: list[MessageNotice]) -> TreatmentMessage:
+    """The one way either Director route turns prose plus notices into a stored reply.
+
+    `content` keeps carrying the joined text: it is what every saved project already holds and
+    what `api.js`'s marker-scanning helpers read, so changing it would break both for no gain.
+    The notices ride alongside it as data, which is what lets the renderer split the two apart
+    without searching the message for a separator that its own text may contain.
+    """
+    content = prose
+    if notices:
+        content = prose + NOTICE_SEPARATOR + NOTICE_JOIN.join(notice.text for notice in notices)
+    return TreatmentMessage(role="assistant", content=content, notices=notices)
 
 
 def _short(value: str, limit: int = 60) -> str:
@@ -671,6 +862,15 @@ def create_app(
         for field in DOCUMENT_LABELS:
             for owned in (f"{field}_previous", f"{field}_locked"):
                 setattr(project, owned, getattr(current, owned))
+        # The thread is server-owned for the same reason and by the same argument. Nothing in
+        # this application posts a message: the chat route, the expansion route and the restore
+        # route are the only writers, and each appends exactly what it did. A client body is
+        # therefore never the authority on it — and since a message now carries structured
+        # notices, trusting one would let an ordinary save invent a refusal that never happened,
+        # reword the reason a real one gave, or simply omit the field and revert every notice in
+        # the project to undifferentiated prose. The recovery slots were the first case of this;
+        # a body that merely *omits* what it does not know about is the shape of all of them.
+        project.messages = current.messages
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -1284,7 +1484,7 @@ def create_app(
         # the existing text the guard compares against, and the slot being spent.
         project = get_project(project_id)
         project.messages.append(TreatmentMessage(role="user", content=request.message))
-        notices: list[str] = []
+        notices: list[MessageNotice] = []
         replaced: list[str] = []
         first_drafts: list[str] = []
         not_requested: list[str] = []
@@ -1306,7 +1506,11 @@ def create_app(
             # locked Treatment would carry the same paragraph on every reply forever.
             if getattr(project, f"{field}_locked"):
                 if not reason:
-                    notices.append(DOCUMENT_LOCK_NOTICE.format(document=label))
+                    notices.append(
+                        MessageNotice(
+                            kind="refusal", text=DOCUMENT_LOCK_NOTICE.format(document=label)
+                        )
+                    )
                 continue
             # Consent is the second "do not write, and say why" gate, and it sits *after* the
             # lock deliberately: a lock is durable state the Director set and a flag is one
@@ -1322,7 +1526,18 @@ def create_app(
                     not_requested.append(label)
                 continue
             if reason:
-                notices.append(f"{label} was NOT replaced: {reason}. Raw output: {candidate[:400]}")
+                # The candidate travels in `raw`, never in the sentence. It used to be pasted
+                # into `content` — the one place in this module guaranteed to be handed back
+                # to the model on the next turn. `MessageNotice` is what bounds it.
+                notices.append(
+                    rejection_notice(
+                        DOCUMENT_REJECTED_NOTICE,
+                        DOCUMENT_REJECTED_EMPTY_NOTICE,
+                        raw=candidate,
+                        document=label,
+                        reason=reason,
+                    )
+                )
                 continue
             # Capture on apply, never on attempt. Writing the recovery slot before the
             # guard ran would let a rejected candidate overwrite the only copy of the good
@@ -1337,29 +1552,44 @@ def create_app(
         # Both statements go ahead of the "was NOT replaced" notices: what did change is what
         # the Director has to review, and it is the thing this reply used to never mention.
         if first_drafts:
-            notices.insert(0, document_first_draft_notice(first_drafts))
+            notices.insert(
+                0, MessageNotice(kind="change", text=document_first_draft_notice(first_drafts))
+            )
         if replaced:
-            notices.insert(0, document_change_notice(replaced))
+            notices.insert(
+                0, MessageNotice(kind="change", text=document_change_notice(replaced))
+            )
         # One grouped statement rather than one per document: a declined turn wrote nothing, so
         # the Director needs the list and the reason once, not the same paragraph twice.
         if not_requested:
-            notices.append(document_not_requested_notice(not_requested))
-        if request.apply_shots and not result.shots:
             notices.append(
-                "No shot plan was applied: the model returned an empty shot list. "
-                "Existing shots are unchanged."
+                MessageNotice(kind="refusal", text=document_not_requested_notice(not_requested))
             )
+        # A model that returned no sentence of its own must not leave the reply as a bare
+        # separator followed by notices — the expansion route's guard, which this one lacked.
+        message = result.message.strip() or CHAT_EMPTY_MESSAGE
+        # The two empty-list notices are independent, and both can fire on one reply. They answer
+        # different questions: this one says the reply contradicts itself, and the next says the
+        # consent the Director gave produced nothing. Suppressing either would leave one of those
+        # facts unsaid in exactly the turn it is about.
+        if not result.shots and prose_claims_shots(message):
+            notices.append(shot_claim_mismatch_notice(len(project.shots)))
+        if request.apply_shots and not result.shots:
+            notices.append(MessageNotice(kind="flag", text=SHOT_PLAN_EMPTY_NOTICE))
         for item in result.shots:
             if item.duration < H3_MIN_SHOT_SECONDS or item.duration > H3_MAX_SHOT_SECONDS:
                 notices.append(
-                    f"Proposed {item.duration:g}s shot at {item.start:g}s falls outside MiniMax "
-                    f"H3's reliable {H3_MIN_SHOT_SECONDS:g}-{H3_MAX_SHOT_SECONDS:g}s window; "
-                    "split or trim it before rendering."
+                    MessageNotice(
+                        kind="flag",
+                        text=SHOT_WINDOW_NOTICE.format(
+                            duration=item.duration,
+                            start=item.start,
+                            minimum=H3_MIN_SHOT_SECONDS,
+                            maximum=H3_MAX_SHOT_SECONDS,
+                        ),
+                    )
                 )
-        message = result.message
-        if notices:
-            message = message + "\n\n---\n" + "\n\n".join(notices)
-        project.messages.append(TreatmentMessage(role="assistant", content=message))
+        project.messages.append(assistant_reply(message, notices))
         if request.apply_shots and result.shots:
             merged_shots: list[Shot] = []
             for index, item in enumerate(result.shots):
@@ -1437,7 +1667,7 @@ def create_app(
         rendered: list[str] = []
         unknown: list[str] = []
         duplicated: list[str] = []
-        rejected: list[str] = []
+        rejected: list[MessageNotice] = []
         answered: set[str] = set()
         for item in result.shots:
             shot = shots_by_id.get(item.shot_id)
@@ -1469,8 +1699,19 @@ def create_app(
                 continue
             reason = expansion_rejection(item.prompt)
             if reason:
+                # The refused prompt is restored here, in `raw`. Story 2.2 dropped it because it
+                # had nowhere to live that the next Director call would not read; the notice's
+                # excluded field is that place, so the Director can now see what was refused.
+                # `ExpandedShot.prompt` has no upper bound, so `MessageNotice` is what stops an
+                # unbounded prompt reaching the manifest.
                 rejected.append(
-                    EXPANSION_REJECTED_NOTICE.format(shot=labels[shot.id], reason=reason)
+                    rejection_notice(
+                        EXPANSION_REJECTED_NOTICE,
+                        EXPANSION_REJECTED_EMPTY_NOTICE,
+                        raw=item.prompt,
+                        shot=labels[shot.id],
+                        reason=reason,
+                    )
                 )
                 continue
             shot.prompt = item.prompt
@@ -1483,39 +1724,55 @@ def create_app(
             for shot in project.shots
             if shot.id not in answered and not shot.locked and not shot_render_provenance(shot)
         ]
-        notices: list[str] = []
+        notices: list[MessageNotice] = []
         # What changed goes first, as it does in the chat reply: it is the thing the Director has
         # to review, and everything below it is an explanation of something that did not happen.
         if written:
             notices.append(
-                EXPANSION_WRITTEN_NOTICE.format(
-                    count=len(written), shots=", ".join(labels[shot_id] for shot_id in written)
+                MessageNotice(
+                    # The confirmation, and the one notice on this route that is good news:
+                    # "Prompts written for 4 shot(s)" is the thing the Director pressed the
+                    # button for, and dressing it as caution is how caution stops being read.
+                    kind="change",
+                    text=EXPANSION_WRITTEN_NOTICE.format(
+                        count=len(written),
+                        shots=", ".join(labels[shot_id] for shot_id in written),
+                    ),
                 )
             )
-        for reported, wording in (
-            (locked, EXPANSION_LOCKED_NOTICE),
-            (rendered, EXPANSION_RENDERED_NOTICE),
-            (omitted, EXPANSION_OMITTED_NOTICE),
-            (duplicated, EXPANSION_DUPLICATE_NOTICE),
+        # A lock and existing render provenance are decisions to *not* write; an omission and a
+        # contradiction are the model behaving oddly about Shots nothing refused.
+        for reported, wording, kind in (
+            (locked, EXPANSION_LOCKED_NOTICE, "refusal"),
+            (rendered, EXPANSION_RENDERED_NOTICE, "refusal"),
+            (omitted, EXPANSION_OMITTED_NOTICE, "flag"),
+            (duplicated, EXPANSION_DUPLICATE_NOTICE, "flag"),
         ):
             if reported:
                 notices.append(
-                    wording.format(shots=", ".join(labels[shot_id] for shot_id in reported))
+                    MessageNotice(
+                        kind=kind,
+                        text=wording.format(
+                            shots=", ".join(labels[shot_id] for shot_id in reported)
+                        ),
+                    )
                 )
         if unknown:
             notices.append(
-                EXPANSION_UNKNOWN_NOTICE.format(
-                    count=len(unknown),
-                    shots=", ".join(_short(shot_id) for shot_id in unknown),
+                MessageNotice(
+                    # Discarded rather than guessed at: a refusal to invent a Shot.
+                    kind="refusal",
+                    text=EXPANSION_UNKNOWN_NOTICE.format(
+                        count=len(unknown),
+                        shots=", ".join(_short(shot_id) for shot_id in unknown),
+                    ),
                 )
             )
         notices.extend(rejected)
         # A model that returned no sentence of its own must not leave the reply as a bare
         # separator followed by notices.
         message = result.message.strip() or EXPANSION_EMPTY_MESSAGE
-        if notices:
-            message = message + "\n\n---\n" + "\n\n".join(notices)
-        project.messages.append(TreatmentMessage(role="assistant", content=message))
+        project.messages.append(assistant_reply(message, notices))
         return store.save(project)
 
     @app.get("/api/projects/{project_id}/jobs/{job_id}", response_model=RenderJob)

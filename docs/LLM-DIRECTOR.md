@@ -74,13 +74,15 @@ Two slots are **absent rather than fabricated**: `song_fraction` when there is n
 
 Expansion writes prompts only. It never retimes a window, never queues a render, and never rewrites a shot that is either **locked** or **carries render provenance** — anything with a submitted prompt id, a take on disk, an approval, or a status past `draft`. For those, the prompt is no longer an intention but the record of what produced a specific piece of media, so rewriting it in place would leave the take and its prompt quietly disagreeing. Note the consequence: marking a shot `ready` takes it out of expansion's reach.
 
-A returned id matching no shot, a shot the model omitted, a prompt that parses as JSON, and the model answering for the same shot twice are each reported in the reply and not applied — on a duplicate, the first answer wins. The refused text itself is **not** written into the thread: the thread becomes context for the next chat turn, and persisting degraded JSON there would feed the exact failure `document_rejection` exists to catch.
+A returned id matching no shot, a shot the model omitted, a prompt that parses as JSON, and the model answering for the same shot twice are each reported in the reply and not applied — on a duplicate, the first answer wins. The refused text itself is kept **beside** the notice, in the notice's `raw` field — not inside the message's `content`. The thread becomes context for the next chat turn, so persisting degraded JSON in `content` would feed the exact failure `document_rejection` exists to catch; carrying it in a field that `DIRECTOR_CONTEXT_EXCLUDE` strips lets the Director inspect what was refused without the model ever seeing it again. This replaced an earlier design that dropped the refused text entirely, which kept the invariant but left a refusal you could not examine.
 
 The reply is appended to the project's chat thread as an assistant turn **with no preceding user turn** — expansion is a button, not a question, but it shares the thread because that thread is the audit trail for what the Director wrote. It is therefore visible in the Treatment workspace alongside chat replies, and it becomes part of the context a later chat turn sees.
 
 ## Project context
 
-The director receives the current song metadata, creative documents, assets, shots, and prior messages. Render jobs and internal message IDs/timestamps are omitted to reduce irrelevant context.
+The director receives the current song metadata, creative documents, assets, shots, and prior messages. Render jobs and internal message IDs/timestamps are omitted to reduce irrelevant context, and so are the recovery slots (`treatment_previous`, `style_bible_previous`) and every message's `notices` list.
+
+The `notices` omission is a correctness rule, not an economy: a notice's `raw` field holds the degraded output a refusal is *about*, and this dump is what the next call is handed, so leaving it in would make the guard that catches degraded output the thing supplying it. The whole list is dropped rather than the `raw` field within it, because each notice's sentence already appears in `content` — keeping the structured copy would echo a second copy of every notice into the prompt — and because a nested exclusion path silently stops covering a field that is later renamed or added beside it.
 
 ## Editing model
 

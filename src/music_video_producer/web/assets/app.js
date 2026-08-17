@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage, threadHtml } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -261,11 +261,12 @@ function renderTreatment() {
   $("#style-bible").value = project?.style_bible || "";
   syncDocumentControls();
   const thread = $("#chat-thread");
-  if (!project?.messages?.length) {
-    thread.innerHTML = `<div class="empty-thread"><strong>Direct the video naturally</strong><p>Describe narrative, energy, references, camera language, what to avoid, and where the performance should feel literal or abstract.</p></div>`;
-    return;
-  }
-  thread.innerHTML = project.messages.map((message) => `<div class="message ${message.role}">${escapeHtml(message.content)}</div>`).join("");
+  // The whole body -- the empty-thread copy, every bubble, the prose/notice split and every
+  // escape -- is `threadHtml`, a pure function the suite executes. This line is the only place
+  // any of it becomes DOM, so it is the only thing left here that a test cannot run: assigning
+  // to `textContent` instead would print every refusal as literal markup with the block never
+  // appearing, so the assignment itself is pinned by tests/test_frontend_contract.py.
+  thread.innerHTML = threadHtml(project?.messages);
   thread.scrollTop = thread.scrollHeight;
 }
 
@@ -745,10 +746,6 @@ function attachSelectedAsset() {
   saveShotsSilently();
   renderTimeline();
   toast(`${asset.name} attached to shot`);
-}
-
-function escapeHtml(value = "") {
-  return String(value).replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[char]));
 }
 
 function bindEvents() {

@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 SongSource = Literal["imported", "generated"]
 AssetKind = Literal["character", "setting", "prop", "style", "image", "audio", "video"]
@@ -77,10 +77,86 @@ class Shot(BaseModel):
         return self.start + self.duration
 
 
+#: How much model-controlled output one notice keeps for inspection.
+#:
+#: Enforced by the model below rather than by the routes that build notices. The argument for
+#: the cap is about *persistence* — the thread is written to the manifest and read back on every
+#: load — and a rule argued in this file and applied in another is a rule the next writer, or a
+#: hand-edited manifest, silently escapes. `ExpandedShot.prompt` has no upper bound at all, so
+#: nothing outside this constraint bounds what a notice could carry.
+NOTICE_RAW_LIMIT = 400
+
+#: What a notice is *about*, which decides how it is rendered rather than only how it reads.
+#:
+#: Every notice used to look alike, so "Prompts written for 4 shot(s)" — the confirmation that
+#: the thing the Director asked for happened — carried the same caution chrome as a refusal. A
+#: warning that fires on the success path is one the Director stops reading, which is the exact
+#: failure this story exists to fix rather than to reproduce.
+#:
+#: * `change` — something was written. Good news, and the thing to review.
+#: * `refusal` — something was deliberately not written, and the notice says why.
+#: * `flag` — it was written, or there was nothing to write, and something is worth a look.
+NoticeKind = Literal["change", "refusal", "flag"]
+
+
+class MessageNotice(BaseModel):
+    """One thing a reply reports about itself, as data rather than as a text convention.
+
+    `text` is the sentence the Director reads. It is *also* concatenated into
+    `TreatmentMessage.content`, because that string is what every saved project already holds and
+    what two client helpers still scan for markers — the notices are the structure the renderer
+    splits by, not a replacement for the joined text. It is constrained non-empty for that
+    reason: an empty sentence would contribute nothing to the joined tail the client strips,
+    so every notice after it in the same reply would render twice.
+
+    `raw` is the model output the notice is about, and it is the whole reason this model exists.
+    The document rejection used to paste 400 characters of degraded output straight into
+    `content`, and `director_chat` ships the thread back to the model as context on the next
+    turn — so the guard that catches "JSON in context begets JSON" was the thing supplying it.
+    `app.DIRECTOR_CONTEXT_EXCLUDE` drops every notice from that dump, which is what makes this a
+    field the model never sees.
+
+    `kind` deliberately has **no default**, against this file's usual rule. A default is what a
+    new construction site inherits without deciding, and the whole defect being fixed is a notice
+    wearing the wrong chrome — so forgetting it has to fail loudly at construction rather than
+    quietly on screen. The manifest-compatibility argument the other defaults exist for does not
+    apply: `notices` itself is new in this change, so no saved project carries a notice at all,
+    let alone one without a kind.
+    """
+
+    kind: NoticeKind
+    text: str = Field(min_length=1)
+    raw: str = ""
+
+    @field_validator("raw", mode="before")
+    @classmethod
+    def _bounded_raw(cls, value: object) -> object:
+        """Cap the kept output, and store "nothing" as nothing.
+
+        The cap does not collapse whitespace the way `app._short` does: the point of this field
+        is to show what the model actually returned, and a reflowed blob is a different artefact
+        from the one being inspected. It renders inside a disclosure of its own, where a newline
+        costs nothing.
+
+        Blank in means blank out, because a notice whose raw is `"   "` opens a disclosure onto
+        an empty box — and the sentence that offers it would be claiming there is something to
+        see. Both rejection wordings pick their final sentence off this field, so this is what
+        makes that choice honest.
+        """
+        if not isinstance(value, str):
+            return value
+        if not value.strip():
+            return ""
+        return value if len(value) <= NOTICE_RAW_LIMIT else f"{value[:NOTICE_RAW_LIMIT]}…"
+
+
 class TreatmentMessage(BaseModel):
     id: str = Field(default_factory=lambda: new_id("msg"))
     role: Literal["user", "assistant", "system"]
     content: str
+    # Defaulted, like every other field added after the fact, so a manifest written before
+    # notices existed loads unchanged and simply carries none.
+    notices: list[MessageNotice] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=now_utc)
 
 

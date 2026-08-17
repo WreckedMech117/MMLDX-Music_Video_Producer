@@ -3,7 +3,9 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from typing import get_args
 
+import pytest
 from fastapi import HTTPException
 
 from music_video_producer.app import (
@@ -18,7 +20,7 @@ from music_video_producer.app import (
     document_not_requested_notice,
     document_restore_notice,
 )
-from music_video_producer.models import Project, Shot, Song
+from music_video_producer.models import MessageNotice, Project, Shot, Song
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
 API_JS = Path("src/music_video_producer/web/assets/api.js")
@@ -1584,8 +1586,18 @@ def test_system_audit_line_is_visually_distinct_from_director_prose():
         assert f"{token}:" in root.group(1), f"{token} is not a palette token"
     # No new colour: every colour in the rule is a token, not a literal.
     assert not re.search(r"#[0-9a-fA-F]{3,8}", body), body
-    # And the role reaches the stylesheet at all.
-    assert 'class="message ${message.role}"' in APP_JS.read_text(encoding="utf-8")
+    # And the role reaches the stylesheet at all, executed rather than grepped for: the bubble is
+    # built by `threadHtml`, so what a browser would receive is what this reads the class off.
+    stamped = run_module("""
+      import { threadHtml } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ thread: threadHtml([
+        { id: 'msg_1', role: 'user', content: 'Ask.' },
+        { id: 'msg_2', role: 'assistant', content: 'Answer.' },
+        { id: 'msg_3', role: 'system', content: 'Treatment was restored.' },
+      ]) }));
+    """)["thread"]
+    for role in ("user", "assistant", "system"):
+        assert f'<div class="message {role}">' in stamped, role
 
 
 def test_document_prose_names_come_only_from_the_label_mapping():
@@ -2683,3 +2695,655 @@ def test_the_shot_inspector_shows_the_block_the_refusal_sends_the_director_to_fi
     assert "${readinessHtml}" in inspector
     styles = STYLES_CSS.read_text(encoding="utf-8")
     assert re.search(r"\.shot-readiness \{", styles), "the inspector's blocked state has no style"
+
+
+def notice_contract() -> dict:
+    """api.js's half of the notice contract: what it strips, what it names, and how per kind."""
+    return run_module("""
+      import { NOTICE_FALLBACK_KIND, NOTICE_JOIN, NOTICE_KINDS, NOTICE_RAW_LABEL, NOTICE_SEPARATOR }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        separator: NOTICE_SEPARATOR,
+        join: NOTICE_JOIN,
+        kinds: NOTICE_KINDS,
+        fallback: NOTICE_FALLBACK_KIND,
+        rawLabel: NOTICE_RAW_LABEL,
+      }));
+    """)
+
+
+def notice_kind_values() -> set[str] | None:
+    """The kinds `MessageNotice.kind` admits, or None while the server carries no discriminator."""
+    field = MessageNotice.model_fields.get("kind")
+    if field is None:
+        return None
+    arguments = get_args(field.annotation)
+    if arguments:
+        return {str(argument) for argument in arguments}
+    members = getattr(field.annotation, "__members__", None)
+    if members:
+        return {str(member.value) for member in members.values()}
+    return None
+
+
+def server_reply_with_notices(tmp_path: Path) -> tuple[dict, str]:
+    """One assistant reply exactly as the browser receives it: built by the route, read off it.
+
+    The double is written to produce the two notices that matter together — a document rejection
+    carrying raw model output, and the prose-claims-Shots mismatch — under prose that itself
+    contains the `\\n\\n---\\n` separator. That last detail is the point: a renderer that split the
+    message on `---` would cut this reply in the wrong place, and no hand-written fixture would
+    catch it because the server is what decides where the real separator goes.
+    """
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.app import create_app
+    from music_video_producer.config import Settings
+    from music_video_producer.store import ProjectStore
+
+    class NoticeDirector:
+        """Rejected style bible, echoed treatment, prose claiming shots it does not return."""
+
+        message = (
+            "Beat one, the corridor.\n\n---\n"
+            "Beat two, the stage. I have written four shots against the second verse."
+        )
+        style_bible = '[{"style":"<script>alert(1)</script>","palette":["amber","teal"]}]'
+
+        async def plan(self, message, project_context):
+            return type(
+                "DirectorResult",
+                (),
+                {
+                    "message": self.message,
+                    "treatment": project_context["treatment"],
+                    "style_bible": self.style_bible,
+                    "shots": [],
+                },
+            )()
+
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Notices"))
+    project.treatment = "The original treatment, written by hand over several sessions."
+    project.style_bible = "Sodium amber, hard backlight, 35mm grain, wardrobe continuity notes."
+    store.save(project)
+    app = create_app(
+        settings=Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy"),
+        store=store,
+        director=NoticeDirector(),
+    )
+    response = TestClient(app).post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Break it into beats", "apply_documents": True},
+    )
+
+    assert response.status_code == 200, response.text
+    reply = response.json()["messages"][-1]
+    assert reply["role"] == "assistant"
+    # The model's own sentence is returned beside the reply: it is what the prose half of the
+    # split has to come back as, and reconstructing it from `content` would be the very guess
+    # this test exists to refuse.
+    return reply, NoticeDirector.message
+
+
+def test_the_notice_splitter_and_renderer_are_executed_against_a_real_server_reply(tmp_path: Path):
+    """The split and the markup, run over a reply the route really produced.
+
+    Nothing tied the thread render to anything before this: the whole thread was one `innerHTML`
+    map that escaped `content`, no test touched it, and a protective refusal was therefore plain
+    text after a `---` that read exactly like something the Director said. Asserting a substring
+    of app.js would prove the source contains a string, not that a notice renders — so both the
+    splitter and the markup it feeds are executed here, and every claim below is read off the
+    HTML that would reach the browser.
+    """
+    from music_video_producer.app import (
+        DOCUMENT_REJECTED_NOTICE,
+        NOTICE_JOIN,
+        NOTICE_SEPARATOR,
+        SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
+    )
+
+    reply, prose = server_reply_with_notices(tmp_path)
+    contract = notice_contract()
+    # One separator, one join, one spelling — the tail the client strips is the tail the server
+    # wrote, and a drift would print every notice twice rather than fail quietly.
+    assert contract["separator"] == NOTICE_SEPARATOR
+    assert contract["join"] == NOTICE_JOIN
+
+    parsed = run_module(f"""
+      import {{ messageBodyHtml, messageParts }}
+        from './src/music_video_producer/web/assets/api.js';
+      const reply = {json.dumps(reply)};
+      console.log(JSON.stringify({{
+        parts: messageParts(reply),
+        html: messageBodyHtml(reply),
+        // The two shapes that must render exactly as they did before notices existed: an
+        // ordinary reply, and a message from a manifest saved before the field was added.
+        plain: messageBodyHtml({{ role: 'assistant', content: 'Plain <b>reply</b>', notices: [] }}),
+        legacy: messageBodyHtml({{ role: 'assistant', content: 'A reply from before.' }}),
+      }}));
+    """)
+
+    # The prose is the model's own message, whole and unaltered -- including the `---` it wrote
+    # itself, which is the sequence a splitter that guessed would have cut it at.
+    server_notices = reply["notices"]
+    assert len(server_notices) == 2, server_notices
+    assert parsed["parts"]["prose"] == prose
+    assert parsed["parts"]["prose"].count("---") == 1
+    # And the shortcut really would have been wrong on this reply, rather than merely being
+    # forbidden: splitting the stored message on the separator loses most of the Director's own
+    # sentence, because the model wrote that separator itself.
+    assert reply["content"].split(NOTICE_SEPARATOR)[0] != prose
+    for notice in server_notices:
+        assert notice["text"] not in parsed["parts"]["prose"], notice["text"]
+    # Both notices come through as data, in the server's order and the server's words — and under
+    # the server's own kind, or the fallback for a manifest written before kinds existed.
+    assert parsed["parts"]["notices"] == [
+        {
+            "kind": notice.get("kind") or contract["fallback"],
+            "text": notice["text"],
+            "raw": notice["raw"],
+        }
+        for notice in server_notices
+    ]
+    assert server_notices[0]["text"].startswith("Style bible was NOT replaced")
+    assert server_notices[0]["text"] == DOCUMENT_REJECTED_NOTICE.format(
+        document="Style bible", reason="the model returned JSON instead of prose"
+    )
+    # The fixture project has no shots, so the mismatch is worded for that case.
+    assert server_notices[1]["text"] == SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE
+
+    html = parsed["html"]
+    # Each notice in a block of its own, after the prose rather than inside it.
+    assert html.count('<div class="message-notice ') == 2
+    assert html.index('<div class="message-notice ') > html.index("Beat two, the stage")
+    # Labelled in words, not only edged in colour: one label per block, and the word is the one
+    # its own kind carries rather than a single label stamped on every notice alike.
+    assert html.count('<strong class="notice-label"') == 2
+    for notice in server_notices:
+        label = contract["kinds"][notice.get("kind") or contract["fallback"]]["label"]
+        assert label.strip()
+        assert f">{label}</strong>" in html, label
+    # The raw model output is reachable, behind a disclosure that starts closed. Asserted on the
+    # tag itself: the old ` open` scan read the whole body, so the Director's own prose or the raw
+    # model output could satisfy it or break it for reasons that have nothing to do with the tag.
+    disclosures = re.findall(r"<details[^>]*>", html)
+    assert len(disclosures) == 1, disclosures
+    assert not re.search(r"[\s\"']open\b", disclosures[0]), disclosures[0]
+    assert 'class="notice-raw"' in disclosures[0], disclosures[0]
+    assert f"<summary>{contract['rawLabel']}</summary>" in html
+    raw_start = html.index("<details")
+    assert html.index("alert(1)") > raw_start
+    # Escaped after the split, never before it: this raw output is a script tag.
+    assert "<script>" in server_notices[0]["raw"]
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    # Said once. A message rendered from `content` *and* from its notices would print every
+    # refusal twice, which is how a tail-strip that silently stopped matching would look.
+    for notice in server_notices:
+        assert html.count(escape_for_html(notice["text"])) == 1, notice["text"]
+
+    # And a reply with no notices renders exactly as it did before: escaped prose, no chrome.
+    assert parsed["plain"] == "Plain &lt;b&gt;reply&lt;/b&gt;"
+    assert parsed["legacy"] == "A reply from before."
+
+
+def escape_for_html(value: str) -> str:
+    """The five replacements `escapeHtml` makes, for asserting against rendered markup."""
+    for character, entity in (
+        ("&", "&amp;"),
+        ("<", "&lt;"),
+        (">", "&gt;"),
+        ('"', "&quot;"),
+        ("'", "&#39;"),
+    ):
+        value = value.replace(character, entity)
+    return value
+
+
+def test_escape_html_escapes_every_character_that_can_close_a_tag_or_an_attribute():
+    """`escapeHtml` had no test of its own, and it did not escape `'`.
+
+    It is a shared public export interpolated into attribute positions all over app.js --
+    `value="${…}"`, `title="${…}"`, `data-*` -- so the apostrophe is not cosmetic: a value
+    carrying one closes any single-quoted attribute and lets the rest be read as markup. Only `<`
+    and `>` were ever exercised, and then only indirectly through the notice renderer, so `"` and
+    `&` were unasserted too and could have been dropped in silence.
+    """
+    escaped = run_module("""
+      import { escapeHtml } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        ampersand: escapeHtml('a & b'),
+        lessThan: escapeHtml('a < b'),
+        greaterThan: escapeHtml('a > b'),
+        doubleQuote: escapeHtml('say "no"'),
+        singleQuote: escapeHtml("the Director's cut"),
+        together: escapeHtml(`<img src='x' onerror="alert(1)" & more>`),
+        // The order matters: escaping `&` after the others would double-escape their entities.
+        entity: escapeHtml('&lt;'),
+        empty: escapeHtml(''),
+        absent: escapeHtml(),
+        number: escapeHtml(7),
+        nullish: escapeHtml(null),
+      }));
+    """)
+
+    assert escaped["ampersand"] == "a &amp; b"
+    assert escaped["lessThan"] == "a &lt; b"
+    assert escaped["greaterThan"] == "a &gt; b"
+    assert escaped["doubleQuote"] == "say &quot;no&quot;"
+    assert escaped["singleQuote"] == "the Director&#39;s cut"
+    # Nothing that could close a tag or an attribute survives, in either quoting style.
+    for raw in ("<", ">", '"', "'"):
+        assert raw not in escaped["together"], raw
+    assert escaped["together"] == escape_for_html(
+        "<img src='x' onerror=\"alert(1)\" & more>"
+    )
+    # `&` first, or `&lt;` would come back as `&amp;lt;` and the text would read wrong.
+    assert escaped["entity"] == "&amp;lt;"
+    assert escaped["empty"] == ""
+    assert escaped["absent"] == ""
+    assert escaped["number"] == "7"
+    assert escaped["nullish"] == "null"
+
+
+def test_the_thread_body_is_built_by_a_pure_function_the_dom_only_assigns():
+    """Swapping `thread.innerHTML` for `thread.textContent` was a green mutation.
+
+    app.js is imported by no test and executed by none, so while the thread's markup was built
+    there, both assertions the suite had -- that the render calls `messageBodyHtml` and does not
+    escape `content` -- stayed satisfied while every refusal rendered as the literal text
+    `<div class="message-notice">…` and the block never appeared at all. Double-escaping the body
+    was the same class of silent kill. This codebase hit that three times in Story 2.3, so the
+    whole body is a pure function now: what a browser would receive is executed here, and the one
+    line that turns it into DOM is what is left to pin.
+    """
+    rendered = run_module("""
+      import { threadHtml } from './src/music_video_producer/web/assets/api.js';
+      const thread = threadHtml([
+        { id: 'msg_1', role: 'user', content: 'Break it into beats <b>now</b>.' },
+        {
+          id: 'msg_2', role: 'assistant',
+          content: 'Beat one.\\n\\n---\\nStyle bible was NOT replaced.',
+          notices: [{
+            kind: 'refusal', text: 'Style bible was NOT replaced.',
+            raw: '<script>alert(1)</script>',
+          }],
+        },
+      ]);
+      console.log(JSON.stringify({
+        thread,
+        empty: threadHtml([]),
+        noMessages: threadHtml(undefined),
+        nonArray: threadHtml('nope'),
+      }));
+    """)
+
+    thread = rendered["thread"]
+    # Real markup, not markup-shaped text: every structural tag opens as a tag, and everything
+    # that came from the model or the Director is escaped inside it.
+    assert '<div class="message user">' in thread
+    assert '<div class="message assistant">' in thread
+    assert '<div class="message-notice notice-refusal"' in thread
+    assert "&lt;div class=&quot;message-notice" not in thread, "the body is escaped a second time"
+    assert "&amp;lt;" not in thread, "the body is escaped a second time"
+    assert "Break it into beats &lt;b&gt;now&lt;/b&gt;." in thread
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in thread
+    assert "<script>" not in thread
+    # The role the stylesheet keys off is still stamped on every bubble.
+    assert thread.count('<div class="message ') == 2
+
+    # One empty state, whatever "no messages" arrives as.
+    assert rendered["empty"] == rendered["noMessages"] == rendered["nonArray"]
+    assert '<div class="empty-thread">' in rendered["empty"]
+    assert '<div class="message ' not in rendered["empty"]
+    assert "<" in rendered["empty"] and "&lt;div" not in rendered["empty"]
+    # The markup carries that same empty state for the moment before app.js runs, and it cannot
+    # import the constants -- so this is what stops the two copies becoming two wordings, the way
+    # every other string the markup and a module both hold is held together here.
+    placeholder = re.search(
+        r'<div class="empty-thread">.*?</div>', INDEX_HTML.read_text(encoding="utf-8"), re.DOTALL
+    )
+    assert placeholder, "the thread has no empty state before the first render"
+    assert placeholder.group(0) == rendered["empty"], placeholder.group(0)
+
+    # And the DOM layer is one assignment of that string, with no markup and no second escape
+    # left in it for the suite to be unable to reach.
+    render = without_comments(app_js_block("function renderTreatment"))
+    assert "thread.innerHTML = threadHtml(project?.messages);" in render
+    assert "textContent" not in render, "the thread body would render as literal markup"
+    for leaked in ("<div", "messageBodyHtml", "escapeHtml", "empty-thread", "message-notice"):
+        assert leaked not in render, leaked
+
+
+def test_every_notice_block_is_a_named_note_with_its_own_label_id():
+    """The block the story calls unmissable had no accessibility semantics at all.
+
+    Its whole "this is the guard speaking, not the Director" was a coloured left edge and a line
+    of 9px small caps -- one of which a screen reader does not convey and the other of which it
+    reads as one more run of text inside the reply. It is a named `note` now, and the ids have to
+    be unique per block or `aria-labelledby` names the wrong one in a thread of several refusals.
+    """
+    thread = run_module("""
+      import { threadHtml } from './src/music_video_producer/web/assets/api.js';
+      const notices = [
+        { kind: 'refusal', text: 'Style bible was NOT replaced.' },
+        { kind: 'flag', text: 'The reply claims shots it did not carry.' },
+      ];
+      const body = (parts) => 'Prose.\\n\\n---\\n' + parts.map((n) => n.text).join('\\n\\n');
+      console.log(JSON.stringify({ thread: threadHtml([
+        { id: 'msg_1', role: 'assistant', content: body(notices), notices },
+        { id: 'msg_2', role: 'assistant', content: body(notices), notices },
+        // No id at all -- a hand-written or pre-id manifest must still get unique ids.
+        { role: 'assistant', content: body(notices), notices },
+      ]) }));
+    """)["thread"]
+
+    blocks = re.findall(r'<div class="message-notice[^"]*"([^>]*)>', thread)
+    assert len(blocks) == 6, blocks
+    identifiers = []
+    for attributes in blocks:
+        assert 'role="note"' in attributes, attributes
+        named = re.search(r'aria-labelledby="([^"]+)"', attributes)
+        assert named, attributes
+        identifiers.append(named.group(1))
+
+    # Unique per block, or the note is named by another block's label.
+    assert len(set(identifiers)) == len(identifiers), identifiers
+    for identifier in identifiers:
+        assert thread.count(f'id="{identifier}"') == 1, identifier
+        # And what it names is the kind label, so the note's accessible name says which kind it is.
+        named = re.search(
+            rf'<strong class="notice-label" id="{re.escape(identifier)}">([^<]+)</strong>', thread
+        )
+        assert named, identifier
+        assert named.group(1).strip(), identifier
+
+
+def test_every_notice_kind_carries_its_own_words_and_its_own_edge_token():
+    """One label for every notice reported good news in amber under the word "Safety notice".
+
+    A reply that successfully replaced a document, or wrote prompts for four shots, was dressed
+    exactly like the refusal beside it -- which is the alarm fatigue that makes the refusal
+    stop registering. Both signals move together per kind: the label's words and the edge's
+    colour, executed here from the rendered HTML and matched against the rule that colours it.
+    """
+    contract = notice_contract()
+    kinds = contract["kinds"]
+    assert len(kinds) >= 2, kinds
+    assert contract["fallback"] in kinds, contract
+
+    rendered = run_module(f"""
+      import {{ messageBodyHtml }} from './src/music_video_producer/web/assets/api.js';
+      const reply = (kind) => ({{
+        id: 'msg_' + String(kind), role: 'assistant',
+        content: 'Prose.\\n\\n---\\nWhat happened.',
+        notices: [{{ kind, text: 'What happened.' }}],
+      }});
+      const out = {{}};
+      for (const kind of {json.dumps(list(kinds))}) out[kind] = messageBodyHtml(reply(kind));
+      out.unknown = messageBodyHtml(reply('catastrophe'));
+      out.absent = messageBodyHtml(reply(undefined));
+      console.log(JSON.stringify(out));
+    """)
+
+    labels = {}
+    for kind, presentation in kinds.items():
+        block = rendered[kind]
+        assert f'<div class="message-notice {presentation["className"]}"' in block, kind
+        assert f'>{presentation["label"]}</strong>' in block, kind
+        labels[kind] = presentation["label"]
+    # Different words per kind, or the label is not a signal that tells them apart.
+    assert len(set(labels.values())) == len(labels), labels
+    assert len({presentation["className"] for presentation in kinds.values()}) == len(kinds), kinds
+
+    # An unrecognised or missing kind is presented as the fallback -- the cautious one -- rather
+    # than as the quietest available, and never as an unstyled block with no label at all.
+    fallback = kinds[contract["fallback"]]
+    for guessed in ("unknown", "absent"):
+        assert f'<div class="message-notice {fallback["className"]}"' in rendered[guessed], guessed
+        assert f'>{fallback["label"]}</strong>' in rendered[guessed], guessed
+
+    # The stylesheet colours exactly those class names, each from its own palette token.
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    rules = dict(css_rules(css))
+    root = re.search(r":root\s*\{(.*?)\n\}", css, re.DOTALL)
+    assert root, "styles.css no longer declares its palette on :root"
+    tokens = {}
+    for kind, presentation in kinds.items():
+        edge = rules.get(f".message-notice.{presentation['className']}")
+        label = rules.get(f".message-notice.{presentation['className']} .notice-label")
+        assert edge, f"nothing colours the {kind} edge"
+        assert label, f"nothing colours the {kind} label"
+        edge_token = re.search(r"border-left-color:\s*var\((--[\w-]+)\)", edge)
+        label_token = re.search(r"color:\s*var\((--[\w-]+)\)", label)
+        assert edge_token, edge
+        assert label_token, label
+        # One colour per kind across both signals, and a token the palette really declares.
+        assert edge_token.group(1) == label_token.group(1), kind
+        assert f"{edge_token.group(1)}:" in root.group(1), edge_token.group(1)
+        tokens[kind] = edge_token.group(1)
+    # Distinct per kind, or the edge conveys nothing, and no new colour was invented for any of
+    # them: every one is a token that already existed.
+    assert len(set(tokens.values())) == len(tokens), tokens
+    assert tokens[contract["fallback"]] == "--amber", tokens
+
+
+def test_the_notice_kinds_the_client_renders_are_the_kinds_the_server_sends():
+    """A kind the server sends and the client has never heard of falls back to a refusal label.
+
+    That is the safe direction, and it is still wrong: good news would keep arriving in amber. The
+    two halves are one set, so this is what stops a kind being added on one side alone.
+    """
+    server_kinds = notice_kind_values()
+    if server_kinds is None:
+        pytest.skip("MessageNotice carries no `kind` discriminator yet")
+    assert server_kinds == set(notice_contract()["kinds"]), server_kinds
+
+
+def test_an_empty_notice_does_not_make_every_other_notice_render_twice():
+    """The count used to be taken from the filtered list, and the tail then stopped matching.
+
+    One notice with empty text -- and the server is the only thing that decides there is never
+    one -- dropped a `\\n\\n` from the reconstructed tail, so `endsWith` failed, the whole joined
+    string was kept as prose, and every remaining refusal printed twice: once inside the prose,
+    once as a block. A client guarantee that holds only because of a server constraint is not a
+    client guarantee.
+    """
+    parsed = run_module("""
+      import { messageBodyHtml, messageParts } from './src/music_video_producer/web/assets/api.js';
+      const notices = [
+        { kind: 'refusal', text: 'Style bible was NOT replaced.' },
+        { kind: 'refusal', text: '' },
+        { kind: 'flag', text: 'The reply claims shots it did not carry.' },
+      ];
+      // Joined exactly as app.assistant_reply joins it: every notice, empty text included.
+      const reply = {
+        id: 'msg_1', role: 'assistant', notices,
+        content: 'Beat one.' + '\\n\\n---\\n' + notices.map((n) => n.text).join('\\n\\n'),
+      };
+      console.log(JSON.stringify({ parts: messageParts(reply), html: messageBodyHtml(reply) }));
+    """)
+
+    assert parsed["parts"]["prose"] == "Beat one."
+    # The empty one is no block: there is no sentence in it to read.
+    assert [notice["text"] for notice in parsed["parts"]["notices"]] == [
+        "Style bible was NOT replaced.",
+        "The reply claims shots it did not carry.",
+    ]
+    html = parsed["html"]
+    assert html.count('<div class="message-notice ') == 2
+    for said in ("Style bible was NOT replaced.", "The reply claims shots it did not carry."):
+        assert html.count(escape_for_html(said)) == 1, said
+
+
+def test_only_an_assistant_reply_renders_notice_chrome():
+    """A user bubble carrying notices was drawn as a protective refusal.
+
+    Nothing on the server puts notices anywhere but an assistant reply, so a `user` or `system`
+    message carrying them is a hand-edited manifest or the Director's own words fed back -- and a
+    bubble the Director typed made to look like the guard speaking is the exact confusion the
+    block exists to end. Nothing is swallowed either: the content is kept whole and escaped.
+    """
+    rendered = run_module("""
+      import { messageBodyHtml } from './src/music_video_producer/web/assets/api.js';
+      const notices = [{ kind: 'refusal', text: 'Style bible was NOT replaced.' }];
+      const content = 'Do it my way.\\n\\n---\\nStyle bible was NOT replaced.';
+      const out = {};
+      for (const role of ['user', 'system', 'assistant', 'director', undefined]) {
+        out[String(role)] = messageBodyHtml({ id: 'msg_1', role, content, notices });
+      }
+      console.log(JSON.stringify(out));
+    """)
+
+    for impostor in ("user", "system", "director", "undefined"):
+        html = rendered[impostor]
+        assert "message-notice" not in html, impostor
+        assert "notice-label" not in html, impostor
+        # Kept whole rather than half-swallowed: the tail is only stripped where it was written.
+        assert html == escape_for_html(
+            "Do it my way.\n\n---\nStyle bible was NOT replaced."
+        ), impostor
+    assert '<div class="message-notice ' in rendered["assistant"]
+    assert rendered["assistant"].startswith(escape_for_html("Do it my way."))
+
+
+def test_a_blank_raw_output_offers_evidence_only_when_there_is_some():
+    """Whitespace is truthy, so a raw of `"   "` opened a disclosure onto an empty box.
+
+    Offering the evidence behind a refusal and then showing none is worse than not offering it.
+    """
+    rendered = run_module("""
+      import { messageBodyHtml, messageParts } from './src/music_video_producer/web/assets/api.js';
+      const reply = (raw) => ({
+        id: 'msg_1', role: 'assistant',
+        content: 'Prose.\\n\\n---\\nStyle bible was NOT replaced.',
+        notices: [{ kind: 'refusal', text: 'Style bible was NOT replaced.', raw }],
+      });
+      console.log(JSON.stringify({
+        blank: messageBodyHtml(reply('   \\n\\t ')),
+        emptyRaw: messageBodyHtml(reply('')),
+        missing: messageBodyHtml(reply(undefined)),
+        nonString: messageBodyHtml(reply(42)),
+        real: messageBodyHtml(reply('{"style": "json"}')),
+        // Real output that merely begins and ends with whitespace keeps every character of it.
+        padded: messageParts(reply('\\n  {"style": "json"}  \\n')).notices[0].raw,
+      }));
+    """)
+
+    for absent in ("blank", "emptyRaw", "missing", "nonString"):
+        assert "<details" not in rendered[absent], absent
+        assert "notice-raw" not in rendered[absent], absent
+        # The refusal itself is still a block; only the empty promise is gone.
+        assert '<div class="message-notice ' in rendered[absent], absent
+    assert "<details" in rendered["real"]
+    assert escape_for_html('{"style": "json"}') in rendered["real"]
+    # Trimming decides presence only -- what is shown is the output exactly as it arrived.
+    assert rendered["padded"] == '\n  {"style": "json"}  \n'
+
+
+def test_a_tail_that_does_not_match_keeps_every_word_of_the_content():
+    """The documented fallback branch was never executed, only its matching twin.
+
+    A message whose content the client cannot account for keeps all of it and still shows every
+    notice as its own block: printing a refusal twice is a visible defect, and silently swallowing
+    half of one is not. Only the branch that strips was covered, so the branch that deliberately
+    does not could have been deleted or inverted with the suite green.
+    """
+    parsed = run_module("""
+      import { messageParts } from './src/music_video_producer/web/assets/api.js';
+      const notices = [{ kind: 'refusal', text: 'Style bible was NOT replaced.' }];
+      const tail = '\\n\\n---\\n' + notices[0].text;
+      console.log(JSON.stringify({
+        matching: messageParts({ role: 'assistant', notices, content: 'Beat one.' + tail }),
+        // Hand-edited, re-wrapped, or written by an older server: the tail is not where it should
+        // be, so nothing may be cut off the end on the strength of a guess.
+        reworded: messageParts({
+          role: 'assistant', notices,
+          content: 'Beat one.\\n\\n---\\nStyle bible was not replaced.',
+        }),
+        trailing: messageParts({ role: 'assistant', notices, content: 'Beat one.' + tail + '\\n' }),
+        inTheMiddle: messageParts({
+          role: 'assistant', notices, content: 'Beat one.' + tail + '\\n\\nBeat two.',
+        }),
+        noTailAtAll: messageParts({ role: 'assistant', notices, content: 'Beat one.' }),
+        empty: messageParts({ role: 'assistant', notices, content: '' }),
+      }));
+    """)
+
+    assert parsed["matching"]["prose"] == "Beat one."
+    unmatched = {
+        "reworded": "Beat one.\n\n---\nStyle bible was not replaced.",
+        "trailing": "Beat one.\n\n---\nStyle bible was NOT replaced.\n",
+        "inTheMiddle": "Beat one.\n\n---\nStyle bible was NOT replaced.\n\nBeat two.",
+        "noTailAtAll": "Beat one.",
+        "empty": "",
+    }
+    for label, content in unmatched.items():
+        # Not one character less than arrived, and the notice is still its own block.
+        assert parsed[label]["prose"] == content, label
+        assert len(parsed[label]["notices"]) == 1, label
+
+
+def test_the_notice_block_is_edged_named_and_not_reclaimed_by_a_later_rule():
+    """A notice that reads like Director prose is the defect; colour alone is not the fix.
+
+    `.message.system` is the precedent — full width, coloured left edge, palette tokens only —
+    and this block carries the same constraints plus one that precedent did not have: it nests
+    *inside* a `.message`, so the rules it competes with are the bare-element ones the stylesheet
+    sets globally, and nothing later may reclaim its edge.
+    """
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    rules = css_rules(css)
+    blocks = [
+        (index, selector, body)
+        for index, (selector, body) in enumerate(rules)
+        if "message-notice" in selector
+    ]
+    assert blocks, "the notice block has no style of its own"
+    base = next(item for item in blocks if item[1].strip() == ".message-notice")
+    # The bubbles it is told apart from are still styled, or "distinct" means nothing.
+    for bubble in (r"\.message\.assistant", r"\.message\.system"):
+        assert re.search(bubble + r"\s*\{", css), bubble
+
+    # Nothing declared later takes the edge back -- the `.shot-clip.no-prompt` lesson, where all
+    # that was pinned was that a declaration appeared *somewhere* in the rule. The per-kind rules
+    # recolour the edge and may not restate the shorthand, which is the only way to lose it.
+    shorthands = [index for index, _, body in blocks if re.search(r"border-left:", body)]
+    assert shorthands == [base[0]], shorthands
+    for index, selector, body in blocks:
+        if "border-left-color" not in body:
+            continue
+        assert index > base[0], selector
+        assert selector_specificity(selector) > selector_specificity(".message-notice"), selector
+    # The notice's own text rules outrank the bare-element ones that would otherwise set them:
+    # `h1, h2, p` sets a paragraph margin globally, and the notice's paragraphs are inside a
+    # bubble whose `white-space` and line height are its own.
+    assert any(re.search(r"(^|,)\s*p\s*(,|$)", selector.strip()) for selector, _ in rules)
+    assert selector_specificity(".message-notice p") > selector_specificity("p")
+    assert any(item[1].strip() == ".message-notice p" for item in blocks), blocks
+
+    # The class the disclosure actually carries is the class it is styled through: a class no rule
+    # and no test names is a class that outlives whatever it was for.
+    raw_rules = [item for item in blocks if ".notice-raw" in item[1]]
+    assert raw_rules, "`<details class=\"notice-raw\">` names a class nothing styles"
+    assert any("max-height" in body for _, _, body in raw_rules), raw_rules
+
+    # The label is the signal that has to survive the colour being ignored, so it is not 9px.
+    label = next(item for item in blocks if item[1].strip() == ".message-notice .notice-label")
+    size = re.search(r"font:[^;]*?(\d+)px", label[2])
+    assert size and int(size.group(1)) >= 11, label[2]
+    assert "uppercase" in label[2], label[2]
+
+    # The existing caution token, reused rather than reinvented, and every colour is a token.
+    assert "var(--amber)" in base[2]
+    assert not re.search(r"#[0-9a-fA-F]{3,8}", base[2]), base[2]
+    root = re.search(r":root\s*\{(.*?)\n\}", css, re.DOTALL)
+    assert root, "styles.css no longer declares its palette on :root"
+    for index, _, body in blocks:
+        assert not re.search(r"#[0-9a-fA-F]{3,8}", body), body
+        for token in re.findall(r"var\((--[\w-]+)\)", body):
+            assert f"{token}:" in root.group(1), f"{token} is not a palette token"
+    # And every one of them was already declared: no new colour was added for this.
+    for token in ("--amber:", "--acid:", "--cyan:"):
+        assert token in root.group(1), token

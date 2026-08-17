@@ -5,22 +5,52 @@ from io import BytesIO
 from pathlib import Path
 from typing import get_args
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
+    CHAT_EMPTY_MESSAGE,
     DIRECTOR_CONTEXT_EXCLUDE,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
+    DOCUMENT_REJECTED_EMPTY_NOTICE,
+    DOCUMENT_REJECTED_NOTICE,
+    EXPANSION_REJECTED_EMPTY_NOTICE,
+    SHOT_CLAIM_MISMATCH_NOTICE,
+    SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
+    SHOT_PLAN_EMPTY_NOTICE,
+    SHOT_WINDOW_NOTICE,
     DirectorRequest,
     DocumentName,
     create_app,
+    document_change_notice,
+    document_first_draft_notice,
+    prose_claims_shots,
 )
 from music_video_producer.batch import readiness_refusal
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.director import DirectorError, DirectorResult, DirectorUnavailable
-from music_video_producer.models import Asset, Project, Shot, Song, VisionInspectionRecord
+from music_video_producer.director import (
+    DirectorError,
+    DirectorResult,
+    DirectorUnavailable,
+    ExpandedShot,
+    PlannedShot,
+    ShotExpansion,
+)
+from music_video_producer.models import (
+    NOTICE_RAW_LIMIT,
+    Asset,
+    MessageNotice,
+    NoticeKind,
+    Project,
+    Shot,
+    Song,
+    TreatmentMessage,
+    VisionInspectionRecord,
+)
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import expansion_input
 
@@ -1297,6 +1327,13 @@ def test_director_reports_shots_outside_the_h3_window(tmp_path: Path):
     saved = store.get(project.id)
     assert "outside MiniMax H3's reliable 4-15s window" in saved.messages[-1].content
     assert len(saved.shots) == 1  # still applied; the Director decides what to do about it
+    # Carried as data as well as in the joined text, so the reply renders it as a notice block
+    # rather than as another paragraph of Director prose.
+    assert saved.messages[-1].notices[-1].text == SHOT_WINDOW_NOTICE.format(
+        duration=20, start=0, minimum=4, maximum=15
+    )
+    # A flag, not a refusal: nothing about the Shot came from the model's raw output.
+    assert saved.messages[-1].notices[-1].raw == ""
 
 
 class RevisingDirector(FakeDirector):
@@ -1660,6 +1697,22 @@ def test_document_mapping_field_names_and_context_exclusion_cannot_drift():
     # The exclusion is derived from the mapping rather than transcribed beside it, which is
     # the whole reason the two cannot fall out of step.
     assert DIRECTOR_CONTEXT_EXCLUDE["jobs"] is True
+    # Notices go out whole, raw output and all. The alternative — excluding the `raw` field by
+    # a nested path — stops covering a field renamed or added beside it, and this is the one
+    # invariant that turns the degradation guard into the source of the degradation.
+    per_message = DIRECTOR_CONTEXT_EXCLUDE["messages"]["__all__"]
+    assert "notices" in per_message
+    assert "notices" in TreatmentMessage.model_fields
+    assert set(MessageNotice.model_fields) == {"kind", "text", "raw"}
+    # `kind` has no default on purpose: a new construction site must decide rather than inherit
+    # whichever rendering happened to be the fallback, which is how a confirmation ends up
+    # wearing caution chrome. The other two carry the constraints the persisted thread needs.
+    assert MessageNotice.model_fields["kind"].is_required()
+    assert set(get_args(NoticeKind)) == {"change", "refusal", "flag"}
+    with pytest.raises(ValidationError):
+        MessageNotice(text="No kind was decided for this one.")
+    with pytest.raises(ValidationError):
+        MessageNotice(kind="flag", text="")
 
 
 def test_full_project_put_cannot_clear_the_slots_or_the_locks(tmp_path: Path):
@@ -2134,6 +2187,658 @@ def test_restore_rejects_an_unknown_document_and_an_unknown_project(tmp_path: Pa
     assert unknown_project.json()["detail"] == "Project not found"
 
 
+def contains_text(payload, needle: str) -> bool:
+    """True when `needle` appears inside any string anywhere in `payload`.
+
+    Deliberately not `needle in json.dumps(payload)`, which is what the no-feedback assertion
+    used to be. `json.dumps` escapes the quotes that degraded model output is made of, so
+    `'[{"style":"moody"}]'` is never a substring of a dump that contains it — the check passed
+    for exactly the text it exists to catch, whether or not the text was there.
+    """
+    if isinstance(payload, str):
+        return needle in payload
+    if isinstance(payload, dict):
+        return any(contains_text(value, needle) for value in payload.values()) or any(
+            contains_text(key, needle) for key in payload
+        )
+    if isinstance(payload, list):
+        return any(contains_text(item, needle) for item in payload)
+    return False
+
+
+class RecordingChatDirector(FakeDirector):
+    """One reply, fixed at construction, and every `project_context` it was handed.
+
+    The recorded contexts are the only place the "never fed back" invariant can actually be
+    read: what the model is sent is not what is stored, and asserting on the stored message
+    would prove nothing about the prompt.
+    """
+
+    def __init__(self, *, message: str, treatment=None, style_bible=None, shots=()):
+        self.contexts: list[dict] = []
+        self.message = message
+        self.treatment = treatment
+        self.style_bible = style_bible
+        self.shots = list(shots)
+
+    async def plan(self, message, project_context):
+        self.contexts.append(project_context)
+        return type(
+            "DirectorResult",
+            (),
+            {
+                "message": self.message,
+                # `None` means "echo whatever the project holds", which the guard treats as no
+                # proposal at all — so a test about one document reports only that document.
+                "treatment": (
+                    project_context["treatment"] if self.treatment is None else self.treatment
+                ),
+                "style_bible": (
+                    project_context["style_bible"]
+                    if self.style_bible is None
+                    else self.style_bible
+                ),
+                "shots": self.shots,
+            },
+        )()
+
+
+def test_a_rejected_document_keeps_its_raw_output_out_of_the_reply_and_the_next_context(
+    tmp_path: Path,
+):
+    """The Story 2.2 invariant, extended to the chat route — the one that still had it open.
+
+    The rejection notice used to paste 400 characters of the model's own degraded output into
+    the assistant message, and this thread is dumped to the model as context on the next turn.
+    So the guard that exists to stop "JSON in context begets JSON" was the thing supplying the
+    JSON. Asserted against the recorded context rather than the stored project, because the
+    stored project is exactly where the raw text is now *supposed* to be.
+    """
+    degraded = '[{"style":"moody","color_palette":["amber","teal"]}]'
+    director = RecordingChatDirector(
+        message="Warmer, and I left the plan alone.", style_bible=degraded
+    )
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Rejected raw")
+    kept = project.style_bible
+
+    first = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Moodier", "apply_documents": True},
+    )
+
+    assert first.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.style_bible == kept
+    assert saved.style_bible_previous == ""
+    reply = saved.messages[-1]
+    # One notice, carrying the refusal as data rather than as a text convention.
+    assert [notice.text for notice in reply.notices] == [
+        DOCUMENT_REJECTED_NOTICE.format(
+            document=DOCUMENT_LABELS["style_bible"],
+            reason="the model returned JSON instead of prose",
+        )
+    ]
+    # Inspectable: the refused text is kept whole, in the field the context dump drops...
+    assert reply.notices[0].raw == degraded
+    # ...and nowhere in the joined text the thread carries.
+    assert degraded not in reply.content
+    assert "Raw output:" not in reply.content
+    assert reply.content.endswith(reply.notices[0].text)
+
+    second = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Carry on"}
+    )
+
+    assert second.status_code == 200
+    context = director.contexts[1]
+    # Not in the payload the model was handed, in any nesting: not the whole blob, not a
+    # fragment of it, and not under a `notices` key that a future field could be added beside.
+    assert not contains_text(context, degraded)
+    assert not contains_text(context, '"color_palette"')
+    assert all("notices" not in message for message in context["messages"])
+    # The reply itself is still there, so the model keeps the conversation it is continuing —
+    # the exclusion drops the raw output, not the turn.
+    carried = [message["content"] for message in context["messages"]]
+    assert reply.content in carried
+    assert director.contexts[0] != context
+
+
+def test_the_collapse_floor_is_reached_through_the_route_and_not_only_in_the_unit_test(
+    tmp_path: Path,
+):
+    """The sub-40% floor has never been exercised by a request.
+
+    Every existing double either echoes the stored document or returns a long replacement, so
+    the floor was asserted only against `document_rejection` directly — and the route could
+    have stopped consulting it for short candidates without a single test noticing.
+    """
+    collapsed = "Too short."
+    director = RecordingChatDirector(message="Tightened it right down.", treatment=collapsed)
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Collapse floor")
+    kept = project.treatment
+    assert len(collapsed) < 0.4 * len(kept)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Cut it back", "apply_documents": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    # Refused: the document stands and the single recovery slot was not spent on the refusal.
+    assert saved.treatment == kept
+    assert saved.treatment_previous == ""
+    notice = saved.messages[-1].notices[0]
+    assert notice.text.startswith(f"{DOCUMENT_LABELS['treatment']} was NOT replaced")
+    assert f"{len(collapsed)} characters against {len(kept)} existing" in notice.text
+    assert "below the 40% floor" in notice.text
+    # And the refused text is inspectable rather than described.
+    assert notice.raw == collapsed
+
+
+def test_the_kept_raw_output_is_bounded_because_the_manifest_is_persisted(tmp_path: Path):
+    """Inspectable is not unbounded. The reply is written to disk and read back on every load.
+
+    Nothing model-controlled goes into the manifest at whatever length the model chose — the
+    rule `_short` already applies to what reaches `content`. This keeps the shape of the output
+    rather than collapsing it, because a collapsed blob is a different artefact from the one
+    being inspected, so only the length is capped.
+    """
+    sprawling = '[{"style":"' + "y" * 900 + '"}]'
+    director = RecordingChatDirector(message="Here it is.", style_bible=sprawling)
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Sprawling raw")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Rewrite it", "apply_documents": True},
+    )
+
+    assert response.status_code == 200
+    raw = ProjectStore(tmp_path).get(project.id).messages[-1].notices[0].raw
+    assert len(sprawling) > NOTICE_RAW_LIMIT
+    assert raw == f"{sprawling[:NOTICE_RAW_LIMIT]}…"
+    assert len(raw) == NOTICE_RAW_LIMIT + 1
+
+
+def test_a_refusal_with_nothing_to_show_does_not_offer_an_inspection(tmp_path: Path):
+    """A notice must not promise a disclosure that renders empty.
+
+    A blank or whitespace-only candidate is refused by the ratio floor like any other, and
+    `MessageNotice` stores blank as blank — so the wording that says the returned text is kept
+    for inspection would be offering an empty box. That is the same class of false sentence this
+    story rewrote `EXPANSION_REJECTED_NOTICE` to remove, and writing it here while removing it
+    there would be no improvement at all.
+    """
+    director = RecordingChatDirector(message="Cleared it.", treatment="   \n\t ")
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Nothing to show")
+    kept = project.treatment
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Empty it", "apply_documents": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    # Still refused, and the document still stands.
+    assert saved.treatment == kept
+    notice = saved.messages[-1].notices[0]
+    assert notice.kind == "refusal"
+    assert notice.raw == ""
+    assert notice.text == DOCUMENT_REJECTED_EMPTY_NOTICE.format(
+        document=DOCUMENT_LABELS["treatment"],
+        reason=f"the replacement is 0 characters against {len(kept)} existing, below the 40% floor",
+    )
+    # The claim is the thing being pinned: nothing here offers an inspection.
+    assert "inspection" not in notice.text
+    assert "nothing to inspect" in notice.text
+
+
+def test_an_expansion_refusal_with_nothing_to_show_makes_no_offer_either(tmp_path: Path):
+    """The same rule on the other route, where the blank case is the documented one.
+
+    `expansion_rejection` refuses a blank prompt in exactly those words, so this is the reachable
+    half: `ExpandedShot` allows whitespace through `min_length`, and the route must not then
+    claim to have kept it.
+    """
+    director = FixedExpansionDirector([("shot_first", "   \n\t ")])
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Nothing to show")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    notice = saved.messages[-1].notices[-1]
+    assert notice.kind == "refusal"
+    assert notice.raw == ""
+    assert notice.text.endswith(EXPANSION_REJECTED_EMPTY_NOTICE.split("{reason}. ")[1])
+    assert "inspection" not in notice.text
+
+
+def test_the_expansion_route_bounds_the_prompt_it_keeps(tmp_path: Path):
+    """The cap belongs to the type, and this is the route the type has to cover.
+
+    `ExpandedShot.prompt` carries `min_length` and no upper bound, so nothing outside
+    `MessageNotice` stops a refused prompt of any length being written into a manifest that is
+    read back on every load. Replacing the chat route's bounded call with an unbounded one used
+    to pass the whole suite, because the only test reading this field compared against a
+    63-character prompt.
+    """
+    sprawling = '[{"shot":"' + "y" * 900 + '"}]'
+    director = FixedExpansionDirector([("shot_first", sprawling)])
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Sprawling prompt")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == "New shot"
+    raw = saved.messages[-1].notices[-1].raw
+    assert len(sprawling) > NOTICE_RAW_LIMIT
+    assert raw == f"{sprawling[:NOTICE_RAW_LIMIT]}…"
+    # And the manifest on disk carries no more than that, which is the whole argument.
+    assert sprawling not in store.manifest_path(project.id).read_text(encoding="utf-8")
+
+
+def test_a_reply_with_no_message_of_its_own_is_not_stored_as_a_bare_separator_either(
+    tmp_path: Path,
+):
+    """The expansion route's guard, on the route that never had it.
+
+    `DirectorResult.message` has no floor and deliberately keeps none — an empty sentence is not
+    a reason to fail a turn that legitimately replaced a document. Without a fallback the stored
+    reply begins with `\\n\\n---\\n`, and that reply is context for the next call.
+    """
+    director = RecordingChatDirector(message="   \n ", treatment="A genuinely new treatment, long enough to clear the ratio floor comfortably.")
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "No message")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Rewrite it", "apply_documents": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    reply = saved.messages[-1]
+    assert reply.content.startswith(CHAT_EMPTY_MESSAGE)
+    assert not reply.content.startswith("\n")
+    # The turn still did its work; only the missing sentence was substituted.
+    assert saved.treatment.startswith("A genuinely new treatment")
+    assert [notice.kind for notice in reply.notices] == ["change"]
+
+
+def test_every_notice_says_what_it_is_about_so_good_news_is_not_dressed_as_caution(
+    tmp_path: Path,
+):
+    """A confirmation carried the same chrome as a refusal, which is how caution stops working.
+
+    Both routes are driven here, because the worst instance is on the expansion route: "Prompts
+    written for 2 shot(s)" is the thing the Director pressed the button for.
+    """
+    chat = RecordingChatDirector(
+        message="Rewritten.",
+        treatment="A genuinely new treatment, long enough to clear the ratio floor comfortably.",
+        style_bible='[{"style":"moody"}]',
+    )
+    client, store = make_client_with_director(tmp_path, chat)
+    project = documented_project(store, "Kinds")
+
+    assert client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Rework it", "apply_documents": True},
+    ).status_code == 200
+
+    replied = ProjectStore(tmp_path).get(project.id).messages[-1]
+    assert [(notice.kind, notice.text.split(":")[0]) for notice in replied.notices] == [
+        ("change", "Replaced by this reply"),
+        ("refusal", f"{DOCUMENT_LABELS['style_bible']} was NOT replaced"),
+    ]
+
+    # The other two chat wordings, which cannot occur in the reply above: a document filled from
+    # blank is a change, and a lock is a refusal, and they can only be told apart per document.
+    locked_director = RecordingChatDirector(
+        message="Filled the blank one.",
+        treatment="A rewrite of the locked document, long enough to clear the ratio floor.",
+        style_bible="The first style bible this project has ever had, written out at length.",
+    )
+    client, store = make_client_with_director(tmp_path, locked_director)
+    mixed = store.create(Project(name="Locked and blank"))
+    mixed.treatment = "The original treatment, written by hand over several sessions."
+    mixed.treatment_locked = True
+    store.save(mixed)
+
+    assert client.post(
+        f"/api/projects/{mixed.id}/director/chat",
+        json={"message": "Both", "apply_documents": True},
+    ).status_code == 200
+
+    mixed_reply = ProjectStore(tmp_path).get(mixed.id).messages[-1]
+    assert [(notice.kind, notice.text) for notice in mixed_reply.notices] == [
+        ("change", document_first_draft_notice([DOCUMENT_LABELS["style_bible"]])),
+        ("refusal", DOCUMENT_LOCK_NOTICE.format(document=DOCUMENT_LABELS["treatment"])),
+    ]
+
+    expanding = FixedExpansionDirector(
+        [("shot_first", "A corridor, widening."), ("shot_second", '[{"json":"instead"}]')]
+    )
+    client, store, _ = make_client(tmp_path, expanding)
+    plan = planned_project(store, "Kinds too")
+
+    assert client.post(f"/api/projects/{plan.id}/director/expand").status_code == 200
+
+    expanded = ProjectStore(tmp_path).get(plan.id).messages[-1]
+    assert [notice.kind for notice in expanded.notices] == ["change", "refusal"]
+    written = expanded.notices[0]
+    assert written.text.startswith("Prompts written for 1 shot(s)")
+    # The confirmation is not a caution, whatever the client does with the two.
+    assert written.kind != "refusal"
+    assert written.raw == ""
+    # And every notice either route produces carries one of the three kinds, never a default.
+    for notice in (*replied.notices, *expanded.notices):
+        assert notice.kind in get_args(NoticeKind), notice
+
+
+class RealResultDirector(FakeDirector):
+    """Returns an actual `DirectorResult`, not a duck-typed stand-in.
+
+    Every other double in this file builds `type("DirectorResult", (), {...})`, which is quick to
+    write and cannot fail validation — so a renamed field, a newly required one, or a tightened
+    constraint on `PlannedShot` would leave the whole route suite green while the real client
+    raised on the first real reply.
+    """
+
+    def __init__(self, result: DirectorResult):
+        self.result = result
+
+    async def plan(self, message, project_context):
+        return self.result
+
+
+class RealExpansionDirector(FakeDirector):
+    """The same, for `ShotExpansion` — the model the expansion route actually receives."""
+
+    def __init__(self, expansion: ShotExpansion):
+        self.expansion = expansion
+
+    async def expand(self, expansion_input):
+        return self.expansion
+
+
+def test_the_chat_route_handles_the_real_result_model_and_not_only_a_stand_in(tmp_path: Path):
+    """One route test per Director model, built through the model's own validation."""
+    result = DirectorResult(
+        message="One continuous move, and I have rewritten the treatment under it.",
+        treatment="A single unbroken movement through the room, written out at length.",
+        style_bible="Cold blue, handheld, 28mm, hard sodium spill through every doorway.",
+        shots=[PlannedShot(start=0, duration=20, prompt="One long take")],
+    )
+    client, store = make_client_with_director(tmp_path, RealResultDirector(result))
+    project = documented_project(store, "Real result")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "One take", "apply_shots": True, "apply_documents": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == result.treatment
+    assert [shot.duration for shot in saved.shots] == [20]
+    assert [(notice.kind, notice.text) for notice in saved.messages[-1].notices] == [
+        ("change", document_change_notice([DOCUMENT_LABELS[field] for field in DOCUMENT_LABELS])),
+        ("flag", SHOT_WINDOW_NOTICE.format(duration=20, start=0, minimum=4, maximum=15)),
+    ]
+
+
+def test_the_expansion_route_handles_the_real_expansion_model_and_not_only_a_stand_in(
+    tmp_path: Path,
+):
+    """`ShotExpansion` and `ExpandedShot`, constructed rather than imitated."""
+    expansion = ShotExpansion(
+        message="Two prompts, one refused.",
+        shots=[
+            ExpandedShot(shot_id="shot_first", prompt="A corridor, widening ahead of the singer."),
+            ExpandedShot(shot_id="shot_second", prompt='[{"camera":"push in"}]'),
+        ],
+    )
+    client, store, _ = make_client(tmp_path, RealExpansionDirector(expansion))
+    project = planned_project(store, "Real expansion")
+
+    response = client.post(f"/api/projects/{project.id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].prompt == expansion.shots[0].prompt
+    assert saved.shots[1].prompt == ""
+    assert [notice.kind for notice in saved.messages[-1].notices] == ["change", "refusal"]
+    assert saved.messages[-1].notices[-1].raw == expansion.shots[1].prompt
+
+
+def test_a_full_project_save_cannot_write_the_thread_or_invent_a_notice(tmp_path: Path):
+    """The sibling-route hole the recovery slots had, in its thread form.
+
+    `replace_project` binds a whole client `Project`, and the chat thread is now the carrier of
+    every protective refusal this application makes. A body that *invents* a notice would be
+    planting a refusal that never happened; one that rewords a real one would rewrite the reason
+    a guard gave; and one that simply omits the field — which is what any client written before
+    notices existed sends — would revert every notice in the project to undifferentiated prose.
+    Nothing in this application posts a message: the chat, expansion and restore routes are the
+    only writers.
+    """
+    degraded = '[{"style":"moody","color_palette":["amber"]}]'
+    director = RecordingChatDirector(message="Warmer.", style_bible=degraded)
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Thread save")
+
+    assert client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Moodier", "apply_documents": True},
+    ).status_code == 200
+
+    body = client.get(f"/api/projects/{project.id}").json()
+    stored = ProjectStore(tmp_path).get(project.id)
+    body["messages"][-1]["notices"] = [
+        {"kind": "change", "text": "Everything was applied exactly as you asked.", "raw": ""}
+    ]
+    body["messages"].append(
+        {"id": "msg_forged", "role": "assistant", "content": "Forged.", "notices": []}
+    )
+    body["creative_brief"] = "Edited by a client that also rewrote the thread."
+
+    response = client.put(f"/api/projects/{project.id}", json=body)
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    # The ordinary edit lands...
+    assert saved.creative_brief == "Edited by a client that also rewrote the thread."
+    # ...and nothing about the thread does.
+    assert [message.id for message in saved.messages] == [
+        message.id for message in stored.messages
+    ]
+    assert saved.messages[-1].notices == stored.messages[-1].notices
+    assert saved.messages[-1].notices[0].kind == "refusal"
+    assert saved.messages[-1].notices[0].raw == degraded
+    assert "Forged." not in json.dumps(saved.model_dump(mode="json"))
+
+    # And a body that predates notices entirely cannot strip them either.
+    stripped = client.get(f"/api/projects/{project.id}").json()
+    for message in stripped["messages"]:
+        del message["notices"]
+    assert client.put(f"/api/projects/{project.id}", json=stripped).status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).messages[-1].notices[0].raw == degraded
+
+
+def test_a_reply_that_describes_shots_while_returning_none_is_reported_as_a_mismatch(
+    tmp_path: Path,
+):
+    """FR-15's last clause, and the half of the recorded defect nothing ever reported.
+
+    The reproduced failure returned `shots: []` under prose describing a four-beat sequence, so
+    the Director was told a plan had been made and no plan existed. The check is ungated on
+    `apply_shots` on purpose: the browser hardcodes that flag to `false`, so gating it there
+    would put the notice where no Director can reach it.
+
+    The wording is chosen from what the project actually holds. This one has no shots, so being
+    told "the existing shots are unchanged" would describe a timeline that does not exist, in
+    the one reply that has just led the Director to believe it does.
+    """
+    director = RecordingChatDirector(message="Splitting your vision into a four-beat sequence.")
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Claimed plan")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Break it into beats"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots == []
+    assert [notice.text for notice in saved.messages[-1].notices] == [
+        SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE
+    ]
+    # Nothing was refused and nothing was written, so it is a flag rather than a refusal: the
+    # amber chrome a refusal carries would be the wrong signal here and on every reply like it.
+    assert [notice.kind for notice in saved.messages[-1].notices] == ["flag"]
+    # Reported, never applied, and never a block: the reply is stored as usual.
+    assert saved.messages[-1].content.startswith(director.message)
+
+
+def test_a_plan_that_already_exists_is_told_its_shots_are_unchanged(tmp_path: Path):
+    """The other half of the wording, and the reason the check reads `project.shots` at all.
+
+    A project with a timeline can be reassured that the timeline was not touched. A project
+    without one cannot, and the previous single wording told both the same thing.
+    """
+    director = RecordingChatDirector(message="I have written four shots across the second verse.")
+    client, store = make_client_with_director(tmp_path, director)
+    project = planned_project(store, "Existing plan")
+    before = shots_snapshot(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Rework the verse"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert [notice.text for notice in saved.messages[-1].notices] == [SHOT_CLAIM_MISMATCH_NOTICE]
+    # And the sentence is true: the plan it describes as unchanged really is unchanged.
+    assert shots_snapshot(saved) == before
+
+
+def test_ordinary_talk_about_shots_is_not_read_as_a_claim(tmp_path: Path):
+    """The boundary, exercised where it actually sits.
+
+    The first cut matched `\\bshots?\\b` anywhere, so "I did not add any shots" and "the shots
+    you have are fine" both produced the notice — on a project whose timeline the Director was
+    only discussing. A caution that fires on ordinary conversation is one that gets scrolled
+    past, which is the failure this whole story is about. The negative cases here all contain
+    the vocabulary on purpose; a reply with no shot words in it would prove nothing.
+    """
+    quiet = [
+        "I did not add any shots; the pacing question comes first.",
+        "The shots you have are fine, so I left them alone.",
+        "Nothing here writes shots — tell me when you want the plan.",
+        "I have written the treatment in two parts and a short coda.",
+        "Your four shots read well against the second verse.",
+        "There is no shot list yet, and I would not guess at one.",
+        "The style bible now covers one section on wardrobe and one on light.",
+    ]
+    loud = [
+        "Splitting your vision into a four-beat sequence.",
+        "I have written four shots for the second verse.",
+        "Here are the shots, cut to the chorus.",
+        "I broke the song into a six-part sequence.",
+        # A denial in a *different* sentence silences that sentence and no other. Scanning the
+        # whole message at once would let one unrelated "nothing" hide a real claim beside it.
+        "I have written four shots for the second verse. Nothing else changed.",
+    ]
+
+    for message in quiet:
+        assert prose_claims_shots(message) is False, message
+    for message in loud:
+        assert prose_claims_shots(message) is True, message
+
+    # And the quiet half really does reach the route without producing a notice, rather than
+    # only satisfying the predicate in isolation.
+    director = RecordingChatDirector(message=quiet[1])
+    client, store = make_client_with_director(tmp_path, director)
+    project = planned_project(store, "Quiet talk")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "How is the plan?"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.messages[-1].notices == []
+    assert saved.messages[-1].content == quiet[1]
+
+
+def test_the_consent_and_mismatch_notices_are_independent_facts(tmp_path: Path):
+    """Both can be true of one reply, and each answers a question the other does not.
+
+    One says the consent the Director gave produced nothing; the other says the reply
+    contradicts itself. Suppressing either would leave that fact unsaid in the exact turn it is
+    about — and the empty-list notice is gated on `apply_shots`, which the browser never sets,
+    so the mismatch is the only one a Director reaches from the UI.
+    """
+    director = RecordingChatDirector(message="I have written four shots for the second verse.")
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Both notices")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Plan it", "apply_shots": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert [notice.text for notice in saved.messages[-1].notices] == [
+        SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
+        SHOT_PLAN_EMPTY_NOTICE,
+    ]
+    assert saved.shots == []
+
+
+def test_a_manifest_written_before_notices_existed_loads_and_saves_unchanged(tmp_path: Path):
+    """Every field added after the fact is defaulted, and this is the one that reaches the thread.
+
+    A project saved before this story has messages with no `notices` key at all. It must load,
+    render as prose, and survive the next reply being appended to it.
+    """
+    director = RecordingChatDirector(message="Carrying on from before.")
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Old manifest")
+    project.messages.append(TreatmentMessage(role="assistant", content="A reply from before."))
+    store.save(project)
+
+    manifest = store.manifest_path(project.id)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    for message in payload["messages"]:
+        del message["notices"]
+    manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    loaded = client.get(f"/api/projects/{project.id}")
+    appended = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Carry on"}
+    )
+
+    assert loaded.status_code == 200
+    assert [message["notices"] for message in loaded.json()["messages"]] == [[]]
+    assert loaded.json()["messages"][0]["content"] == "A reply from before."
+    assert appended.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.messages[0].content == "A reply from before."
+    assert saved.messages[0].notices == []
+
+
 def expansion_result(message: str, shots: list[tuple[str, str]]):
     """A `ShotExpansion`-shaped reply, in the duck-typed style the other doubles use."""
     return type(
@@ -2368,8 +3073,10 @@ def test_expansion_does_not_apply_a_prompt_that_parses_as_json(tmp_path: Path):
     assert "NOT applied to" in notice
     assert "the model returned JSON instead of prose" in notice
     assert "Prompts written for 1 shot(s)" in notice
-    # The refused text itself is *not* stored -- see the dedicated test below for why.
+    # The refused text is never in the reply's own words -- it travels in the notice's `raw`,
+    # which the Director's context dump excludes. See the dedicated test below for why.
     assert degraded not in notice
+    assert saved.messages[-1].notices[-1].raw == degraded
 
 
 def test_expansion_never_rewrites_a_shot_a_render_or_take_already_depends_on(tmp_path: Path):
@@ -2508,6 +3215,10 @@ def test_a_refused_prompt_is_reported_without_feeding_itself_back_into_the_next_
     notice that quoted the degraded output would persist it into exactly the context whose
     richness produced it. Asserted end to end: refuse, then take a chat turn and read what
     actually reached the model.
+
+    Narrowed from the whole project dump to the context dump when the notice gained a `raw`
+    field: the refused text is now deliberately kept in the project, so "absent from the
+    manifest" is no longer the claim. "Absent from what the model is handed" always was.
     """
     degraded = '[{"shot":"corridor","camera":"push in","palette":["amber","teal"]}]'
     director = RecordingExpansionDirector([("shot_first", degraded)])
@@ -2518,19 +3229,24 @@ def test_a_refused_prompt_is_reported_without_feeding_itself_back_into_the_next_
 
     saved = ProjectStore(tmp_path).get(project.id)
     assert saved.shots[0].prompt == "New shot"
-    notice = saved.messages[-1].content
+    reply = saved.messages[-1]
     # Reported, and the reason is named -- the Director still learns what happened.
-    assert "NOT applied to" in notice
-    assert "the model returned JSON instead of prose" in notice
-    assert notice.endswith("produces more of it.")
-    # But the text itself is nowhere in the stored project at all.
-    assert degraded not in json.dumps(saved.model_dump(mode="json"))
+    assert "NOT applied to" in reply.content
+    assert "the model returned JSON instead of prose" in reply.content
+    assert reply.content.endswith("produces more of it.")
+    # The refused prompt is kept for inspection -- restored by Story 2.4, having been dropped
+    # in 2.2 only because there was nowhere to put it that the model would not read back.
+    assert reply.notices[-1].raw == degraded
+    # But never in the reply's own text, which is what the thread carries into the prompt.
+    assert degraded not in reply.content
 
     # And it is therefore not in what the next Director call is handed.
     assert client.post(
         f"/api/projects/{project.id}/director/chat", json={"message": "Carry on"}
     ).status_code == 200
-    assert degraded not in json.dumps(director.contexts[0])
+    assert not contains_text(director.contexts[0], degraded)
+    assert not contains_text(director.contexts[0], '"camera":"push in"')
+    assert all("notices" not in message for message in director.contexts[0]["messages"])
 
 
 def test_deleting_every_shot_during_the_call_is_refused_rather_than_recorded(tmp_path: Path):

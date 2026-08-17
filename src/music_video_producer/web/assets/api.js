@@ -326,6 +326,163 @@ export function documentProposalDeclined(project) {
   return (assistantReply(project) ?? "").includes(DOCUMENT_NOT_REQUESTED_MARKER);
 }
 
+// The separator app.py puts between a reply's prose and the notices attached to it, and the one
+// it joins the notices with. Both are app.py's NOTICE_SEPARATOR and NOTICE_JOIN, asserted
+// identical by a contract test -- the splitter strips exactly this tail, so a drift here would
+// leave every notice printed twice rather than silently mis-rendered.
+export const NOTICE_SEPARATOR = "\n\n---\n";
+export const NOTICE_JOIN = "\n\n";
+
+// What each kind of notice is called on screen, and the class its left edge is coloured through.
+//
+// State is never conveyed by colour alone, so the label is the first signal and the edge is the
+// second -- and both change together per kind, which is the whole point of the kind existing. One
+// label for every notice meant a reply that had *successfully* replaced a document, or written
+// prompts for four shots, announced that in amber under the word "Safety notice": the alarm
+// fatigue that makes the real refusal beside it invisible.
+//
+// The keys are the server's own discriminator (`models.MessageNotice.kind`), asserted equal by a
+// contract test. Each class is styled in styles.css and the mapping is executed there too, so a
+// kind the client renders but never colours cannot pass.
+export const NOTICE_KINDS = {
+  // Something the guard would not do, or would not let the model do.
+  refusal: { label: "Safety notice", className: "notice-refusal" },
+  // Something that was done: a document replaced, prompts written, a version restored.
+  change: { label: "Change applied", className: "notice-change" },
+  // Neither -- a discrepancy worth a look, like prose claiming shots the reply did not carry.
+  flag: { label: "Check this", className: "notice-flag" },
+};
+
+// An unknown or absent kind is presented as a refusal rather than as the quietest option. A
+// refusal dressed as good news is the failure that costs something; a change dressed as a
+// refusal is merely over-cautious, and it is what every notice looked like before kinds existed.
+export const NOTICE_FALLBACK_KIND = "refusal";
+
+export function noticeKind(kind) {
+  return Object.prototype.hasOwnProperty.call(NOTICE_KINDS, kind) ? kind : NOTICE_FALLBACK_KIND;
+}
+
+// The disclosure over the model output a refusal is about. Collapsed by default because it is
+// evidence, not reading -- and because it is exactly the degraded text the guard exists to keep
+// out of sight and out of the next prompt.
+export const NOTICE_RAW_LABEL = "Raw model output";
+
+// Five characters, not four. This is a shared export used in attribute positions as well as text
+// -- `value="${…}"`, `title="${…}"`, `data-*` -- and an unescaped `'` closes any single-quoted
+// attribute and lets the rest of the value be read as markup. The apostrophe costs nothing in
+// text position and is the difference between escaping and nearly escaping in attribute position.
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+
+export function escapeHtml(value = "") {
+  return String(value).replace(/[&<>"']/g, (char) => HTML_ESCAPES[char]);
+}
+
+// One stored message split into the Director's prose and the notices the server attached to it.
+//
+// The notices are read from the message's own `notices` field, never recovered from the text. The
+// message is *not* split on the `---` separator, and that is the whole reason the field exists:
+// the Director's prose can legitimately contain that sequence, and so can the raw model output a
+// rejection notice is about, so a search would split one notice into two blocks -- with the
+// second being the model's own degraded text presented as a protective refusal.
+//
+// The joined tail is reconstructed from the notices and stripped from the end of `content`, which
+// is exactly how the server built it. A message with no notices -- every message in every project
+// saved before notices existed, and every ordinary reply -- is returned as prose and nothing else,
+// so it renders exactly as it did before.
+export function messageParts(message) {
+  const content = typeof message?.content === "string" ? message.content : "";
+  // Notice chrome belongs to an assistant reply and to nothing else. `app.assistant_reply` is the
+  // one constructor that attaches notices, so a `user` or `system` message arriving with a
+  // populated list is a hand-edited manifest or the Director's own words fed back -- and drawing
+  // that as a protective refusal lets a bubble the Director typed be made to look like the guard
+  // speaking, which is the exact confusion the block exists to remove.
+  if (message?.role !== "assistant") return { prose: content, notices: [] };
+  const carried = (Array.isArray(message?.notices) ? message.notices : []).map((notice) => ({
+    kind: noticeKind(notice?.kind),
+    text: typeof notice?.text === "string" ? notice.text : "",
+    // Whitespace-only raw output is absent output. It is truthy, so it used to render a
+    // disclosure that offered the evidence behind a refusal and then opened onto an empty box.
+    raw: typeof notice?.raw === "string" && notice.raw.trim() !== "" ? notice.raw : "",
+  }));
+  if (!carried.length) return { prose: content, notices: [] };
+  // The tail is reconstructed from *every* carried notice, including any whose text is empty,
+  // because `NOTICE_JOIN.join(notice.text for notice in notices)` on the server joined every one
+  // of them. Reconstructing it from the displayable subset instead made the tail stop matching
+  // the moment one empty notice existed, and the fallback below then kept the whole joined string
+  // as prose -- printing every remaining notice twice, once inside the prose and once as a block.
+  const tail = NOTICE_SEPARATOR + carried.map((notice) => notice.text).join(NOTICE_JOIN);
+  // Nothing is dropped when the tail does not match: a reply whose joined text the client cannot
+  // account for keeps all of its content and still shows every notice as its own block. Printing
+  // a notice twice is a visible defect; silently swallowing part of a refusal is not.
+  const prose = content.endsWith(tail) ? content.slice(0, content.length - tail.length) : content;
+  // An empty notice is not a block: there is no sentence to read in it. It still counted above,
+  // which is the only thing it is good for.
+  return { prose, notices: carried.filter((notice) => notice.text !== "") };
+}
+
+// The inner HTML of one message in the thread: the prose, then one block per notice, each
+// labelled in words for its kind and each carrying its raw output behind a collapsed disclosure.
+//
+// Every part is escaped separately, after the split rather than before it -- the thread used to
+// be one `innerHTML` map that escaped `content` whole, so notice markup built by splitting the
+// escaped string would have had to re-parse its own escaping.
+//
+// `key` only has to be unique within one thread: it is what makes each block's label id unique,
+// which is what `aria-labelledby` needs to name the right block.
+export function messageBodyHtml(message, key = "") {
+  const { prose, notices } = messageParts(message);
+  const base = noticeIdBase(key === "" || key === null || key === undefined ? message?.id : key);
+  return escapeHtml(prose) + notices.map((notice, index) => noticeHtml(notice, `${base}-${index}`)).join("");
+}
+
+function noticeIdBase(key) {
+  const slug = String(key ?? "").replace(/[^A-Za-z0-9_-]/g, "-");
+  return `notice-${slug || "0"}`;
+}
+
+// `role="note"` with the label as its accessible name, so the block is announced as an aside with
+// a name rather than as one more run of text inside the Director's reply -- until this existed,
+// the whole of "this is the guard speaking, not the Director" was a coloured edge and a line of
+// small caps, neither of which a screen reader conveys at all.
+function noticeHtml(notice, id) {
+  const { label, className } = NOTICE_KINDS[notice.kind];
+  const raw = notice.raw
+    ? `<details class="notice-raw"><summary>${escapeHtml(NOTICE_RAW_LABEL)}</summary><pre>${escapeHtml(notice.raw)}</pre></details>`
+    : "";
+  return `<div class="message-notice ${escapeHtml(className)}" role="note" aria-labelledby="${escapeHtml(id)}">`
+    + `<strong class="notice-label" id="${escapeHtml(id)}">${escapeHtml(label)}</strong>`
+    + `<p>${escapeHtml(notice.text)}</p>${raw}</div>`;
+}
+
+// What the Director is told when a project has no reply yet. Here rather than in the template it
+// is drawn into, because `threadHtml` below returns the *whole* body and there is exactly one
+// thing the thread can be.
+export const EMPTY_THREAD_TITLE = "Direct the video naturally";
+export const EMPTY_THREAD_HINT =
+  "Describe narrative, energy, references, camera language, what to avoid, and where the " +
+  "performance should feel literal or abstract.";
+
+// The entire inner HTML of the chat thread, built here so it can be executed.
+//
+// This is the string `renderTreatment` assigns to `thread.innerHTML` and nothing else: no markup
+// is left in the DOM layer for the suite to be unable to reach. That split is the point. app.js
+// is imported by no test and executed by none, so while the markup lived there, assigning it to
+// `textContent` instead -- or escaping the body a second time -- left every assertion in the
+// suite satisfied while every refusal rendered as literal `<div class="message-notice">` text and
+// the block never appeared at all.
+export function threadHtml(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  if (!list.length) {
+    return `<div class="empty-thread"><strong>${escapeHtml(EMPTY_THREAD_TITLE)}</strong><p>${escapeHtml(EMPTY_THREAD_HINT)}</p></div>`;
+  }
+  return list
+    .map((message, index) => {
+      const key = message?.id ? message.id : `${index}`;
+      return `<div class="message ${escapeHtml(message?.role ?? "")}">${messageBodyHtml(message, key)}</div>`;
+    })
+    .join("");
+}
+
 // `applied` is the consent that was actually sent, not a guess: with it off the server writes
 // no document at all, so the reply cannot have replaced anything whatever the two projects
 // differ by. It defaults to `true` because that is the safe default of the two — a caller that

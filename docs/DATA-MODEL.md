@@ -6,6 +6,8 @@ The recoverable source of truth is `data/projects/<project-id>/project.json`.
 
 - `id`, `name`, `created_at`, `updated_at`
 - `creative_brief`, `treatment`, `style_bible`
+- `treatment_previous`, `style_bible_previous` — single-slot recovery, one prior version per document, written only when a replacement is actually applied
+- `treatment_locked`, `style_bible_locked` — a lock stops the Director from replacing a document; it does not stop the human editing it
 - optional `song`
 - `assets[]`
 - `shots[]`
@@ -51,6 +53,20 @@ Imported and generated songs have equal project status.
 - `locked`
 
 Shot timing is measured in seconds against the master song. Director compilation converts it to frames only at the workflow boundary.
+
+## TreatmentMessage
+
+- stable `id`, `role` (user, assistant, system), `content`, `created_at`
+- `notices[]` — the protective refusals, changes and flags a Director turn produced, carried as data rather than as text appended to `content`
+
+## MessageNotice
+
+- `text` — the sentence shown to the Director; also present in the message's `content`, which is what the marker-substring consumers read
+- `raw` — the model output the notice is *about*, capped in length because the manifest is persisted
+
+`notices` and its `raw` are excluded from the context sent back to the language model. That is the rule, not an optimisation: the raw field holds the degraded output a refusal was raised over, and feeding it back is the self-reinforcing failure `document_rejection` exists to catch. See `docs/LLM-DIRECTOR.md`.
+
+Messages saved before 2026-08-17 carry no `notices` and still have the old inline `Raw output: …` text inside `content`; they load unchanged, but that historical text is not covered by the exclusion.
 
 ## RenderJob
 

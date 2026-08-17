@@ -126,6 +126,34 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    quieter than Director prose: the thread is this feature's audit trail, so a record of what
    happened to a document must not read as something the Director said. */
 .message.system { max-width: 100%; border-color: var(--line-strong); border-left: 3px solid var(--cyan); background: var(--surface-1); color: var(--muted); font-size: 12px; }
+/* Every notice a reply carried, one block each. Declared after the three `.message` rules it
+   nests inside so nothing about a bubble's own colour reaches it by a tie: a notice that reads
+   like Director prose is the entire defect this exists to end. The edge shorthand is set here and
+   only here -- the per-kind rules below recolour it and never restate it -- so no later rule can
+   take the edge away. */
+.message-notice { margin-top: 11px; padding: 9px 11px; border: 1px solid var(--line-strong); border-left: 3px solid var(--amber); border-radius: var(--radius); background: var(--surface-1); color: var(--ink); font-size: 12px; }
+/* One edge colour and one label colour per kind, from tokens the palette already declares -- no
+   new colour was added for this. Caution amber for a refusal, acid for something that was
+   actually done, cyan for a flag, matching the cyan the system audit line already uses. The
+   colour is the *second* signal: the label below says which kind this is in words, and the words
+   differ per kind, so a Director reading without colour still tells good news from a refusal. */
+.message-notice.notice-refusal { border-left-color: var(--amber); }
+.message-notice.notice-change { border-left-color: var(--acid); }
+.message-notice.notice-flag { border-left-color: var(--cyan); }
+/* 11px and bold rather than the 9px this started at: a signal small enough to be missed is not a
+   redundant signal, and this is the one that has to survive with the colour ignored. */
+.message-notice .notice-label { display: block; margin-bottom: 5px; font: 700 11px Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
+.message-notice.notice-refusal .notice-label { color: var(--amber); }
+.message-notice.notice-change .notice-label { color: var(--acid); }
+.message-notice.notice-flag .notice-label { color: var(--cyan); }
+.message-notice p { margin: 0; line-height: 1.45; }
+/* The raw model output, collapsed until asked for. Styled through the class the markup actually
+   carries, so a disclosure added elsewhere in a notice is not silently given this treatment.
+   `pre-wrap` and its own scroll container because this is unsanitised model output: a single
+   400-character line must not widen the thread, and the newlines are part of what is inspected. */
+.message-notice .notice-raw { margin-top: 9px; color: var(--muted); font-size: 11px; }
+.message-notice .notice-raw summary { cursor: pointer; }
+.message-notice .notice-raw pre { margin: 7px 0 0; padding: 8px 9px; max-height: 190px; overflow: auto; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-0); color: var(--muted); font: 11px/1.45 Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .composer { padding: 12px; border-top: 1px solid var(--line); }
 .composer textarea { margin-bottom: 8px; }
 /* Wraps because the row carries three items now -- the hint, the per-turn document consent and
