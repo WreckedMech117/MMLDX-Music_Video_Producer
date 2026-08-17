@@ -29,8 +29,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from music_video_producer.workflows import (
-    _build_songplanner_core,
     build_songplanner_invented_payload,
+    build_songplanner_known_lyrics_payload,
 )
 
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "object_info.json"
@@ -41,13 +41,13 @@ def audit_payloads() -> list[tuple[str, dict]]:
     invented = build_songplanner_invented_payload(
         idea="preflight idea", genre_hint="", duration=120, seed=0, prefix="preflight"
     )
-    known = _build_songplanner_core(
+    known = build_songplanner_known_lyrics_payload(
         idea="preflight idea",
         genre_hint="",
+        lyrics="[verse]\npreflight",
         duration=120,
         seed=0,
         prefix="preflight",
-        lyrics="[verse]\npreflight",
     )
     return [("invented", invented), ("known-lyrics", known)]
 

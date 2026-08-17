@@ -7,14 +7,23 @@ export function comfyOutputUrl(baseUrl, outputPath) {
   return `${baseUrl.replace(/\/$/, "")}/view?${params}`;
 }
 
-// Pure preset → (endpoint, body) mapping for the Song workspace form. The invented
-// SongPlanner variant reuses the creative-direction (caption) field as the idea and
-// never sends lyrics; every other preset takes the direct Music 3 path.
+// Pure preset → (endpoint, body) mapping for the Song workspace form. Both
+// SongPlanner variants reuse the creative-direction (caption) field as the idea;
+// invented never sends lyrics, known sends the Director's lyric sheet with only
+// its leading/trailing whitespace trimmed (matching the server's constraint) —
+// every interior line, blank line and indent is preserved. Every other preset
+// takes the direct Music 3 path.
 export function musicGenerationPlan(data) {
   if (data.preset === "songplanner-invented") {
     return {
       endpoint: "songplanner",
       body: { title: data.title, idea: data.caption, duration: Number(data.duration), seed: Number(data.seed) },
+    };
+  }
+  if (data.preset === "songplanner-known") {
+    return {
+      endpoint: "songplanner",
+      body: { title: data.title, idea: data.caption, lyrics: (data.lyrics || "").trim(), duration: Number(data.duration), seed: Number(data.seed) },
     };
   }
   return {
@@ -23,15 +32,42 @@ export function musicGenerationPlan(data) {
   };
 }
 
+// Pure preset → lyrics/duration field state for the Song workspace form, kept
+// here beside musicGenerationPlan so the routing and the form shape cannot drift
+// apart. Both SongPlanner variants cap duration at the route's 200 s bound; only
+// the known-lyrics cover needs a lyric sheet from the Director.
+export function musicPresetFieldState(preset) {
+  const songplanner = preset === "songplanner-invented" || preset === "songplanner-known";
+  return {
+    lyricsVisible: preset !== "songplanner-invented",
+    lyricsRequired: preset === "songplanner-known",
+    durationMax: songplanner ? 200 : 360,
+  };
+}
+
+// FastAPI reports handler failures as a plain `detail` string but validation
+// failures (422) as a list of {loc, msg, type} objects, which would otherwise
+// reach the Director as "[object Object]". Render both into readable text.
+export function errorMessage(payload, response) {
+  const detail = payload?.detail ?? payload?.message;
+  if (detail === null || detail === undefined) return `${response.status} ${response.statusText}`;
+  const readable = (item) => {
+    if (typeof item === "string") return item;
+    if (!item || typeof item !== "object") return String(item);
+    const field = Array.isArray(item.loc) ? item.loc.filter((part) => part !== "body").join(".") : "";
+    const message = item.msg || item.message || item.type || JSON.stringify(item);
+    return field ? `${field}: ${message}` : message;
+  };
+  const rendered = Array.isArray(detail) ? detail.map(readable).join("; ") : readable(detail);
+  return rendered || `${response.status} ${response.statusText}`;
+}
+
 export async function request(path, options = {}) {
   const response = await fetch(path, options);
   let payload = null;
   const type = response.headers.get("content-type") || "";
   if (type.includes("application/json")) payload = await response.json();
-  if (!response.ok) {
-    const message = payload?.detail || payload?.message || `${response.status} ${response.statusText}`;
-    throw new Error(message);
-  }
+  if (!response.ok) throw new Error(errorMessage(payload, response));
   return payload;
 }
 

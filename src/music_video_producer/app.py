@@ -43,6 +43,7 @@ from .workflows import (
     build_multiview_payload,
     build_music3_payload,
     build_songplanner_invented_payload,
+    build_songplanner_known_lyrics_payload,
 )
 
 
@@ -62,6 +63,10 @@ class SongPlannerRequest(BaseModel):
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)]
     idea: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
     genre_hint: str = Field(default="", max_length=160)
+    lyrics: (
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8000)]
+        | None
+    ) = None
     duration: float = Field(default=120, ge=4, le=200)
     seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
 
@@ -419,13 +424,23 @@ def create_app(
     async def generate_songplanner(project_id: str, request: SongPlannerRequest) -> RenderJob:
         project = get_project(project_id)
         prefix = f"music-video-producer/{project_id}/songs/{_safe_filename(request.title)}"
-        payload = build_songplanner_invented_payload(
-            idea=request.idea,
-            genre_hint=request.genre_hint,
-            duration=request.duration,
-            seed=request.seed,
-            prefix=prefix,
-        )
+        if request.lyrics is not None:
+            payload = build_songplanner_known_lyrics_payload(
+                idea=request.idea,
+                genre_hint=request.genre_hint,
+                lyrics=request.lyrics,
+                duration=request.duration,
+                seed=request.seed,
+                prefix=prefix,
+            )
+        else:
+            payload = build_songplanner_invented_payload(
+                idea=request.idea,
+                genre_hint=request.genre_hint,
+                duration=request.duration,
+                seed=request.seed,
+                prefix=prefix,
+            )
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
@@ -434,6 +449,7 @@ def create_app(
             title=request.title,
             source="generated",
             duration=request.duration,
+            lyrics=request.lyrics or "",
             caption=request.idea,
             prompt_id=submission.prompt_id,
         )

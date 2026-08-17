@@ -7,20 +7,25 @@ import pytest
 
 from music_video_producer.workflows import (
     WorkflowCatalog,
-    _build_songplanner_core,
     build_flux_payload,
     build_h3_director_payload,
     build_h3_reference_payload,
     build_multiview_payload,
     build_music3_payload,
     build_songplanner_invented_payload,
+    build_songplanner_known_lyrics_payload,
     patch_ltx25_dimension_boundary,
 )
 
-SONGPLANNER_EXPORT = Path(
-    "workflow_templates/reference_exports/songplanner-invented-user-export.json"
-)
-SONGPLANNER_EXPORT_SHA256 = "8c313fda7665ccb79a9aeb02734f3d5c04f7f92821af3d0dbff764bc718ec28a"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REFERENCE_EXPORTS = REPO_ROOT / "workflow_templates" / "reference_exports"
+
+SONGPLANNER_EXPORTS = {
+    REFERENCE_EXPORTS
+    / "songplanner-invented-user-export.json": "8c313fda7665ccb79a9aeb02734f3d5c04f7f92821af3d0dbff764bc718ec28a",
+    REFERENCE_EXPORTS
+    / "songplanner-known-lyrics-user-export.json": "24485cf273bf1be1be798c50be65081f5737264f8c0dc6ffb1004389682523b2",
+}
 
 
 def test_catalog_reports_present_and_missing_workflows(tmp_path: Path):
@@ -103,28 +108,64 @@ def test_songplanner_invented_payload_lands_controls_on_planner_and_music_nodes(
     assert not dropped & {node["class_type"] for node in payload.values()}
 
 
-def test_songplanner_core_reserves_known_lyrics_branch_for_story_1_2():
-    payload = _build_songplanner_core(
+def test_songplanner_known_lyrics_payload_passes_lyrics_through_unchanged():
+    lyrics = (
+        "[Intro]\n\n[Verse 1]\nStatic in the wires tonight\n  indented line kept as-is\n\n"
+        "[Chorus]\nWe are the night signal\nWe are the night signal\n\n[Outro]\nFade…"
+    )
+    payload = build_songplanner_known_lyrics_payload(
         idea="ballad",
         genre_hint="",
+        lyrics=lyrics,
         duration=60,
         seed=3,
         prefix="mvp/songs/known",
-        lyrics="[verse]\nKnown words",
     )
 
     encoder = next(
         node for node in payload.values() if node["class_type"] == "MiniMaxMusic3TextEncode"
     )
-    assert encoder["inputs"]["lyrics"] == "[verse]\nKnown words"
+    assert encoder["inputs"]["lyrics"] == lyrics
     assert encoder["inputs"]["caption"] == ["55", 0]
 
 
-def test_songplanner_core_rejects_blank_known_lyrics():
+def test_songplanner_known_lyrics_payload_rejects_blank_lyrics():
     with pytest.raises(ValueError, match="lyrics"):
-        _build_songplanner_core(
-            idea="ballad", genre_hint="", duration=60, seed=3, prefix="mvp/songs/x", lyrics="  \n"
+        build_songplanner_known_lyrics_payload(
+            idea="ballad", genre_hint="", lyrics="  \n", duration=60, seed=3, prefix="mvp/songs/x"
         )
+
+
+def test_songplanner_known_lyrics_payload_never_degrades_to_invented():
+    """A cover request with no lyric sheet must fail loudly, not silently invent lyrics."""
+    for missing in (None, 0, ["[verse]"]):
+        with pytest.raises(TypeError, match="string"):
+            build_songplanner_known_lyrics_payload(
+                idea="ballad",
+                genre_hint="",
+                lyrics=missing,
+                duration=60,
+                seed=3,
+                prefix="mvp/songs/x",
+            )
+
+
+def test_songplanner_builders_differ_only_in_node_45_lyric_handling():
+    shared = {
+        "idea": "ballad",
+        "genre_hint": "rock",
+        "duration": 60,
+        "seed": 3,
+        "prefix": "mvp/songs/pair",
+    }
+    invented = build_songplanner_invented_payload(**shared)
+    known = build_songplanner_known_lyrics_payload(lyrics="[verse]\nKnown words", **shared)
+
+    assert invented["45"]["inputs"]["lyrics"] == ["55", 1]
+    assert known["45"]["inputs"]["lyrics"] == "[verse]\nKnown words"
+    invented["45"]["inputs"].pop("lyrics")
+    known["45"]["inputs"].pop("lyrics")
+    assert invented == known
 
 
 def test_songplanner_variants_validate_separately_against_recorded_object_info():
@@ -152,9 +193,10 @@ def test_songplanner_model_files_are_present_in_recorded_combos():
         assert filename in options, f"{class_type}.{input_name}: {filename}"
 
 
-def test_songplanner_source_export_is_not_mutated():
-    digest = hashlib.sha256(SONGPLANNER_EXPORT.read_bytes()).hexdigest()
-    assert digest == SONGPLANNER_EXPORT_SHA256
+def test_songplanner_source_exports_are_not_mutated():
+    for export, expected in SONGPLANNER_EXPORTS.items():
+        digest = hashlib.sha256(export.read_bytes()).hexdigest()
+        assert digest == expected, export
 
 
 def test_multiview_payload_uses_uploaded_character_and_quadview_lora():

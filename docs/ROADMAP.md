@@ -8,6 +8,7 @@
 - [x] Browser waveform and automatic imported-song duration
 - [x] Direct MiniMax Music 3 generation
 - [x] SongPlanner invented-lyrics generation (FR-13) — unit-tested against a recorded `/object_info` fixture; live generation not yet verified (pending Story 1.3's ≤16 s run)
+- [x] SongPlanner known-lyrics cover generation (FR-14) — unit-tested (lyric sheet reaches the payload unchanged apart from edge-whitespace stripping, payload equality with the invented variant except lyric handling, route and preset coverage); live generation not yet verified (pending Story 1.3)
 - [x] OpenAI-compatible conversational treatment planner
 - [x] Flux character/setting/prop/style generation
 - [x] Media asset library
@@ -58,9 +59,10 @@
 ## Verification status on 2026-08-16
 
 - First-run project creation: repaired and verified in headless Edge against an empty isolated data root; all five workspaces opened with zero severe console errors.
-- Python suite: 62 passing. Ruff and JavaScript syntax checks pass. Browser QA is also a required release gate; use the commands in `README.md`.
+- Python suite: 84 passing. Ruff and JavaScript syntax checks pass. Browser QA is also a required release gate; use the commands in `README.md`.
 - Music 3: prior real eight-second integrated FLAC successful in ComfyUI.
-- SongPlanner invented lyrics (FR-13): adapter, route, and Song-workspace variant selector implemented 2026-08-16. `tests/preflight_songplanner.py` confirmed all 11 node classes and every model/combo value against live ComfyUI 0.33.1 `/object_info` and recorded `tests/fixtures/object_info.json`; unit tests validate payloads offline against that fixture. **No live generation has been run** — the short end-to-end run is Story 1.3.
+- SongPlanner invented lyrics (FR-13): adapter, route, and Song-workspace variant selector implemented 2026-08-16. `tests/preflight_songplanner.py` confirmed all 10 node classes and every model/combo value against live ComfyUI 0.33.1 `/object_info` and recorded `tests/fixtures/object_info.json`; unit tests validate payloads offline against that fixture. **No live generation has been run** — the short end-to-end run is Story 1.3.
+- SongPlanner known lyrics (FR-14): second thin builder over the shared core, optional `lyrics` on the songplanner route, and a third Song-workspace preset implemented 2026-08-16. The audited Known_Lyrics export (SHA-256 verified) differs from the invented export only in node `45.lyrics`/preview `58.source`; unit tests assert payload equality except lyric handling and pin the lyric-handling contract exactly — the route strips leading/trailing whitespace only, and interior blank lines and indentation reach the payload unchanged. The offline `/object_info` fixture validates the known variant via the public builder. **No live generation has been run** — live verification is pending Story 1.3.
 - Flux API adapter: structurally matched to live `/object_info`; live smoke pending in this app.
 - Krea: prior one-step character-sheet generation successful; current multiview adapter unit-tested; live app smoke pending.
 - Director compiler: `MiniMaxH3DirectorCS` is registered on 8188; app timing now uses `start`/`length`, while full media/reference conversion remains pending.

@@ -239,6 +239,106 @@ def test_songplanner_generation_submits_planner_payload_and_records_job(tmp_path
     assert saved.song.title == "Night Signal"
 
 
+def test_songplanner_known_lyrics_submits_supplied_lyrics_and_records_job(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Cover"))
+    lyrics = "[Verse]\nStatic in the wires\n\n[Chorus]\nNight signal, night signal"
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={
+            "title": "Night Signal (Cover)",
+            "idea": "faithful synthwave cover, airy female vocals",
+            "genre_hint": "synthwave",
+            "lyrics": lyrics,
+            "duration": 90,
+            "seed": 21,
+        },
+    )
+
+    assert response.status_code == 202
+    payload = comfy.prompts[-1]
+    encoder = next(
+        node for node in payload.values() if node["class_type"] == "MiniMaxMusic3TextEncode"
+    )
+    assert encoder["inputs"]["lyrics"] == lyrics
+    planner = next(node for node in payload.values() if node["class_type"] == "M3SongPlanner")
+    assert planner["inputs"]["idea"].startswith("faithful synthwave cover")
+    assert planner["inputs"]["genre_hint"] == "synthwave"
+    saved = store.get(project.id)
+    job = saved.jobs[-1]
+    assert job.kind == "music"
+    assert job.prompt_id == "p-101"
+    assert job.seed == 21
+    assert job.target_id == "song"
+    assert saved.song.lyrics == lyrics
+    assert saved.song.source == "generated"
+    assert saved.song.prompt_id == "p-101"
+    assert saved.song.title == "Night Signal (Cover)"
+
+
+def test_songplanner_known_lyrics_strips_only_edge_whitespace(tmp_path: Path):
+    """Edge whitespace is not lyric content; every interior character must survive."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Whitespace"))
+    interior = (
+        "[Intro]\n\n\n[Verse 1]\nStatic in the wires\n    four-space indent kept\n"
+        "\tTab indent kept\n\n[Chorus]\nNight signal   \n\n[Outro]\nFade…"
+    )
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "Edges", "idea": "cover", "lyrics": f"\n\n  {interior}  \n\t\n"},
+    )
+
+    assert response.status_code == 202
+    encoder = next(
+        node
+        for node in comfy.prompts[-1].values()
+        if node["class_type"] == "MiniMaxMusic3TextEncode"
+    )
+    assert encoder["inputs"]["lyrics"] == interior
+    assert store.get(project.id).song.lyrics == interior
+
+
+def test_songplanner_rejects_blank_lyrics(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="BlankLyrics"))
+
+    for lyrics in ("", "   \n\t "):
+        response = client.post(
+            f"/api/projects/{project.id}/generate/songplanner",
+            json={"title": "T", "idea": "an idea", "lyrics": lyrics},
+        )
+        assert response.status_code == 422, repr(lyrics)
+    assert store.get(project.id).jobs == []
+    assert store.get(project.id).song is None
+
+
+def test_songplanner_without_lyrics_keeps_invented_planner_wiring(tmp_path: Path):
+    """Omitted and explicitly null lyrics both take the invented path, by design."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Invented"))
+    bodies = (
+        {"title": "Night Signal", "idea": "sunset synthwave"},
+        {"title": "Night Signal", "idea": "sunset synthwave", "lyrics": None},
+    )
+
+    for body in bodies:
+        response = client.post(
+            f"/api/projects/{project.id}/generate/songplanner", json=body
+        )
+
+        assert response.status_code == 202, body
+        encoder = next(
+            node
+            for node in comfy.prompts[-1].values()
+            if node["class_type"] == "MiniMaxMusic3TextEncode"
+        )
+        assert encoder["inputs"]["lyrics"] == ["55", 1], body
+        assert store.get(project.id).song.lyrics == ""
+
+
 def test_songplanner_rejects_out_of_bounds_requests(tmp_path: Path):
     client, store, _ = make_client(tmp_path)
     project = store.create(Project(name="Validation"))
@@ -249,6 +349,7 @@ def test_songplanner_rejects_out_of_bounds_requests(tmp_path: Path):
         {"title": "T", "idea": "x" * 4001},  # idea above max_length
         {"title": "T", "idea": "an idea", "genre_hint": "g" * 161},  # genre above max_length
         {"title": "T", "idea": "an idea", "seed": 2**64},  # seed above 64-bit range
+        {"title": "T", "idea": "an idea", "lyrics": "x" * 8001},  # lyrics above max_length
     )
 
     for body in invalid_bodies:

@@ -94,7 +94,7 @@ def _build_songplanner_core(
     duration: float,
     seed: int,
     prefix: str,
-    lyrics: str | None = None,
+    lyrics: str | None,
 ) -> dict[str, dict[str, Any]]:
     """Shared SongPlanner → Music 3 core.
 
@@ -103,9 +103,13 @@ def _build_songplanner_core(
     indirection (52), and the dead tiled-decode branch (53/54) are dropped; the
     literal seed feeds nodes 45 and 50 directly, and the master is saved as FLAC
     instead of the export's mp3/V0. ``lyrics=None`` keeps the invented path where
-    Gemma-3 writes both caption and lyrics; a non-empty string (Story 1.2, unused
-    externally for now) replaces the planner's lyrics with a known lyric sheet
-    passed literally to node 45, matching ``build_music3_payload``.
+    Gemma-3 writes both caption and lyrics; a non-empty string (the known-lyrics
+    path) replaces the planner's lyrics with a known lyric sheet passed literally
+    to node 45, matching ``build_music3_payload``.
+
+    ``lyrics`` is deliberately not defaulted: both wrappers must state which
+    variant they want, so no caller can silently fall into the invented path
+    while asking for a cover.
     """
     if lyrics is not None and not lyrics.strip():
         raise ValueError("Known lyrics must not be empty; pass None for invented lyrics")
@@ -131,7 +135,48 @@ def build_songplanner_invented_payload(
 ) -> dict[str, dict[str, Any]]:
     """SongPlanner invented-lyrics path: Gemma-3 writes caption + lyrics in-graph."""
     return _build_songplanner_core(
-        idea=idea, genre_hint=genre_hint, duration=duration, seed=seed, prefix=prefix
+        idea=idea,
+        genre_hint=genre_hint,
+        duration=duration,
+        seed=seed,
+        prefix=prefix,
+        lyrics=None,
+    )
+
+
+def build_songplanner_known_lyrics_payload(
+    *, idea: str, genre_hint: str, lyrics: str, duration: float, seed: int, prefix: str
+) -> dict[str, dict[str, Any]]:
+    """SongPlanner known-lyrics path: the supplied lyric sheet reaches node 45 unchanged.
+
+    Matches the audited ``songplanner-known-lyrics-user-export.json``, which differs
+    from the invented export only in feeding node 45's ``lyrics`` from a lyric-sheet
+    text node instead of the planner; the adapter passes the sheet as a literal and
+    never rewrites, reflows, or truncates it. Callers that accept Director input
+    (the ``/generate/songplanner`` route) strip leading/trailing whitespace before
+    calling — edge whitespace is not lyric content — but every interior character,
+    blank line, and indent survives byte for byte.
+
+    ``lyrics`` must be a non-empty string: this function only builds the cover
+    variant, so ``None`` is rejected rather than degrading to invented lyrics.
+    """
+    if not isinstance(lyrics, str):
+        raise TypeError(
+            "Known lyrics must be a string; use build_songplanner_invented_payload "
+            "for the invented-lyrics path"
+        )
+    if not lyrics.strip():
+        raise ValueError(
+            "Known lyrics must not be empty; use build_songplanner_invented_payload "
+            "for the invented-lyrics path"
+        )
+    return _build_songplanner_core(
+        idea=idea,
+        genre_hint=genre_hint,
+        duration=duration,
+        seed=seed,
+        prefix=prefix,
+        lyrics=lyrics,
     )
 
 

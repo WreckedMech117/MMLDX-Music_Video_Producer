@@ -1,4 +1,4 @@
-import { api, comfyOutputUrl, musicGenerationPlan } from "./api.js";
+import { api, comfyOutputUrl, musicGenerationPlan, musicPresetFieldState } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -515,12 +515,13 @@ function bindEvents() {
   });
   const musicForm = $("#music-form");
   const syncMusicVariant = () => {
-    const invented = musicForm.elements.preset.value === "songplanner-invented";
+    const fields = musicPresetFieldState(musicForm.elements.preset.value);
     const lyricsField = musicForm.elements.lyrics;
-    lyricsField.closest("label").style.display = invented ? "none" : "";
-    lyricsField.disabled = invented;
-    musicForm.elements.duration.max = invented ? 200 : 360;
-    if (invented && Number(musicForm.elements.duration.value) > 200) musicForm.elements.duration.value = 200;
+    lyricsField.closest("label").style.display = fields.lyricsVisible ? "" : "none";
+    lyricsField.disabled = !fields.lyricsVisible;
+    lyricsField.required = fields.lyricsRequired;
+    musicForm.elements.duration.max = fields.durationMax;
+    if (Number(musicForm.elements.duration.value) > fields.durationMax) musicForm.elements.duration.value = fields.durationMax;
   };
   syncMusicVariant();
   musicForm.elements.preset.addEventListener("change", syncMusicVariant);
@@ -528,6 +529,9 @@ function bindEvents() {
     event.preventDefault(); if (!requireProject()) return;
     const data = Object.fromEntries(new FormData(event.currentTarget));
     const plan = musicGenerationPlan(data);
+    if (data.preset === "songplanner-known" && !plan.body.lyrics) {
+      return toast("Paste the lyric sheet, or switch to the invented-lyrics preset.", "error");
+    }
     try {
       if (plan.endpoint === "songplanner") {
         if (!window.confirm("Queue SongPlanner generation? It loads the 12B Gemma-3 planner plus the Music 3 stack and can use significant GPU time.")) return;

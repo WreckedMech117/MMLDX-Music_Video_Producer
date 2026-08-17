@@ -66,11 +66,11 @@
               <form id="music-form">
                 <label>Title<input name="title" required placeholder="Night Signal"></label>
                 <label>Creative direction<textarea name="caption" required rows="4" placeholder="Genre, mood, vocal character, instrumentation and arrangement…"></textarea></label>
-                <label>Lyrics / section plan<textarea name="lyrics" rows="7" placeholder="[Intro]&#10;…&#10;&#10;[Verse]&#10;…"></textarea></label>
+                <label>Lyrics / section plan<textarea name="lyrics" rows="7" maxlength="8000" placeholder="[Intro]&#10;…&#10;&#10;[Verse]&#10;…"></textarea></label>
                 <div class="form-row thirds">
                   <label>Duration <span>s</span><input name="duration" type="number" min="4" max="360" value="120"></label>
                   <label>Seed<input name="seed" type="number" min="0" value="0"></label>
-                  <label>Preset<select name="preset" title="Generation variant"><option value="balanced">Balanced (direct)</option><option value="songplanner-invented">SongPlanner — invented lyrics</option></select></label>
+                  <label>Preset<select name="preset" title="Generation variant"><option value="balanced">Balanced (direct)</option><option value="songplanner-invented">SongPlanner — invented lyrics</option><option value="songplanner-known">SongPlanner — known lyrics</option></select></label>
                 </div>
                 <button class="primary-button full" type="submit">Queue song generation</button>
               </form>

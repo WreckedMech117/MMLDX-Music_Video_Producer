@@ -54,7 +54,7 @@ The standalone form accepts prepared caption/lyrics directly. Conversational Son
 
 **Purpose:** generate a complete song from just an idea — Gemma-3 writes the caption and lyrics inside ComfyUI (`M3SongPlanner`), and Music 3 renders them in the same graph.
 
-**Adapter path:** `build_songplanner_invented_payload()` over the shared `_build_songplanner_core()` (the core reserves a known-lyrics branch for the Story 1.2 variant; it is not exposed externally yet).
+**Adapter path:** `build_songplanner_invented_payload()` over the shared `_build_songplanner_core()` (the known-lyrics variant below is the second thin builder over the same core).
 
 **Models:**
 
@@ -66,6 +66,25 @@ The standalone form accepts prepared caption/lyrics directly. Conversational Son
 **Controls:** title, idea, duration (4–200 s), seed, output prefix. A genre hint is accepted by the API (`genre_hint`, max 160 chars) but is currently API-only — the Song workspace form never sends it. Planner defaults follow the audited export (female vocals, English, temperature 0.8, top-p 0.95, top-k 64); Music 3 sampling uses the export's 30 Euler/simple steps at CFG 1.7 with encode CFG 1.5.
 
 The explicit 10-node adapter drops the export's UI-only preview nodes, the CR Text scratchpad, the SeedNode indirection, and the dead tiled-decode branch; the literal seed feeds the encoder and sampler directly, and the model-resolved duration (`MiniMaxMusic3TextEncode` output 1) still drives the latent length. The master is saved as FLAC (matching the live-verified direct adapter) instead of the export's mp3/V0. `tests/preflight_songplanner.py` audits classes and model combos against live `/object_info` and records `tests/fixtures/object_info.json` for offline validation. Combo note: 0.33.1 V3 nodes publish options at `input[1]["options"]`, while classic loaders still inline them at `input[0]` — the audit reads both.
+
+## SongPlanner — known lyrics (MiniMax Music 3)
+
+**Immutable source:** `workflow_templates/reference_exports/songplanner-known-lyrics-user-export.json` (audited copy of the creator's "SongPlanner + MiniMax Music 3 - Quality BF16-Known_Lyrics" API export; SHA-256 in the reference-exports `MANIFEST.md`).
+
+**Purpose:** generate a cover or an already-written song — the Director supplies the finished lyric sheet, Gemma-3 still writes the caption from the idea, and Music 3 renders the supplied lyrics unchanged (FR-14).
+
+**Adapter path:** `build_songplanner_known_lyrics_payload()` over the same shared `_build_songplanner_core()` as the invented variant. The audited export differs from the invented export only in node `45.lyrics` and preview-node `58.source` (planner output → CR Text lyric sheet); the adapter passes the lyric sheet as a literal to node 45, so both builders' payloads are identical except node 45's lyric input (asserted by unit test). Passing a non-string (including `None`) to the known builder raises `TypeError` rather than degrading to the invented payload.
+
+**Models:**
+
+- `gemma_3_12B_it_fp4_mixed` (SongPlanner text encoder — still writes the caption from the idea)
+- `minimax_music3_text_encoder_bf16`
+- `minimax_music3_dit_fp16`
+- `minimax_music3_dav`
+
+**Controls:** title, idea, lyrics, duration (4–200 s), seed, output prefix; `genre_hint` is accepted by the API as on the invented variant. Sampling settings are unchanged from the invented variant.
+
+**Lyric handling:** the route strips only leading and trailing whitespace from the submitted sheet — edge whitespace is not lyric content — and every interior character, blank line, and indent then reaches node 45 unchanged; the builder never rewrites, reflows, or truncates it, and the planner never sees it. The stripped sheet is what is stored in `Song.lyrics`, so the manifest and the payload always agree. Blank or whitespace-only lyrics are rejected (HTTP 422 at the route, `ValueError` in the builder); the sheet is bounded at 8000 characters both in the form markup and at the route. Selected in the Song workspace via the `SongPlanner — known lyrics` preset, which keeps the lyrics textarea visible and required and posts to the same `/generate/songplanner` route with a `lyrics` field.
 
 ## Krea 2 multiview character sheet
 
@@ -131,6 +150,7 @@ SeedVR2 completed a real 192-frame upscale at 1250×720. The following LTX VAE e
 | Flux Image Gen | yes | yes | yes | models present | yes |
 | Music 3 direct | yes | yes | yes | generated FLAC previously | yes |
 | SongPlanner invented lyrics | n/a | explicit 10-node adapter | yes | classes/models validated against live `/object_info` 2026-08-16; no live generation yet | yes |
+| SongPlanner known lyrics | n/a | same 10-node core, lyric sheet literal | yes | same audited node classes/models as invented; no live generation yet | yes |
 | Krea multiview | yes | yes | yes | one-step sheet previously | yes |
 | Director compile | yes | start/length timing | yes | live compiler accepts timing scaffold | timeline only |
 | H3 text-only shot render | yes | explicit 15-node adapter | yes | **live render verified end to end 2026-08-16** | yes |
