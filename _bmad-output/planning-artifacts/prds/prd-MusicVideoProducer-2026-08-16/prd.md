@@ -296,6 +296,20 @@ Shots proposed by the language model fall within the range the renderer handles 
 
 **Notes:** Observed during diagnosis — the model proposed a single 20-second Shot for a 20-second request, well outside H3's reliable 4–15 second window, and validation permitted it because the planning limit is 30 seconds.
 
+#### FR-26: Expand the story into fully prompted Shots before rendering
+
+The Director can expand the Treatment and Style Bible into a complete Shot Plan in which every Shot carries a fully written render prompt — with deliberate shot-to-shot variance matched to the Song's structure — before any Batch is submitted. *(FR IDs are global and stable; FR-26 is the next free ID and lives here by feature, not by sequence.)*
+
+**Consequences (testable):**
+- Story expansion is a distinct planning act between Treatment and rendering: it takes the Treatment, Style Bible, and Shot windows as input and produces a render-ready prompt per Shot.
+- A Batch submission that includes a Shot with an empty prompt is refused, naming the Shots that block it.
+- Near-duplicate prompts are surfaced before submission: Shots whose prompts are identical, or differ only trivially, are flagged as lacking variance so the Director can differentiate them deliberately.
+- Expanded prompts embed the Style Bible's continuity constants (identity, wardrobe, palette, lens) while varying the per-Shot action, framing, and energy.
+- Expansion is reviewable and editable per Shot before submission; it never queues renders itself.
+- Song structure available to the application (at minimum: position within the Song; later, section boundaries when BPM/section analysis exists) informs the variance — e.g. shots in a repeated section may rhyme visually but must not be verbatim copies.
+
+**Notes:** This closes a real gap: nothing currently prevents submitting a Batch of empty or copy-pasted prompts, and the cost of discovering that is a full render pass. The variance requirement is the product-level defense against the most common failure of AI music videos — every shot looking like the same shot. `[NOTE FOR PM]` Whether expansion is one Director call over the whole plan or per-Shot calls is an architecture decision; the requirement is only that the result is complete, varied, and reviewed before GPU time is spent.
+
 ### 4.6 Continuity and Cast
 
 **Description:** Identity is held as a data relationship rather than as prompting skill. A character Asset is approved, promoted to a Reference Sheet, and that sheet is what Shots refer to. Realizes UJ-2.
@@ -441,6 +455,7 @@ A Project manifest is never left partially written, and concurrent edits do not 
 - GPU resource coordination — freeing language-model VRAM before rendering, and reporting headroom.
 - Song generation in both variants: invented lyrics and known lyrics.
 - Repair of the Director: validated output, and no silent destruction of creative documents.
+- Story expansion: every Shot fully prompted, with deliberate variance, gated before Batch submission.
 - Reference-driven Shot rendering, proven live.
 - Explicit approval, and Assembly of Approved Outputs into one song-synchronized video.
 - The Finishing chain, accepting approved renders as input.
@@ -470,6 +485,7 @@ A Project manifest is never left partially written, and concurrent edits do not 
 - **SM-6**: Faster than by hand — producing a video in the application beats driving ComfyUI manually for the same song. `[ASSUMPTION: measured once as wall-clock from song to assembled draft, not as a repeatable benchmark.]` Validates FR-4, FR-9.
 - **SM-7**: Review overlaps rendering — the Director can watch and judge completed Shots while later Shots are still being generated, and flag work without interrupting the batch. Validates FR-7, FR-8.
 - **SM-8**: No creative document is ever lost to a Director call. Zero occurrences of an existing Treatment or Style Bible being replaced by degraded model output. Validates FR-15, FR-16.
+- **SM-9**: No blind renders — zero Batches submitted containing an empty or unreviewed prompt; duplicate-prompt flags are resolved before GPU time is spent. Validates FR-26, FR-4.
 
 **Counter-metrics (do not optimize)**
 
