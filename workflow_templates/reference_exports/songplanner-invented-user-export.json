@@ -1,0 +1,257 @@
+{
+  "35": {
+    "inputs": {
+      "filename_prefix": "audio/audio_minimax_music3",
+      "format": "mp3",
+      "format.quality": "V0",
+      "audio": [
+        "54",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "Save Audio (Advanced)"
+    }
+  },
+  "44": {
+    "inputs": {
+      "unet_name": "minimax_music3_dit_fp16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "45": {
+    "inputs": {
+      "caption": [
+        "57",
+        0
+      ],
+      "lyrics": [
+        "55",
+        1
+      ],
+      "seed": [
+        "52",
+        0
+      ],
+      "max_duration": 200,
+      "cfg_scale": 1.5,
+      "top_k": 50,
+      "clip": [
+        "46",
+        0
+      ]
+    },
+    "class_type": "MiniMaxMusic3TextEncode",
+    "_meta": {
+      "title": "MiniMax Music3 Text Encode"
+    }
+  },
+  "46": {
+    "inputs": {
+      "clip_name": "minimax_music3_text_encoder_bf16.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "47": {
+    "inputs": {
+      "vae_name": "minimax_music3_dav.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "48": {
+    "inputs": {
+      "conditioning": [
+        "45",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "Conditioning Zero Out"
+    }
+  },
+  "49": {
+    "inputs": {
+      "seconds": [
+        "45",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyMiniMaxMusic3LatentAudio",
+    "_meta": {
+      "title": "Empty MiniMax Music3 Latent Audio"
+    }
+  },
+  "50": {
+    "inputs": {
+      "seed": [
+        "52",
+        0
+      ],
+      "steps": 30,
+      "cfg": 1.7,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "44",
+        0
+      ],
+      "positive": [
+        "45",
+        0
+      ],
+      "negative": [
+        "48",
+        0
+      ],
+      "latent_image": [
+        "49",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "51": {
+    "inputs": {
+      "samples": [
+        "50",
+        0
+      ],
+      "vae": [
+        "47",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE Decode Audio"
+    }
+  },
+  "52": {
+    "inputs": {
+      "seed": 485518873026442
+    },
+    "class_type": "SeedNode",
+    "_meta": {
+      "title": "Seed"
+    }
+  },
+  "53": {
+    "inputs": {
+      "tile_size": 1536,
+      "overlap": 64,
+      "samples": [
+        "50",
+        0
+      ],
+      "vae": [
+        "47",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudioTiled",
+    "_meta": {
+      "title": "VAE Decode Audio (Tiled)"
+    }
+  },
+  "54": {
+    "inputs": {
+      "switch": false,
+      "on_false": [
+        "51",
+        0
+      ],
+      "on_true": [
+        "53",
+        0
+      ]
+    },
+    "class_type": "ComfySwitchNode",
+    "_meta": {
+      "title": "If/Else Switch"
+    }
+  },
+  "55": {
+    "inputs": {
+      "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+      "idea": "A hard-core modern electronic metal song with complex electric guitar riffs and lyrics sung by a female vocalist, with a supplied lyric set.",
+      "genre_hint": "cinematic metal",
+      "vocal_config": "female vocals",
+      "language": "English",
+      "duration_seconds": 200,
+      "seed": 3914114222,
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "top_k": 64,
+      "max_tokens": 2048,
+      "keep_model_loaded": false
+    },
+    "class_type": "M3SongPlanner",
+    "_meta": {
+      "title": "M3 Song Planner — Idea to Caption + Lyrics"
+    }
+  },
+  "57": {
+    "inputs": {
+      "source": [
+        "55",
+        0
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Review — Generated Music Caption"
+    }
+  },
+  "58": {
+    "inputs": {
+      "source": [
+        "55",
+        1
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Review — Generated Lyrics"
+    }
+  },
+  "59": {
+    "inputs": {
+      "source": [
+        "55",
+        2
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Review — Planner Debug / Warnings"
+    }
+  },
+  "63": {
+    "inputs": {
+      "text": "[intro]\nplaceholder lyric line\n\n[verse]\nplaceholder lyric line\nplaceholder lyric line\n\n[chorus]\nplaceholder lyric line\nplaceholder lyric line\n\n[bridge]\nplaceholder lyric line\n\n[outro]\nplaceholder lyric line"
+    },
+    "class_type": "CR Text",
+    "_meta": {
+      "title": "🔤 CR Text"
+    }
+  }
+}

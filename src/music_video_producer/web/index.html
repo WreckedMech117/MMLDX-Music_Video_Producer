@@ -70,7 +70,7 @@
                 <div class="form-row thirds">
                   <label>Duration <span>s</span><input name="duration" type="number" min="4" max="360" value="120"></label>
                   <label>Seed<input name="seed" type="number" min="0" value="0"></label>
-                  <label>Preset<select name="preset" disabled title="Additional API presets are planned"><option>Balanced</option></select></label>
+                  <label>Preset<select name="preset" title="Generation variant"><option value="balanced">Balanced (direct)</option><option value="songplanner-invented">SongPlanner — invented lyrics</option></select></label>
                 </div>
                 <button class="primary-button full" type="submit">Queue song generation</button>
               </form>

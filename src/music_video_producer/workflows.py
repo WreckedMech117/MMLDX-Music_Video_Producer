@@ -87,6 +87,54 @@ def build_music3_payload(
     }
 
 
+def _build_songplanner_core(
+    *,
+    idea: str,
+    genre_hint: str,
+    duration: float,
+    seed: int,
+    prefix: str,
+    lyrics: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Shared SongPlanner → Music 3 core.
+
+    Adapted from the audited ``songplanner-invented-user-export.json``: UI-only
+    preview nodes (57/58/59), the CR Text scratchpad (63), the SeedNode
+    indirection (52), and the dead tiled-decode branch (53/54) are dropped; the
+    literal seed feeds nodes 45 and 50 directly, and the master is saved as FLAC
+    instead of the export's mp3/V0. ``lyrics=None`` keeps the invented path where
+    Gemma-3 writes both caption and lyrics; a non-empty string (Story 1.2, unused
+    externally for now) replaces the planner's lyrics with a known lyric sheet
+    passed literally to node 45, matching ``build_music3_payload``.
+    """
+    if lyrics is not None and not lyrics.strip():
+        raise ValueError("Known lyrics must not be empty; pass None for invented lyrics")
+    payload: dict[str, dict[str, Any]] = {
+        "55": {"class_type": "M3SongPlanner", "inputs": {"text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors", "idea": idea, "genre_hint": genre_hint, "vocal_config": "female vocals", "language": "English", "duration_seconds": duration, "seed": seed, "temperature": 0.8, "top_p": 0.95, "top_k": 64, "max_tokens": 2048, "keep_model_loaded": False}},
+        "44": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_music3_dit_fp16.safetensors", "weight_dtype": "default"}},
+        "45": {"class_type": "MiniMaxMusic3TextEncode", "inputs": {"clip": ["46", 0], "caption": ["55", 0], "lyrics": ["55", 1], "seed": seed, "max_duration": duration, "cfg_scale": 1.5, "top_k": 50}},
+        "46": {"class_type": "CLIPLoader", "inputs": {"clip_name": "minimax_music3_text_encoder_bf16.safetensors", "type": "minimax", "device": "default"}},
+        "47": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_music3_dav.safetensors"}},
+        "48": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["45", 0]}},
+        "49": {"class_type": "EmptyMiniMaxMusic3LatentAudio", "inputs": {"seconds": ["45", 1], "batch_size": 1}},
+        "50": {"class_type": "KSampler", "inputs": {"model": ["44", 0], "seed": seed, "steps": 30, "cfg": 1.7, "sampler_name": "euler", "scheduler": "simple", "positive": ["45", 0], "negative": ["48", 0], "latent_image": ["49", 0], "denoise": 1.0}},
+        "51": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["50", 0], "vae": ["47", 0]}},
+        "35": {"class_type": "SaveAudioAdvanced", "inputs": {"audio": ["51", 0], "filename_prefix": prefix, "format": "flac"}},
+    }
+    if lyrics is not None:
+        payload["45"]["inputs"]["lyrics"] = lyrics
+    return payload
+
+
+def build_songplanner_invented_payload(
+    *, idea: str, genre_hint: str, duration: float, seed: int, prefix: str
+) -> dict[str, dict[str, Any]]:
+    """SongPlanner invented-lyrics path: Gemma-3 writes caption + lyrics in-graph."""
+    return _build_songplanner_core(
+        idea=idea, genre_hint=genre_hint, duration=duration, seed=seed, prefix=prefix
+    )
+
+
 def build_h3_director_payload(
     *,
     timeline_data: str,

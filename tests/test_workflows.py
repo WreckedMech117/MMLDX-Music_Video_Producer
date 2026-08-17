@@ -1,15 +1,26 @@
+import hashlib
 import json
 from pathlib import Path
 
+import preflight_songplanner
+import pytest
+
 from music_video_producer.workflows import (
     WorkflowCatalog,
+    _build_songplanner_core,
     build_flux_payload,
     build_h3_director_payload,
     build_h3_reference_payload,
     build_multiview_payload,
     build_music3_payload,
+    build_songplanner_invented_payload,
     patch_ltx25_dimension_boundary,
 )
+
+SONGPLANNER_EXPORT = Path(
+    "workflow_templates/reference_exports/songplanner-invented-user-export.json"
+)
+SONGPLANNER_EXPORT_SHA256 = "8c313fda7665ccb79a9aeb02734f3d5c04f7f92821af3d0dbff764bc718ec28a"
 
 
 def test_catalog_reports_present_and_missing_workflows(tmp_path: Path):
@@ -56,6 +67,94 @@ def test_music3_payload_uses_caption_lyrics_and_duration():
     assert encoder["inputs"]["caption"].startswith("dark synth")
     assert encoder["inputs"]["lyrics"].startswith("[Verse]")
     assert latent["inputs"]["seconds"] == 12.0
+
+
+def test_songplanner_invented_payload_lands_controls_on_planner_and_music_nodes():
+    payload = build_songplanner_invented_payload(
+        idea="a slow-burn desert rock anthem with a female vocalist",
+        genre_hint="desert rock",
+        duration=90.0,
+        seed=41,
+        prefix="mvp/songs/night-signal",
+    )
+
+    planner = next(node for node in payload.values() if node["class_type"] == "M3SongPlanner")
+    encoder = next(
+        node for node in payload.values() if node["class_type"] == "MiniMaxMusic3TextEncode"
+    )
+    latent = next(
+        node for node in payload.values() if node["class_type"] == "EmptyMiniMaxMusic3LatentAudio"
+    )
+    sampler = next(node for node in payload.values() if node["class_type"] == "KSampler")
+    save = next(node for node in payload.values() if node["class_type"] == "SaveAudioAdvanced")
+    assert planner["inputs"]["idea"].startswith("a slow-burn desert rock")
+    assert planner["inputs"]["genre_hint"] == "desert rock"
+    assert planner["inputs"]["duration_seconds"] == 90.0
+    assert planner["inputs"]["seed"] == 41
+    assert encoder["inputs"]["caption"] == ["55", 0]
+    assert encoder["inputs"]["lyrics"] == ["55", 1]
+    assert encoder["inputs"]["seed"] == 41
+    assert encoder["inputs"]["max_duration"] == 90.0
+    assert latent["inputs"]["seconds"] == ["45", 1]
+    assert sampler["inputs"]["seed"] == 41
+    assert save["inputs"]["format"] == "flac"
+    assert save["inputs"]["filename_prefix"] == "mvp/songs/night-signal"
+    dropped = {"PreviewAny", "CR Text", "SeedNode", "VAEDecodeAudioTiled", "ComfySwitchNode"}
+    assert not dropped & {node["class_type"] for node in payload.values()}
+
+
+def test_songplanner_core_reserves_known_lyrics_branch_for_story_1_2():
+    payload = _build_songplanner_core(
+        idea="ballad",
+        genre_hint="",
+        duration=60,
+        seed=3,
+        prefix="mvp/songs/known",
+        lyrics="[verse]\nKnown words",
+    )
+
+    encoder = next(
+        node for node in payload.values() if node["class_type"] == "MiniMaxMusic3TextEncode"
+    )
+    assert encoder["inputs"]["lyrics"] == "[verse]\nKnown words"
+    assert encoder["inputs"]["caption"] == ["55", 0]
+
+
+def test_songplanner_core_rejects_blank_known_lyrics():
+    with pytest.raises(ValueError, match="lyrics"):
+        _build_songplanner_core(
+            idea="ballad", genre_hint="", duration=60, seed=3, prefix="mvp/songs/x", lyrics="  \n"
+        )
+
+
+def test_songplanner_variants_validate_separately_against_recorded_object_info():
+    object_info = json.loads(
+        Path("tests/fixtures/object_info.json").read_text(encoding="utf-8")
+    )
+
+    for label, payload in preflight_songplanner.audit_payloads():
+        assert preflight_songplanner.validate(label, payload, object_info) == []
+
+
+def test_songplanner_model_files_are_present_in_recorded_combos():
+    object_info = json.loads(
+        Path("tests/fixtures/object_info.json").read_text(encoding="utf-8")
+    )
+    expectations = (
+        ("M3SongPlanner", "text_encoder", "gemma_3_12B_it_fp4_mixed.safetensors"),
+        ("UNETLoader", "unet_name", "minimax_music3_dit_fp16.safetensors"),
+        ("CLIPLoader", "clip_name", "minimax_music3_text_encoder_bf16.safetensors"),
+        ("VAELoader", "vae_name", "minimax_music3_dav.safetensors"),
+    )
+    for class_type, input_name, filename in expectations:
+        spec = object_info[class_type]["input"]["required"][input_name]
+        options = preflight_songplanner.combo_options(spec)
+        assert filename in options, f"{class_type}.{input_name}: {filename}"
+
+
+def test_songplanner_source_export_is_not_mutated():
+    digest = hashlib.sha256(SONGPLANNER_EXPORT.read_bytes()).hexdigest()
+    assert digest == SONGPLANNER_EXPORT_SHA256
 
 
 def test_multiview_payload_uses_uploaded_character_and_quadview_lora():

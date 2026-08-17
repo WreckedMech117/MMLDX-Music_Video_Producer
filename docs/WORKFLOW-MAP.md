@@ -48,6 +48,25 @@ The editor-only rgthree group bypasser, label, notes, primitive controls, and op
 
 The standalone form accepts prepared caption/lyrics directly. Conversational SongPlanner expansion is represented in the saved workflow and remains a later API adapter; it is not falsely claimed as active in the current direct payload.
 
+## SongPlanner — invented lyrics (MiniMax Music 3)
+
+**Immutable source:** `workflow_templates/reference_exports/songplanner-invented-user-export.json` (audited copy of the creator's "SongPlanner + MiniMax Music 3 - Quality BF16" API export; SHA-256 in the reference-exports `MANIFEST.md`).
+
+**Purpose:** generate a complete song from just an idea — Gemma-3 writes the caption and lyrics inside ComfyUI (`M3SongPlanner`), and Music 3 renders them in the same graph.
+
+**Adapter path:** `build_songplanner_invented_payload()` over the shared `_build_songplanner_core()` (the core reserves a known-lyrics branch for the Story 1.2 variant; it is not exposed externally yet).
+
+**Models:**
+
+- `gemma_3_12B_it_fp4_mixed` (SongPlanner text encoder)
+- `minimax_music3_text_encoder_bf16`
+- `minimax_music3_dit_fp16`
+- `minimax_music3_dav`
+
+**Controls:** title, idea, duration (4–200 s), seed, output prefix. A genre hint is accepted by the API (`genre_hint`, max 160 chars) but is currently API-only — the Song workspace form never sends it. Planner defaults follow the audited export (female vocals, English, temperature 0.8, top-p 0.95, top-k 64); Music 3 sampling uses the export's 30 Euler/simple steps at CFG 1.7 with encode CFG 1.5.
+
+The explicit 10-node adapter drops the export's UI-only preview nodes, the CR Text scratchpad, the SeedNode indirection, and the dead tiled-decode branch; the literal seed feeds the encoder and sampler directly, and the model-resolved duration (`MiniMaxMusic3TextEncode` output 1) still drives the latent length. The master is saved as FLAC (matching the live-verified direct adapter) instead of the export's mp3/V0. `tests/preflight_songplanner.py` audits classes and model combos against live `/object_info` and records `tests/fixtures/object_info.json` for offline validation. Combo note: 0.33.1 V3 nodes publish options at `input[1]["options"]`, while classic loaders still inline them at `input[0]` — the audit reads both.
+
 ## Krea 2 multiview character sheet
 
 **Saved source:** `Video/Music Video Advanced/02 - Krea 2 Character Sheet.json`
@@ -111,6 +130,7 @@ SeedVR2 completed a real 192-frame upscale at 1250×720. The following LTX VAE e
 |---|---:|---:|---:|---:|---:|
 | Flux Image Gen | yes | yes | yes | models present | yes |
 | Music 3 direct | yes | yes | yes | generated FLAC previously | yes |
+| SongPlanner invented lyrics | n/a | explicit 10-node adapter | yes | classes/models validated against live `/object_info` 2026-08-16; no live generation yet | yes |
 | Krea multiview | yes | yes | yes | one-step sheet previously | yes |
 | Director compile | yes | start/length timing | yes | live compiler accepts timing scaffold | timeline only |
 | H3 text-only shot render | yes | explicit 15-node adapter | yes | **live render verified end to end 2026-08-16** | yes |

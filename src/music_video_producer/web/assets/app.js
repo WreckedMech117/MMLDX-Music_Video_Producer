@@ -1,4 +1,4 @@
-import { api, comfyOutputUrl } from "./api.js";
+import { api, comfyOutputUrl, musicGenerationPlan } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -513,11 +513,32 @@ function bindEvents() {
     try { state.project = await api.uploadSong(state.project.id, form); renderAll(); toast("Song imported"); }
     catch (error) { toast(error.message, "error"); }
   });
-  $("#music-form").addEventListener("submit", async (event) => {
+  const musicForm = $("#music-form");
+  const syncMusicVariant = () => {
+    const invented = musicForm.elements.preset.value === "songplanner-invented";
+    const lyricsField = musicForm.elements.lyrics;
+    lyricsField.closest("label").style.display = invented ? "none" : "";
+    lyricsField.disabled = invented;
+    musicForm.elements.duration.max = invented ? 200 : 360;
+    if (invented && Number(musicForm.elements.duration.value) > 200) musicForm.elements.duration.value = 200;
+  };
+  syncMusicVariant();
+  musicForm.elements.preset.addEventListener("change", syncMusicVariant);
+  musicForm.addEventListener("submit", async (event) => {
     event.preventDefault(); if (!requireProject()) return;
     const data = Object.fromEntries(new FormData(event.currentTarget));
-    const body = { title: data.title, caption: data.caption, lyrics: data.lyrics, duration: Number(data.duration), seed: Number(data.seed) };
-    try { await api.generateMusic(state.project.id, body); await loadProject(state.project.id); toast("Music 3 job queued"); }
+    const plan = musicGenerationPlan(data);
+    try {
+      if (plan.endpoint === "songplanner") {
+        if (!window.confirm("Queue SongPlanner generation? It loads the 12B Gemma-3 planner plus the Music 3 stack and can use significant GPU time.")) return;
+        await api.generateSongPlanner(state.project.id, plan.body);
+        toast("SongPlanner job queued");
+      } else {
+        await api.generateMusic(state.project.id, plan.body);
+        toast("Music 3 job queued");
+      }
+      await loadProject(state.project.id);
+    }
     catch (error) { toast(error.message, "error"); }
   });
   $("#flux-form").addEventListener("submit", async (event) => {

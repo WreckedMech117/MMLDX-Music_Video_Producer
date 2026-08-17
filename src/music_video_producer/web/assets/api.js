@@ -7,6 +7,22 @@ export function comfyOutputUrl(baseUrl, outputPath) {
   return `${baseUrl.replace(/\/$/, "")}/view?${params}`;
 }
 
+// Pure preset → (endpoint, body) mapping for the Song workspace form. The invented
+// SongPlanner variant reuses the creative-direction (caption) field as the idea and
+// never sends lyrics; every other preset takes the direct Music 3 path.
+export function musicGenerationPlan(data) {
+  if (data.preset === "songplanner-invented") {
+    return {
+      endpoint: "songplanner",
+      body: { title: data.title, idea: data.caption, duration: Number(data.duration), seed: Number(data.seed) },
+    };
+  }
+  return {
+    endpoint: "music",
+    body: { title: data.title, caption: data.caption, lyrics: data.lyrics, duration: Number(data.duration), seed: Number(data.seed) },
+  };
+}
+
 export async function request(path, options = {}) {
   const response = await fetch(path, options);
   let payload = null;
@@ -30,6 +46,7 @@ export const api = {
   uploadSong: (id, data) => request(`/api/projects/${id}/songs/upload`, { method: "POST", body: data }),
   uploadAsset: (id, data) => request(`/api/projects/${id}/assets/upload`, { method: "POST", body: data }),
   generateMusic: (id, body) => request(`/api/projects/${id}/generate/music`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  generateSongPlanner: (id, body) => request(`/api/projects/${id}/generate/songplanner`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateFlux: (id, body) => request(`/api/projects/${id}/generate/flux`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateMultiview: (projectId, assetId, body) => request(`/api/projects/${projectId}/assets/${assetId}/multiview`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   analyzeAsset: (projectId, assetId) => request(`/api/projects/${projectId}/assets/${assetId}/analyze`, { method: "POST" }),

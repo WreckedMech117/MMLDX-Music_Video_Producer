@@ -11,5 +11,6 @@ They are **reference evidence**, not graphs submitted directly by Music Video Pr
 | `h3-ltx23-user-export.json` | `d4027e76b2d1d3a7bd070505f2f493e275bcd519f9f6a5d0c692004e70890eca` | 56 nodes; all server node classes registered; combined creator path retained for reference only |
 | `h3-ltx25-user-export.json` | `fe009123bf7e8c85841a8263cae7f85551ba44423b57423b309b8f6aa93909b4` | 65 nodes; all server node classes registered; contains hard-coded media and the diagnosed SeedVR2→LTX dimension boundary |
 | `h3-ultra-references-user-export.json` | `bbcd1bcd1df6f7d826ccf439ce01b8817a517c171a2a72b0e83c1144e196ff46` | 29 nodes; all classes registered; media loader supports 9 pictures, 3 videos with paired audio, and 3 standalone audios; adapted as an explicit 18-node Ultra reference stage |
+| `songplanner-invented-user-export.json` | `8c313fda7665ccb79a9aeb02734f3d5c04f7f92821af3d0dbff764bc718ec28a` | 17 nodes; complete API format; adapted as an explicit 10-node invented-lyrics stage dropping the PreviewAny/CR Text UI nodes, the SeedNode indirection, and the dead tiled-decode branch; the adapter saves FLAC (lossless master, matching the live-verified direct adapter) where the export saved mp3/V0 |
 
 Imported: 2026-08-16.

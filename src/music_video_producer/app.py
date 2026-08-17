@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from .comfy import ComfyClient, ComfyError
 from .config import Settings
@@ -42,6 +42,7 @@ from .workflows import (
     build_h3_reference_payload,
     build_multiview_payload,
     build_music3_payload,
+    build_songplanner_invented_payload,
 )
 
 
@@ -55,6 +56,14 @@ class MusicRequest(BaseModel):
     lyrics: str = ""
     duration: float = Field(default=120, ge=4, le=360)
     seed: int = Field(default=0, ge=0)
+
+
+class SongPlannerRequest(BaseModel):
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)]
+    idea: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
+    genre_hint: str = Field(default="", max_length=160)
+    duration: float = Field(default=120, ge=4, le=200)
+    seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
 
 
 class FluxRequest(BaseModel):
@@ -390,6 +399,42 @@ def create_app(
             duration=request.duration,
             lyrics=request.lyrics,
             caption=request.caption,
+            prompt_id=submission.prompt_id,
+        )
+        job = RenderJob(
+            kind="music",
+            prompt_id=submission.prompt_id,
+            target_id="song",
+            seed=request.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
+        return job
+
+    @app.post(
+        "/api/projects/{project_id}/generate/songplanner",
+        response_model=RenderJob,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def generate_songplanner(project_id: str, request: SongPlannerRequest) -> RenderJob:
+        project = get_project(project_id)
+        prefix = f"music-video-producer/{project_id}/songs/{_safe_filename(request.title)}"
+        payload = build_songplanner_invented_payload(
+            idea=request.idea,
+            genre_hint=request.genre_hint,
+            duration=request.duration,
+            seed=request.seed,
+            prefix=prefix,
+        )
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        project.song = Song(
+            title=request.title,
+            source="generated",
+            duration=request.duration,
+            caption=request.idea,
             prompt_id=submission.prompt_id,
         )
         job = RenderJob(

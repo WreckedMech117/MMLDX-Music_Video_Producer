@@ -16,11 +16,14 @@ class FakeComfy:
         self.prompts = []
         self.uploads = []
         self.history_error = False
+        self.submit_error = False
 
     async def health(self):
         return {"online": True, "url": "http://fake"}
 
     async def submit(self, prompt, client_id=None):
+        if self.submit_error:
+            raise ComfyError("ComfyUI is unreachable")
         self.prompts.append(prompt)
         return type("Submission", (), {"prompt_id": "p-101", "number": 1})()
 
@@ -203,6 +206,110 @@ def test_music_and_flux_generation_submit_real_payload_shapes(tmp_path: Path):
     assert saved.song.source == "generated"
     assert {job.kind for job in saved.jobs} == {"music", "flux"}
     assert saved.assets[0].kind == "character"
+
+
+def test_songplanner_generation_submits_planner_payload_and_records_job(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Planner"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={
+            "title": "Night Signal",
+            "idea": "sunset synthwave with airy female vocals",
+            "genre_hint": "synthwave",
+            "duration": 90,
+            "seed": 21,
+        },
+    )
+
+    assert response.status_code == 202
+    payload = comfy.prompts[-1]
+    planner = next(node for node in payload.values() if node["class_type"] == "M3SongPlanner")
+    assert planner["inputs"]["idea"].startswith("sunset synthwave")
+    assert planner["inputs"]["genre_hint"] == "synthwave"
+    saved = store.get(project.id)
+    job = saved.jobs[-1]
+    assert job.kind == "music"
+    assert job.prompt_id == "p-101"
+    assert job.seed == 21
+    assert job.target_id == "song"
+    assert saved.song.source == "generated"
+    assert saved.song.prompt_id == "p-101"
+    assert saved.song.title == "Night Signal"
+
+
+def test_songplanner_rejects_out_of_bounds_requests(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Validation"))
+    invalid_bodies = (
+        {"title": "T", "idea": "   "},  # blank/whitespace idea
+        {"title": "   ", "idea": "an idea"},  # whitespace title
+        {"title": "T", "idea": "an idea", "duration": 300},  # duration above 200
+        {"title": "T", "idea": "x" * 4001},  # idea above max_length
+        {"title": "T", "idea": "an idea", "genre_hint": "g" * 161},  # genre above max_length
+        {"title": "T", "idea": "an idea", "seed": 2**64},  # seed above 64-bit range
+    )
+
+    for body in invalid_bodies:
+        response = client.post(f"/api/projects/{project.id}/generate/songplanner", json=body)
+        assert response.status_code == 422, body
+    assert store.get(project.id).jobs == []
+    assert store.get(project.id).song is None
+
+
+def test_songplanner_comfy_outage_leaves_project_unchanged(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Down"))
+    comfy.submit_error = True
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "Night Signal", "idea": "an idea"},
+    )
+
+    assert response.status_code == 502
+    assert "unreachable" in response.json()["detail"]
+    saved = store.get(project.id)
+    assert saved.jobs == []
+    assert saved.song is None
+
+
+def test_completed_songplanner_job_reconciles_song_path(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Reconcile"))
+    job = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "Night Signal", "idea": "an idea", "duration": 30, "seed": 5},
+    ).json()
+
+    async def completed_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "complete",
+                "outputs": [
+                    {
+                        "subfolder": f"music-video-producer\\{project.id}\\songs",
+                        "filename": "Night Signal_00001_.flac",
+                    }
+                ],
+                "error": "",
+            },
+        )()
+
+    comfy.history = completed_history
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "complete"
+    saved = store.get(project.id)
+    assert saved.song.path == (
+        f"music-video-producer/{project.id}/songs/Night Signal_00001_.flac"
+    )
+    assert "\\" not in saved.song.path
 
 
 def test_job_refresh_translates_comfy_outage_to_502(tmp_path: Path):
