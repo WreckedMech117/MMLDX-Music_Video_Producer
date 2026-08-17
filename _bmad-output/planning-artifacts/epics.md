@@ -7,6 +7,8 @@ inputDocuments:
   - docs/ROADMAP.md
   - docs/ARCHITECTURE.md
   - docs/WORKFLOW-MAP.md
+  - _bmad-output/planning-artifacts/ux-designs/ux-mvp-2026-08-16/DESIGN.md
+  - _bmad-output/planning-artifacts/ux-designs/ux-mvp-2026-08-16/EXPERIENCE.md
 ---
 
 # MusicVideoProducer - Epic Breakdown
@@ -63,16 +65,16 @@ NFR-2: Project state survives crashes and concurrent writes *(implemented — at
 
 ### UX Design Requirements
 
-No UX design contract exists. UX-shaped requirements are carried by FR consequences (Wizard composition FR-1..3, live timeline FR-7, flagging FR-8, confirmation surfaces FR-4/FR-11). A `bmad-ux` pass is recommended before Epic 6 implementation.
+A UX design contract exists at `_bmad-output/planning-artifacts/ux-designs/ux-mvp-2026-08-16/` (`DESIGN.md` + `EXPERIENCE.md`), settled with the Director on 2026-08-16. The four load-bearing decisions — the rail doubles as the wizard with a guidance banner, clip state via border + corner chips in the existing palette, on-clip hover actions with F/A keys for flag/approve, and a pre-flight modal for batch confirmation — are folded into the story ACs of Epics 2, 4, 5, and 6.
 
 ### FR Coverage Map
 
 FR-12: Epic 1 — verified as-is, no new story
 FR-13: Epic 1 — SongPlanner invented-lyrics adapter
 FR-14: Epic 1 — Known_Lyrics adapter
-FR-15: Epic 2 — done; regression story only
+FR-15: Epic 2 — done; backend regression ACs in Story 2.4
 FR-16: Epic 2 — reviewable replacement + session recovery
-FR-17: Epic 2 — done; folded into Epic 2 regression story
+FR-17: Epic 2 — done; backend regression ACs in Story 2.4
 FR-26: Epic 2 — story expansion + submission gate
 FR-18: Epic 3 — existing; exercised by live verification story
 FR-19: Epic 3 — existing; exercised by live verification story
@@ -141,7 +143,7 @@ So that a production can start from nothing but an idea.
 **Given** the SongPlanner invented-lyrics workflow (`SongPlanner + MiniMax Music 3 - Quality BF16.json`) audited as a checksummed reference export
 **When** the Director submits a caption, maximum duration, and seed from the Song workspace
 **Then** an explicit API-format payload (never the saved editor JSON) is submitted to ComfyUI
-**And** every node class and model file in the payload is validated against live `/object_info` in unit tests
+**And** unit tests validate the payload against a recorded `/object_info` fixture, with a live pre-flight audit (Story 3.1 pattern) checking classes and models against the running server before first submission
 **And** the resulting RenderJob records prompt ID, seed, and kind `music` (FR-13, FR-24).
 
 **Given** the generation completes
@@ -158,7 +160,7 @@ So that covers and already-written songs get the same treatment as invented ones
 
 **Given** the Known_Lyrics workflow variant audited as a checksummed reference export
 **When** the Director supplies lyrics with the caption
-**Then** the lyrics are passed to the known-lyrics adapter verbatim and are not rewritten by the model (FR-14)
+**Then** the supplied lyrics appear verbatim in the submitted payload's lyric input, asserted by unit test (FR-14)
 **And** the variant is selectable independently of the invented-lyrics path
 **And** the two adapters share all structure except lyric handling, verified by a unit test comparing their payloads.
 
@@ -177,6 +179,10 @@ So that song generation is verified capability, not unit-tested claim.
 **Given** an imported WAV whose duration the browser could not decode
 **When** the application restarts
 **Then** the duration is still available via the `ffprobe` fallback (FR-12 regression guard).
+
+**Given** a project with existing Shots
+**When** the Director replaces or removes the Song
+**Then** the action requires explicit confirmation naming that Shot windows and Assembly synchronization depend on it, and no Shot data is deleted.
 
 ## Epic 2: A Render-Ready Shot Plan
 
@@ -211,8 +217,8 @@ So that the video's text is fully planned — with deliberate shot-to-shot varia
 **Given** a project with a Treatment, Style Bible, and timed Shot windows
 **When** the Director invokes story expansion
 **Then** every Shot receives a fully written prompt embedding the Style Bible's continuity constants (identity, wardrobe, palette, lens) while varying per-Shot action, framing, and energy (FR-26)
-**And** each Shot's position within the Song informs its prompt's energy and content
-**And** the expansion is presented for per-Shot review and editing, and never queues a render
+**And** the expansion input verifiably includes each Shot's position within the Song — and section boundaries when analysis exists — so structure can inform variance deterministically
+**And** expanded prompts land as editable Shot prompts reviewed through the existing shot inspector, and the expansion never queues a render
 **And** expanded prompts pass through the existing degradation and window checks (FR-15, FR-17).
 
 ### Story 2.3: Shot Plan Readiness Gate
@@ -228,7 +234,7 @@ So that a Batch can never contain empty or copy-paste prompts.
 **Then** the plan is reported not ready, naming the blocking Shots (FR-26)
 **And** any Shot submission path refuses an empty-prompt Shot.
 
-**Given** two Shots whose prompts are identical or differ only trivially
+**Given** two Shots whose prompts are identical after lowercasing and whitespace collapse, or whose token overlap exceeds 90%
 **When** readiness is evaluated
 **Then** both are flagged as lacking variance, and the Director can differentiate or accept them deliberately — the flag warns, only emptiness blocks (FR-26).
 
@@ -244,6 +250,10 @@ So that a protective refusal never reads like a normal chat reply.
 **When** the reply renders in the Treatment workspace
 **Then** the notice block is visually distinct from the assistant prose, and the raw rejected output is inspectable (FR-15, FR-17 surfacing)
 **And** regression tests cover notice rendering in the frontend contract suite.
+
+**Given** the shipped guard logic
+**When** the backend regression suite runs
+**Then** tests assert JSON-as-prose rejection, the <40% collapse floor, the empty-target skip, the prose-claims-shots mismatch notice, and the 4–15 s window flag (FR-15, FR-17 regression).
 
 ## Epic 3: Continuity Proven, Not Promised
 
@@ -261,7 +271,10 @@ So that a reference render cannot fail for a reason a free check would have caug
 **When** the pre-flight audit runs
 **Then** all H3 Ultra node classes and model files are confirmed present via `/object_info`, reading combo options from the `[1]["options"]` shape
 **And** each attached reference resolves to a real file within project media or contained ComfyUI output (FR-19)
-**And** the deterministic `<Picture N>`/`<Video N>`/`<Audio N>` numbering is asserted for a fixed attachment order (FR-19).
+**And** the deterministic `<Picture N>`/`<Video N>`/`<Audio N>` numbering is asserted for a fixed attachment order (FR-19)
+**And** exceeding the 9-picture/3-video/3-audio limits produces a clear 422 message, asserted in tests (FR-19)
+**And** unit assertions cover the routing rule — a Shot with attached Assets builds the reference payload, one with none builds the text-only payload (FR-20)
+**And** promotion assertions cover that a Reference Sheet records its parent Asset and leaves the source Asset unmodified (FR-18).
 
 ### Story 3.2: First Live Reference-Driven Render
 
@@ -275,7 +288,7 @@ So that character consistency becomes demonstrated capability.
 **When** the Shot is submitted through the reference path (FR-20)
 **Then** ComfyUI accepts the 18-node graph, and the completed output is verified with `ffprobe` for frames, duration, and synchronized audio
 **And** `latest_output` is written while `approved_output` stays empty
-**And** any defect surfaced is fixed in-session or filed with the exact ComfyUI error, and `docs/ROADMAP.md` records the outcome either way.
+**And** `docs/ROADMAP.md` records either the verified render or the exact ComfyUI error alongside its shipped fix or filed defect — readiness is never silently overstated.
 
 ## Epic 4: One-Pass Video, Watched Live
 
@@ -293,7 +306,11 @@ So that a 31 GB model stack never collides with a resident language model I forg
 **When** a render confirmation is shown
 **Then** the loaded model is named, with a statement that it holds VRAM outside ComfyUI's control (FR-11)
 **And** free VRAM from ComfyUI `/system_stats` is displayed as context, never as a gate
-**And** an unload action requests LM Studio unload its models, then re-reads and reports observed free VRAM rather than assuming success (FR-10).
+**And** confirming the Batch automatically requests LM Studio unload its models before submission — with a visible skip control — then re-reads and reports observed free VRAM rather than assuming success (FR-10).
+
+**Given** no model is loaded on the configured endpoint
+**When** the confirmation is shown
+**Then** no warning is displayed (FR-11).
 
 **Given** no language-model endpoint is configured, or the unload fails
 **When** the confirmation is shown
@@ -310,7 +327,7 @@ So that rendering a whole video is one act of intent, not forty.
 **Given** a Shot Plan that passes the readiness gate (Story 2.3)
 **When** the Director confirms once, seeing the Shot count
 **Then** each ready Shot is submitted as its own RenderJob with its own prompt ID (FR-4)
-**And** Shots are submitted in same-kind sequence with no other workflow kind interleaved, and no free/unload/interrupt call is issued mid-Batch (FR-9)
+**And** Shots are grouped by payload kind — text-only H3 Shots contiguous, H3 Ultra reference Shots contiguous — with no other workflow kind interleaved, and no free/unload/interrupt call issued mid-Batch (FR-9; the two H3 payloads load different UNET sets, so mixing them mid-run costs ~150 s per eviction)
 **And** a Shot failing validation is skipped and reported by ID without blocking the rest (FR-4).
 
 ### Story 4.3: Truthful Render State in the Interface
@@ -326,6 +343,10 @@ So that a twelve-minute render never looks like a stuck queue.
 **Then** that Shot displays as running, distinct from queued (FR-6; backend shipped 2026-08-16)
 **And** a failed Shot displays the exact ComfyUI execution error on the Shot itself
 **And** refresh happens automatically during an active Batch without a manual button press.
+
+**Given** the application restarts while a Batch is partially drained
+**When** jobs refresh after restart
+**Then** in-flight prompts are re-located via `/queue`, completed Shots reconcile from history, flags persist, and no job is invented or lost (FR-24, NFR-2).
 
 ### Story 4.4: Live Timeline Population
 
@@ -359,6 +380,10 @@ So that fixing three Shots never costs me the other thirty.
 **When** the Director resubmits the flagged set
 **Then** only those Shots re-render, each replacing its own `latest_output` and leaving every other Shot and every `approved_output` untouched (FR-5).
 
+**Given** flagged Shots exist while the Batch is still active
+**When** the Director attempts resubmission
+**Then** the action is refused with a plain message until the Batch drains, preserving same-kind ordering (FR-9).
+
 ### Story 4.6: Responsive Under a Full Batch
 
 As the Director,
@@ -369,7 +394,7 @@ So that reviewing and flagging during a Batch is real, not theoretical.
 
 **Given** a simulated 40-Shot Batch against a mocked ComfyUI
 **When** reconciliation runs
-**Then** no request blocks the event loop, all outbound calls carry bounded timeouts, and a hanging ComfyUI request never hangs the application (NFR-1)
+**Then** a probe asserts `/api/health` answers within 500 ms while a mocked ComfyUI request is held open, all outbound calls carry bounded timeouts, and a hanging request never hangs the application (NFR-1)
 **And** browser QA demonstrates navigation, playback, and Shot editing remain interactive during the simulated Batch.
 
 ## Epic 5: A Finished, Durable Video
@@ -404,7 +429,15 @@ So that the production ends as a single watchable file.
 **And** the assembled file's duration matches the Song within one frame
 **And** the output is verified with `ffprobe` after writing; failure is reported, never presented as success
 **And** no Shot's Approved Output is modified (FR-22)
-**And** the assembly is recorded as a RenderJob with full provenance (FR-24).
+**And** the assembly is recorded as a RenderJob of kind `post` carrying its inputs (Shot IDs and take paths), output path, status, exact error, and timestamps — prompt ID and seed are empty by design for local ffmpeg work (FR-24, adapted).
+
+**Given** a Shot whose window changed after its take was approved
+**When** Assembly is requested
+**Then** the stale take is reported by Shot ID and Assembly refuses until it is re-approved (FR-22).
+
+**Given** a Shot Plan whose windows leave gaps or overlaps against the Song
+**When** Assembly is requested
+**Then** the uncovered or conflicting ranges are reported instead of producing a silently mistimed file (FR-22).
 
 ### Story 5.3: Honest Recovery and Missing Media
 
@@ -420,7 +453,7 @@ So that a six-month-old project tells me the truth about its own state.
 
 **Given** the existing atomic-write and serialized-save behavior (NFR-2)
 **When** the regression suite runs
-**Then** tests assert temp-file-plus-replace writes, stale-revision rejection, malformed-manifest skip, and provenance survival across restart (FR-24, FR-25, NFR-2).
+**Then** tests assert temp-file-plus-replace writes, stale-revision rejection, malformed-manifest skip, and that a RenderJob's full provenance set — kind, prompt ID, seed, target, output paths, status, exact error, timestamps — survives restart as a set (FR-24, FR-25, NFR-2).
 
 ## Epic 6: The Production Wizard
 
@@ -451,20 +484,21 @@ So that the wizard teaches the editor instead of hiding it.
 **Given** the wizard at any step
 **When** the step renders
 **Then** it presents the same component the full editor uses for that workspace (FR-2)
-**And** an action taken inside the wizard produces byte-identical project state to the same action in the editor
+**And** an action taken inside the wizard produces semantically equal project state to the same action in the editor, excluding volatile fields such as timestamps
 **And** a skip control at every step moves to the full editor without altering project state (FR-3).
 
 ### Story 6.3: First-Run Journey Verified in a Browser
 
 As the Director,
 I want the song-to-first-Shot path verified end to end in headless Edge,
-So that SM-3 — first Shot without leaving the wizard — is measured, not assumed.
+So that the wizard path is verified end to end up to submission, with the post-render exit exercised against a mocked completion — SM-3's full claim is then measured by the first live wizard-driven render.
 
 **Acceptance Criteria:**
 
 **Given** an empty isolated data root on port 8766
 **When** the first-run browser QA drives the wizard from project creation through Song, Treatment, Cast, and Shots to the render confirmation (submission mocked)
 **Then** every step is reached without leaving the wizard and with zero severe console errors
+**And** with submission mocked to complete, the wizard resolves past the Render step and never reappears for that project (FR-3)
 **And** the ComfyUI-offline edge case shows a plain unavailable state at the step that needs it, not fake progress.
 
 ## Epic 7: Finishing (Drop-Conditioned)
