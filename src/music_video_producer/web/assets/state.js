@@ -8,6 +8,9 @@ export const state = {
   assetFilter: "all",
   waveform: null,
   audioBuffer: null,
+  // The candidate import's own measurement, tied to the File it came from. Kept apart
+  // from audioBuffer, which loadPersistedWaveform also writes for the stored song.
+  pendingImport: null,
   pixelsPerSecond: 16,
   playhead: 0,
   dirty: false,

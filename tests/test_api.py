@@ -1,3 +1,4 @@
+import subprocess
 import wave
 from io import BytesIO
 from pathlib import Path
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 from music_video_producer.app import create_app
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.models import Asset, Project, Shot
+from music_video_producer.models import Asset, Project, Shot, Song
 from music_video_producer.store import ProjectStore
 
 
@@ -102,24 +103,96 @@ def test_project_lifecycle_and_song_upload(tmp_path: Path):
     assert client.get("/api/projects").json()[0]["name"] == "Signal Bloom"
 
 
-def test_song_upload_probes_duration_when_browser_does_not_supply_it(tmp_path: Path):
-    client, store, _ = make_client(tmp_path)
-    project = store.create(Project(name="Duration probe"))
+def wav_bytes(seconds: float, rate: int = 8000) -> bytes:
+    """A silent mono WAV of a known length — the smallest thing ffprobe can measure."""
     content = BytesIO()
     with wave.open(content, "wb") as target:
         target.setnchannels(1)
         target.setsampwidth(2)
-        target.setframerate(8000)
-        target.writeframes(b"\0\0" * 8000)
+        target.setframerate(rate)
+        target.writeframes(b"\0\0" * int(rate * seconds))
+    return content.getvalue()
+
+
+def test_song_upload_probes_duration_when_browser_does_not_supply_it(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Duration probe"))
 
     response = client.post(
         f"/api/projects/{project.id}/songs/upload",
         data={"title": "One second", "duration": "0"},
-        files={"file": ("one-second.wav", content.getvalue(), "audio/wav")},
+        files={"file": ("one-second.wav", wav_bytes(1.0), "audio/wav")},
     )
 
     assert response.status_code == 200
     assert 0.99 <= response.json()["song"]["duration"] <= 1.01
+
+
+def test_probed_song_duration_survives_a_restart_and_replaces_the_previous_song(
+    tmp_path: Path,
+):
+    """FR-12's actual claim: after a restart the probed duration is still there.
+
+    The route test above only reads the response body, which is the in-memory object
+    the handler just built. Re-reading through a *fresh* ProjectStore over the same
+    data root is the only thing that proves the value reached the manifest — and the
+    pre-existing 187.5 s song proves the new duration is the freshly probed one
+    rather than the length the frontend used to carry over from the previous song.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = Project(name="Restart survival")
+    project.song = Song(
+        title="Previous song",
+        source="imported",
+        path="media/songs/previous.wav",
+        duration=187.5,
+    )
+    store.create(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Undecodable but probeable", "duration": "0"},
+        files={"file": ("two-seconds.wav", wav_bytes(2.0), "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    probed = response.json()["song"]["duration"]
+    assert 1.99 <= probed <= 2.01
+
+    restarted = ProjectStore(tmp_path).get(project.id)
+    assert restarted.song is not None
+    assert restarted.song.duration == probed
+    assert restarted.song.duration != 187.5
+    assert restarted.song.title == "Undecodable but probeable"
+
+
+def test_song_upload_stores_zero_when_ffprobe_cannot_run(tmp_path: Path, monkeypatch):
+    """A missing ffprobe must cost the duration, not the import — and never invent one.
+
+    `_media_duration` swallows the failure and returns 0.0 by contract; what matters
+    here is that 0 is what gets persisted, because a fabricated number would silently
+    become the timing spine of the whole production.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="No ffprobe"))
+    real_run = subprocess.run
+
+    def missing_ffprobe(command, *args, **kwargs):
+        if command and command[0] == "ffprobe":
+            raise FileNotFoundError(2, "No such file or directory", "ffprobe")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr("music_video_producer.app.subprocess.run", missing_ffprobe)
+
+    response = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Unmeasurable", "duration": "0"},
+        files={"file": ("silent.wav", wav_bytes(1.0), "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["song"]["duration"] == 0
+    assert ProjectStore(tmp_path).get(project.id).song.duration == 0
 
 
 def test_uploads_enforce_size_and_asset_type_limits(tmp_path: Path):
@@ -962,6 +1035,439 @@ def test_windows_output_subfolders_are_normalised(tmp_path: Path):
     comfy.history = windows_history
     refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}").json()
     assert refreshed["output_files"] == ["music-video-producer/proj/shots/take.mp4"]
+
+
+def shots_snapshot(project: Project) -> list[dict]:
+    """Every persisted field of every shot, for exact before/after comparison."""
+    return [shot.model_dump(mode="json") for shot in project.shots]
+
+
+def project_with_song_and_shots(client: TestClient, store: ProjectStore, name: str) -> Project:
+    """A project whose Song is a real file on disk, with shots carrying every field.
+
+    The song is imported through the route so the audio genuinely exists under
+    `media/songs/`, which is what lets the removal tests assert the file survives. The
+    import itself needs no confirmation because the project has no shots yet — the shots
+    are added afterwards, which is exactly the state the guard exists for.
+    """
+    project = store.create(Project(name=name))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Original spine", "duration": "180"},
+        files={"file": ("original.wav", wav_bytes(0.25), "audio/wav")},
+    )
+    project = store.get(project.id)
+    project.shots = [
+        Shot(
+            start=0,
+            duration=5,
+            prompt="Opening on the corridor",
+            mode="text",
+            seed=11,
+            status="approved",
+            prompt_id="render-1",
+            latest_output="takes/one.mp4",
+            approved_output="takes/one.mp4",
+            locked=True,
+        ),
+        Shot(
+            start=12.5,
+            duration=7.25,
+            prompt="Chorus release",
+            asset_ids=["asset_lead"],
+            reference_labels={"asset_lead": "lead vocalist"},
+            use_song_audio=True,
+            seed=44,
+            status="ready",
+        ),
+    ]
+    store.save(project)
+    return store.get(project.id)
+
+
+def test_song_replacement_without_confirmation_is_refused_and_changes_nothing(tmp_path: Path):
+    """All three replacement paths refuse, and the refusal costs nothing — no GPU, no bytes.
+
+    The uploaded filename deliberately collides with the existing song's, because songs
+    are written under their own name with no index prefix: a guard placed after the copy
+    would have overwritten the audio it was refusing to replace.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = project_with_song_and_shots(client, store, "Unconfirmed replace")
+    before_shots = shots_snapshot(project)
+    before_song = project.song.model_dump(mode="json")
+    audio = store.project_dir(project.id) / project.song.path
+    before_audio = audio.read_bytes()
+
+    attempts = {
+        "import": client.post(
+            f"/api/projects/{project.id}/songs/upload",
+            data={"title": "Replacement", "duration": "9"},
+            files={"file": ("original.wav", b"not-audio-at-all", "audio/wav")},
+        ),
+        "music": client.post(
+            f"/api/projects/{project.id}/generate/music",
+            json={"title": "Replacement", "caption": "industrial synth rock", "duration": 12},
+        ),
+        "songplanner": client.post(
+            f"/api/projects/{project.id}/generate/songplanner",
+            json={"title": "Replacement", "idea": "sunset synthwave"},
+        ),
+    }
+
+    for label, response in attempts.items():
+        assert response.status_code == 409, (label, response.text)
+        detail = response.json()["detail"].lower()
+        assert "shot window" in detail, label
+        assert "assembly synchronization" in detail, label
+    assert comfy.prompts == []
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.model_dump(mode="json") == before_song
+    assert shots_snapshot(saved) == before_shots
+    assert saved.jobs == []
+    assert audio.read_bytes() == before_audio
+
+
+def test_confirmed_song_replacement_keeps_every_shot_field_intact(tmp_path: Path):
+    """The epic's "no shot data is deleted" guarantee, by design rather than by accident.
+
+    Each replacement is re-read through a *fresh* ProjectStore, because the response body
+    is the in-memory object the handler just built; only the manifest proves the shots.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = project_with_song_and_shots(client, store, "Confirmed replace")
+    before_shots = shots_snapshot(project)
+
+    imported = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Second spine", "duration": "0", "confirm_song_replacement": "true"},
+        files={"file": ("second.wav", wav_bytes(1.0), "audio/wav")},
+    )
+    assert imported.status_code == 200
+    after_import = ProjectStore(tmp_path).get(project.id)
+    assert after_import.song.title == "Second spine"
+    assert after_import.song.path.endswith("second.wav")
+    assert shots_snapshot(after_import) == before_shots
+
+    generated = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={
+            "title": "Third spine",
+            "caption": "industrial synth rock",
+            "duration": 12,
+            "confirm_song_replacement": True,
+        },
+    )
+    assert generated.status_code == 202
+    after_music = ProjectStore(tmp_path).get(project.id)
+    assert after_music.song.title == "Third spine"
+    assert after_music.song.source == "generated"
+    assert shots_snapshot(after_music) == before_shots
+
+    planned = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "Fourth spine", "idea": "sunset synthwave", "confirm_song_replacement": True},
+    )
+    assert planned.status_code == 202
+    after_planner = ProjectStore(tmp_path).get(project.id)
+    assert after_planner.song.title == "Fourth spine"
+    assert shots_snapshot(after_planner) == before_shots
+
+
+def test_a_first_import_and_a_shotless_project_need_no_confirmation(tmp_path: Path):
+    """The gate must not make ordinary work friction: nothing depends on the song yet."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Frictionless"))
+
+    first = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "First", "duration": "30"},
+        files={"file": ("first.wav", wav_bytes(0.25), "audio/wav")},
+    )
+    replaced = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Replacement", "duration": "40"},
+        files={"file": ("second.wav", wav_bytes(0.25), "audio/wav")},
+    )
+    generated = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Generated", "caption": "industrial synth rock", "duration": 12},
+    )
+    removed = client.delete(f"/api/projects/{project.id}/song")
+
+    assert first.status_code == 200
+    assert replaced.status_code == 200
+    assert generated.status_code == 202
+    assert removed.status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).song is None
+
+
+def test_song_removal_requires_confirmation_and_never_touches_shots_or_media(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = project_with_song_and_shots(client, store, "Removal")
+    before_shots = shots_snapshot(project)
+    audio = store.project_dir(project.id) / project.song.path
+    assert audio.is_file()
+
+    refused = client.delete(f"/api/projects/{project.id}/song")
+
+    assert refused.status_code == 409
+    detail = refused.json()["detail"].lower()
+    assert "shot window" in detail
+    assert "assembly synchronization" in detail
+    unchanged = ProjectStore(tmp_path).get(project.id)
+    assert unchanged.song is not None
+    assert shots_snapshot(unchanged) == before_shots
+
+    removed = client.delete(f"/api/projects/{project.id}/song?confirm_song_replacement=true")
+
+    assert removed.status_code == 200
+    assert removed.json()["song"] is None
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song is None
+    assert shots_snapshot(saved) == before_shots
+    # Removal detaches the song; it never destroys the media it detaches.
+    assert audio.is_file()
+
+
+def test_song_removal_reports_nothing_to_remove_when_there_is_no_song(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Nothing to remove"))
+    project.shots = [Shot(start=0, duration=5, prompt="Opening")]
+    store.save(project)
+    before_shots = shots_snapshot(store.get(project.id))
+
+    for query in ("", "?confirm_song_replacement=true"):
+        response = client.delete(f"/api/projects/{project.id}/song{query}")
+
+        assert response.status_code == 404, query
+        assert "no song" in response.json()["detail"].lower(), query
+    assert shots_snapshot(ProjectStore(tmp_path).get(project.id)) == before_shots
+
+
+def test_full_project_put_gates_a_song_change_but_never_an_ordinary_save(tmp_path: Path):
+    """The generic save was one HTTP call wide of the guarantee.
+
+    `PUT /api/projects/{id}` is the normal save path for every edit in the UI, so it
+    cannot be gated on *carrying* a Song — only on changing one. A body whose Song differs
+    from the stored Song is a replacement or a removal however it arrived.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = project_with_song_and_shots(client, store, "Generic save")
+    before_shots = shots_snapshot(project)
+    before_song = project.song.model_dump(mode="json")
+
+    swapped = project.model_dump(mode="json")
+    swapped["song"] = {**before_song, "title": "Smuggled spine", "duration": 12.0}
+    removed = project.model_dump(mode="json")
+    removed["song"] = None
+
+    for label, payload in (("swapped", swapped), ("removed", removed)):
+        response = client.put(f"/api/projects/{project.id}", json=payload)
+
+        assert response.status_code == 409, (label, response.text)
+        detail = response.json()["detail"].lower()
+        assert "shot window" in detail, label
+        assert "assembly synchronization" in detail, label
+        saved = ProjectStore(tmp_path).get(project.id)
+        assert saved.song.model_dump(mode="json") == before_song, label
+        assert shots_snapshot(saved) == before_shots, label
+
+    # An ordinary save carrying the same Song must pass untouched — that is the entire
+    # reason this route could not simply be gated.
+    ordinary = project.model_dump(mode="json")
+    ordinary["creative_brief"] = "An ordinary edit"
+    passed = client.put(f"/api/projects/{project.id}", json=ordinary)
+
+    assert passed.status_code == 200
+    after_save = ProjectStore(tmp_path).get(project.id)
+    assert after_save.creative_brief == "An ordinary edit"
+    assert after_save.song.model_dump(mode="json") == before_song
+    assert shots_snapshot(after_save) == before_shots
+
+    # And an acknowledged change goes through, still without touching a shot.
+    acknowledged = after_save.model_dump(mode="json")
+    acknowledged["song"] = None
+    confirmed = client.put(
+        f"/api/projects/{project.id}?confirm_song_replacement=true", json=acknowledged
+    )
+
+    assert confirmed.status_code == 200
+    final = ProjectStore(tmp_path).get(project.id)
+    assert final.song is None
+    assert shots_snapshot(final) == before_shots
+
+
+def completed_history_for(outputs: list[dict]):
+    async def history(prompt_id: str):
+        return type(
+            "History",
+            (),
+            {"prompt_id": prompt_id, "status": "complete", "outputs": outputs, "error": ""},
+        )()
+
+    return history
+
+
+def test_a_completing_music_job_does_not_re_attach_audio_to_a_removed_song(tmp_path: Path):
+    """A job finishing after removal must not resurrect the Song the Director removed.
+
+    Every music job carries `target_id == "song"`, so the prompt id is the only thing that
+    ties a completion to a particular Song. The produced file is not lost — it stays on the
+    job's `output_files`, which is where an orphaned take is recovered from.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Removed mid-flight"))
+    job = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "In flight", "caption": "industrial synth rock", "duration": 12},
+    ).json()
+    assert client.delete(f"/api/projects/{project.id}/song").status_code == 200
+    comfy.history = completed_history_for(
+        [{"subfolder": f"music-video-producer/{project.id}/songs", "filename": "flight.flac"}]
+    )
+
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "complete"
+    assert refreshed.json()["output_files"] == [
+        f"music-video-producer/{project.id}/songs/flight.flac"
+    ]
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song is None
+    assert saved.jobs[-1].output_files == [
+        f"music-video-producer/{project.id}/songs/flight.flac"
+    ]
+
+
+def test_a_completing_music_job_does_not_overwrite_a_different_song(tmp_path: Path):
+    """The reverse interleaving: the generated file must not be pasted onto an import.
+
+    Overwriting `path` alone left a Song claiming `source == "imported"` while pointing at
+    a ComfyUI output, which the frontend resolves through an entirely different URL.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Replaced mid-flight"))
+    job = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "In flight", "caption": "industrial synth rock", "duration": 12},
+    ).json()
+    imported = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Imported instead", "duration": "30"},
+        files={"file": ("instead.wav", wav_bytes(0.25), "audio/wav")},
+    )
+    assert imported.status_code == 200
+    replacement = ProjectStore(tmp_path).get(project.id).song.model_dump(mode="json")
+    comfy.history = completed_history_for(
+        [{"subfolder": f"music-video-producer/{project.id}/songs", "filename": "flight.flac"}]
+    )
+
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+
+    assert refreshed.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.model_dump(mode="json") == replacement
+    assert saved.song.source == "imported"
+    assert "flight.flac" not in saved.song.path
+    # Still recoverable from the job rather than silently discarded.
+    assert saved.jobs[-1].output_files == [
+        f"music-video-producer/{project.id}/songs/flight.flac"
+    ]
+
+
+def test_a_completing_music_job_matches_the_song_by_prompt_id_not_by_source(tmp_path: Path):
+    """Two generated songs in a row: `source` cannot tell them apart, the prompt id can.
+
+    The Director queued one song, then queued another before the first finished. The first
+    completion belongs to a Song that is no longer the project's, and must not be pasted
+    onto the Song that is.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Two generations"))
+    first = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "First", "caption": "industrial synth rock", "duration": 12},
+    ).json()
+
+    async def second_submission(prompt, client_id=None):
+        return type("Submission", (), {"prompt_id": "p-202", "number": 2})()
+
+    comfy.submit = second_submission
+    second = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Second", "caption": "colder synth rock", "duration": 12},
+    )
+    assert second.status_code == 202
+    assert ProjectStore(tmp_path).get(project.id).song.prompt_id == "p-202"
+    comfy.history = completed_history_for(
+        [{"subfolder": f"music-video-producer/{project.id}/songs", "filename": "first.flac"}]
+    )
+
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{first['id']}")
+
+    assert refreshed.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.prompt_id == "p-202"
+    assert saved.song.title == "Second"
+    # The second song has not rendered yet, so it still has no audio of its own — and the
+    # first job's output is not it.
+    assert saved.song.path == ""
+    assert saved.jobs[0].output_files == [
+        f"music-video-producer/{project.id}/songs/first.flac"
+    ]
+
+
+def test_a_confirmed_replacement_never_destroys_the_previous_audio(tmp_path: Path):
+    """"Re-import the same file" is only an undo if the file is still there.
+
+    Songs were written under their own name, so a replacement whose filename matched the
+    previous song overwrote it. Assets avoid this with an index prefix; songs now do too.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = project_with_song_and_shots(client, store, "Non-destructive replace")
+    before_shots = shots_snapshot(project)
+    previous = store.project_dir(project.id) / project.song.path
+    previous_bytes = previous.read_bytes()
+    replacement_bytes = wav_bytes(2.0)
+    assert replacement_bytes != previous_bytes
+
+    response = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Same name", "duration": "0", "confirm_song_replacement": "true"},
+        files={"file": ("original.wav", replacement_bytes, "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    current = store.project_dir(project.id) / saved.song.path
+    assert current != previous
+    assert current.read_bytes() == replacement_bytes
+    # The audio the Director could re-import to undo this is still on disk, unmodified.
+    assert previous.is_file()
+    assert previous.read_bytes() == previous_bytes
+    assert shots_snapshot(saved) == before_shots
+
+
+def test_an_unusable_reported_duration_falls_through_to_probing(tmp_path: Path):
+    """`duration > 0` admitted `inf` and 1e18 straight into the timing spine.
+
+    `Song.duration` only constrains `ge=0`, so nothing downstream would have caught it.
+    """
+    client, store, _ = make_client(tmp_path)
+
+    for label, reported in (("inf", "inf"), ("absurd", "1e18"), ("nan", "nan")):
+        project = store.create(Project(name=f"Reported {label}"))
+        response = client.post(
+            f"/api/projects/{project.id}/songs/upload",
+            data={"title": "Measured instead", "duration": reported},
+            files={"file": ("one-second.wav", wav_bytes(1.0), "audio/wav")},
+        )
+
+        assert response.status_code == 200, label
+        stored = ProjectStore(tmp_path).get(project.id).song.duration
+        assert 0.99 <= stored <= 1.01, (label, stored)
 
 
 def test_h3_payload_uses_grid_aligned_frame_count(tmp_path: Path):

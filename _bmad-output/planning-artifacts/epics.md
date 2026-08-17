@@ -173,7 +173,12 @@ So that song generation is verified capability, not unit-tested claim.
 **Acceptance Criteria:**
 
 **Given** live ComfyUI and explicit GPU-cost confirmation
-**When** one short (≤16 s) song is generated through each adapter
+**When** one short (≤30 s) song is generated through each adapter
+<!-- Amended 2026-08-17 on live evidence: was "≤16 s", which is unachievable. `M3SongPlanner.duration_seconds`
+     carries `min: 30.0` in the live /object_info schema, so a 16 s request is rejected by ComfyUI at prompt
+     validation (`value_smaller_than_min`) before any GPU work. 30 s is the shortest song this adapter can
+     produce; both variants were verified live at 30 s (measured 29.989 s). -->
+
 **Then** both outputs exist on disk, play in the application, and `docs/ROADMAP.md` records the verification.
 
 **Given** an imported WAV whose duration the browser could not decode

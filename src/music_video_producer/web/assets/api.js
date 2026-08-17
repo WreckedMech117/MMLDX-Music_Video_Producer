@@ -108,6 +108,56 @@ export function musicFormFieldUpdate(preset, current = {}) {
   };
 }
 
+// Pure decision: the `duration` value a pending song import sends to the server.
+//
+// `pending.decoded` is the AudioBuffer the browser produced for *the file being
+// imported*, absent whenever the decode failed. Any other state handed in — most
+// importantly a `previous` buffer the app still holds from an earlier song — is
+// deliberately ignored, which is the entire point of this function existing.
+//
+// The server only runs its ffprobe fallback when this value is 0 (app.py:
+// `resolved_duration = duration if duration > 0 else _media_duration(target)`), so
+// "unknown length" has to arrive as exactly 0. A stale non-zero number instead
+// becomes the persisted Song duration — the timing spine every Shot window,
+// playback sync and Assembly derives from — and a wrong spine is worse than a
+// missing one. Non-finite and non-positive measurements are unknown too.
+export function songImportDuration(pending = {}) {
+  const duration = Number(pending?.decoded?.duration);
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+// True when a rejection is the Song gate refusing an unacknowledged change, which the
+// client can recover from by refreshing and asking again -- as opposed to any other
+// error, where a refresh would tell the Director nothing new. Keyed on the server's
+// own instruction sentence so the two cannot drift apart silently.
+export const SONG_REFUSAL_MARKER = "confirm_song_replacement=true";
+
+export function songRefusalMessage(message) {
+  return typeof message === "string" && message.includes(SONG_REFUSAL_MARKER);
+}
+
+// The single wording for what changing or removing a project's Song costs, shown before
+// the import, generate and remove paths send anything. One exported constant because
+// three call sites would otherwise drift, and a consequence stated differently in three
+// places is a consequence the Director cannot trust.
+//
+// It names both things that silently stop lining up: Shot windows are absolute seconds
+// against the current song, and Assembly synchronization derives from it. It also says
+// what is *not* at risk — no shot data is deleted and no window is moved — because a
+// Director who fears losing work will avoid the operation instead of understanding it.
+// The server states the same consequence in app.py's SONG_REPLACEMENT_CONSEQUENCE.
+export const SONG_CHANGE_CONSEQUENCE =
+  "Shot windows are absolute seconds against the current song, and Assembly synchronization derives from it. " +
+  "No shot data is deleted and no shot window is moved to fit a new song, so every existing shot keeps the timing it has now.";
+
+// Pure mirror of the server's gate (app.py `_require_song_replacement_confirmation`): a
+// Song change only needs acknowledgement once the project has both a Song and Shots. A
+// first import, and a Shot-less project, stay frictionless because nothing depends on
+// the song's timing yet.
+export function songChangeNeedsConfirmation(project) {
+  return Boolean(project?.song) && Boolean(project?.shots?.length);
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.
@@ -143,6 +193,9 @@ export const api = {
   saveDocuments: (id, documents) => request(`/api/projects/${id}/documents`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(documents) }),
   saveShots: (id, shots) => request(`/api/projects/${id}/shots`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ shots }) }),
   uploadSong: (id, data) => request(`/api/projects/${id}/songs/upload`, { method: "POST", body: data }),
+  // The flag is the Director's acknowledgement, so it is passed through rather than
+  // hardcoded: a caller that never showed SONG_CHANGE_CONSEQUENCE must not claim it did.
+  removeSong: (id, confirmed = false) => request(`/api/projects/${id}/song?confirm_song_replacement=${confirmed ? "true" : "false"}`, { method: "DELETE" }),
   uploadAsset: (id, data) => request(`/api/projects/${id}/assets/upload`, { method: "POST", body: data }),
   generateMusic: (id, body) => request(`/api/projects/${id}/generate/music`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateSongPlanner: (id, body) => request(`/api/projects/${id}/generate/songplanner`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

@@ -1,11 +1,21 @@
+import inspect
 import json
 import re
 import subprocess
 from pathlib import Path
 
-from music_video_producer.app import MusicRequest, SongPlannerRequest
+from fastapi import HTTPException
+
+from music_video_producer.app import (
+    SONG_REPLACEMENT_CONSEQUENCE,
+    MusicRequest,
+    SongPlannerRequest,
+    _require_song_replacement_confirmation,
+)
+from music_video_producer.models import Project, Shot, Song
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
+API_JS = Path("src/music_video_producer/web/assets/api.js")
 INDEX_HTML = Path("src/music_video_producer/web/index.html")
 
 # Every preset the markup actually offers, and the endpoint it must resolve to.
@@ -303,6 +313,214 @@ def test_sync_music_variant_is_a_thin_applier_over_the_shared_update():
         assert leaked not in handler, leaked
 
 
+def test_song_import_duration_never_inherits_a_previous_songs_length():
+    """FR-12's ffprobe fallback only runs when the browser sends 0.
+
+    The frontend defeated it: a failed decode left `state.audioBuffer` holding the
+    previously loaded song, so importing an undecodable file into a project that
+    already had a decodable song sent *that* song's duration. The server saw a
+    non-zero value, skipped ffprobe, and persisted a wrong timing spine. Grepping the
+    handler for identifier names could never catch that, so the decision is a pure
+    function and this executes it.
+    """
+    script = """
+      import { songImportDuration } from './src/music_video_producer/web/assets/api.js';
+      const previous = { duration: 187.5 };
+      console.log(JSON.stringify({
+        decoded: songImportDuration({ decoded: { duration: 42.75 } }),
+        failed: songImportDuration({ decoded: null }),
+        failedWithPrevious: songImportDuration({ decoded: null, previous }),
+        failedWithPreviousUndefined: songImportDuration({ previous }),
+        noPending: songImportDuration(),
+        nullPending: songImportDuration(null),
+        zeroLength: songImportDuration({ decoded: { duration: 0 } }),
+        notANumber: songImportDuration({ decoded: { duration: NaN } }),
+        infinite: songImportDuration({ decoded: { duration: Infinity } }),
+        negative: songImportDuration({ decoded: { duration: -3 } }),
+      }));
+    """
+
+    durations = run_module(script)
+    # A successful decode is the only thing trusted, and it is sent exactly.
+    assert durations["decoded"] == 42.75
+    # Every "unknown length" shape must be exactly 0 — the one value that makes
+    # app.py's `resolved_duration` reach for ffprobe.
+    for unknown in ("failed", "failedWithPrevious", "failedWithPreviousUndefined",
+                    "noPending", "nullPending", "zeroLength", "notANumber",
+                    "infinite", "negative"):
+        assert durations[unknown] == 0, unknown
+
+
+def test_song_import_handlers_drop_a_failed_decode_and_delegate_the_duration():
+    """Source-level companion to the pure assertion above.
+
+    The pure function cannot be handed a stale buffer if the handler never keeps
+    one, and nothing else in the suite reaches these two DOM handlers.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    change = source.split('$("#song-file").addEventListener("change"', 1)[1].split("  });", 1)[0]
+    importer = source.split('$("#import-song").addEventListener("click"', 1)[1].split("  });", 1)[0]
+
+    # The decode-failure path must drop the buffer; retaining it was the first defect.
+    assert "catch {" in change
+    assert "state.audioBuffer = null;" in change.split("catch {", 1)[1]
+
+    # Dropping it is not enough on its own: loadPersistedWaveform is a second, un-awaited
+    # writer of state.audioBuffer for the *stored* song, and it could land after this
+    # handler and hand the import that song's length. So the candidate's measurement is
+    # recorded against the File it came from, and both clearing paths bump the revision
+    # counter that cancels an in-flight persisted decode.
+    assert "state.pendingImport = { file, decoded: null }" in change
+    assert "waveformLoadRevision += 1;" in change
+    assert "state.pendingImport = { file, decoded }" in change
+
+    # Rendering must sit outside the decode's catch: a throw from renderSong is not a
+    # decode failure, and treating it as one discards a perfectly good buffer.
+    assert "renderSong();" not in change.split("try {", 1)[1].split("catch", 1)[0]
+
+    # The import reads only that file's own record -- never the shared buffer, which is
+    # what silently carried the previous song's length.
+    assert "state.pendingImport?.file === file" in importer
+    assert "songImportDuration(" in importer
+    assert "state.audioBuffer" not in importer
+
+
+def test_song_change_consequence_names_shot_windows_and_assembly_sync():
+    """Both halves of the refusal must name what actually stops lining up.
+
+    "Are you sure?" is not the requirement — the Director has to be told that shot
+    windows are absolute seconds against the current song and that Assembly
+    synchronization derives from it, on the server and in the browser alike.
+    """
+    script = """
+      import { SONG_CHANGE_CONSEQUENCE } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ consequence: SONG_CHANGE_CONSEQUENCE }));
+    """
+
+    browser = run_module(script)["consequence"].lower()
+
+    for wording in ("shot window", "assembly synchronization"):
+        assert wording in browser, wording
+        assert wording in SONG_REPLACEMENT_CONSEQUENCE.lower(), wording
+    # And it says what is *not* at risk, or the Director avoids the operation instead
+    # of understanding it.
+    assert "no shot data is deleted" in browser
+    assert "deletes no shot data" in SONG_REPLACEMENT_CONSEQUENCE.lower()
+
+
+def test_frontend_confirmation_gate_mirrors_the_server_gate():
+    """Same rule on both sides: acknowledgement only once shots depend on the song."""
+    script = """
+      import { songChangeNeedsConfirmation } from './src/music_video_producer/web/assets/api.js';
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/a.wav', duration: 180 };
+      const shot = { id: 'shot_1', start: 0, duration: 5 };
+      console.log(JSON.stringify({
+        songAndShots: songChangeNeedsConfirmation({ song, shots: [shot] }),
+        songNoShots: songChangeNeedsConfirmation({ song, shots: [] }),
+        shotsNoSong: songChangeNeedsConfirmation({ song: null, shots: [shot] }),
+        neither: songChangeNeedsConfirmation({ song: null, shots: [] }),
+        noProject: songChangeNeedsConfirmation(null),
+        absent: songChangeNeedsConfirmation(),
+      }));
+    """
+
+    gate = run_module(script)
+
+    assert gate["songAndShots"] is True
+    for frictionless in ("songNoShots", "shotsNoSong", "neither", "noProject", "absent"):
+        assert gate[frictionless] is False, frictionless
+
+
+def test_python_and_javascript_gates_agree_on_every_project_state():
+    """Both implementations of the gate, executed over the same states and compared.
+
+    Two hand-written matrices could each be right about a different rule; this executes
+    the real functions and asserts they answer identically, so the browser can never ask
+    for an acknowledgement the server ignores, or stay silent where the server refuses.
+    """
+    script = """
+      import { songChangeNeedsConfirmation } from './src/music_video_producer/web/assets/api.js';
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/a.wav', duration: 180 };
+      const shot = { id: 'shot_1', start: 0, duration: 5 };
+      console.log(JSON.stringify({
+        songAndShots: songChangeNeedsConfirmation({ song, shots: [shot] }),
+        songNoShots: songChangeNeedsConfirmation({ song, shots: [] }),
+        shotsNoSong: songChangeNeedsConfirmation({ song: null, shots: [shot] }),
+        neither: songChangeNeedsConfirmation({ song: null, shots: [] }),
+      }));
+    """
+    browser = run_module(script)
+    project = Project(name="Gate")
+    song = Song(title="Spine", source="imported", path="media/songs/a.wav", duration=180)
+    shot = Shot(start=0, duration=5, prompt="Opening")
+    states = {
+        "songAndShots": (song, [shot]),
+        "songNoShots": (song, []),
+        "shotsNoSong": (None, [shot]),
+        "neither": (None, []),
+    }
+
+    server = {}
+    for label, (current_song, shots) in states.items():
+        project.song = current_song
+        project.shots = shots
+        try:
+            _require_song_replacement_confirmation(project, False)
+            server[label] = False
+        except HTTPException as error:
+            assert error.status_code == 409, label
+            server[label] = True
+        # Acknowledgement always passes, whatever the state.
+        _require_song_replacement_confirmation(project, True)
+
+    assert server == browser
+    assert server["songAndShots"] is True
+
+
+def test_every_song_change_handler_confirms_before_it_sends():
+    """Import, generate and remove all state the consequence before touching the server.
+
+    Source-level because these are DOM handlers, and asserting the *order* is the point:
+    a confirm after the request would be theatre. The flag sent is the Director's actual
+    acknowledgement, never a hardcoded `true`, or a stale local project could defeat the
+    server's gate without anyone reading the consequence.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    handlers = {
+        "import": (
+            source.split('$("#import-song").addEventListener("click"', 1)[1].split("  });", 1)[0],
+            "api.uploadSong(",
+        ),
+        "generate": (
+            source.split('musicForm.addEventListener("submit"', 1)[1].split("  });", 1)[0],
+            "api.generate",
+        ),
+        "remove": (
+            source.split('$("#remove-song").addEventListener("click"', 1)[1].split("  });", 1)[0],
+            "api.removeSong(",
+        ),
+    }
+
+    for label, (handler, send) in handlers.items():
+        assert "confirmSongChange(" in handler, label
+        assert send in handler, label
+        assert handler.index("confirmSongChange(") < handler.index(send), label
+        assert "change.confirmed" in handler, label
+        # No spelling of a hardcoded acknowledgement, in any form. The object-literal and
+        # form.append spellings are not the only ways to write it -- an assignment form is
+        # already used elsewhere in this file -- so match the value, not one syntax.
+        assert not re.search(r"confirm_song_replacement\W{0,4}true", handler), label
+
+    # The shared helper is where the wording and the rule live; the handlers only ask it.
+    helper = source.split("function confirmSongChange", 1)[1].split("\n}", 1)[0]
+    assert "songChangeNeedsConfirmation(state.project)" in helper
+    assert "SONG_CHANGE_CONSEQUENCE" in helper
+    assert "window.confirm(" in helper
+    # Every consequence sentence comes from the one constant, not from a handler's string.
+    for wording in ("Shot windows", "Assembly synchronization"):
+        assert source.count(wording) == 0, wording
+
+
 def test_validation_errors_render_readable_field_messages():
     script = """
       import { errorMessage } from './src/music_video_producer/web/assets/api.js';
@@ -343,3 +561,79 @@ def test_comfy_output_url_preserves_output_subfolder():
         "http://127.0.0.1:8188/view?"
         "filename=image.png&subfolder=music-video-producer%2Fproject%2Fassets&type=output"
     )
+
+
+def test_remove_song_client_matches_a_route_the_server_actually_exposes():
+    """The browser's DELETE path and query key, read off both sides and compared.
+
+    `api.removeSong` hand-writes its URL, and the neighbouring upload route is plural
+    (`/songs/upload`) while removal is singular (`/song`), so this is a live typo risk.
+    Renaming the path or the flag leaves every other test green: the route tests write
+    their own URLs and the handler test only greps for `api.removeSong(`. In a browser
+    that mutation 404s on every project, or -- with only the flag renamed -- refuses
+    forever on exactly the projects the feature was built for, since the parameter
+    would silently default to False.
+    """
+    from music_video_producer.app import create_app
+
+    source = API_JS.read_text(encoding="utf-8")
+    call = source.split("removeSong:", 1)[1].split("\n", 1)[0]
+
+    url = re.search(r"`([^`]+)`", call)
+    assert url, "api.removeSong no longer builds its URL from a template literal"
+    path, _, query = url.group(1).partition("?")
+
+    assert "method: \"DELETE\"" in call, "song removal must be a DELETE"
+
+    # `/api/projects/${id}/song` -> the FastAPI path shape `/api/projects/{project_id}/song`
+    template = re.sub(r"\$\{[^}]+\}", "{project_id}", path)
+    exposed = {route.path for route in create_app().routes}
+    assert template in exposed, f"{template} is not a route the app exposes"
+
+    # The query key must be the parameter name the route declares, not a near-miss.
+    key = query.partition("=")[0]
+    signature = inspect.signature(next(
+        route.endpoint for route in create_app().routes
+        if route.path == template and "DELETE" in getattr(route, "methods", set())
+    ))
+    assert key in signature.parameters, (
+        f"api.removeSong sends `{key}`, which DELETE {template} does not accept"
+    )
+
+
+def test_song_refusal_is_recognised_and_recovered_from_rather_than_just_toasted():
+    """A refusal means the server knows about shots this client does not.
+
+    Without refreshing, every retry re-reads the same stale project, sends
+    confirmed=false again, and fails identically -- the Director is stuck looking at
+    the server's `confirm_song_replacement=true` instruction with no way to act on it.
+    """
+    script = """
+      import { songRefusalMessage, SONG_REFUSAL_MARKER } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        marker: SONG_REFUSAL_MARKER,
+        refusal: songRefusalMessage('shot windows are absolute seconds. Send confirm_song_replacement=true to proceed.'),
+        other: songRefusalMessage('ComfyUI returned 400: prompt outputs failed validation'),
+        missing: songRefusalMessage(undefined),
+        nonString: songRefusalMessage(409),
+      }));
+    """
+
+    result = run_module(script)
+    assert result["refusal"] is True
+    assert result["other"] is False
+    assert result["missing"] is False
+    assert result["nonString"] is False
+    # Keyed on the server's own instruction sentence so the two cannot drift silently.
+    assert result["marker"] in SONG_REPLACEMENT_CONSEQUENCE
+
+    source = APP_JS.read_text(encoding="utf-8")
+    recovery = source.split("async function recoverFromSongRefusal", 1)[1].split("\n}", 1)[0]
+    assert "songRefusalMessage(error.message)" in recovery
+    assert "api.project(" in recovery, "a refusal must refresh the project, not just toast"
+    assert "renderAll();" in recovery
+
+    # Both song-changing handlers route their failures through it.
+    for anchor in ('$("#import-song")', '$("#remove-song")'):
+        handler = source.split(anchor + '.addEventListener("click"', 1)[1].split("  });", 1)[0]
+        assert "recoverFromSongRefusal(error)" in handler, anchor

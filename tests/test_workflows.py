@@ -493,30 +493,61 @@ def test_ltx25_reference_patch_normalizes_seedvr2_frames_before_vae():
     assert template["6116:6070"]["inputs"]["pixels"] == ["6112", 0]
 
 
-def test_ltx25_normalizer_divisor_makes_seedvr2_output_exact_at_every_vae_stage():
-    """The observed SeedVR2 boundary size must divide exactly by the LTX 2.5 VAE's
-    total spatial compression of 32 (4-pixel patchify plus three stride-2 stages).
-    KJNodes with width=0/height=0 keeps the source size and rounds down to the
-    divisor, so 1250x720 must land on 1248x704 -- not the 1248x720 that 16 gives,
-    where 720/32 = 22.5 pushes a half cell through the conv stack.
+def test_ltx25_normalizer_preserves_geometry_by_cropping_not_stretching():
+    """The Director's ruling: preserve geometry, pay for it in trimmed pixels.
+
+    ``keep_proportion="crop"`` centre-crops to the target aspect and then resamples,
+    so the retained content keeps its shape. ``"resize"`` -- what this used to be --
+    resampled straight to the target and squashed 1250x720 into 1248x704, a 2.07%
+    anamorphic stretch. Both produce the same 1248x704 output, so the difference is
+    invisible in dimensions and only this configuration pins it.
+
+    What this test can honestly prove is the configuration contract. How the node
+    actually rounds and crops was verified out of band by executing the installed
+    ``ImageResizeKJv2`` on a synthetic 1250x720 frame: crop mode retained source
+    rows ~6-710 (15 rows trimmed, split centre) at 0.02% residual distortion,
+    against resize mode's full-height 2.07% squash. See docs/WORKFLOW-MAP.md.
     """
     template = json.loads(
         (REFERENCE_EXPORTS / "h3-ltx25-user-export.json").read_text(encoding="utf-8")
     )
 
-    payload = patch_ltx25_dimension_boundary(template)
-    divisor = payload["mvp:ltx-size-normalize"]["inputs"]["divisible_by"]
+    inputs = patch_ltx25_dimension_boundary(template)["mvp:ltx-size-normalize"]["inputs"]
 
-    observed_width, observed_height = 1250, 720
-    normalized_width = observed_width - (observed_width % divisor)
-    normalized_height = observed_height - (observed_height % divisor)
+    assert inputs["keep_proportion"] == "crop"
+    assert inputs["crop_position"] == "center"
+    assert inputs["upscale_method"] == "lanczos"
+    assert inputs["device"] == "cpu"
+    # Deriving the target from the incoming frame is what keeps the patch free of a
+    # hardcoded resolution; crop mode supports it exactly as resize mode did.
+    assert inputs["width"] == 0
+    assert inputs["height"] == 0
+    assert inputs["divisible_by"] == LTX25_DIVISOR
 
-    assert (normalized_width, normalized_height) == (1248, 704)
-    assert normalized_width % 32 == 0
-    assert normalized_height % 32 == 0
-    assert payload["mvp:ltx-size-normalize"]["inputs"]["width"] == 0
-    assert payload["mvp:ltx-size-normalize"]["inputs"]["height"] == 0
-    assert payload["mvp:ltx-size-normalize"]["inputs"]["keep_proportion"] == "resize"
+
+def test_ltx25_divisor_makes_the_observed_boundary_size_exact():
+    """The observed SeedVR2 boundary size must divide exactly by the LTX 2.5 VAE's
+    total spatial compression of 32 (4-pixel patchify plus three stride-2 stages).
+    1250x720 must land on 1248x704 -- not the 1248x720 that 16 gives, where
+    720/32 = 22.5 pushes a half cell through the conv stack.
+
+    This routes through ``normalize_to_divisor``, the function the patch itself uses
+    for the known-size path, rather than recomputing the flooring inline: an inline
+    recomputation would assert its own arithmetic and prove nothing about the code.
+    """
+    template = json.loads(
+        (REFERENCE_EXPORTS / "h3-ltx25-user-export.json").read_text(encoding="utf-8")
+    )
+
+    assert normalize_to_divisor(1250) == 1248
+    assert normalize_to_divisor(720) == 704
+    for axis in (1248, 704):
+        assert axis % 32 == 0
+    # 16 would have cleared patchify and left 720 -- the defect this replaced.
+    assert normalize_to_divisor(720, divisor=16) == 720
+
+    inputs = patch_ltx25_dimension_boundary(template)["mvp:ltx-size-normalize"]["inputs"]
+    assert inputs["divisible_by"] == LTX25_DIVISOR == 32
 
 
 def test_normalize_to_divisor_never_falls_below_one_divisor_cell():

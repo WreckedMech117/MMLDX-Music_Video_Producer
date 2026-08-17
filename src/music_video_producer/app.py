@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import tempfile
@@ -46,6 +47,36 @@ from .workflows import (
     build_songplanner_known_lyrics_payload,
 )
 
+# The one wording for what a Song change costs, shared by every route that changes or
+# removes a project's Song. The Song is the timing spine: `Shot.start`/`Shot.duration`
+# are absolute seconds against it, playback sync and Assembly derive from it, and
+# `use_song_audio` shots reference its audio. Nothing here deletes shot data and nothing
+# moves a shot to fit a new song, so the refusal has to say both — the Director needs to
+# know what silently stops lining up, not to fear losing work.
+#
+# `api.js`'s SONG_CHANGE_CONSEQUENCE is the frontend half of this sentence; both name
+# shot windows and Assembly synchronization, asserted by tests.
+SONG_REPLACEMENT_CONSEQUENCE = (
+    "This project already has shots that depend on the current song: shot windows are "
+    "absolute seconds against it, and Assembly synchronization derives from it. "
+    "Replacing or removing the song deletes no shot data and adjusts no shot window, so "
+    "every existing shot keeps the timing it has now. "
+    "Send confirm_song_replacement=true to proceed."
+)
+
+
+def _require_song_replacement_confirmation(project: Project, confirmed: bool) -> None:
+    """Refuse an unacknowledged Song change once the project has shots.
+
+    A first import, and any project with no shots, stays frictionless: there is nothing
+    whose timing the change can invalidate. Callers must invoke this *before* doing any
+    work — writing the uploaded file or submitting to ComfyUI — or the refusal comes too
+    late to be a refusal.
+    """
+    if confirmed or project.song is None or not project.shots:
+        return
+    raise HTTPException(status_code=409, detail=SONG_REPLACEMENT_CONSEQUENCE)
+
 
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -61,6 +92,9 @@ class MusicRequest(BaseModel):
     # ceiling. Unbounded is still wrong: ComfyUI refuses anything past 64-bit
     # at /prompt validation, which reaches the Director as an opaque 502.
     seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
+    # Acknowledgement of SONG_REPLACEMENT_CONSEQUENCE, not stored state: both generate
+    # routes assign `project.song` at submit time, so the replacement happens here.
+    confirm_song_replacement: bool = False
 
 
 class SongPlannerRequest(BaseModel):
@@ -80,6 +114,8 @@ class SongPlannerRequest(BaseModel):
     # KSampler seeds it shares a payload with are 64-bit, so the planner governs
     # here too. Direct Music 3 never touches the planner and keeps its own range.
     seed: int = Field(default=0, ge=0, le=0xFFFFFFFF)
+    # See MusicRequest.confirm_song_replacement.
+    confirm_song_replacement: bool = False
 
 
 class FluxRequest(BaseModel):
@@ -169,6 +205,26 @@ def _media_duration(path: Path) -> float:
         return max(0.0, float(result.stdout.strip()))
     except (FileNotFoundError, subprocess.SubprocessError, ValueError):
         return 0.0
+
+
+# The longest imported song length that is a measurement rather than a mistake. Twenty-four
+# hours is far past any real master and still finite, which is the point: the ceiling exists
+# to reject nonsense, not to legislate song length.
+MAX_IMPORTED_SONG_SECONDS = 86_400.0
+
+
+def _browser_reported_duration(duration: float) -> float:
+    """The browser's measurement, or exactly 0 when it is not a usable number.
+
+    `upload_song` only reaches for ffprobe when this is 0, so every "unknown length" shape
+    has to arrive as exactly that. `float` accepts `inf` and `nan` from a form post, and
+    `Song.duration` only constrains `ge=0`, so without this an `inf` or `1e18` would be
+    persisted untouched as the timing spine every Shot window, playback sync and Assembly
+    derives from — and a wrong spine is worse than a missing one.
+    """
+    if not math.isfinite(duration) or duration <= 0 or duration > MAX_IMPORTED_SONG_SECONDS:
+        return 0.0
+    return duration
 
 
 def _vision_media(path: Path) -> tuple[bytes, str]:
@@ -285,7 +341,9 @@ def create_app(
         return get_project(project_id)
 
     @app.put("/api/projects/{project_id}", response_model=Project)
-    def replace_project(project_id: str, project: Project) -> Project:
+    def replace_project(
+        project_id: str, project: Project, confirm_song_replacement: bool = False
+    ) -> Project:
         current = get_project(project_id)
         if project.id != project_id:
             raise HTTPException(status_code=422, detail="Project ID cannot be changed")
@@ -294,6 +352,15 @@ def create_app(
                 status_code=409,
                 detail="Project changed since it was loaded; refresh before replacing it",
             )
+        # This is the normal save path for every edit in the UI, so it cannot be gated on
+        # carrying a Song — that would refuse ordinary saves. It is gated on *changing* one:
+        # a body whose Song differs from the stored Song is a replacement or a removal
+        # however it arrived, and without this the guard was one HTTP call wide of true.
+        # `Song` has no timestamps, so an untouched Song round-trips equal and passes here;
+        # both being None is equal too, and adding a first Song to a Song-less project is
+        # not a replacement.
+        if project.song != current.song:
+            _require_song_replacement_confirmation(current, confirm_song_replacement)
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -316,23 +383,57 @@ def create_app(
         file: Annotated[UploadFile, File()],
         title: Annotated[str, Form()],
         duration: Annotated[float, Form()] = 0,
+        confirm_song_replacement: Annotated[bool, Form()] = False,
     ) -> Project:
         project = get_project(project_id)
+        # Before `_copy_upload`: a refusal must not have written anything, or it is not a
+        # refusal. (The write itself no longer overwrites — see the index prefix below.)
+        _require_song_replacement_confirmation(project, confirm_song_replacement)
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in {".wav", ".mp3", ".flac"}:
             raise HTTPException(status_code=415, detail="Song must be WAV, MP3, or FLAC")
         songs_dir = store.media_dir(project_id) / "songs"
         songs_dir.mkdir(parents=True, exist_ok=True)
         filename = _safe_filename(file.filename or f"song{suffix}")
-        target = songs_dir / filename
+        # Songs used to be written under their own name, so a confirmed replacement whose
+        # filename matched the previous song destroyed the very audio that makes "re-import
+        # the same file" an undo — the promise `remove_song` documents. Assets avoid this
+        # with an index prefix; songs now do too. The index advances past whatever name is
+        # already taken rather than being derived from a count, so a file deleted by hand
+        # cannot make a later import land on a name that still exists.
+        index = 0
+        target = songs_dir / f"{index:03d}-{filename}"
+        while target.exists():
+            index += 1
+            target = songs_dir / f"{index:03d}-{filename}"
         _copy_upload(file, target, settings.max_upload_bytes)
-        resolved_duration = duration if duration > 0 else _media_duration(target)
+        reported = _browser_reported_duration(duration)
+        resolved_duration = reported if reported > 0 else _media_duration(target)
         project.song = Song(
             title=title.strip() or target.stem,
             source="imported",
             path=target.relative_to(store.project_dir(project_id)).as_posix(),
             duration=resolved_duration,
         )
+        return store.save(project)
+
+    @app.delete("/api/projects/{project_id}/song", response_model=Project)
+    def remove_song(project_id: str, confirm_song_replacement: bool = False) -> Project:
+        """Detach the project's Song. Removal is not destruction.
+
+        Shots are left exactly as they are — a shot whose window no longer has a song
+        behind it is still the Director's work — and no media is deleted. What "undo" means
+        differs by source, so state it exactly rather than over-promising: an imported song's
+        file stays under `media/songs/` and re-importing it restores the Song, while a
+        generated song's audio lives in ComfyUI's output and stays listed on its render job's
+        `output_files`, which is the only record tying that take to this project once the
+        Song reference is gone.
+        """
+        project = get_project(project_id)
+        if project.song is None:
+            raise HTTPException(status_code=404, detail="This project has no song to remove")
+        _require_song_replacement_confirmation(project, confirm_song_replacement)
+        project.song = None
         return store.save(project)
 
     @app.post("/api/projects/{project_id}/assets/upload", response_model=Project)
@@ -399,6 +500,8 @@ def create_app(
     )
     async def generate_music(project_id: str, request: MusicRequest) -> RenderJob:
         project = get_project(project_id)
+        # Before submission: the refusal must cost no GPU time.
+        _require_song_replacement_confirmation(project, request.confirm_song_replacement)
         prefix = f"music-video-producer/{project_id}/songs/{_safe_filename(request.title)}"
         payload = build_music3_payload(
             caption=request.caption,
@@ -436,6 +539,8 @@ def create_app(
     )
     async def generate_songplanner(project_id: str, request: SongPlannerRequest) -> RenderJob:
         project = get_project(project_id)
+        # Before submission: the refusal must cost no GPU time.
+        _require_song_replacement_confirmation(project, request.confirm_song_replacement)
         prefix = f"music-video-producer/{project_id}/songs/{_safe_filename(request.title)}"
         if request.lyrics is not None:
             payload = build_songplanner_known_lyrics_payload(
@@ -845,7 +950,20 @@ def create_app(
                     asset = next((item for item in project.assets if item.id == job.target_id), None)
                     if asset and job.output_files:
                         asset.path = job.output_files[0]
-                elif job.kind == "music" and project.song and job.output_files:
+                # Only the Song this job actually produced may adopt its output. `target_id`
+                # is the constant string "song" for every music job, so the prompt id is the
+                # only thing tying a completion to a particular Song. Without this check a
+                # job that finished after the Song was removed re-attached its audio to
+                # whatever Song was there — and in the other order it overwrote an *imported*
+                # song's `path` with a generated file while `source` still said "imported".
+                # A mismatched output is not lost: it stays listed on the job's
+                # `output_files`, which is where an orphaned take is recovered from.
+                elif (
+                    job.kind == "music"
+                    and project.song
+                    and project.song.prompt_id == job.prompt_id
+                    and job.output_files
+                ):
                     project.song.path = job.output_files[0]
                 elif job.kind == "h3":
                     shot = next((item for item in project.shots if item.id == job.target_id), None)

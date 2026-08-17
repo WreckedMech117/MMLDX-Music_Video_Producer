@@ -1,4 +1,4 @@
-import { api, comfyOutputUrl, musicFormFieldUpdate, musicGenerationPlan } from "./api.js";
+import { SONG_CHANGE_CONSEQUENCE, api, comfyOutputUrl, musicFormFieldUpdate, musicGenerationPlan, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -23,6 +23,37 @@ function formatTime(seconds = 0, frames = false) {
   if (frames) return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}:${String(Math.floor((safe % 1) * 24)).padStart(2, "0")}`;
   const millis = Math.floor((safe % 1) * 1000);
   return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
+// One gate for every path that changes or removes the project's Song — import, generate,
+// remove — matching the `window.confirm` precedent for destructive and expensive actions.
+//
+// Returns both answers separately on purpose. `proceed` is whether to act at all;
+// `confirmed` is whether the Director actually saw and accepted SONG_CHANGE_CONSEQUENCE,
+// and that is the only thing sent to the server as confirm_song_replacement. Sending a
+// blanket `true` would let a stale local project (shots added elsewhere since this one
+// loaded) defeat the server's gate without anyone ever reading the consequence.
+function confirmSongChange(question) {
+  if (!songChangeNeedsConfirmation(state.project)) return { proceed: true, confirmed: false };
+  const confirmed = window.confirm(`${question}\n\n${SONG_CHANGE_CONSEQUENCE}`);
+  return { proceed: confirmed, confirmed };
+}
+
+// A refusal from the Song gate means the server knows about Shots this client does not,
+// so `confirmSongChange` never asked. Without refreshing, every retry re-reads the same
+// stale project, sends confirmed=false again, and fails identically -- the Director is
+// stuck, staring at a REST instruction they cannot act on. Refresh and let them retry
+// for real; any other error is just reported.
+async function recoverFromSongRefusal(error) {
+  toast(error.message, "error");
+  if (!state.project || !songRefusalMessage(error.message)) return;
+  try {
+    state.project = await api.project(state.project.id);
+    renderAll();
+    toast("This project has shots on the server. Try again to see what changing the song affects.");
+  } catch {
+    // Leave the original error standing; a failed refresh is not new information.
+  }
 }
 
 function requireProject() {
@@ -108,6 +139,7 @@ function renderSong() {
   $("#duration-value").textContent = song?.duration ? formatTime(song.duration) : "—";
   $("#timeline-value").textContent = song?.duration ? `${state.project?.shots.length || 0} shots · ready` : "Waiting for song";
   $("#analyze-song").disabled = true;
+  $("#remove-song").disabled = !song;
   $("#send-treatment").disabled = !song;
   $("#waveform-empty").style.display = state.audioBuffer ? "none" : "grid";
   const duration = song?.duration || 0;
@@ -501,17 +533,63 @@ function bindEvents() {
     const file = event.target.files[0];
     if (!file) return;
     $("#import-title").value ||= file.name.replace(/\.[^.]+$/, "");
-    try { const buffer = await decodeAudio(file); $("#duration-value").textContent = formatTime(buffer.duration); renderSong(); }
-    catch { toast("The browser could not decode this audio file.", "error"); }
+    // The chosen file's measurement is recorded against the file itself, not left in
+    // state.audioBuffer. That field has a second writer -- loadPersistedWaveform, an
+    // un-awaited decode of the *stored* song -- which could land after this handler and
+    // hand the import the previous song's length, persisting a wrong timing spine: the
+    // exact regression this path exists to prevent. Bumping the revision also cancels
+    // any persisted decode still in flight.
+    waveformLoadRevision += 1;
+    let decoded = null;
+    try { decoded = await decodeAudio(file); }
+    catch {
+      state.pendingImport = { file, decoded: null };
+      state.audioBuffer = null;
+      renderSong();
+      $("#duration-value").textContent = "—";
+      toast("The browser could not decode this audio file; its length will be measured on the server.", "error");
+      // The song still loaded in the project keeps its waveform; an unrelated failed
+      // decode of a candidate file should not blank the display until a reload.
+      if (state.project?.song?.path) loadPersistedWaveform(state.project.id);
+      return;
+    }
+    // Rendering is outside the catch on purpose: a throw from renderSong or the
+    // waveform draw is not a decode failure, and reporting it as "undecodable file"
+    // would discard a perfectly good buffer.
+    state.pendingImport = { file, decoded };
+    renderSong();
+    $("#duration-value").textContent = formatTime(decoded.duration);
   });
   $("#import-song").addEventListener("click", async () => {
     if (!requireProject()) return;
     const file = $("#song-file").files[0];
     if (!file) return toast("Choose a WAV, FLAC, or MP3 file.", "error");
+    const change = confirmSongChange("Replace this project's song with the imported file?");
+    if (!change.proceed) return;
     const form = new FormData();
-    form.append("file", file); form.append("title", $("#import-title").value || file.name); form.append("duration", state.audioBuffer?.duration || 0);
-    try { state.project = await api.uploadSong(state.project.id, form); renderAll(); toast("Song imported"); }
-    catch (error) { toast(error.message, "error"); }
+    form.append("file", file); form.append("title", $("#import-title").value || file.name);
+    // Only this file's own measurement counts. Anything decoded for another file --
+    // or for the project's stored song -- is not this import's length.
+    form.append("duration", songImportDuration(state.pendingImport?.file === file ? state.pendingImport : null));
+    form.append("confirm_song_replacement", String(change.confirmed));
+    try { state.project = await api.uploadSong(state.project.id, form); state.pendingImport = null; renderAll(); toast("Song imported"); }
+    catch (error) { await recoverFromSongRefusal(error); }
+  });
+  $("#remove-song").addEventListener("click", async () => {
+    if (!requireProject()) return;
+    if (!state.project.song) return toast("This project has no song to remove.", "error");
+    const change = confirmSongChange("Remove the song from this project?");
+    if (!change.proceed) return;
+    try {
+      state.project = await api.removeSong(state.project.id, change.confirmed);
+      // Cancels any persisted decode still in flight, so a removed song's waveform
+      // cannot reappear and be read as current.
+      waveformLoadRevision += 1;
+      state.audioBuffer = null;
+      renderAll();
+      toast("Song removed from the project; the audio file was left on disk");
+    }
+    catch (error) { await recoverFromSongRefusal(error); }
   });
   const musicForm = $("#music-form");
   // Thin DOM applier: every decision (which bounds, which way to clamp) lives in
@@ -541,6 +619,12 @@ function bindEvents() {
     if (data.preset === "songplanner-known" && !plan.body.lyrics) {
       return toast("Paste the lyric sheet, or switch to the invented-lyrics preset.", "error");
     }
+    // Both generate routes assign the new Song at submit time, before any audio exists,
+    // so the consequence is asked here rather than when the job completes. This is a
+    // separate question from the GPU-cost confirm below, which is about render time.
+    const change = confirmSongChange("Queue song generation? It replaces this project's song as soon as the job is submitted.");
+    if (!change.proceed) return;
+    plan.body.confirm_song_replacement = change.confirmed;
     try {
       if (plan.endpoint === "songplanner") {
         if (!window.confirm("Queue SongPlanner generation? It loads the 12B Gemma-3 planner plus the Music 3 stack and can use significant GPU time.")) return;

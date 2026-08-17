@@ -358,10 +358,17 @@ def patch_ltx25_dimension_boundary(
 
     ``source_size`` is the SeedVR2 frame size in pixels when the caller knows it.
     Given it, both axes are normalized here through ``normalize_to_divisor``, so a
-    frame with an axis under the divisor cannot collapse to a zero-sized resize.
+    frame with an axis under the divisor cannot floor to zero.
     Left as ``None`` the node keeps deriving the size from its input at runtime
     (``width``/``height`` 0), which is the export's own behaviour and carries that
     floor-to-zero risk for sub-divisor frames — pass the size to eliminate it.
+
+    That risk is sharper under ``keep_proportion="crop"`` than it was under
+    ``"resize"``. Verified by executing the installed node: a sub-divisor frame
+    with derived size raises ``ZeroDivisionError`` in crop mode (it divides by the
+    floored target height) where resize mode raised ``ValueError: height and width
+    must be > 0``. Both are failures, but the crop-mode one is the more obscure,
+    so passing ``source_size`` matters more now, not less.
     """
     payload = deepcopy(template)
     expected = {
@@ -388,8 +395,17 @@ def patch_ltx25_dimension_boundary(
             "width": width,
             "height": height,
             "upscale_method": "lanczos",
-            "keep_proportion": "resize",
+            # "crop", not "resize": the Director's ruling is that geometry is
+            # preserved and a few trimmed pixels are the acceptable price.
+            # "resize" resamples straight to the target (crop="disabled"), which
+            # squashed 1250x720 into 1248x704 -- a 2.07% anamorphic stretch,
+            # measured by executing the node. "crop" centre-crops to the target
+            # aspect first (1250x705), then resamples 705 -> 704, leaving 0.02%
+            # residual distortion and costing 15 rows of frame.
+            "keep_proportion": "crop",
             "pad_color": "0, 0, 0",
+            # Splits the trimmed rows between top and bottom (7/8 here) rather
+            # than taking them all off one edge.
             "crop_position": "center",
             # The LTX 2.5 video VAE's total spatial compression is 32 (a 4-pixel
             # patchify followed by three stride-2 stages), and it sets
