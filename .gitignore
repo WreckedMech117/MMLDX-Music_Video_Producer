@@ -9,4 +9,7 @@ data/projects/
 .DS_Store
 Thumbs.db
 test-artifacts/
-_bmad-output/
+# Planning artifacts (briefs, PRDs) are deliverables and stay versioned;
+# anything else BMAD writes under _bmad-output is transient.
+_bmad-output/*
+!_bmad-output/planning-artifacts/

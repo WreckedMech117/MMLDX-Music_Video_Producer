@@ -74,6 +74,11 @@ The standalone form accepts prepared caption/lyrics directly. Conversational Son
 
 The app validates shot windows, creates Director-compatible `start`/`length` segments, and builds a self-contained 15-node H3 graph with explicit registered loaders. Ready text-only shots can be submitted from Queue after a GPU-cost confirmation. The job stores its prompt ID and latest output; completion does not imply approval.
 
+This path is verified live. On 2026-08-16 a 3.75 s window at 640×384 and 4 steps produced a 90-frame h264 clip with synchronized 32 kHz AAC audio, confirmed by `ffprobe`. Two observations from that run:
+
+- The graph passes `requested_frames` to `duration_frames` and `normalDurationFrames`. The verified window was chosen to sit exactly on the 17k+5 grid; off-grid windows are untested, and `DirectorTimeline.aligned_frames` is currently computed but unused by the payload.
+- `VHS_VideoCombine` returns a Windows subfolder with backslashes, which the application joins to the filename with a forward slash, so stored paths mix separators. ComfyUI's `/view` accepts this and previews resolve correctly, so it is a cosmetic inconsistency rather than a defect.
+
 ## MiniMax H3 Ultra — References to Video
 
 - Immutable source: `workflow_templates/reference_exports/h3-ultra-references-user-export.json`.
@@ -108,7 +113,7 @@ SeedVR2 completed a real 192-frame upscale at 1250×720. The following LTX VAE e
 | Music 3 direct | yes | yes | yes | generated FLAC previously | yes |
 | Krea multiview | yes | yes | yes | one-step sheet previously | yes |
 | Director compile | yes | start/length timing | yes | live compiler accepts timing scaffold | timeline only |
-| H3 text-only shot render | yes | explicit 15-node adapter | yes | schema/classes/models verified; app render pending | yes |
+| H3 text-only shot render | yes | explicit 15-node adapter | yes | **live render verified end to end 2026-08-16** | yes |
 | H3 Ultra reference/audio shot | yes | explicit 18-node adapter | yes | live schema/classes and real vision path verified | yes |
 | LTX 2.5 enhance | yes | combined export audited + boundary patch | yes | reached VAE encode; boundary diagnosed | no |
 | SeedVR2/RTX/FILM | yes | pending | no | SeedVR2 192-frame upscale passed; later stages pending | no |

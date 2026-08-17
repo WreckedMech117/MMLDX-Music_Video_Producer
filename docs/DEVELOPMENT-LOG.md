@@ -1,5 +1,31 @@
 # Development Log
 
+## 2026-08-16 — Defect sweep after the first verified render
+
+- Fixed the data-loss defect in Director chat: `document_rejection()` refuses a Treatment or Style Bible that parses as JSON or collapses below 40% of the document it would replace, and the reply reports what was kept and why.
+- Diagnosed the root cause as self-reinforcing. The whole project is sent as context, so a Style Bible once stored as JSON caused the model to keep returning JSON. Verified both directions live: prose in context gave clean prose 3/3, JSON in context gave JSON 2/2 and the guard rejected both.
+- Fixed executing renders reporting `queued` by consulting `/queue` when history is still empty. Verified live against a running prompt.
+- Fixed `apply_shots` applying nothing silently when the model returns an empty shot list.
+- Fixed the payload sending requested rather than grid-aligned frames; `align_h3_frames()` output now crosses the workflow boundary.
+- Fixed mixed path separators in stored output paths.
+- Added flagging for planned shots outside MiniMax H3's 4–15 second window, without rewriting the proposal.
+- Restored `ruff check .` as a real gate by excluding vendored agent tooling, which had introduced 39 errors outside application code.
+- Established that `sageattention` is not installed in ComfyUI's embedded Python, so the `PathchSageAttentionKJ` pin to `disabled` is correct rather than a leftover.
+- Recorded the Production Wizard reconciliation in `docs/ARCHITECTURE.md`: the Operate / Command-Inspect decision rejects decorative surfaces, not sequencing.
+- Test suite 52 → 62.
+
+## 2026-08-16 — First verified end-to-end render, and version control
+
+- Rendered the first real H3 shot ever submitted from this application: 3.75 s, 90 frames, 640×384, 4 steps, seed 12345, against live ComfyUI 0.33.1.
+- Confirmed the output with `ffprobe`: h264 640×384, 90 frames, 3.750 s, synchronized AAC audio at 32 kHz.
+- Confirmed the job reconciled to `complete`, wrote `latest_output`, and left `approved_output` empty as designed.
+- Pre-flighted all thirteen node classes and five model files against live `/object_info` before spending GPU time.
+- Found that job refresh reports `queued` for the whole of an executing render, because it reads history rather than the queue.
+- Found that stored output paths mix separators; ComfyUI's `/view` tolerates it, so previews still resolve.
+- Noted that the H3 payload sends `requested_frames` rather than `aligned_frames`; the verified window was deliberately on-grid, so off-grid behavior is still unknown.
+- Initialized version control, which the repository had never had despite a `.gitignore` and documentation referring to Git.
+- Added `AGENTS.md` agent instructions.
+
 ## 2026-08-16 — H3 Ultra multi-reference and vision continuity
 
 - Preserved and checksummed the new MiniMax References-to-Video API export.

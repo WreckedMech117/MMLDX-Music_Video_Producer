@@ -6,6 +6,10 @@ from itertools import pairwise
 
 from .models import Shot
 
+#: MiniMax H3 is trained primarily for shot windows in this range, in seconds.
+H3_MIN_SHOT_SECONDS = 4.0
+H3_MAX_SHOT_SECONDS = 15.0
+
 
 class TimelineError(ValueError):
     pass
@@ -55,8 +59,11 @@ def build_director_timeline(
             }
         )
     warnings: list[str] = []
-    if window_duration < 4 or window_duration > 15:
-        warnings.append("MiniMax H3 is trained primarily for 4–15 second shot windows.")
+    if window_duration < H3_MIN_SHOT_SECONDS or window_duration > H3_MAX_SHOT_SECONDS:
+        warnings.append(
+            f"MiniMax H3 is trained primarily for {H3_MIN_SHOT_SECONDS:g}–"
+            f"{H3_MAX_SHOT_SECONDS:g} second shot windows."
+        )
     requested = round(window_duration * fps)
     payload = {
         "version": 1,

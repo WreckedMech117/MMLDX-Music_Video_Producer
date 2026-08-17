@@ -81,6 +81,7 @@ data/projects/<project-id>/
 
 ## Documentation
 
+- [Agent instructions](AGENTS.md) — rules for AI agents working in this repository
 - [Architecture](docs/ARCHITECTURE.md)
 - [Workflow map](docs/WORKFLOW-MAP.md)
 - [Data model](docs/DATA-MODEL.md)
@@ -92,4 +93,8 @@ data/projects/<project-id>/
 
 ## Honest status
 
-The application currently runs real API-format adapters for Music 3, Flux, Krea multiview, and text-only H3 Director shots. H3 reference assets/audio, standalone LTX enhancement, post-processing, final assembly, BPM/section analysis, and multi-take approval remain planned. Their controls are disabled or explicitly scoped rather than presented as complete.
+The application currently runs real API-format adapters for Music 3, Flux, Krea multiview, and text-only H3 Director shots.
+
+The text-only H3 path is the one route verified end to end from this application: on 2026-08-16 a 3.75 second shot rendered through live ComfyUI 0.33.1 and returned a 90-frame video with synchronized audio. Every other route is built and unit-tested but has not produced a real render from this application. Standalone LTX enhancement, post-processing, final assembly, BPM/section analysis, and multi-take approval remain planned. Their controls are disabled or explicitly scoped rather than presented as complete.
+
+Known rough edge: a render that is executing still reports `queued`, because job refresh reads ComfyUI's history rather than its queue.

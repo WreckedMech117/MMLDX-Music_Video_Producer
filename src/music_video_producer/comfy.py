@@ -84,6 +84,20 @@ class ComfyClient:
     async def queue(self) -> dict[str, Any]:
         return self._json(await self._request("GET", "/queue"))
 
+    async def queue_state(self, prompt_id: str) -> str:
+        """Locate ``prompt_id`` in the live queue.
+
+        ComfyUI writes no history entry until a prompt finishes, so history alone cannot
+        tell an executing render from a waiting one. Returns "running", "queued", or
+        "absent" when the prompt is in neither bucket.
+        """
+        payload = await self.queue()
+        for key, state in (("queue_running", "running"), ("queue_pending", "queued")):
+            for item in payload.get(key, []):
+                if isinstance(item, list) and any(part == prompt_id for part in item):
+                    return state
+        return "absent"
+
     async def object_info(self) -> dict[str, Any]:
         return self._json(await self._request("GET", "/object_info"))
 

@@ -503,3 +503,144 @@ def test_director_shot_application_preserves_existing_shot_provenance(tmp_path: 
     assert shot.status == "approved"
     assert shot.prompt_id == "render-1"
     assert shot.approved_output == "take.mp4"
+
+
+class DegradedDirector(FakeDirector):
+    """Reproduces the 2026-08-16 defect: JSON returned in a prose field, empty shot list."""
+
+    async def plan(self, message, project_context):
+        return type(
+            "DirectorResult",
+            (),
+            {
+                "message": "Splitting your vision into a four-beat sequence.",
+                "treatment": "A genuinely rewritten treatment of adequate length for replacement.",
+                "style_bible": '[{"style":"moody","color_palette":["amber","teal"]}]',
+                "shots": [],
+            },
+        )()
+
+
+def make_client_with_director(tmp_path: Path, director):
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    store = ProjectStore(tmp_path)
+    app = create_app(settings=settings, store=store, comfy=FakeComfy(), director=director)
+    return TestClient(app), store
+
+
+def test_director_never_overwrites_a_document_with_json(tmp_path: Path):
+    client, store = make_client_with_director(tmp_path, DegradedDirector())
+    project = store.create(Project(name="Guarded"))
+    project.style_bible = "Sodium amber, hard backlight, 35mm grain, wardrobe continuity notes."
+    project.treatment = "The original treatment the Director wrote by hand."
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Make it moodier", "apply_shots": True},
+    )
+
+    assert response.status_code == 200
+    saved = store.get(project.id)
+    # The style bible survives untouched; the treatment was legitimately replaced.
+    assert saved.style_bible == "Sodium amber, hard backlight, 35mm grain, wardrobe continuity notes."
+    assert saved.treatment.startswith("A genuinely rewritten treatment")
+    notice = saved.messages[-1].content
+    assert "Style bible was NOT replaced" in notice
+    assert "empty shot list" in notice
+
+
+def test_director_reports_shots_outside_the_h3_window(tmp_path: Path):
+    class LongShotDirector(FakeDirector):
+        async def plan(self, message, project_context):
+            shot = type("PlannedShot", (), {"start": 0, "duration": 20, "prompt": "One long take"})()
+            return type(
+                "DirectorResult",
+                (),
+                {
+                    "message": "One continuous shot.",
+                    "treatment": "A single unbroken movement through the room.",
+                    "style_bible": "Cold blue, handheld, 28mm.",
+                    "shots": [shot],
+                },
+            )()
+
+    client, store = make_client_with_director(tmp_path, LongShotDirector())
+    project = store.create(Project(name="Long"))
+
+    client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "one long take", "apply_shots": True},
+    )
+
+    saved = store.get(project.id)
+    assert "outside MiniMax H3's reliable 4-15s window" in saved.messages[-1].content
+    assert len(saved.shots) == 1  # still applied; the Director decides what to do about it
+
+
+def test_running_prompt_is_not_reported_as_queued(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Running"))
+    project.shots = [Shot(start=0, duration=5, prompt="Turn", mode="text", status="ready")]
+    store.save(project)
+    job = client.post(
+        f"/api/projects/{project.id}/shots/{project.shots[0].id}/generate/h3", json={}
+    ).json()
+
+    async def empty_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {"prompt_id": prompt_id, "status": "queued", "outputs": [], "error": ""},
+        )()
+
+    async def running_queue_state(prompt_id):
+        return "running"
+
+    comfy.history = empty_history
+    comfy.queue_state = running_queue_state
+
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}").json()
+    assert refreshed["status"] == "running"
+
+
+def test_windows_output_subfolders_are_normalised(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Paths"))
+    project.shots = [Shot(start=0, duration=5, prompt="Turn", mode="text", status="ready")]
+    store.save(project)
+    job = client.post(
+        f"/api/projects/{project.id}/shots/{project.shots[0].id}/generate/h3", json={}
+    ).json()
+
+    async def windows_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "complete",
+                "outputs": [
+                    {"subfolder": r"music-video-producer\proj\shots", "filename": "take.mp4"}
+                ],
+                "error": "",
+            },
+        )()
+
+    comfy.history = windows_history
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}").json()
+    assert refreshed["output_files"] == ["music-video-producer/proj/shots/take.mp4"]
+
+
+def test_h3_payload_uses_grid_aligned_frame_count(tmp_path: Path):
+    """A 4s window is 96 frames, which is off H3's 17k+5 grid and must round to 107."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Grid"))
+    project.shots = [Shot(start=0, duration=4, prompt="Off-grid", mode="text", status="ready")]
+    store.save(project)
+
+    client.post(f"/api/projects/{project.id}/shots/{project.shots[0].id}/generate/h3", json={})
+
+    inputs = comfy.prompts[-1]["2343"]["inputs"]
+    assert inputs["duration_frames"] == 107
+    assert (inputs["duration_frames"] - 5) % 17 == 0

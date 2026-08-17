@@ -20,11 +20,14 @@
 
 ## Next vertical slice
 
-1. Run one short, low-cost text-only H3 shot through the new adapter and inspect/probe its output.
-2. Add Director image and custom-audio reference serialization using project-contained media.
-3. Add take comparison and explicit approval.
-4. Build a standalone LTX 2.5 enhancement graph that accepts an approved take instead of regenerating H3.
-5. Run the repaired SeedVR2→dimension-normalization→LTX boundary live.
+1. ~~Run one short, low-cost text-only H3 shot through the new adapter and inspect/probe its output.~~ **Done 2026-08-16** — see the verification section below.
+2. ~~Report running renders as `running` rather than `queued`.~~ **Done 2026-08-16** — refresh consults `/queue` when history is empty; verified live.
+3. ~~Decide whether the payload should send `aligned_frames`.~~ **Done 2026-08-16** — it now does. A live off-grid render confirming it is recorded below.
+4. Run the H3 Ultra reference path live; only the text-only path has real evidence.
+5. Add Director image and custom-audio reference serialization using project-contained media.
+6. Add take comparison and explicit approval.
+7. Build a standalone LTX 2.5 enhancement graph that accepts an approved take instead of regenerating H3.
+8. Run the repaired SeedVR2→dimension-normalization→LTX boundary live.
 
 ## Production editing
 
@@ -54,12 +57,16 @@
 ## Verification status on 2026-08-16
 
 - First-run project creation: repaired and verified in headless Edge against an empty isolated data root; all five workspaces opened with zero severe console errors.
-- Python suite: 46 passing. Ruff and JavaScript syntax checks pass. Browser QA is also a required release gate; use the commands in `README.md`.
+- Python suite: 62 passing. Ruff and JavaScript syntax checks pass. Browser QA is also a required release gate; use the commands in `README.md`.
 - Music 3: prior real eight-second integrated FLAC successful in ComfyUI.
 - Flux API adapter: structurally matched to live `/object_info`; live smoke pending in this app.
 - Krea: prior one-step character-sheet generation successful; current multiview adapter unit-tested; live app smoke pending.
 - Director compiler: `MiniMaxH3DirectorCS` is registered on 8188; app timing now uses `start`/`length`, while full media/reference conversion remains pending.
-- H3 adapter: all required node classes and model files are present; API/UI submission is wired, but no expensive render was automatically queued during integration.
+- H3 text-only adapter: **verified live end to end on 2026-08-16.** A 3.75 s / 90-frame shot at 640×384 and 4 steps was submitted from the application to ComfyUI 0.33.1, accepted with HTTP 202, executed on the RTX 5090, and returned `music-video-producer/<project>/shots/<shot>-h3_00001-audio.mp4`. `ffprobe` confirms h264 640×384, 90 frames, 3.750 s, with synchronized AAC audio at 32 kHz. Wall clock was roughly twelve minutes, dominated by loading the ~31 GB model stack; free VRAM fell from 32 GB to 1.1 GB during sampling. The job reconciled to `complete`, `latest_output` was written, and `approved_output` correctly stayed empty.
+- H3 frame grid: **off-grid alignment verified live 2026-08-16.** Two 4.0 s shots (96 requested frames, off the 17k+5 grid) were submitted after the payload was changed to send `DirectorTimeline.aligned_frames`. Both rendered at exactly 107 frames, `ffprobe` duration 4.458 s. Note the consequence: an aligned clip is longer than its shot window, so assembly must trim.
+- Model residency: **measured 2026-08-16.** Two identical 107-frame H3 renders submitted back to back completed in 438 s and 288 s. ComfyUI keeps the model stack resident between consecutive prompts, saving roughly 150 s per subsequent render. No warm-batching machinery is required; the requirement is only to avoid interleaving other workflow kinds into a shot batch.
+- SageAttention: `sageattention` is **not installed** in ComfyUI's embedded Python, so the `PathchSageAttentionKJ` pin to `disabled` is correct rather than a leftover error. `triton` and torch 2.7.0+cu128 are present, so it is installable; whether a Blackwell-compatible build helps remains an unmeasured spike.
+- Director defect sweep: seven defects found and fixed on 2026-08-16 — creative-document data loss, `queued`-while-running, silent empty shot application, unaligned frames, mixed path separators, unbounded planned shot durations, and a `ruff check .` gate broken by vendored tooling. See `docs/DEVELOPMENT-LOG.md`.
 - SeedVR2: real 192-frame upscale completed at 1250×720.
 - LTX: downstream VAE encode failed on width 1250; the audited graph now normalizes to a multiple of 16 before all LTX image consumers.
 - H3/LTX full renders: not complete and not claimed complete.

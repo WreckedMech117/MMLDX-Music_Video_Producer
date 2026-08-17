@@ -47,6 +47,36 @@ was rendered. Keep identities, wardrobe, setting, color, camera, and motion cont
 The message should briefly explain the creative changes you made."""
 
 
+#: A replacement shorter than this fraction of an existing document is treated as degraded.
+MIN_REPLACEMENT_RATIO = 0.4
+
+
+def document_rejection(candidate: str, existing: str) -> str:
+    """Return why ``candidate`` must not replace ``existing``, or "" when it may.
+
+    Local models occasionally emit a serialised JSON structure into a string field, or
+    collapse a document to a fragment. Either silently destroys creative work, so both
+    are rejected rather than persisted. An empty target accepts any first draft.
+    """
+    stripped = candidate.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            json.loads(stripped)
+        except ValueError:
+            pass
+        else:
+            return "the model returned JSON instead of prose"
+    if not existing.strip():
+        return ""
+    if len(stripped) < MIN_REPLACEMENT_RATIO * len(existing.strip()):
+        return (
+            f"the replacement is {len(stripped)} characters against "
+            f"{len(existing.strip())} existing, below the "
+            f"{int(MIN_REPLACEMENT_RATIO * 100)}% floor"
+        )
+    return ""
+
+
 class DirectorClient:
     def __init__(
         self,

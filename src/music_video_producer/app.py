@@ -13,7 +13,12 @@ from pydantic import BaseModel, Field
 
 from .comfy import ComfyClient, ComfyError
 from .config import Settings
-from .director import DirectorClient, DirectorError, DirectorUnavailable
+from .director import (
+    DirectorClient,
+    DirectorError,
+    DirectorUnavailable,
+    document_rejection,
+)
 from .models import (
     Asset,
     Project,
@@ -24,7 +29,12 @@ from .models import (
     VisionInspectionRecord,
 )
 from .store import ProjectNotFound, ProjectStore
-from .timeline import TimelineError, build_director_timeline
+from .timeline import (
+    H3_MAX_SHOT_SECONDS,
+    H3_MIN_SHOT_SECONDS,
+    TimelineError,
+    build_director_timeline,
+)
 from .workflows import (
     WorkflowCatalog,
     build_flux_payload,
@@ -638,7 +648,7 @@ def create_app(
             payload = build_h3_director_payload(
                 timeline_data=timeline.timeline_data,
                 duration=shot.duration,
-                requested_frames=timeline.requested_frames,
+                requested_frames=timeline.aligned_frames,
                 seed=shot.seed,
                 width=request.width,
                 height=request.height,
@@ -676,10 +686,35 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(error)) from error
         except DirectorError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
-        project.messages.append(TreatmentMessage(role="assistant", content=result.message))
-        project.treatment = result.treatment
-        project.style_bible = result.style_bible
-        if request.apply_shots:
+        notices: list[str] = []
+        for label, candidate, existing in (
+            ("Treatment", result.treatment, project.treatment),
+            ("Style bible", result.style_bible, project.style_bible),
+        ):
+            reason = document_rejection(candidate, existing)
+            if reason:
+                notices.append(f"{label} was NOT replaced: {reason}. Raw output: {candidate[:400]}")
+            elif label == "Treatment":
+                project.treatment = candidate
+            else:
+                project.style_bible = candidate
+        if request.apply_shots and not result.shots:
+            notices.append(
+                "No shot plan was applied: the model returned an empty shot list. "
+                "Existing shots are unchanged."
+            )
+        for item in result.shots:
+            if item.duration < H3_MIN_SHOT_SECONDS or item.duration > H3_MAX_SHOT_SECONDS:
+                notices.append(
+                    f"Proposed {item.duration:g}s shot at {item.start:g}s falls outside MiniMax "
+                    f"H3's reliable {H3_MIN_SHOT_SECONDS:g}-{H3_MAX_SHOT_SECONDS:g}s window; "
+                    "split or trim it before rendering."
+                )
+        message = result.message
+        if notices:
+            message = message + "\n\n---\n" + "\n\n".join(notices)
+        project.messages.append(TreatmentMessage(role="assistant", content=message))
+        if request.apply_shots and result.shots:
             merged_shots: list[Shot] = []
             for index, item in enumerate(result.shots):
                 if index < len(project.shots):
@@ -708,10 +743,23 @@ def create_app(
                 history = await comfy.history(job.prompt_id)
             except ComfyError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
-            job.status = history.status if history.status in {"queued", "running", "complete", "error"} else "running"
+            job.status = (
+                history.status
+                if history.status in {"queued", "running", "complete", "error"}
+                else "running"
+            )
+            if job.status == "queued":
+                # History is empty for both waiting and executing prompts. Only the live
+                # queue distinguishes them, so a running render is not reported as queued.
+                try:
+                    located = await comfy.queue_state(job.prompt_id)
+                except ComfyError:
+                    located = "absent"
+                if located == "running":
+                    job.status = "running"
             job.output_files = [
                 "/".join(
-                    part
+                    part.replace("\\", "/").strip("/")
                     for part in (item.get("subfolder", ""), item.get("filename", ""))
                     if part
                 )

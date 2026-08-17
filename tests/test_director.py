@@ -151,3 +151,35 @@ async def test_director_inspects_reference_image_with_multimodal_content():
 
     assert result.identity == ["short dark hair", "silver jacket"]
     assert result.risks == ["face partly shadowed"]
+
+
+def test_document_rejection_blocks_json_masquerading_as_prose():
+    """Reproduces the observed defect: the model returns serialised JSON in a prose field."""
+    from music_video_producer.director import document_rejection
+
+    degraded = '[{"style":"moody","color_palette":["amber","teal"]}]'
+    assert "JSON" in document_rejection(degraded, "An existing style bible with real prose.")
+    # Also rejected when there is nothing to lose, because it is still not prose.
+    assert document_rejection(degraded, "") != ""
+
+
+def test_document_rejection_blocks_collapsed_replacement():
+    from music_video_producer.director import document_rejection
+
+    existing = "x" * 500
+    assert document_rejection("y" * 100, existing) != ""  # 20%, under the 40% floor
+    assert document_rejection("y" * 400, existing) == ""  # 80%, accepted
+
+
+def test_document_rejection_accepts_any_first_draft():
+    from music_video_producer.director import document_rejection
+
+    assert document_rejection("Short but the first one.", "") == ""
+    assert document_rejection("Short but the first one.", "   ") == ""
+
+
+def test_document_rejection_allows_prose_starting_with_a_bracket():
+    from music_video_producer.director import document_rejection
+
+    prose = "[Opening] The performer steps into frame under a single amber bulb."
+    assert document_rejection(prose, "An existing treatment of similar length here.") == ""

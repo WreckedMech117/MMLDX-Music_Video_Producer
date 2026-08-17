@@ -91,7 +91,7 @@ def build_h3_director_payload(
     *,
     timeline_data: str,
     duration: float,
-    requested_frames: int,
+    requested_frames: int,  # must already sit on H3's 17k+5 grid; see timeline.align_h3_frames
     seed: int,
     width: int,
     height: int,

@@ -33,3 +33,6 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
+# Vendored agent tooling, not this project's source. Excluded so `ruff check .`
+# remains a meaningful gate on application code.
+extend-exclude = [".claude", "_bmad", "_bmad-output"]

@@ -84,3 +84,24 @@ async def test_comfy_client_normalizes_successful_history_status():
 
     assert result.status == "complete"
     assert result.outputs[0]["filename"] == "done.png"
+
+
+@pytest.mark.asyncio
+async def test_queue_state_distinguishes_running_from_pending():
+    """History is empty for both waiting and executing prompts; only the queue separates them."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/queue"
+        return httpx.Response(
+            200,
+            json={
+                "queue_running": [[0, "running-id", {}, {}]],
+                "queue_pending": [[1, "pending-id", {}, {}]],
+            },
+        )
+
+    client = ComfyClient("http://comfy", transport=httpx.MockTransport(handler))
+    assert await client.queue_state("running-id") == "running"
+    assert await client.queue_state("pending-id") == "queued"
+    assert await client.queue_state("finished-id") == "absent"
+    await client.close()
