@@ -105,6 +105,17 @@ class Project(BaseModel):
     creative_brief: str = ""
     treatment: str = ""
     style_bible: str = ""
+    # Single-slot recovery per AD-14: the one value an applied Director replacement
+    # overwrote, and nothing older. A rejected or locked candidate leaves these alone —
+    # capturing on attempt rather than on apply would let a refused candidate destroy the
+    # only copy of the document the refusal exists to protect.
+    treatment_previous: str = ""
+    style_bible_previous: str = ""
+    # Per-document locks, mirroring `Shot.locked`: the Director's "do not touch this" for a
+    # creative document. Every field here is defaulted so manifests written before this
+    # existed load unchanged.
+    treatment_locked: bool = False
+    style_bible_locked: bool = False
     song: Song | None = None
     assets: list[Asset] = Field(default_factory=list)
     shots: list[Shot] = Field(default_factory=list)

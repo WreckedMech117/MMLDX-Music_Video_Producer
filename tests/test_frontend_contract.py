@@ -7,16 +7,20 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from music_video_producer.app import (
+    DOCUMENT_LABELS,
+    DOCUMENT_RESTORE_REFUSAL,
     SONG_REPLACEMENT_CONSEQUENCE,
     MusicRequest,
     SongPlannerRequest,
     _require_song_replacement_confirmation,
+    document_restore_notice,
 )
 from music_video_producer.models import Project, Shot, Song
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
 API_JS = Path("src/music_video_producer/web/assets/api.js")
 INDEX_HTML = Path("src/music_video_producer/web/index.html")
+STYLES_CSS = Path("src/music_video_producer/web/assets/styles.css")
 
 # Every preset the markup actually offers, and the endpoint it must resolve to.
 # A typo in either the markup or the mapping must not silently route a cover
@@ -37,6 +41,29 @@ def markup_preset_values() -> list[str]:
     return re.findall(r'<option value="([^"]+)"', select.group(0))
 
 
+def app_js_block(anchor: str, terminator: str = "\n}") -> str:
+    """The source of one app.js function or handler, for the DOM code no import can reach."""
+    source = APP_JS.read_text(encoding="utf-8")
+    assert anchor in source, anchor
+    return source.split(anchor, 1)[1].split(terminator, 1)[0]
+
+
+def without_comments(source: str) -> str:
+    """`source` with its `//` comment lines dropped, so assertions are about code only."""
+    return "\n".join(line for line in source.splitlines() if not line.strip().startswith("//"))
+
+
+def scoped_control_group(document_tab: str) -> str:
+    """The markup of the controls group scoped to one document tab."""
+    group = re.search(
+        rf'<div class="document-scoped" data-doc-controls="{document_tab}">.*?</div>',
+        INDEX_HTML.read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert group, f"no per-document controls group is scoped to the {document_tab} tab"
+    return group.group(0)
+
+
 def run_module(script: str):
     result = subprocess.run(
         ["node", "--input-type=module", "--eval", script],
@@ -45,6 +72,14 @@ def run_module(script: str):
         text=True,
     )
     return json.loads(result.stdout)
+
+
+def document_controls() -> dict:
+    """api.js's one table of per-document selectors, project fields and document tab."""
+    return run_module("""
+      import { DOCUMENT_CONTROLS } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(DOCUMENT_CONTROLS));
+    """)
 
 
 def test_async_project_submit_keeps_stable_form_reference():
@@ -519,6 +554,434 @@ def test_every_song_change_handler_confirms_before_it_sends():
     # Every consequence sentence comes from the one constant, not from a handler's string.
     for wording in ("Shot windows", "Assembly synchronization"):
         assert source.count(wording) == 0, wording
+
+
+def test_document_restore_wording_agrees_on_both_sides():
+    """One sentence for a restore, and one for refusing it, executed on both sides.
+
+    The Director reads the browser's toast and the thread's stored line for the same act, so
+    two wordings would describe one event differently. The refusal marker is asserted to be
+    a real substring of the server's own refusal, or the client's recovery path would stop
+    recognising a 409 the moment the server's phrasing changed.
+    """
+    script = """
+      import { DOCUMENT_LABELS, DOCUMENT_RESTORE_REFUSAL_MARKER, documentRestoreNotice }
+        from './src/music_video_producer/web/assets/api.js';
+      const attempt = (fn) => { try { return fn(); } catch (error) { return `THREW: ${error.message}`; } };
+      console.log(JSON.stringify({
+        labels: DOCUMENT_LABELS,
+        marker: DOCUMENT_RESTORE_REFUSAL_MARKER,
+        notices: {
+          treatment: documentRestoreNotice('treatment'),
+          style_bible: documentRestoreNotice('style_bible'),
+        },
+        unknown: attempt(() => documentRestoreNotice('creative_brief')),
+      }));
+    """
+
+    browser = run_module(script)
+
+    assert browser["labels"] == DOCUMENT_LABELS
+    for document in DOCUMENT_LABELS:
+        assert browser["notices"][document] == document_restore_notice(document), document
+        # The sentence has to say the swap is reversible; single-slot recovery the Director
+        # is afraid to use is not recovery.
+        assert "swaps back" in browser["notices"][document], document
+        # And that no model was involved, which is the point of the route existing.
+        assert "No Director call was made" in browser["notices"][document], document
+    assert browser["marker"] in DOCUMENT_RESTORE_REFUSAL
+    # A document the server has no field for must throw rather than toast "undefined".
+    assert "THREW: Unknown document" in browser["unknown"]
+
+
+def test_restore_reaches_a_real_route_and_sends_no_chat_message():
+    """Restore must never travel through the Director, in the client half as well.
+
+    Asserted three ways because each could pass alone: the api client sends no body at all
+    to a POST route the app really exposes, and the handler neither builds a message nor
+    touches `api.directorChat`. A restore that quietly went through chat would risk a second
+    unwanted rewrite while claiming to undo the first.
+    """
+    from music_video_producer.app import create_app
+
+    api_source = API_JS.read_text(encoding="utf-8")
+    call = api_source.split("restoreDocument:", 1)[1].split("\n", 1)[0]
+
+    url = re.search(r"`([^`]+)`", call)
+    assert url, "api.restoreDocument no longer builds its URL from a template literal"
+    assert 'method: "POST"' in call
+    # No body, no headers, nothing to carry a message in.
+    assert "body:" not in call, call
+    assert "JSON.stringify" not in call, call
+
+    template = re.sub(r"\$\{[^}]+\}", "{}", url.group(1))
+    template = template.replace("/{}/documents/{}/", "/{project_id}/documents/{document}/")
+    assert template in {route.path for route in create_app().routes}, template
+
+    handler = app_js_block("async function restoreDocument")
+    assert "api.restoreDocument(state.project.id, documentKey)" in handler
+    assert "documentRestoreNotice(documentKey)" in handler
+    assert "directorChat" not in handler
+    assert "api.saveDocuments" not in handler
+    # Both controls route through this one function rather than reimplementing the call, and
+    # they are bound from the one control table so a document's selector is never respelled.
+    bindings = APP_JS.read_text(encoding="utf-8")
+    assert "for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS))" in bindings
+    assert '$(control.restore).addEventListener("click", () => restoreDocument(documentKey));' in bindings
+
+
+def test_document_save_sends_both_locks_so_the_toggles_are_not_decorative():
+    """`PUT /documents` reads an absent lock as "leave it alone", by design.
+
+    That is what stops an ordinary save from silently unlocking both documents — but it also
+    means a client that omits the locks can never set one, so the save path has to send them
+    every time.
+    """
+    handler = APP_JS.read_text(encoding="utf-8").split("async function saveProject", 1)[1].split("\n}", 1)[0]
+
+    assert 'treatment_locked: $("#lock-treatment").checked' in handler
+    assert 'style_bible_locked: $("#lock-style").checked' in handler
+    # The recovery slots are never sent: only an applied Director replacement writes them.
+    for forbidden in ("treatment_previous", "style_bible_previous"):
+        assert forbidden not in handler, forbidden
+
+
+def test_treatment_markup_exposes_every_control_the_app_dereferences():
+    """A missing id breaks startup, and nothing else in the suite would notice.
+
+    `bindEvents` runs during `init()` and dereferences all four control ids with no null
+    check, so removing one throws `TypeError: Cannot read properties of null` before anything
+    renders and the whole app fails to initialize. Deleting two of them left the suite green.
+
+    The ids are read from the same table app.js binds from, so a rename has to land in both
+    halves; and each pair must sit in a group scoped to its own document tab, or lock and
+    restore stay visible over the Creative brief, which has neither.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    controls = document_controls()
+
+    assert set(controls) == set(DOCUMENT_LABELS), controls
+    tabs = re.findall(r'<button[^>]*data-doc="([^"]+)"', markup)
+    for document, control in controls.items():
+        assert control["tab"] in tabs, f"{document} is scoped to a tab the markup does not offer"
+        group = scoped_control_group(control["tab"])
+        for role in ("lock", "restore"):
+            element_id = control[role].removeprefix("#")
+            assert f'id="{element_id}"' in markup, f"{document}: no #{element_id} for app.js to bind"
+            assert f'id="{element_id}"' in group, f"#{element_id} is not scoped to the {document} tab"
+    # And the tab handler is what does the scoping, or the groups never appear at all.
+    assert 'group.classList.toggle("active", group.dataset.docControls === button.dataset.doc)' in (
+        APP_JS.read_text(encoding="utf-8")
+    )
+
+
+def test_lock_checkboxes_are_seeded_from_their_own_locked_field():
+    """Losing the seeding silently unlocks both documents on the next ordinary save.
+
+    Deleting the two seeding lines left the suite green. With them gone a locked project loads
+    with both boxes unchecked, and because `PUT /documents` reads a *present* lock as an
+    instruction, the next save explicitly sends `locked: false` — defeating the route's
+    tri-state design from one layer up. The pairing is asserted, not just the presence: a
+    crossed wiring would unlock the document the Director did not touch.
+    """
+    controls = document_controls()
+
+    for document, control in controls.items():
+        assert control["lockedField"] == f"{document}_locked", control
+        assert control["lockedField"] in Project.model_fields, control["lockedField"]
+    assert len({control["lock"] for control in controls.values()}) == len(controls), controls
+
+    seeding = app_js_block("function syncDocumentControls")
+    assert "for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS))" in seeding
+    assert "$(control.lock).checked = Boolean(state.project?.[control.lockedField]);" in seeding
+    # Rendering the workspace has to seed them, or a locked project still loads unchecked.
+    assert "syncDocumentControls();" in app_js_block("function renderTreatment")
+
+
+def test_restore_button_enabled_state_derives_from_its_own_previous_slot():
+    """Replacing the `kept` computation with `true` left the suite green.
+
+    Both buttons are then always enabled, so a project with an empty slot offers a restore
+    that 409s — and the handler misdiagnoses its own bad offer as stale state and "refreshes" a
+    project that was never stale. The decision is a pure function so it can be executed here,
+    including crossed cases: one document's kept version must never enable the other's button.
+    """
+    controls = document_controls()
+    for document, control in controls.items():
+        assert control["previousField"] == f"{document}_previous", control
+        assert control["previousField"] in Project.model_fields, control["previousField"]
+
+    script = """
+      import { documentRestoreAvailable } from './src/music_video_producer/web/assets/api.js';
+      const attempt = (fn) => { try { return fn(); } catch (error) { return `THREW: ${error.message}`; } };
+      const treatmentOnly = { treatment_previous: 'kept treatment', style_bible_previous: '' };
+      const styleOnly = { treatment_previous: '', style_bible_previous: 'kept style bible' };
+      console.log(JSON.stringify({
+        keptTreatment: documentRestoreAvailable(treatmentOnly, 'treatment'),
+        crossedToStyle: documentRestoreAvailable(treatmentOnly, 'style_bible'),
+        keptStyle: documentRestoreAvailable(styleOnly, 'style_bible'),
+        crossedToTreatment: documentRestoreAvailable(styleOnly, 'treatment'),
+        whitespace: documentRestoreAvailable({ treatment_previous: '  \\n\\t ' }, 'treatment'),
+        missing: documentRestoreAvailable({}, 'treatment'),
+        noProject: documentRestoreAvailable(null, 'treatment'),
+        absent: documentRestoreAvailable(undefined, 'treatment'),
+        nonString: documentRestoreAvailable({ treatment_previous: 5 }, 'treatment'),
+        unknown: attempt(() => documentRestoreAvailable({}, 'creative_brief')),
+      }));
+    """
+
+    available = run_module(script)
+    assert available["keptTreatment"] is True
+    assert available["keptStyle"] is True
+    # A kept version of one document must not enable the other document's restore.
+    assert available["crossedToStyle"] is False
+    assert available["crossedToTreatment"] is False
+    for empty in ("whitespace", "missing", "noProject", "absent", "nonString"):
+        assert available[empty] is False, empty
+    assert "THREW: Unknown document" in available["unknown"]
+
+    # And that answer is what the button's state is, rather than a constant or a second rule.
+    seeding = app_js_block("function syncDocumentControls")
+    assert "const available = documentRestoreAvailable(state.project, documentKey);" in seeding
+    assert "button.disabled = !available;" in seeding
+    assert "documentRestoreTitle(documentKey, available)" in seeding
+
+
+def test_restore_refusal_is_recognised_and_recovered_from_rather_than_just_toasted():
+    """`documentRestoreRefusal` was never executed by the suite.
+
+    Changing it to an equality check left every test green, and the predicate then never
+    matches the server's real refusal sentence: the stale-project refresh silently stops
+    working and every retry fails identically against the same stale state. So the predicate is
+    executed against the server's own wording, an unrelated error, and a non-string.
+    """
+    refusal = DOCUMENT_RESTORE_REFUSAL.format(document=DOCUMENT_LABELS["treatment"])
+    script = f"""
+      import {{ documentRestoreRefusal, documentRestoreStaleNotice }}
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({{
+        refusal: documentRestoreRefusal({json.dumps(refusal)}),
+        other: documentRestoreRefusal('ComfyUI returned 400: prompt outputs failed validation'),
+        missing: documentRestoreRefusal(undefined),
+        nonString: documentRestoreRefusal(409),
+        keptAfterRefresh: documentRestoreStaleNotice('treatment', true),
+        emptyAfterRefresh: documentRestoreStaleNotice('treatment', false),
+      }}));
+    """
+
+    result = run_module(script)
+    assert result["refusal"] is True, "the predicate no longer matches the server's own refusal"
+    assert result["other"] is False
+    assert result["missing"] is False
+    assert result["nonString"] is False
+    # After the refresh, the refreshed project decides the wording: the refusal only proves
+    # this client was stale, so a project that does hold a kept version must not be reported
+    # as having none -- that tells the Director to stop trying one click short of working.
+    assert "does have a kept version" in result["keptAfterRefresh"]
+    assert DOCUMENT_LABELS["treatment"] in result["keptAfterRefresh"]
+    assert "No kept version" in result["emptyAfterRefresh"]
+
+    handler = app_js_block("async function restoreDocument")
+    assert "documentRestoreRefusal(error.message)" in handler
+    assert "api.project(" in handler, "a refusal must refresh the project, not just toast"
+    assert "renderAll();" in handler
+    assert (
+        "documentRestoreStaleNotice(documentKey, documentRestoreAvailable(state.project, documentKey))"
+        in handler
+    )
+
+
+def test_chat_toast_reports_what_changed_instead_of_asserting_an_update():
+    """The reply states what actually changed; the toast is the loudest thing on screen.
+
+    It used to claim "Treatment updated" unconditionally -- including when the document was
+    locked, when the guard rejected the candidate, and when the rewrite was identical. Derived
+    from the project before and after the call, so it cannot contradict the reply it sits next to.
+    """
+    script = """
+      import { documentChangeToast } from './src/music_video_producer/web/assets/api.js';
+      const before = { treatment: 'old treatment', style_bible: 'old style bible' };
+      console.log(JSON.stringify({
+        treatmentOnly: documentChangeToast(before, { ...before, treatment: 'new treatment' }),
+        styleOnly: documentChangeToast(before, { ...before, style_bible: 'new style bible' }),
+        both: documentChangeToast(before, { treatment: 'new t', style_bible: 'new s' }),
+        lockedOrRejected: documentChangeToast(before, { ...before }),
+        identicalRewrite: documentChangeToast(before, { ...before }),
+        firstEverFill: documentChangeToast({}, { treatment: 'first treatment' }),
+      }));
+    """
+
+    toasts = run_module(script)
+    assert "Treatment" in toasts["treatmentOnly"]
+    assert "Style bible" not in toasts["treatmentOnly"]
+    assert "Style bible" in toasts["styleOnly"]
+    assert "Treatment" not in toasts["styleOnly"]
+    for label in DOCUMENT_LABELS.values():
+        assert label in toasts["both"], label
+    # Nothing moved: the toast must say so rather than announce an update that never happened.
+    for unchanged in ("lockedOrRejected", "identicalRewrite"):
+        assert "no document changed" in toasts[unchanged], unchanged
+        for label in DOCUMENT_LABELS.values():
+            assert label not in toasts[unchanged], (unchanged, label)
+    assert "Treatment" in toasts["firstEverFill"]
+
+    handler = APP_JS.read_text(encoding="utf-8").split(
+        '$("#chat-form").addEventListener("submit"', 1
+    )[1].split("  });", 1)[0]
+    assert "const before = state.project;" in handler
+    assert "documentChangeToast(before, state.project)" in handler
+    # The old unconditional claim is gone from the whole module, in any handler.
+    assert "Treatment updated" not in APP_JS.read_text(encoding="utf-8")
+
+
+def test_editor_overwrites_warn_before_discarding_unsaved_edits_and_clear_the_flags():
+    """Unsaved textarea edits are the one loss this feature cannot undo.
+
+    A restore and a Director reply both re-render the editors from the server, and the captured
+    "previous version" is the *stored* text -- so on-screen edits are unrecoverable. Both paths
+    ask first, matching the `window.confirm` precedent on project switch, and both then clear
+    the dirty flags exactly as `saveProject` does: text that matches the server is not dirty,
+    and a project permanently flagged dirty teaches the Director to click through the one
+    question that protects real work.
+    """
+    guard = app_js_block("function confirmDiscardingDocumentEdits")
+    assert "state.documentsDirty" in guard
+    assert "window.confirm(" in guard
+    assert "UNSAVED_DOCUMENT_EDITS_CONSEQUENCE" in guard
+
+    source = APP_JS.read_text(encoding="utf-8")
+    handlers = {
+        "restore": (app_js_block("async function restoreDocument"), "api.restoreDocument("),
+        "chat": (
+            source.split('$("#chat-form").addEventListener("submit"', 1)[1].split("  });", 1)[0],
+            "api.directorChat(",
+        ),
+    }
+    for label, (handler, send) in handlers.items():
+        assert "confirmDiscardingDocumentEdits(" in handler, label
+        # Asked *before* the request, or the warning is theatre over an already-lost edit.
+        assert handler.index("confirmDiscardingDocumentEdits(") < handler.index(send), label
+        # Every re-render from the server clears the flags, asserted per re-render: the restore
+        # handler has two such paths, and clearing on only one leaves the project flagged dirty
+        # against text that already matches the server.
+        before_rerenders = handler.split("renderAll();")[:-1]
+        assert before_rerenders, label
+        for index, segment in enumerate(before_rerenders):
+            assert segment.rstrip().endswith("markDocumentsSaved();"), (label, index)
+
+    saved = app_js_block("function markDocumentsSaved")
+    assert "state.documentsDirty = false;" in saved
+    assert "state.dirty = state.shotsDirty;" in saved
+    # The ordinary save clears them through the same helper, so the three paths cannot drift.
+    assert "markDocumentsSaved();" in app_js_block("async function saveProject")
+
+    consequence = run_module("""
+      import { UNSAVED_DOCUMENT_EDITS_CONSEQUENCE } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ consequence: UNSAVED_DOCUMENT_EDITS_CONSEQUENCE }));
+    """)["consequence"].lower()
+    # It says *why* the edits cannot come back, not merely "are you sure".
+    assert "only stored text" in consequence
+    assert "unsaved edits cannot be restored" in consequence
+
+
+def test_lock_toggle_confirms_the_lock_and_reverts_the_control_when_the_save_fails():
+    """A generic "Project saved" says nothing about whether the document is now protected.
+
+    And a failed save leaves the checkbox asserting a lock the server does not have, which is
+    worse than not offering the control: the Director believes the document is protected while
+    the next reply is free to replace it. So the control reverts to the stored state on failure
+    -- the control only, since reverting the editors would discard unsaved typing.
+    """
+    script = """
+      import { documentLockNotice } from './src/music_video_producer/web/assets/api.js';
+      const attempt = (fn) => { try { return fn(); } catch (error) { return `THREW: ${error.message}`; } };
+      console.log(JSON.stringify({
+        treatmentLocked: documentLockNotice('treatment', true),
+        treatmentUnlocked: documentLockNotice('treatment', false),
+        styleLocked: documentLockNotice('style_bible', true),
+        unknown: attempt(() => documentLockNotice('creative_brief', true)),
+      }));
+    """
+
+    notices = run_module(script)
+    assert notices["treatmentLocked"].startswith(f"{DOCUMENT_LABELS['treatment']} is locked")
+    assert notices["treatmentUnlocked"].startswith(f"{DOCUMENT_LABELS['treatment']} is unlocked")
+    assert notices["styleLocked"].startswith(f"{DOCUMENT_LABELS['style_bible']} is locked")
+    assert "THREW: Unknown document" in notices["unknown"]
+
+    binding = app_js_block('$(control.lock).addEventListener("change"', "    });")
+    assert "documentLockNotice(documentKey, event.currentTarget.checked)" in binding
+    assert "Project saved" not in binding
+    assert "syncDocumentControls();" in binding
+    # Reverting through renderTreatment would overwrite the textareas from the server, which
+    # is the very discard this feature exists to stop.
+    assert "renderTreatment" not in binding
+    for editor in ("#treatment-text", "#style-bible", "#creative-brief"):
+        assert editor not in app_js_block("function syncDocumentControls"), editor
+
+    # The handler can only tell that the save failed because saveProject reports it.
+    save = app_js_block("async function saveProject")
+    assert "return true;" in save
+    assert "return false;" in save
+    # A click handler must not be handed the event as the toast wording.
+    for selector in ('$("#save-project")', '$("#save-treatment")'):
+        assert f'{selector}.addEventListener("click", () => saveProject());' in (
+            APP_JS.read_text(encoding="utf-8")
+        ), selector
+
+
+def test_system_audit_line_is_visually_distinct_from_director_prose():
+    """The restore line is the audit trail, rendered into the same thread as Director prose.
+
+    Only `.message.user` and `.message.assistant` were styled, so the audit record was
+    indistinguishable from something the Director said. Its colours come from the existing
+    palette tokens -- an invented hex here would drift from every other surface.
+    """
+    css = STYLES_CSS.read_text(encoding="utf-8")
+
+    rule = re.search(r"\.message\.system\s*\{([^}]*)\}", css)
+    assert rule, "the restore audit line has no style of its own"
+    body = rule.group(1)
+    for role in (r"\.message\.user", r"\.message\.assistant"):
+        assert re.search(role + r"\s*\{", css), role
+
+    tokens = re.findall(r"var\((--[\w-]+)\)", body)
+    assert tokens, body
+    root = re.search(r":root\s*\{(.*?)\n\}", css, re.DOTALL)
+    assert root, "styles.css no longer declares its palette on :root"
+    for token in tokens:
+        assert f"{token}:" in root.group(1), f"{token} is not a palette token"
+    # No new colour: every colour in the rule is a token, not a literal.
+    assert not re.search(r"#[0-9a-fA-F]{3,8}", body), body
+    # And the role reaches the stylesheet at all.
+    assert 'class="message ${message.role}"' in APP_JS.read_text(encoding="utf-8")
+
+
+def test_document_prose_names_come_only_from_the_label_mapping():
+    """`DOCUMENT_LABELS` exists to centralise what each document is called on screen.
+
+    The restore handler, the control render and the markup's own labels each spelled the names
+    out again, so a rename could leave a button, a tooltip and a toast disagreeing about the
+    same document -- and nothing covered any of them.
+    """
+    controls = document_controls()
+
+    for label, excerpt in (
+        ("restore handler", app_js_block("async function restoreDocument")),
+        ("control sync", app_js_block("function syncDocumentControls")),
+        ("lock binding", app_js_block('$(control.lock).addEventListener("change"', "    });")),
+    ):
+        code = without_comments(excerpt).lower()
+        for prose in ("treatment", "style bible", "style-bible", "style_bible"):
+            assert prose not in code, f"{label} names {prose!r} instead of using the mapping"
+    assert "documentLabel(documentKey)" in APP_JS.read_text(encoding="utf-8")
+
+    # The markup cannot import the mapping, so the test is what keeps its wording agreeing.
+    for document, control in controls.items():
+        text = re.sub(r"<[^>]+>", " ", scoped_control_group(control["tab"])).lower()
+        label = DOCUMENT_LABELS[document].lower()
+        assert f"lock {label}" in " ".join(text.split()), (document, text)
+        assert f"restore {label}" in " ".join(text.split()), (document, text)
 
 
 def test_validation_errors_render_readable_field_messages():

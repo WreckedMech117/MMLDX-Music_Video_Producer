@@ -125,7 +125,16 @@
             <label class="document-editor active" data-doc-panel="brief"><span>Creative brief</span><textarea id="creative-brief" placeholder="Core idea, emotional arc, audience, constraints…"></textarea></label>
             <label class="document-editor" data-doc-panel="treatment"><span>Treatment</span><textarea id="treatment-text" placeholder="The structured treatment appears here…"></textarea></label>
             <label class="document-editor" data-doc-panel="style"><span>Visual continuity</span><textarea id="style-bible" placeholder="Color, lenses, lighting, wardrobe, locations, continuity rules…"></textarea></label>
-            <div class="document-actions"><button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="apply-shot-plan" disabled title="Explicit Director plan application is planned">Apply shot plan · planned</button></div>
+            <!-- Lock and restore belong to one document each, so they live in a group scoped to
+                 that document's tab: the Creative brief is never replaced by a Director reply and
+                 has neither control. The button and label wording is the DOCUMENT_LABELS spelling,
+                 asserted by tests/test_frontend_contract.py; the restore tooltips are set from the
+                 same mapping by syncDocumentControls rather than duplicated here. -->
+            <div class="document-actions">
+              <div class="document-scoped" data-doc-controls="treatment"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-treatment">Lock Treatment</label><button class="quiet-button" id="restore-treatment" disabled>Restore Treatment</button></div>
+              <div class="document-scoped" data-doc-controls="style"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-style">Lock Style bible</label><button class="quiet-button" id="restore-style" disabled>Restore Style bible</button></div>
+              <button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="apply-shot-plan" disabled title="Explicit Director plan application is planned">Apply shot plan · planned</button>
+            </div>
           </div>
         </div>
       </section>

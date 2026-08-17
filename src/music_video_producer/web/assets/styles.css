@@ -118,6 +118,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .message { max-width: 85%; margin-bottom: 14px; padding: 11px 13px; border: 1px solid var(--line); border-radius: var(--radius); white-space: pre-wrap; line-height: 1.45; }
 .message.user { margin-left: auto; border-color: #53602b; background: #1b2014; }
 .message.assistant { background: var(--surface-2); }
+/* The restore audit line the server writes into the thread. Full width, cyan-edged and
+   quieter than Director prose: the thread is this feature's audit trail, so a record of what
+   happened to a document must not read as something the Director said. */
+.message.system { max-width: 100%; border-color: var(--line-strong); border-left: 3px solid var(--cyan); background: var(--surface-1); color: var(--muted); font-size: 12px; }
 .composer { padding: 12px; border-top: 1px solid var(--line); }
 .composer textarea { margin-bottom: 8px; }
 .composer > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
@@ -129,7 +133,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .document-editor { display: none; min-height: 0; margin: 0; padding: 16px; }
 .document-editor.active { display: grid; grid-template-rows: auto 1fr; }
 .document-editor textarea { resize: none; font-size: 14px; line-height: 1.6; }
-.document-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+.document-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+/* Per-document controls: shown only while their own document tab is active, so neither pair
+   is offered over the Creative brief, which has no lock and no kept version. */
+.document-scoped { display: none; align-items: center; gap: 8px; margin-right: auto; }
+.document-scoped.active { display: flex; }
+.lock-toggle { display: flex; align-items: center; gap: 6px; margin: 0 4px 0 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.lock-toggle input { width: 13px; height: 13px; accent-color: var(--acid); }
 .asset-layout { display: grid; grid-template-columns: 310px minmax(420px, 1fr) 270px; gap: 12px; height: calc(100% - 82px); min-height: 580px; }
 .generator-panel, .library-panel, .inspector, .shot-inspector { min-height: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
 .generator-panel { overflow: auto; padding: 15px; }

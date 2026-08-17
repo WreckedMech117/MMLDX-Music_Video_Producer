@@ -158,6 +158,141 @@ export function songChangeNeedsConfirmation(project) {
   return Boolean(project?.song) && Boolean(project?.shots?.length);
 }
 
+// The two creative documents a Director reply can replace, and what each is called on
+// screen. The server states the same mapping in app.py's DOCUMENT_LABELS; the keys are the
+// path segment the restore route accepts, so a rename here 404s rather than mislabelling.
+export const DOCUMENT_LABELS = { treatment: "Treatment", style_bible: "Style bible" };
+
+// Every per-document control, in one table: the two element ids the Treatment workspace
+// exposes, the project fields they read, and the document tab each pair belongs to. One
+// mapping because the alternative — a document's selectors, fields and prose name spelled
+// out again at the seed, render, bind and label sites — is exactly how a rename half-lands
+// and leaves a control wired to the other document. The field names are the ones the
+// restore route derives with `getattr(project, f"{document}_previous")`, so they cannot be
+// spelled differently here without the two halves disagreeing about the same slot.
+export const DOCUMENT_CONTROLS = {
+  treatment: {
+    tab: "treatment",
+    lock: "#lock-treatment",
+    restore: "#restore-treatment",
+    lockedField: "treatment_locked",
+    previousField: "treatment_previous",
+  },
+  style_bible: {
+    tab: "style",
+    lock: "#lock-style",
+    restore: "#restore-style",
+    lockedField: "style_bible_locked",
+    previousField: "style_bible_previous",
+  },
+};
+
+// One lookup for both tables, throwing rather than returning undefined: a document the
+// server has no field for must fail loudly here instead of rendering "undefined" into a
+// toast or silently binding a control to nothing.
+export function documentControls(document) {
+  const control = DOCUMENT_CONTROLS[document];
+  if (!control) throw new Error(`Unknown document: ${JSON.stringify(document)}`);
+  return control;
+}
+
+export function documentLabel(document) {
+  const label = DOCUMENT_LABELS[document];
+  if (!label) throw new Error(`Unknown document: ${JSON.stringify(document)}`);
+  return label;
+}
+
+// Pure: is anything actually recoverable for this document? The restore button's enabled
+// state is the answer to that question and nothing else — an always-enabled button offers a
+// restore the server refuses with 409, and the client then misreads its own bad offer as
+// stale state and "refreshes" a project that was never stale.
+export function documentRestoreAvailable(project, document) {
+  const previous = project?.[documentControls(document).previousField];
+  return typeof previous === "string" && previous.trim().length > 0;
+}
+
+// What the restore button says it will do, in the two states it has. Named from
+// DOCUMENT_LABELS so the tooltip, the toast and the markup's label are one spelling.
+export function documentRestoreTitle(document, available) {
+  const label = documentLabel(document);
+  return available
+    ? `Swap ${label} back to the version kept before the last applied replacement; no Director call is made`
+    : `No previous version of ${label} is kept yet; one is kept when a Director reply replaces it`;
+}
+
+// Toggling a lock is a change to how the *next* Director reply behaves, so the toast has to
+// confirm that change rather than report a generic save — "Project saved" tells the Director
+// nothing about whether the document is now protected.
+export const DOCUMENT_LOCK_SET_NOTICE =
+  "{document} is locked: a Director reply will not replace it, and no previous version is recorded for it.";
+export const DOCUMENT_LOCK_CLEARED_NOTICE =
+  "{document} is unlocked: a Director reply may replace it, keeping the previous version for restore.";
+
+export function documentLockNotice(document, locked) {
+  const wording = locked ? DOCUMENT_LOCK_SET_NOTICE : DOCUMENT_LOCK_CLEARED_NOTICE;
+  return wording.replace("{document}", documentLabel(document));
+}
+
+// What to say after a refused restore has been recovered from by refreshing. The refreshed
+// project decides which sentence is true: the refusal only means *this client* was stale, so
+// claiming no kept version exists would contradict the very state just fetched — and would
+// tell the Director to stop trying when one more click would work.
+export function documentRestoreStaleNotice(document, available) {
+  const label = documentLabel(document);
+  return available
+    ? `${label} does have a kept version on the server; this project has been refreshed, so the restore can be tried again.`
+    : `No kept version of ${label} exists on the server; this project has been refreshed.`;
+}
+
+// What a Director reply actually did to the documents, computed from the project before and
+// after the call. The reply itself states which documents changed, were locked, or were
+// rejected; the toast is the most prominent feedback there is, so it must not assert an
+// update that may not have happened — a locked document, a rejected candidate and an
+// identical rewrite all leave the text exactly as it was.
+export const DOCUMENT_CHANGE_TOAST =
+  "{documents} replaced by this reply; existing shots preserved and the previous version kept.";
+export const DOCUMENT_UNCHANGED_TOAST =
+  "The Director replied and no document changed; the reply says what it proposed and why it was not applied.";
+
+export function documentChangeToast(before, after) {
+  const changed = Object.keys(DOCUMENT_LABELS).filter(
+    (document) => (before?.[document] ?? "") !== (after?.[document] ?? ""),
+  );
+  if (!changed.length) return DOCUMENT_UNCHANGED_TOAST;
+  return DOCUMENT_CHANGE_TOAST.replace("{documents}", changed.map(documentLabel).join(" and "));
+}
+
+// The consequence of letting the server's text overwrite the editors, stated before any path
+// does it. Recovery captures the *stored* text, so unsaved on-screen edits are the one thing
+// this feature cannot bring back — discarding them silently would reintroduce the exact loss
+// mode it exists to eliminate.
+export const UNSAVED_DOCUMENT_EDITS_CONSEQUENCE =
+  "The document editors have unsaved edits. Continuing replaces their text with the version stored on the " +
+  "server, and only stored text is ever kept as a recoverable version, so unsaved edits cannot be restored " +
+  "afterwards. Cancel and save the document first to keep them.";
+
+// The one wording for a restore, mirroring app.py's DOCUMENT_RESTORE_NOTICE so the toast
+// the Director reads is the same sentence the thread records. It says the swap is
+// symmetric on purpose: single-slot recovery nobody dares use is not recovery.
+export const DOCUMENT_RESTORE_NOTICE =
+  "{document} was restored to the version kept before the last applied replacement. " +
+  "No Director call was made. The text that was replaced is now the kept version, so " +
+  "restoring again swaps back.";
+
+export function documentRestoreNotice(document) {
+  return DOCUMENT_RESTORE_NOTICE.replace("{document}", documentLabel(document));
+}
+
+// True when a rejection is the restore route refusing because no version was ever kept.
+// The controls are disabled when the loaded project has an empty slot, so a refusal means
+// this client is looking at stale state -- the same recovery shape as SONG_REFUSAL_MARKER.
+// Keyed on a phrase from the server's own refusal so the two cannot drift apart silently.
+export const DOCUMENT_RESTORE_REFUSAL_MARKER = "nothing to restore";
+
+export function documentRestoreRefusal(message) {
+  return typeof message === "string" && message.includes(DOCUMENT_RESTORE_REFUSAL_MARKER);
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.
@@ -191,6 +326,9 @@ export const api = {
   createProject: (name) => request("/api/projects", { method: "POST", headers: jsonHeaders, body: JSON.stringify({ name }) }),
   saveProject: (project) => request(`/api/projects/${project.id}`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(project) }),
   saveDocuments: (id, documents) => request(`/api/projects/${id}/documents`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(documents) }),
+  // Recovery must not depend on the model that caused the problem, so this is its own
+  // route and carries no message: nothing here reaches the Director.
+  restoreDocument: (id, document) => request(`/api/projects/${id}/documents/${document}/restore`, { method: "POST" }),
   saveShots: (id, shots) => request(`/api/projects/${id}/shots`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ shots }) }),
   uploadSong: (id, data) => request(`/api/projects/${id}/songs/upload`, { method: "POST", body: data }),
   // The flag is the Director's acknowledgement, so it is passed through rather than

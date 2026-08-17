@@ -65,6 +65,107 @@ SONG_REPLACEMENT_CONSEQUENCE = (
 )
 
 
+# The creative documents a Director reply can replace, keyed by field name. One mapping,
+# and everything else about them is derived from it: the field names the guard loop reaches
+# by interpolation, the slots kept out of the model's context, and the labels used on
+# screen. Adding a third document must not require finding four other places, because the
+# one that gets missed silently leaks a document's kept copy back into every prompt.
+# `api.js`'s DOCUMENT_LABELS is the frontend half; tests assert both sides, the
+# `DocumentName` literal, and `Project`'s actual fields all agree.
+DOCUMENT_LABELS = {"treatment": "Treatment", "style_bible": "Style bible"}
+DocumentName = Literal["treatment", "style_bible"]
+
+# What the Director's project dump leaves out. The recovery slots are *derived* from the
+# mapping rather than listed, so a document added to it cannot have its kept copy echoed
+# into the prompt by omission. See `director_chat` for why that matters.
+DIRECTOR_CONTEXT_EXCLUDE: dict[str, Any] = {
+    "jobs": True,
+    "messages": {"__all__": {"id", "created_at"}},
+    **{f"{field}_previous": True for field in DOCUMENT_LABELS},
+}
+
+# The one wording for *what changed*. `document_rejection` has always told the Director
+# what was not applied; nothing told them what was, which is exactly how a plausible
+# unrequested rewrite became permanent and invisible. This says which documents moved and
+# that the previous version is recoverable, because a change nobody is told about cannot
+# be reviewed.
+DOCUMENT_CHANGE_NOTICE = (
+    "Replaced by this reply: {documents}. The version each one had before this reply is "
+    "kept and can be restored from the Treatment workspace, which discards nothing else."
+)
+
+# Filling a blank document is not a replacement, and must not be described as one. The
+# guard deliberately accepts any first draft into an empty target, so the recovery slot it
+# captures is empty too and a restore would refuse — promising recovery here would be a
+# promise the restore route breaks.
+DOCUMENT_FIRST_DRAFT_NOTICE = (
+    "Written for the first time by this reply: {documents}. Each was empty beforehand, so "
+    "there is no previous version to restore; one is kept the next time a reply replaces it."
+)
+
+# The one wording for a locked document. Emitted only when the candidate would genuinely
+# have changed something, or a project with a locked Treatment would carry this paragraph
+# on every reply forever — including replies where the model simply echoed the current text
+# back. It also states the scope of the lock: the Director is stopped, the human is not.
+DOCUMENT_LOCK_NOTICE = (
+    "{document} is locked, so the replacement this reply proposed was not applied and no "
+    "previous version was recorded. A lock only stops the Director: you can still edit the "
+    "document yourself, restore a kept version, or unlock it in the Treatment workspace."
+)
+
+# The one wording for a restore, and for refusing one. `api.js`'s DOCUMENT_RESTORE_NOTICE
+# and DOCUMENT_RESTORE_REFUSAL_MARKER are the frontend halves, so the toast the Director
+# reads and the message stored in the thread cannot drift apart.
+#
+# A restore is a *swap*, not a pop: the text being replaced moves into the recovery slot,
+# so a restore is normally its own inverse and a mis-click costs nothing. Saying so is the
+# whole point — single-slot recovery the Director is afraid to use is not recovery.
+DOCUMENT_RESTORE_NOTICE = (
+    "{document} was restored to the version kept before the last applied replacement. "
+    "No Director call was made. The text that was replaced is now the kept version, so "
+    "restoring again swaps back."
+)
+# ...except when the text being displaced is empty. An empty slot has to refuse, so that
+# restore is one-way, and claiming reversibility exactly where the recovered text matters
+# most would be the one lie this feature cannot afford.
+DOCUMENT_RESTORE_ONE_WAY_NOTICE = (
+    "{document} was restored to the version kept before the last applied replacement. "
+    "No Director call was made. The document it replaced was empty, so nothing recoverable "
+    "was displaced and there is nothing to swap back to: this restore is one-way."
+)
+DOCUMENT_RESTORE_REFUSAL = (
+    "No previous version of {document} was kept, so there is nothing to restore. A version "
+    "is only kept when a Director reply actually replaces the document."
+)
+
+
+def document_change_notice(labels: list[str]) -> str:
+    """State which documents this reply replaced, from the one wording above.
+
+    This one has no JavaScript half and needs none: it is written into the chat thread the
+    browser renders verbatim, so mirroring it client-side would be an unused second copy
+    of a sentence — the drift this pattern exists to prevent.
+    """
+    return DOCUMENT_CHANGE_NOTICE.format(documents=", ".join(labels))
+
+
+def document_first_draft_notice(labels: list[str]) -> str:
+    """State which documents this reply filled from blank. See DOCUMENT_FIRST_DRAFT_NOTICE."""
+    return DOCUMENT_FIRST_DRAFT_NOTICE.format(documents=", ".join(labels))
+
+
+def document_restore_notice(document: DocumentName, *, reversible: bool = True) -> str:
+    """Confirm a restore, from the one wording above. Mirrored by `documentRestoreNotice`.
+
+    `reversible` defaults to the ordinary case — a non-empty document displaced into the
+    recovery slot, so restoring again swaps back — which is the sentence the frontend
+    mirrors. The route passes it explicitly, because a restore over an empty document is
+    one-way and must not claim otherwise.
+    """
+    template = DOCUMENT_RESTORE_NOTICE if reversible else DOCUMENT_RESTORE_ONE_WAY_NOTICE
+    return template.format(document=DOCUMENT_LABELS[document])
+
+
 def _require_song_replacement_confirmation(project: Project, confirmed: bool) -> None:
     """Refuse an unacknowledged Song change once the project has shots.
 
@@ -162,6 +263,16 @@ class ProjectDocumentsRequest(BaseModel):
     creative_brief: str = ""
     treatment: str = ""
     style_bible: str = ""
+    # Locks are tri-state on the wire: `None` means "leave the stored lock as it is". Every
+    # other field here defaults to "", which is why an omitted one blanks its document —
+    # a lock defaulting to False the same way would silently unlock both documents on every
+    # ordinary save, and the save path would quietly defeat the feature.
+    #
+    # The recovery slots are deliberately absent from this model. Only an applied Director
+    # replacement writes them; a save cannot forge, clear, or advance a kept version, and
+    # because the route mutates the *stored* project they survive untouched.
+    treatment_locked: bool | None = None
+    style_bible_locked: bool | None = None
 
 
 def _safe_filename(value: str) -> str:
@@ -361,6 +472,17 @@ def create_app(
         # not a replacement.
         if project.song != current.song:
             _require_song_replacement_confirmation(current, confirm_song_replacement)
+        # The recovery slots and the document locks are server-owned, and this route binds a
+        # whole client-supplied `Project` whose every field is defaulted. A body that simply
+        # omits them — which is what any client written before they existed sends — arrives
+        # as ""/False, so trusting it lets one ordinary save clear both kept versions and
+        # unlock both documents: exactly what AD-14 and the lock exist to prevent. Worse, a
+        # body that *invents* a slot would be planting text that the restore route then swaps
+        # into the live document as "the version you had before". Only an applied Director
+        # replacement writes a slot, and only `PUT /documents` sets a lock.
+        for field in DOCUMENT_LABELS:
+            for owned in (f"{field}_previous", f"{field}_locked"):
+                setattr(project, owned, getattr(current, owned))
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -375,6 +497,54 @@ def create_app(
         project.creative_brief = request.creative_brief
         project.treatment = request.treatment
         project.style_bible = request.style_bible
+        # A lock stops the *Director* from replacing a document; it does not stop the human
+        # who set it from typing in the textarea, so the text above is assigned either way.
+        # Refusing an edit here would leave the Director unable to fix a locked document
+        # without unlocking, saving, editing, and locking again.
+        if request.treatment_locked is not None:
+            project.treatment_locked = request.treatment_locked
+        if request.style_bible_locked is not None:
+            project.style_bible_locked = request.style_bible_locked
+        return store.save(project)
+
+    @app.post("/api/projects/{project_id}/documents/{document}/restore", response_model=Project)
+    def restore_document(project_id: str, document: DocumentName) -> Project:
+        """Swap a document with its single kept previous version. No Director call.
+
+        Recovery has to be reachable without the model: the failure it exists for is the
+        Director returning something unwanted, and asking that same Director to undo it
+        risks a second unwanted rewrite. This route reads and writes stored text only.
+
+        The swap is normally symmetric, so the operation is its own inverse and a mis-click
+        is recoverable — but not when the document being displaced is empty, because an
+        empty slot has to refuse. That case is real and is the one where the recovered text
+        matters most, so it is reported as one-way rather than promised reversible.
+
+        A locked document may still be restored: a lock stops the Director, not the human
+        who set it, exactly as `PUT /documents` still accepts hand edits to a locked
+        document. `DOCUMENT_LOCK_NOTICE` states that scope, and a route test pins it.
+
+        An empty slot refuses with 409 rather than silently blanking the live document with
+        "" — the exact data loss AD-14 exists to stop.
+        """
+        project = get_project(project_id)
+        previous = getattr(project, f"{document}_previous")
+        if not previous.strip():
+            raise HTTPException(
+                status_code=409,
+                detail=DOCUMENT_RESTORE_REFUSAL.format(document=DOCUMENT_LABELS[document]),
+            )
+        displaced = getattr(project, document)
+        setattr(project, f"{document}_previous", displaced)
+        setattr(project, document, previous)
+        # Recorded in the thread, not only toasted: the chat is the audit trail of what
+        # happened to these documents, and a restore is as much a change as a replacement.
+        project.messages.append(
+            TreatmentMessage(
+                role="system",
+                content=document_restore_notice(document, reversible=bool(displaced.strip())),
+            )
+        )
         return store.save(project)
 
     @app.post("/api/projects/{project_id}/songs/upload", response_model=Project)
@@ -853,30 +1023,73 @@ def create_app(
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)
     async def director_chat(project_id: str, request: DirectorRequest) -> Project:
-        project = get_project(project_id)
-        project.messages.append(TreatmentMessage(role="user", content=request.message))
-        context = project.model_dump(
-            mode="json",
-            exclude={"jobs": True, "messages": {"__all__": {"id", "created_at"}}},
-        )
+        # This snapshot is only ever used to build the prompt. It carries the user's message
+        # so the model sees the turn it is answering, and it is then thrown away — see the
+        # re-read after the await.
+        snapshot = get_project(project_id)
+        snapshot.messages.append(TreatmentMessage(role="user", content=request.message))
+        # The recovery slots are excluded, and that is not an optimisation. This dump is the
+        # whole project, so leaving them in would echo a second full copy of both documents
+        # into every prompt — and the recorded root cause of the original document
+        # corruption was degradation under rich context (JSON in context begets JSON), the
+        # very failure `document_rejection` was written to catch. The locks stay: they are
+        # two booleans, and knowing a document is off-limits is useful direction.
+        context = snapshot.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
         try:
             result = await director.plan(message=request.message, project_context=context)
         except DirectorUnavailable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except DirectorError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
+        # Re-read after the await. A local model can hold this call open for many seconds,
+        # and anything committed in that window — a lock set, a restore applied, a document
+        # hand-edited — would otherwise be silently reverted by the stale snapshot on save.
+        # Every decision below reads the fresh state: the lock that says do not touch this,
+        # the existing text the guard compares against, and the slot being spent.
+        project = get_project(project_id)
+        project.messages.append(TreatmentMessage(role="user", content=request.message))
         notices: list[str] = []
-        for label, candidate, existing in (
-            ("Treatment", result.treatment, project.treatment),
-            ("Style bible", result.style_bible, project.style_bible),
-        ):
+        replaced: list[str] = []
+        first_drafts: list[str] = []
+        for field, label in DOCUMENT_LABELS.items():
+            candidate = getattr(result, field)
+            existing = getattr(project, field)
+            # A candidate identical to the stored text is not a replacement, whatever the
+            # guard says about it — `document_rejection` returns "" for an echo. Spending
+            # the single recovery slot on it would annihilate the genuinely recoverable
+            # version with a copy of the live one, and announcing it would be a change the
+            # Director cannot find. Nothing captured, nothing assigned, nothing claimed.
+            if candidate.strip() == existing.strip():
+                continue
             reason = document_rejection(candidate, existing)
+            # The lock is checked after the comparisons but before anything is written, so
+            # nothing is assigned and nothing is captured — the lock must not spend the
+            # recovery slot on a replacement it refused to make. It is *reported* only when
+            # the candidate would genuinely have changed something, or a project with a
+            # locked Treatment would carry the same paragraph on every reply forever.
+            if getattr(project, f"{field}_locked"):
+                if not reason:
+                    notices.append(DOCUMENT_LOCK_NOTICE.format(document=label))
+                continue
             if reason:
                 notices.append(f"{label} was NOT replaced: {reason}. Raw output: {candidate[:400]}")
-            elif label == "Treatment":
-                project.treatment = candidate
-            else:
-                project.style_bible = candidate
+                continue
+            # Capture on apply, never on attempt. Writing the recovery slot before the
+            # guard ran would let a rejected candidate overwrite the only copy of the good
+            # document — turning a protective refusal into the data loss it prevents.
+            setattr(project, f"{field}_previous", existing)
+            setattr(project, field, candidate)
+            # A blank target accepts any first draft, by design, so the slot it captures is
+            # empty and a restore would refuse. Reported separately: describing that as a
+            # replacement whose previous version "can be restored" is a promise broken by
+            # the very next click.
+            (first_drafts if not existing.strip() else replaced).append(label)
+        # Both statements go ahead of the "was NOT replaced" notices: what did change is what
+        # the Director has to review, and it is the thing this reply used to never mention.
+        if first_drafts:
+            notices.insert(0, document_first_draft_notice(first_drafts))
+        if replaced:
+            notices.insert(0, document_change_notice(replaced))
         if request.apply_shots and not result.shots:
             notices.append(
                 "No shot plan was applied: the model returned an empty shot list. "

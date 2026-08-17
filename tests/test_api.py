@@ -1,13 +1,22 @@
+import json
 import subprocess
 import wave
 from io import BytesIO
 from pathlib import Path
+from typing import get_args
 
 from fastapi.testclient import TestClient
 
-from music_video_producer.app import create_app
+from music_video_producer.app import (
+    DIRECTOR_CONTEXT_EXCLUDE,
+    DOCUMENT_LABELS,
+    DOCUMENT_LOCK_NOTICE,
+    DocumentName,
+    create_app,
+)
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
+from music_video_producer.director import DirectorResult
 from music_video_producer.models import Asset, Project, Shot, Song
 from music_video_producer.store import ProjectStore
 
@@ -953,6 +962,15 @@ def test_director_never_overwrites_a_document_with_json(tmp_path: Path):
     notice = saved.messages[-1].content
     assert "Style bible was NOT replaced" in notice
     assert "empty shot list" in notice
+    # A rejected candidate must leave the recovery slot alone as well as the document.
+    # Capturing before the guard ran would have spent the single slot on the rejection,
+    # overwriting the only copy of the good style bible — the guard destroying the very
+    # thing it exists to protect. The applied replacement does capture, in the same call.
+    assert saved.style_bible_previous == ""
+    assert saved.treatment_previous == "The original treatment the Director wrote by hand."
+    # And the reply now says what *did* change, not only what did not.
+    # The list ends at the Treatment, so the rejected style bible is not claimed as changed.
+    assert "Replaced by this reply: Treatment." in notice
 
 
 def test_director_reports_shots_outside_the_h3_window(tmp_path: Path):
@@ -981,6 +999,609 @@ def test_director_reports_shots_outside_the_h3_window(tmp_path: Path):
     saved = store.get(project.id)
     assert "outside MiniMax H3's reliable 4-15s window" in saved.messages[-1].content
     assert len(saved.shots) == 1  # still applied; the Director decides what to do about it
+
+
+class RevisingDirector(FakeDirector):
+    """Returns a different, guard-passing pair of documents on every call.
+
+    Also records each `project_context` it was handed, which is the only way to assert what
+    the prompt actually carried.
+    """
+
+    def __init__(self):
+        self.calls = 0
+        self.contexts: list[dict] = []
+
+    async def plan(self, message, project_context):
+        self.calls += 1
+        self.contexts.append(project_context)
+        return type(
+            "DirectorResult",
+            (),
+            {
+                "message": f"Revision {self.calls}.",
+                "treatment": f"Treatment revision {self.calls}, written long enough to clear the floor.",
+                "style_bible": f"Style bible revision {self.calls}, written long enough to clear it too.",
+                "shots": [],
+            },
+        )()
+
+
+class RefusingDirector(FakeDirector):
+    """Fails the test if it is called at all — restore must never reach the model."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def plan(self, message, project_context):
+        self.calls += 1
+        raise AssertionError("the Director was called on a path that must not call it")
+
+
+class EchoDirector(FakeDirector):
+    """Returns the project's stored documents straight back — the "nothing to say" reply.
+
+    Read out of the supplied context rather than hardcoded, so the echo is genuinely of
+    whatever the project holds. `document_rejection` returns "" for this, which is why the
+    guard alone treats it as an applied replacement.
+    """
+
+    async def plan(self, message, project_context):
+        return type(
+            "DirectorResult",
+            (),
+            {
+                "message": "Nothing to change.",
+                "treatment": project_context["treatment"],
+                "style_bible": project_context["style_bible"],
+                "shots": [],
+            },
+        )()
+
+
+class ConcurrentEditDirector(FakeDirector):
+    """Commits a change to the *stored* project while the LLM call is in flight.
+
+    Stands in for the real window a local model opens: `director.plan` can be held for many
+    seconds, and a lock set or a restore applied in that time is committed by another request
+    before the reply is saved.
+    """
+
+    def __init__(self, store: ProjectStore, project_id: str, edit):
+        self.store = store
+        self.project_id = project_id
+        self.edit = edit
+
+    async def plan(self, message, project_context):
+        during = self.store.get(self.project_id)
+        self.edit(during)
+        self.store.save(during)
+        return type(
+            "DirectorResult",
+            (),
+            {
+                "message": "Revision 1.",
+                "treatment": "Treatment revision 1, written long enough to clear the floor.",
+                "style_bible": "Style bible revision 1, written long enough to clear it too.",
+                "shots": [],
+            },
+        )()
+
+
+def documented_project(store: ProjectStore, name: str) -> Project:
+    """A project whose two creative documents both hold work worth losing."""
+    project = store.create(Project(name=name))
+    project.treatment = "The original treatment, written by hand over several sessions."
+    project.style_bible = "Sodium amber, hard backlight, 35mm grain, wardrobe continuity notes."
+    store.save(project)
+    return store.get(project.id)
+
+
+def test_applied_replacement_keeps_the_previous_version_and_names_what_changed(tmp_path: Path):
+    """FR-16's core: a replacement the Director never asked for is now visible and reversible.
+
+    Re-read through a *fresh* ProjectStore, because the response body is the in-memory
+    object the handler just built; only the manifest proves recovery survives a restart.
+    """
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Recoverable")
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Make it colder"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == "Treatment revision 1, written long enough to clear the floor."
+    assert saved.style_bible == "Style bible revision 1, written long enough to clear it too."
+    assert saved.treatment_previous == project.treatment
+    assert saved.style_bible_previous == project.style_bible
+    # Nothing in the reply used to say a document had changed at all, which is what made a
+    # plausible unrequested rewrite permanent *and* invisible.
+    notice = saved.messages[-1].content
+    assert "Replaced by this reply: Treatment, Style bible." in notice
+    assert "can be restored" in notice
+
+
+def test_repeat_replacement_keeps_only_the_immediately_previous_version(tmp_path: Path):
+    """AD-14 is single-slot by decision: recovery is one step back, never a history stack."""
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Single slot")
+
+    for message in ("Colder", "Colder still"):
+        assert (
+            client.post(
+                f"/api/projects/{project.id}/director/chat", json={"message": message}
+            ).status_code
+            == 200
+        )
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert director.calls == 2
+    assert saved.treatment == "Treatment revision 2, written long enough to clear the floor."
+    assert saved.treatment_previous == "Treatment revision 1, written long enough to clear the floor."
+    # The hand-written original is gone, and deliberately so — one slot, not a stack.
+    assert project.treatment not in (saved.treatment, saved.treatment_previous)
+
+
+def test_locked_document_is_not_replaced_and_records_no_previous_version(tmp_path: Path):
+    """FR-16's "locked fields are never modified", mirroring `Shot.locked`.
+
+    A lock must not spend the recovery slot either: a document that was never in play has
+    no previous version, and recording one would report a change that did not happen.
+    """
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Locked treatment")
+    project.treatment_locked = True
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Rewrite everything"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == project.treatment
+    assert saved.treatment_previous == ""
+    assert saved.treatment_locked is True
+    # The unlocked document still moves, so the lock is a per-document rule and not a
+    # whole-reply veto.
+    assert saved.style_bible == "Style bible revision 1, written long enough to clear it too."
+    assert saved.style_bible_previous == project.style_bible
+    notice = saved.messages[-1].content
+    assert "Treatment is locked" in notice
+    assert "Replaced by this reply: Style bible." in notice
+
+
+def test_locked_shot_survives_a_director_result(tmp_path: Path):
+    """The one lock that already existed, previously untested on this path."""
+    client, store = make_client_with_director(tmp_path, FakeDirector())
+    project = store.create(Project(name="Locked shot"))
+    project.shots = [
+        Shot(start=1.5, duration=6.25, prompt="Held wide on the corridor", locked=True),
+        Shot(start=20, duration=4, prompt="Chorus release"),
+    ]
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Retime the opening", "apply_shots": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    # FakeDirector proposes start 0 / duration 5 / "A widening corridor" for index 0.
+    assert saved.shots[0].start == 1.5
+    assert saved.shots[0].duration == 6.25
+    assert saved.shots[0].prompt == "Held wide on the corridor"
+    assert saved.shots[0].locked is True
+    # The shot the plan did not reach is kept rather than dropped.
+    assert saved.shots[1].prompt == "Chorus release"
+
+
+def test_restore_swaps_the_document_without_calling_the_director(tmp_path: Path):
+    """Recovery must not depend on the model whose output caused the problem.
+
+    The kept version is planted directly rather than produced by a chat, so the route is
+    exercised with a Director that raises if it is touched at all.
+    """
+    director = RefusingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Restore")
+    project.treatment = "The unwanted rewrite nobody asked for."
+    project.treatment_previous = "The original treatment, worth getting back."
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/documents/treatment/restore")
+
+    assert response.status_code == 200
+    assert director.calls == 0
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == "The original treatment, worth getting back."
+    # A swap, not a pop: the restore is itself reversible, so a mis-click costs nothing.
+    assert saved.treatment_previous == "The unwanted rewrite nobody asked for."
+    assert saved.style_bible == project.style_bible
+    assert saved.messages[-1].role == "system"
+    assert "Treatment was restored" in saved.messages[-1].content
+    assert "No Director call was made" in saved.messages[-1].content
+
+    again = client.post(f"/api/projects/{project.id}/documents/treatment/restore")
+    assert again.status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).treatment == "The unwanted rewrite nobody asked for."
+
+
+def test_restore_with_nothing_kept_is_refused_and_changes_nothing(tmp_path: Path):
+    """An empty slot must refuse, not blank the live document with "" — that is the loss."""
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Nothing kept")
+
+    response = client.post(f"/api/projects/{project.id}/documents/style_bible/restore")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "No previous version of Style bible was kept" in detail
+    assert "nothing to restore" in detail
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.style_bible == project.style_bible
+    assert saved.style_bible_previous == ""
+    assert saved.messages == []
+
+
+def test_document_save_preserves_recovery_and_lock_fields_and_can_set_the_locks(tmp_path: Path):
+    """The UI's ordinary save path must not defeat the feature.
+
+    Every text field on `ProjectDocumentsRequest` defaults to "", so an omitted one blanks
+    its document. A lock defaulting to False the same way would silently unlock both
+    documents on every save, and a recovery slot defaulting to "" would discard the kept
+    version — so locks are tri-state and the slots are not on the request model at all.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Ordinary save")
+    project.treatment_previous = "The version kept before the last replacement."
+    project.style_bible_previous = "The style bible kept before the last replacement."
+    project.treatment_locked = True
+    store.save(project)
+
+    untouched = client.put(
+        f"/api/projects/{project.id}/documents",
+        json={
+            "creative_brief": "A brief",
+            "treatment": "Hand-edited treatment text.",
+            "style_bible": project.style_bible,
+        },
+    )
+
+    assert untouched.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == "Hand-edited treatment text."
+    assert saved.treatment_previous == "The version kept before the last replacement."
+    assert saved.style_bible_previous == "The style bible kept before the last replacement."
+    # An omitted lock means "leave it alone", so a client that predates locks cannot unlock.
+    assert saved.treatment_locked is True
+    assert saved.style_bible_locked is False
+
+    setting = client.put(
+        f"/api/projects/{project.id}/documents",
+        json={
+            "creative_brief": "A brief",
+            "treatment": "Hand-edited treatment text.",
+            "style_bible": project.style_bible,
+            "treatment_locked": False,
+            "style_bible_locked": True,
+        },
+    )
+
+    assert setting.status_code == 200
+    relocked = ProjectStore(tmp_path).get(project.id)
+    assert relocked.treatment_locked is False
+    assert relocked.style_bible_locked is True
+    assert relocked.treatment_previous == "The version kept before the last replacement."
+
+
+def test_director_context_excludes_every_recovery_slot(tmp_path: Path):
+    """Not an optimisation. The recorded root cause of the original document corruption was
+    degradation under rich context, so echoing a second full copy of both documents into
+    every prompt makes the failure `document_rejection` exists for *more* likely.
+
+    Driven off `DOCUMENT_LABELS` rather than the two field names, so a document added to the
+    mapping is covered here without anyone remembering to extend this test — which is the
+    drift that would silently leak a kept copy back into the prompt.
+    """
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Context")
+    for field in DOCUMENT_LABELS:
+        setattr(project, f"{field}_previous", f"A kept {field} that must not reach the prompt.")
+    store.save(project)
+
+    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "Colder"})
+
+    context = director.contexts[0]
+    serialised = json.dumps(context)
+    for field in DOCUMENT_LABELS:
+        assert f"{field}_previous" not in context, field
+        assert "must not reach the prompt" not in serialised, field
+        # The live documents and the locks are still there: the model needs the current
+        # text, and a boolean saying a document is off-limits is useful direction.
+        assert context[field] == getattr(project, field), field
+        assert context[f"{field}_locked"] is False, field
+
+
+def test_document_mapping_field_names_and_context_exclusion_cannot_drift():
+    """One mapping, and everything derived from it — asserted, not assumed.
+
+    The guard loop reaches document fields by string interpolation (`f"{field}_previous"`),
+    so a name in `DOCUMENT_LABELS` that `Project` does not carry is an `AttributeError` at
+    request time rather than a startup failure, and a slot on `Project` that the mapping does
+    not know about is a full second copy of a document silently added to every prompt.
+    """
+    assert set(DOCUMENT_LABELS) == set(get_args(DocumentName))
+    for field in DOCUMENT_LABELS:
+        for owned in (field, f"{field}_previous", f"{field}_locked"):
+            assert owned in Project.model_fields, owned
+        # The loop reads the candidate off DirectorResult by the same name.
+        assert field in DirectorResult.model_fields, field
+        assert DIRECTOR_CONTEXT_EXCLUDE[f"{field}_previous"] is True, field
+    slots = {name for name in Project.model_fields if name.endswith("_previous")}
+    assert slots == {f"{field}_previous" for field in DOCUMENT_LABELS}
+    assert {name for name in DIRECTOR_CONTEXT_EXCLUDE if name.endswith("_previous")} == slots
+    # The exclusion is derived from the mapping rather than transcribed beside it, which is
+    # the whole reason the two cannot fall out of step.
+    assert DIRECTOR_CONTEXT_EXCLUDE["jobs"] is True
+
+
+def test_full_project_put_cannot_clear_the_slots_or_the_locks(tmp_path: Path):
+    """The sibling-route hole the Song story had, in its document form.
+
+    `replace_project` binds a whole client `Project` and every one of these four fields is
+    defaulted, so a body that merely *omits* them — which is what any client written before
+    they existed sends — arrives as ""/False. Trusting it means one ordinary save clears both
+    kept versions and unlocks both documents. Worse, a body that *invents* a slot would be
+    planting text the restore route then swaps into the live document as "the version you
+    had before".
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Full save")
+    project.treatment_previous = "The kept treatment an ordinary save must not discard."
+    project.style_bible_previous = "The kept style bible an ordinary save must not discard."
+    project.treatment_locked = True
+    project.style_bible_locked = True
+    store.save(project)
+
+    omitted = client.get(f"/api/projects/{project.id}").json()
+    for field in DOCUMENT_LABELS:
+        del omitted[f"{field}_previous"]
+        del omitted[f"{field}_locked"]
+    omitted["creative_brief"] = "Edited by a client that predates recovery."
+
+    response = client.put(f"/api/projects/{project.id}", json=omitted)
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.creative_brief == "Edited by a client that predates recovery."
+    assert saved.treatment_previous == "The kept treatment an ordinary save must not discard."
+    assert saved.style_bible_previous == "The kept style bible an ordinary save must not discard."
+    assert saved.treatment_locked is True
+    assert saved.style_bible_locked is True
+
+    forged = client.get(f"/api/projects/{project.id}").json()
+    forged["treatment_previous"] = "Text nobody ever wrote, planted to be restored later."
+    forged["treatment_locked"] = False
+
+    assert client.put(f"/api/projects/{project.id}", json=forged).status_code == 200
+    unforged = ProjectStore(tmp_path).get(project.id)
+    assert unforged.treatment_previous == "The kept treatment an ordinary save must not discard."
+    assert unforged.treatment_locked is True
+
+
+def test_identical_candidate_neither_spends_the_slot_nor_claims_a_change(tmp_path: Path):
+    """`document_rejection` returns "" for an echo, so the guard alone counts it as applied.
+
+    Capturing it overwrites the genuinely recoverable version with a copy of the live text —
+    the single slot annihilated by a reply that changed nothing — while the notice announces
+    a change the Director cannot find anywhere.
+    """
+    client, store = make_client_with_director(tmp_path, EchoDirector())
+    project = documented_project(store, "Echo")
+    project.treatment_previous = "The genuinely recoverable treatment."
+    project.style_bible_previous = "The genuinely recoverable style bible."
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Anything to add?"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == project.treatment
+    assert saved.style_bible == project.style_bible
+    assert saved.treatment_previous == "The genuinely recoverable treatment."
+    assert saved.style_bible_previous == "The genuinely recoverable style bible."
+    # And the reply claims nothing: no notice block at all was added to the message.
+    assert "Replaced by this reply" not in saved.messages[-1].content
+    assert "\n\n---\n" not in saved.messages[-1].content
+
+
+def test_first_draft_into_a_blank_document_promises_no_recovery(tmp_path: Path):
+    """The guard skips its floor for an empty target, so any first draft is "applied".
+
+    The slot it captures is empty, so a restore refuses — and the replacement wording says
+    the previous version "can be restored", which would be a promise broken by the very next
+    click. A first fill is reported as a first fill.
+    """
+    client, store = make_client_with_director(tmp_path, RevisingDirector())
+    project = store.create(Project(name="Blank"))
+    project.treatment = "The treatment already written by hand, long enough to keep."
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Draft the look"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    notice = saved.messages[-1].content
+    # The style bible was blank: filled, with nothing kept and nothing promised.
+    assert saved.style_bible.startswith("Style bible revision 1")
+    assert saved.style_bible_previous == ""
+    assert "Written for the first time by this reply: Style bible." in notice
+    # The treatment had text: genuinely replaced, and genuinely recoverable.
+    assert saved.treatment_previous == project.treatment
+    assert "Replaced by this reply: Treatment." in notice
+    # The recoverable claim attaches only to the document it is true of.
+    assert notice.index("Replaced by this reply") < notice.index("Written for the first time")
+    assert client.post(f"/api/projects/{project.id}/documents/style_bible/restore").status_code == 409
+
+
+def test_lock_notice_is_silent_unless_the_candidate_would_have_changed_something(tmp_path: Path):
+    """A locked document must not carry the same paragraph on every reply forever.
+
+    The lock check has to run before anything is written, but reporting it before any
+    comparison asserted that "the replacement this reply proposed was not applied" even when
+    the model echoed the current text back, or returned something the guard would have
+    refused anyway.
+    """
+    client, store = make_client_with_director(tmp_path, EchoDirector())
+    project = documented_project(store, "Locked and echoed")
+    project.treatment_locked = True
+    store.save(project)
+
+    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "Anything?"})
+
+    echoed = ProjectStore(tmp_path).get(project.id).messages[-1].content
+    assert "is locked" not in echoed
+    assert echoed == "Nothing to change."
+
+    # Same lock, a candidate the guard would have refused as degraded: still silent, because
+    # the lock is not what stopped it and nothing would have changed either way.
+    client, store = make_client_with_director(tmp_path, DegradedDirector())
+    project = documented_project(store, "Locked and degraded")
+    project.style_bible_locked = True
+    store.save(project)
+
+    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "Moodier"})
+
+    degraded = ProjectStore(tmp_path).get(project.id)
+    assert "Style bible is locked" not in degraded.messages[-1].content
+    assert "Style bible was NOT replaced" not in degraded.messages[-1].content
+    assert degraded.style_bible == project.style_bible
+    assert degraded.style_bible_previous == ""
+
+
+def test_a_lock_set_during_the_llm_call_is_honoured_rather_than_reverted(tmp_path: Path):
+    """The project must be re-read after the await, not carried across it.
+
+    A local model holds `director.plan` open for many seconds. Anything committed in that
+    window — a lock set, a restore applied, a document hand-edited — is reverted on save by a
+    snapshot taken before the call, so the reply silently undoes work that finished first.
+    """
+    store = ProjectStore(tmp_path)
+    project = documented_project(store, "Concurrent")
+
+    def lock_the_treatment(during: Project) -> None:
+        during.treatment_locked = True
+        during.creative_brief = "Typed while the model was still thinking."
+
+    director = ConcurrentEditDirector(ProjectStore(tmp_path), project.id, lock_the_treatment)
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    app = create_app(settings=settings, store=store, comfy=FakeComfy(), director=director)
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "Rewrite it all"}
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    # The lock won, even though it did not exist when the call was made.
+    assert saved.treatment_locked is True
+    assert saved.treatment == project.treatment
+    assert saved.treatment_previous == ""
+    # And the concurrent hand edit survived rather than being reverted to "".
+    assert saved.creative_brief == "Typed while the model was still thinking."
+    # The unlocked document still moved, so this is a re-read and not a refusal to apply.
+    assert saved.style_bible.startswith("Style bible revision 1")
+
+
+def test_restore_over_an_empty_document_reports_itself_as_one_way(tmp_path: Path):
+    """The reversibility promise has to hold, or be withdrawn where it does not.
+
+    Displacing an empty document leaves an empty slot, which the route must refuse — so this
+    restore genuinely cannot be swapped back, in exactly the case where the recovered text
+    matters most.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = store.create(Project(name="One way"))
+    project.treatment_previous = "The only copy of the treatment, worth getting back."
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/documents/treatment/restore")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == "The only copy of the treatment, worth getting back."
+    assert saved.treatment_previous == ""
+    notice = saved.messages[-1].content
+    assert "this restore is one-way" in notice
+    assert "swaps back" not in notice
+    # And the claim is true: there is nothing to swap back to.
+    assert client.post(f"/api/projects/{project.id}/documents/treatment/restore").status_code == 409
+
+
+def test_a_whitespace_only_kept_version_is_refused_like_an_empty_one(tmp_path: Path):
+    """Restoring "   " over real text is data loss wearing a non-empty string."""
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Whitespace")
+    project.treatment_previous = "   \n\t "
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/documents/treatment/restore")
+
+    assert response.status_code == 409
+    assert "nothing to restore" in response.json()["detail"]
+    assert ProjectStore(tmp_path).get(project.id).treatment == project.treatment
+
+
+def test_restore_is_allowed_on_a_locked_document(tmp_path: Path):
+    """The decided rule, pinned: a lock stops the Director, not the human who set it.
+
+    `PUT /documents` already accepts hand edits to a locked document for the same reason —
+    otherwise fixing one means unlock, save, edit, lock. The lock wording states this scope,
+    so the behaviour is documented rather than merely permitted.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Locked restore")
+    project.treatment_previous = "The version kept before the lock went on."
+    project.treatment_locked = True
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/documents/treatment/restore")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.treatment == "The version kept before the lock went on."
+    assert saved.treatment_previous == project.treatment
+    # Restoring does not quietly unlock it.
+    assert saved.treatment_locked is True
+    # And the lock wording says so, rather than leaving the rule to be discovered.
+    assert "restore a kept version" in DOCUMENT_LOCK_NOTICE
+
+
+def test_restore_rejects_an_unknown_document_and_an_unknown_project(tmp_path: Path):
+    """The path segment is a Literal, so a typo is a 422 rather than a 500 or a no-op."""
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Bad targets")
+
+    unknown_document = client.post(f"/api/projects/{project.id}/documents/creative_brief/restore")
+    unknown_project = client.post("/api/projects/project_deadbeef0000/documents/treatment/restore")
+
+    assert unknown_document.status_code == 422
+    assert "treatment" in json.dumps(unknown_document.json())
+    assert unknown_project.status_code == 404
+    assert unknown_project.json()["detail"] == "Project not found"
 
 
 def test_running_prompt_is_not_reported_as_queued(tmp_path: Path):

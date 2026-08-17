@@ -1,4 +1,4 @@
-import { SONG_CHANGE_CONSEQUENCE, api, comfyOutputUrl, musicFormFieldUpdate, musicGenerationPlan, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
+import { DOCUMENT_CONTROLS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, comfyOutputUrl, documentChangeToast, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, musicFormFieldUpdate, musicGenerationPlan, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -210,6 +210,7 @@ function renderTreatment() {
   $("#creative-brief").value = project?.creative_brief || "";
   $("#treatment-text").value = project?.treatment || "";
   $("#style-bible").value = project?.style_bible || "";
+  syncDocumentControls();
   const thread = $("#chat-thread");
   if (!project?.messages?.length) {
     thread.innerHTML = `<div class="empty-thread"><strong>Direct the video naturally</strong><p>Describe narrative, energy, references, camera language, what to avoid, and where the performance should feel literal or abstract.</p></div>`;
@@ -217,6 +218,47 @@ function renderTreatment() {
   }
   thread.innerHTML = project.messages.map((message) => `<div class="message ${message.role}">${escapeHtml(message.content)}</div>`).join("");
   thread.scrollTop = thread.scrollHeight;
+}
+
+// Both per-document controls, seeded from the project's own fields through the one control
+// table: each lock checkbox from its `*_locked` flag, each restore button's enabled state from
+// its `*_previous` slot.
+//
+// Seeding the checkboxes is not cosmetic. An unseeded box reads as unlocked, and the next
+// ordinary save PUTs `locked: false` for both — so the client explicitly unlocks on the server
+// what the Director locked, defeating the route's "absent means leave it alone" design from
+// one layer up.
+//
+// Deliberately separate from renderTreatment: a failed lock save has to revert these two
+// controls to the stored state without also overwriting textareas the Director is still
+// typing in.
+function syncDocumentControls() {
+  for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS)) {
+    $(control.lock).checked = Boolean(state.project?.[control.lockedField]);
+    const available = documentRestoreAvailable(state.project, documentKey);
+    const button = $(control.restore);
+    button.disabled = !available;
+    button.title = documentRestoreTitle(documentKey, available);
+  }
+}
+
+// The textareas now hold exactly what the server has, so the project is no longer dirty
+// against it -- the same bookkeeping saveProject does. Leaving the flags set makes the next
+// project switch ask to discard changes that do not exist, which teaches the Director to
+// click straight through the one question that protects real unsaved work.
+function markDocumentsSaved() {
+  state.documentsDirty = false;
+  state.dirty = state.shotsDirty;
+}
+
+// One gate for every path that lets the server's text overwrite the document editors --
+// restore and a Director reply -- matching the `window.confirm` precedent on project switch.
+// Recovery captures the *stored* text, so unsaved on-screen edits are the one thing that
+// cannot be restored afterwards; discarding them silently is the loss mode this feature
+// exists to eliminate.
+function confirmDiscardingDocumentEdits(question) {
+  if (!state.documentsDirty) return true;
+  return window.confirm(`${question}\n\n${UNSAVED_DOCUMENT_EDITS_CONSEQUENCE}`);
 }
 
 function assetImageUrl(asset) {
@@ -408,20 +450,63 @@ function renderJobs() {
   list.innerHTML = [...jobs].reverse().map((job) => `<div class="job-row" data-job-id="${job.id}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(job.target_id || "—")}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span></div>`).join("");
 }
 
-async function saveProject() {
-  if (!requireProject()) return;
+// `notice` so a lock toggle can confirm what it actually changed instead of reporting a
+// generic save. Returns whether the save reached the server, which is the only way the lock
+// handler can tell that the checkbox in front of the Director is now a lock the server does
+// not have.
+async function saveProject(notice = "Project saved") {
+  if (!requireProject()) return false;
   const documents = {
     creative_brief: $("#creative-brief").value,
     treatment: $("#treatment-text").value,
     style_bible: $("#style-bible").value,
+    // Sent on every document save, never omitted: the route reads an absent lock as "leave
+    // it alone", so omitting them would make the checkboxes purely decorative.
+    treatment_locked: $("#lock-treatment").checked,
+    style_bible_locked: $("#lock-style").checked,
   };
   try {
     state.project = await api.saveDocuments(state.project.id, documents);
-    state.documentsDirty = false;
-    state.dirty = state.shotsDirty;
-    toast("Project saved");
+    markDocumentsSaved();
+    toast(notice);
+    return true;
   }
-  catch (error) { toast(error.message, "error"); }
+  catch (error) { toast(error.message, "error"); return false; }
+}
+
+// Recovery, without the model that caused the problem: this sends no message and never
+// reaches the Director. The reply is the whole project, so re-rendering shows the restored
+// text, the swapped recovery slot, and the system line the thread now carries.
+// `documentKey`, not `document`: this module reaches for the DOM global constantly, and a
+// parameter shadowing it here would break the next edit in a thoroughly confusing way.
+async function restoreDocument(documentKey) {
+  if (!requireProject()) return;
+  // The restored text lands in the textarea, so anything typed and unsaved is gone -- and it
+  // was never captured, because only stored text becomes a kept version.
+  if (!confirmDiscardingDocumentEdits(`Restore ${documentLabel(documentKey)} from the version kept on the server?`)) return;
+  try {
+    state.project = await api.restoreDocument(state.project.id, documentKey);
+    markDocumentsSaved();
+    renderAll();
+    toast(documentRestoreNotice(documentKey));
+  } catch (error) {
+    toast(error.message, "error");
+    // The controls are disabled unless a version is kept, so this refusal means the loaded
+    // project is stale. Refresh, exactly as a Song refusal does, or every retry fails
+    // identically against the same stale state.
+    if (!documentRestoreRefusal(error.message) || !state.project) return;
+    try {
+      state.project = await api.project(state.project.id);
+      markDocumentsSaved();
+      renderAll();
+      // Which sentence is true is decided by the project just fetched, never assumed: the
+      // refusal only proves this client was stale, so a refreshed project that does hold a
+      // kept version must not be reported as having none.
+      toast(documentRestoreStaleNotice(documentKey, documentRestoreAvailable(state.project, documentKey)));
+    } catch {
+      // Leave the original error standing; a failed refresh is not new information.
+    }
+  }
 }
 
 function saveShotsSilently() {
@@ -526,8 +611,25 @@ function bindEvents() {
     try { const project = await api.createProject(name); $("#project-dialog").close(); form.reset(); await loadProjects(project.id); toast("Project created"); }
     catch (error) { toast(error.message, "error"); }
   });
-  $("#save-project").addEventListener("click", saveProject);
-  $("#save-treatment").addEventListener("click", saveProject);
+  // Wrapped rather than passed directly: saveProject's first argument is the toast wording,
+  // and handing it a click event would report an Event object as the confirmation.
+  $("#save-project").addEventListener("click", () => saveProject());
+  $("#save-treatment").addEventListener("click", () => saveProject());
+  // Bound from the one control table, so a document's selectors are never spelled out again
+  // here -- a crossed pair would otherwise wire one document's button to the other's slot.
+  for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS)) {
+    $(control.restore).addEventListener("click", () => restoreDocument(documentKey));
+    // A lock change persists immediately through the ordinary document save, which also
+    // carries whatever is in the textareas -- so nothing typed is discarded, and a lock the
+    // Director set is in effect before the next reply rather than waiting on a separate save.
+    $(control.lock).addEventListener("change", async (event) => {
+      if (await saveProject(documentLockNotice(documentKey, event.currentTarget.checked))) return;
+      // The save never landed, so the server's lock is still whatever it was; a checkbox left
+      // showing the attempted state claims a protection that does not exist. Only the controls
+      // are reverted -- reverting the textareas too would discard unsaved typing.
+      syncDocumentControls();
+    });
+  }
   ["creative-brief", "treatment-text", "style-bible"].forEach((id) => $("#" + id).addEventListener("input", () => { state.documentsDirty = true; state.dirty = true; }));
   $("#song-file").addEventListener("change", async (event) => {
     const file = event.target.files[0];
@@ -658,7 +760,14 @@ function bindEvents() {
   });
   $$("#asset-filters button").forEach((button) => button.addEventListener("click", () => { state.assetFilter = button.dataset.filter; $$("#asset-filters button").forEach((item) => item.classList.toggle("active", item === button)); renderAssets(); }));
   $("#asset-search").addEventListener("input", renderAssets);
-  $$(".document-tabs button").forEach((button) => button.addEventListener("click", () => { $$(".document-tabs button").forEach((item) => item.classList.toggle("active", item === button)); $$(".document-editor").forEach((editor) => editor.classList.toggle("active", editor.dataset.docPanel === button.dataset.doc)); }));
+  $$(".document-tabs button").forEach((button) => button.addEventListener("click", () => {
+    $$(".document-tabs button").forEach((item) => item.classList.toggle("active", item === button));
+    $$(".document-editor").forEach((editor) => editor.classList.toggle("active", editor.dataset.docPanel === button.dataset.doc));
+    // Lock and restore each belong to one document. The Creative brief has neither -- it is
+    // never replaced by a Director reply -- so controls left visible there offer actions that
+    // cannot apply to the text on screen.
+    $$("[data-doc-controls]").forEach((group) => group.classList.toggle("active", group.dataset.docControls === button.dataset.doc));
+  }));
   $("#chat-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!requireProject()) return;
@@ -666,13 +775,22 @@ function bindEvents() {
     const message = field.value.trim();
     if (!message) return;
     if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to enable conversational planning.", "error");
+    // A reply can replace either document, and the whole project comes back -- so the editors
+    // are re-rendered from the server whether or not anything changed. Ask before that
+    // discards typing that was never stored and therefore was never recoverable.
+    if (!confirmDiscardingDocumentEdits("Send this to the Director? A reply can replace either creative document.")) return;
+    const before = state.project;
     const button = event.currentTarget.querySelector("button[type=submit]");
     button.disabled = true; button.textContent = "Directing…";
     try {
       state.project = await api.directorChat(state.project.id, { message, apply_shots: false });
       field.value = "";
+      markDocumentsSaved();
       renderAll();
-      toast("Treatment updated; existing shots preserved");
+      // Derived from what the documents actually are now, not asserted. A locked document, a
+      // candidate the guard rejected and an identical rewrite all leave the text as it was,
+      // and the most prominent feedback on screen must not contradict the reply itself.
+      toast(documentChangeToast(before, state.project));
     } catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; button.textContent = "Send to Director"; }
   });
