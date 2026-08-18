@@ -201,9 +201,20 @@ def test_the_expansion_prompt_describes_every_key_the_input_actually_carries():
     whole point of the story, and `locked` is only worth sending if something asks the model to
     skip locked Shots. Driven off a real `expansion_input` payload rather than a hand-written
     list, so a key added to the builder without a line in the prompt fails here.
+
+    The `song` block is walked as well as the top level, because it is the one nested object in
+    this payload that carries meaning of its own: the lyric sheet and the style description are
+    the bulkiest thing the call sends, and a field the prompt never names is a field the model
+    may quietly ignore — which would make sending it look done while doing nothing.
     """
     project = Project(name="Prompted")
-    project.song = Song(title="Spine", source="imported", duration=120)
+    project.song = Song(
+        title="Spine",
+        source="imported",
+        duration=120,
+        lyrics="[Verse 1]\nCold rail, the platform hums",
+        caption="Downtempo industrial pop, tape saturation.",
+    )
     project.shots = [
         Shot(id="shot_a", start=0, duration=5, prompt="Corridor"),
         Shot(id="shot_b", start=30, duration=6, prompt="Threshold", locked=True),
@@ -217,6 +228,22 @@ def test_the_expansion_prompt_describes_every_key_the_input_actually_carries():
         assert key in described, key
     for key in payload["shots"][0]:
         assert key in described, key
+    # The song block is only worth its tokens if the model is told what it has and what to do
+    # with it. Driven off the built block, so a key added to the song without a line in the
+    # prompt fails here exactly as a top-level one does.
+    #
+    # Scoped to the `- song:` entry rather than searched for anywhere in the prompt, because a
+    # whole-text search is satisfied by a word that happens to appear in some other sentence —
+    # which is how "lyrics" could be struck from the list the model reads as its manifest of
+    # what the input holds while this test stayed green. The list is the thing under test.
+    described_song = described.split("- song:")[1].split(" - ")[0]
+    assert set(payload["song"]) == {"title", "duration", "lyrics", "caption"}
+    for key in payload["song"]:
+        assert key in described_song, key
+    # Named *and* aimed: the words are context for what the video is about, and they are not a
+    # clock — a section tag in a lyric sheet is the one thing nothing in this path may retime.
+    assert "draw imagery, subject and mood from them" in described_song
+    assert "a section tag inside the sheet is structure, not a time" in described_song
     # And the two keys that only pay for themselves if the model is told what to do with them.
     assert "Return no entry for a locked shot" in described
     assert "energy curve" in described

@@ -23,11 +23,18 @@ from music_video_producer.app import (
     SHOT_PLAN_EMPTY_NOTICE,
     SHOT_WINDOW_NOTICE,
     SONG_CAPTION_LIMIT,
+    SONG_CONTEXT_FIELD_NAMES,
+    SONG_CONTEXT_LABELS,
+    SONG_CONTEXT_RESTORE_REFUSAL,
     SONG_CONTEXT_WITHOUT_SONG,
+    SONG_DIRECTOR_VISIBLE,
+    SONG_DIRECTOR_WITHHELD,
     SONG_LYRICS_LIMIT,
     DirectorRequest,
     DocumentName,
+    SongContextField,
     SongContextRequest,
+    _withheld_fields,
     create_app,
     document_change_notice,
     document_first_draft_notice,
@@ -588,6 +595,541 @@ def test_a_song_saved_before_this_change_loads_with_both_fields_empty(tmp_path: 
     assert response.json()["song"]["caption"] == ""
     assert response.json()["song"]["duration"] == 12.5
     assert ProjectStore(tmp_path).get(project.id).song.lyrics == ""
+
+
+def save_context(client: TestClient, project_id: str, **fields: str):
+    """One song-context save, defaulting each field to what is already stored.
+
+    The route assigns both fields from the body, so a test that means "edit the lyrics" has to send
+    the stored caption back with it or it is also testing a deletion. Reading the stored values
+    here is what keeps every test below about the one field it names.
+    """
+    song = client.get(f"/api/projects/{project_id}").json()["song"]
+    body = {field: song[field] for field in ("lyrics", "caption")} | fields
+    return client.put(f"/api/projects/{project_id}/song/context", json=body)
+
+
+def restore_context(client: TestClient, project_id: str, field: str):
+    return client.post(f"/api/projects/{project_id}/song/context/{field}/restore")
+
+
+def test_a_context_edit_keeps_the_version_it_replaced(tmp_path: Path):
+    """The gap this closes: the largest hand-authored text here finally has a way back.
+
+    Re-read through a fresh ProjectStore, because the response body is the in-memory object the
+    handler just built and the claim is that recovery survives a restart.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Kept"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+
+    response = save_context(
+        client, project.id, lyrics="A different sheet entirely.", caption="A different sound."
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id).song
+    assert saved.lyrics == "A different sheet entirely."
+    assert saved.caption == "A different sound."
+    assert saved.lyrics_previous == IMPORTED_LYRIC_SHEET
+    assert saved.caption_previous == IMPORTED_SONG_STYLE
+    # Single-slot, exactly as AD-14 has it for the documents: a second edit keeps only the version
+    # immediately before it, never a stack.
+    save_context(client, project.id, lyrics="A third sheet.")
+    again = ProjectStore(tmp_path).get(project.id).song
+    assert again.lyrics_previous == "A different sheet entirely."
+    assert IMPORTED_LYRIC_SHEET not in (again.lyrics, again.lyrics_previous)
+
+
+def test_a_no_op_save_does_not_spend_the_slot(tmp_path: Path):
+    """The most likely accidental path there is: open the editor, click save, change nothing.
+
+    Spending the one slot on that would overwrite the genuinely recoverable version with a copy of
+    the live text — the feature destroying the thing it exists to protect, silently, on a click the
+    Director had no reason to think was destructive. Asserted for a save that repeats the whole
+    context, for one that repeats it with the whitespace a paste leaves behind (the route normalises
+    both sides the same way, so that is still a no-op), and for the untouched half of a real edit.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="No-op"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+    save_context(client, project.id, lyrics="The replacement worth keeping a way back from.")
+    kept = ProjectStore(tmp_path).get(project.id).song
+    assert kept.lyrics_previous == IMPORTED_LYRIC_SHEET
+
+    identical = save_context(client, project.id)
+
+    assert identical.status_code == 200
+    after = ProjectStore(tmp_path).get(project.id).song
+    assert after.lyrics == "The replacement worth keeping a way back from."
+    # The whole assertion: the slot still holds the sheet, not a second copy of the live text.
+    assert after.lyrics_previous == IMPORTED_LYRIC_SHEET
+    assert after.caption_previous is None
+
+    padded = save_context(
+        client, project.id, lyrics="\n\n  The replacement worth keeping a way back from.  \n\t"
+    )
+
+    assert padded.status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).song.lyrics_previous == IMPORTED_LYRIC_SHEET
+
+
+def test_only_the_edited_fields_slot_moves(tmp_path: Path):
+    """Two fields, two slots, one save button — and the button is a fact about the screen.
+
+    Editing the lyric sheet must not spend the style description's slot: they are separate pieces
+    of work, and a Director correcting a typo in the lyrics would otherwise lose the way back to a
+    style description they were not even looking at.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Independent slots"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+    save_context(client, project.id, caption="A style description worth getting back.")
+
+    save_context(client, project.id, lyrics="Only the lyrics changed here.")
+
+    saved = ProjectStore(tmp_path).get(project.id).song
+    assert saved.lyrics_previous == IMPORTED_LYRIC_SHEET
+    # Untouched by the second save, so the earlier style description is still recoverable.
+    assert saved.caption_previous == IMPORTED_SONG_STYLE
+    assert saved.caption == "A style description worth getting back."
+
+
+def test_restore_swaps_rather_than_pops_so_it_is_itself_undoable(tmp_path: Path):
+    """The document restore's shape exactly, because the asymmetry would be the surprise.
+
+    A Director who has used Restore on the Treatment knows a mis-click costs nothing there; a pop
+    here would make the identical-looking button one-way and the identical-looking click final.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Swap"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+    save_context(client, project.id, lyrics="The paste nobody wanted.")
+
+    response = restore_context(client, project.id, "lyrics")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id).song
+    assert saved.lyrics == IMPORTED_LYRIC_SHEET
+    assert saved.lyrics_previous == "The paste nobody wanted."
+    # The other field is untouched by a restore of this one.
+    assert saved.caption == IMPORTED_SONG_STYLE
+    assert saved.caption_previous is None
+
+    back = restore_context(client, project.id, "lyrics")
+
+    assert back.status_code == 200
+    swapped = ProjectStore(tmp_path).get(project.id).song
+    assert swapped.lyrics == "The paste nobody wanted."
+    assert swapped.lyrics_previous == IMPORTED_LYRIC_SHEET
+
+
+def test_an_empty_previous_version_is_a_real_one_and_restores(tmp_path: Path):
+    """A blank is a legitimate recovery target, and this is where the document shape is wrong here.
+
+    The document slots are `str = ""`, so they cannot tell "nothing was ever kept" from "what was
+    kept was blank", and their restore route refuses an empty slot. A Director who pasted a sheet
+    into a field that was empty has a real previous version — the blank — and wanting it back is an
+    ordinary undo. `None` is what means nothing was kept; `""` restores.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Blank before"))
+    import_song(client, project.id)
+    before = ProjectStore(tmp_path).get(project.id).song
+    assert before.lyrics == ""
+    assert before.lyrics_previous is None
+
+    save_context(client, project.id, lyrics=IMPORTED_LYRIC_SHEET)
+    filled = ProjectStore(tmp_path).get(project.id).song
+    assert filled.lyrics == IMPORTED_LYRIC_SHEET
+    # The slot holds a blank, and it is a slot rather than an absence.
+    assert filled.lyrics_previous == ""
+
+    response = restore_context(client, project.id, "lyrics")
+
+    assert response.status_code == 200
+    restored = ProjectStore(tmp_path).get(project.id).song
+    assert restored.lyrics == ""
+    # And the swap still holds, so the sheet is not lost by getting the blank back.
+    assert restored.lyrics_previous == IMPORTED_LYRIC_SHEET
+
+
+@pytest.mark.parametrize("field", ["lyrics", "caption"])
+def test_song_context_restore_with_nothing_kept_is_refused_and_changes_nothing(
+    tmp_path: Path, field: str
+):
+    """An empty slot must refuse rather than blank the live text — that is the loss, not the fix."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Nothing kept"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+
+    response = restore_context(client, project.id, field)
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert isinstance(detail, str)
+    assert SONG_CONTEXT_LABELS[field] in detail
+    assert detail == SONG_CONTEXT_RESTORE_REFUSAL.format(field=SONG_CONTEXT_LABELS[field])
+    saved = ProjectStore(tmp_path).get(project.id).song
+    assert saved.lyrics == IMPORTED_LYRIC_SHEET
+    assert saved.caption == IMPORTED_SONG_STYLE
+    assert saved.lyrics_previous is None
+    assert saved.caption_previous is None
+
+
+def test_song_context_restore_needs_a_song_and_a_known_field(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    songless = store.create(Project(name="Songless"))
+
+    missing = restore_context(client, songless.id, "lyrics")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == SONG_CONTEXT_WITHOUT_SONG
+
+    project = store.create(Project(name="Unknown field"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET)
+    assert restore_context(client, project.id, "title").status_code == 422
+    assert restore_context(client, "project_missing", "lyrics").status_code == 404
+
+
+def test_the_restore_route_touches_nothing_but_the_field_it_names(tmp_path: Path):
+    """Recovery must not become a second door onto the audio, its length or its provenance."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Restore touches nothing"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET)
+    imported = ProjectStore(tmp_path).get(project.id).song
+    save_context(client, project.id, lyrics="Replaced.")
+
+    assert restore_context(client, project.id, "lyrics").status_code == 200
+
+    restored = ProjectStore(tmp_path).get(project.id).song
+    assert restored.path == imported.path
+    assert restored.duration == imported.duration
+    assert restored.source == imported.source
+    assert restored.prompt_id == imported.prompt_id
+    assert restored.title == imported.title
+    assert (store.project_dir(project.id) / imported.path).is_file()
+
+
+def test_an_import_writes_no_recovery_slot(tmp_path: Path):
+    """A new song has nothing prior to keep, so an import that invented a slot would be lying.
+
+    Asserted for both doors a song arrives through, and for a *replacement* import as well as a
+    first one — the previous song's sheet is the previous song's, not this one's history.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Import keeps nothing"))
+
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+
+    first = ProjectStore(tmp_path).get(project.id).song
+    assert first.lyrics_previous is None
+    assert first.caption_previous is None
+
+    save_context(client, project.id, lyrics="An edit that does keep a version.")
+    assert ProjectStore(tmp_path).get(project.id).song.lyrics_previous == IMPORTED_LYRIC_SHEET
+
+    replaced = import_song(
+        client, project.id, filename="second.wav", lyrics="The new song's own sheet."
+    )
+
+    assert replaced.status_code == 200
+    after = ProjectStore(tmp_path).get(project.id).song
+    assert after.lyrics == "The new song's own sheet."
+    assert after.lyrics_previous is None
+    assert after.caption_previous is None
+
+
+def song_with_kept_context(client: TestClient, store: ProjectStore, name: str) -> Project:
+    """A project with a song, a shot depending on it, and both recovery slots occupied.
+
+    The shot is what makes every song-changing route demand confirmation, so these tests exercise
+    the confirmed path rather than the frictionless one — a slot that survives a *refused* change
+    is not a bug, and a slot that survives a confirmed one is.
+    """
+    project = store.create(Project(name=name))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+    save_context(client, project.id, lyrics="A replacement sheet.", caption="A replacement style.")
+    project = store.get(project.id)
+    project.shots = [Shot(start=0, duration=4, prompt="Held wide")]
+    store.save(project)
+    kept = store.get(project.id).song
+    assert kept.lyrics_previous == IMPORTED_LYRIC_SHEET
+    assert kept.caption_previous == IMPORTED_SONG_STYLE
+    return store.get(project.id)
+
+
+def test_no_slot_outlives_the_song_it_describes(tmp_path: Path):
+    """A slot is about one track. Carried onto the next, it is a lie the Director can click.
+
+    "Restore" on a song imported ten minutes ago would hand back a lyric sheet belonging to a track
+    that is no longer in the project, presented as this song's own previous version. All five
+    song-changing routes are covered here, on their confirmed path, because that is the one that
+    actually replaces the song.
+    """
+    client, store, _ = make_client(tmp_path)
+
+    uploaded = song_with_kept_context(client, store, "Replaced by import")
+    assert (
+        client.post(
+            f"/api/projects/{uploaded.id}/songs/upload",
+            data={"title": "Second", "duration": "9", "confirm_song_replacement": "true"},
+            files={"file": ("second.wav", wav_bytes(0.5), "audio/wav")},
+        ).status_code
+        == 200
+    )
+    replaced_by_import = ProjectStore(tmp_path).get(uploaded.id).song
+    assert replaced_by_import.lyrics_previous is None
+    assert replaced_by_import.caption_previous is None
+
+    music = song_with_kept_context(client, store, "Replaced by Music 3")
+    assert (
+        client.post(
+            f"/api/projects/{music.id}/generate/music",
+            json={
+                "title": "Night Wire",
+                "caption": "industrial synth rock",
+                "duration": 8,
+                "confirm_song_replacement": True,
+            },
+        ).status_code
+        == 202
+    )
+    assert ProjectStore(tmp_path).get(music.id).song.lyrics_previous is None
+
+    planner = song_with_kept_context(client, store, "Replaced by SongPlanner")
+    assert (
+        client.post(
+            f"/api/projects/{planner.id}/generate/songplanner",
+            json={
+                "title": "Night Wire (Cover)",
+                "idea": "faithful synthwave cover",
+                "duration": 90,
+                "confirm_song_replacement": True,
+            },
+        ).status_code
+        == 202
+    )
+    assert ProjectStore(tmp_path).get(planner.id).song.caption_previous is None
+
+    removed = song_with_kept_context(client, store, "Removed")
+    assert (
+        client.delete(
+            f"/api/projects/{removed.id}/song?confirm_song_replacement=true"
+        ).status_code
+        == 200
+    )
+    assert ProjectStore(tmp_path).get(removed.id).song is None
+
+    # And the whole-manifest PUT, which is the sibling write path every one of these stories has
+    # had to close: it carries a Song in its body, so it can replace one too.
+    put = song_with_kept_context(client, store, "Replaced by PUT")
+    body = client.get(f"/api/projects/{put.id}").json()
+    body["song"] = {"title": "Another track", "source": "imported", "path": "media/songs/x.wav", "duration": 42}
+    response = client.put(
+        f"/api/projects/{put.id}?confirm_song_replacement=true", json=body
+    )
+    assert response.status_code == 200
+    swapped = ProjectStore(tmp_path).get(put.id).song
+    assert swapped.title == "Another track"
+    assert swapped.lyrics_previous is None
+    assert swapped.caption_previous is None
+
+
+def test_the_whole_project_put_neither_wipes_nor_invents_a_song_recovery_slot(tmp_path: Path):
+    """The generic save is the guard hole every previous story here left open once.
+
+    Three failures in one route, all from binding a client-supplied `Song`. A client written before
+    the slots existed omits them, so an ordinary save arrives carrying `None` and deletes both kept
+    versions. A client that *invents* one is worse — it plants text the restore route then swaps
+    into the live lyric sheet as "the version you had before". And because the route decides a song
+    was replaced by comparing the bodies, the slots have to be adopted from storage *before* that
+    comparison, or the omission alone makes an ordinary save look like a song replacement and
+    demand a confirmation for a change nobody made.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = song_with_kept_context(client, store, "Ordinary save")
+
+    body = client.get(f"/api/projects/{project.id}").json()
+    del body["song"]["lyrics_previous"]
+    del body["song"]["caption_previous"]
+    body["name"] = "Renamed by an old client"
+
+    omitted = client.put(f"/api/projects/{project.id}", json=body)
+
+    # No confirmation was asked for and none was sent: this is not a song change.
+    assert omitted.status_code == 200, omitted.json()
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.name == "Renamed by an old client"
+    assert saved.song.lyrics_previous == IMPORTED_LYRIC_SHEET
+    assert saved.song.caption_previous == IMPORTED_SONG_STYLE
+
+    forged = client.get(f"/api/projects/{project.id}").json()
+    forged["song"]["lyrics_previous"] = "Text the Director never wrote and never stored."
+
+    planted = client.put(f"/api/projects/{project.id}", json=forged)
+
+    assert planted.status_code == 200, planted.json()
+    unplanted = ProjectStore(tmp_path).get(project.id).song
+    assert unplanted.lyrics_previous == IMPORTED_LYRIC_SHEET
+    # And the restore route cannot be made to serve it.
+    assert restore_context(client, project.id, "lyrics").status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).song.lyrics == IMPORTED_LYRIC_SHEET
+
+
+def test_a_song_saved_before_recovery_existed_loads_with_no_slots(tmp_path: Path):
+    """A manifest whose Song predates the slots must load unchanged and simply keep nothing.
+
+    Written by removing the keys from a real manifest rather than by constructing a `Song`, because
+    the claim is about JSON on disk. `None` rather than `""`: an older song has kept nothing, which
+    is a different statement from having kept a blank, and the restore route must refuse it.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Older manifest, no slots"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+    manifest = store.manifest_path(project.id)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    del payload["song"]["lyrics_previous"]
+    del payload["song"]["caption_previous"]
+    manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    loaded = client.get(f"/api/projects/{project.id}")
+
+    assert loaded.status_code == 200
+    assert loaded.json()["song"]["lyrics_previous"] is None
+    assert loaded.json()["song"]["lyrics"] == IMPORTED_LYRIC_SHEET
+    assert restore_context(client, project.id, "lyrics").status_code == 422
+
+
+def test_song_context_mapping_field_names_and_labels_cannot_drift():
+    """One mapping, and the route's path segment, the slots and the labels all derived from it.
+
+    The save loop and the restore route reach the fields by interpolation
+    (`f"{field}{RECOVERY_SLOT_SUFFIX}"`), so a key in `SONG_CONTEXT_LABELS` that `Song` does not
+    carry is an `AttributeError` at request time rather than a startup failure.
+    """
+    assert set(SONG_CONTEXT_LABELS) == set(get_args(SongContextField))
+    for field in SONG_CONTEXT_LABELS:
+        assert field in Song.model_fields, field
+        assert f"{field}_previous" in Song.model_fields, field
+        # The slot is `str | None`, which is what lets "kept a blank" differ from "kept nothing".
+        assert Song.model_fields[f"{field}_previous"].default is None, field
+        assert Song(title="t", source="imported").model_dump()[f"{field}_previous"] is None
+    # The two spellings of the same two things — mid-sentence for a length refusal, sentence-initial
+    # for a restore — must name the same fields, or one refusal contradicts the other.
+    for field, label in SONG_CONTEXT_LABELS.items():
+        assert label.lower() in SONG_CONTEXT_FIELD_NAMES[field].lower(), field
+
+
+def test_neither_recovery_slot_reaches_the_director(tmp_path: Path):
+    """The correctness rule, proven against what the model was actually handed.
+
+    A slot leaking into the dump means the Director reads back the lyric sheet the Director
+    deliberately discarded — the model working from text that was superseded on purpose, presented
+    as current. That a field is on the Song proves only that it was stored, so the recording double
+    is the only witness that can settle this.
+    """
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="Slots stay out"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+    client.put(
+        f"/api/projects/{project.id}/song/context",
+        json={"lyrics": "The sheet the model is meant to read.", "caption": "The current sound."},
+    )
+    kept = store.get(project.id).song
+    assert kept.lyrics_previous == IMPORTED_LYRIC_SHEET
+
+    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "What is this?"})
+
+    context = director.contexts[0]
+    serialised = json.dumps(context)
+    for field in SONG_CONTEXT_LABELS:
+        assert f"{field}_previous" not in context["song"], field
+    # And the discarded text itself is nowhere in what was encoded into the prompt — a key present
+    # but empty would satisfy the check above on its own.
+    assert "counting sodium lights" not in serialised
+    assert IMPORTED_SONG_STYLE not in serialised
+    # The live context is still there, which is the whole reason these fields exist.
+    assert context["song"]["lyrics"] == "The sheet the model is meant to read."
+    assert context["song"]["caption"] == "The current sound."
+
+
+def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_sees():
+    """The nested-path hazard, answered by making forgetting loud instead of silent.
+
+    `DIRECTOR_CONTEXT_EXCLUDE` strips whole top-level keys, and its own comment warns that a nested
+    path stops covering a field renamed or added beside it — silently. These two slots live inside
+    `song`, so a nested path is exactly the wrong shape: `{"song": {"lyrics_previous"}}` would stay
+    valid, match nothing new, and leak a third slot into every prompt with the whole suite green.
+
+    So the exclusion is not a path but a classification, and this test is the proof. A hypothetical
+    new `Song` field is introduced here — the drift that would happen for real — and the guard is
+    shown to refuse to build an exclusion at all rather than build an incomplete one. Both
+    directions of drift are covered: a field the model declares and nobody classified, and a
+    classification of a field the model no longer declares.
+    """
+
+    class SongWithANewField(Song):
+        bpm_previous: str | None = None
+
+    with pytest.raises(RuntimeError) as unclassified:
+        _withheld_fields(
+            SongWithANewField,
+            visible=SONG_DIRECTOR_VISIBLE,
+            withheld=SONG_DIRECTOR_WITHHELD,
+        )
+
+    # It names the field and says what to do about it, because a loud failure nobody can act on is
+    # only a different kind of obstacle.
+    assert "bpm_previous" in str(unclassified.value)
+    assert "SONG_DIRECTOR_WITHHELD" in str(unclassified.value)
+
+    # Classified as withheld, the same hypothetical field is covered without another edit anywhere:
+    # this is the "the guard still covers it" half of the claim.
+    covered = _withheld_fields(
+        SongWithANewField,
+        visible=SONG_DIRECTOR_VISIBLE,
+        withheld=SONG_DIRECTOR_WITHHELD | {"bpm_previous"},
+    )
+    assert "bpm_previous" in covered
+    song = SongWithANewField(title="t", source="imported", bpm_previous="128")
+    assert "bpm_previous" not in song.model_dump(exclude=covered)
+
+    # Classified as visible, it reaches the model — the classification is a decision, not a filter
+    # that only ever hides things.
+    shown = _withheld_fields(
+        SongWithANewField,
+        visible=SONG_DIRECTOR_VISIBLE | {"bpm_previous"},
+        withheld=SONG_DIRECTOR_WITHHELD,
+    )
+    assert "bpm_previous" in song.model_dump(exclude=shown)
+
+    # Drift the other way: a classification naming a field the model no longer declares covers
+    # nothing, and saying so is the difference between a renamed slot and a leaked one.
+    with pytest.raises(RuntimeError) as stale:
+        _withheld_fields(
+            Song,
+            visible=SONG_DIRECTOR_VISIBLE,
+            withheld=SONG_DIRECTOR_WITHHELD | {"lyrics_backup"},
+        )
+    assert "lyrics_backup" in str(stale.value)
+
+    # And a field classified as both is a decision that was never actually made.
+    with pytest.raises(RuntimeError) as overlap:
+        _withheld_fields(
+            Song,
+            visible=SONG_DIRECTOR_VISIBLE | {"lyrics_previous"},
+            withheld=SONG_DIRECTOR_WITHHELD,
+        )
+    assert "lyrics_previous" in str(overlap.value)
+
+    # The live classification is complete right now, which is what makes the import at the top of
+    # this module succeed at all — asserted rather than assumed, so a future edit that silences the
+    # guard by widening a set to `Song.model_fields` fails here.
+    assert _withheld_fields(
+        Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD
+    ) == {"lyrics_previous", "caption_previous"}
+    assert not SONG_DIRECTOR_VISIBLE & SONG_DIRECTOR_WITHHELD
 
 
 def test_uploads_enforce_size_and_asset_type_limits(tmp_path: Path):
@@ -2480,9 +3022,13 @@ def test_an_imported_songs_lyrics_and_style_reach_the_directors_context(tmp_path
     serialised = json.dumps(context)
     assert "counting sodium lights" in serialised
     assert "tape saturation" in serialised
-    # Nothing about the song is excluded from the dump, and that is what makes the two fields above
-    # arrive without any further work. Asserted as the rule rather than only as its consequence.
-    assert "song" not in DIRECTOR_CONTEXT_EXCLUDE
+    # There *is* now an exclusion under `song` — the two recovery slots — so the rule this asserts
+    # is no longer "nothing is excluded" but "exactly the withheld set is, and nothing beside it".
+    # Read off the classification rather than restated, so a field moved from one side to the other
+    # cannot leave this test asserting the old answer.
+    assert DIRECTOR_CONTEXT_EXCLUDE["song"] == set(SONG_DIRECTOR_WITHHELD)
+    for shown in SONG_DIRECTOR_VISIBLE:
+        assert shown in context["song"], shown
     # The same holds after a correction: the edit route is the other door into the same fields.
     client.put(
         f"/api/projects/{project.id}/song/context",
@@ -4303,6 +4849,54 @@ def test_expansion_hands_the_pure_builders_output_verbatim_to_the_director(tmp_p
     assert "song" not in sent
     for entry in sent["shots"]:
         assert "song_fraction" not in entry
+
+
+def test_an_imported_songs_lyrics_and_style_reach_the_model_on_the_expansion_path(tmp_path: Path):
+    """The claim the docs used to get wrong, asserted against what the model was actually handed.
+
+    The reach used to be the chat route only, and expansion — the planning act most likely to
+    want the words — wrote every prompt without them. That a field is on the Song proves it was
+    saved; that it is in `expansion_input`'s return proves the builder emits it. Neither proves
+    the model saw it, because the route builds the payload from a pre-await snapshot and hands
+    it across a boundary of its own. The recording double is the only witness, exactly as
+    `test_an_imported_songs_lyrics_and_style_reach_the_directors_context` is for chat.
+
+    Read out of the recorded input *and* out of its serialisation, because serialising is what
+    the client then encodes into the prompt: a lyric sheet present as a key but empty would
+    satisfy the key check alone.
+    """
+    director = ExpandingDirector()
+    client, store, _ = make_client(tmp_path, director)
+    project = planned_project(store, "Expansion sees the song")
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+
+    assert client.post(f"/api/projects/{project.id}/director/expand").status_code == 200
+
+    sent = director.inputs[0]
+    assert sent["song"]["lyrics"] == IMPORTED_LYRIC_SHEET
+    assert sent["song"]["caption"] == IMPORTED_SONG_STYLE
+    serialised = json.dumps(sent)
+    assert "counting sodium lights" in serialised
+    assert "tape saturation" in serialised
+    # Whole and unaltered: the interior structure of the sheet is what a summariser or an
+    # excerpter inserted anywhere along this path would be the first thing to lose.
+    assert "\n    counting sodium lights" in sent["song"]["lyrics"]
+    assert "[Chorus]" in sent["song"]["lyrics"]
+    # The correction route is the other door into the same two fields, and it reaches expansion
+    # for the same reason — the payload is built per call, from the stored Song.
+    client.put(
+        f"/api/projects/{project.id}/song/context",
+        json={"lyrics": "Corrected words only.", "caption": "Corrected sound only."},
+    )
+    assert client.post(f"/api/projects/{project.id}/director/expand").status_code == 200
+    assert director.inputs[1]["song"]["lyrics"] == "Corrected words only."
+    assert director.inputs[1]["song"]["caption"] == "Corrected sound only."
+    # And a song that says neither is a song block of title and duration, absent not empty —
+    # the payload an expansion built before either field existed.
+    bare = planned_project(store, "Expansion without the words")
+    import_song(client, bare.id)
+    assert client.post(f"/api/projects/{bare.id}/director/expand").status_code == 200
+    assert set(director.inputs[2]["song"]) == {"title", "duration"}
 
 
 def test_the_expansion_input_carries_no_production_state(tmp_path: Path):

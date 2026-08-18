@@ -82,7 +82,12 @@ You are given the whole plan at once and must write one render-ready prompt per 
 
 The input is a JSON object with these keys:
 - creative_brief, treatment, style_bible: the creative work every prompt must embed.
-- song: the master song's title and length in seconds, when one exists.
+- song: the master song, when one exists. Always its title and its duration, the length in
+  seconds. It also carries lyrics, the song's words exactly as written, and caption, a
+  description of how the song sounds — each present only when the song has one, so treat an
+  absent key as unknown rather than as empty. The words and the sound say what the video is
+  about; draw imagery, subject and mood from them. Neither carries timing: a section tag
+  inside the sheet is structure, not a time, and the shot windows below are the only timing.
 - h3_shot_window: the shot length in seconds the renderer is most reliable within.
 - shots: every shot in the plan, ordered by when it happens in the song.
 

@@ -125,6 +125,17 @@
               <div class="block-heading"><h2>Song context</h2><span>Reaches the Director</span></div>
               <label>Lyrics<span class="field-count" id="song-lyrics-count"></span><textarea id="song-lyrics" rows="6" placeholder="The words of the loaded song, stored as supplied"></textarea></label>
               <label>Style<span class="field-count" id="song-style-count"></span><textarea id="song-style" rows="3" placeholder="Genre, mood, vocal character, instrumentation…"></textarea></label>
+              <!-- One restore per field, because each keeps its own single previous version and a
+                   save that changes only the lyrics must not offer to roll back the style too.
+                   Both ship disabled: nothing is recoverable until a save has displaced something,
+                   and renderSongContext is the only thing that opens them — from the stored slot,
+                   never from a constant. The ids and the slots they read are api.js's
+                   SONG_CONTEXT_CONTROLS, asserted against this markup by the contract tests; the
+                   tooltips are set from the same table rather than duplicated here. -->
+              <div class="context-actions">
+                <button class="quiet-button" id="restore-song-lyrics" disabled>Restore lyrics</button>
+                <button class="quiet-button" id="restore-song-style" disabled>Restore style</button>
+              </div>
               <button class="quiet-button full" id="save-song-context" disabled>Save song context</button>
             </div>
             <div class="production-note"><span>PRODUCTION NOTE</span><p>Imported songs and Music 3 outputs are equal first-class sources. Generation is never required to begin a video.</p></div>

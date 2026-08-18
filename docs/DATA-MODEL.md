@@ -21,6 +21,7 @@ The recoverable source of truth is `data/projects/<project-id>/project.json`.
 - `path`: project-relative upload or Comfy output-relative media path
 - `duration`
 - `lyrics`, `caption` — the song's own words and a short description of how it sounds. Both are optional, both reach the Director's context, and both are now reachable from either source: a generation path writes them from the request, and an import can carry them on the upload form or have them set afterwards through `PUT /api/projects/{id}/song/context`
+- `lyrics_previous`, `caption_previous` — the one kept version of each context field, `None` when nothing has been displaced
 - `prompt_id` for generated songs
 
 Imported and generated songs have equal project status.
@@ -31,7 +32,11 @@ The context edit route touches those two fields and nothing else: `path`, `durat
 
 Bounds are `SONG_LYRICS_LIMIT` 8,000 and `SONG_CAPTION_LIMIT` 4,000 characters, measured **after** trimming, and the route is the only place they are enforced. The textareas deliberately carry no `maxlength`: it truncated an oversized paste at the client and dropped the tail with no message, while an API client sending the same text got a documented 422. The boxes show a live count measured the same way the server measures it, and refuse to save rather than silently shorten.
 
-Unlike `treatment` and `style_bible`, song context has **no `*_previous` recovery slot** — see `docs/DEVELOPMENT-LOG.md` for why it was declined rather than overlooked. The one unrecoverable accident, a save that replaces stored text with nothing, is guarded by a confirmation; replacing text with different text is not.
+Song context has the same single-slot recovery the two creative documents gained in Story 2.1. `lyrics_previous` and `caption_previous` each hold the one version a save displaced, restored by `POST /api/projects/{id}/song/context/{field}/restore`, which **swaps rather than pops** so a restore is itself undoable. A save that changes nothing writes no slot — spending the one slot on a no-op would destroy what it exists to protect — and each field's slot moves independently. Slots do not outlive the song they describe: every route that replaces or removes the Song clears them, so a "previous version" can never belong to a track that is gone.
+
+Both slots are `str | None`, which is where this **deliberately departs** from the document slots' `str = ""`. `None` means no save has ever displaced anything; `""` means a save displaced a blank, and that restores — a Director who pasted a sheet over an empty field has a real previous version and may want it back. The document slots cannot draw that distinction, which is why `restore_document` refuses an empty slot; mirroring their shape here would have made the blank-recovery case unimplementable.
+
+Neither slot reaches the Director's context, and **that exclusion is a classification rather than a path**. `SONG_DIRECTOR_VISIBLE` and `SONG_DIRECTOR_WITHHELD` in `app.py` must between them account for every field `Song` declares; an unclassified, double-classified or stale entry raises at import. Adding a field without deciding what the Director sees aborts the test suite during collection with the field named, rather than silently leaking it into every prompt — which is what a nested exclusion path would have done. Verified by adding a field and watching it fail.
 
 ## Asset
 

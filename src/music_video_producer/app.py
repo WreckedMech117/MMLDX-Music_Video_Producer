@@ -81,6 +81,84 @@ SONG_REPLACEMENT_CONSEQUENCE = (
 DOCUMENT_LABELS = {"treatment": "Treatment", "style_bible": "Style bible"}
 DocumentName = Literal["treatment", "style_bible"]
 
+# The two context fields of a Song, keyed by field name and named for the screen. One mapping,
+# and the recovery slots, the restore route's path segment, the per-field save loop and the
+# labels are all derived from it — the same argument DOCUMENT_LABELS makes one line up.
+#
+# `SONG_LYRICS_FIELD`/`SONG_CAPTION_FIELD` below are these same two things worded for the middle
+# of a refusal sentence ("The lyric sheet is 9001 characters"); these are worded to start one
+# ("Lyric sheet was restored…"), exactly as DOCUMENT_LABELS' values are. A contract test holds
+# the two spellings to the same words.
+SONG_CONTEXT_LABELS = {"lyrics": "Lyric sheet", "caption": "Style description"}
+SongContextField = Literal["lyrics", "caption"]
+
+#: The suffix every single-slot recovery field in this application carries.
+RECOVERY_SLOT_SUFFIX = "_previous"
+
+# Every field a `Song` carries, classified into what the Director is shown and what is withheld.
+#
+# This is two *sets* rather than the one exclusion path the shape appears to want, and the reason
+# is written a few lines below in DIRECTOR_CONTEXT_EXCLUDE's own comment: a nested path stops
+# covering a field renamed or added beside it, silently. `{"song": {"lyrics_previous"}}` is
+# exactly that shape. A third slot added to `Song` later — a `title_previous`, or a rename of
+# these two — would leave the path still valid, still matching nothing, and the Director reading
+# back a lyric sheet the Director deliberately discarded. A path can only be wrong by omission,
+# and omission has no symptom.
+#
+# Classification does have a symptom. `_withheld_fields` refuses to produce an exclusion at all
+# unless every declared field of the model appears in exactly one of these two sets, so adding a
+# field to `Song` without deciding which side it belongs on raises at import: the application does
+# not start, and every test in the suite fails on collection. That is deliberately louder than a
+# leak deserves to be quiet. It costs nothing in production — `Song.model_fields` is code, never
+# data, so this can only ever trip on a machine where someone is editing `models.py`.
+#
+# Only the slots are withheld. `path` and `prompt_id` are of no use to the model either, but they
+# were in the dump before this change and taking them out is a change to what the Director is
+# prompted with — which is Ask First, and is not what this story is for.
+SONG_DIRECTOR_VISIBLE = frozenset({"title", "source", "path", "duration", "lyrics", "caption", "prompt_id"})
+SONG_DIRECTOR_WITHHELD = frozenset(
+    f"{field}{RECOVERY_SLOT_SUFFIX}" for field in SONG_CONTEXT_LABELS
+)
+
+
+def _withheld_fields(
+    model: type[BaseModel],
+    *,
+    visible: frozenset[str],
+    withheld: frozenset[str],
+) -> set[str]:
+    """The fields of `model` to strip from the Director's context, or a loud refusal.
+
+    Returns `withheld` — but only after proving that `visible | withheld` is exactly the model's
+    declared surface. Anything unclassified, anything classified twice, and anything named in a
+    set that the model no longer declares are all `RuntimeError`s raised at import time.
+
+    The return value is deliberately the *input*: this function exists for the check, not the
+    computation. Deriving the answer instead (say, "every field ending `_previous`") would move
+    the silent-omission problem rather than solve it — a slot named `lyrics_backup` would be
+    derived out of the exclusion just as quietly as a path fails to match it.
+    """
+    declared = set(model.model_fields) | set(model.model_computed_fields)
+    where = model.__name__
+    if overlap := visible & withheld:
+        raise RuntimeError(
+            f"{where}: {sorted(overlap)} is classified as both shown to the Director and "
+            "withheld from it. Every field belongs on exactly one side."
+        )
+    if unclassified := declared - visible - withheld:
+        raise RuntimeError(
+            f"{where}: {sorted(unclassified)} is not classified as shown to the Director or "
+            "withheld from it. Add it to SONG_DIRECTOR_VISIBLE or SONG_DIRECTOR_WITHHELD — a "
+            "recovery slot left unclassified would be echoed back into every prompt."
+        )
+    if stale := (visible | withheld) - declared:
+        raise RuntimeError(
+            f"{where}: {sorted(stale)} is classified but no longer declared on the model. A "
+            "classification of a field that does not exist covers nothing."
+        )
+    return set(withheld)
+
+
 # What the Director's project dump leaves out. The recovery slots are *derived* from the
 # mapping rather than listed, so a document added to it cannot have its kept copy echoed
 # into the prompt by omission. See `director_chat` for why that matters.
@@ -94,7 +172,13 @@ DIRECTOR_CONTEXT_EXCLUDE: dict[str, Any] = {
     # keeping the structured copy would echo a second copy of each one into the prompt; and a
     # nested path stops covering a field that is later renamed or added beside it, silently.
     "messages": {"__all__": {"id", "created_at", "notices"}},
-    **{f"{field}_previous": True for field in DOCUMENT_LABELS},
+    # The one nested path in this mapping, and the only one that is safe to write: it is not a
+    # list of names anyone has to remember to extend, it is whatever `Song` declares and nobody
+    # classified as visible. See SONG_DIRECTOR_WITHHELD.
+    "song": _withheld_fields(
+        Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD
+    ),
+    **{f"{field}{RECOVERY_SLOT_SUFFIX}": True for field in DOCUMENT_LABELS},
 }
 
 # The one wording for *what changed*. `document_rejection` has always told the Director
@@ -761,6 +845,33 @@ SONG_LYRICS_LIMIT = 8_000
 SONG_CAPTION_FIELD = "The style description"
 SONG_CAPTION_LIMIT = 4_000
 
+# The bound each context field is measured against, keyed the way `SONG_CONTEXT_LABELS` is, so the
+# route that writes both can loop rather than spell each field out twice — which is how a counter,
+# a ceiling or a slot ends up wired to the other field.
+SONG_CONTEXT_LIMITS = {"lyrics": SONG_LYRICS_LIMIT, "caption": SONG_CAPTION_LIMIT}
+SONG_CONTEXT_FIELD_NAMES = {"lyrics": SONG_LYRICS_FIELD, "caption": SONG_CAPTION_FIELD}
+
+# The one wording for a song-context restore, and for refusing one. `api.js`'s
+# SONG_CONTEXT_RESTORE_NOTICE and SONG_CONTEXT_RESTORE_REFUSAL_MARKER are the frontend halves.
+#
+# A restore is a swap, exactly as the document one is: the text being displaced moves into the
+# slot, so restoring again puts it back and a mis-click costs nothing. Unlike the document
+# restore there is no one-way case to warn about — an empty previous version is a real previous
+# version here (`Song.lyrics_previous` is `None` until a save displaces something), so displacing
+# a blank leaves a blank in the slot and the swap stays symmetric.
+SONG_CONTEXT_RESTORE_NOTICE = (
+    "{field} was restored to the version kept before the last save that changed it. The text "
+    "that was replaced is now the kept version, so restoring again swaps back. Nothing else "
+    "about the song changed: not the audio, its length or its provenance."
+)
+# The refusal's wording deliberately shares no phrase with `DOCUMENT_RESTORE_REFUSAL`: both halves
+# recognise their own refusal by substring, and an overlapping phrase would let one recovery path
+# claim the other's failure and "refresh" a project that was never stale.
+SONG_CONTEXT_RESTORE_REFUSAL = (
+    "No previous version of {field} was kept for this song, so there is nothing to swap back to. "
+    "A version is kept when a save replaces stored text with different text."
+)
+
 # The one wording for an oversized field, shared by the import and the edit. It says what was *not*
 # done, because both callers reach this before anything is written: an import that refuses here has
 # copied no audio and left the previous Song exactly as it was, and an edit has changed nothing.
@@ -800,6 +911,43 @@ def _song_context(value: str, limit: int, field: str) -> str:
             detail=SONG_CONTEXT_TOO_LONG.format(field=field, length=len(text), limit=limit),
         )
     return text
+
+
+def _detach_song_recovery_slots(song: Song | None) -> None:
+    """Leave `song` with no kept context versions at all.
+
+    A slot describes the track it sits on. Carried across a replacement it would offer the
+    Director a "previous version" of a song that is gone — a lyric sheet from the track this
+    project used to have, restorable onto the one it has now, silently mislabelled as this
+    song's own history. Every route that puts a *different* song on the project calls this, or
+    builds a fresh `Song` whose slots default to `None`, which is the same thing said in the
+    constructor.
+    """
+    if song is None:
+        return
+    for field in SONG_CONTEXT_LABELS:
+        setattr(song, f"{field}{RECOVERY_SLOT_SUFFIX}", None)
+
+
+def _adopt_song_recovery_slots(incoming: Song | None, stored: Song | None) -> None:
+    """Overwrite `incoming`'s slots with the stored song's, because a client is never their author.
+
+    `PUT /api/projects/{id}` binds a whole client-supplied `Project`, so its `song` arrives with
+    every field defaulted — including these. That is the sibling write path the document slots
+    already had to be defended on, and it fails two ways at once here. A client written before the
+    slots existed omits them, so an ordinary save arrives carrying `None` and wipes both kept
+    versions. A client that *invents* one is worse: it would be planting text that the restore
+    route then swaps into the live lyric sheet as "the version you had before".
+
+    Adoption happens *before* the route compares the two songs, so a body that differs only in
+    these fields compares equal and does not trip the replacement gate — which would otherwise
+    demand a song-replacement confirmation for an ordinary save from an old client.
+    """
+    if incoming is None:
+        return
+    for field in SONG_CONTEXT_LABELS:
+        slot = f"{field}{RECOVERY_SLOT_SUFFIX}"
+        setattr(incoming, slot, getattr(stored, slot) if stored is not None else None)
 
 
 def _vision_media(path: Path) -> tuple[bytes, str]:
@@ -958,8 +1106,18 @@ def create_app(
         # `Song` has no timestamps, so an untouched Song round-trips equal and passes here;
         # both being None is equal too, and adding a first Song to a Song-less project is
         # not a replacement.
+        #
+        # The Song's recovery slots are taken off the stored song first, for the reason
+        # `_adopt_song_recovery_slots` gives — and it has to happen ahead of this comparison,
+        # or a client that predates the slots would send `None` for both, compare unequal, and
+        # be told an ordinary save is a song replacement.
+        _adopt_song_recovery_slots(project.song, current.song)
         if project.song != current.song:
             _require_song_replacement_confirmation(current, confirm_song_replacement)
+            # Confirmed: this is a different song, so nothing kept for the old one comes with
+            # it. Only reached once the gate above has let the replacement through, so a
+            # refused save has cleared nothing.
+            _detach_song_recovery_slots(project.song)
         # The recovery slots and the document locks are server-owned, and this route binds a
         # whole client-supplied `Project` whose every field is defaulted. A body that simply
         # omits them — which is what any client written before they existed sends — arrives
@@ -1116,14 +1274,76 @@ def create_app(
 
         Both values are computed before either is assigned, so a refusal over the second field
         cannot leave the first one applied.
+
+        Each field keeps the one version this save displaced, and only when the save genuinely
+        displaces something. A save whose text equals the stored text writes no slot: the single
+        slot is the whole protection, and spending it on a no-op would overwrite the recoverable
+        version with a copy of the live one — destroying the thing it exists to protect, on the
+        most likely accidental path there is, a Director opening the editor and clicking save.
+
+        The two fields are independent. Editing the lyric sheet moves the lyric slot and leaves
+        the style description's alone, because they are two separate pieces of work and one save
+        button is an implementation detail of the screen rather than a fact about the text.
         """
         project = get_project(project_id)
         if project.song is None:
             raise HTTPException(status_code=404, detail=SONG_CONTEXT_WITHOUT_SONG)
-        song_lyrics = _song_context(request.lyrics, SONG_LYRICS_LIMIT, SONG_LYRICS_FIELD)
-        song_caption = _song_context(request.caption, SONG_CAPTION_LIMIT, SONG_CAPTION_FIELD)
-        project.song.lyrics = song_lyrics
-        project.song.caption = song_caption
+        submitted = {
+            field: _song_context(
+                getattr(request, field), SONG_CONTEXT_LIMITS[field], SONG_CONTEXT_FIELD_NAMES[field]
+            )
+            for field in SONG_CONTEXT_LABELS
+        }
+        for field, text in submitted.items():
+            stored = getattr(project.song, field)
+            # A no-op, and the one case where doing nothing is the whole feature. Note this
+            # compares the *normalised* submission against stored text that was normalised the
+            # same way on its own way in, so re-saving an untouched sheet is byte-equal here.
+            if text == stored:
+                continue
+            setattr(project.song, f"{field}{RECOVERY_SLOT_SUFFIX}", stored)
+            setattr(project.song, field, text)
+        return store.save(project)
+
+    @app.post(
+        "/api/projects/{project_id}/song/context/{field}/restore", response_model=Project
+    )
+    def restore_song_context(project_id: str, field: SongContextField) -> Project:
+        """Swap one song context field with the single version kept for it.
+
+        A swap rather than a pop, matching the document restore exactly: the text being displaced
+        becomes the kept version, so the restore is its own inverse and a mis-click costs nothing.
+        The asymmetry would be the surprise — a Director who has used restore on the Treatment
+        would reasonably expect the same click to behave the same way here.
+
+        Nothing else about the Song is read or written. This route takes no body at all, so
+        `path`, `duration`, `source` and `prompt_id` are not on the wire and cannot be defaulted
+        away by it, which is the same guarantee the edit route makes.
+
+        Nothing is appended to the chat thread, which is where this differs from the document
+        restore deliberately. That thread is the audit trail of what the *Director* did to the two
+        creative documents, and a Director reply can replace them without being asked; song
+        context only ever changes when the human clicks save, so a system line about it would be
+        the application narrating the human's own click back at them — and, since the thread is
+        handed to the model on the next turn, doing so in the model's prompt.
+
+        `None` in the slot means no save has ever displaced anything, and that refuses. `""` means
+        a save displaced a blank, and that restores — a Director who pasted a sheet over an empty
+        field has a real previous version, and telling them the blank is unrecoverable would be
+        the conflation `Song`'s own docstring exists to avoid.
+        """
+        project = get_project(project_id)
+        if project.song is None:
+            raise HTTPException(status_code=404, detail=SONG_CONTEXT_WITHOUT_SONG)
+        slot = f"{field}{RECOVERY_SLOT_SUFFIX}"
+        previous = getattr(project.song, slot)
+        if previous is None:
+            raise HTTPException(
+                status_code=422,
+                detail=SONG_CONTEXT_RESTORE_REFUSAL.format(field=SONG_CONTEXT_LABELS[field]),
+            )
+        setattr(project.song, slot, getattr(project.song, field))
+        setattr(project.song, field, previous)
         return store.save(project)
 
     @app.delete("/api/projects/{project_id}/song", response_model=Project)

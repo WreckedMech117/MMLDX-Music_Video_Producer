@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -237,7 +237,55 @@ function renderSongContext() {
   lyrics.disabled = !editable;
   style.disabled = !editable;
   $("#save-song-context").disabled = !editable;
+  // Each restore follows its own field's slot, never a shared flag and never a constant: a save
+  // that changed only the lyrics leaves the style description with nothing kept, and offering a
+  // restore there is an offer the route refuses with a 422 the Director did nothing to earn.
+  // Gated on `editable` as well, because a project with no song has no slots to read at all.
+  for (const [field, control] of Object.entries(SONG_CONTEXT_CONTROLS)) {
+    const available = editable && songContextRestoreAvailable(song, field);
+    const button = $(control.restore);
+    button.disabled = !available;
+    button.title = songContextRestoreTitle(field, available);
+  }
   renderSongContextCounts();
+}
+
+// Recovery for one context field: swap the box back to the version kept before the last save that
+// changed it. Nothing is sent but the field name -- the kept text lives on the server, and a client
+// that supplied it would be inventing the thing it claims to be restoring.
+//
+// The response re-seeds the editors, so anything typed and unsaved is discarded by it. That text was
+// never captured, because only *stored* text becomes a kept version, so the question is asked first
+// -- the same gate `restoreDocument` puts in front of the identical loss.
+async function restoreSongContext(field) {
+  if (!requireProject()) return;
+  if (state.songContextDirty && !window.confirm(songContextRestoreQuestion(field))) return;
+  try {
+    state.project = await api.restoreSongContext(state.project.id, field);
+    // Cleared only once the server has answered, and before the render, so the boxes are re-seeded
+    // from the restored Song rather than left holding the text that was just swapped out.
+    state.songContextDirty = false;
+    renderSong();
+    toast(songContextRestoreNotice(field));
+  } catch (error) {
+    toast(error.message, "error");
+    // The buttons are disabled unless a version is kept, so this refusal means the loaded project
+    // is stale. Refresh, exactly as a document restore and a Song refusal do, or every retry fails
+    // identically against the same stale state.
+    if (!songContextRestoreRefusal(error.message) || !state.project) return;
+    try {
+      state.project = await api.project(state.project.id);
+      state.songContextDirty = false;
+      renderSong();
+    } catch {
+      // Leave the original error standing; a failed refresh is not new information.
+    }
+  }
+}
+
+// The unsaved-work question for a restore, which is the one thing a restore destroys.
+function songContextRestoreQuestion(field) {
+  return `Restore the ${SONG_CONTEXT_CONTROLS[field].label.toLowerCase()} from the version kept on the server?\n\nWhat is in the box now is unsaved, so it is not the kept version and it is discarded.`;
 }
 
 // How much of its bound the text in each of the four song-context boxes uses, written where the
@@ -934,6 +982,11 @@ function bindEvents() {
     catch (error) { await recoverFromSongRefusal(error); }
   });
   $("#save-song-context").addEventListener("click", saveSongContext);
+  // Both restores route through the one function rather than reimplementing the call, and they are
+  // bound from the one control table so a field's selector is never respelled at the bind site.
+  for (const [field, control] of Object.entries(SONG_CONTEXT_CONTROLS)) {
+    $(control.restore).addEventListener("click", () => restoreSongContext(field));
+  }
   // Typing marks the editors dirty so no incidental re-render overwrites them; a landed save, an
   // import, a removal and a load that actually changes project are the only things that clear it.
   ["song-lyrics", "song-style"].forEach((id) => $("#" + id).addEventListener("input", () => { state.songContextDirty = true; }));

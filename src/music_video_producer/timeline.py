@@ -147,7 +147,8 @@ def expansion_input(project: Project) -> dict[str, Any]:
     in the song rather than in the manifest, and the route's notices are numbered by the same
     call. `song_fraction` is **absent** when there is no Song or its duration is unknown — a
     fabricated 0.0 would tell the model every shot opens the song — and `section` is absent for
-    the reason `song_section` documents.
+    the reason `song_section` documents. The song block's `lyrics` and `caption` follow the same
+    convention: present when the Song carries them, absent rather than `""` when it does not.
 
     Every key here is described to the model in `EXPANSION_SYSTEM_PROMPT`. A payload whose
     semantics the model has to infer is a payload whose variance mechanism is hoped for rather
@@ -207,7 +208,25 @@ def expansion_input(project: Project) -> dict[str, Any]:
         "shots": shots,
     }
     if project.song is not None:
-        # Title and length only. The lyric sheet and the generation caption are the Song's
-        # bulkiest fields and neither says where a Shot sits, which is what this input is for.
-        payload["song"] = {"title": project.song.title, "duration": project.song.duration}
+        # Title, length, and what the Director already said the song *is*. The lyric sheet and
+        # the style caption are the Song's bulkiest fields, and carrying them is a deliberate
+        # decision about what this call sees rather than an oversight: the chat route has always
+        # sent both, and expansion is the planning act most likely to want the words. The
+        # context objection that keeps this input trimmed is about *accumulation* — one
+        # expansion is a single stateless whole-plan call, so the sheet costs its tokens once
+        # per expansion and not once per turn the way the chat thread does.
+        #
+        # Sent exactly as stored: nothing here parses, sections, excerpts or summarises a lyric
+        # sheet, and a section tag inside one is structure, never a timestamp.
+        #
+        # Absent rather than empty, for the same reason `song_fraction` is absent when there is
+        # no duration: `""` is not "this song has no words", it is a confident claim that it
+        # has none. A Song carrying neither field therefore produces the payload this builder
+        # produced before either field existed, byte for byte.
+        song: dict[str, Any] = {"title": project.song.title, "duration": project.song.duration}
+        if project.song.lyrics:
+            song["lyrics"] = project.song.lyrics
+        if project.song.caption:
+            song["caption"] = project.song.caption
+        payload["song"] = song
     return payload

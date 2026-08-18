@@ -21,6 +21,24 @@ def now_utc() -> datetime:
 
 
 class Song(BaseModel):
+    """A track and what it is: the audio, its timing spine, and the two context fields.
+
+    The context fields carry the largest hand-authored text this application accepts, so each
+    has the single-slot recovery `Project.treatment`/`style_bible` gained in Story 2.1 — one
+    previous version, no history stack, and a restore that swaps rather than pops.
+
+    The slots are `str | None`, which is the one place this deliberately does *not* mirror the
+    document slots. Those are `str = ""` and so cannot tell "no version was ever kept" from "the
+    version kept was blank"; the document restore route resolves that by refusing an empty slot,
+    which is defensible there because a first draft into a blank document is not a replacement.
+    It is not defensible here. A Director who pasted a lyric sheet over a blank field has a real
+    previous version — the blank — and wanting it back is an ordinary undo, not a corner case.
+    `None` means no save has ever displaced anything; `""` means a save displaced a blank.
+
+    Both are excluded from the Director's context by `app.SONG_DIRECTOR_WITHHELD`, which is
+    enforced by classification rather than by a path — see that constant for why.
+    """
+
     title: str
     source: SongSource
     path: str = ""
@@ -28,6 +46,8 @@ class Song(BaseModel):
     lyrics: str = ""
     caption: str = ""
     prompt_id: str = ""
+    lyrics_previous: str | None = None
+    caption_previous: str | None = None
 
 
 class VisionInspectionRecord(BaseModel):

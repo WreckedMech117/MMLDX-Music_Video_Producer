@@ -117,6 +117,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .analysis-strip strong { font-size: 13px; font-weight: 550; }
 .song-context { padding: 15px 18px; border-bottom: 1px solid var(--line); }
 .song-context .block-heading { margin-bottom: 11px; }
+/* The two per-field restore buttons, above the save so the row that undoes is never mistaken for
+   the row that writes. Each stretches to half the width: two equal targets for two equal fields. */
+.context-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 8px; }
 .production-note { display: grid; grid-template-columns: 120px 1fr; gap: 20px; padding: 14px 18px; }
 .production-note span { color: var(--amber); font: 10px Consolas, monospace; letter-spacing: .09em; }
 .production-note p { margin: 0; color: var(--muted); font-size: 12px; }

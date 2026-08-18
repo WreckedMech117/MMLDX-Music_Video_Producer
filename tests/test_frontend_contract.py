@@ -14,11 +14,15 @@ from music_video_producer.app import (
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_RESTORE_REFUSAL,
     SONG_CAPTION_LIMIT,
+    SONG_CONTEXT_LABELS,
+    SONG_CONTEXT_RESTORE_NOTICE,
+    SONG_CONTEXT_RESTORE_REFUSAL,
     SONG_LYRICS_LIMIT,
     SONG_REPLACEMENT_CONSEQUENCE,
     MusicRequest,
     SongPlannerRequest,
     _require_song_replacement_confirmation,
+    create_app,
     document_not_requested_notice,
     document_restore_notice,
 )
@@ -912,7 +916,13 @@ def test_saving_an_emptied_song_context_asks_before_it_deletes():
     assert len(saves["refused"]["asked"]) == 1
     assert "lyric sheet" in saves["refused"]["asked"][0]
     assert saves["consequence"] in saves["refused"]["asked"][0]
-    assert "no previous version" in saves["consequence"]
+    # The consequence used to say a song "keeps no previous version of its context". It does now,
+    # so the sentence has to say what recovery there is *and* its one-step limit -- a Director told
+    # the text is gone forever will not look for the Restore button that would bring it back, and a
+    # Director told it is simply recoverable will not notice the next save spends the slot.
+    assert "no previous version" not in saves["consequence"]
+    assert "Restore" in saves["consequence"]
+    assert "the next save spends it" in saves["consequence"]
     assert saves["refused"]["sent"] == 0
     # The text on screen is still the only copy, so the dirty flag must survive the refusal.
     assert saves["refused"]["dirty"] is True
@@ -931,6 +941,301 @@ def test_saving_an_emptied_song_context_asks_before_it_deletes():
     assert saves["bothFields"] == ["lyric sheet", "style description"]
     assert saves["neither"] == []
     assert saves["nothingStored"] == []
+
+
+def song_context_controls() -> dict:
+    """api.js's one table of per-field selectors, slots and restore-route path segments."""
+    return run_module("""
+      import { SONG_CONTEXT_CONTROLS } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(SONG_CONTEXT_CONTROLS));
+    """)
+
+
+def song_context_count_boxes() -> set[str]:
+    """The box selectors api.js's counter table knows about."""
+    counts = run_module("""
+      import { SONG_CONTEXT_COUNTS } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(SONG_CONTEXT_COUNTS));
+    """)
+    return {control["field"] for control in counts}
+
+
+def test_song_context_restore_controls_exist_and_agree_with_the_server():
+    """A missing id breaks startup, and nothing else in the suite would notice.
+
+    `bindEvents` dereferences both restore ids with no null check, so removing one throws before
+    anything renders and the whole workspace fails to initialize. The ids, the slots they read and
+    the path segment they call are read from the table app.js binds from, so a rename has to land
+    in both halves -- and the slot names are checked against `Song` itself, because a slot spelled
+    differently here reads `undefined` and disables a button that should have been offered.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    controls = song_context_controls()
+    counted = song_context_count_boxes()
+
+    assert set(controls) == set(SONG_CONTEXT_LABELS), controls
+    for field, control in controls.items():
+        # The path segment is the route's own, so a rename 404s rather than restoring the wrong half.
+        assert control["field"] == field, control
+        assert control["previousField"] == f"{field}_previous", control
+        assert control["previousField"] in Song.model_fields, control["previousField"]
+        assert control["label"] == SONG_CONTEXT_LABELS[field], control
+        element_id = control["restore"].removeprefix("#")
+        assert markup.count(f'id="{element_id}"') == 1, element_id
+        # Shipped disabled: nothing is recoverable until a save has displaced something, and the
+        # render is the only thing that may open it.
+        assert re.search(rf'id="{element_id}"[^>]*disabled', markup), element_id
+        # The box each restore belongs to is a box the workspace really has a counter for, so the
+        # two tables cannot name different controls for the same field.
+        assert control["box"] in counted, control
+    # Two distinct buttons, or one field's restore is the other's.
+    assert len({control["restore"] for control in controls.values()}) == len(controls)
+
+    # And the route each one calls really exists on the server, built the same way the api client
+    # builds it rather than spelled out here.
+    call = API_JS.read_text(encoding="utf-8").split("restoreSongContext:", 1)[1].split("\n", 1)[0]
+    url = re.search(r"`([^`]+)`", call)
+    assert url, "api.restoreSongContext no longer builds its URL from a template literal"
+    assert 'method: "POST"' in call
+    # No body: the kept version lives on the server, and a client that supplied it would be
+    # inventing the thing it claims to be restoring.
+    assert "body:" not in call, call
+    assert "JSON.stringify" not in call, call
+    template = re.sub(r"\$\{[^}]+\}", "{}", url.group(1))
+    template = template.replace("/{}/song/context/{}/", "/{project_id}/song/context/{field}/")
+    assert template in {route.path for route in create_app().routes}, template
+
+
+def test_a_song_context_restore_button_is_enabled_by_its_own_slot_including_an_empty_one():
+    """The decision is executed, and the empty-versus-absent distinction is the whole point.
+
+    `documentRestoreAvailable` tests emptiness, because a document slot is `str = ""` and cannot
+    tell "kept nothing" from "kept a blank". A song slot is `str | None` precisely so it can, and
+    copying the document predicate here would disable the button on exactly the case the matrix
+    calls out: a Director who pasted over a blank field and wants the blank back. So `""` must
+    enable and `null` must not, and a crossed wiring must never let one field's slot enable the
+    other's button.
+    """
+    available = run_module("""
+      import { songContextRestoreAvailable } from './src/music_video_producer/web/assets/api.js';
+      const attempt = (fn) => { try { return fn(); } catch (error) { return `THREW: ${error.message}`; } };
+      const lyricsOnly = { lyrics_previous: 'kept sheet', caption_previous: null };
+      const captionOnly = { lyrics_previous: null, caption_previous: 'kept style' };
+      console.log(JSON.stringify({
+        keptLyrics: songContextRestoreAvailable(lyricsOnly, 'lyrics'),
+        crossedToCaption: songContextRestoreAvailable(lyricsOnly, 'caption'),
+        keptCaption: songContextRestoreAvailable(captionOnly, 'caption'),
+        crossedToLyrics: songContextRestoreAvailable(captionOnly, 'lyrics'),
+        keptBlank: songContextRestoreAvailable({ lyrics_previous: '' }, 'lyrics'),
+        keptWhitespace: songContextRestoreAvailable({ lyrics_previous: '  \\n ' }, 'lyrics'),
+        nullSlot: songContextRestoreAvailable({ lyrics_previous: null }, 'lyrics'),
+        missing: songContextRestoreAvailable({}, 'lyrics'),
+        noSong: songContextRestoreAvailable(null, 'lyrics'),
+        absent: songContextRestoreAvailable(undefined, 'lyrics'),
+        nonString: songContextRestoreAvailable({ lyrics_previous: 5 }, 'lyrics'),
+        unknown: attempt(() => songContextRestoreAvailable({}, 'title')),
+      }));
+    """)
+
+    assert available["keptLyrics"] is True
+    assert available["keptCaption"] is True
+    # An empty previous version is a real one: the blank a Director pasted over is recoverable.
+    assert available["keptBlank"] is True
+    assert available["keptWhitespace"] is True
+    # A kept version of one field must not enable the other field's restore.
+    assert available["crossedToCaption"] is False
+    assert available["crossedToLyrics"] is False
+    for nothing in ("nullSlot", "missing", "noSong", "absent", "nonString"):
+        assert available[nothing] is False, nothing
+    assert "THREW: Unknown song context field" in available["unknown"]
+
+
+def test_rendering_the_song_sets_each_restore_button_from_its_own_stored_slot():
+    """Replacing the enabled computation with a constant must not leave the suite green.
+
+    The buttons are the entire interface to recovery. Always enabled, they offer a restore the
+    route refuses with a 422 the Director did nothing to earn; never enabled, the feature does not
+    exist on screen at all while every string assertion in this file still passes. So the render is
+    run against the stub DOM and the buttons are read afterwards, including the case that decides
+    the shape of the whole feature -- a slot holding an empty string.
+    """
+    rendered = run_workspace("""
+      const base = { title: 'Spine', source: 'imported', path: 'media/songs/000-master.wav', duration: 180, lyrics: 'live sheet', caption: 'live style' };
+      const read = () => ({
+        lyrics: { disabled: at('#restore-song-lyrics').disabled, title: at('#restore-song-lyrics').title },
+        caption: { disabled: at('#restore-song-style').disabled, title: at('#restore-song-style').title },
+      });
+      const render = (song) => { state.project = { id: 'p1', shots: [], jobs: [], song }; state.songContextDirty = false; app.renderSong(); return read(); };
+      console.log(JSON.stringify({
+        nothingKept: render({ ...base, lyrics_previous: null, caption_previous: null }),
+        lyricsKept: render({ ...base, lyrics_previous: 'the kept sheet', caption_previous: null }),
+        blankKept: render({ ...base, lyrics_previous: '', caption_previous: null }),
+        bothKept: render({ ...base, lyrics_previous: 'a', caption_previous: 'b' }),
+        songless: render(null),
+        preRecovery: render({ ...base }),
+      }));
+    """)
+
+    # Nothing displaced yet: both shut, and the tooltip says why rather than leaving a dead button.
+    assert rendered["nothingKept"]["lyrics"]["disabled"] is True
+    assert rendered["nothingKept"]["caption"]["disabled"] is True
+    assert "No previous version" in rendered["nothingKept"]["lyrics"]["title"]
+
+    # One field's slot opens one field's button and not the other's.
+    assert rendered["lyricsKept"]["lyrics"]["disabled"] is False
+    assert rendered["lyricsKept"]["caption"]["disabled"] is True
+    assert "Swap the lyric sheet back" in rendered["lyricsKept"]["lyrics"]["title"]
+
+    # The case the document predicate would have got wrong.
+    assert rendered["blankKept"]["lyrics"]["disabled"] is False
+
+    assert rendered["bothKept"]["lyrics"]["disabled"] is False
+    assert rendered["bothKept"]["caption"]["disabled"] is False
+
+    # No song at all: nothing to restore and no route to call, so both stay shut.
+    assert rendered["songless"]["lyrics"]["disabled"] is True
+    assert rendered["songless"]["caption"]["disabled"] is True
+    # A song from a manifest written before the slots existed carries neither key.
+    assert rendered["preRecovery"]["lyrics"]["disabled"] is True
+
+
+def test_the_song_context_restore_click_calls_the_route_and_asks_before_discarding_typing():
+    """The click is fired, not read: the handler, the guard and the request are all executed.
+
+    Two things have to hold at once. The response re-seeds both boxes, so unsaved typing is
+    discarded by a restore -- and that text was never captured, because only *stored* text becomes
+    a kept version, which makes it the one thing a restore can destroy. And the request itself must
+    carry no body, or the client would be supplying the very version it claims to be recovering.
+    """
+    clicks = run_workspace("""
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/000-master.wav', duration: 180, lyrics: 'live sheet', caption: 'live style', lyrics_previous: 'the kept sheet', caption_previous: 'the kept style' };
+      const restores = () => requests.filter((sent) => sent.path.includes('/song/context/'));
+      const arrange = (dirty) => {
+        state.project = { id: 'p1', shots: [], jobs: [], song };
+        state.songContextDirty = dirty;
+        app.renderSong();
+      };
+      arrange(false);
+      answer(false);
+      await fire('#restore-song-lyrics:click', {});
+      const clean = { asked: [...asked], sent: restores() };
+      arrange(true);
+      at('#song-lyrics').value = 'MID-PASTE';
+      answer(false);
+      await fire('#restore-song-lyrics:click', {});
+      const refused = { asked: [...asked], sent: restores().length, lyrics: at('#song-lyrics').value, dirty: state.songContextDirty };
+      answer(true);
+      await fire('#restore-song-style:click', {});
+      const accepted = { asked: [...asked], sent: restores() };
+      console.log(JSON.stringify({ clean, refused, accepted, notice: contract.songContextRestoreNotice('lyrics') }));
+    """)
+
+    # Nothing unsaved: no question, and the call goes straight out with no body.
+    assert clicks["clean"]["asked"] == []
+    assert len(clicks["clean"]["sent"]) == 1
+    sent = clicks["clean"]["sent"][0]
+    assert sent["method"] == "POST"
+    assert sent["body"] is None
+    assert sent["path"] == "/api/projects/p1/song/context/lyrics/restore"
+
+    # Unsaved typing: asked, refused, and nothing sent -- the text on screen is still the only copy.
+    assert len(clicks["refused"]["asked"]) == 1
+    assert "discarded" in clicks["refused"]["asked"][0]
+    assert clicks["refused"]["sent"] == 0
+    assert clicks["refused"]["lyrics"] == "MID-PASTE"
+    assert clicks["refused"]["dirty"] is True
+
+    # Answered yes: the other field's button calls the other field's route segment.
+    assert len(clicks["accepted"]["asked"]) == 1
+    assert len(clicks["accepted"]["sent"]) == 1
+    assert clicks["accepted"]["sent"][0]["path"].endswith("/song/context/caption/restore")
+
+    # And the toast says the swap is reversible, or single-slot recovery nobody dares use is not
+    # recovery -- the same claim the document restore's wording makes.
+    assert "swaps back" in clicks["notice"]
+    assert SONG_CONTEXT_LABELS["lyrics"] in clicks["notice"]
+
+
+def test_song_context_restore_wording_agrees_with_the_server_on_both_sides():
+    """One sentence per act, and a refusal marker that is really a substring of the server's.
+
+    The marker is what makes the stale-project refresh work; keyed on a phrase the server does not
+    actually send, the recovery path silently stops running and every retry fails identically. It
+    must also share no phrase with the document refusal, or one recovery path claims the other's
+    failure and refreshes a project that was never stale.
+    """
+    refusal = SONG_CONTEXT_RESTORE_REFUSAL.format(field=SONG_CONTEXT_LABELS["lyrics"])
+    result = run_module(f"""
+      import {{ SONG_CONTEXT_RESTORE_REFUSAL_MARKER, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, DOCUMENT_RESTORE_REFUSAL_MARKER }}
+        from './src/music_video_producer/web/assets/api.js';
+      const attempt = (fn) => {{ try {{ return fn(); }} catch (error) {{ return `THREW: ${{error.message}}`; }} }};
+      console.log(JSON.stringify({{
+        marker: SONG_CONTEXT_RESTORE_REFUSAL_MARKER,
+        documentMarker: DOCUMENT_RESTORE_REFUSAL_MARKER,
+        refusal: songContextRestoreRefusal({json.dumps(refusal)}),
+        other: songContextRestoreRefusal('ComfyUI returned 400: prompt outputs failed validation'),
+        missing: songContextRestoreRefusal(undefined),
+        nonString: songContextRestoreRefusal(422),
+        notices: {{ lyrics: songContextRestoreNotice('lyrics'), caption: songContextRestoreNotice('caption') }},
+        titles: {{ available: songContextRestoreTitle('lyrics', true), empty: songContextRestoreTitle('lyrics', false) }},
+        unknown: attempt(() => songContextRestoreNotice('title')),
+      }}));
+    """)
+
+    assert result["marker"] in SONG_CONTEXT_RESTORE_REFUSAL
+    assert result["refusal"] is True, "the predicate no longer matches the server's own refusal"
+    for not_this in ("other", "missing", "nonString"):
+        assert result[not_this] is False, not_this
+    # The two refusals must not be confusable in either direction.
+    assert result["marker"] not in DOCUMENT_RESTORE_REFUSAL
+    assert result["documentMarker"] not in SONG_CONTEXT_RESTORE_REFUSAL
+    # One sentence for the act, matching the server's word for word.
+    for field, label in SONG_CONTEXT_LABELS.items():
+        assert result["notices"][field] == SONG_CONTEXT_RESTORE_NOTICE.format(field=label), field
+    assert "Swap" in result["titles"]["available"]
+    assert "No previous version" in result["titles"]["empty"]
+    assert "THREW: Unknown song context field" in result["unknown"]
+
+    # A refusal must refresh the project rather than only toast, or every retry fails identically.
+    handler = app_js_block("async function restoreSongContext")
+    assert "api.restoreSongContext(state.project.id, field)" in handler
+    assert "songContextRestoreRefusal(error.message)" in handler
+    assert "api.project(" in handler
+    # The dirty flag is cleared only after the server has answered, and before the re-render, or
+    # the boxes keep showing the text that was just swapped out.
+    assert handler.index("api.restoreSongContext(") < handler.index("state.songContextDirty = false")
+    assert handler.index("state.songContextDirty = false") < handler.index("renderSong();")
+    # Both buttons route through this one function, bound from the one control table.
+    bindings = APP_JS.read_text(encoding="utf-8")
+    assert "for (const [field, control] of Object.entries(SONG_CONTEXT_CONTROLS))" in bindings
+    assert '$(control.restore).addEventListener("click", () => restoreSongContext(field));' in bindings
+
+
+def test_the_song_context_editor_never_sends_a_recovery_slot():
+    """Only a save that displaces something writes a slot, and only the server decides that.
+
+    The save path builds its body from `songContextFields`, which has exactly two keys — but the
+    whole-project save is the sibling write path that has twice been the hole here, and it PUTs a
+    `Song` the client has been holding. Both are asserted: the context save cannot name a slot, and
+    the project save cannot be the authority on one.
+    """
+    save = without_comments(app_js_block("async function saveSongContext()"))
+    project_save = without_comments(
+        APP_JS.read_text(encoding="utf-8").split("async function saveProject", 1)[1].split("\n}", 1)[0]
+    )
+
+    for slot in ("lyrics_previous", "caption_previous"):
+        assert slot not in save, slot
+        assert slot not in project_save, slot
+
+    # The client may still round-trip the field it was given, so the server-side guard is what
+    # actually holds -- pinned in tests/test_api.py against the route. This half only proves the
+    # client never constructs one.
+    body = run_module("""
+      import { songContextFields } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(Object.keys(songContextFields('words', 'style'))));
+    """)
+    assert body == ["lyrics", "caption"]
 
 
 def test_the_song_context_boxes_count_against_the_bound_instead_of_truncating_at_it():

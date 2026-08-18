@@ -54,6 +54,24 @@ def test_director_timeline_warns_outside_h3_training_window():
     assert any("4–15" in warning for warning in result.warnings)
 
 
+# A lyric sheet with the three things a real one has and nothing in this path may touch:
+# section tags, interior blank lines, and indentation. Written for this suite rather than taken
+# from a real song — a copyrighted sheet is not test data, and nothing here depends on the words.
+SPINE_LYRIC_SHEET = (
+    "[Verse 1]\n"
+    "Cold rail, the platform hums\n"
+    "\n"
+    "    a paper cup goes over the edge\n"
+    "\n"
+    "[Chorus]\n"
+    "Hold the line, hold the line\n"
+    "\n"
+    "[Bridge]\n"
+    "    counting sodium lights"
+)
+SPINE_SONG_STYLE = "Downtempo industrial pop, close female vocal, tape saturation, no live drums."
+
+
 def expansion_project(*, song: Song | None) -> Project:
     """A plan whose shots are deliberately out of manifest order, with one locked."""
     project = Project(name="Expansion")
@@ -85,6 +103,9 @@ def test_expansion_input_carries_each_shots_position_in_the_song():
     assert built["shots"][1]["end"] == 36
     assert built["shots"][1]["duration"] == 6
     assert built["shots"][1]["song_fraction"] == 0.25
+    # Exact equality, still: the block is a *song* block and nothing else may drift into it.
+    # This Song carries no words and no style description, so the payload is the one this
+    # builder produced before either field existed — absent, never `""`.
     assert built["song"] == {"title": "Spine", "duration": 120}
     # The documents the prompts have to embed, and nothing about takes or renders.
     assert built["treatment"].startswith("Three movements")
@@ -96,6 +117,91 @@ def test_expansion_input_carries_each_shots_position_in_the_song():
     # reliable range, the 5 s one is not. Nothing here gates anything; expansion writes prompts.
     assert built["shots"][2]["outside_h3_window"] is True
     assert built["shots"][0]["outside_h3_window"] is False
+
+
+def test_expansion_input_carries_the_songs_words_and_style_exactly_as_stored():
+    """The words reach the planning act most likely to want them, and reach it unaltered.
+
+    Pinned by exact equality rather than by `in`, for the same reason the title-and-duration
+    assertion above always was: this block is a *song* block, and the guard that catches the
+    next unintended widening of it is the one that names every key it may hold. A looser check
+    would pass just as happily on a block that had grown a fourth field nobody decided on.
+
+    Interior structure is asserted separately from the equality, because equality alone would
+    still hold if the sheet were normalised on both sides of this test at once — the constant
+    is checked to actually contain a section tag, a blank line and an indent, so "exactly as
+    stored" is a claim about something rather than about an already-flat string.
+    """
+    song = Song(
+        title="Spine",
+        source="imported",
+        duration=120,
+        lyrics=SPINE_LYRIC_SHEET,
+        caption=SPINE_SONG_STYLE,
+    )
+
+    built = expansion_input(expansion_project(song=song))
+
+    assert built["song"] == {
+        "title": "Spine",
+        "duration": 120,
+        "lyrics": SPINE_LYRIC_SHEET,
+        "caption": SPINE_SONG_STYLE,
+    }
+    # No parsing, sectioning, excerpting or summarising: the sheet goes whole.
+    assert "[Chorus]" in built["song"]["lyrics"]
+    assert "\n\n" in built["song"]["lyrics"]
+    assert "\n    counting sodium lights" in built["song"]["lyrics"]
+    # A maximum sheet is sent whole too — this is one stateless call, not a growing thread.
+    maximum = Song(
+        title="Long", source="imported", duration=120, lyrics="x" * 8000, caption="y" * 4000
+    )
+    whole = expansion_input(expansion_project(song=maximum))["song"]
+    assert len(whole["lyrics"]) == 8000
+    assert len(whole["caption"]) == 4000
+
+
+def test_expansion_input_omits_the_songs_words_and_style_when_the_song_has_none():
+    """Absent means absent, so a song with neither is byte-identical to what it was before.
+
+    `""` is not "this song has no words" — it is a confident claim that it has none, which is
+    the same failure a fabricated `song_fraction` of 0.0 would be. Each of the four
+    combinations is pinned by exact equality, so a field emptied instead of omitted fails here
+    whichever of the two it is, and the serialised form is compared against a Song built
+    without the fields at all — which is what "byte-identical" actually means.
+    """
+    bare = Song(title="Spine", source="imported", duration=120)
+    cases = {
+        "neither": (bare, {"title": "Spine", "duration": 120}),
+        "words only": (
+            bare.model_copy(update={"lyrics": SPINE_LYRIC_SHEET}),
+            {"title": "Spine", "duration": 120, "lyrics": SPINE_LYRIC_SHEET},
+        ),
+        "style only": (
+            bare.model_copy(update={"caption": SPINE_SONG_STYLE}),
+            {"title": "Spine", "duration": 120, "caption": SPINE_SONG_STYLE},
+        ),
+        "blank strings": (
+            bare.model_copy(update={"lyrics": "", "caption": ""}),
+            {"title": "Spine", "duration": 120},
+        ),
+    }
+    for label, (song, expected) in cases.items():
+        built = expansion_input(expansion_project(song=song))
+
+        assert built["song"] == expected, label
+        for field in ("lyrics", "caption"):
+            if field not in expected:
+                assert field not in built["song"], (label, field)
+
+    # Byte-identical, not merely equal: the whole payload for a Song carrying neither field is
+    # the exact JSON this builder produced before either field existed.
+    without = json.dumps(expansion_input(expansion_project(song=bare)), sort_keys=True)
+    assert '"song": {"duration": 120.0, "title": "Spine"}' in without
+    assert "lyrics" not in without
+    assert "caption" not in without
+    # And no Song at all is still no `song` key, unchanged by any of the above.
+    assert "song" not in expansion_input(expansion_project(song=None))
 
 
 def test_expansion_input_omits_the_song_fraction_rather_than_fabricating_zero():

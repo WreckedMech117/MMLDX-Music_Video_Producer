@@ -222,14 +222,14 @@ export function songContextSeedClearedOnLoad(currentProjectId, nextProjectId) {
 
 // Which stored song-context fields a save would delete outright.
 //
-// The route assigns both fields from the body, so saving with an empty box deletes what is stored —
-// and unlike the two creative documents, which Story 2.1 gave `treatment_previous` and
-// `style_bible_previous`, a Song keeps no earlier copy. Nothing can bring a deleted lyric sheet
-// back, and it is the largest hand-authored text this application accepts.
+// The route assigns both fields from the body, so saving with an empty box deletes what is stored.
+// It is now recoverable — each field keeps the one version a save displaced, exactly as the
+// treatment and the style bible do — but recovery is one step deep and the next save spends it, so
+// clearing 8000 characters of pasted lyrics is still the save worth stopping on.
 //
-// Asked only for that unrecoverable case: text that exists being replaced with nothing. Editing a
-// sheet down to *different* text is typing, and a question about every save would train the
-// Director to click through the one question that protects real work.
+// Asked only for that case: text that exists being replaced with nothing. Editing a sheet down to
+// *different* text is typing, and a question about every save would train the Director to click
+// through the one question that protects real work.
 export function songContextClearing(song, context) {
   const cleared = [];
   if (song?.lyrics?.trim() && !context?.lyrics?.trim()) cleared.push("lyric sheet");
@@ -237,12 +237,78 @@ export function songContextClearing(song, context) {
   return cleared;
 }
 
+// What is true after the click, stated exactly. It used to say a song "keeps no previous version
+// of its context", which was true when it was written and is a lie now — and a consequence that
+// overstates the damage is as corrosive as one that understates it: a Director who believes an
+// emptied field is gone forever will not look for the Restore button that would bring it back.
 export const SONG_CONTEXT_CLEARING_CONSEQUENCE =
-  "A song keeps no previous version of its context, so this cannot be restored the way a replaced " +
-  "treatment or style bible can. Nothing else about the song changes: not the audio, its length or its provenance.";
+  "The version being replaced is kept, and Restore beside the box swaps it back — but only the one " +
+  "most recent version, so the next save spends it. Nothing else about the song changes: not the audio, its length or its provenance.";
 
 export function songContextClearingQuestion(cleared) {
   return `Save this? It deletes the stored ${cleared.join(" and ")} for this song.\n\n${SONG_CONTEXT_CLEARING_CONSEQUENCE}`;
+}
+
+// Every per-field song-context control, in one table: the restore button's element id, the field
+// on the stored Song its enabled state reads, and the path segment the restore route accepts.
+// Same shape and same argument as DOCUMENT_CONTROLS — a field's selector, slot and route segment
+// spelled out again at the render, bind and call sites is how a rename half-lands and leaves a
+// button wired to the other field's slot. `field` is the route's own path segment, so a rename
+// here 404s rather than restoring the wrong half of the context.
+export const SONG_CONTEXT_CONTROLS = {
+  lyrics: { field: "lyrics", box: "#song-lyrics", restore: "#restore-song-lyrics", previousField: "lyrics_previous", label: "Lyric sheet" },
+  caption: { field: "caption", box: "#song-style", restore: "#restore-song-style", previousField: "caption_previous", label: "Style description" },
+};
+
+// One lookup, throwing rather than returning undefined — the DOCUMENT_CONTROLS argument exactly:
+// a field the server has no slot for must fail loudly here instead of rendering "undefined" into a
+// toast or binding a control to nothing.
+export function songContextControls(field) {
+  const control = SONG_CONTEXT_CONTROLS[field];
+  if (!control) throw new Error(`Unknown song context field: ${JSON.stringify(field)}`);
+  return control;
+}
+
+// Pure: is anything actually recoverable for this field? An always-enabled button offers a restore
+// the server refuses with 422, and the client then misreads its own bad offer as stale state.
+//
+// The test is `null`/`undefined`, NOT emptiness, and that is the one place this deliberately does
+// not copy `documentRestoreAvailable`. `Song.lyrics_previous` is `str | None`: `null` means no save
+// has ever displaced anything, and `""` means a save displaced a blank. A Director who pasted a
+// sheet over an empty field has a real previous version — the blank — and wanting it back is an
+// ordinary undo. Treating `""` as "nothing kept" would disable the button on exactly that case.
+export function songContextRestoreAvailable(song, field) {
+  const previous = song?.[songContextControls(field).previousField];
+  return typeof previous === "string";
+}
+
+// What the restore button says it will do, in the two states it has.
+export function songContextRestoreTitle(field, available) {
+  const label = songContextControls(field).label;
+  return available
+    ? `Swap the ${label.toLowerCase()} back to the version kept before the last save that changed it; the text on screen becomes the kept version`
+    : `No previous version of the ${label.toLowerCase()} is kept yet; one is kept when a save replaces it`;
+}
+
+// The one wording for a song-context restore, mirroring app.py's SONG_CONTEXT_RESTORE_NOTICE so
+// the toast the Director reads is the sentence the server would state for the same act.
+export const SONG_CONTEXT_RESTORE_NOTICE =
+  "{field} was restored to the version kept before the last save that changed it. The text " +
+  "that was replaced is now the kept version, so restoring again swaps back. Nothing else " +
+  "about the song changed: not the audio, its length or its provenance.";
+
+export function songContextRestoreNotice(field) {
+  return SONG_CONTEXT_RESTORE_NOTICE.replace("{field}", songContextControls(field).label);
+}
+
+// True when a rejection is the song-context restore route refusing because no version was kept.
+// The buttons are disabled when the loaded project has no slot, so a refusal means this client is
+// looking at stale state — the same recovery shape as DOCUMENT_RESTORE_REFUSAL_MARKER, and keyed
+// on a phrase that appears in the server's song refusal and in no other refusal it sends.
+export const SONG_CONTEXT_RESTORE_REFUSAL_MARKER = "was kept for this song";
+
+export function songContextRestoreRefusal(message) {
+  return typeof message === "string" && message.includes(SONG_CONTEXT_RESTORE_REFUSAL_MARKER);
 }
 
 // True when a rejection is the Song gate refusing an unacknowledged change, which the
@@ -1022,6 +1088,9 @@ export const api = {
   // Its own route, and it carries only the two context fields: the audio, the duration and the
   // provenance are not editable text, so nothing that could overwrite them is on the wire.
   saveSongContext: (id, context) => request(`/api/projects/${id}/song/context`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(context) }),
+  // Recovery for one context field. No body, exactly as the document restore has none: the kept
+  // version lives on the server and nothing the client could send is the authority on it.
+  restoreSongContext: (id, field) => request(`/api/projects/${id}/song/context/${field}/restore`, { method: "POST" }),
   // The flag is the Director's acknowledgement, so it is passed through rather than
   // hardcoded: a caller that never showed SONG_CHANGE_CONSEQUENCE must not claim it did.
   removeSong: (id, confirmed = false) => request(`/api/projects/${id}/song?confirm_song_replacement=${confirmed ? "true" : "false"}`, { method: "DELETE" }),
