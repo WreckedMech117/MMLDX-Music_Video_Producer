@@ -1,0 +1,1028 @@
+{
+  "1988": {
+    "inputs": {
+      "PowerLoraLoaderHeaderWidget": {
+        "type": "PowerLoraLoaderHeaderWidget"
+      },
+      "➕ Add Lora": "",
+      "model": [
+        "2004",
+        0
+      ]
+    },
+    "class_type": "Power Lora Loader (rgthree)",
+    "_meta": {
+      "title": "Power Lora Loader (rgthree)"
+    }
+  },
+  "1991": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "2007",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "1994": {
+    "inputs": {
+      "frame_rate": [
+        "1993:1748",
+        0
+      ],
+      "loop_count": 0,
+      "filename_prefix": "LTX2-EXTNO",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "1993:1746",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine 🎥🅥🅗🅢"
+    }
+  },
+  "1995": {
+    "inputs": {
+      "value": 1920
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "WIDTH"
+    }
+  },
+  "1996": {
+    "inputs": {
+      "value": 1080
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "HEIGHT"
+    }
+  },
+  "1997": {
+    "inputs": {
+      "value": 24
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "Framerate"
+    }
+  },
+  "1998": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "1999": {
+    "inputs": {
+      "noise_seed": 62189421302031
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "2000": {
+    "inputs": {
+      "value": 10
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "Extend video by (seconds)"
+    }
+  },
+  "2001": {
+    "inputs": {
+      "value": 3
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "Reference (in seconds) leave it at 3"
+    }
+  },
+  "2002": {
+    "inputs": {
+      "video": "TOCUT-18dsq.mp4",
+      "force_rate": [
+        "1993:1748",
+        0
+      ],
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "LTXV"
+    },
+    "class_type": "VHS_LoadVideo",
+    "_meta": {
+      "title": "Load Video (Upload) 🎥🅥🅗🅢"
+    }
+  },
+  "2004": {
+    "inputs": {
+      "unet_name": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "2005": {
+    "inputs": {
+      "vae_name": "ltx-2.5-video-vae-conv-bf16.safetensors",
+      "device": "main_device",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "VAELoaderKJ",
+    "_meta": {
+      "title": "VAELoader KJ"
+    }
+  },
+  "2006": {
+    "inputs": {
+      "vae_name": "ltx-2.5-audio-vae-bf16.safetensors",
+      "device": "cpu",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "VAELoaderKJ",
+    "_meta": {
+      "title": "VAELoader KJ"
+    }
+  },
+  "2007": {
+    "inputs": {
+      "clip_name": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+      "type": "ltxv",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP - Text Encoder"
+    }
+  },
+  "2013": {
+    "inputs": {
+      "model_name": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    },
+    "class_type": "LatentUpscaleModelLoader",
+    "_meta": {
+      "title": "Load Latent Upscale Model"
+    }
+  },
+  "1993:1712": {
+    "inputs": {
+      "start_index": -1,
+      "num_frames": [
+        "1993:1753",
+        1
+      ],
+      "images": [
+        "1993:1744",
+        0
+      ]
+    },
+    "class_type": "GetImageRangeFromBatch",
+    "_meta": {
+      "title": "Get end video (ref frames)"
+    }
+  },
+  "1993:1713": {
+    "inputs": {
+      "inputcount": 2,
+      "Update inputs": null,
+      "image_1": [
+        "1993:1714",
+        0
+      ],
+      "image_2": [
+        "1993:1715",
+        0
+      ]
+    },
+    "class_type": "ImageBatchMulti",
+    "_meta": {
+      "title": "Image Batch Multi"
+    }
+  },
+  "1993:1714": {
+    "inputs": {
+      "start_index": 0,
+      "num_frames": [
+        "1993:1720",
+        1
+      ],
+      "images": [
+        "1993:1744",
+        0
+      ]
+    },
+    "class_type": "GetImageRangeFromBatch",
+    "_meta": {
+      "title": "Get Image or Mask Range From Batch"
+    }
+  },
+  "1993:1715": {
+    "inputs": {
+      "width": [
+        "1993:1743",
+        2
+      ],
+      "height": [
+        "1993:1743",
+        1
+      ],
+      "upscale_method": "nearest-exact",
+      "keep_proportion": "pad_edge_pixel",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 64,
+      "device": "cpu",
+      "image": [
+        "1993:1716",
+        0
+      ]
+    },
+    "class_type": "ImageResizeKJv2",
+    "_meta": {
+      "title": "Resize Image v2"
+    }
+  },
+  "1993:1716": {
+    "inputs": {
+      "anything": [
+        "1993:1717",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "Clean VRAM Used"
+    }
+  },
+  "1993:1717": {
+    "inputs": {
+      "anything": [
+        "1993:1718",
+        0
+      ]
+    },
+    "class_type": "easy clearCacheAll",
+    "_meta": {
+      "title": "Clear Cache All"
+    }
+  },
+  "1993:1718": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 4096,
+      "temporal_overlap": 8,
+      "samples": [
+        "1993:1722",
+        0
+      ],
+      "vae": [
+        "2005",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "VAE Decode (Tiled)"
+    }
+  },
+  "1993:1719": {
+    "inputs": {
+      "samples": [
+        "1993:1722",
+        1
+      ],
+      "audio_vae": [
+        "2006",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVAEDecode",
+    "_meta": {
+      "title": "LTXV Audio VAE Decode"
+    }
+  },
+  "1993:1720": {
+    "inputs": {
+      "expression": "a - b ",
+      "variables.a": [
+        "1993:1721",
+        3
+      ],
+      "variables.b": [
+        "1993:1753",
+        1
+      ]
+    },
+    "class_type": "SimpleCalculatorKJ",
+    "_meta": {
+      "title": "SimpleCalculatorKJ"
+    }
+  },
+  "1993:1721": {
+    "inputs": {
+      "image": [
+        "1993:1744",
+        0
+      ]
+    },
+    "class_type": "GetImageSizeAndCount",
+    "_meta": {
+      "title": "Get Image Size & Count"
+    }
+  },
+  "1993:1722": {
+    "inputs": {
+      "av_latent": [
+        "1993:1723",
+        1
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "LTXVSeparateAVLatent"
+    }
+  },
+  "1993:1723": {
+    "inputs": {
+      "noise": [
+        "1993:1745",
+        0
+      ],
+      "guider": [
+        "1993:1725",
+        0
+      ],
+      "sampler": [
+        "1998",
+        0
+      ],
+      "sigmas": [
+        "1993:1726",
+        0
+      ],
+      "latent_image": [
+        "1993:1729",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "1993:1724": {
+    "inputs": {
+      "a": [
+        "2000",
+        0
+      ]
+    },
+    "class_type": "CM_IntToFloat",
+    "_meta": {
+      "title": "IntToFloat"
+    }
+  },
+  "1993:1725": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "1988",
+        0
+      ],
+      "positive": [
+        "1993:1735",
+        0
+      ],
+      "negative": [
+        "1993:1735",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider"
+    }
+  },
+  "1993:1726": {
+    "inputs": {
+      "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "ManualSigmas"
+    }
+  },
+  "1993:1728": {
+    "inputs": {
+      "samples": [
+        "1993:1730",
+        0
+      ],
+      "upscale_model": [
+        "2013",
+        0
+      ],
+      "vae": [
+        "2005",
+        0
+      ]
+    },
+    "class_type": "LTXVLatentUpsampler",
+    "_meta": {
+      "title": "LTXVLatentUpsampler"
+    }
+  },
+  "1993:1729": {
+    "inputs": {
+      "video_latent": [
+        "1993:1727",
+        0
+      ],
+      "audio_latent": [
+        "1993:1730",
+        1
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "LTXVConcatAVLatent"
+    }
+  },
+  "1993:1730": {
+    "inputs": {
+      "av_latent": [
+        "1993:1732",
+        1
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "LTXVSeparateAVLatent"
+    }
+  },
+  "1993:1732": {
+    "inputs": {
+      "noise": [
+        "1999",
+        0
+      ],
+      "guider": [
+        "1993:1733",
+        0
+      ],
+      "sampler": [
+        "1998",
+        0
+      ],
+      "sigmas": [
+        "1993:1734",
+        0
+      ],
+      "latent_image": [
+        "1993:1751",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "1993:1733": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "1988",
+        0
+      ],
+      "positive": [
+        "1993:1735",
+        0
+      ],
+      "negative": [
+        "1993:1735",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider"
+    }
+  },
+  "1993:1734": {
+    "inputs": {
+      "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "ManualSigmas"
+    }
+  },
+  "1993:1735": {
+    "inputs": {
+      "frame_rate": [
+        "1993:1748",
+        0
+      ],
+      "positive": [
+        "1991",
+        0
+      ],
+      "negative": [
+        "1993:1739",
+        0
+      ]
+    },
+    "class_type": "LTXVConditioning",
+    "_meta": {
+      "title": "LTXVConditioning"
+    }
+  },
+  "1993:1736": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 4096,
+      "temporal_overlap": 8,
+      "pixels": [
+        "1993:1737",
+        0
+      ],
+      "vae": [
+        "2005",
+        0
+      ]
+    },
+    "class_type": "VAEEncodeTiled",
+    "_meta": {
+      "title": "VAE Encode (Tiled)"
+    }
+  },
+  "1993:1737": {
+    "inputs": {
+      "img_compression": 33,
+      "image": [
+        "1993:1738",
+        0
+      ]
+    },
+    "class_type": "LTXVPreprocess",
+    "_meta": {
+      "title": "LTXV Preprocess"
+    }
+  },
+  "1993:1738": {
+    "inputs": {
+      "resize_type": "scale by multiplier",
+      "resize_type.multiplier": 0.5,
+      "scale_method": "area",
+      "input": [
+        "1993:1712",
+        0
+      ]
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Resize Image/Mask"
+    }
+  },
+  "1993:1739": {
+    "inputs": {
+      "text": "text, subtitles, logo, still image, still video, no motion, static, frozen, blurry, low quality, distorted, bad anatomy, oversaturated, pixelated, low resolution, grainy, compression artifacts, jpeg artifacts, glitches, watermark, signature, copyright,  distortedsound, saturated sound, loud sound , deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, blurry teeth, disfigured teeth, ",
+      "clip": [
+        "2007",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "1993:1740": {
+    "inputs": {
+      "expression": "a + b",
+      "variables.a": [
+        "2000",
+        0
+      ],
+      "variables.b": [
+        "1993:1747",
+        0
+      ]
+    },
+    "class_type": "SimpleCalculatorKJ",
+    "_meta": {
+      "title": "Ref  + extend = end time"
+    }
+  },
+  "1993:1741": {
+    "inputs": {
+      "start_index": 0,
+      "num_frames": 1,
+      "images": [
+        "1993:1712",
+        0
+      ]
+    },
+    "class_type": "GetImageRangeFromBatch",
+    "_meta": {
+      "title": "FIRST FRAME"
+    }
+  },
+  "1993:1742": {
+    "inputs": {
+      "longer_edge": 1536,
+      "images": [
+        "1993:1741",
+        0
+      ]
+    },
+    "class_type": "ResizeImagesByLongerEdge",
+    "_meta": {
+      "title": "Resize Images by Longer Edge (DEPRECATED)"
+    }
+  },
+  "1993:1743": {
+    "inputs": {
+      "value": [
+        "1993:1744",
+        0
+      ]
+    },
+    "class_type": "ImpactImageInfo",
+    "_meta": {
+      "title": "ImpactImageInfo"
+    }
+  },
+  "1993:1744": {
+    "inputs": {
+      "width": [
+        "1995",
+        0
+      ],
+      "height": [
+        "1996",
+        0
+      ],
+      "upscale_method": "nearest-exact",
+      "keep_proportion": "stretch",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 64,
+      "device": "cpu",
+      "image": [
+        "2002",
+        0
+      ]
+    },
+    "class_type": "ImageResizeKJv2",
+    "_meta": {
+      "title": "Resize Image v2"
+    }
+  },
+  "1993:1745": {
+    "inputs": {
+      "noise_seed": 28
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "1993:1746": {
+    "inputs": {
+      "width": [
+        "1995",
+        0
+      ],
+      "height": [
+        "1996",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "keep_proportion": "stretch",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 8,
+      "device": "cpu",
+      "image": [
+        "1993:1713",
+        0
+      ]
+    },
+    "class_type": "ImageResizeKJv2",
+    "_meta": {
+      "title": "Resize Image v2"
+    }
+  },
+  "1993:1747": {
+    "inputs": {
+      "expression": "a / b",
+      "variables.a": [
+        "1993:1753",
+        1
+      ],
+      "variables.b": [
+        "1997",
+        0
+      ]
+    },
+    "class_type": "SimpleCalculatorKJ",
+    "_meta": {
+      "title": "ref in seconds"
+    }
+  },
+  "1993:1748": {
+    "inputs": {
+      "a": [
+        "1997",
+        0
+      ]
+    },
+    "class_type": "CM_IntToFloat",
+    "_meta": {
+      "title": "IntToFloat"
+    }
+  },
+  "1993:1749": {
+    "inputs": {
+      "expression": "a / b",
+      "variables.a": [
+        "1993:1753",
+        1
+      ],
+      "variables.b": [
+        "1993:1760",
+        5
+      ]
+    },
+    "class_type": "SimpleCalculatorKJ",
+    "_meta": {
+      "title": "overlap in seconds"
+    }
+  },
+  "1993:1750": {
+    "inputs": {
+      "video_fps": [
+        "1993:1748",
+        0
+      ],
+      "video_start_time": [
+        "1993:1747",
+        0
+      ],
+      "video_end_time": [
+        "1993:1740",
+        0
+      ],
+      "audio_start_time": [
+        "1993:1747",
+        0
+      ],
+      "audio_end_time": [
+        "1993:1740",
+        0
+      ],
+      "max_length": "pad",
+      "existing_mask_mode": "add",
+      "video_latent": [
+        "1993:1736",
+        0
+      ],
+      "audio_latent": [
+        "1993:1754",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVideoMask",
+    "_meta": {
+      "title": "LTXVAudioVideoMask"
+    }
+  },
+  "1993:1751": {
+    "inputs": {
+      "video_latent": [
+        "1993:1750",
+        0
+      ],
+      "audio_latent": [
+        "1993:1750",
+        1
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "LTXVConcatAVLatent"
+    }
+  },
+  "1993:1752": {
+    "inputs": {
+      "start_index": [
+        "1993:1761",
+        0
+      ],
+      "duration": 60
+    },
+    "class_type": "TrimAudioDuration",
+    "_meta": {
+      "title": "Get end audio"
+    }
+  },
+  "1993:1753": {
+    "inputs": {
+      "expression": "(a*b)+1",
+      "variables.a": [
+        "2001",
+        0
+      ],
+      "variables.b": [
+        "1997",
+        0
+      ]
+    },
+    "class_type": "SimpleCalculatorKJ",
+    "_meta": {
+      "title": "VIDEO REFERENCE FRAMES"
+    }
+  },
+  "1993:1754": {
+    "inputs": {
+      "frames_number": [
+        "1993:1753",
+        1
+      ],
+      "frame_rate": [
+        "2000",
+        0
+      ],
+      "batch_size": 1,
+      "audio_vae": [
+        "2006",
+        0
+      ]
+    },
+    "class_type": "LTXVEmptyLatentAudio",
+    "_meta": {
+      "title": "LTXV Empty Latent Audio"
+    }
+  },
+  "1993:1755": {
+    "inputs": {
+      "expression": "(a*b)+1"
+    },
+    "class_type": "SimpleCalculatorKJ",
+    "_meta": {
+      "title": "VIDEO AUDIO EMPTY"
+    }
+  },
+  "1993:1756": {
+    "inputs": {
+      "start_index": [
+        "1993:1749",
+        0
+      ],
+      "duration": [
+        "1993:1724",
+        0
+      ],
+      "audio": [
+        "1993:1719",
+        0
+      ]
+    },
+    "class_type": "TrimAudioDuration",
+    "_meta": {
+      "title": "Trim Audio Duration"
+    }
+  },
+  "1993:1757": {
+    "inputs": {
+      "direction": "after",
+      "audio1": [
+        "1993:1759",
+        0
+      ],
+      "audio2": [
+        "1993:1756",
+        0
+      ]
+    },
+    "class_type": "AudioConcat",
+    "_meta": {
+      "title": "Concatenate Audio"
+    }
+  },
+  "1993:1758": {
+    "inputs": {
+      "frames_number": [
+        "1993:1760",
+        1
+      ],
+      "frame_rate": [
+        "2000",
+        0
+      ],
+      "batch_size": 1,
+      "audio_vae": [
+        "2006",
+        0
+      ]
+    },
+    "class_type": "LTXVEmptyLatentAudio",
+    "_meta": {
+      "title": "LTXV Empty Latent Audio"
+    }
+  },
+  "1993:1759": {
+    "inputs": {
+      "samples": [
+        "1993:1758",
+        0
+      ],
+      "audio_vae": [
+        "2006",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVAEDecode",
+    "_meta": {
+      "title": "LTXV Audio VAE Decode"
+    }
+  },
+  "1993:1760": {
+    "inputs": {
+      "video_info": [
+        "2002",
+        3
+      ]
+    },
+    "class_type": "VHS_VideoInfo",
+    "_meta": {
+      "title": "Video Info 🎥🅥🅗🅢"
+    }
+  },
+  "1993:1761": {
+    "inputs": {
+      "expression": "a - b",
+      "variables.a": [
+        "1993:1760",
+        7
+      ],
+      "variables.b": [
+        "1993:1749",
+        0
+      ]
+    },
+    "class_type": "SimpleCalculatorKJ",
+    "_meta": {
+      "title": "start audio at"
+    }
+  },
+  "1993:1727": {
+    "inputs": {
+      "strength": 1,
+      "bypass": false,
+      "vae": [
+        "2005",
+        0
+      ],
+      "image": [
+        "1993:1742",
+        0
+      ],
+      "latent": [
+        "1993:1728",
+        0
+      ]
+    },
+    "class_type": "LTXVImgToVideoInplace",
+    "_meta": {
+      "title": "LTXVImgToVideoInplace"
+    }
+  }
+}
