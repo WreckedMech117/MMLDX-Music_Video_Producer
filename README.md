@@ -2,8 +2,6 @@
 
 A standalone, local-first production editor for creating songs and complete AI-assisted music videos with the existing portable ComfyUI installation.
 
-> This project is intentionally independent of Agent OS. It contains no Agent OS imports, routes, data paths, or runtime dependency.
-
 ## Current working vertical slice
 
 - Create persistent production projects.
