@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class ComfyError(RuntimeError):
@@ -33,8 +37,19 @@ class ComfyClient:
         *,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        before_submit: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
+        """`before_submit` runs once immediately before each prompt is sent.
+
+        It exists so a resource optimisation the application owns — today, releasing the
+        language model's VRAM — covers every submission route through one wiring, including
+        routes added later. It is injected rather than imported so this client stays
+        ignorant of any other provider: reaching into an LM Studio client from inside the
+        ComfyUI client would tie two unrelated services together and would make testing the
+        eject require a ComfyUI server.
+        """
         self.base_url = base_url.rstrip("/")
+        self.before_submit = before_submit
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
@@ -43,6 +58,22 @@ class ComfyClient:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    async def _run_before_submit(self) -> None:
+        """Run the pre-submission hook, absorbing anything it does.
+
+        The hook is an optimisation; the render is the work. A render must never fail to
+        happen because a hook failed, so every exception is swallowed here as well as
+        inside the hook itself — this is the only guarantee that holds for a hook this
+        client did not write. `CancelledError` is a `BaseException` and still propagates,
+        so shutdown is not absorbed along with it.
+        """
+        if self.before_submit is None:
+            return
+        try:
+            await self.before_submit()
+        except Exception as error:  # noqa: BLE001 - the render outranks the optimisation
+            logger.warning("Pre-submission hook failed; submitting anyway: %r", error)
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         try:
@@ -74,6 +105,11 @@ class ComfyClient:
         body: dict[str, Any] = {"prompt": prompt}
         if client_id:
             body["client_id"] = client_id
+        # After the payload is built and the caller's own validation has passed, and before
+        # a single byte goes to ComfyUI. A submission refused by validation must not have
+        # cost the Director their loaded model, and a model released after the prompt is
+        # queued releases nothing the render can use.
+        await self._run_before_submit()
         response = await self._request("POST", "/prompt", json=body)
         payload = self._json(response)
         prompt_id = payload.get("prompt_id") if isinstance(payload, dict) else None

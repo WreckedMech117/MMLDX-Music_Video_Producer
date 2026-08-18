@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    #: On by default. The language model and ComfyUI share one card, and a model left
+    #: resident is the difference between a render that allocates and one that spills to
+    #: system RAM. Defaulting it on is safe because every way it can go wrong ends with the
+    #: render submitted anyway: with no host configured it never fires, with nothing loaded
+    #: it costs one local HTTP call, and with no `lms` CLI present it records a line and
+    #: gets out of the way. Set MVP_LLM_EJECT_BEFORE_RENDER=false to turn it off.
+    llm_eject_before_render: bool = True
+    #: Path to LM Studio's `lms` executable. Blank means "find it" — PATH, then
+    #: ~/.lmstudio/bin. The arguments are not configurable; see `vram.CliUnloader`.
+    llm_eject_executable: str = ""
+    #: Ceiling on how long a render may wait for the eject before giving up on it.
+    llm_eject_timeout: float = Field(default=20.0, gt=0)
     request_timeout: float = Field(default=30.0, gt=0)
     max_upload_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
 

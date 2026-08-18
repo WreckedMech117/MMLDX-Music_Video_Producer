@@ -40,6 +40,7 @@ from .timeline import (
     expansion_input,
     ordered_shots,
 )
+from .vram import CliUnloader, LlmEjector
 from .workflows import (
     H3_DEFAULT_PROFILE,
     WorkflowCatalog,
@@ -834,14 +835,37 @@ def create_app(
     store: ProjectStore | None = None,
     comfy: ComfyClient | Any | None = None,
     director: DirectorClient | Any | None = None,
+    ejector: LlmEjector | Any | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     store = store or ProjectStore(settings.data_root)
-    comfy = comfy or ComfyClient(settings.comfy_url, timeout=settings.request_timeout)
     director = director or DirectorClient(
         base_url=settings.llm_base_url,
         model=settings.llm_model,
         api_key=settings.llm_api_key,
+    )
+    # Built before the ComfyUI client because the client takes it as its pre-submission
+    # hook. That single wiring is what covers all five submission routes — and any route
+    # added later — without any of them knowing a language model exists. An injected
+    # `comfy` (every test does this) has no hook and therefore never ejects, which is why
+    # the existing suites gained no dependency on a language-model host.
+    #
+    # `getattr` on the busy gate, not `director.busy`: `director` may be an injected double
+    # that has never heard of it, and a missing gate must mean "not busy" rather than an
+    # AttributeError inside a hook that runs before every render.
+    ejector = ejector or LlmEjector(
+        base_url=settings.llm_base_url,
+        enabled=settings.llm_eject_before_render,
+        unload_timeout=settings.llm_eject_timeout,
+        unloader=CliUnloader(settings.llm_eject_executable)
+        if settings.llm_eject_executable
+        else None,
+        is_busy=lambda: bool(getattr(director, "busy", False)),
+    )
+    comfy = comfy or ComfyClient(
+        settings.comfy_url,
+        timeout=settings.request_timeout,
+        before_submit=ejector.eject,
     )
     catalog = WorkflowCatalog(settings.workflow_root)
 
@@ -853,6 +877,7 @@ def create_app(
     app.state.settings = settings
     app.state.store = store
     app.state.comfy = comfy
+    app.state.ejector = ejector
 
     def get_project(project_id: str) -> Project:
         try:

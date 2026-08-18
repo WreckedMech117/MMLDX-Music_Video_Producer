@@ -156,9 +156,25 @@ class DirectorClient:
         self.model = model
         self.api_key = api_key
         self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
+        self._in_flight = 0
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    @property
+    def busy(self) -> bool:
+        """True while any request to the language-model host is outstanding.
+
+        The VRAM eject before a render consults this and steps aside when it is true.
+        Releasing the model out from under a call the Director is waiting on trades a
+        conversation for a render, which is the wrong trade — and the model would only be
+        reloaded moments later anyway, having achieved nothing.
+
+        A counter, not a flag: a Director can have an expansion and a vision inspection in
+        the air at once, and a flag would report the host idle the moment the first of them
+        returned while the second was still holding VRAM.
+        """
+        return self._in_flight > 0
 
     async def _completion(
         self, *, body: dict[str, Any], headers: dict[str, str]
@@ -172,38 +188,49 @@ class DirectorClient:
 
         `body` is copied rather than mutated for the retry, so a caller's request body is not
         silently rewritten to an instance id that will not exist on the next call.
+
+        The whole method is counted as in-flight, retry included, because `busy` exists to
+        keep the VRAM eject away from a live call — and the retry is when the call is at its
+        most fragile. `finally` rather than a decrement on the happy path: an exception that
+        left the counter raised would wedge the eject off permanently for the life of the
+        process.
         """
-        response = await self._client.post(
-            f"{self.base_url}/chat/completions", headers=headers, json=body
-        )
-        if response.status_code == 400 and (
-            "Failed to load model" in response.text or "Model is unloaded" in response.text
-        ):
-            models = await self._client.get(f"{self.base_url}/models", headers=headers)
-            models.raise_for_status()
-            # Shape-checked rather than assumed. `/models` is whatever the configured provider
-            # answers with, and a bare JSON array or scalar makes `.get` raise AttributeError —
-            # which is outside every caller's caught tuple, so the recovery path for one
-            # provider quirk would crash as a 500 on another. No usable id simply means no
-            # retry: the original 400 is returned and reported as the provider error it is.
-            listing = models.json()
-            entries = listing.get("data", []) if isinstance(listing, dict) else []
-            loaded = next(
-                (
-                    item["id"]
-                    for item in entries
-                    if isinstance(item, dict)
-                    and str(item.get("id", "")).startswith(f"{self.model}:")
-                ),
-                "",
+        self._in_flight += 1
+        try:
+            response = await self._client.post(
+                f"{self.base_url}/chat/completions", headers=headers, json=body
             )
-            if loaded:
-                response = await self._client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=headers,
-                    json={**body, "model": loaded},
+            if response.status_code == 400 and (
+                "Failed to load model" in response.text or "Model is unloaded" in response.text
+            ):
+                models = await self._client.get(f"{self.base_url}/models", headers=headers)
+                models.raise_for_status()
+                # Shape-checked rather than assumed. `/models` is whatever the configured
+                # provider answers with, and a bare JSON array or scalar makes `.get` raise
+                # AttributeError — which is outside every caller's caught tuple, so the
+                # recovery path for one provider quirk would crash as a 500 on another. No
+                # usable id simply means no retry: the original 400 is returned and reported
+                # as the provider error it is.
+                listing = models.json()
+                entries = listing.get("data", []) if isinstance(listing, dict) else []
+                loaded = next(
+                    (
+                        item["id"]
+                        for item in entries
+                        if isinstance(item, dict)
+                        and str(item.get("id", "")).startswith(f"{self.model}:")
+                    ),
+                    "",
                 )
-        return response
+                if loaded:
+                    response = await self._client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=headers,
+                        json={**body, "model": loaded},
+                    )
+            return response
+        finally:
+            self._in_flight -= 1
 
     @staticmethod
     def _content(response: httpx.Response) -> str:

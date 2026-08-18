@@ -22,8 +22,27 @@ Key settings:
 - `MVP_LLM_MODEL`
 - `MVP_LLM_API_KEY`
 - `MVP_MAX_UPLOAD_BYTES` (default 2 GiB)
+- `MVP_LLM_EJECT_BEFORE_RENDER` (**default on**), `MVP_LLM_EJECT_EXECUTABLE`, `MVP_LLM_EJECT_TIMEOUT` (default 20 s)
 
 Copy `.env.example` to the ignored `.env` file before startup. Editing the example alone does not affect runtime settings.
+
+## VRAM: ejecting the language model before a render
+
+The Director's language model and ComfyUI compete for the same VRAM, and an idle LM Studio can hold tens of gigabytes. Immediately before any payload is POSTed to `/prompt`, the application asks LM Studio to release whatever is resident, then **re-reads `GET /api/v1/models` to confirm it actually went**. A command that exits 0 while a model stays resident is reported as a failure, because that outcome is indistinguishable from doing nothing and the VRAM is the entire point.
+
+It is on by default and **never fails a render**. Every failure path — no LM Studio, no `lms` CLI, a non-zero exit, a timeout, an unreadable listing, or a release that did not happen — logs once and submits anyway. It is skipped silently when nothing is loaded, and skipped while a Director call is in flight, because a render is not worth cancelling a call the Director is waiting on. A later Director call reloads the model on demand; `director.py` already handles LM Studio's "Model is unloaded" 400 by retrying against the loaded instance.
+
+Watch it with `INFO` on `music_video_producer.vram`:
+
+```text
+INFO:     music_video_producer.vram - VRAM eject before render: released <model> (lms CLI reported: ...)
+```
+
+Turn it off with `MVP_LLM_EJECT_BEFORE_RENDER=0` — worth doing if you deliberately run a small model alongside renders and would rather keep it warm.
+
+**The mechanism is the vendor CLI, and that is a considered choice rather than a first guess.** LM Studio's HTTP surface cannot be probed for an unload route: every unknown path returns **HTTP 200** with an error body, and a `GET` against a real `POST` route is indistinguishable from a `GET` against a path that does not exist, so no read-only probe can establish whether a REST unload exists. `lms.exe` itself contains no `api/v0` or `api/v1` route strings but does contain `ws://127.0.0.1:1234` and `unloadModel` — the vendor unloads over WebSocket RPC, not REST. The CLI sits behind a three-line protocol, so swapping in a proven REST or WebSocket unload later is one new class; the verification above never trusted the mechanism in the first place.
+
+The practical consequence for planning a session is unchanged and still worth following by hand: do the text-heavy work — treatment, style bible, shot expansion — in one pass up front, so the model loads once rather than being evicted and reloaded around every render.
 
 LM Studio supports JSON-schema structured output rather than the older `json_object` response mode. Music Video Producer sends the validated Director schema and, when LM Studio exposes a loaded instance as `model-name:N`, automatically reuses that instance instead of trying to load a duplicate copy.
 
