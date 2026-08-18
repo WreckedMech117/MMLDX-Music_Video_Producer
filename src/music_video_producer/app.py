@@ -29,6 +29,8 @@ from .director import (
     DirectorUnavailable,
     document_rejection,
 )
+from .h3_expansion_prompt import system_prompt as h3_system_prompt
+from .h3_prompt import check as h3_check
 from .models import (
     ASSET_ROLE_LABELS,
     SHOT_MODE_SPECS,
@@ -56,6 +58,7 @@ from .timeline import (
     build_director_timeline,
     expansion_input,
     ordered_shots,
+    shot_expansion_input,
 )
 from .vram import CliUnloader, LlmEjector
 from .workflows import (
@@ -1609,6 +1612,51 @@ class DirectorRequest(BaseModel):
     # deliberately not stored on `Project`, so it is neither remembered across turns nor
     # inherited by another project, and a client that omits or nulls it is a decline.
     apply_documents: DeclinedIfNull = False
+
+
+#: The modes whose H3 prompt opens with an instruction line stating how each picture aligns to
+#: a time in the target video. Text-to-video has none and must not be given one; the guide's
+#: checklist treats an instruction on a text-only prompt as a mode confusion.
+#:
+#: `references` is deliberately absent: full-reference mode has its own six-section structure
+#: rather than the keyframe instruction line, and lumping it in here would have the specialist
+#: open a reference prompt with a sentence that belongs to a different mode.
+H3_KEYFRAME_MODES: frozenset[str] = frozenset(
+    {"image_to_video", "first_last", "first_middle_last"}
+)
+
+#: Why one Shot cannot be expanded. Separate wordings because the fixes are different: one
+#: is "write an intent first", the other two are "this Shot is not yours to rewrite".
+EXPAND_PROMPT_WITHOUT_INTENT = (
+    "{shot} has no intent to expand. Pass one writes the short intent; this pass turns that "
+    "into the H3 format. Write or generate an intent first."
+)
+EXPAND_PROMPT_LOCKED = "{shot} is locked, so nothing automated may rewrite it."
+EXPAND_PROMPT_RENDERED = (
+    "{shot} has already rendered, so its prompt is the record of what produced a take rather "
+    "than an intention. Use render again if you want a different take."
+)
+
+#: What the model returned when it did not return a usable prompt. Kept beside the report
+#: rather than stored: a malformed expansion that reached the manifest would be submitted by
+#: the next render, which is the one outcome the check exists to prevent.
+EXPAND_PROMPT_MALFORMED = (
+    "The model's answer is not a well-formed H3 prompt, so it was not saved. What it returned "
+    "is below, with what is wrong with it."
+)
+
+
+class ShotExpansionResult(BaseModel):
+    """What one expansion did, including when it did nothing."""
+
+    project: Project
+    applied: bool
+    #: Empty when applied. Each entry is one thing wrong, in the checker's own words.
+    problems: list[str] = Field(default_factory=list)
+    #: What the model returned, always — the Director can read a refused prompt and judge it,
+    #: which is the same argument `MessageNotice.raw` makes for refused Director output.
+    prompt: str = ""
+    note: str = ""
 
 
 class AssistantRequest(BaseModel):
@@ -3712,6 +3760,98 @@ def create_app(
         message = result.message.strip() or EXPANSION_EMPTY_MESSAGE
         project.messages.append(assistant_reply(message, notices))
         return store.save(project)
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/expand-prompt",
+        response_model=ShotExpansionResult,
+    )
+    async def expand_shot_prompt(project_id: str, shot_id: str) -> ShotExpansionResult:
+        """Turn one Shot's intent into an H3-format prompt. Pass two, one Shot at a time.
+
+        No body: everything this needs is already on the Shot and its project. The whole-plan
+        `director/expand` above is pass one and is untouched — it lays shots out so they flow
+        together, in one call, because cross-shot variance is a property of the plan. This is
+        the opposite shape for the opposite reason: one H3 prompt is long, and thirty of them
+        will not fit a single context.
+
+        Refusal order matters and is the same one every other automated writer uses: whether
+        this Shot may be written to at all comes before whether there is anything to write
+        from. A locked Shot with an empty intent should hear that it is locked — telling it to
+        write an intent first would send the Director to do work that would then be refused.
+
+        **A malformed answer is not stored.** The checker runs before the write, and a prompt
+        that fails it is returned with its problems rather than saved. Storing it would put a
+        broken prompt in the manifest that the *next render* would submit, which is exactly the
+        outcome checking before a render exists to prevent — and the failure would surface as a
+        bad take rather than as a message.
+        """
+        project = get_project(project_id)
+        shot = next((held for held in project.shots if held.id == shot_id), None)
+        if shot is None:
+            raise HTTPException(status_code=404, detail="Shot not found")
+
+        label = shot_label(project, shot)
+        if reason := shot_write_refusal(shot):
+            wording = (
+                EXPAND_PROMPT_LOCKED if reason == "locked" else EXPAND_PROMPT_RENDERED
+            )
+            raise HTTPException(status_code=422, detail=wording.format(shot=label))
+        if prompt_is_missing(shot):
+            raise HTTPException(
+                status_code=422, detail=EXPAND_PROMPT_WITHOUT_INTENT.format(shot=label)
+            )
+
+        mode = resolve_shot_mode(shot)
+        try:
+            text = await director.expand_shot(
+                shot_input=shot_expansion_input(project, shot),
+                system_prompt=h3_system_prompt(
+                    expect_instruction=mode in H3_KEYFRAME_MODES
+                ),
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+        checked = h3_check(
+            text,
+            duration=shot.duration,
+            expect_instruction=mode in H3_KEYFRAME_MODES,
+        )
+        if not checked.well_formed:
+            return ShotExpansionResult(
+                project=project,
+                applied=False,
+                problems=[problem.message for problem in checked.problems],
+                prompt=text,
+                note=EXPAND_PROMPT_MALFORMED,
+            )
+
+        # Re-read after the await for the reason `director_chat` documents: the Shot may have
+        # been locked, rendered or deleted while the model was thinking, and the answer was
+        # written against a snapshot that no longer describes it.
+        project = get_project(project_id)
+        current = next((held for held in project.shots if held.id == shot_id), None)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if reason := shot_write_refusal(current):
+            wording = (
+                EXPAND_PROMPT_LOCKED if reason == "locked" else EXPAND_PROMPT_RENDERED
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=wording.format(shot=shot_label(project, current)),
+            )
+
+        current.h3_prompt = text
+        store.save(project)
+        return ShotExpansionResult(
+            project=project,
+            applied=True,
+            problems=[problem.message for problem in checked.problems],
+            prompt=text,
+        )
 
     @app.post("/api/projects/{project_id}/assistant/fill", response_model=Project)
     async def assistant_fill(project_id: str, request: AssistantRequest) -> Project:

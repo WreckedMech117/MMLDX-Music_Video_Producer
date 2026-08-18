@@ -8691,3 +8691,162 @@ def test_an_expansion_of_only_whitespace_is_treated_as_absent():
     blank = "   " + "\n" + "  "
     shot = Shot(start=0.0, duration=3.75, prompt="Wide on Lucy.", h3_prompt=blank)
     assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")
+
+
+GOOD_EXPANSION = (
+    "integrated_multimodal_description: [Shot 1] A grey wolf paces through birch trunks "
+    "under low amber light; the camera drifts with it, handheld.\n"
+    "overall_soundscape: Dry needles compress underfoot. Wind moves through the branches.\n"
+    "non_diegetic_music: A low cello figure at a slow tempo, swelling once and receding."
+)
+
+
+class ExpandingShotDirector(FakeDirector):
+    """Returns one fixed H3 prompt and records the input it was handed."""
+
+    def __init__(self, text: str = GOOD_EXPANSION):
+        self.text = text
+        self.inputs: list[dict] = []
+        self.prompts: list[str] = []
+
+    async def expand_shot(self, *, shot_input, system_prompt, **_):
+        self.inputs.append(shot_input)
+        self.prompts.append(system_prompt)
+        return self.text
+
+
+def _expandable(client, store, **shot_kwargs):
+    project = store.create(Project(name="Pass two"))
+    shot = Shot(start=0.0, duration=3.75, prompt="Wolf B-roll", **shot_kwargs)
+    client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": [json.loads(shot.model_dump_json())]},
+    )
+    return project.id, shot.id
+
+
+def test_expanding_a_shot_writes_only_its_h3_prompt(tmp_path: Path):
+    """The intent survives, which is the whole reason this is a second field."""
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store)
+
+    response = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert body["problems"] == []
+
+    stored = store.get(project_id).shots[0]
+    assert stored.h3_prompt == GOOD_EXPANSION
+    assert stored.prompt == "Wolf B-roll"
+    assert stored.status == "draft"
+    assert stored.prompt_id == ""
+
+
+def test_a_malformed_expansion_is_reported_and_never_stored(tmp_path: Path):
+    """The one outcome checking before a render exists to prevent.
+
+    A malformed prompt in the manifest would be submitted by the *next* render, and the
+    failure would surface as a bad take rather than as a message. So it is returned with its
+    problems and the Shot is left exactly as it was.
+    """
+    director = ExpandingShotDirector("A grey wolf pacing through trees. 35mm, grainy.")
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store)
+
+    body = client.post(
+        f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt"
+    ).json()
+
+    assert body["applied"] is False
+    assert body["problems"]
+    # The refused text comes back so the Director can read and judge it, the same argument
+    # `MessageNotice.raw` makes for refused Director output.
+    assert body["prompt"] == "A grey wolf pacing through trees. 35mm, grainy."
+    assert store.get(project_id).shots[0].h3_prompt == ""
+
+
+def test_a_locked_shot_is_refused_before_the_model_is_called(tmp_path: Path):
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store, locked=True)
+
+    response = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+
+    assert response.status_code == 422
+    assert "locked" in response.json()["detail"]
+    assert director.inputs == []
+
+
+def test_a_rendered_shot_is_refused_for_its_provenance_not_its_prompt(tmp_path: Path):
+    """Its prompt is the record of what produced a take, not an intention any more."""
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store, prompt_id="abc", status="complete")
+
+    response = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+
+    assert response.status_code == 422
+    assert "render again" in response.json()["detail"]
+    assert director.inputs == []
+
+
+def test_a_shot_with_no_intent_is_refused_and_told_which_pass_writes_one(tmp_path: Path):
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="No intent"))
+    shot = Shot(start=0.0, duration=3.75, prompt="New shot")
+    client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": [json.loads(shot.model_dump_json())]},
+    )
+
+    response = client.post(f"/api/projects/{project.id}/shots/{shot.id}/expand-prompt")
+
+    assert response.status_code == 422
+    assert "no intent to expand" in response.json()["detail"]
+    assert director.inputs == []
+
+
+def test_being_locked_is_reported_ahead_of_having_no_intent(tmp_path: Path):
+    """Order matters: telling a locked Shot to write an intent first sends the Director to do
+    work that would then be refused anyway."""
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="Both wrong"))
+    shot = Shot(start=0.0, duration=3.75, prompt="New shot", locked=True)
+    client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": [json.loads(shot.model_dump_json())]},
+    )
+
+    detail = client.post(
+        f"/api/projects/{project.id}/shots/{shot.id}/expand-prompt"
+    ).json()["detail"]
+
+    assert "locked" in detail
+    assert "no intent" not in detail
+
+
+def test_a_text_only_shot_is_not_told_to_write_an_instruction_line(tmp_path: Path):
+    """The guide's checklist treats an instruction line on a text-only prompt as a mode
+    confusion, so the specialist must not be asked for one."""
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store, mode="text_to_video")
+
+    client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+
+    assert "must open with the instruction line" not in director.prompts[0]
+
+
+def test_a_keyframe_shot_is_told_to_write_one(tmp_path: Path):
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store, mode="first_last")
+
+    client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+
+    assert "must open with the instruction line" in director.prompts[0]
