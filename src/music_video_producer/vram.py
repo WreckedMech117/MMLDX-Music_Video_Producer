@@ -317,7 +317,17 @@ class LlmEjector:
         unload_timeout: float = DEFAULT_UNLOAD_TIMEOUT,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        #: The single gate. `before_submit` is the one place every submission funnels
+        #: through, and `_attempt` reads this on the way in, so switching it decides what
+        #: *every* submission route does without any of them knowing the setting exists.
+        #: Plain attribute assignment on purpose: turning the eject on must not introduce a
+        #: way for it to fail a render, and there is no failure mode in setting a bool.
         self.enabled = enabled
+        #: What the most recent attempt did, or None before the first submission. Held here
+        #: because `EjectOutcome` already carries the only honest evidence there is — which
+        #: models were resident and whether they are gone — and until now it was written to
+        #: the log and thrown away. Never a VRAM figure: see the module docstring.
+        self.last_outcome: EjectOutcome | None = None
         self.models_url = models_url(base_url) if base_url else ""
         self.unloader: Unloader = unloader if unloader is not None else CliUnloader()
         self.unload_timeout = unload_timeout
@@ -340,6 +350,9 @@ class LlmEjector:
         except Exception as error:  # noqa: BLE001 - a render outranks any eject failure
             outcome = EjectOutcome(EjectStatus.MECHANISM_FAILED, f"the eject raised {error!r}")
         self._record(outcome)
+        # After `_record`, and inside no try of its own: the assignment cannot raise, and a
+        # render must never be at risk from bookkeeping about the render.
+        self.last_outcome = outcome
         return outcome
 
     async def _attempt(self) -> EjectOutcome:

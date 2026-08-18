@@ -29,6 +29,14 @@ export const state = {
   // and by a project load that actually changes project -- never by a refresh of the project
   // already on screen, which is a queue refresh, not a decision to discard anything.
   songContextDirty: false,
+  // The server's answer about the VRAM eject: whether it is on, where that value came from, and
+  // what the last attempt did. `null` until the first successful GET, which is what the control
+  // renders as "unknown" rather than guessing a default.
+  //
+  // Not project data and never sent back inside one: this describes the machine's single card,
+  // shared by LM Studio and ComfyUI, and a project manifest carrying it would change how someone
+  // else's renders behave. It lives beside `health` for that reason, not beside `project`.
+  vramEject: null,
 };
 
 export function selectedAsset() {

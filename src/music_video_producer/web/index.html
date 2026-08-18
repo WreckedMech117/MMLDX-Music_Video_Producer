@@ -28,6 +28,21 @@
       <div class="system-state">
         <span class="status-dot checking" id="comfy-dot"></span>
         <span id="comfy-label">Checking ComfyUI</span>
+        <!-- The VRAM eject describes this machine — one card shared by LM Studio and ComfyUI —
+             not the video, so it sits in the system state beside ComfyUI's own status rather than
+             in any workspace, and nothing about it is ever written into a project manifest. It
+             gates one place on the server, the pre-submission hook every render route funnels
+             through, so this single control covers all of them.
+             It ships disabled and unticked: the server owns the value, including when
+             MVP_LLM_EJECT_BEFORE_RENDER pinned it, and a box drawn ticked before the answer
+             arrives would be showing a default the application may not be honouring. app.js
+             enables it from the server's reply alone. The label is api.js's VRAM_EJECT_LABEL and
+             the note beside it is written by vramEjectNote, both asserted by
+             tests/test_frontend_contract.py and both executed there against a real server reply.
+             The note reports which models were released, never a free-VRAM figure — that reading
+             is confounded by ComfyUI's own cache; see docs/OPERATIONS.md. -->
+        <label class="lock-toggle" id="vram-eject-toggle" title="Release the language model's VRAM immediately before every ComfyUI submission"><input type="checkbox" id="vram-eject" disabled>Eject LLM</label>
+        <span class="eject-note" id="vram-eject-note"></span>
         <button class="quiet-button" id="save-project">Save</button>
       </div>
     </header>

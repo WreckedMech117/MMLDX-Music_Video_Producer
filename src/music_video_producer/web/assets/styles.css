@@ -46,6 +46,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .transport-mini time { min-width: 76px; color: var(--muted); font: 12px/1 Consolas, monospace; }
 .transport-play { border-radius: 50%; width: 34px; }
 .system-state { justify-self: end; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+/* The eject report sits in a topbar cell that has to hold a project name too, so it truncates
+   rather than pushing the Save button off the end. The full sentence stays reachable through the
+   element's title, which app.js sets from the same status object. */
+.eject-note { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
 .status-dot.online { background: var(--acid); box-shadow: 0 0 0 3px #d4f75e18; }
 .status-dot.offline { background: var(--red); }
@@ -261,6 +265,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .shot-readiness strong { display: block; margin-bottom: 5px; color: var(--red); font: 9px Consolas, monospace; letter-spacing: .08em; }
 .shot-readiness p { margin: 0 0 6px; font-size: 11px; }
 .shot-readiness p:last-child { margin-bottom: 0; }
+/* Why the render-again control is there but off. The button is drawn disabled rather than hidden
+   for a locked, approved or unprompted shot, so that "why can I not render this again" is answered
+   where it is asked -- and a disabled button conveys only that something is wrong, which is state
+   by appearance alone. This is the sentence. It is also the button's tooltip, for the pointer. */
+.render-again-reason { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 /* The whole readiness report, above the batch button. Blocking and sameness lines are told apart
    by the words app.js writes into them as well as by the marker colour, because a list where the
    only difference is red versus amber conveys state by colour alone. */

@@ -1002,6 +1002,81 @@ export function shotInspectorReadiness(report, shot) {
   return { blocked: cell.blocked, flag: cell.blocked ? cell.text : "", help: shotPromptHelp(shot), sameness };
 }
 
+// The Shot statuses the render-again control is drawn for at all: app.py's RENDER_AGAIN_STATUSES,
+// asserted identical by a contract test. A control offered for a status the route does not
+// re-open is a button whose only possible outcome is a refusal.
+export const RENDER_AGAIN_STATUSES = ["complete", "error", "approved"];
+
+export const RENDER_AGAIN_LABEL = "Render again";
+export const RENDER_AGAIN_HELP =
+  "Re-open this shot so it can be queued for another take. Nothing is rendered by this and no " +
+  "GPU time is spent until the shot is queued.";
+// The two refusals the browser can see coming, in the server's words. Drawn as a disabled control
+// carrying the reason rather than as no control at all: "why can I not render this again" is a
+// question the panel should answer where it is asked, and a control that silently vanishes for a
+// locked or approved shot answers it nowhere.
+export const RENDER_AGAIN_LOCKED =
+  "This shot is locked. A lock is a deliberate hands-off on this shot, and re-opening it for " +
+  "another render is exactly the kind of change it refuses. Unlock the shot first.";
+export const RENDER_AGAIN_APPROVED =
+  "This shot carries an approved take. An approval is an editorial decision about one specific " +
+  "take, so rendering over it would leave that decision describing a take that no longer exists. " +
+  "Clear the approval first if the decision has changed.";
+
+// Everything the inspector draws for the render-again control, decided here rather than in the
+// template -- the same reason `shotPromptCell` exists. The states this has to tell apart are
+// "not applicable", "applicable but refused, here is why" and "go ahead", and a template holding
+// those ternaries can have its arms swapped while every string the suite greps for survives.
+// Executed by tests/test_frontend_contract.py for every status and every refusal.
+//
+// The prompt is checked here, from the Shot on screen, and that check is the whole design note of
+// this feature: passing the readiness gate once is not a permanent property of a Shot. The
+// textarea writes `shot.prompt` and re-renders the inspector on every change, so a Shot whose
+// prompt is deleted after it rendered stops offering this control immediately -- before the click,
+// as well as after it, where the route refuses it again from scratch.
+//
+// `disabled` is never inferred from `shown` and never the other way round: an approved Shot is
+// shown *and* disabled, which is the case that carries the reason worth reading.
+export function renderAgainControl(shot) {
+  const status = String(shot?.status ?? "");
+  if (!RENDER_AGAIN_STATUSES.includes(status)) {
+    return { shown: false, disabled: true, label: RENDER_AGAIN_LABEL, title: "", reason: "" };
+  }
+  const refuse = (reason) => ({ shown: true, disabled: true, label: RENDER_AGAIN_LABEL, title: reason, reason });
+  if (shot?.locked) return refuse(RENDER_AGAIN_LOCKED);
+  if (shot?.approved_output || status === "approved") return refuse(RENDER_AGAIN_APPROVED);
+  const rejection = promptRejection(shot);
+  if (rejection) return refuse(`${rejection} ${READINESS_REMEDY}.`);
+  return { shown: true, disabled: false, label: RENDER_AGAIN_LABEL, title: RENDER_AGAIN_HELP, reason: "" };
+}
+
+// What re-opening did to the take that was already there, mirroring app.py's
+// RENDER_AGAIN_PREVIOUS_TAKE so the sentence the Director reads is the one the server implements.
+// A contract test asserts the two are identical.
+//
+// Said on every success rather than buried in the docs, because the belief this exists to prevent
+// -- that the application is keeping the takes -- is exactly the belief a silent "re-opened" toast
+// would leave in place.
+export const RENDER_AGAIN_PREVIOUS_TAKE =
+  "{shot} is open for another render. The take already there is not deleted: ComfyUI numbers " +
+  "its output files, so the next render writes a new numbered file beside the old one rather " +
+  "than over it, and the job that produced the old take goes on naming it in the render queue. " +
+  "What moves is this shot's single latest-take pointer, once the new take lands. This " +
+  "application does not track takes, so the older file is on disk and not in a take list.";
+
+// The Shot named as the timeline names it: `SHOT 03 (shot_id)`, matching batch.py's `shot_label`.
+// Both halves, for that function's reason -- the number is what is drawn on the clip and the id is
+// what is unambiguous -- and numbered by manifest position, which is what the timeline draws.
+export function shotLabel(project, shotId) {
+  const shots = project?.shots || [];
+  const index = shots.findIndex((item) => item?.id === shotId);
+  return index < 0 ? String(shotId ?? "") : `SHOT ${String(index + 1).padStart(2, "0")} (${shotId})`;
+}
+
+export function renderAgainNotice(project, shotId) {
+  return RENDER_AGAIN_PREVIOUS_TAKE.replace("{shot}", shotLabel(project, shotId));
+}
+
 // What a batch that failed partway has to say beyond the failure itself. The Shots already
 // accepted are burning GPU minutes right now, and a bare refusal reads as "nothing happened" --
 // so the Director edits and resubmits a plan half of which is already in flight.
@@ -1045,6 +1120,98 @@ export const DOCUMENT_RESTORE_REFUSAL_MARKER = "nothing to restore";
 
 export function documentRestoreRefusal(message) {
   return typeof message === "string" && message.includes(DOCUMENT_RESTORE_REFUSAL_MARKER);
+}
+
+// The VRAM eject control. It describes *this machine* — one card shared by LM Studio and
+// ComfyUI — not the video, which is why it lives in the topbar's system state beside ComfyUI's
+// own status rather than in any workspace, and why nothing about it is ever written into a
+// project manifest. A shared project carrying "do not eject" would silently change how someone
+// else's renders behave.
+//
+// Deliberately *not* the `apply_documents` pattern. That control is consent for one turn and is
+// cleared after every send and every project load, because remembering it would apply consent
+// the Director never gave again. This is the opposite case: it is a standing property of the
+// machine, so it is remembered — on the server, in `machine-preferences.json` — and a project
+// load refreshes it rather than clearing it.
+export const VRAM_EJECT_CONTROL = "#vram-eject";
+export const VRAM_EJECT_NOTE = "#vram-eject-note";
+export const VRAM_EJECT_LABEL = "Eject LLM";
+
+// What the last attempt did, one sentence per `vram.EjectStatus`. `{before}` and `{after}` are
+// filled from the host's own residency listing and from nothing else.
+//
+// **There is no VRAM figure here, and adding one would be a defect.** Measured on 2026-08-18, the
+// free-VRAM reading fell 31.6 → 16.0 GB across one eject of a 4.71 GB model, because ComfyUI
+// released its own cache at the same moment: the number is confounded and attributes ComfyUI's
+// behaviour to us. Which models were resident and whether they are gone is directly observed, and
+// is the honest version of the same reassurance.
+export const VRAM_EJECT_LAST = {
+  "disabled": "Last render: no eject was attempted.",
+  "not-configured": "Last render: no language-model host is configured.",
+  "director-busy": "Last render: skipped, a Director call was in flight.",
+  "host-unreachable": "Last render: the language-model host did not answer.",
+  "nothing-loaded": "Last render: no model was resident.",
+  "released": "Last render: released {before}.",
+  "still-resident": "Last render: {after} did not go. The render was submitted anyway.",
+  "mechanism-absent": "Last render: no `lms` CLI to eject with. The render was submitted anyway.",
+  "mechanism-failed": "Last render: the eject failed. The render was submitted anyway.",
+  "timed-out": "Last render: the eject timed out. The render was submitted anyway.",
+  "unreadable": "Last render: the release could not be confirmed. The render was submitted anyway.",
+};
+
+export const VRAM_EJECT_UNKNOWN = "Eject state unknown — the application has not answered yet.";
+export const VRAM_EJECT_IDLE_ON = "On. Nothing has been submitted yet.";
+export const VRAM_EJECT_IDLE_OFF = "Off. No eject before a render.";
+
+// Why the setting is what it is, and what changing it here will and will not survive.
+export const VRAM_EJECT_SOURCES = {
+  environment: "MVP_LLM_EJECT_BEFORE_RENDER set this when the application started. Changing it here applies from the next submission, but the environment decides again at the next start.",
+  director: "You chose this. It is remembered on this machine and is never stored in a project.",
+  default: "The built-in default. Changing it here is remembered on this machine and is never stored in a project.",
+};
+
+// Whether the server has actually said anything about the eject. Distinguished from "off" on
+// purpose: a control drawn unticked because a GET failed would be a machine-wide setting reported
+// as off while every render still ejects, which is the exact lie this feature exists to remove.
+export function vramEjectAvailable(status) {
+  return typeof status?.enabled === "boolean";
+}
+
+// Ticked only when the server says the eject is on. Never a hardcoded default and never the last
+// thing the Director clicked: the server owns this value, including when the environment pinned it
+// to something other than the default.
+export function vramEjectChecked(status) {
+  return status?.enabled === true;
+}
+
+export function vramEjectNote(status) {
+  if (!vramEjectAvailable(status)) return VRAM_EJECT_UNKNOWN;
+  const last = status.last;
+  if (!last) return status.enabled ? VRAM_EJECT_IDLE_ON : VRAM_EJECT_IDLE_OFF;
+  const names = (values) => (Array.isArray(values) && values.length ? values.join(", ") : "the model");
+  const sentence = VRAM_EJECT_LAST[last.status];
+  // An unrecognised status is named rather than dressed up as one of the known ones. A new
+  // `EjectStatus` the client has not learned about must not be reported as a success.
+  if (!sentence) return `Last render: the eject ended as "${last.status}". The render was submitted anyway.`;
+  return sentence
+    .replace("{before}", names(last.resident_before))
+    .replace("{after}", names(last.resident_after));
+}
+
+// The hover text: where the setting came from, plus the host's own words about the last attempt.
+// The detail is quoted, never summarised into a number.
+export function vramEjectTitle(status) {
+  if (!vramEjectAvailable(status)) return VRAM_EJECT_UNKNOWN;
+  const source = VRAM_EJECT_SOURCES[status.source] || "";
+  const detail = status.last?.detail || "";
+  return [source, detail].filter(Boolean).join("\n\n");
+}
+
+// What just changed, said in terms of renders rather than of a checkbox.
+export function vramEjectToast(status) {
+  return vramEjectChecked(status)
+    ? "The language model will be released before each render."
+    : "The language model will be left loaded. Renders share the card with it.";
 }
 
 // FastAPI reports handler failures as a plain `detail` string but validation
@@ -1106,6 +1273,11 @@ export const api = {
   // the only stale answer possible is one this client held on to.
   readiness: (id) => request(`/api/projects/${id}/readiness`),
   generateH3: (projectId, shotId, body = {}) => request(`/api/projects/${projectId}/shots/${shotId}/generate/h3`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // Re-open one settled shot for another take. Its own route and no body at all: the shots write
+  // is the generic full-project-shaped one, and sending a whole shot list to say "render this
+  // again" is how a stale client silently reverts every other shot in the plan. Nothing is
+  // rendered by this and no GPU time is spent -- the re-opened shot is queued like any other.
+  renderAgain: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/render-again`, { method: "POST" }),
   directorChat: (id, body) => request(`/api/projects/${id}/director/chat`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // Its own route, and it carries no body: expansion is not a chat turn. The whole input the
   // model sees is derived on the server from the project itself, so there is nothing here for a
@@ -1113,4 +1285,9 @@ export const api = {
   expandShots: (id) => request(`/api/projects/${id}/director/expand`, { method: "POST" }),
   job: (projectId, jobId) => request(`/api/projects/${projectId}/jobs/${jobId}`),
   workflows: () => request("/api/workflows"),
+  // Machine-scoped, so neither call carries a project id. The GET is what refreshes the
+  // after-the-fact report; the PUT is the only thing that changes the setting, and the server
+  // answers both with the same shape so nothing here has to merge two views of one value.
+  vramEject: () => request("/api/vram-eject"),
+  setVramEject: (enabled) => request("/api/vram-eject", { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ enabled }) }),
 };

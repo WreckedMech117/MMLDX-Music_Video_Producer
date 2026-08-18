@@ -18,6 +18,10 @@ from music_video_producer.app import (
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
     EXPANSION_REJECTED_EMPTY_NOTICE,
+    RENDER_AGAIN_APPROVED_REFUSAL,
+    RENDER_AGAIN_IN_FLIGHT_REFUSAL,
+    RENDER_AGAIN_LOCKED_REFUSAL,
+    RENDER_AGAIN_STATUSES,
     SHOT_CLAIM_MISMATCH_NOTICE,
     SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
     SHOT_PLAN_EMPTY_NOTICE,
@@ -59,6 +63,7 @@ from music_video_producer.models import (
     NoticeKind,
     Project,
     Shot,
+    ShotStatus,
     Song,
     TreatmentMessage,
     VisionInspectionRecord,
@@ -2305,6 +2310,417 @@ def test_h3_asks_only_for_the_blocking_answer_so_a_batch_is_not_quadratic_per_sh
     assert response.status_code == 202
     assert asked == [False], "the submission route computed variance warnings it then discarded"
     assert len(comfy.prompts) == 1
+
+
+def render_again(client, project_id: str, shot_id: str, **kwargs):
+    """The purpose-built re-open. No body, by design — see `render_again` in app.py."""
+    return client.post(f"/api/projects/{project_id}/shots/{shot_id}/render-again", **kwargs)
+
+
+def land_take(client, comfy, project_id: str, job_id: str, filename: str):
+    """Refresh one job as a completed render that wrote `filename`, the way ComfyUI reports it.
+
+    The numbering is the point of the argument. ComfyUI's savers derive the output name from the
+    workflow's `filename_prefix` and append a five-digit counter, so a second render of one shot
+    writes `…_00002` beside `…_00001` rather than over it. Verified against this installation
+    rather than taken from the spec: one shot's prefix under the ComfyUI output root carries
+    `_00001`, `_00002` and `_00003` side by side, all three produced by re-renders of that shot.
+    """
+
+    async def completed_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "complete",
+                "outputs": [
+                    {"subfolder": f"music-video-producer/{project_id}/shots", "filename": filename}
+                ],
+                "error": "",
+            },
+        )()
+
+    comfy.history = completed_history
+    response = client.get(f"/api/projects/{project_id}/jobs/{job_id}")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def rendered_shot(client, store, comfy, name: str, *, filename: str = "shot_take-h3_00001.mp4"):
+    """A project whose single Shot has actually been through a render, start to finish.
+
+    Built by driving the real routes rather than by writing `status="complete"` onto a Shot,
+    because every interesting thing about re-rendering is about what a *completed* render left
+    behind — the job record, the prompt id and the output pointer — and a hand-built Shot has
+    none of it. Returns the project id, the shot id and the first job's id.
+    """
+    project = store.create(Project(name=name))
+    project.shots = [
+        Shot(
+            id="shot_take",
+            start=0,
+            duration=5,
+            prompt="A singer turns toward camera",
+            mode="text",
+            status="ready",
+        )
+    ]
+    store.save(project)
+    submitted = submit_h3(client, project.id, "shot_take")
+    assert submitted.status_code == 202, submitted.text
+    job_id = submitted.json()["id"]
+    land_take(client, comfy, project.id, job_id, filename)
+    assert store.get(project.id).shots[0].status == "complete"
+    return project.id, "shot_take", job_id
+
+
+def test_render_again_reopens_a_completed_shot_so_the_interface_alone_can_queue_it(tmp_path: Path):
+    """The whole point: comparing two takes without an API client.
+
+    Both halves are asserted, because either alone is a half-built feature. The status has to
+    become `ready` — that is the state the batch button filters on and the state the submission
+    route requires — and a submission through the ordinary route then has to be accepted, which
+    is what makes "a new render can be queued through the interface alone" true rather than
+    merely plausible.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Second take")
+
+    response = render_again(client, project_id, shot_id)
+
+    assert response.status_code == 200, response.text
+    reopened = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert reopened.status == "ready"
+    # Re-opening is not itself a render, and the take already there is still this Shot's take
+    # until a new one lands. Nothing was spent and nothing was displaced by the click.
+    assert reopened.latest_output.endswith("shot_take-h3_00001.mp4")
+    assert len(comfy.prompts) == 1
+
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+    assert len(comfy.prompts) == 2
+    assert ProjectStore(tmp_path).get(project_id).shots[0].status == "queued"
+
+
+def test_render_again_writes_the_status_and_nothing_else(tmp_path: Path):
+    """The reason this is its own action rather than the shots write it replaces.
+
+    `PUT /shots` is the generic full-project-shaped route — it takes the whole Shot list from the
+    client — so using it to walk one status back also reasserts every prompt, window, reference
+    and lock the client happens to be holding, from however long ago it loaded them. This route
+    binds no body at all, so there is nothing on the wire that could do that.
+
+    Asserted as a whole-manifest comparison rather than by checking a few fields: a field-by-field
+    check only catches the fields somebody thought of, and the hazard here is precisely the field
+    nobody thought of. A body is posted too, and must be ignored — a handler that grew one later
+    would fail this.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Narrow write")
+    stored = store.get(project_id)
+    stored.shots.append(
+        Shot(id="shot_other", start=10, duration=5, prompt="A second shot", locked=True)
+    )
+    store.save(stored)
+    before = ProjectStore(tmp_path).get(project_id).model_dump(mode="json")
+
+    response = render_again(
+        client,
+        project_id,
+        shot_id,
+        json={"shots": [{"id": "shot_other", "start": 0, "duration": 1, "prompt": "OVERWRITTEN"}]},
+    )
+
+    assert response.status_code == 200, response.text
+    after = ProjectStore(tmp_path).get(project_id).model_dump(mode="json")
+    # The one intended difference, isolated by neutralising it and comparing everything else.
+    assert before["shots"][0]["status"] == "complete"
+    assert after["shots"][0]["status"] == "ready"
+    after["shots"][0]["status"] = before["shots"][0]["status"]
+    after["updated_at"] = before["updated_at"]
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["", "   \n\t", "New shot", "  new   SHOT  "],
+    ids=["blank", "whitespace", "placeholder", "collapsed-placeholder"],
+)
+def test_render_again_refuses_a_shot_whose_prompt_was_emptied_after_it_rendered(
+    tmp_path: Path, prompt: str
+):
+    """The design note, executed: the gate is asked again rather than remembered.
+
+    This Shot has already satisfied the readiness gate — it rendered, successfully, with a real
+    prompt — and the tempting implementation reads that as permission: it rendered once, so its
+    prompt is evidently fine. It is not. A prompt can be deleted, or pasted over with the
+    `"New shot"` placeholder a duplicate carries, between one render and the next, and the gate
+    exists to stop a full GPU pass returning noise rather than to count renders.
+
+    Both emptiness cases and both of their spacing variants, because the collapse is what catches
+    a placeholder that picked up stray spacing on the way through a duplicate.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Emptied after rendering")
+    stored = store.get(project_id)
+    stored.shots[0].prompt = prompt
+    store.save(stored)
+
+    response = render_again(client, project_id, shot_id)
+
+    assert response.status_code == 422
+    # The same sentence a first render would have refused with: one rule, one wording.
+    assert response.json()["detail"] == readiness_refusal([f"SHOT 01 ({shot_id})"])
+    # And it was genuinely not re-opened, rather than refused after the write.
+    assert ProjectStore(tmp_path).get(project_id).shots[0].status == "complete"
+
+
+def test_render_again_refuses_an_approved_take_and_says_why_rather_than_that_it_refused(
+    tmp_path: Path,
+):
+    """The one refusal here that is about meaning, and it has to read that way.
+
+    Nothing technical stops a second render over an approved take. What stops it is that an
+    approval is a decision about one specific piece of media, and afterwards the decision would
+    be attached to something nobody approved. So the message is asserted to actually say that,
+    not merely to be a 422 — a refusal that says "refused" leaves the Director with no idea that
+    clearing the approval is the thing they are being asked to decide.
+
+    Both approval signals, because they can be set independently and a Shot carrying either is
+    a Shot somebody has made a decision about. `approved_output` is the one AGENTS.md calls the
+    editorial decision; the `approved` status is reachable by hand and must not be a way past it.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Approved")
+    stored = store.get(project_id)
+    stored.shots[0].approved_output = stored.shots[0].latest_output
+    store.save(stored)
+
+    response = render_again(client, project_id, shot_id)
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail == RENDER_AGAIN_APPROVED_REFUSAL.format(shot=f"SHOT 01 ({shot_id})")
+    # The approval is named as the reason, and the consequence is stated: this is the sentence
+    # that has to survive a rewrite, not the status code.
+    assert "approved take" in detail
+    assert "no longer exists" in detail
+    assert "Clear the approval" in detail
+    assert ProjectStore(tmp_path).get(project_id).shots[0].status == "complete"
+
+    # The status half of the same decision, with no approved_output at all.
+    stored = store.get(project_id)
+    stored.shots[0].approved_output = ""
+    stored.shots[0].status = "approved"
+    store.save(stored)
+
+    assert render_again(client, project_id, shot_id).status_code == 422
+    assert ProjectStore(tmp_path).get(project_id).shots[0].status == "approved"
+
+
+def test_render_again_refuses_a_locked_shot(tmp_path: Path):
+    """Consistent with everything else that respects `Shot.locked`.
+
+    A lock is a deliberate hands-off, and re-opening a Shot for another render is exactly the
+    class of change it exists to refuse — the same argument `expand_shot_prompts` makes when it
+    leaves a locked Shot's prompt alone. The remedy is stated for the same reason it is there:
+    a lock stops an action, it does not stop the human who set it from unsetting it.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Locked")
+    stored = store.get(project_id)
+    stored.shots[0].locked = True
+    store.save(stored)
+
+    response = render_again(client, project_id, shot_id)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == RENDER_AGAIN_LOCKED_REFUSAL.format(
+        shot=f"SHOT 01 ({shot_id})"
+    )
+    assert "Unlock" in response.json()["detail"]
+    assert ProjectStore(tmp_path).get(project_id).shots[0].status == "complete"
+
+    stored = store.get(project_id)
+    stored.shots[0].locked = False
+    store.save(stored)
+    assert render_again(client, project_id, shot_id).status_code == 200
+
+
+def test_render_again_refuses_a_shot_with_a_render_still_in_flight(tmp_path: Path):
+    """Two renders of one shot would race on its output, so the second is refused.
+
+    The second case is the one that matters and the one a status-only check misses. `Shot.status`
+    is exactly what the generic shots write can rewrite by hand — that is how this whole story
+    started — so a Shot can read `complete` on screen while ComfyUI is still working on it. The
+    job record is what still knows, and it is keyed by `target_id`.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="In flight"))
+    project.shots = [
+        Shot(id="shot_live", start=0, duration=5, prompt="A singer turns", mode="text",
+             status="ready")
+    ]
+    store.save(project)
+    submitted = submit_h3(client, project.id, "shot_live")
+    assert submitted.status_code == 202
+
+    # The ordinary case: the Shot itself says a render is out.
+    queued = render_again(client, project.id, "shot_live")
+    assert queued.status_code == 409
+    assert queued.json()["detail"] == RENDER_AGAIN_IN_FLIGHT_REFUSAL.format(
+        shot="SHOT 01 (shot_live)"
+    )
+    assert "race" in queued.json()["detail"]
+
+    # ...and the same Shot with its status walked back by hand while the job is still out.
+    stored = store.get(project.id)
+    stored.shots[0].status = "complete"
+    store.save(stored)
+
+    hidden = render_again(client, project.id, "shot_live")
+    assert hidden.status_code == 409, "a hand-edited status hid a live render from the guard"
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "complete"
+
+    # Once the job has actually landed, the same request is accepted.
+    land_take(client, comfy, project.id, submitted.json()["id"], "shot_live-h3_00001.mp4")
+    assert render_again(client, project.id, "shot_live").status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "ready"
+
+
+def test_render_again_reopens_a_shot_whose_render_failed(tmp_path: Path):
+    """A failed render is the likeliest thing anyone wants to try again."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Errored"))
+    project.shots = [
+        Shot(id="shot_bad", start=0, duration=5, prompt="A singer turns", mode="text",
+             status="error", latest_output="")
+    ]
+    store.save(project)
+
+    assert render_again(client, project.id, "shot_bad").status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "ready"
+
+
+@pytest.mark.parametrize("status_before", ["draft", "ready"])
+def test_render_again_leaves_a_shot_that_never_rendered_exactly_as_it_was(
+    tmp_path: Path, status_before: str
+):
+    """Nothing to render again, so nothing happens — and it is not an error.
+
+    `draft` carrying the `"New shot"` placeholder is what every Shot the interface creates is,
+    and by far the commonest state in the application. Refusing it here would turn that state
+    into a failure and would refuse it for its *prompt*, which is not the reason: it was never
+    being re-opened. The no-op is therefore checked before any refusal, and this pins that order.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Never rendered"))
+    project.shots = [
+        Shot(id="shot_new", start=0, duration=5, prompt="New shot", status=status_before)
+    ]
+    store.save(project)
+    before = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+
+    response = render_again(client, project.id, "shot_new")
+
+    assert response.status_code == 200, response.text
+    assert ProjectStore(tmp_path).get(project.id).model_dump(mode="json") == before
+
+
+def test_a_second_take_moves_only_the_pointer_and_the_first_take_stays_named(tmp_path: Path):
+    """What "the previous take's record is not silently lost" honestly means here.
+
+    Take management is out of scope, so this is not a promise that the application keeps takes.
+    It is the two things that are true instead, and they are worth pinning because the docs
+    say them: ComfyUI numbers its outputs from the filename prefix, so the second render writes
+    `_00002` beside `_00001` rather than over it, and `RenderJob.output_files` is written per
+    submission and never rewritten, so the job that produced the first take goes on naming it.
+    What moves is the single `Shot.latest_output` pointer.
+
+    The numbering itself is ComfyUI's behaviour and is verified on the installation rather than
+    here — see `land_take` — so what this drives is the half that is this application's: two job
+    records, two names, one pointer.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, first_job = rendered_shot(client, store, comfy, "Two takes")
+
+    assert render_again(client, project_id, shot_id).status_code == 200
+    second = submit_h3(client, project_id, shot_id)
+    assert second.status_code == 202
+    second_job = second.json()["id"]
+    land_take(client, comfy, project_id, second_job, "shot_take-h3_00002.mp4")
+
+    saved = ProjectStore(tmp_path).get(project_id)
+    assert first_job != second_job
+    jobs = {job.id: job for job in saved.jobs}
+    # The first take is still named, by the job that produced it, under its own number.
+    assert jobs[first_job].output_files == [
+        f"music-video-producer/{project_id}/shots/shot_take-h3_00001.mp4"
+    ]
+    assert jobs[second_job].output_files == [
+        f"music-video-producer/{project_id}/shots/shot_take-h3_00002.mp4"
+    ]
+    # And the pointer -- the only thing that moved -- names the new one.
+    assert saved.shots[0].latest_output.endswith("shot_take-h3_00002.mp4")
+    assert saved.shots[0].status == "complete"
+
+
+def test_a_new_take_drops_the_vision_review_of_the_take_it_displaces(tmp_path: Path):
+    """A review is an inspection of one file, so it must not outlive that file being the latest.
+
+    Carrying it across would leave "Inspect latest take" reporting on the previous render under
+    the new take's name — a stale answer that reads as a fresh one, which is worse than no answer.
+    It becomes reachable with this story: before it, re-rendering a shot needed an API client.
+
+    The second half is the guard against overcorrecting. A job refresh that reports the same
+    output must not clear a review of that same file.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Stale review")
+    stored = store.get(project_id)
+    stored.shots[0].latest_review = VisionInspectionRecord(summary="Take one: silver jacket.")
+    store.save(stored)
+
+    assert render_again(client, project_id, shot_id).status_code == 200
+    second = submit_h3(client, project_id, shot_id)
+    land_take(client, comfy, project_id, second.json()["id"], "shot_take-h3_00002.mp4")
+
+    displaced = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert displaced.latest_output.endswith("shot_take-h3_00002.mp4")
+    assert displaced.latest_review is None
+
+    # A completion that lands the same file again leaves the review it belongs to alone.
+    stored = store.get(project_id)
+    stored.shots[0].latest_review = VisionInspectionRecord(summary="Take two: silver jacket.")
+    store.save(stored)
+    assert render_again(client, project_id, shot_id).status_code == 200
+    third = submit_h3(client, project_id, shot_id)
+    land_take(client, comfy, project_id, third.json()["id"], "shot_take-h3_00002.mp4")
+
+    kept = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert kept.latest_review is not None
+    assert kept.latest_review.summary == "Take two: silver jacket."
+
+
+def test_render_again_404s_for_a_shot_and_a_project_that_do_not_exist(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Missing"))
+
+    assert render_again(client, project.id, "shot_nope").status_code == 404
+    assert render_again(client, "no-such-project", "shot_nope").status_code == 404
+
+
+def test_render_again_statuses_are_exactly_the_settled_ones(tmp_path: Path):
+    """The list the route and the control both key on, pinned against the status vocabulary.
+
+    A status added to `ShotStatus` later is either settled or it is not, and this is what makes
+    that a decision somebody has to make rather than one that gets made by omission.
+    """
+    settled = set(RENDER_AGAIN_STATUSES)
+    assert settled == {"complete", "error", "approved"}
+    assert settled <= set(get_args(ShotStatus))
+    # The in-flight statuses and the settled ones must not overlap, or a Shot could be both.
+    assert settled.isdisjoint({"queued", "running"})
 
 
 def test_readiness_route_404s_for_a_project_that_does_not_exist(tmp_path: Path):

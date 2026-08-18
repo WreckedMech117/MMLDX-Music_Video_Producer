@@ -643,3 +643,287 @@ def test_the_eject_is_on_by_default_and_can_be_switched_off(monkeypatch, tmp_pat
 
     monkeypatch.setenv("MVP_LLM_EJECT_BEFORE_RENDER", "false")
     assert Settings(data_root=tmp_path).llm_eject_before_render is False
+
+
+# --------------------------------------------------------------------------------------
+# The visible control
+#
+# The setting is a property of this machine, not of a video. Three things are asserted here
+# and each was a way to get it wrong: it must gate at the one funnel every submission route
+# already passes through rather than at any route; it must not lie about an environment that
+# disagrees with it; and switching it on must not create any path where the eject can fail a
+# render, which is why every case below still ends with the prompt queued.
+# --------------------------------------------------------------------------------------
+
+
+def submitting_app(tmp_path: Path, ejector, **kwargs):
+    """A real app whose real `ComfyClient` — hook and all — talks to a mock ComfyUI.
+
+    The ComfyUI client is the one `create_app` builds, not an injected double, because the
+    wiring under test *is* `before_submit`. Only its transport is replaced.
+    """
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.app import create_app
+    from music_video_producer.store import ProjectStore
+
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    app = create_app(settings=settings, store=ProjectStore(tmp_path), ejector=ejector, **kwargs)
+    submitted: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        submitted.append(request.url.path)
+        return httpx.Response(200, json={"prompt_id": "prompt-1", "number": 1})
+
+    app.state.comfy._client = httpx.AsyncClient(
+        base_url="http://comfy.test", transport=httpx.MockTransport(handler)
+    )
+    return app, TestClient(app), submitted
+
+
+def eject_state(tmp_path: Path, **settings_kwargs) -> dict:
+    """What a freshly started application reports about the eject."""
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.app import create_app
+    from music_video_producer.store import ProjectStore
+
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy", **settings_kwargs)
+    app = create_app(settings=settings, store=ProjectStore(tmp_path))
+    return TestClient(app).get("/api/vram-eject").json()
+
+
+PROMPT = {"1": {"class_type": "SaveImage", "inputs": {}}}
+
+
+async def test_the_control_gates_the_one_funnel_every_submission_route_uses(tmp_path: Path):
+    """Turned off, nothing is asked of the host; turned on, the release happens as before.
+
+    Driven through the route and through the application's own ComfyUI client, so this is the
+    real path a render takes rather than a reconstruction of it. The gate lives on the
+    ejector, which `before_submit` reaches, so it covers every submission route at once.
+    """
+    host = Host(listing("qwen"), listing())
+    unloader = FakeUnloader()
+    app, client, submitted = submitting_app(tmp_path, make_ejector(host, unloader))
+
+    assert client.put("/api/vram-eject", json={"enabled": False}).json()["enabled"] is False
+    await app.state.comfy.submit(PROMPT)
+    assert unloader.calls == [], "an eject was attempted with the control switched off"
+    assert host.requests == [], "the host was probed with the control switched off"
+    assert app.state.ejector.last_outcome.status is EjectStatus.DISABLED
+
+    assert client.put("/api/vram-eject", json={"enabled": True}).json()["enabled"] is True
+    await app.state.comfy.submit(PROMPT)
+    assert len(unloader.calls) == 1
+    assert app.state.ejector.last_outcome.status is EjectStatus.RELEASED
+
+    # And nothing about the render changed in either direction.
+    assert submitted == ["/prompt", "/prompt"]
+
+
+def test_the_hook_and_the_route_act_on_the_very_same_ejector(tmp_path: Path):
+    """A second ejector, or a copy of the flag, is how the control becomes decorative."""
+    from music_video_producer.app import create_app
+    from music_video_producer.store import ProjectStore
+
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    app = create_app(settings=settings, store=ProjectStore(tmp_path))
+
+    assert app.state.comfy.before_submit.__self__ is app.state.ejector
+
+
+@pytest.mark.parametrize(
+    ("name", "host", "unloader"),
+    [
+        ("released", Host(listing("qwen"), listing()), FakeUnloader()),
+        ("host absent", Host(httpx.ConnectError("refused")), FakeUnloader()),
+        ("mechanism fails", Host(listing("qwen")), FakeUnloader(raises=UnloaderFailed("exit 1"))),
+        ("mechanism hangs", Host(listing("qwen")), FakeUnloader(raises=TimeoutError("hung"))),
+        ("listing unreadable", Host({"models": [{"key": "mystery"}]}), FakeUnloader()),
+    ],
+)
+async def test_switching_the_control_never_creates_a_path_that_fails_a_render(
+    name, host, unloader, tmp_path: Path
+):
+    """The property the whole feature was built around, re-proved with the control moving.
+
+    A control that can turn the eject off must not make turning it *on* a way to lose a
+    render, so the setting is flipped between submissions against every failure mode and
+    every submission still has to come back with a prompt id.
+    """
+    ejector = make_ejector(host, unloader, enabled=False, unload_timeout=0.05)
+    app, client, submitted = submitting_app(tmp_path, ejector)
+
+    for enabled in (False, True, False, True):
+        assert client.put("/api/vram-eject", json={"enabled": enabled}).status_code == 200
+        submission = await app.state.comfy.submit(PROMPT)
+        assert submission.prompt_id == "prompt-1", f"{name}, enabled={enabled}"
+
+    assert submitted == ["/prompt"] * 4, name
+
+
+def test_the_default_is_on_and_reports_itself_as_the_default(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("MVP_LLM_EJECT_BEFORE_RENDER", raising=False)
+    state = eject_state(tmp_path)
+
+    assert state["enabled"] is True
+    assert state["source"] == "default"
+    assert state["environment_pinned"] is False
+    assert state["last"] is None
+
+
+def test_a_stored_choice_survives_a_restart_and_beats_the_built_in_default(
+    tmp_path: Path, monkeypatch
+):
+    """"Survives a reload" is the point of storing it at all."""
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.app import create_app
+    from music_video_producer.store import ProjectStore
+
+    monkeypatch.delenv("MVP_LLM_EJECT_BEFORE_RENDER", raising=False)
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    first = create_app(settings=settings, store=ProjectStore(tmp_path))
+    TestClient(first).put("/api/vram-eject", json={"enabled": False})
+
+    restarted = eject_state(tmp_path)
+    assert restarted["enabled"] is False
+    assert restarted["source"] == "director"
+
+
+@pytest.mark.parametrize(("variable", "expected"), [("0", False), ("1", True)])
+def test_the_environment_decides_how_the_application_starts(
+    tmp_path: Path, monkeypatch, variable: str, expected: bool
+):
+    """The stated precedence, in the direction that can lie.
+
+    The interface must show what the application is actually doing. With the variable set at
+    startup, a stored choice that disagrees must not be what the control displays — otherwise
+    the box says "on" while every submission skips the eject, which is the exact failure this
+    control exists to remove.
+    """
+    from music_video_producer.preferences import EJECT_PREFERENCE_KEY, MachinePreferences
+
+    MachinePreferences(tmp_path).set_bool(EJECT_PREFERENCE_KEY, not expected)
+    monkeypatch.setenv("MVP_LLM_EJECT_BEFORE_RENDER", variable)
+
+    state = eject_state(tmp_path)
+    assert state["enabled"] is expected
+    assert state["source"] == "environment"
+    assert state["environment_pinned"] is True
+
+
+def test_an_unreadable_preferences_file_falls_back_instead_of_guessing(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """A corrupt file must not be read as "the Director switched it off"."""
+    monkeypatch.delenv("MVP_LLM_EJECT_BEFORE_RENDER", raising=False)
+    (tmp_path / "machine-preferences.json").write_text("{not json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="music_video_producer.preferences"):
+        state = eject_state(tmp_path)
+
+    assert state["enabled"] is True
+    assert state["source"] == "default"
+    assert "Ignoring unreadable machine preferences" in caplog.text
+
+
+def test_a_value_of_the_wrong_type_is_not_coerced(tmp_path: Path, monkeypatch):
+    """`"false"` is not `False`. Coercing it would turn a typo into a setting."""
+    monkeypatch.delenv("MVP_LLM_EJECT_BEFORE_RENDER", raising=False)
+    (tmp_path / "machine-preferences.json").write_text(
+        '{"llm_eject_before_render": "false"}', encoding="utf-8"
+    )
+
+    assert eject_state(tmp_path)["enabled"] is True
+
+
+def test_the_choice_is_stored_on_the_machine_and_never_in_a_project(tmp_path: Path):
+    """A shared project carrying "do not eject" would change someone else's renders.
+
+    Both halves are checked: the setting leaves no trace in the manifest, and the manifest's
+    own save path — including the whole-project PUT, which writes every field it is handed —
+    cannot reach the setting from the other direction.
+    """
+    import json
+
+    from music_video_producer.models import Project
+
+    host = Host(listing())
+    app, client, _ = submitting_app(tmp_path, make_ejector(host))
+    project = app.state.store.create(Project(name="Shared"))
+    manifest = app.state.store.manifest_path(project.id)
+    before = manifest.read_bytes()
+
+    assert client.put("/api/vram-eject", json={"enabled": False}).json()["enabled"] is False
+
+    assert manifest.read_bytes() == before, "changing the setting touched a project manifest"
+    assert "llm_eject_before_render" not in Project.model_fields
+    assert "llm_eject_before_render" not in manifest.read_text(encoding="utf-8")
+
+    # The machine file is a sibling of `projects/`, not inside any project directory.
+    stored = tmp_path / "machine-preferences.json"
+    assert json.loads(stored.read_text(encoding="utf-8")) == {"llm_eject_before_render": False}
+    assert app.state.store.projects_root not in stored.parents
+
+    # And a full-project PUT carrying the field cannot switch the eject back on.
+    body = json.loads(manifest.read_text(encoding="utf-8"))
+    body["llm_eject_before_render"] = True
+    client.put(f"/api/projects/{project.id}", json=body)
+    assert app.state.ejector.enabled is False
+    assert "llm_eject_before_render" not in manifest.read_text(encoding="utf-8")
+
+
+def test_a_setting_that_cannot_be_saved_is_refused_rather_than_applied_for_one_session(
+    tmp_path: Path,
+):
+    """Applying it anyway would put a value on screen that silently reverts at the next start."""
+
+    class BrokenPreferences:
+        def get_bool(self, key: str) -> bool | None:
+            return None
+
+        def set_bool(self, key: str, value: bool) -> None:
+            raise OSError("the data root is read-only")
+
+    host = Host(listing())
+    app, client, _ = submitting_app(tmp_path, make_ejector(host), preferences=BrokenPreferences())
+
+    response = client.put("/api/vram-eject", json={"enabled": False})
+    assert response.status_code == 500
+    assert "was not changed" in response.json()["detail"]
+    assert app.state.ejector.enabled is True
+    assert client.get("/api/vram-eject").json()["enabled"] is True
+
+
+def test_the_route_refuses_a_body_that_says_nothing(tmp_path: Path):
+    """An empty body is the one a confused client sends; it must not mean anything."""
+    host = Host(listing())
+    _, client, _ = submitting_app(tmp_path, make_ejector(host))
+
+    assert client.put("/api/vram-eject", json={}).status_code == 422
+
+
+async def test_what_the_eject_did_is_reported_as_residency_and_never_as_a_vram_figure(
+    tmp_path: Path,
+):
+    """The honest half of Story 4.1, and the dishonest half held out.
+
+    `resident_before` and `resident_after` are directly observed — the host's own listing
+    before and after. A free-VRAM delta is not: measured on 2026-08-18 it fell 31.6 -> 16.0 GB
+    across one eject of a 4.71 GB model, because ComfyUI released its own cache at the same
+    moment, so the number describes ComfyUI and is presented as describing us.
+    """
+    host = Host(listing("qwen"), listing())
+    app, client, _ = submitting_app(tmp_path, make_ejector(host))
+
+    assert client.get("/api/vram-eject").json()["last"] is None
+    await app.state.comfy.submit(PROMPT)
+
+    last = client.get("/api/vram-eject").json()["last"]
+    assert last["status"] == "released"
+    assert last["resident_before"] == ["qwen:1"]
+    assert last["resident_after"] == []
+    # Nothing in the payload is or could become a free-VRAM figure.
+    assert set(last) == {"status", "detail", "resident_before", "resident_after"}

@@ -136,9 +136,23 @@ globalThis.window = {
   confirm: (question) => { throw new Error("unanswered confirm: " + question); },
   prompt: () => null,
 };
+// Canned answers keyed by exact path, for the tests that need the workspace to *receive*
+// something rather than only to be watched sending. `__RESPONSES__` is `{}` for every existing
+// caller, so an unlisted path rejects exactly as it always did and nothing already written here
+// changes behaviour. Each entry is `{body}` for a 200, or `{status, body}` to be refused.
+const responses = new Map(Object.entries(__RESPONSES__));
 globalThis.fetch = (path, options = {}) => {
   requests.push({ path, method: options.method || "GET", body: options.body || null });
-  return Promise.reject(new Error("the contract harness makes no requests"));
+  if (!responses.has(path)) return Promise.reject(new Error("the contract harness makes no requests"));
+  const canned = responses.get(path);
+  const status = canned.status || 200;
+  return Promise.resolve({
+    ok: status < 400,
+    status,
+    statusText: "canned",
+    headers: { get: () => "application/json" },
+    json: async () => canned.body,
+  });
 };
 // The workspace boots on import: it binds every handler, then fires its startup requests, which
 // reject. Timers are stubbed out so a pending toast cannot hold the process open for its 4.2 s.
@@ -159,12 +173,23 @@ const answer = (reply) => {
   requests.length = 0;
   globalThis.window.confirm = (question) => { asked.push(question); return reply; };
 };
+// The workspace's startup requests are fired but not awaited by the module's top level, so a test
+// that asserts about what a *reply* did to the DOM has to let those promises settle first. Real
+// promises, so draining the microtask queue is enough -- and `setTimeout` is stubbed out, so
+// waiting on a timer would hang instead.
+const flush = async () => { for (let index = 0; index < 60; index += 1) await Promise.resolve(); };
 """
 
 
-def run_workspace(body: str):
-    """Boot `app.js` against the stub DOM and run `body` against the workspace it produced."""
-    return run_module(WORKSPACE_HARNESS + body)
+def run_workspace(body: str, responses: dict | None = None):
+    """Boot `app.js` against the stub DOM and run `body` against the workspace it produced.
+
+    `responses` maps an exact request path to `{"body": ...}` for a 200, or
+    `{"status": N, "body": ...}` for a refusal. Anything unlisted is rejected, which is what
+    every caller that passes nothing gets.
+    """
+    harness = WORKSPACE_HARNESS.replace("__RESPONSES__", json.dumps(responses or {}))
+    return run_module(harness + body)
 
 
 def document_controls() -> dict:
@@ -3123,6 +3148,244 @@ def test_the_timeline_clip_renders_only_what_the_prompt_cell_decided():
         assert redecided not in body, redecided
 
 
+def test_the_render_again_control_is_decided_by_executing_it_for_every_state():
+    """Every state the control can be in, run rather than read.
+
+    Three outcomes have to be told apart and none of them is inferable from the others: not shown
+    at all, shown but refused with the reason, and shown and ready. `disabled` is not the negation
+    of `shown` -- an approved shot is shown *and* disabled, and that is the case carrying the
+    sentence worth reading -- so a design that collapsed the two would fail here rather than
+    quietly hiding the one control that had something to say.
+
+    The prompt cases are the design note of the whole feature. A shot that rendered successfully
+    and then had its prompt deleted must stop offering this control immediately, from the prompt
+    in the textarea rather than from any memory of having passed the gate once.
+    """
+    from music_video_producer.app import RENDER_AGAIN_STATUSES
+
+    states = run_module("""
+      import { RENDER_AGAIN_APPROVED, RENDER_AGAIN_HELP, RENDER_AGAIN_LABEL, RENDER_AGAIN_LOCKED,
+        RENDER_AGAIN_STATUSES, READINESS_REMEDY, renderAgainControl }
+        from './src/music_video_producer/web/assets/api.js';
+      const shot = (fields) => ({ id: 'shot_a', prompt: 'A singer turns toward camera', locked: false, approved_output: '', ...fields });
+      const seen = {};
+      for (const status of ['draft', 'ready', 'queued', 'running', 'complete', 'error', 'approved']) {
+        seen[status] = renderAgainControl(shot({ status }));
+      }
+      console.log(JSON.stringify({
+        statuses: RENDER_AGAIN_STATUSES,
+        label: RENDER_AGAIN_LABEL,
+        help: RENDER_AGAIN_HELP,
+        lockedText: RENDER_AGAIN_LOCKED,
+        approvedText: RENDER_AGAIN_APPROVED,
+        remedy: READINESS_REMEDY,
+        seen,
+        locked: renderAgainControl(shot({ status: 'complete', locked: true })),
+        approved: renderAgainControl(shot({ status: 'complete', approved_output: 'takes/one.mp4' })),
+        // A locked *and* approved shot reads its lock first, because unlocking is what has to
+        // happen before anything else can.
+        lockedAndApproved: renderAgainControl(shot({ status: 'complete', locked: true, approved_output: 'takes/one.mp4' })),
+        emptied: renderAgainControl(shot({ status: 'complete', prompt: '' })),
+        whitespace: renderAgainControl(shot({ status: 'complete', prompt: '  \\n\\t ' })),
+        placeholder: renderAgainControl(shot({ status: 'complete', prompt: 'New shot' })),
+        errored: renderAgainControl(shot({ status: 'error' })),
+        nothing: renderAgainControl(undefined),
+      }));
+    """)
+
+    # The status list is the server's, so the control is never offered for a status the route
+    # would not re-open.
+    assert states["statuses"] == list(RENDER_AGAIN_STATUSES)
+
+    # Not applicable: nothing to render again, so no control and nothing to explain.
+    for status in ("draft", "ready", "queued", "running"):
+        assert states["seen"][status]["shown"] is False, status
+        assert states["seen"][status]["title"] == "", status
+    # Applicable, and for an errored shot too -- the likeliest use of the whole action.
+    assert states["seen"]["complete"] == {
+        "shown": True, "disabled": False, "label": states["label"],
+        "title": states["help"], "reason": "",
+    }
+    assert states["errored"]["shown"] is True
+    assert states["errored"]["disabled"] is False
+
+    # Refused, shown, and carrying the reason -- which is the state a hide-it design loses.
+    assert states["locked"]["shown"] is True
+    assert states["locked"]["disabled"] is True
+    assert states["locked"]["reason"] == states["lockedText"]
+    assert states["approved"]["reason"] == states["approvedText"]
+    assert states["lockedAndApproved"]["reason"] == states["lockedText"]
+    # The `approved` status alone is refused as well, with no approved_output at all.
+    assert states["seen"]["approved"]["shown"] is True
+    assert states["seen"]["approved"]["disabled"] is True
+    assert states["seen"]["approved"]["reason"] == states["approvedText"]
+
+    # The gate, asked again on a shot that has already passed it once.
+    for case in ("emptied", "whitespace", "placeholder"):
+        assert states[case]["shown"] is True, case
+        assert states[case]["disabled"] is True, case
+        assert states[case]["reason"].endswith(f"{states['remedy']}."), case
+    assert "no prompt" in states["emptied"]["reason"]
+    assert "placeholder" in states["placeholder"]["reason"]
+
+    # And nothing at all is not a shot with something to re-render.
+    assert states["nothing"]["shown"] is False
+
+
+def test_the_shot_inspector_draws_and_binds_the_render_again_control_it_was_given():
+    """The control, rendered and clicked, against the workspace's own code.
+
+    Two things this proves that no amount of source reading can. The inspector really applies what
+    `renderAgainControl` decided -- so a template that drew the button for every shot, or dropped
+    the `disabled`, would fail here rather than pass on the strength of the decision function being
+    correct and unused. And the click really reaches the purpose-built route: `PUT /shots` is the
+    generic full-project write that had to be used by hand to do this, and a control wired to it
+    would look identical in the source and would carry the whole shot list on the wire.
+    """
+    rendered = run_workspace("""
+      const project = (fields) => ({
+        id: 'p1', assets: [], jobs: [], song: null,
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+                  mode: 'text', asset_ids: [], reference_labels: {}, use_song_audio: false,
+                  seed: 0, status: 'complete', prompt_id: 'p-1', latest_output: 'takes/one.mp4',
+                  approved_output: '', locked: false, ...fields }],
+      });
+      const draw = (fields) => {
+        state.project = project(fields);
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+        const html = at('#shot-inspector').innerHTML;
+        return {
+          present: html.includes('id="render-again"'),
+          disabled: /id="render-again"[^>]*\\sdisabled/.test(html),
+          html,
+        };
+      };
+      const complete = draw({});
+      const locked = draw({ locked: true });
+      const approved = draw({ approved_output: 'takes/one.mp4' });
+      const emptied = draw({ prompt: '' });
+      const draft = draw({ status: 'draft', prompt: 'New shot', latest_output: '' });
+      const running = draw({ status: 'running' });
+
+      // Back to the shot that may be re-opened, and click it. The reply is a project whose shot
+      // is now ready, exactly as the route returns.
+      draw({});
+      const reopened = project({ status: 'ready' });
+      globalThis.fetch = (path, options = {}) => {
+        requests.push({ path, method: options.method || 'GET', body: options.body || null });
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          json: async () => reopened,
+        });
+      };
+      const toasts = [];
+      globalThis.document.createElement = () => { const item = make('<toast>'); toasts.push(item); return item; };
+      // The boot requests this module fires on import are not this click's; only what the click
+      // itself puts on the wire is the thing under test.
+      requests.length = 0;
+      await fire('#render-again:click', {});
+      console.log(JSON.stringify({
+        complete: { present: complete.present, disabled: complete.disabled },
+        locked: { present: locked.present, disabled: locked.disabled, reason: locked.html.includes(contract.RENDER_AGAIN_LOCKED) },
+        approved: { present: approved.present, disabled: approved.disabled, reason: approved.html.includes(contract.RENDER_AGAIN_APPROVED) },
+        emptied: { present: emptied.present, disabled: emptied.disabled },
+        draft: { present: draft.present },
+        running: { present: running.present },
+        requests,
+        status: state.project.shots[0].status,
+        toasts: toasts.map((item) => item.textContent),
+        notice: contract.renderAgainNotice(reopened, 'shot_a'),
+      }));
+    """)
+
+    # Drawn only where it applies, and disabled where it is refused.
+    assert rendered["complete"] == {"present": True, "disabled": False}
+    assert rendered["locked"] == {"present": True, "disabled": True, "reason": True}
+    assert rendered["approved"] == {"present": True, "disabled": True, "reason": True}
+    assert rendered["emptied"] == {"present": True, "disabled": True}
+    assert rendered["draft"]["present"] is False
+    assert rendered["running"]["present"] is False
+
+    # One request, to the purpose-built route, with no body: nothing a stale client could
+    # reassert over the rest of the plan travelled with it.
+    assert rendered["requests"] == [
+        {"path": "/api/projects/p1/shots/shot_a/render-again", "method": "POST", "body": None}
+    ]
+    # ...and emphatically not the generic shots write, which is what this replaces.
+    assert not any(sent["path"].endswith("/shots") for sent in rendered["requests"])
+
+    # The reply is adopted, so the panel and the batch button redraw from it.
+    assert rendered["status"] == "ready"
+    # And the Director is told what happened to the take that is already there, rather than
+    # being left to assume the application is keeping both.
+    assert rendered["toasts"] == [rendered["notice"]]
+    assert "SHOT 01 (shot_a)" in rendered["notice"]
+
+
+def test_render_again_wordings_are_the_servers_own():
+    """One rule, one sentence, whichever side the Director meets it on.
+
+    The lock and the approval are refused by the route and previewed by the panel, and the
+    previous-take statement is the server's account of what re-opening does. Two hand-written
+    wordings for one rule is how the browser starts describing behaviour the server no longer has.
+    """
+    from music_video_producer.app import (
+        RENDER_AGAIN_APPROVED_REFUSAL,
+        RENDER_AGAIN_LOCKED_REFUSAL,
+        RENDER_AGAIN_PREVIOUS_TAKE,
+    )
+
+    shared = run_module("""
+      import { RENDER_AGAIN_APPROVED, RENDER_AGAIN_LOCKED, RENDER_AGAIN_PREVIOUS_TAKE,
+        renderAgainNotice, shotLabel } from './src/music_video_producer/web/assets/api.js';
+      const project = { shots: [{ id: 'shot_a' }, { id: 'shot_b' }, { id: 'shot_c' }] };
+      console.log(JSON.stringify({
+        locked: RENDER_AGAIN_LOCKED,
+        approved: RENDER_AGAIN_APPROVED,
+        previousTake: RENDER_AGAIN_PREVIOUS_TAKE,
+        notice: renderAgainNotice(project, 'shot_c'),
+        first: shotLabel(project, 'shot_a'),
+        // A shot this client does not have is named by its bare id rather than by a position
+        // it does not hold -- exactly what batch.shot_label does.
+        absent: shotLabel(project, 'shot_z'),
+      }));
+    """)
+
+    # The refusals are the server's sentence exactly, with "This shot" standing in for the label
+    # the server prefixes: the panel is already showing the shot, so naming it there would name it
+    # twice, and every other word has to be the same or the two sides describe different rules.
+    assert shared["locked"] == RENDER_AGAIN_LOCKED_REFUSAL.format(shot="This shot")
+    assert shared["approved"] == RENDER_AGAIN_APPROVED_REFUSAL.format(shot="This shot")
+    assert shared["previousTake"] == RENDER_AGAIN_PREVIOUS_TAKE
+    assert shared["notice"] == RENDER_AGAIN_PREVIOUS_TAKE.format(shot="SHOT 03 (shot_c)")
+    assert shared["first"] == "SHOT 01 (shot_a)"
+    assert shared["absent"] == "shot_z"
+
+
+def test_the_shot_inspector_does_not_re_decide_the_render_again_control():
+    """Source-level companion: the template applies the decision and never re-makes it.
+
+    The executed test above proves the decision is right and is used. This is what keeps it the
+    only copy -- a second lock or prompt test written into the template is a second rule, and the
+    one that is tested is not the one that would then be drawn.
+    """
+    inspector = APP_JS.read_text(encoding="utf-8").split(
+        "export function renderShotInspector", 1
+    )[1].split("\n}", 1)[0]
+    body = without_comments(inspector)
+
+    assert "const again = renderAgainControl(shot);" in body
+    assert "again.shown" in body
+    assert 'again.disabled ? "disabled" : ""' in body
+    assert "escapeHtml(again.title)" in body
+    # No second copy of the decision, in any of its spellings.
+    for redecided in ("shot.locked", "approved_output", 'status === "complete"'):
+        assert redecided not in body, redecided
+
+
 def selector_specificity(selector: str) -> tuple[int, int, int]:
     """(ids, classes, elements) for a simple selector, which is all this stylesheet uses."""
     ids = len(re.findall(r"#[\w-]+", selector))
@@ -4197,3 +4460,279 @@ def test_the_notice_block_is_edged_named_and_not_reclaimed_by_a_later_rule():
     # And every one of them was already declared: no new colour was added for this.
     for token in ("--amber:", "--acid:", "--cyan:"):
         assert token in root.group(1), token
+
+
+# --------------------------------------------------------------------------------------
+# The VRAM eject control
+#
+# Every guarantee about it that lives in the browser is asserted by *running* the deciding
+# code, not by reading it: the workspace is booted against the stub DOM with a canned reply
+# from `/api/vram-eject` and the control is read afterwards. Three UI guarantees in this
+# project have already been found able to invert while a substring assertion stayed green.
+# --------------------------------------------------------------------------------------
+
+VRAM_EJECT_STATE = "/api/vram-eject"
+
+
+def eject_status(**overrides) -> dict:
+    """One server answer about the eject, shaped exactly as `vram_eject_state` builds it."""
+    return {
+        "enabled": True,
+        "source": "default",
+        "environment_pinned": False,
+        "last": None,
+        **overrides,
+    }
+
+
+def booted_eject_control(status, project_paths: dict | None = None, body: str = "") -> dict:
+    """Boot the workspace against `status` and report what the control ended up showing."""
+    responses = {VRAM_EJECT_STATE: {"body": status}, "/api/projects": {"body": []}}
+    responses.update(project_paths or {})
+    return run_workspace(
+        body
+        + """
+      await flush();
+      console.log(JSON.stringify({
+        checked: at('#vram-eject').checked,
+        disabled: at('#vram-eject').disabled,
+        note: at('#vram-eject-note').textContent,
+        title: at('#vram-eject-note').title,
+        requests: requests.map((item) => ({ path: item.path, method: item.method, body: item.body })),
+      }));
+    """,
+        responses=responses,
+    )
+
+
+def vram_eject_exports() -> dict:
+    return run_module("""
+      import { VRAM_EJECT_CONTROL, VRAM_EJECT_LABEL, VRAM_EJECT_LAST, VRAM_EJECT_NOTE, VRAM_EJECT_SOURCES }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        control: VRAM_EJECT_CONTROL,
+        label: VRAM_EJECT_LABEL,
+        note: VRAM_EJECT_NOTE,
+        last: VRAM_EJECT_LAST,
+        sources: VRAM_EJECT_SOURCES,
+      }));
+    """)
+
+
+def test_the_eject_control_exists_in_the_markup_and_ships_showing_nothing():
+    """The server owns the value, so the box must not be drawn from the markup's own guess."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    exports = vram_eject_exports()
+
+    control = re.search(r'<label class="lock-toggle" id="vram-eject-toggle".*?</label>', markup)
+    assert control, "the topbar no longer carries the VRAM eject control"
+    assert 'id="{}"'.format(exports["control"].removeprefix("#")) in control.group(0)
+    assert exports["label"] in control.group(0), exports["label"]
+    # Unticked *and* disabled until the server answers. A ticked default here is precisely the
+    # "showing a default it is not honouring" failure the environment case is about.
+    assert "checked" not in control.group(0), control.group(0)
+    assert "disabled" in control.group(0), control.group(0)
+    assert 'id="{}"'.format(exports["note"].removeprefix("#")) in markup
+
+    # It is in the system state, beside ComfyUI's own status -- not inside any workspace panel,
+    # because it describes the machine rather than the project on screen.
+    system_state = re.search(r'<div class="system-state">.*?\n      </div>', markup, re.DOTALL)
+    assert system_state and 'id="vram-eject"' in system_state.group(0)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_the_control_is_painted_from_the_servers_answer_rather_than_a_default(enabled: bool):
+    result = booted_eject_control(eject_status(enabled=enabled))
+    assert result["checked"] is enabled
+    assert result["disabled"] is False
+
+
+def test_an_environment_disabled_eject_is_shown_as_off_rather_than_as_the_default():
+    """The acceptance criterion: the interface must not show a default it is not honouring."""
+    result = booted_eject_control(
+        eject_status(enabled=False, source="environment", environment_pinned=True)
+    )
+
+    assert result["checked"] is False
+    assert "Off" in result["note"]
+    # And it says *why*, including that the environment will decide again at the next start.
+    assert "MVP_LLM_EJECT_BEFORE_RENDER" in result["title"]
+
+
+def test_a_control_with_no_answer_yet_says_unknown_instead_of_guessing():
+    """A failed GET must not report a machine-wide setting as off while renders still eject."""
+    result = run_workspace("""
+      await flush();
+      console.log(JSON.stringify({
+        checked: at('#vram-eject').checked,
+        disabled: at('#vram-eject').disabled,
+        note: at('#vram-eject-note').textContent,
+      }));
+    """)
+
+    assert result["checked"] is False
+    assert result["disabled"] is True
+    assert "unknown" in result["note"]
+
+
+def test_turning_the_control_off_sends_the_boxs_own_value_to_the_one_route():
+    result = booted_eject_control(
+        eject_status(enabled=True),
+        body="""
+          const control = at('#vram-eject');
+          control.checked = false;
+          await fire('#vram-eject:change', { currentTarget: control });
+        """,
+    )
+
+    put = [item for item in result["requests"] if item["method"] == "PUT"]
+    assert put == [
+        {"path": "/api/vram-eject", "method": "PUT", "body": '{"enabled":false}'}
+    ]
+
+
+def test_a_refused_change_reverts_the_box_instead_of_leaving_it_lying():
+    """A box left ticked after a refusal claims an eject that no render will perform."""
+    result = booted_eject_control(
+        eject_status(enabled=True),
+        body="""
+          await flush();
+          // The GET has already answered; make the PUT the thing that fails.
+          responses.set('/api/vram-eject', { status: 500, body: { detail: 'could not be saved' } });
+          const control = at('#vram-eject');
+          control.checked = false;
+          await fire('#vram-eject:change', { currentTarget: control });
+        """,
+    )
+
+    assert result["checked"] is True
+    assert result["disabled"] is False
+
+
+def test_a_project_load_refreshes_the_control_and_never_clears_it():
+    """The opposite of `apply_documents`: a standing machine setting, not per-turn consent.
+
+    Clearing it on a project load would silently re-enable an eject the Director switched off.
+    """
+    project = {
+        "id": "project_abc",
+        "name": "p",
+        "shots": [],
+        "assets": [],
+        "jobs": [],
+        "song": None,
+        "messages": [],
+    }
+    result = booted_eject_control(
+        eject_status(enabled=False, source="director"),
+        project_paths={
+            "/api/projects/project_abc": {"body": project},
+            "/api/projects/project_abc/readiness": {"body": {"shots": [], "blocking": []}},
+        },
+        body="""
+          await flush();
+          requests.length = 0;
+          const select = at('#project-select');
+          select.value = 'project_abc';
+          await fire('#project-select:change', { target: select });
+        """,
+    )
+
+    assert result["checked"] is False, "a project load reset a machine-level setting"
+    assert any(
+        item["path"] == "/api/vram-eject" and item["method"] == "GET"
+        for item in result["requests"]
+    ), "a project load does not refresh what the last eject did"
+
+
+def test_a_failed_refresh_leaves_the_setting_standing_rather_than_blanking_it():
+    """The half of "never cleared" that a working refresh hides.
+
+    Clearing the setting on a project load is only visible when nothing restores it, so the
+    refresh is made to fail here. A machine-level setting must not become "unknown", and the
+    control must not become unusable, because one incidental GET did not come back.
+    """
+    project = {
+        "id": "project_abc",
+        "name": "p",
+        "shots": [],
+        "assets": [],
+        "jobs": [],
+        "song": None,
+        "messages": [],
+    }
+    result = booted_eject_control(
+        eject_status(enabled=False, source="director"),
+        project_paths={
+            "/api/projects/project_abc": {"body": project},
+            "/api/projects/project_abc/readiness": {"body": {"shots": [], "blocking": []}},
+        },
+        body="""
+          await flush();
+          // The startup GET has answered. Take the route away, so the refresh the project load
+          // fires cannot come back.
+          responses.delete('/api/vram-eject');
+          const select = at('#project-select');
+          select.value = 'project_abc';
+          await fire('#project-select:change', { target: select });
+        """,
+    )
+
+    assert result["checked"] is False
+    assert result["disabled"] is False, "a failed refresh disabled a setting that had not changed"
+    assert "unknown" not in result["note"], result["note"]
+
+
+def test_the_client_reports_every_eject_status_the_server_can_send():
+    """A status the client has not learned about must not be dressed up as one it has."""
+    from music_video_producer.vram import EjectStatus
+
+    rendered = vram_eject_exports()["last"]
+    assert set(rendered) == {status.value for status in EjectStatus}
+
+
+def test_no_eject_report_presents_a_vram_figure():
+    """The half of Story 4.1 that was deliberately dropped, held dropped.
+
+    Measured on 2026-08-18: free VRAM fell 31.6 -> 16.0 GB across one eject of a 4.71 GB
+    model, because ComfyUI released its own cache at the same moment. Any figure the client
+    printed would attribute ComfyUI's behaviour to the eject.
+    """
+    exports = vram_eject_exports()
+    units = re.compile(r"\d+(\.\d+)?\s*(GB|MB|GiB|MiB|bytes)\b", re.IGNORECASE)
+    for sentence in [*exports["last"].values(), *exports["sources"].values()]:
+        assert not units.search(sentence), sentence
+
+    # And the sentences the Director reads are built from residency alone: a status carrying a
+    # plausible-looking figure in its `detail` never reaches the note.
+    note = run_module("""
+      import { vramEjectNote } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(vramEjectNote({
+        enabled: true, source: 'default', environment_pinned: false,
+        last: { status: 'released', detail: 'freed 15.6 GB of VRAM',
+                resident_before: ['qwen3-vl-4b'], resident_after: [] },
+      })));
+    """)
+    assert "15.6" not in note and "GB" not in note, note
+    assert "qwen3-vl-4b" in note, note
+
+
+def test_the_note_reports_which_models_went_rather_than_asserting_a_release():
+    """Executed against the shape the route really produces for each interesting outcome."""
+    notes = run_module("""
+      import { vramEjectNote } from './src/music_video_producer/web/assets/api.js';
+      const say = (last) => vramEjectNote({ enabled: true, source: 'default', environment_pinned: false, last });
+      console.log(JSON.stringify({
+        released: say({ status: 'released', detail: '', resident_before: ['a', 'b'], resident_after: [] }),
+        stillResident: say({ status: 'still-resident', detail: '', resident_before: ['a'], resident_after: ['a'] }),
+        off: say({ status: 'disabled', detail: '', resident_before: [], resident_after: [] }),
+        unknownStatus: say({ status: 'invented-later', detail: '', resident_before: [], resident_after: [] }),
+      }));
+    """)
+
+    assert "a, b" in notes["released"]
+    assert "a" in notes["stillResident"] and "did not go" in notes["stillResident"]
+    assert "no eject was attempted" in notes["off"]
+    # Never reported as a success, and never silently blank.
+    assert "invented-later" in notes["unknownStatus"]
+    assert "submitted anyway" in notes["unknownStatus"]

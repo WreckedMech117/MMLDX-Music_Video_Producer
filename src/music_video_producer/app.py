@@ -12,7 +12,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
-from .batch import ReadinessReport, readiness_refusal, readiness_report, shot_label
+from .batch import (
+    ReadinessReport,
+    prompt_is_missing,
+    readiness_refusal,
+    readiness_report,
+    shot_label,
+)
 from .comfy import ComfyClient, ComfyError
 from .config import Settings
 from .director import (
@@ -27,10 +33,12 @@ from .models import (
     Project,
     RenderJob,
     Shot,
+    ShotStatus,
     Song,
     TreatmentMessage,
     VisionInspectionRecord,
 )
+from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
 from .store import ProjectNotFound, ProjectStore
 from .timeline import (
     H3_MAX_SHOT_SECONDS,
@@ -500,6 +508,129 @@ def shot_render_provenance(shot: Shot) -> bool:
     )
 
 
+#: The Shot statuses `render_again` recognises as settled — a Shot that has something to redo.
+#:
+#: `error` is in here deliberately and is the likeliest use of the whole action: a render that
+#: failed is the most obvious thing anyone wants to try again. `approved` is in here too even
+#: though the route then refuses it — the refusal is the point, and a status the route did not
+#: recognise would fall through to the silent no-op below and say nothing about the approval.
+#:
+#: `api.js`'s RENDER_AGAIN_STATUSES is the frontend half, and decides when the control is drawn
+#: at all. A contract test asserts the two lists are identical, because a control offered for a
+#: status the route does not re-open is a button whose only outcome is a refusal.
+RENDER_AGAIN_STATUSES: tuple[ShotStatus, ...] = ("complete", "error", "approved")
+
+#: A render that has been accepted and has not finished. Two of these for one Shot would write
+#: the same prefix at the same time and race on which take the manifest ends up naming.
+RENDER_IN_FLIGHT_STATUSES: frozenset[str] = frozenset({"queued", "running"})
+
+# Why one Shot may not be re-opened. Each names the Shot as the timeline names it, because a bare
+# `shot_a1b2c3d4e5f6` appears nowhere in the interface — the same reason `generate_h3`'s refusal
+# carries `shot_label`.
+#
+# The lock wording says what a lock is for rather than only that one is set, matching
+# EXPANSION_LOCKED_NOTICE: a lock stops an automated rewrite, and the human who set it can undo it.
+RENDER_AGAIN_LOCKED_REFUSAL = (
+    "{shot} is locked. A lock is a deliberate hands-off on this shot, and re-opening it for "
+    "another render is exactly the kind of change it refuses. Unlock the shot first."
+)
+# The one refusal here that is about meaning rather than mechanics, and it has to read that way.
+# Nothing technical stops a second render over an approved take; what stops it is that the
+# approval is a decision *about a particular piece of media*, and after a re-render the decision
+# would be attached to something nobody approved. Clearing the approval is how a Director says the
+# decision has changed — which is a thing they should have to say, not a side effect of a button.
+RENDER_AGAIN_APPROVED_REFUSAL = (
+    "{shot} carries an approved take. An approval is an editorial decision about one specific "
+    "take, so rendering over it would leave that decision describing a take that no longer "
+    "exists. Clear the approval first if the decision has changed."
+)
+# Concurrency, stated as the concrete harm rather than as a busy signal. The staleness escape is
+# named in the same sentence: job status only moves when `read_job` is asked, so a job that
+# finished while nobody was polling still reads as in flight here.
+RENDER_AGAIN_IN_FLIGHT_REFUSAL = (
+    "A render for {shot} has not finished. Two renders of one shot would race on its output, so "
+    "nothing was re-opened. Wait for it, or refresh the render queue if it has already finished "
+    "and this project has not been told yet."
+)
+# What re-opening does to the take that is already there, said in full rather than implied.
+#
+# This is the whole of the honest answer to "no silent destruction of the previous take's record",
+# and it is deliberately not a promise of take management. Three separate facts, and the third is
+# the one that stops the first two from being read as more than they are:
+#
+#   * The file survives. ComfyUI's savers number their outputs from the filename prefix, so a
+#     second render of one shot writes `…_00002` beside `…_00001` rather than over it. Verified on
+#     this installation: one shot's prefix carries `_00001`, `_00002` and `_00003` on disk.
+#   * The job that produced it keeps naming it. `RenderJob.output_files` is per submission and is
+#     never rewritten, so the previous take stays reachable through the render queue.
+#   * The application is not tracking takes. Only `Shot.latest_output` moves, and it is a single
+#     pointer, not a list. Nobody should read any of the above as a take history.
+RENDER_AGAIN_PREVIOUS_TAKE = (
+    "{shot} is open for another render. The take already there is not deleted: ComfyUI numbers "
+    "its output files, so the next render writes a new numbered file beside the old one rather "
+    "than over it, and the job that produced the old take goes on naming it in the render queue. "
+    "What moves is this shot's single latest-take pointer, once the new take lands. This "
+    "application does not track takes, so the older file is on disk and not in a take list."
+)
+# Deliberately ASCII, exactly as `batch.READINESS_REFUSAL` is and for the same reason: the
+# frontend half of this sentence is read back through node, whose stdout the contract test decodes
+# with the platform encoding on Windows, and a typographic dash would come back mangled and fail
+# the test that holds the two wordings together for a reason that has nothing to do with them.
+
+
+def render_again_refusal(project: Project, shot: Shot) -> tuple[int, str] | None:
+    """Why this settled Shot may not be re-opened, as (status code, sentence), or None.
+
+    One function rather than a chain of `raise`s inside the route, so every refusal this action
+    can give is visible in one place and the *order* is a thing that can be read. Order matters
+    and is not arbitrary: the first three ask whether this Shot may be touched at all, and the
+    prompt gate asks whether rendering it would produce anything. A locked Shot with a blank
+    prompt is refused for its lock, because unlocking is what the Director has to do first.
+
+    The prompt gate is last and is asked **again**, from the prompt as it is right now. That is
+    the point of this story: the readiness gate is not a "render once" rule that a Shot passes
+    permanently, it is a "do not render nonsense" rule, and a prompt can be edited to nothing —
+    or back to the `"New shot"` placeholder — between one render and the next. Nothing here reads
+    the fact that this Shot rendered successfully once as evidence about the prompt it has now.
+
+    Asked through `prompt_is_missing` rather than through `readiness_report`, unlike
+    `generate_h3`. Both are AD-5's one implementation — `readiness_report` calls
+    `prompt_rejection` per Shot and this calls it through `prompt_is_missing`, so there is no
+    second definition of empty — but this route is about exactly one Shot and has no use for a
+    whole-plan pass. The refusal sentence is `readiness_refusal`'s, so the Director reads the
+    same instruction here as at submission.
+    """
+    if shot.locked:
+        return 422, RENDER_AGAIN_LOCKED_REFUSAL.format(shot=shot_label(project, shot))
+    if shot.approved_output or shot.status == "approved":
+        return 422, RENDER_AGAIN_APPROVED_REFUSAL.format(shot=shot_label(project, shot))
+    if prompt_is_missing(shot):
+        return 422, readiness_refusal([shot_label(project, shot)])
+    return None
+
+
+def shot_render_in_flight(project: Project, shot: Shot) -> bool:
+    """True when a render for this Shot has been accepted and is not known to have finished.
+
+    Both signals are read, because they can disagree and the disagreement is the dangerous case.
+    `Shot.status` is the half that is right when no job record was ever written; the job records
+    are the durable half, keyed by `target_id`, and they are what still says "in flight" when the
+    status has been walked backwards by hand through the generic shots write — which is precisely
+    how a Shot can read `complete` on screen while ComfyUI is still working on it.
+
+    Job status only ever moves when `read_job` is asked, so a job that finished while nobody was
+    polling still reads `queued` here and this returns True. That is the safe direction to be
+    wrong in — the cost is a refusal that says to refresh the queue, against a second render
+    racing a first one for the same output prefix.
+    """
+    if shot.status in RENDER_IN_FLIGHT_STATUSES:
+        return True
+    return any(
+        job.kind == "h3" and job.target_id == shot.id and job.status in RENDER_IN_FLIGHT_STATUSES
+        for job in project.jobs
+    )
+
+
 def prose_claims_shots(message: str) -> bool:
     """True when a reply's prose claims to have produced a shot plan. See `_SHOT_CLAIM_PATTERNS`.
 
@@ -768,6 +899,17 @@ class ProjectDocumentsRequest(BaseModel):
     style_bible_locked: bool | None = None
 
 
+class VramEjectRequest(BaseModel):
+    """The Director's choice about the VRAM eject. Required, with no default.
+
+    A default here would make an empty body mean something, and the one body a confused
+    client is most likely to send is an empty one. This way an omission is a 422 naming the
+    field rather than a setting that changed to a value nobody asked for.
+    """
+
+    enabled: bool
+
+
 def _safe_filename(value: str) -> str:
     stem = Path(value).name
     clean = re.sub(r"[^A-Za-z0-9._ -]+", "_", stem).strip(" .")
@@ -984,9 +1126,14 @@ def create_app(
     comfy: ComfyClient | Any | None = None,
     director: DirectorClient | Any | None = None,
     ejector: LlmEjector | Any | None = None,
+    preferences: MachinePreferences | Any | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     store = store or ProjectStore(settings.data_root)
+    # Machine-scoped, deliberately not project-scoped: see `preferences.py`. It sits beside
+    # `projects/` under the same data root, so a project directory copied to another machine
+    # carries no opinion about that machine's VRAM.
+    preferences = preferences or MachinePreferences(settings.data_root)
     director = director or DirectorClient(
         base_url=settings.llm_base_url,
         model=settings.llm_model,
@@ -1001,9 +1148,31 @@ def create_app(
     # `getattr` on the busy gate, not `director.busy`: `director` may be an injected double
     # that has never heard of it, and a missing gate must mean "not busy" rather than an
     # AttributeError inside a hook that runs before every render.
+    #
+    # Where the starting value comes from, decided once here rather than in each reader.
+    # **The environment decides how the application starts; the control decides what happens
+    # next.** An explicitly configured `MVP_LLM_EJECT_BEFORE_RENDER` — from the environment,
+    # from `.env`, or passed to `Settings` — wins over anything stored, because an operator
+    # who pins it in a startup file is saying how this machine starts and the interface must
+    # not show a default it is not honouring. Absent that, the Director's last stored choice
+    # wins over the built-in default, which is the whole point of a control that survives a
+    # reload. A runtime change through the route always takes effect immediately and is
+    # stored; the next start re-applies this same precedence to it.
+    #
+    # `model_fields_set` is what distinguishes "configured to True" from "defaulted to True".
+    # Comparing the value against the default cannot: `MVP_LLM_EJECT_BEFORE_RENDER=1` and no
+    # variable at all are the same value and mean different things.
+    eject_pinned_by_environment = "llm_eject_before_render" in settings.model_fields_set
+    stored_eject = preferences.get_bool(EJECT_PREFERENCE_KEY)
+    if eject_pinned_by_environment or stored_eject is None:
+        eject_enabled = settings.llm_eject_before_render
+        eject_source = "environment" if eject_pinned_by_environment else "default"
+    else:
+        eject_enabled = stored_eject
+        eject_source = "director"
     ejector = ejector or LlmEjector(
         base_url=settings.llm_base_url,
-        enabled=settings.llm_eject_before_render,
+        enabled=eject_enabled,
         unload_timeout=settings.llm_eject_timeout,
         unloader=CliUnloader(settings.llm_eject_executable)
         if settings.llm_eject_executable
@@ -1026,6 +1195,12 @@ def create_app(
     app.state.store = store
     app.state.comfy = comfy
     app.state.ejector = ejector
+    app.state.preferences = preferences
+    # Where the *current* value came from, which changes the moment the Director changes the
+    # setting. Held on `app.state` rather than closed over so it stays inspectable, and read
+    # back below rather than captured, because a closure over the local would keep reporting
+    # the startup answer forever.
+    app.state.eject_source = eject_source
 
     def get_project(project_id: str) -> Project:
         try:
@@ -1074,6 +1249,65 @@ def create_app(
                 "model": settings.llm_model,
             },
         }
+
+    def vram_eject_state() -> dict[str, Any]:
+        """The setting, where it came from, and what the last eject actually did.
+
+        `enabled` is read off the ejector rather than from any copy, because the ejector's
+        own attribute is the thing every submission consults — a second field that could
+        disagree with it is a field that will eventually lie.
+
+        `last` carries only what the host itself reported: which models were resident before
+        the attempt and which are resident after it. There is deliberately **no free-VRAM
+        figure**. Measured on 2026-08-18, the reading fell 31.6 → 16.0 GB across one eject of
+        a 4.71 GB model, because ComfyUI released its own cache in the same moment; a number
+        that looks like evidence and is not is worse than no number. See `docs/OPERATIONS.md`.
+        """
+        outcome = getattr(ejector, "last_outcome", None)
+        return {
+            "enabled": bool(getattr(ejector, "enabled", False)),
+            "source": app.state.eject_source,
+            "environment_pinned": eject_pinned_by_environment,
+            "last": None
+            if outcome is None
+            else {
+                "status": outcome.status.value,
+                "detail": outcome.detail,
+                "resident_before": list(outcome.resident_before),
+                "resident_after": list(outcome.resident_after),
+            },
+        }
+
+    @app.get("/api/vram-eject")
+    def read_vram_eject() -> dict[str, Any]:
+        return vram_eject_state()
+
+    @app.put("/api/vram-eject")
+    def set_vram_eject(request: VramEjectRequest) -> dict[str, Any]:
+        """Turn the eject on or off for every submission route, from now on.
+
+        One assignment, to the one attribute `LlmEjector._attempt` reads on its way in. It
+        gates at the `before_submit` funnel rather than at any route, so a submission path
+        added tomorrow is covered without knowing this setting exists — and so turning the
+        setting *on* adds no code to any render path that could fail one.
+
+        The store is written before the ejector is changed. A choice that cannot be saved is
+        refused outright rather than applied for this session only: leaving the setting live
+        but unsaved puts a value on screen that silently reverts at the next start, which is
+        the same class of lie this feature exists to remove.
+        """
+        try:
+            preferences.set_bool(EJECT_PREFERENCE_KEY, request.enabled)
+        except OSError as error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"The VRAM eject setting could not be saved, so it was not changed: {error}"
+                ),
+            ) from error
+        ejector.enabled = request.enabled
+        app.state.eject_source = "director"
+        return vram_eject_state()
 
     @app.get("/api/projects", response_model=list[Project])
     def list_projects() -> list[Project]:
@@ -1859,6 +2093,67 @@ def create_app(
         store.save(project)
         return job
 
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/render-again", response_model=Project
+    )
+    def render_again(project_id: str, shot_id: str) -> Project:
+        """Re-open one settled Shot so it can be submitted once more. Its own action, no body.
+
+        Comparing two takes of a shot is an ordinary creative act, and until this existed the only
+        way to do it was to walk `status` back to `ready` by hand through `PUT /shots` with an API
+        client — which is what was done on 2026-08-18 to compare two sampling profiles.
+
+        That route is the generic full-project-shaped write, and using it for this is the hazard
+        this codebase keeps rediscovering: it takes the whole Shot list from the client, so a
+        request whose only intent was "let me render this again" also carries, and therefore can
+        silently overwrite, every prompt, window, reference and lock in the plan. This route takes
+        **no body at all**. There is nothing on the wire for a stale client to reassert, and the
+        only field it writes is `status`. A route test pins that: everything else in the manifest
+        compares byte-identical across the call.
+
+        Not a bypass of the readiness gate. The gate refuses unprompted shots so they do not spend
+        a GPU pass returning noise, and that question is asked here from scratch — see
+        `render_again_refusal`. A shot that rendered successfully and then had its prompt deleted
+        is refused exactly as a first render would refuse it.
+
+        What happens to the take already there is stated rather than implied, in
+        `RENDER_AGAIN_PREVIOUS_TAKE`: nothing, until the new one lands, and then only the single
+        `latest_output` pointer moves. Take management — keeping, naming or comparing several
+        outputs per shot — is deliberately not this story and is not started here.
+
+        The response is the whole project, as every other purpose-built action returns, so the
+        client redraws the timeline, the inspector and the queue button from one reply.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        # First, and ahead of the settled check, because an in-flight Shot is neither settled nor
+        # untouched: it is the one state where a second submission does concrete harm. It is also
+        # the state a hand-walked-back status hides — `ready` with a live job is exactly the race —
+        # so this must not be reachable only through the statuses below.
+        if shot_render_in_flight(project, shot):
+            raise HTTPException(
+                status_code=409,
+                detail=RENDER_AGAIN_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # A Shot that has never rendered has nothing to render *again*, so this does nothing to it
+        # and says so by changing nothing. Not an error: `draft` is what every Shot the interface
+        # creates is, and a 422 here would turn the commonest state in the application into a
+        # failure. It is also why this precedes the refusals — the placeholder prompt every new
+        # Shot carries would otherwise refuse a shot that was never being re-opened.
+        if shot.status not in RENDER_AGAIN_STATUSES:
+            return project
+        refusal = render_again_refusal(project, shot)
+        if refusal:
+            raise HTTPException(status_code=refusal[0], detail=refusal[1])
+        # The whole write. `latest_output`, `latest_review`, `prompt_id` and the job history are
+        # left exactly as they are: the previous take is still this Shot's take until a new one
+        # actually lands, and re-opening a Shot the Director then thinks better of must cost them
+        # nothing.
+        shot.status = "ready"
+        return store.save(project)
+
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)
     async def director_chat(project_id: str, request: DirectorRequest) -> Project:
         # This snapshot is only ever used to build the prompt. It carries the user's message
@@ -2236,6 +2531,22 @@ def create_app(
                     if shot:
                         shot.status = "complete"
                         if job.output_files:
+                            # The pointer moves; the file it used to name does not. ComfyUI
+                            # numbers its outputs from the filename prefix, so a re-render of
+                            # one shot writes `…_00002` beside `…_00001` — and this job's own
+                            # `output_files` goes on naming whichever it produced. That is the
+                            # whole of what "the previous take is not silently lost" means:
+                            # nothing here is a take list, and nothing should be read as one.
+                            #
+                            # `latest_review` is dropped when, and only when, the take it
+                            # describes stops being the latest one. It is a vision inspection of
+                            # a *specific* file; carrying it across a new take would leave the
+                            # inspector reporting on the previous render under the new take's
+                            # name, which is worse than showing nothing — and it is now reachable
+                            # from the interface, because a shot can be re-opened and rendered
+                            # again. Re-run "Inspect latest take" for the new one.
+                            if job.output_files[0] != shot.latest_output:
+                                shot.latest_review = None
                             shot.latest_output = job.output_files[0]
             elif job.kind == "h3" and job.status == "error":
                 shot = next((item for item in project.shots if item.id == job.target_id), None)

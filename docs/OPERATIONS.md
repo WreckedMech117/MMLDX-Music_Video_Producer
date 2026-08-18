@@ -22,7 +22,7 @@ Key settings:
 - `MVP_LLM_MODEL`
 - `MVP_LLM_API_KEY`
 - `MVP_MAX_UPLOAD_BYTES` (default 2 GiB)
-- `MVP_LLM_EJECT_BEFORE_RENDER` (**default on**), `MVP_LLM_EJECT_EXECUTABLE`, `MVP_LLM_EJECT_TIMEOUT` (default 20 s)
+- `MVP_LLM_EJECT_BEFORE_RENDER` (**default on**) — pins the value at startup; the interface can change it thereafter, and does not override this variable across a restart. Plus `MVP_LLM_EJECT_EXECUTABLE` and `MVP_LLM_EJECT_TIMEOUT` (default 20 s)
 
 Copy `.env.example` to the ignored `.env` file before startup. Editing the example alone does not affect runtime settings.
 
@@ -38,7 +38,13 @@ Watch it with `INFO` on `music_video_producer.vram`:
 INFO:     music_video_producer.vram - VRAM eject before render: released <model> (lms CLI reported: ...)
 ```
 
-Turn it off with `MVP_LLM_EJECT_BEFORE_RENDER=0` — worth doing if you deliberately run a small model alongside renders and would rather keep it warm.
+**There is a visible control** in the topbar beside the ComfyUI status. Unticking it stops the eject from the next submission onward, with no restart, and it reports what the last submission actually did — `Last render: released <model>`, or `no eject was attempted`. Worth turning off if you deliberately run a small model alongside renders and would rather keep it warm.
+
+**Precedence, because the two can disagree: the environment decides how the application starts, the control decides what happens after.** An explicitly set `MVP_LLM_EJECT_BEFORE_RENDER` — from the environment, from `.env`, or passed to `Settings` — wins at startup over any stored choice; otherwise the last stored choice wins over the built-in default. A change made in the interface applies immediately and is stored, but the next start re-applies that same order, so **with the variable pinned, a change made here does not survive a restart**. The control's hover text says so rather than leaving you to discover it. The alternative — a stored choice permanently overriding the variable — was rejected because it makes a startup file silently inert. Note that "explicitly set" is read from pydantic's `model_fields_set`, not by comparing against the default: `MVP_LLM_EJECT_BEFORE_RENDER=1` and no variable at all are the same value and mean different things.
+
+The choice is stored in `data/machine-preferences.json`, a sibling of `projects/` and **never** inside a project manifest — it describes this machine's card, not the video, and a shared project carrying "do not eject" would silently change how someone else's renders behave. A missing, unreadable or wrong-typed value reads as *no choice recorded* rather than as "off", so a corrupt file cannot quietly disable the eject.
+
+**No free-VRAM figure is shown, deliberately.** Story 4.1 asked for one; it was dropped after measurement. Across one eject of a 4.71 GB model the reading fell 31.6 → 16.0 GB, because ComfyUI released its own cache at the same moment — a number that looks like evidence and is not. What the interface reports instead is which models were resident and whether they are gone, which is directly observed.
 
 **The mechanism is the vendor CLI, and that is a considered choice rather than a first guess.** LM Studio's HTTP surface cannot be probed for an unload route: every unknown path returns **HTTP 200** with an error body, and a `GET` against a real `POST` route is indistinguishable from a `GET` against a path that does not exist, so no read-only probe can establish whether a REST unload exists. `lms.exe` itself contains no `api/v0` or `api/v1` route strings but does contain `ws://127.0.0.1:1234` and `unloadModel` — the vendor unloads over WebSocket RPC, not REST. The CLI sits behind a three-line protocol, so swapping in a proven REST or WebSocket unload later is one new class; the verification above never trusted the mechanism in the first place.
 
@@ -55,6 +61,8 @@ Back up both:
 
 Project manifests reference Comfy outputs; backing up manifests alone preserves decisions but not generated media.
 
+`data/machine-preferences.json` is deliberately **not** on that list. It holds choices that describe this machine — currently the VRAM eject toggle — and restoring it onto different hardware is not meaningful. Losing it costs nothing: every value in it falls back to its documented default.
+
 ## Recover a project
 
 - Restore its complete `<project-id>` directory beneath `data/projects`.
@@ -69,6 +77,18 @@ Malformed manifests are skipped during list operations rather than crashing the 
 Jobs persist their Comfy prompt IDs. Use **Queue → Refresh** after an application restart. The backend reads `/history/<prompt-id>` and updates completion, outputs, or exact execution errors.
 
 Comfy history can be cleared independently. If a prompt ID no longer exists, the job remains queued until a future reconciliation policy marks it stale; current code does not invent a completion.
+
+## Render a shot again
+
+`POST /api/projects/{id}/shots/{shot_id}/render-again`, and a control in the shot inspector, re-open a settled shot for one more submission by writing exactly one field — `status` back to `ready`. Before this existed, comparing two takes meant hand-editing status through the generic shots route with an API client, which is what had to be done on 2026-08-18 to compare the two sampling profiles.
+
+The readiness gate is **not** a "render once" rule, it is a "do not render nonsense" rule, so re-opening a shot that already satisfied it is not a bypass. The prompt check is asked **again** from the prompt as it stands at that moment, not remembered from the first render — a prompt edited to nothing, or back to the `"New shot"` placeholder, is refused exactly as a first render would be.
+
+Refusals, in the order they are checked: a job already **in flight** for that shot (409, decided from both the status *and* the job records, because a hand-walked-back status hides it); a shot that was never rendered (nothing to do); a **locked** shot; an **approved** take; and finally the prompt gate. The approval refusal is about meaning rather than mechanics — re-rendering over an approved take would leave the approval describing something that no longer exists.
+
+**On the previous take: the application does not track takes.** ComfyUI writes numbered outputs (`_00001`, `_00002`), so the earlier file survives on disk; what changes is that `Shot.latest_output` stops pointing at it. Nothing in the manifest records that an earlier take existed. Take comparison and approval remain unbuilt (`docs/ROADMAP.md`).
+
+A stale vision review no longer follows a shot across takes: `Shot.latest_review` is cleared when a new output displaces the file it describes. That defect predates this feature — only an API client could reach it before — but this control makes it a button.
 
 ## Troubleshooting
 

@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, renderAgainControl, renderAgainNotice, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -87,6 +87,38 @@ async function loadHealth() {
   }
 }
 
+// The VRAM eject setting and what the last attempt did. Its own route rather than a field on
+// health, because this is refreshed after every project load -- which is every submission path's
+// last step -- and health probes ComfyUI over HTTP on the way through.
+//
+// A failure leaves whatever was last known on screen and repaints nothing. Before the first
+// successful answer that is `null`, which renders as "unknown" with the control disabled: the
+// server owns this value, and a box drawn from a guess would report a machine-wide setting the
+// renders are not honouring. After that, a transient blip must not blank a setting that has not
+// changed. Nothing here is a gate, so nothing here is worth a toast.
+async function loadVramEject() {
+  try {
+    state.vramEject = await api.vramEject();
+  } catch {
+    // Keep the last known answer; the server remains the authority on the next call.
+  }
+  renderVramEject();
+}
+
+// Painted from `state.vramEject` and from nothing else -- no default, and never from what the
+// Director last clicked. That is what makes the environment case honest: with
+// MVP_LLM_EJECT_BEFORE_RENDER=0 the server answers `enabled: false` and the box is drawn
+// unticked, rather than showing a default the application is not honouring.
+function renderVramEject() {
+  const status = state.vramEject;
+  const control = $(VRAM_EJECT_CONTROL);
+  const note = $(VRAM_EJECT_NOTE);
+  control.disabled = !vramEjectAvailable(status);
+  control.checked = vramEjectChecked(status);
+  note.textContent = vramEjectNote(status);
+  note.title = vramEjectTitle(status);
+}
+
 async function loadProjects(selectId = null) {
   state.projects = await api.projects();
   const select = $("#project-select");
@@ -142,6 +174,15 @@ async function loadProject(id) {
   renderAll();
   loadPersistedWaveform(id);
   loadReadiness(id);
+  // Refreshed here rather than in each submission handler, because every path that queues a
+  // render reloads the project immediately afterwards -- the queue-ready loop, both generate
+  // forms, the shot renders, the queue refresh. One call here therefore reports what the eject
+  // did after every submission, and no submission handler needs to know this control exists.
+  //
+  // A refresh, never a reset. The `apply_documents` consent above is cleared on a project change
+  // because it is consent for one turn; this is a standing property of the machine, and clearing
+  // it on a project load would silently re-enable an eject the Director turned off.
+  loadVramEject();
 }
 
 // Readiness for the project just loaded, fetched rather than computed: this client's copy of the
@@ -599,7 +640,12 @@ function bindClip(clip) {
   });
 }
 
-function renderShotInspector() {
+// Exported for the executed frontend contract, on the `renderSong` precedent: the render-again
+// control is drawn, enabled and bound in here, and a test that only read this source could not
+// tell a control that is bound to the purpose-built route from one bound to the generic shots
+// write -- which is the whole distinction the action exists to make. The harness in
+// tests/test_frontend_contract.py boots this module, calls this, and reads what came out.
+export function renderShotInspector() {
   const shot = selectedShot();
   const inspector = $("#shot-inspector");
   if (!shot) {
@@ -612,10 +658,18 @@ function renderShotInspector() {
   // empty box. The sameness lines are the other half: a near-duplicate pair is only something the
   // Director can differentiate or accept deliberately if it is named where its prompt is edited.
   const readiness = shotInspectorReadiness(readinessReport, shot);
+  // Whether this shot may be re-opened, and why not when it may not -- decided by
+  // `renderAgainControl`, which the contract tests execute for every status and every refusal.
+  // Nothing about that decision is re-made in the template below: it applies `shown`, `disabled`
+  // and `title` and nothing else, exactly as the clip applies `shotPromptCell`.
+  const again = renderAgainControl(shot);
+  const againHtml = again.shown
+    ? `<button class="quiet-button full" id="render-again" ${again.disabled ? "disabled" : ""} title="${escapeHtml(again.title)}">${escapeHtml(again.label)}</button>${again.reason ? `<p class="render-again-reason">${escapeHtml(again.reason)}</p>` : ""}`
+    : "";
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode"><option value="reference" ${shot.mode === "reference" ? "selected" : ""}>Reference + audio</option><option value="image" ${shot.mode === "image" ? "selected" : ""}>Image to video</option><option value="text" ${shot.mode === "text" ? "selected" : ""}>Text to video</option></select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>References<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !shot.asset_ids.includes(asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shot.asset_ids.map((id) => { const asset = assets.find((item) => item.id === id); if (!asset) return ""; const sameKind = shot.asset_ids.map((ref) => assets.find((item) => item.id === ref)).filter((item) => item && (item.kind === asset.kind || (!["video", "audio"].includes(item.kind) && !["video", "audio"].includes(asset.kind)))); const tag = asset.kind === "video" ? "Video" : asset.kind === "audio" ? "Audio" : "Picture"; return `<button class="quiet-button remove-ref" data-id="${id}">${tag} ${sameKind.indexOf(asset) + 1}: ${escapeHtml(asset.name)} ×</button>`; }).join(" ")}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode"><option value="reference" ${shot.mode === "reference" ? "selected" : ""}>Reference + audio</option><option value="image" ${shot.mode === "image" ? "selected" : ""}>Image to video</option><option value="text" ${shot.mode === "text" ? "selected" : ""}>Text to video</option></select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>References<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !shot.asset_ids.includes(asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shot.asset_ids.map((id) => { const asset = assets.find((item) => item.id === id); if (!asset) return ""; const sameKind = shot.asset_ids.map((ref) => assets.find((item) => item.id === ref)).filter((item) => item && (item.kind === asset.kind || (!["video", "audio"].includes(item.kind) && !["video", "audio"].includes(asset.kind)))); const tag = asset.kind === "video" ? "Video" : asset.kind === "audio" ? "Audio" : "Picture"; return `<button class="quiet-button remove-ref" data-id="${id}">${tag} ${sameKind.indexOf(asset) + 1}: ${escapeHtml(asset.name)} ×</button>`; }).join(" ")}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   ["shot-start", "shot-duration", "shot-mode", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
   $("#shot-asset-select").addEventListener("change", (event) => { if (event.target.value) { shot.asset_ids.push(event.target.value); saveShotsSilently(); renderTimeline(); } });
   $$(".remove-ref", inspector).forEach((button) => button.addEventListener("click", () => { shot.asset_ids = shot.asset_ids.filter((id) => id !== button.dataset.id); saveShotsSilently(); renderTimeline(); }));
@@ -623,6 +677,29 @@ function renderShotInspector() {
   $("#analyze-take")?.addEventListener("click", async () => {
     try { state.project = await api.analyzeLatestTake(state.project.id, shot.id); renderTimeline(); toast("Latest take review saved"); }
     catch (error) { toast(error.message, "error"); }
+  });
+  // Its own route, and it sends no body. The shots write would have done this too -- it is what
+  // had to be used by hand on 2026-08-18 -- but that route takes the whole shot list, so a request
+  // meaning "let me render this one again" would also reassert every prompt, window and lock this
+  // client happens to be holding. There is nothing here for a stale client to overwrite with.
+  //
+  // The reply is the whole project, so the status, the timeline and the queue button all redraw
+  // from it. `renderJobs` as well as `renderTimeline`, because the re-opened shot has just become
+  // queueable and the batch button is disabled off exactly that count.
+  //
+  // The toast is the previous take's fate, in the server's own sentence. A bare "re-opened" would
+  // leave the Director believing the application is keeping both takes, which it is not.
+  $("#render-again")?.addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const projectId = state.project.id;
+    try {
+      const project = await api.renderAgain(projectId, shot.id);
+      if (state.project?.id !== projectId) return;
+      state.project = project;
+      renderTimeline();
+      renderJobs();
+      toast(renderAgainNotice(project, shot.id));
+    } catch (error) { toast(error.message, "error"); }
   });
 }
 
@@ -1216,6 +1293,26 @@ function bindEvents() {
     }
     finally { renderJobs(); }
   });
+  // The whole of the control. It sends the box's own value -- never a hardcoded one, which would
+  // make the control decorative in one direction and unusable in the other -- and repaints from
+  // the server's reply, so a refused change reverts the box instead of leaving it showing a
+  // setting no render will honour. The same revert the document lock toggles do.
+  //
+  // Nothing about a render happens here. The setting reaches submissions through the server's
+  // pre-submission hook, so no failure on this path can reach a render: the worst case is a
+  // control that did not change.
+  $(VRAM_EJECT_CONTROL).addEventListener("change", async (event) => {
+    const control = event.currentTarget;
+    const wanted = control.checked === true;
+    control.disabled = true;
+    try {
+      state.vramEject = await api.setVramEject(wanted);
+      toast(vramEjectToast(state.vramEject));
+    } catch (error) {
+      toast(error.message, "error");
+    }
+    renderVramEject();
+  });
   window.addEventListener("resize", () => { if (state.audioBuffer) { renderSong(); renderTimeline(); } });
   // The same predicate the project switch asks: a tab closed on an unsaved lyric sheet loses it as
   // completely as a project switch does, and the browser's own dialog is the only warning left.
@@ -1234,7 +1331,7 @@ async function refreshJobs() {
 
 async function init() {
   bindEvents();
-  await Promise.all([loadHealth(), api.workflows().catch(() => [])]);
+  await Promise.all([loadHealth(), loadVramEject(), api.workflows().catch(() => [])]);
   try { await loadProjects(); } catch (error) { toast(error.message, "error"); }
 }
 
