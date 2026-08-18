@@ -88,11 +88,43 @@ def build_music3_payload(
     }
 
 
+#: What ``MiniMaxMusic3TextEncode.max_duration`` accepts, read off the recorded
+#: ``/object_info`` (0.04–360 s). Only the ceiling is named here: every SongPlanner request
+#: is already above the floor by the planner's own 30 s minimum, and it is the *product* of
+#: the requested duration and the headroom below that can leave the schema. Past it ComfyUI
+#: rejects the whole prompt at ``/prompt`` validation, which reaches the Director as an
+#: opaque 502 — so the adapter refuses locally and names the numbers instead.
+MUSIC3_MAX_DURATION_SECONDS = 360.0
+
+#: ``M3SongPlanner.duration_seconds`` and ``MiniMaxMusic3TextEncode.max_duration`` take the
+#: same kind of number and mean different things. The planner is told **how long a song to
+#: write**; the encoder is given a **latent ceiling** the song may finish before. Handing the
+#: target to both leaves no room, so a song whose lyrics run slightly long loses its ending.
+#: The multiplier between the two is the headroom.
+#:
+#: 1.5 is the creator's documented rule — "max_duration: set this 50% longer than your target
+#: (60s lyrics → 90s max duration)" — stated four separate times in their write-up, once as a
+#: first-hand account of an ending being cut off. Their own audited export sets both inputs to
+#: 200, equal, no headroom at all. The evidence disagrees with itself, which is why the
+#: headroom is a request field the Director can see and change rather than a constant buried
+#: here: only a long, lyric-dense song settles it by ear, and both live SongPlanner runs so
+#: far sat at the 30 s floor and returned 29.989 s, precisely where this could never show.
+SONGPLANNER_DEFAULT_DURATION_HEADROOM = 1.5
+
+#: The widest headroom any acceptable request could survive. ``SongPlannerRequest.duration``
+#: cannot go below the planner's 30 s floor, and 30 × 12 is exactly
+#: ``MUSIC3_MAX_DURATION_SECONDS`` — so above 12 there is no duration at all the route would
+#: accept, and the refusal should name the setting rather than a product that was never
+#: reachable. ``tests/test_workflows.py`` re-derives this from the recorded schema.
+SONGPLANNER_MAX_DURATION_HEADROOM = 12.0
+
+
 def _build_songplanner_core(
     *,
     idea: str,
     genre_hint: str,
     duration: float,
+    duration_headroom: float,
     seed: int,
     prefix: str,
     lyrics: str | None,
@@ -110,14 +142,36 @@ def _build_songplanner_core(
 
     ``lyrics`` is deliberately not defaulted: both wrappers must state which
     variant they want, so no caller can silently fall into the invented path
-    while asking for a cover.
+    while asking for a cover. ``duration_headroom`` is not defaulted for the same
+    reason — the two duration inputs mean different things (see
+    ``SONGPLANNER_DEFAULT_DURATION_HEADROOM``), and a caller that has not said how
+    much room the song gets to overrun into should have to say so rather than
+    silently re-conflate them. ``duration`` reaches ``M3SongPlanner`` untouched
+    whatever the headroom is: a song is asked for at the length that was asked for.
     """
     if lyrics is not None and not lyrics.strip():
         raise ValueError("Known lyrics must not be empty; pass None for invented lyrics")
+    if duration_headroom < 1.0:
+        raise ValueError(
+            f"A duration headroom of {duration_headroom:g} puts "
+            f"MiniMaxMusic3TextEncode.max_duration below the song asked for, which can only "
+            f"truncate it; 1.0 gives the encoder exactly the target and no room to overrun"
+        )
+    # Exactly 1.0 hands the encoder the target *object*, not ``duration * 1.0``: multiplying
+    # would turn an integer 120 into 120.0 and change the JSON that goes out. A headroom of
+    # 1.0 has to reproduce the pre-headroom payload byte for byte — that is the evidence this
+    # change is inert where it is meant to be.
+    max_duration = duration if duration_headroom == 1.0 else duration * duration_headroom
+    if max_duration > MUSIC3_MAX_DURATION_SECONDS:
+        raise ValueError(
+            f"A {duration:g}s song at {duration_headroom:g}x headroom sets "
+            f"MiniMaxMusic3TextEncode.max_duration={max_duration:g}, above that node's "
+            f"maximum of {MUSIC3_MAX_DURATION_SECONDS:g}; lower the headroom or the duration"
+        )
     payload: dict[str, dict[str, Any]] = {
         "55": {"class_type": "M3SongPlanner", "inputs": {"text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors", "idea": idea, "genre_hint": genre_hint, "vocal_config": "female vocals", "language": "English", "duration_seconds": duration, "seed": seed, "temperature": 0.8, "top_p": 0.95, "top_k": 64, "max_tokens": 2048, "keep_model_loaded": False}},
         "44": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_music3_dit_fp16.safetensors", "weight_dtype": "default"}},
-        "45": {"class_type": "MiniMaxMusic3TextEncode", "inputs": {"clip": ["46", 0], "caption": ["55", 0], "lyrics": ["55", 1], "seed": seed, "max_duration": duration, "cfg_scale": 1.5, "top_k": 50}},
+        "45": {"class_type": "MiniMaxMusic3TextEncode", "inputs": {"clip": ["46", 0], "caption": ["55", 0], "lyrics": ["55", 1], "seed": seed, "max_duration": max_duration, "cfg_scale": 1.5, "top_k": 50}},
         "46": {"class_type": "CLIPLoader", "inputs": {"clip_name": "minimax_music3_text_encoder_bf16.safetensors", "type": "minimax", "device": "default"}},
         "47": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_music3_dav.safetensors"}},
         "48": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["45", 0]}},
@@ -132,13 +186,14 @@ def _build_songplanner_core(
 
 
 def build_songplanner_invented_payload(
-    *, idea: str, genre_hint: str, duration: float, seed: int, prefix: str
+    *, idea: str, genre_hint: str, duration: float, duration_headroom: float, seed: int, prefix: str
 ) -> dict[str, dict[str, Any]]:
     """SongPlanner invented-lyrics path: Gemma-3 writes caption + lyrics in-graph."""
     return _build_songplanner_core(
         idea=idea,
         genre_hint=genre_hint,
         duration=duration,
+        duration_headroom=duration_headroom,
         seed=seed,
         prefix=prefix,
         lyrics=None,
@@ -146,7 +201,14 @@ def build_songplanner_invented_payload(
 
 
 def build_songplanner_known_lyrics_payload(
-    *, idea: str, genre_hint: str, lyrics: str, duration: float, seed: int, prefix: str
+    *,
+    idea: str,
+    genre_hint: str,
+    lyrics: str,
+    duration: float,
+    duration_headroom: float,
+    seed: int,
+    prefix: str,
 ) -> dict[str, dict[str, Any]]:
     """SongPlanner known-lyrics path: the supplied lyric sheet reaches node 45 unchanged.
 
@@ -175,6 +237,7 @@ def build_songplanner_known_lyrics_payload(
         idea=idea,
         genre_hint=genre_hint,
         duration=duration,
+        duration_headroom=duration_headroom,
         seed=seed,
         prefix=prefix,
         lyrics=lyrics,

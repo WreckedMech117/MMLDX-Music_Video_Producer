@@ -144,6 +144,10 @@
   summary: The API selects the SongPlanner variant implicitly by presence of the lyrics field; consider an explicit variant discriminator so a client cannot silently degrade a cover request into an invented generation.
   evidence: Verification-gap and blind-hunter both flagged that {"lyrics": null} takes the invented path with no signal; the frontend has an explicit preset concept the route lacks. Behavior is now pinned by test, but the design question stands.
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-song-duration-headroom.md`
+  summary: Expose `duration_headroom` in the Song workspace UI (currently API-only; the form never sends it, so it always takes the 1.5 default).
+  evidence: The spec's own reasoning is that the creator's documentation and their audited export disagree, so the Director should be able to see the choice and settle it by ear — which a form field would serve and an API-only field does not. Same shape as the `genre_hint` entry above. Two further UI consequences of the default: a duration above 240 s now takes a 422 unless the headroom is lowered, and the duration field's 30-300 s `max` no longer describes what the form can actually submit; a headroom control would need `musicFormFieldUpdate` to relate the two.
+
 
 ## Resolved
 

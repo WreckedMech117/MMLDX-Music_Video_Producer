@@ -50,6 +50,9 @@ from music_video_producer.workflows import (
     MULTIVIEW_SAMPLER,
     MULTIVIEW_SCHEDULER,
     MULTIVIEW_STEPS,
+    MUSIC3_MAX_DURATION_SECONDS,
+    SONGPLANNER_DEFAULT_DURATION_HEADROOM,
+    SONGPLANNER_MAX_DURATION_HEADROOM,
     H3SamplingProfile,
     WorkflowCatalog,
     build_flux_payload,
@@ -265,6 +268,7 @@ def test_songplanner_invented_payload_lands_controls_on_planner_and_music_nodes(
         idea="a slow-burn desert rock anthem with a female vocalist",
         genre_hint="desert rock",
         duration=90.0,
+        duration_headroom=1.5,
         seed=41,
         prefix="mvp/songs/night-signal",
     )
@@ -285,7 +289,9 @@ def test_songplanner_invented_payload_lands_controls_on_planner_and_music_nodes(
     assert encoder["inputs"]["caption"] == ["55", 0]
     assert encoder["inputs"]["lyrics"] == ["55", 1]
     assert encoder["inputs"]["seed"] == 41
-    assert encoder["inputs"]["max_duration"] == 90.0
+    # The planner is asked for 90 s of song; the encoder's ceiling is 90 × 1.5. Two inputs
+    # that take the same kind of number and mean different things.
+    assert encoder["inputs"]["max_duration"] == 135.0
     assert latent["inputs"]["seconds"] == ["45", 1]
     assert sampler["inputs"]["seed"] == 41
     assert save["inputs"]["format"] == "flac"
@@ -304,6 +310,7 @@ def test_songplanner_known_lyrics_payload_passes_lyrics_through_unchanged():
         genre_hint="",
         lyrics=lyrics,
         duration=60,
+        duration_headroom=1.5,
         seed=3,
         prefix="mvp/songs/known",
     )
@@ -318,7 +325,13 @@ def test_songplanner_known_lyrics_payload_passes_lyrics_through_unchanged():
 def test_songplanner_known_lyrics_payload_rejects_blank_lyrics():
     with pytest.raises(ValueError, match="lyrics"):
         build_songplanner_known_lyrics_payload(
-            idea="ballad", genre_hint="", lyrics="  \n", duration=60, seed=3, prefix="mvp/songs/x"
+            idea="ballad",
+            genre_hint="",
+            lyrics="  \n",
+            duration=60,
+            duration_headroom=1.5,
+            seed=3,
+            prefix="mvp/songs/x",
         )
 
 
@@ -331,6 +344,7 @@ def test_songplanner_known_lyrics_payload_never_degrades_to_invented():
                 genre_hint="",
                 lyrics=missing,
                 duration=60,
+                duration_headroom=1.5,
                 seed=3,
                 prefix="mvp/songs/x",
             )
@@ -341,6 +355,7 @@ def test_songplanner_builders_differ_only_in_node_45_lyric_handling():
         "idea": "ballad",
         "genre_hint": "rock",
         "duration": 60,
+        "duration_headroom": 1.5,
         "seed": 3,
         "prefix": "mvp/songs/pair",
     }
@@ -352,6 +367,138 @@ def test_songplanner_builders_differ_only_in_node_45_lyric_handling():
     invented["45"]["inputs"].pop("lyrics")
     known["45"]["inputs"].pop("lyrics")
     assert invented == known
+
+
+#: SHA-256 of the canonical JSON of each SongPlanner payload as it was built *before* the
+#: duration headroom existed, at commit b08df47. Recorded rather than recomputed on purpose:
+#: a headroom of 1.0 has to reproduce the pre-headroom payload byte for byte, and only a
+#: digest taken from the old code can prove that. The invented case deliberately passes an
+#: integer duration and the known-lyrics case a float, because `duration * 1.0` would turn
+#: `90` into `90.0` and change the bytes on the wire while every `==` assertion still passed.
+PRE_HEADROOM_PAYLOAD_DIGESTS = {
+    "invented": "b2a336c306af3bef831d454174cfc9e19d44b0b5642be9438a72f27be5ab86bc",
+    "known-lyrics": "013cc12ce86290e69597753d70201ef29c13a978c19d0ca8b7bd4cc266906585",
+}
+
+
+def headroom_builders(duration, headroom):
+    """Both variants at one duration and headroom, unbuilt.
+
+    Callables rather than payloads so a refusal test can name which variant raised: building
+    the pair eagerly would let the invented builder's `ValueError` stand in for both. Keyed as
+    `PRE_HEADROOM_PAYLOAD_DIGESTS` is. The known-lyrics variant takes `float(duration)`
+    deliberately — one integer target and one float target across the pair, because the
+    `1.0` guarantee is about wire bytes and `90` and `90.0` are different bytes.
+    """
+    shared = {
+        "idea": "a slow-burn desert rock anthem",
+        "genre_hint": "desert rock",
+        "duration_headroom": headroom,
+        "seed": 41,
+        "prefix": "mvp/songs/night-signal",
+    }
+    return {
+        "invented": lambda: build_songplanner_invented_payload(duration=duration, **shared),
+        "known-lyrics": lambda: build_songplanner_known_lyrics_payload(
+            duration=float(duration), lyrics="[verse]\nKnown words", **shared
+        ),
+    }
+
+
+def headroom_payload_pair(duration, headroom):
+    """Both variants built, keyed as `PRE_HEADROOM_PAYLOAD_DIGESTS` is."""
+    return {label: build() for label, build in headroom_builders(duration, headroom).items()}
+
+
+def test_songplanner_headroom_raises_the_encoders_ceiling_and_never_the_planners_target():
+    """The whole point: one number is a target to write to, the other a ceiling to stop at.
+
+    `M3SongPlanner.duration_seconds` is how long a song to write; `max_duration` is the
+    encoder's latent ceiling, which the song may finish before. Passing the target to both —
+    which is what the creator's own export does — leaves a song whose lyrics run long no room
+    for its ending. Asserted on both variants because a cover's supplied lyric sheet can
+    overrun exactly as easily as an invented one.
+    """
+    for headroom, expected_ceiling in ((1.0, 60.0), (1.5, 90.0), (2.0, 120.0), (6.0, 360.0)):
+        for label, payload in headroom_payload_pair(60.0, headroom).items():
+            assert payload["55"]["inputs"]["duration_seconds"] == 60.0, (label, headroom)
+            assert payload["45"]["inputs"]["max_duration"] == expected_ceiling, (label, headroom)
+
+
+def test_songplanner_headroom_of_one_reproduces_the_pre_headroom_payload_byte_for_byte():
+    """A headroom of 1.0 must be inert: identical bytes, not merely equal numbers.
+
+    Compared as a digest of canonical JSON rather than field by field, because the failure
+    this guards against is a `90` that became `90.0` — same value, different wire bytes, and
+    `assert x == 90` cannot see it.
+    """
+    for label, payload in headroom_payload_pair(90, 1.0).items():
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        assert hashlib.sha256(blob).hexdigest() == PRE_HEADROOM_PAYLOAD_DIGESTS[label], label
+
+
+def test_songplanner_refuses_a_headroom_that_pushes_the_ceiling_past_the_schema():
+    """Named, not clamped: a quietly shortened ceiling is the truncation this exists to stop.
+
+    300 s is a duration the route accepts and 1.5 is the default headroom, so the product is
+    reachable from an entirely valid-looking request — which is why the refusal has to name
+    both numbers and the ceiling rather than the request as a whole.
+    """
+    for label, build in headroom_builders(300.0, 1.5).items():
+        with pytest.raises(ValueError, match="max_duration=450") as raised:
+            build()
+        assert "360" in str(raised.value), label
+        assert "300" in str(raised.value), label
+        assert "1.5" in str(raised.value), label
+
+    # The last product the encoder accepts is exactly the ceiling, and it is not refused.
+    at_ceiling = headroom_payload_pair(240.0, 1.5)
+    assert at_ceiling["invented"]["45"]["inputs"]["max_duration"] == MUSIC3_MAX_DURATION_SECONDS
+    assert at_ceiling["invented"]["55"]["inputs"]["duration_seconds"] == 240.0
+
+
+def test_songplanner_refuses_a_headroom_below_one():
+    """Below the target the ceiling can only truncate, which is the bug inverted."""
+    for headroom in (0.99, 0.5, 0.0):
+        for label, build in headroom_builders(60.0, headroom).items():
+            with pytest.raises(ValueError, match="below the song asked for") as raised:
+                build()
+            assert f"{headroom:g}" in str(raised.value), (label, headroom)
+
+
+def test_headroom_bounds_are_derived_from_the_recorded_node_schema():
+    """Both ends of the headroom bound are node facts, not taste, so read them off the node.
+
+    `MUSIC3_MAX_DURATION_SECONDS` is the encoder's own maximum, and the widest headroom worth
+    offering is that maximum over the planner's duration floor: above it no duration this
+    route accepts could produce a legal ceiling. Re-derived here so a re-recorded fixture
+    cannot move the schema without moving the constants with it.
+    """
+    schema = recorded_object_info()
+    encoder_min, encoder_max = preflight.numeric_bounds(
+        schema["MiniMaxMusic3TextEncode"]["input"]["required"]["max_duration"]
+    )
+    planner_min, _ = preflight.numeric_bounds(
+        schema["M3SongPlanner"]["input"]["required"]["duration_seconds"]
+    )
+
+    assert MUSIC3_MAX_DURATION_SECONDS == encoder_max
+    assert SONGPLANNER_MAX_DURATION_HEADROOM * planner_min == MUSIC3_MAX_DURATION_SECONDS
+    # The encoder's floor is far below anything the planner's 30 s minimum can reach, which is
+    # why only the ceiling needs guarding.
+    assert encoder_min < planner_min
+    # The creator's documented rule, and the reason it is a default rather than a constant.
+    assert SONGPLANNER_DEFAULT_DURATION_HEADROOM == 1.5
+
+    field = SongPlannerRequest.model_fields["duration_headroom"]
+    bounds = {item.__class__.__name__: item for item in field.metadata}
+    assert field.default == SONGPLANNER_DEFAULT_DURATION_HEADROOM
+    assert bounds["Ge"].ge == 1.0
+    assert bounds["Le"].le == SONGPLANNER_MAX_DURATION_HEADROOM
+    # Most of the value of this change is that the two inputs stop being interchangeable in
+    # the reader's head, so the field has to say which one it moves and which one it does not.
+    assert "max_duration" in field.description
+    assert "M3SongPlanner.duration_seconds" in field.description
 
 
 def test_songplanner_variants_validate_separately_against_recorded_object_info():
@@ -370,10 +517,10 @@ def test_payload_validation_rejects_numeric_values_outside_the_schema_range():
     )
 
     below = build_songplanner_invented_payload(
-        idea="too short", genre_hint="", duration=16, seed=0, prefix="range"
+        idea="too short", genre_hint="", duration=16, duration_headroom=1.0, seed=0, prefix="range"
     )
     above = build_songplanner_invented_payload(
-        idea="too long", genre_hint="", duration=301, seed=0, prefix="range"
+        idea="too long", genre_hint="", duration=301, duration_headroom=1.0, seed=0, prefix="range"
     )
 
     low_problems = preflight.validate("below", below, object_info)
@@ -390,7 +537,12 @@ def test_payload_validation_rejects_numeric_values_outside_the_schema_range():
     # M3SongPlanner's seed is 32-bit even though the encoder and sampler seeds in
     # the same payload are 64-bit, so the narrow bound must be caught per node.
     wide_seed = build_songplanner_invented_payload(
-        idea="wide seed", genre_hint="", duration=120, seed=2**32, prefix="range"
+        idea="wide seed",
+        genre_hint="",
+        duration=120,
+        duration_headroom=1.0,
+        seed=2**32,
+        prefix="range",
     )
     seed_problems = preflight.validate("seed", wide_seed, object_info)
     assert [
@@ -413,7 +565,7 @@ def test_numeric_bounds_reads_the_schema_and_ignores_step():
     # ComfyUI only rejects min/max violations.
     assert preflight.numeric_bounds(planner["text_encoder"]) == (None, None)
     off_step = build_songplanner_invented_payload(
-        idea="off step", genre_hint="", duration=37.5, seed=0, prefix="range"
+        idea="off step", genre_hint="", duration=37.5, duration_headroom=1.5, seed=0, prefix="range"
     )
     assert preflight.validate("off-step", off_step, object_info) == []
 

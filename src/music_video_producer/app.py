@@ -58,6 +58,8 @@ from .workflows import (
     H3_DIRECTOR_DEFAULT_HEIGHT,
     H3_DIRECTOR_DEFAULT_WIDTH,
     LTX25_ENHANCE_SEED,
+    SONGPLANNER_DEFAULT_DURATION_HEADROOM,
+    SONGPLANNER_MAX_DURATION_HEADROOM,
     WorkflowCatalog,
     build_flux_payload,
     build_h3_director_payload,
@@ -1131,6 +1133,28 @@ class SongPlannerRequest(BaseModel):
     # the recorded /object_info schema, not from the reference export's literals —
     # anything outside it is rejected by ComfyUI before a node runs.
     duration: float = Field(default=120, ge=30, le=300)
+    # How much longer than the song asked for the encoder's latent ceiling is allowed to run.
+    # `duration` is what the planner is told to write; `MiniMaxMusic3TextEncode.max_duration`
+    # is only a ceiling the song may finish before, so passing the same number to both leaves
+    # a song whose lyrics run long no room for its ending. The planner's input never moves —
+    # the multiplier applies to the encoder's ceiling alone. See
+    # `SONGPLANNER_DEFAULT_DURATION_HEADROOM` for why 1.5 is a default rather than a constant:
+    # the creator documents the 50% rule and their own audited export contradicts it.
+    # Floor 1.0 — a ceiling under the target can only truncate. Ceiling
+    # SONGPLANNER_MAX_DURATION_HEADROOM — above it no duration this route accepts could stay
+    # inside the encoder's 360 s schema maximum. Between the two, a product that does leave
+    # the schema is refused by the adapter as a 422 naming both numbers, never clamped.
+    duration_headroom: float = Field(
+        default=SONGPLANNER_DEFAULT_DURATION_HEADROOM,
+        ge=1.0,
+        le=SONGPLANNER_MAX_DURATION_HEADROOM,
+        description=(
+            "Multiplier from the requested duration to MiniMaxMusic3TextEncode.max_duration, "
+            "the encoder's latent ceiling. M3SongPlanner.duration_seconds still receives the "
+            "requested duration unchanged: this only buys a song that runs long room for its "
+            "ending. 1.0 gives the encoder exactly the target and no room."
+        ),
+    )
     # M3SongPlanner.seed is 32-bit (max 4294967295) even though the encoder and
     # KSampler seeds it shares a payload with are 64-bit, so the planner governs
     # here too. Direct Music 3 never touches the planner and keeps its own range.
@@ -2102,23 +2126,34 @@ def create_app(
         # Before submission: the refusal must cost no GPU time.
         _require_song_replacement_confirmation(project, request.confirm_song_replacement)
         prefix = f"music-video-producer/{project_id}/songs/{_safe_filename(request.title)}"
-        if request.lyrics is not None:
-            payload = build_songplanner_known_lyrics_payload(
-                idea=request.idea,
-                genre_hint=request.genre_hint,
-                lyrics=request.lyrics,
-                duration=request.duration,
-                seed=request.seed,
-                prefix=prefix,
-            )
-        else:
-            payload = build_songplanner_invented_payload(
-                idea=request.idea,
-                genre_hint=request.genre_hint,
-                duration=request.duration,
-                seed=request.seed,
-                prefix=prefix,
-            )
+        # Before `comfy.submit` for the same reason the confirmation gate is: a duration and
+        # headroom whose product leaves `MiniMaxMusic3TextEncode`'s 0.04–360 s schema range
+        # would be rejected at `/prompt` validation and reach the Director as an opaque 502.
+        # Refused here instead, naming both numbers and the ceiling — never silently clamped,
+        # because a quietly shortened ceiling is the very truncation this setting exists to
+        # prevent.
+        try:
+            if request.lyrics is not None:
+                payload = build_songplanner_known_lyrics_payload(
+                    idea=request.idea,
+                    genre_hint=request.genre_hint,
+                    lyrics=request.lyrics,
+                    duration=request.duration,
+                    duration_headroom=request.duration_headroom,
+                    seed=request.seed,
+                    prefix=prefix,
+                )
+            else:
+                payload = build_songplanner_invented_payload(
+                    idea=request.idea,
+                    genre_hint=request.genre_hint,
+                    duration=request.duration,
+                    duration_headroom=request.duration_headroom,
+                    seed=request.seed,
+                    prefix=prefix,
+                )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:

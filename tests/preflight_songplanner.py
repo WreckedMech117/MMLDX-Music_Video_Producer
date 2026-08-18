@@ -24,25 +24,48 @@ repo_src_on_path()
 # Imported after `repo_src_on_path()` on purpose: run as a script, `src` is not
 # importable until that call puts it on the path.
 from music_video_producer.workflows import (
+    SONGPLANNER_DEFAULT_DURATION_HEADROOM,
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
 )
 
 
 def audit_payloads() -> list[tuple[str, dict]]:
-    """The graphs under audit, validated separately so neither masks the other."""
+    """The graphs under audit, validated separately so neither masks the other.
+
+    Both variants carry the default duration headroom, because that is what the route
+    actually sends: ``MiniMaxMusic3TextEncode.max_duration`` is a multiple of the requested
+    duration, not the requested duration, and it is the multiplied number whose range has to
+    hold. The third graph is that number at its worst — 240 s at 1.5x is exactly the
+    encoder's 360 s schema maximum, the largest ceiling any acceptable request can produce —
+    so the audit fails here rather than at ``/prompt`` if that maximum ever moves.
+    """
     invented = build_songplanner_invented_payload(
-        idea="preflight idea", genre_hint="", duration=120, seed=0, prefix="preflight"
+        idea="preflight idea",
+        genre_hint="",
+        duration=120,
+        duration_headroom=SONGPLANNER_DEFAULT_DURATION_HEADROOM,
+        seed=0,
+        prefix="preflight",
     )
     known = build_songplanner_known_lyrics_payload(
         idea="preflight idea",
         genre_hint="",
         lyrics="[verse]\npreflight",
         duration=120,
+        duration_headroom=SONGPLANNER_DEFAULT_DURATION_HEADROOM,
         seed=0,
         prefix="preflight",
     )
-    return [("invented", invented), ("known-lyrics", known)]
+    at_ceiling = build_songplanner_invented_payload(
+        idea="preflight idea",
+        genre_hint="",
+        duration=240,
+        duration_headroom=SONGPLANNER_DEFAULT_DURATION_HEADROOM,
+        seed=0,
+        prefix="preflight",
+    )
+    return [("invented", invented), ("known-lyrics", known), ("headroom-at-ceiling", at_ceiling)]
 
 
 def main() -> None:

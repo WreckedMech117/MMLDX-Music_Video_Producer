@@ -1473,14 +1473,25 @@ def test_songplanner_rejects_below_floor_before_reaching_comfy(tmp_path: Path):
 
 
 def test_songplanner_accepts_the_node_range_endpoints(tmp_path: Path):
-    """30 and 300 are the M3SongPlanner floor and ceiling; both must reach the payload."""
+    """30 and 300 are the M3SongPlanner floor and ceiling; both must reach the payload.
+
+    300 s needs a headroom of 1.0 to be submittable at all: at the default 1.5 the encoder's
+    ceiling would be 450 s, past the 360 s the node accepts. The duration range is unchanged —
+    both endpoints still reach the planner — but the headroom the Director chooses now decides
+    which of them can be asked for, which is exactly the choice the field exists to expose.
+    """
     client, store, comfy = make_client(tmp_path)
 
-    for duration in (30, 300):
+    for duration, headroom in ((30, 1.5), (300, 1.0)):
         project = store.create(Project(name=f"Bound {duration}"))
         response = client.post(
             f"/api/projects/{project.id}/generate/songplanner",
-            json={"title": "Bounded", "idea": "an idea", "duration": duration},
+            json={
+                "title": "Bounded",
+                "idea": "an idea",
+                "duration": duration,
+                "duration_headroom": headroom,
+            },
         )
 
         assert response.status_code == 202, duration
@@ -1488,6 +1499,113 @@ def test_songplanner_accepts_the_node_range_endpoints(tmp_path: Path):
             node for node in comfy.prompts[-1].values() if node["class_type"] == "M3SongPlanner"
         )
         assert planner["inputs"]["duration_seconds"] == duration
+
+
+def test_songplanner_headroom_moves_only_the_encoder_ceiling(tmp_path: Path):
+    """The planner is asked for the length that was asked for; only the ceiling is multiplied.
+
+    `M3SongPlanner.duration_seconds` says how long a song to write and
+    `MiniMaxMusic3TextEncode.max_duration` caps the encoder's latent length; the route used to
+    hand the same number to both, so a song whose lyrics ran slightly long lost its ending.
+    Both variants are checked because a supplied lyric sheet can overrun just as easily.
+    """
+    client, store, comfy = make_client(tmp_path)
+    lyrics = "[Verse]\nStatic in the wires"
+    cases = {
+        # Omitted headroom is the creator's documented 1.5: 60 s asked for, 90 s of room.
+        "default": ({"title": "Default", "idea": "an idea", "duration": 60}, 90.0),
+        "explicit": (
+            {"title": "Explicit", "idea": "an idea", "duration": 60, "duration_headroom": 2.5},
+            150.0,
+        ),
+        "none wanted": (
+            {"title": "None", "idea": "an idea", "duration": 60, "duration_headroom": 1.0},
+            60.0,
+        ),
+        "known lyrics": (
+            {"title": "Cover", "idea": "an idea", "duration": 60, "lyrics": lyrics},
+            90.0,
+        ),
+    }
+
+    for label, (body, expected_ceiling) in cases.items():
+        project = store.create(Project(name=label))
+        response = client.post(
+            f"/api/projects/{project.id}/generate/songplanner", json=body
+        )
+
+        assert response.status_code == 202, (label, response.text)
+        payload = comfy.prompts[-1]
+        planner = next(node for node in payload.values() if node["class_type"] == "M3SongPlanner")
+        encoder = next(
+            node for node in payload.values() if node["class_type"] == "MiniMaxMusic3TextEncode"
+        )
+        assert planner["inputs"]["duration_seconds"] == 60, label
+        assert encoder["inputs"]["max_duration"] == expected_ceiling, label
+        # What is stored is the song that was asked for, not the room it was given.
+        assert store.get(project.id).song.duration == 60, label
+
+
+def test_songplanner_refuses_a_headroom_that_leaves_the_encoder_schema(tmp_path: Path):
+    """450 s of ceiling is refused here, naming both numbers, rather than as an opaque 502.
+
+    The product of a duration the route accepts and a headroom the route accepts can still be
+    outside `MiniMaxMusic3TextEncode`'s 0.04-360 s range, and ComfyUI would reject the whole
+    prompt at `/prompt` validation. Refusing locally costs no GPU time and says which of the
+    two numbers to lower; clamping the ceiling instead would silently reintroduce the
+    truncation the headroom exists to prevent.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Past the ceiling"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "Too much room", "idea": "an idea", "duration": 300},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "450" in detail and "360" in detail, detail
+    assert "300" in detail and "1.5" in detail, detail
+    assert comfy.prompts == []
+    saved = store.get(project.id)
+    assert saved.jobs == []
+    assert saved.song is None
+
+
+def test_songplanner_refuses_a_headroom_below_one_or_past_the_field_bound(tmp_path: Path):
+    """A ceiling under the target can only truncate; above 12 no accepted duration is legal."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Headroom bounds"))
+    invalid = (0.99, 0.0, -1.0, 12.01, 1000.0)
+
+    for headroom in invalid:
+        response = client.post(
+            f"/api/projects/{project.id}/generate/songplanner",
+            json={
+                "title": "T",
+                "idea": "an idea",
+                "duration": 60,
+                "duration_headroom": headroom,
+            },
+        )
+        assert response.status_code == 422, headroom
+        assert any(
+            "duration_headroom" in item["loc"] for item in response.json()["detail"]
+        ), headroom
+    # 12.0 is the bound itself, and 30 s is the only duration it can legally multiply.
+    accepted = client.post(
+        f"/api/projects/{project.id}/generate/songplanner",
+        json={"title": "T", "idea": "an idea", "duration": 30, "duration_headroom": 12.0},
+    )
+    assert accepted.status_code == 202
+    encoder = next(
+        node
+        for node in comfy.prompts[-1].values()
+        if node["class_type"] == "MiniMaxMusic3TextEncode"
+    )
+    assert encoder["inputs"]["max_duration"] == 360.0
+    assert len(comfy.prompts) == 1
 
 
 def test_songplanner_accepts_the_planner_seed_ceiling(tmp_path: Path):
