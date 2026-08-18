@@ -58,10 +58,47 @@ Two things about this are worth fixing early, because they are easy to get wrong
 
 **Unaffected and still valid:** the LTX enhancer adapter spec, the browser QA owed on four controls, and every guarantee around refusals, recovery slots and context exclusion.
 
-## Open questions this direction raises
+## Decisions taken 2026-08-18
+
+**Asset roles live on the Shot's citation, not on the asset.** A shot holds entries of the shape `{asset_id, role, order}`, so the same library asset can be a reference in one shot and a last frame in another. The wolf is not "a middle frame"; it is a middle frame *in this shot*. This is what keeps assets reusable and makes a shot self-describing for its mode.
+
+**The timeline constrains while dragging.** A shot's mode bounds what the Director can draw, snapping to the generator's frame grid during a resize, so a plan that cannot render is never built in the first place. This is the substance of the "polished pre-gen editor" feel — the constraint is the feature, not an obstacle to it.
+
+**Generate All skips shots that already have a take, with an explicit Replace Existing toggle.** The expensive choice is the deliberate one.
+
+**The assistant is tool-calling against real routes**, and the Director's reasoning is the important part of this decision rather than the mechanism:
+
+> There are a lot of shots, and filling them out automatically but intelligently is something that could be done to help get the project initially filled out and a rough plan in place **after the initial assets and plan have been figured out**. If the system prompt for the initial setup agent is good and creative enough — knows it is a professional music video director/producer — then there is a good chance of good one-shot setups.
+
+Two constraints follow from that framing and should not be lost:
+
+- **The bulk fill runs after an asset library and a rough plan exist**, not from nothing. The assistant's job is to populate many shots against material that is already there, which is a far more tractable task than inventing the material. Sequencing this the other way round would ask the model to do the part it is worst at.
+- **The system prompt is a deliverable, not a detail.** The Director is explicitly betting on one-shot quality coming from a well-written professional-director persona. That makes the prompt something to iterate against real output, not something to write once.
+
+### The interaction the Director described, exactly
+
+1. Click a shot on the timeline.
+2. Click the prefill button beside the chat — the composer fills with that shot's context.
+3. Ask in plain language: *"make that shot a B-roll of a grey wolf walking through a forest."*
+4. The assistant expands the request into what the video generator prefers, and **updates that shot section**.
+5. The Director then opens the shot and has an image generated — to aim at something specific, to get a preview, or to serve as the first frame, **whichever role they assigned it**.
+
+Step 5 is the one that constrains the model: an image generated for a shot has a *role* chosen by the Director, and the same generated image is a preview or a first frame depending on that choice. It is not a separate "preview" concept.
+
+## Still open
 
 1. Does `Shot.mode` replace the current text-only/reference branch, or sit above it as a selector that chooses among adapters including those two?
-2. Do asset roles live on the Shot's citation of an asset, or on the asset itself? The wolf is not "a middle frame" — it is a middle frame *in this shot*.
-3. Does a section's mode constrain what the timeline will let the Director draw, or does the timeline allow anything and the readiness check refuse it later?
-4. How much of the assistant's ability to act is tool-calling against real routes versus proposing changes the Director applies?
-5. Is Replace Existing a per-render choice, a batch-level toggle, or a property of the shot?
+2. Which routes does the assistant get as tools, and does every tool inherit the existing refusals (locked shots, render provenance, the prompt gate) or does it get a narrower set?
+3. Does a bulk assistant fill produce one reviewable change-set, or write shot by shot as it goes?
+
+## New capability asks, 2026-08-18
+
+**Multiview promotion on objects — asked, and answered by running it, 2026-08-18. It works.** A Flux-generated cargo spaceship promoted through the existing Krea QuadView path produced a clean multi-view sheet: front, three-quarter, side profile and rear, with hull markings, panel detail and proportions consistent across every view. The same machinery that gives character consistency gives object consistency, with no model work required.
+
+**The only thing preventing it is our own gate.** `generate_multiview` refuses with a 422 unless `source.kind == "character"`, so a `prop`, `setting` or `style` asset cannot be promoted at all. The probe was run by labelling the ship a character — a deliberate workaround to separate *our policy* from *the model's capability*, and the distinction turned out to be the whole answer. Widening the gate is a small change; the prompt also needs to stop being character-specific, since the shipped one says "the same person… identical face, hair, and wardrobe". Worth noting the run produced **six** panels rather than four despite the LoRA's name and a prompt asking for four, so nothing should assume a panel count.
+
+**A reference sheet is one third of the creator's pipeline.** `Music-Video.md` in the Advanced set documents the Krea character sheet as **three** sampling stages — a 10-step euler layout pass at CFG 1, an 8-step euler refine at CFG 0.3, and an 8-step `res_multistep` final — plus a refine-prompt toggle to regenerate weak panels, at 44 nodes. Our adapter runs **only the first**: one `KSampler`, 10 steps, euler, CFG 1.0. Every reference sheet driving character identity through H3 is therefore a layout pass without its refine or finish. That is a quality gap in the input to everything downstream, and it is the likeliest single lever on reference fidelity. The creator also names 1 MP as the sweet spot for sheets; the adapter emits 1536×1024, which is 1.57 MP.
+
+**The SongPlanner `max_duration` headroom rule is documented and not implemented.** `Music-Video.md`: *"max_duration: set this 50% longer than your target (60s lyrics → 90s max duration)."* `duration_seconds` tells the planner how long a song to write; `max_duration` caps the encoder's latent length. The adapter passes the same value to both, leaving no headroom, so a song whose lyrics run slightly long loses its ending. Both live SongPlanner runs were at the 30 s floor and returned 29.989 s, which is exactly where this would never show. Note honestly that the audited export *also* sets both to 200, so the creator's own example does not follow their stated advice — which is why this needs a decision rather than a silent fix.
+
+**Workflow tuning is available.** The Director has offered to adjust ComfyUI workflows and export new API versions on request. That materially changes what is buildable: a graph that is nearly right no longer has to be worked around in the adapter. Where an adapter would otherwise have to reproduce awkward wiring or drop a capability, asking for a tuned export is now the better move.
