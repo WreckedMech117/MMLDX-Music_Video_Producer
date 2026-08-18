@@ -63,6 +63,7 @@ from music_video_producer.app import (
     document_first_draft_notice,
     multiview_refusal,
     prose_claims_shots,
+    reference_prompt,
 )
 from music_video_producer.batch import PLACEHOLDER_PROMPT, readiness_refusal, shot_label
 from music_video_producer.comfy import ComfyError
@@ -8642,3 +8643,51 @@ def test_a_restoration_never_asks_the_readiness_questions_a_render_asks(tmp_path
 
     assert restore_audio(client, project).status_code == 202
     assert len(comfy.prompts) == 1
+
+
+def test_a_shot_without_an_expansion_submits_exactly_what_it_always_did():
+    """The safety argument for the whole expansion feature, as one equality.
+
+    `reference_prompt` is the only thing between a Shot and what the reference render
+    submits. For a Shot nobody has expanded it must produce the string this route built
+    before the field existed — reference map, then intent — because anything else would
+    silently change every render in every existing project.
+
+    Written as the literal pre-change expression rather than a call back into the helper,
+    which would pass no matter what the helper did.
+    """
+    shot = Shot(start=0.0, duration=3.75, prompt="The wolf paces through birch.")
+    tags = ["<Picture 1> is Lucy", "<Audio 1> is the master song for synchronization"]
+
+    assert reference_prompt(shot, tags) == (
+        f"Reference map: {'; '.join(tags)}. {shot.prompt}"
+    )
+
+
+def test_an_expansion_is_submitted_alone_without_the_reference_map_preamble():
+    """Dropping the preamble is the point, not an omission.
+
+    An H3-format prompt is a document with a required shape — an optional instruction
+    line first, then the three named fields. Prefixing prose to it would put text in
+    front of the instruction line and break the very format the expansion exists to
+    produce. The tags are not lost: the specialist was given them and wrote them into
+    the description as <Picture 1>, which is where the guide puts them.
+    """
+    expansion = (
+        "integrated_multimodal_description: [Shot 1] <Picture 1> stands in the warehouse.\n"
+        "overall_soundscape: Distant traffic behind a low room tone.\n"
+        "non_diegetic_music: N/A"
+    )
+    shot = Shot(start=0.0, duration=3.75, prompt="Wide on Lucy.", h3_prompt=expansion)
+
+    submitted = reference_prompt(shot, ["<Picture 1> is Lucy"])
+    assert submitted == expansion
+    assert "Reference map" not in submitted
+    assert submitted.startswith("integrated_multimodal_description:")
+
+
+def test_an_expansion_of_only_whitespace_is_treated_as_absent():
+    """Otherwise a field cleared to spaces would submit a blank prompt and render noise."""
+    blank = "   " + "\n" + "  "
+    shot = Shot(start=0.0, duration=3.75, prompt="Wide on Lucy.", h3_prompt=blank)
+    assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")

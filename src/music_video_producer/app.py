@@ -341,6 +341,27 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 #: purpose-built payload rather than this dump.
 SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset({"h3_prompt"})
 
+def reference_prompt(shot: Shot, tags: list[str]) -> str:
+    """What the reference render actually submits for this Shot.
+
+    Without an expansion this is byte-for-byte the string this route has always built:
+    the reference map, then the Shot's intent. That equality is the whole safety
+    argument for the change — a Shot nobody has expanded renders exactly as it did.
+
+    With one, the expansion is submitted **alone**, and dropping the preamble is the
+    point rather than an omission. An H3-format prompt is a document with a required
+    shape: an optional instruction line first, then the three named fields. Prefixing
+    "Reference map: ..." would put prose in front of that instruction line and break the
+    format the expansion exists to produce. The tags are not lost — the specialist was
+    handed them and wrote them into the description as `<Picture 1>`, which is where the
+    guide puts them and is a better place than a preamble the model has to parse back out.
+    """
+    if shot.h3_prompt.strip():
+        return shot.h3_prompt
+    return f"Reference map: {'; '.join(tags)}. {shot.prompt}"
+
+
+
 #: The check, run for its refusal. See `SHOT_DIRECTOR_VISIBLE`.
 SHOT_DIRECTOR_WITHHELD_FIELDS = _withheld_fields(
     Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
@@ -2834,7 +2855,7 @@ def create_app(
                 tags.append(f"<Audio {numbers['audio']}> is the master song for synchronization")
             try:
                 payload = build_h3_reference_payload(
-                    prompt=f"Reference map: {'; '.join(tags)}. {shot.prompt}",
+                    prompt=reference_prompt(shot, tags),
                     references=references,
                     duration=shot.duration,
                     seed=shot.seed,
