@@ -31,6 +31,9 @@
 
 ## Accepted by the Director, specced, not yet built
 
+> **Open defect, found 2026-08-18: a reference shot hears the wrong part of the song.** `use_song_audio` hands the reference path the **entire song file with no offset**, so H3 lip-syncs to the first seconds of the track wherever the shot actually sits — a shot at 1:20 performs the opening bars. The text-only Director path already sends `start_second`/`end_second`; the two paths disagree. **Every live reference render in this project has used a shot at `start = 0.0`**, the one value where the bug and correct behaviour are identical, which is why no test or smoke caught it. Found by ear: the test render's audio has no intelligible words, and the mangled face follows from H3 being driven by an instrumental intro with no phonemes to sync to. Specced as `spec-song-audio-window.md`. **Consequence for everything else recorded here: no judgement about H3 face or lip-sync fidelity on this project's renders is trustworthy**, because none of them heard the right seconds.
+
+
 Each of these was decided on 2026-08-18 and has a written spec under `_bmad-output/implementation-artifacts/`. They are listed here because that directory is not versioned — only `deferred-work.md` is — so this is the record that survives a clone.
 
 - **LTX 2.5 enhancer adapter** (`spec-ltx25-enhancer-adapter.md`) — submit an existing take to the standalone enhancement graph instead of regenerating H3, the long-standing gap in the render pipeline. Evidence imported and hash-pinned as `ltx25-enhancer-user-export.json`. Note before building: `LatentUpscaleModelLoader` and the audio VAE in that export are **orphaned**, so dependencies must come from the reachable subgraph — there is no latent upscale in the executed path despite the node's presence.
