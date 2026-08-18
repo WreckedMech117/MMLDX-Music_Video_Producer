@@ -1398,6 +1398,148 @@ export function reconcileShotCitations(shot) {
   return shot;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Assistant ProducerBot
+// ---------------------------------------------------------------------------------------------
+
+// Whether an automated writer may change this shot at all, mirroring app.py's `shot_write_refusal`
+// and the `shot_render_provenance` it calls. A contract test runs both sides over the same shots.
+//
+// Mirrored rather than fetched, for `promptRejection`'s reason: this decides what is *drawn* --
+// which shots the bulk fill offers to send, and whether the single-shot control is enabled -- and
+// the server remains the gate. Both refusals are pre-empted rather than discovered by a click,
+// because "why will this not fill in my shot" is a question the composer should answer where it
+// is asked.
+export function shotWriteRefusal(shot) {
+  if (!shot) return null;
+  if (shot.locked) return "locked";
+  if (shot.prompt_id || shot.latest_output || shot.approved_output || (shot.status && shot.status !== "draft")) return "rendered";
+  return null;
+}
+
+// Seconds the way a Director reads them, and never NaN. A shot arriving without a window is a
+// client bug, not something to print `NaN s` about in text the Director is invited to send.
+function seconds(value) {
+  return readable(Number.isFinite(Number(value)) ? Number(value) : 0);
+}
+
+// The composer text the prefill control writes: the selected shot's context, as a sentence a
+// Director could have typed, ending part-way through their own request so they finish it.
+//
+// **Convenience, not a channel.** This is the constraint the planning document fixed early and it
+// decides the whole shape of this function: the structured shot context the model actually works
+// from is built server-side by `timeline.assistant_input` and sent in the request, so nothing here
+// has to be machine-readable and nothing downstream parses it. If it did double as a channel, the
+// Director editing their own composer text would be silently editing the model's input.
+//
+// It ends on "Make it" because that is where the Director's sentence begins -- their own described
+// interaction is "make that shot a B-roll of a grey wolf walking through a forest" -- and a prefill
+// that ends on a full stop invites deleting it rather than continuing it.
+export function shotPrefillText(project, shot) {
+  if (!shot) return "";
+  const spec = shotModeSpec(resolveShotMode(shot));
+  const names = new Map((project?.assets || []).map((asset) => [asset.id, asset.name]));
+  const cited = shotCitations(shot).map((citation) => `${names.get(citation.asset_id) || citation.asset_id} as its ${ASSET_ROLE_LABELS[citation.role] || citation.role}`);
+  const written = promptRejection(shot) ? "" : String(shot.prompt || "").trim();
+  return [
+    `${shotLabel(project, shot.id)} runs from ${seconds(shot.start)}s to ${seconds(Number(shot.start) + Number(shot.duration))}s, ${seconds(shot.duration)}s long.`,
+    `Today it is a ${spec ? spec.label.toLowerCase() : resolveShotMode(shot)} shot${cited.length ? `, citing ${cited.join(" and ")}` : " and cites no assets"}.`,
+    written ? `Its prompt reads: ${written}` : "It has no prompt yet.",
+    "Make it ",
+  ].join(" ");
+}
+
+// Why a control is off when it is off. Drawn as a disabled control carrying the reason rather than
+// as no control at all -- `renderAgainControl`'s argument -- except for the "no shot selected"
+// case, which the frozen matrix says must be "absent or shut, not a silent no-op": shut, with the
+// reason, is the version that answers the question instead of leaving the Director hunting.
+export const ASSISTANT_WITHOUT_SHOT = "Select a shot on the timeline first.";
+export const ASSISTANT_LOCKED =
+  "This shot is locked. A lock is a deliberate hands-off, and filling it in is exactly the kind of change it refuses. Unlock the shot first.";
+export const ASSISTANT_RENDERED =
+  "A render or a take already depends on this shot being what it is, so filling it in would leave the take describing something that never produced it. Edit it yourself in the shot inspector.";
+export const ASSISTANT_WITHOUT_WRITABLE_SHOTS =
+  "Every shot in this plan is locked or has already been rendered, so there is nothing to fill in.";
+// The composer is empty. Refused in the browser rather than sent, because `AssistantRequest.message`
+// is `min_length=1` and an empty send would come back as a 422 about a field the Director cannot
+// see -- and because an assistant handed no request has nothing to fill the shot in *from*.
+export const ASSISTANT_WITHOUT_REQUEST =
+  "Type what you want the shot to be first, or press Prefill from shot and finish the sentence.";
+// The assistant's half of SHOT_EXPANSION_EDIT_BLOCKED: the same protection, and a different
+// sentence because the two writes revert different work. An expansion loses prompts; a fill loses
+// modes and citations too, which is worse to have silently reverted and harder to notice.
+export const ASSISTANT_EDIT_BLOCKED =
+  "Assistant ProducerBot is filling shots in, so this timeline edit was not saved -- a save queued " +
+  "now would carry the shots from before the fill and revert it. Make the edit again once the " +
+  "fill lands.";
+
+// The claim every assistant control makes about what pressing it costs, in the one spelling the
+// expansion control already uses -- a Director deciding whether an assistant button will spend GPU
+// minutes must not read two different sentences about it.
+export const ASSISTANT_PREFILL_CONTROL = "#prefill-shot";
+export const ASSISTANT_FILL_CONTROL = "#assistant-fill";
+export const ASSISTANT_FILL_ALL_CONTROL = "#assistant-fill-all";
+export const ASSISTANT_PREFILL_LABEL = "Prefill from shot";
+export const ASSISTANT_PREFILL_HELP =
+  "Fill the composer with the selected shot's context, as text you could have typed yourself. Nothing is sent and nothing changes.";
+export const ASSISTANT_FILL_LABEL = "Fill selected shot";
+export const ASSISTANT_FILL_HELP =
+  `Ask Assistant ProducerBot to fill in the selected shot: its mode, its prompt and the assets it cites. ${SHOT_EXPANSION_NO_RENDER} and no shot window is changed.`;
+export const ASSISTANT_FILL_ALL_LABEL = "Fill every open shot";
+export const ASSISTANT_FILL_ALL_HELP =
+  `Ask Assistant ProducerBot to fill in every shot that is not locked and has not been rendered, judged one at a time. ${SHOT_EXPANSION_NO_RENDER} and no shot window is changed.`;
+
+// Everything the composer draws for one assistant control, decided here rather than in the
+// template -- `renderAgainControl`'s reason exactly. `shotIds` is carried out rather than
+// re-derived at the click site, so the request is sent for the shots the enabled state was decided
+// from and a control that is off cannot be made to send anything.
+export function prefillControl(project, shot) {
+  if (!shot) return { disabled: true, title: ASSISTANT_WITHOUT_SHOT, text: "" };
+  return { disabled: false, title: ASSISTANT_PREFILL_HELP, text: shotPrefillText(project, shot) };
+}
+
+export function assistantControl(project, shot) {
+  if (!shot) return { disabled: true, title: ASSISTANT_WITHOUT_SHOT, shotIds: [] };
+  const refusal = shotWriteRefusal(shot);
+  if (refusal) return { disabled: true, title: refusal === "locked" ? ASSISTANT_LOCKED : ASSISTANT_RENDERED, shotIds: [] };
+  return { disabled: false, title: ASSISTANT_FILL_HELP, shotIds: [shot.id] };
+}
+
+// The bulk fill's own control. It sends the shots the server would accept and no others, so a plan
+// of thirty shots with four locked ones sends twenty-six -- rather than sending thirty and reading
+// four refusals back, which is the same outcome after a model call instead of before one.
+export function assistantFillAllControl(project) {
+  const shotIds = (project?.shots || []).filter((shot) => !shotWriteRefusal(shot)).map((shot) => shot.id);
+  if (!shotIds.length) return { disabled: true, title: ASSISTANT_WITHOUT_WRITABLE_SHOTS, shotIds: [] };
+  return { disabled: false, title: ASSISTANT_FILL_ALL_HELP, shotIds };
+}
+
+// What one assistant turn did, taken from the reply rather than from a diff of the shots --
+// `shotExpansionToast`'s argument, and it is stronger here: a re-fill that lands the same mode and
+// the same citations is indistinguishable from a turn where every call was refused, and the toast
+// is the loudest thing on screen.
+//
+// Keyed on the server's own ASSISTANT_APPLIED_NOTICE, with the `shot(s):` tail part of the match on
+// purpose: the model's own prose sits above the notices in the same message and could otherwise
+// supply the marker itself. A contract test reads the count back out of a real formatted notice.
+export const ASSISTANT_APPLIED_MARKER = "Assistant ProducerBot filled in";
+const ASSISTANT_APPLIED_PATTERN = new RegExp(`${ASSISTANT_APPLIED_MARKER} (\\d+) shot\\(s\\):`);
+export const ASSISTANT_TOAST =
+  `Assistant ProducerBot filled in {count} shot{plural}. ${SHOT_EXPANSION_NO_RENDER}; open a shot to generate an image for it.`;
+export const ASSISTANT_UNCHANGED_TOAST =
+  "No shot was changed. The reply beside the composer says, per shot, what the assistant returned and why none of it was applied.";
+
+export function assistantFilled(project) {
+  const match = ASSISTANT_APPLIED_PATTERN.exec(assistantReply(project) ?? "");
+  return match ? Number(match[1]) : 0;
+}
+
+export function assistantToast(project) {
+  const filled = assistantFilled(project);
+  if (!filled) return ASSISTANT_UNCHANGED_TOAST;
+  return ASSISTANT_TOAST.replace("{count}", filled).replace("{plural}", filled === 1 ? "" : "s");
+}
+
 // What each direction did, mirroring app.py's MARK_READY_NOTICE and MARK_DRAFT_NOTICE so the
 // sentence the Director reads is the one the server implements. A contract test asserts they are
 // identical.
@@ -1671,6 +1813,12 @@ export const api = {
   // model sees is derived on the server from the project itself, so there is nothing here for a
   // message to travel in — and nothing that could queue a render.
   expandShots: (id) => request(`/api/projects/${id}/director/expand`, { method: "POST" }),
+  // Assistant ProducerBot. The body carries the Director's own words and the shots they selected,
+  // and the selection is the turn's consent: the server refuses a tool call naming anything else,
+  // so this is the one place the scope of an assistant turn is decided. No render is queued by it
+  // and no GPU time is spent -- the reply is the whole project, with a per-shot report in its
+  // notices.
+  assistantFill: (id, body) => request(`/api/projects/${id}/assistant/fill`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   job: (projectId, jobId) => request(`/api/projects/${projectId}/jobs/${jobId}`),
   workflows: () => request("/api/workflows"),
   // Machine-scoped, so neither call carries a project id. The GET is what refreshes the

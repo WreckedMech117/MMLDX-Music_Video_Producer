@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, CITATION_MISSING_LABEL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -6,9 +6,12 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 let shotSaveChain = Promise.resolve();
 let shotSaveRevision = 0;
-// True for the whole of an expansion call, which is what stops a timeline edit made *during* it
-// from queueing a whole-list shot save that lands afterwards and reverts every prompt written.
-let shotExpansionInFlight = false;
+// Which automated shot write is in flight, or "" for none. It is what stops a timeline edit made
+// *during* one from queueing a whole-list shot save that lands afterwards and reverts everything
+// just written -- every prompt, for an expansion; every mode, prompt and citation, for an assistant
+// fill. A string rather than a boolean because the two are the same protection with two different
+// things to say about it, and a refusal that names the wrong one is a refusal nobody can act on.
+let shotWriteInFlight = "";
 let waveformLoadRevision = 0;
 // The plan's readiness as the server last reported it, or null when nothing has been fetched for
 // the project on screen. Fetched on project load rather than only at the click, because readiness
@@ -494,6 +497,74 @@ function applyDocumentsControl() {
   return $(APPLY_DOCUMENTS_CONTROL);
 }
 
+// Assistant ProducerBot's three controls, repainted from the current selection and the current
+// project. Exported for the executed frontend contract, on `renderShotInspector`'s precedent: the
+// frozen matrix says the prefill control must be "absent or shut, not a silent no-op" with nothing
+// selected, and a test that only read this source could not tell a control that is shut from one
+// whose handler happens to return early.
+//
+// Every state is decided by the pure functions in api.js and applied here and nowhere else -- this
+// assigns `disabled` and `title` and nothing more, exactly as the timeline clip applies
+// `shotPromptCell`. It runs from renderTimeline, which is what every selection change and every
+// project load already goes through, so a shot selected on the timeline repaints the composer.
+export function syncAssistantControls() {
+  const shot = selectedShot();
+  const prefill = prefillControl(state.project, shot);
+  $(ASSISTANT_PREFILL_CONTROL).disabled = prefill.disabled;
+  $(ASSISTANT_PREFILL_CONTROL).title = prefill.title;
+  const single = assistantControl(state.project, shot);
+  $(ASSISTANT_FILL_CONTROL).disabled = single.disabled;
+  $(ASSISTANT_FILL_CONTROL).title = single.title;
+  const bulk = assistantFillAllControl(state.project);
+  $(ASSISTANT_FILL_ALL_CONTROL).disabled = bulk.disabled;
+  $(ASSISTANT_FILL_ALL_CONTROL).title = bulk.title;
+}
+
+// One assistant turn, for whichever control was pressed. The shot ids come from the decision that
+// drew the button rather than being re-derived here: re-deriving would be a second copy of the
+// rule, and the copy that decided the enabled state is the one the Director actually pressed.
+//
+// The reply is the whole project, so the timeline, the inspector, the thread and the queue button
+// all redraw from it, and the toast is read out of the reply rather than diffed -- a re-fill that
+// lands the same mode and the same citations is indistinguishable from a turn where every call was
+// refused, and the toast must not claim the first when the reply says the second.
+//
+// Silent shot saves are shut out for the whole call in the same two halves the expansion uses, and
+// through the same flag: awaiting the pending chain drains the saves queued before the click, and
+// the in-flight flag refuses the ones a drag would queue during it. A save landing afterwards would
+// carry the shot list from before the fill and revert every mode, prompt and citation just written.
+async function runAssistantFill(control, shotIds) {
+  if (!requireProject()) return;
+  if (!shotIds.length) return;
+  if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to use Assistant ProducerBot.", "error");
+  const field = $("#chat-form").elements.message;
+  const message = field.value.trim();
+  if (!message) return toast(ASSISTANT_WITHOUT_REQUEST, "error");
+  // The id this call is sent for, captured before any await: `state.project` is rebound by the
+  // response and the project selector stays live throughout.
+  const projectId = state.project.id;
+  const label = control.textContent;
+  control.disabled = true;
+  control.textContent = "Filling…";
+  shotWriteInFlight = "assistant";
+  try {
+    await shotSaveChain;
+    const filled = await api.assistantFill(projectId, { message, shot_ids: shotIds });
+    // The Director switched projects while the model was thinking. The shots are written and saved
+    // on the server, so nothing is lost by dropping this reply, whereas applying it here would show
+    // one project's work under another's name.
+    if (state.project?.id !== projectId) return;
+    state.project = filled;
+    field.value = "";
+    renderAll();
+    // A fill writes prompts onto shots, so the report this client holds describes the plan as it
+    // was before the call -- including blocks it has just resolved.
+    loadReadiness(projectId);
+    toast(assistantToast(state.project));
+  } catch (error) { toast(error.message, "error"); }
+  finally { shotWriteInFlight = ""; control.textContent = label; syncAssistantControls(); }
+}
+
 function assetImageUrl(asset) {
   if (!asset?.path) return "";
   if (asset.source === "upload") return `/api/projects/${state.project.id}/media/${encodeURI(asset.path.replace(/^media\//, ""))}`;
@@ -591,6 +662,11 @@ function renderTimeline() {
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
   renderShotInspector();
+  // Assistant ProducerBot's controls live in the composer, two panels away, and their state is
+  // decided by the shot selection this function owns. Repainted from here because every selection
+  // change, every project load and every reply already goes through it -- wiring them to the click
+  // handler instead would leave them stale after a load, a delete or a lock set elsewhere.
+  syncAssistantControls();
   if (state.audioBuffer) drawWaveform($("#timeline-waveform"), state.audioBuffer, "#6f7d3d");
   updateTimelinePlayhead();
 }
@@ -1022,7 +1098,7 @@ async function expandShotPrompts() {
   const label = button.textContent;
   button.disabled = true;
   button.textContent = "Expanding…";
-  shotExpansionInFlight = true;
+  shotWriteInFlight = "expansion";
   try {
     await shotSaveChain;
     const expanded = await api.expandShots(projectId);
@@ -1038,17 +1114,18 @@ async function expandShotPrompts() {
     loadReadiness(projectId);
     toast(shotExpansionToast(state.project));
   } catch (error) { toast(error.message, "error"); }
-  finally { shotExpansionInFlight = false; button.disabled = false; button.textContent = label; }
+  finally { shotWriteInFlight = ""; button.disabled = false; button.textContent = label; }
 }
 
 function saveShotsSilently() {
   if (!state.project) return Promise.resolve();
-  // Refused, not queued: this save carries the whole shot list as it was before the expansion, so
-  // landing it afterwards reverts every prompt just written while the success toast is still on
+  // Refused, not queued: this save carries the whole shot list as it was before the write, so
+  // landing it afterwards reverts everything just written while the success toast is still on
   // screen. Said out loud because the edit really is not saved and the response re-renders the
-  // timeline over it.
-  if (shotExpansionInFlight) {
-    toast(SHOT_EXPANSION_EDIT_BLOCKED, "error");
+  // timeline over it, and named for whichever write is running, because the two have different
+  // remedies.
+  if (shotWriteInFlight) {
+    toast(shotWriteInFlight === "assistant" ? ASSISTANT_EDIT_BLOCKED : SHOT_EXPANSION_EDIT_BLOCKED, "error");
     return Promise.resolve();
   }
   const projectId = state.project.id;
@@ -1408,6 +1485,31 @@ function bindEvents() {
     } catch (error) { toast(error.message, "error"); }
     // The consent this turn carried is spent, so the next turn starts from a decline again.
     finally { clearDocumentConsent(applyDocumentsControl()); button.disabled = false; button.textContent = "Send to Director"; }
+  });
+  // Prefill writes the selected shot's context into the composer and sends nothing. The existing
+  // text is kept and follows the context rather than being replaced: the context is the preamble
+  // and the Director's own sentence is the request, so a Director who typed first must not lose it
+  // to a click on a convenience.
+  $(ASSISTANT_PREFILL_CONTROL).addEventListener("click", () => {
+    const prefill = prefillControl(state.project, selectedShot());
+    if (prefill.disabled) return;
+    const field = $("#chat-form").elements.message;
+    const typed = String(field.value || "").trim();
+    field.value = typed ? `${prefill.text}${typed}` : prefill.text;
+    field.focus?.();
+  });
+  // Two sends, one turn each, and neither is this form's submit: `Send to Director` is a
+  // conversation and these write to shots, so pressing one must never be a way of doing the other.
+  // The scope comes off the control's own decision -- see `runAssistantFill`.
+  $(ASSISTANT_FILL_CONTROL).addEventListener("click", (event) => {
+    const single = assistantControl(state.project, selectedShot());
+    if (single.disabled) return;
+    return runAssistantFill(event.currentTarget, single.shotIds);
+  });
+  $(ASSISTANT_FILL_ALL_CONTROL).addEventListener("click", (event) => {
+    const bulk = assistantFillAllControl(state.project);
+    if (bulk.disabled) return;
+    return runAssistantFill(event.currentTarget, bulk.shotIds);
   });
   $("#send-treatment").addEventListener("click", () => document.querySelector('[data-panel="treatment"]').click());
   $("#expand-shot-prompts").addEventListener("click", expandShotPrompts);

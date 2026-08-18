@@ -189,6 +189,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 /* The per-turn document consent sits with the submit button rather than centred between the
    hint and it: it is part of the act of sending, not a caption. */
 .composer .lock-toggle { margin-left: auto; }
+/* Assistant ProducerBot's row, under the Director's own. Its own rule rather than another
+   `.composer > div`: it is a separate act from the Director send -- a different button, a
+   different route, a scope taken from the shot selection -- and a row that looked like part of the
+   send row would read as decoration on it. The separator says the two are not the same send. */
+.composer .assistant-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.composer .assistant-row #assistant-fill { margin-left: auto; }
 .document-column { display: grid; grid-template-rows: auto 1fr auto; }
 .document-tabs { display: flex; border-bottom: 1px solid var(--line); }
 .document-tabs button { min-height: 43px; border: 0; border-bottom: 2px solid transparent; padding: 0 17px; background: transparent; color: var(--muted); }

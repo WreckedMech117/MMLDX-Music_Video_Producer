@@ -5,7 +5,10 @@ from base64 import b64encode
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from .assistant_prompt import ASSISTANT_SYSTEM_PROMPT, FILL_SHOTS_DESCRIPTION
+from .models import AssetRole, ShotMode, SingingState
 
 
 class DirectorUnavailable(RuntimeError):
@@ -52,6 +55,199 @@ class ShotExpansion(BaseModel):
 
     message: str
     shots: list[ExpandedShot]
+
+
+#: The one tool Assistant ProducerBot has. One rather than several, and the count is a decision:
+#:
+#: every extra tool is another shape a local model can get wrong, and the four things this replaces
+#: — declare a mode, write a prompt, cite assets in roles, record the performance — are the four
+#: halves of *one* answer to "what is this shot". Split across four tools, a model that chose
+#: `first_middle_last` and then failed to make the second call leaves a shot declared as something
+#: its citations cannot satisfy; together, the whole specification is one call that is applied or
+#: refused as a unit. Nothing else the assistant might plausibly be given is allowed: approving a
+#: take, marking a shot ready, deleting a shot, writing a Song and anything that spends GPU time are
+#: all outside this feature, so the honest surface really is one tool.
+FILL_SHOTS_TOOL = "fill_shots"
+
+
+class ShotCitationFill(BaseModel):
+    """One library Asset the model wants a Shot to cite, in one role.
+
+    Mirrors `models.AssetCitation` field for field, and deliberately does not *reuse* it: this is
+    the wire contract for model output and that one is the manifest's. They agree today, and the
+    day they stop agreeing is the day a field the model may not set — added to `AssetCitation` for
+    the manifest's sake — would otherwise become settable by a tool call, silently.
+    """
+
+    asset_id: str = Field(
+        min_length=1,
+        description="The id of an asset in the library, copied verbatim from plan.assets.",
+    )
+    role: AssetRole = Field(
+        default="reference",
+        description="What this asset is for in this shot. See plan.asset_roles.",
+    )
+    order: int = Field(
+        default=0, description="Position among this shot's citations in the same role."
+    )
+
+
+class ShotFill(BaseModel):
+    """Everything the model wants to change about one Shot, addressed to it **by id**.
+
+    Every field but `shot_id` is `None`-defaulted, and `None` means *leave it alone* rather than
+    *clear it*. That is what makes a partial answer safe: a model that sets only a mode must not
+    thereby blank the prompt a Director wrote by hand.
+
+    The types are the whole point of this model existing. `mode`, `role` and `singing` are the
+    `Literal`s from `models.py`, so a mode the taxonomy does not have is a `ValidationError` at the
+    edge — reported to the Director as a refused tool call, with the raw arguments kept beside it —
+    rather than a plausible-looking string that reaches the manifest and is discovered at render.
+    """
+
+    shot_id: str = Field(
+        min_length=1,
+        description="The id of one of the shots in plan.shots, copied verbatim. Any other id is discarded.",
+    )
+    mode: ShotMode | None = Field(
+        default=None, description="What kind of shot this is. Omit to leave the mode as it is."
+    )
+    prompt: str | None = Field(
+        default=None,
+        description="One paragraph of plain prose describing the shot. Omit to leave the prompt as it is.",
+    )
+    # Nothing infers this. The model may *set* it, which is a visible act reported in the reply;
+    # `None` is the normal answer and leaves whatever the Shot already says. See `models.SingingState`.
+    singing: SingingState | None = Field(
+        default=None,
+        description=(
+            "Whether the performer sings in this shot. Set it only when the request or the shot's "
+            "own material says so; omit it otherwise, which is the normal case."
+        ),
+    )
+    # Replaces the Shot's whole citation list when present, because a role change and a removal are
+    # both expressible only as "here is the new list" — and absent when the model is not touching
+    # the citations at all, which is why this is `None` rather than `[]`.
+    citations: list[ShotCitationFill] | None = Field(
+        default=None,
+        description=(
+            "The complete list of library assets this shot should cite, replacing whatever it "
+            "cites now. Omit the key to leave its citations alone."
+        ),
+    )
+
+
+class FillShotsArguments(BaseModel):
+    """The `fill_shots` argument object, and the source of its JSON schema.
+
+    A list rather than one Shot per call: the bulk fill is the case this feature exists for, and a
+    model that has to emit thirty separate tool calls to fill thirty shots will emit some other
+    number. One call, judged per entry.
+    """
+
+    shots: list[ShotFill] = Field(description="One entry per shot to fill in.")
+
+
+def _model_facing_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """`model`'s JSON schema with the class docstrings taken back out.
+
+    Pydantic renders a model's docstring as the schema object's `description`, which is right for
+    a document nobody reads and wrong for this one: the docstrings above are arguments addressed to
+    the next person editing this file — they cite `AssetCitation`, name a failure mode, and run to
+    a paragraph each — and every character of them would be sent to a local model on every turn as
+    though it were instruction. Only the *class* descriptions are dropped, so the per-field
+    `Field(description=…)` sentences, which are written for the model and for nobody else, survive.
+    """
+    schema = model.model_json_schema()
+    schema.pop("description", None)
+    for definition in schema.get("$defs", {}).values():
+        if isinstance(definition, dict):
+            definition.pop("description", None)
+    return schema
+
+
+def assistant_tools() -> list[dict[str, Any]]:
+    """The tool surface as it goes on the wire, generated from the taxonomy rather than written.
+
+    `FillShotsArguments`' schema carries the `Literal` enums as `enum` lists, so adding a mode to
+    `SHOT_MODE_SPECS` or a role to `AssetRole` changes what the model is allowed to say without
+    anyone editing a schema by hand. A hand-written copy here would be the second definition of the
+    taxonomy, and the one that goes stale in the direction that lets a malformed call through.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": FILL_SHOTS_TOOL,
+                "description": FILL_SHOTS_DESCRIPTION,
+                "parameters": _model_facing_schema(FillShotsArguments),
+            },
+        }
+    ]
+
+
+class AssistantTurn(BaseModel):
+    """One assistant answer: what it said, what it wants applied, and what it got wrong.
+
+    `malformed` is the reason this is not simply `list[ShotFill]`. A tool call that does not fit the
+    vocabulary is the *expected* local-model failure, not an exception: discarding the whole turn
+    for one bad entry would throw away every good one beside it, and raising would leave the
+    Director with a 502 and no idea which shot the model fumbled. Each entry is the raw arguments
+    of one rejected call or one rejected shot, kept so the route can put it in a notice's `raw` —
+    the field `DIRECTOR_CONTEXT_EXCLUDE` strips, so it is inspectable without being fed back.
+    """
+
+    message: str = ""
+    fills: list[ShotFill] = Field(default_factory=list)
+    malformed: list[str] = Field(default_factory=list)
+
+
+def _raw_argument(value: object) -> str:
+    """One rejected tool call or shot entry, as a string a notice can carry."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def parse_assistant_reply(reply: dict[str, Any]) -> AssistantTurn:
+    """Split one provider reply into applied-able fills and refused calls. Pure and I/O-free.
+
+    Every branch here is a shape a local model actually produces, and none of them may raise:
+    `tool_calls` absent (the model chatted instead), a tool name that is not ours, `arguments` as a
+    JSON string or as an already-decoded object (providers differ), an argument object with no
+    `shots` key, and a single entry inside a good list that names a mode the taxonomy has never
+    had. The last one is the case the whole typed surface exists for, and it is why entries are
+    validated **one at a time**: validating the list as a whole would let one bad mode discard
+    twenty-nine good shots.
+    """
+    content = reply.get("content")
+    turn = AssistantTurn(message=content.strip() if isinstance(content, str) else "")
+    calls = reply.get("tool_calls")
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict) or function.get("name") != FILL_SHOTS_TOOL:
+            turn.malformed.append(_raw_argument(call))
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                turn.malformed.append(_raw_argument(function.get("arguments")))
+                continue
+        entries = arguments.get("shots") if isinstance(arguments, dict) else None
+        if not isinstance(entries, list):
+            turn.malformed.append(_raw_argument(arguments))
+            continue
+        for entry in entries:
+            try:
+                turn.fills.append(ShotFill.model_validate(entry))
+            except ValidationError:
+                turn.malformed.append(_raw_argument(entry))
+    return turn
 
 
 class VisionInspection(BaseModel):
@@ -336,6 +532,79 @@ class DirectorClient:
         try:
             response = await self._completion(body=body, headers=headers)
             return ShotExpansion.model_validate(json.loads(self._content(response)))
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            raise DirectorError(f"LLM director returned an invalid response: {error}") from error
+
+    @staticmethod
+    def _reply(response: httpx.Response) -> dict[str, Any]:
+        """The whole assistant message of one completion, or raise for anything that is not one.
+
+        `_content` cannot serve here and the difference is the point: it raises whenever `content`
+        is not a string, and a reply carrying tool calls has `content: null` by construction. This
+        returns the message object so the caller can read `tool_calls` and `content` together, and
+        it type-checks the object for `_content`'s reason — a provider answering with a bare array
+        or a scalar must be a 502 naming the reply, not an `AttributeError` inside a route.
+        """
+        response.raise_for_status()
+        payload = response.json()
+        message = payload["choices"][0]["message"]
+        if not isinstance(message, dict):
+            raise TypeError("the reply carried no message object")
+        return message
+
+    async def assist(
+        self, *, message: str, assistant_input: dict[str, Any]
+    ) -> AssistantTurn:
+        """One Assistant ProducerBot turn: the Director's request, the plan, and the tool surface.
+
+        Deliberately **one round trip**. The usual agentic shape — call the tool, hand the results
+        back, let the model summarise — was rejected here for two reasons that both bite locally:
+        it doubles the wall-clock time of a call a Director is watching, and the second turn's
+        context would be the tool results, which is precisely the "rich context" recorded as the
+        root cause of Director degradation. The per-shot report the Director reads is built by the
+        route from what it actually applied, which is a better summary than the model could write
+        and cannot claim anything that did not happen.
+
+        `tool_choice` is `"auto"` rather than forced. Forcing the call would guarantee one, and
+        would also force one on a request the model cannot answer; the no-tool case is reported as
+        a notice instead, which is the honest version. This is a one-word change if a live run
+        shows the model chatting rather than calling — exactly the kind of thing the system prompt
+        is meant to be iterated against.
+
+        `assistant_input` is passed through inside `plan` verbatim: it is built by
+        `timeline.assistant_input`, which is pure and trimmed on purpose, so a test asserting the
+        route sent the builder's output is asserting about the payload the model really saw.
+        """
+        if not self.base_url or not self.model:
+            raise DirectorUnavailable(
+                "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
+            )
+        headers = self._headers()
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": ASSISTANT_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"request": message, "plan": assistant_input}, ensure_ascii=False
+                    ),
+                },
+            ],
+            "temperature": 0.7,
+            "tools": assistant_tools(),
+            "tool_choice": "auto",
+        }
+        try:
+            response = await self._completion(body=body, headers=headers)
+            return parse_assistant_reply(self._reply(response))
         except (
             httpx.HTTPError,
             KeyError,

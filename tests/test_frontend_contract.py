@@ -2363,25 +2363,39 @@ def test_expansion_shuts_out_the_silent_shot_saves_that_would_revert_it():
 
     # Half two: no new save may be queued for the duration, so the flag goes up before the drain
     # and comes down in `finally`, where a failed or refused expansion also releases it.
-    assert handler.index("shotExpansionInFlight = true;") < handler.index("await shotSaveChain")
-    assert "finally { shotExpansionInFlight = false;" in handler
-    # Only the expansion raises it, or something else silently blocks every timeline save.
-    assert source.count("shotExpansionInFlight = true") == 1, source.count("shotExpansionInFlight = true")
+    assert handler.index('shotWriteInFlight = "expansion";') < handler.index("await shotSaveChain")
+    assert 'finally { shotWriteInFlight = "";' in handler
+    # The flag is shared with Assistant ProducerBot, which needs exactly the same protection and
+    # would otherwise get a second copy of it. Each writer raises it in exactly one place and the
+    # two names are the only ones there are, so a third path silently blocking every timeline save
+    # still fails here -- which is what this assertion was written to catch.
+    raisers = re.findall(r'shotWriteInFlight = "(\w+)"', source)
+    assert sorted(raisers) == ["assistant", "expansion"], raisers
+    # Released in a `finally` by each of them, so a failed or refused write does not wedge every
+    # timeline save off for the life of the page.
+    assert source.count('finally { shotWriteInFlight = "";') == 2, source
 
     # The refusal lives in the one function every silent save goes through, ahead of both the
     # queueing and the dirty flags -- a save that is refused was never pending.
-    assert "shotExpansionInFlight" in saver
+    assert "shotWriteInFlight" in saver
     assert "SHOT_EXPANSION_EDIT_BLOCKED" in saver
+    assert "ASSISTANT_EDIT_BLOCKED" in saver
     for later in ("state.shotsDirty = true;", "shotSaveChain = shotSaveChain", "api.saveShots("):
-        assert saver.index("shotExpansionInFlight") < saver.index(later), later
+        assert saver.index("shotWriteInFlight") < saver.index(later), later
     # And it is said out loud: the edit really is not saved, and the response re-renders the
     # timeline over it, so a drag that silently vanishes reads as the app losing work at random.
+    # Both wordings, because a refusal that names the wrong write is one the Director cannot act on.
     blocked = run_module("""
-      import { SHOT_EXPANSION_EDIT_BLOCKED } from './src/music_video_producer/web/assets/api.js';
-      console.log(JSON.stringify({ blocked: SHOT_EXPANSION_EDIT_BLOCKED }));
-    """)["blocked"].lower()
-    assert "not saved" in blocked
-    assert "again" in blocked, blocked
+      import { ASSISTANT_EDIT_BLOCKED, SHOT_EXPANSION_EDIT_BLOCKED }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        blocked: SHOT_EXPANSION_EDIT_BLOCKED, assistant: ASSISTANT_EDIT_BLOCKED,
+      }));
+    """)
+    for wording in (blocked["blocked"].lower(), blocked["assistant"].lower()):
+        assert "not saved" in wording
+        assert "again" in wording, wording
+    assert blocked["blocked"] != blocked["assistant"]
 
     # Every timeline mutation goes through that one function rather than calling the route itself.
     assert "api.saveShots(" not in source.replace(saver, ""), "a shot save bypasses saveShotsSilently"

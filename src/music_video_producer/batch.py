@@ -15,8 +15,25 @@ import re
 from dataclasses import dataclass, field
 from itertools import combinations
 
-from .models import Project, Shot
+from .models import Project, Shot, shot_label
 from .timeline import ordered_shots
+
+#: Re-exported, not redefined. `shot_label` moved to `models.py` when `timeline.assistant_input`
+#: needed it — `timeline` may not import this module — and every existing importer says
+#: `from .batch import shot_label`, so the name stays here and there is still exactly one
+#: implementation. See `models.shot_label` for why both halves of the name are carried.
+__all__ = [
+    "NEAR_DUPLICATE_OVERLAP",
+    "PLACEHOLDER_PROMPT",
+    "READINESS_REFUSAL",
+    "ReadinessNote",
+    "ReadinessReport",
+    "prompt_is_missing",
+    "prompt_rejection",
+    "readiness_refusal",
+    "readiness_report",
+    "shot_label",
+]
 
 #: Token overlap above which two prompts are reported as lacking variance. Jaccard —
 #: shared tokens over the tokens of the pair — rather than intersection-over-smallest,
@@ -97,25 +114,6 @@ READINESS_REFUSAL = (
     "noise, so nothing was sent to ComfyUI. Write a prompt in the shot inspector, or run the "
     "Director's shot expansion, then submit again."
 )
-
-
-def shot_label(project: Project, shot: Shot) -> str:
-    """Name a Shot the way the Director sees it on the timeline, plus its id.
-
-    The clip is drawn as `SHOT 01` from the Shot's position in the **manifest** — that is what
-    `renderTimeline` numbers by — while this report is ordered by position in the song. The two
-    orderings differ for any plan whose manifest order is not its time order, so a refusal that
-    carried only a number would point at the wrong clip; one that carried only the id would name
-    something that appears nowhere on screen. Both, therefore, exactly as `expansion_shot_label`
-    carries both for the same reason.
-
-    A Shot that is not in this project falls back to its bare id rather than claiming a position
-    it does not have.
-    """
-    position = next(
-        (index + 1 for index, item in enumerate(project.shots) if item.id == shot.id), 0
-    )
-    return f"SHOT {position:02d} ({shot.id})" if position else shot.id
 
 
 def readiness_refusal(names: list[str]) -> str:

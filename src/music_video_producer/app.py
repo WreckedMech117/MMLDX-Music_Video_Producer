@@ -4,6 +4,7 @@ import math
 import re
 import subprocess
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -15,6 +16,7 @@ from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 from .batch import (
     ReadinessReport,
     prompt_is_missing,
+    prompt_rejection,
     readiness_refusal,
     readiness_report,
     shot_label,
@@ -28,6 +30,7 @@ from .director import (
     document_rejection,
 )
 from .models import (
+    ASSET_ROLE_LABELS,
     SHOT_MODE_SPECS,
     Asset,
     MessageNotice,
@@ -39,6 +42,7 @@ from .models import (
     TreatmentMessage,
     VisionInspectionRecord,
     citations_in_role,
+    dangling_citations,
     mode_specification_problems,
     resolve_shot_mode,
 )
@@ -48,6 +52,7 @@ from .timeline import (
     H3_MAX_SHOT_SECONDS,
     H3_MIN_SHOT_SECONDS,
     TimelineError,
+    assistant_input,
     build_director_timeline,
     expansion_input,
     ordered_shots,
@@ -629,6 +634,143 @@ EXPANSION_REJECTED_EMPTY_NOTICE = "NOT applied to {shot}: {reason}. There is no 
 EXPANSION_EMPTY_MESSAGE = "The Director returned no summary of this expansion."
 
 
+# --------------------------------------------------------------------------------------------
+# Assistant ProducerBot
+#
+# The Director's language model, given one tool that fills shots in. Every wording below is either
+# shared with the route a Director's own click takes or written here for something only this
+# feature can do; nothing restates a rule that already has an implementation.
+# --------------------------------------------------------------------------------------------
+
+# Why a turn is refused before any model call. The empty case first, on `EXPANSION_WITHOUT_SHOTS`'
+# argument: with nothing to write to there is nothing a result could be keyed to, and a model call
+# would spend the Director's time to report that nothing happened.
+ASSISTANT_WITHOUT_SHOTS = (
+    "Assistant ProducerBot fills in shots you have selected, and this request named none that this "
+    "project has. Select a shot on the timeline and ask again."
+)
+# ...and the same argument for a selection nothing could be written to. Refused before the call
+# rather than after it, so a Director who selects one locked shot waits for a sentence instead of
+# for a model. The reasons are the ones the reply would have carried, so the refusal before the
+# call and the notice after it say the same thing about the same shot.
+ASSISTANT_WITHOUT_WRITABLE_SHOTS = (
+    "Nothing was sent to the model, because none of the selected shots may be written to. {reasons}"
+)
+
+# What one turn actually did, per shot, which is the thing the Director pressed the button for.
+#
+# `kind="change"`, not a caution: this is good news, and Story 2.2's whole finding was that a
+# confirmation wearing warning chrome is how the refusal beside it stops being read. It also states
+# what was *not* done, because "Assistant ProducerBot filled 6 shots" beside a button in an
+# application that renders video invites exactly one wrong belief.
+ASSISTANT_APPLIED_NOTICE = (
+    "Assistant ProducerBot filled in {count} shot(s):\n{details}\n"
+    "Nothing was rendered and no GPU time was spent. Open a shot to generate an image for it when "
+    "you want one."
+)
+# The model addressing a shot the Director did not select. Refused rather than applied, and this is
+# the guard that keeps the tool from widening what it can act *on*: the selection is the turn's
+# scope, so a shot elsewhere in the plan — even a real, unlocked, perfectly writable one — is out
+# of reach for this turn. Bounded through `_short`, because an id that matched nothing is whatever
+# the model emitted and this sentence is persisted into the thread.
+ASSISTANT_OUT_OF_SCOPE_NOTICE = (
+    "Discarded: the model answered for {count} id(s) that are not among the shots this request "
+    "selected ({shots}). Nothing was written for them and no shot was created."
+)
+# A selected shot that no longer exists, which is a stale selection rather than a model error. Its
+# own sentence because the remedy is different: nothing about the reply is wrong.
+ASSISTANT_MISSING_TARGET_NOTICE = (
+    "Not filled in because this project no longer has them: {shots}. They may have been deleted "
+    "while the model was thinking."
+)
+# The model answering for one shot twice, on `EXPANSION_DUPLICATE_NOTICE`'s argument exactly: first
+# answer wins, because two contradictory specifications for one shot is a self-contradiction the
+# Director has to see rather than a preference for whichever arrived last.
+ASSISTANT_DUPLICATE_NOTICE = (
+    "The model answered more than once for {shots}. The first answer for each was applied and the "
+    "later ones were ignored, because a shot cannot be two things."
+)
+# The matrix's asset row, and the one refusal that is deliberately all-or-nothing for the shot: an
+# invented asset id means this answer was not written against the library the Director actually
+# has, so applying the mode and prompt from it and dropping only the citation would leave a shot
+# declared as something its assets cannot satisfy — and leave it looking filled in.
+ASSISTANT_UNKNOWN_ASSET_NOTICE = (
+    "Nothing was applied to {shot}: the model cited {count} asset id(s) this project's library "
+    "does not hold ({assets}). No asset was created and the rest of that answer was discarded, "
+    "because a shot built on an id that does not exist is not the shot that was asked for."
+)
+# A tool call that did not fit the vocabulary at all — a mode the taxonomy has never had, a role
+# that is not a role, arguments that are not JSON. This is what the typed surface converts a
+# plausible-looking mistake *into*, so it is reported rather than swallowed, with the raw arguments
+# carried in the notice's `raw` where `DIRECTOR_CONTEXT_EXCLUDE` keeps them out of the next call.
+ASSISTANT_MALFORMED_NOTICE = (
+    "Discarded: {count} tool call(s) did not fit the shot vocabulary — a mode, role or performance "
+    "value this application does not have, or arguments that could not be read. Nothing was "
+    "written for them. What the model sent is kept beside this notice for inspection and is left "
+    "out of the context of the next Director call."
+)
+ASSISTANT_MALFORMED_EMPTY_NOTICE = (
+    "Discarded: {count} tool call(s) did not fit the shot vocabulary — a mode, role or performance "
+    "value this application does not have, or arguments that could not be read. Nothing was "
+    "written for them, and the model sent nothing to inspect."
+)
+# A selected, writable shot the model simply never answered for. Reported rather than retried, on
+# `EXPANSION_OMITTED_NOTICE`'s argument, and reported *because it was selected*: silence about a
+# shot the Director explicitly picked is the failure this feature is forbidden to have.
+ASSISTANT_OMITTED_NOTICE = (
+    "Selected but not answered for by the model, and therefore unchanged: {shots}. Ask again if "
+    "you want them filled in."
+)
+# The model naming a shot and then setting nothing on it. Distinguished from an omission because
+# the model did spend a call on it, and from a change because nothing changed.
+ASSISTANT_EMPTY_FILL_NOTICE = (
+    "Answered for without naming anything to set, and therefore unchanged: {shots}."
+)
+# A shot that was filled in and still does not fit its own mode. A flag rather than a refusal, and
+# that is the frozen matrix's decision rather than a leniency: planning a first/middle/last section
+# before its images exist is real work, and the refusal that matters happens where GPU time would
+# be spent. The sentences are `mode_specification_problems`', so this reads exactly as the shot
+# inspector reads.
+ASSISTANT_SPECIFICATION_NOTICE = (
+    "Filled in, and still not fully specified for its mode:\n{details}\n"
+    "This does not block anything now; it is refused at render."
+)
+# The model talking instead of calling the tool. Its own notice because it is the failure the
+# system prompt is most likely to be iterated against, and a turn that quietly changed nothing
+# reads as the feature being broken.
+ASSISTANT_WITHOUT_TOOL_CALL_NOTICE = (
+    "The model answered in prose and called no tool, so no shot was changed. Ask again, more "
+    "directly, if you wanted it to fill the shot in."
+)
+# What the reply says when the model returned no sentence of its own, on `EXPANSION_EMPTY_MESSAGE`'s
+# argument: a reply that is a bare separator followed by notices is not a reply.
+ASSISTANT_EMPTY_MESSAGE = "Assistant ProducerBot returned no summary of this turn."
+
+
+def assistant_fill_summary(applied: dict[str, object]) -> str:
+    """One shot's line in the applied notice: what was set on it, in the Director's vocabulary.
+
+    Built from what was *actually* assigned rather than from what the model asked for, so a field
+    the tool sent and the route did not apply cannot appear here. Modes and roles are named by
+    their labels — `SHOT_MODE_SPECS[…].label`, `ASSET_ROLE_LABELS[…]` — because "first_middle_last"
+    is the wire vocabulary and "First / middle / last" is what the mode select says.
+    """
+    clauses: list[str] = []
+    if "mode" in applied:
+        clauses.append(f"mode {SHOT_MODE_SPECS[applied['mode']].label}")
+    if "prompt" in applied:
+        clauses.append("prompt written")
+    if "singing" in applied:
+        clauses.append(f"performance recorded as {applied['singing']}")
+    if "citations" in applied:
+        counted = Counter(citation["role"] for citation in applied["citations"])
+        named = ", ".join(
+            f"{count} {ASSET_ROLE_LABELS[role]}" for role, count in counted.items()
+        )
+        clauses.append(f"cites {named}" if named else "cites nothing")
+    return "; ".join(clauses)
+
+
 def document_change_notice(labels: list[str]) -> str:
     """State which documents this reply replaced, from the one wording above.
 
@@ -677,6 +819,27 @@ def shot_render_provenance(shot: Shot) -> bool:
     return bool(
         shot.prompt_id or shot.latest_output or shot.approved_output or shot.status != "draft"
     )
+
+
+#: Why an automated write may not touch one Shot, or `None` when it may. `"locked"` or `"rendered"`.
+#:
+#: One decision for both automated writers — the Director's shot expansion and Assistant
+#: ProducerBot — because they are the same rule and a second copy of it is a guard hole waiting to
+#: happen: the assistant is a *wider* capability than expansion (it sets modes and citations, not
+#: only prompts), so a divergence would show up as the assistant writing to a Shot expansion
+#: refuses, which is exactly "a tool that cannot be refused".
+#:
+#: The order is the precedence both routes already report by, and it is not arbitrary: a lock is a
+#: decision the Director made and provenance is a fact about media that exists, so when both apply
+#: the lock is the sentence worth reading. `director_chat` uses the same precedence for lock over
+#: consent.
+def shot_write_refusal(shot: Shot) -> Literal["locked", "rendered"] | None:
+    """Whether an automated writer may change this Shot at all. See the note above."""
+    if shot.locked:
+        return "locked"
+    if shot_render_provenance(shot):
+        return "rendered"
+    return None
 
 
 #: The Shot statuses `render_again` recognises as settled — a Shot that has something to redo.
@@ -1160,6 +1323,24 @@ def expansion_rejection(prompt: str) -> str:
     return document_rejection(prompt, "")
 
 
+def assistant_prompt_rejection(prompt: str) -> str:
+    """Why a prompt Assistant ProducerBot wrote must not land on a Shot, or "" when it may.
+
+    Nothing new is decided here. `batch.prompt_rejection` is the existing judgement about what a
+    prompt is worth — AD-5's one implementation, the same call `readiness_report` and the queue
+    make — and it is deliberately used in preference to `expansion_rejection`, because it catches
+    the `"New shot"` placeholder as well as blank. A local model echoing the placeholder it was
+    shown in `current_prompt` is an ordinary local-model behaviour, and it would otherwise be
+    written onto the Shot as a real prompt and then blocked by the readiness gate afterwards: the
+    Director would read "prompt written" and then be refused at the queue for having no prompt.
+
+    The JSON-as-prose half is `document_rejection`'s, reached exactly the way `expansion_rejection`
+    reaches it — `""` as the existing text, so only that check runs and the 40% ratio floor, which
+    is meaningless against a placeholder, does not.
+    """
+    return prompt_rejection(prompt) or document_rejection(prompt, "")
+
+
 def _require_song_replacement_confirmation(project: Project, confirmed: bool) -> None:
     """Refuse an unacknowledged Song change once the project has shots.
 
@@ -1394,6 +1575,30 @@ class DirectorRequest(BaseModel):
     # deliberately not stored on `Project`, so it is neither remembered across turns nor
     # inherited by another project, and a client that omits or nulls it is a decline.
     apply_documents: DeclinedIfNull = False
+
+
+class AssistantRequest(BaseModel):
+    """One Assistant ProducerBot turn: what the Director asked, and which shots they asked it about.
+
+    `shot_ids` is required and non-empty, and it is this feature's answer to "opt-in per turn".
+    `director_chat`'s consent is a boolean because chat's *purpose* is conversation and writing is
+    the side effect; the closest relative here is `expand`, which writes to shots and carries no
+    flag at all, because a control whose only purpose is to write is its own opt-in. A boolean on
+    this route would either be hardcoded true by the client — decorative, and the exact criticism
+    `apply_shots: false` already earns — or would make the primary journey a tick and a click.
+
+    What is kept is the property the boolean encodes, in a stronger form: **the turn's consent is
+    the selection, and the model cannot widen it.** A tool call naming any other shot is refused,
+    including a real, unlocked, perfectly writable one elsewhere in the plan. A boolean says
+    "you may write"; this says "you may write *here*", which is the guarantee the frozen block is
+    actually about — a tool must not widen what it can act on.
+
+    No `apply_documents` sibling and no way to reach one: this route never touches the Treatment,
+    the Style bible or the Song, so there is nothing to consent to.
+    """
+
+    message: str = Field(min_length=1)
+    shot_ids: list[str] = Field(min_length=1)
 
 
 class ShotListRequest(BaseModel):
@@ -3471,6 +3676,303 @@ def create_app(
         # A model that returned no sentence of its own must not leave the reply as a bare
         # separator followed by notices.
         message = result.message.strip() or EXPANSION_EMPTY_MESSAGE
+        project.messages.append(assistant_reply(message, notices))
+        return store.save(project)
+
+    @app.post("/api/projects/{project_id}/assistant/fill", response_model=Project)
+    async def assistant_fill(project_id: str, request: AssistantRequest) -> Project:
+        """Fill in the selected Shots from one plain-language request. Assistant ProducerBot.
+
+        The Director's language model with one tool, `fill_shots`, whose arguments are the shot
+        taxonomy itself — `ShotMode`, `AssetRole`, `SingingState` — so a malformed answer is a
+        validation error at the edge rather than a plausible string in the manifest.
+
+        Six properties are load-bearing, and each has a test that breaks if it stops holding:
+
+        * **The selection is the scope.** `request.shot_ids` decides what the model is shown and
+          what it may write to. A tool call naming anything else is refused and reported, including
+          a real, unlocked Shot elsewhere in the plan. This is what stops tool-calling from widening
+          what the assistant can act *on* while it widens what it can do.
+        * **Every guard a Director's own click meets.** The lock and the render-provenance rules are
+          `shot_write_refusal`, shared with expansion; the prompt gate is `batch.prompt_rejection`
+          through `assistant_prompt_rejection`; the mode rules are `mode_specification_problems`;
+          the library check is `dangling_citations`. Nothing here reimplements any of them.
+        * **No GPU time, on every path.** Nothing in this route touches `comfy`, sets a `status`,
+          queues a job, generates an image or promotes an asset. The Director's own description puts
+          image generation *after* this, as their next act.
+        * **All or nothing per Shot.** A Shot's answer is judged whole and applied whole. A refused
+          prompt or an invented asset id discards that Shot's mode and citations with it, because
+          a Shot carrying half of an answer looks filled in and is not.
+        * **Nothing is persisted until every Shot has been judged.** There is one terminal
+          `store.save`, and candidates are built first and committed second, so a failure part-way
+          through leaves both the manifest and the in-memory project untouched rather than
+          half-written.
+        * **Every selected Shot is named in the reply.** Applied, locked, carrying provenance,
+          refused, discarded, omitted or answered-for-and-empty: a Shot the Director explicitly
+          picked and heard nothing about is the silence this feature is forbidden to have.
+
+        Nothing infers `singing`. The model may *set* it, which is a visible act reported in the
+        applied notice; a `None` from the tool leaves whatever the Shot already says, and no branch
+        here derives it from a mode, a citation or a prompt.
+
+        The empty-selection refusal, the re-read after the await, the 503/502 mapping and the single
+        terminal save all follow `expand_shot_prompts`.
+        """
+        # Built from the pre-await snapshot, exactly as the chat and expansion prompts are.
+        snapshot = get_project(project_id)
+        held = {shot.id: shot for shot in snapshot.shots}
+        # Deduplicated with order kept: a client that sends one id twice must not make the model
+        # answer about it twice, and `dict.fromkeys` is the codebase's stable dedupe.
+        requested = list(dict.fromkeys(request.shot_ids))
+        selected = [held[shot_id] for shot_id in requested if shot_id in held]
+        if not selected:
+            raise HTTPException(status_code=422, detail=ASSISTANT_WITHOUT_SHOTS)
+        # Refused *before* the call when nothing in the selection could be written to, on
+        # EXPANSION_WITHOUT_SHOTS' argument: the model would spend the Director's seconds to be
+        # told what this sentence already says. The wordings are the ones the reply would have
+        # carried, so the refusal before the call and the notice after it agree.
+        blocked: dict[str, list[str]] = {"locked": [], "rendered": []}
+        for shot in selected:
+            if reason := shot_write_refusal(shot):
+                blocked[reason].append(shot_label(snapshot, shot))
+        if len(blocked["locked"]) + len(blocked["rendered"]) == len(selected):
+            reasons = " ".join(
+                wording.format(shots=", ".join(names))
+                for wording, names in (
+                    (EXPANSION_LOCKED_NOTICE, blocked["locked"]),
+                    (EXPANSION_RENDERED_NOTICE, blocked["rendered"]),
+                )
+                if names
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=ASSISTANT_WITHOUT_WRITABLE_SHOTS.format(reasons=reasons),
+            )
+        try:
+            # The requested ids verbatim, not the resolved Shots: `assistant_input` skips the ones
+            # this project no longer has, and a test that asserts the route sent the builder's
+            # output has to be asserting about a call the builder could have been given directly.
+            turn = await director.assist(
+                message=request.message,
+                assistant_input=assistant_input(snapshot, shot_ids=requested),
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        # Re-read after the await, for the reason `director_chat` documents, and here it is also
+        # what makes the selection meaningful: a Shot deleted, locked or rendered while the model
+        # was thinking is in this project and not in the snapshot the answer was written against.
+        project = get_project(project_id)
+        shots_by_id = {shot.id: shot for shot in project.shots}
+        position = {shot.id: index for index, shot in enumerate(project.shots)}
+        present = [shot_id for shot_id in requested if shot_id in shots_by_id]
+        # Re-checked rather than assumed from the snapshot, exactly as expansion re-checks: saving
+        # a reply about shots that no longer exist would leave the thread asserting a fill of
+        # nothing.
+        if not present:
+            raise HTTPException(status_code=422, detail=ASSISTANT_WITHOUT_SHOTS)
+        missing_targets = [shot_id for shot_id in requested if shot_id not in shots_by_id]
+        labels = {shot_id: shot_label(project, shots_by_id[shot_id]) for shot_id in present}
+        # Swept over the *selection* rather than over the model's answer, which is the difference
+        # between this and expansion's equivalent lists. Expansion leaves a locked Shot the model
+        # never mentioned unreported, because nothing was going to be written for it either way;
+        # here the Director explicitly picked it, so "why did nothing happen to the shot I chose"
+        # is a question the reply has to answer whether or not the model addressed it.
+        locked: list[str] = []
+        rendered: list[str] = []
+        writable: list[str] = []
+        for shot_id in present:
+            reason = shot_write_refusal(shots_by_id[shot_id])
+            (locked if reason == "locked" else rendered if reason == "rendered" else writable).append(
+                shot_id
+            )
+        open_to_writing = set(writable)
+
+        staged: list[tuple[int, Shot]] = []
+        summaries: list[str] = []
+        answered: set[str] = set()
+        duplicated: list[str] = []
+        out_of_scope: list[str] = []
+        empty_fills: list[str] = []
+        unknown_assets: list[MessageNotice] = []
+        rejected: list[MessageNotice] = []
+        specification: list[str] = []
+        for fill in turn.fills:
+            if fill.shot_id not in open_to_writing:
+                # A Shot the selection already reports on — locked, or carrying provenance — is not
+                # reported a second time as out of scope: it *was* in scope, and the reply already
+                # says in the Director's own vocabulary why nothing happened to it.
+                if fill.shot_id in labels:
+                    continue
+                if fill.shot_id not in out_of_scope:
+                    out_of_scope.append(fill.shot_id)
+                continue
+            # First answer wins, before any other check, on `expand_shot_prompts`' argument:
+            # last-write-wins would let one Shot be reported as both refused and filled in.
+            if fill.shot_id in answered:
+                if fill.shot_id not in duplicated:
+                    duplicated.append(fill.shot_id)
+                continue
+            answered.add(fill.shot_id)
+            shot = shots_by_id[fill.shot_id]
+            # `None` means leave it alone, never clear it. A model that names only a mode must not
+            # thereby blank the prompt a Director wrote by hand, so the change set is built from
+            # the keys that are actually present.
+            changes: dict[str, Any] = {}
+            if fill.mode is not None:
+                changes["mode"] = fill.mode
+            # Set, never inferred: this is only reached because the tool call carried a value, and
+            # the applied notice says so out loud. See `models.SingingState`.
+            if fill.singing is not None:
+                changes["singing"] = fill.singing
+            if fill.citations is not None:
+                changes["citations"] = [
+                    citation.model_dump() for citation in fill.citations
+                ]
+            if fill.prompt is not None:
+                reason = assistant_prompt_rejection(fill.prompt)
+                if reason:
+                    # The whole answer for this Shot goes, not just its prompt. Applying the mode
+                    # and the citations from an answer whose prompt was refused would leave a Shot
+                    # that reads as filled in and cannot be rendered — and the refused text travels
+                    # in `raw`, which `DIRECTOR_CONTEXT_EXCLUDE` keeps out of the next call.
+                    rejected.append(
+                        rejection_notice(
+                            EXPANSION_REJECTED_NOTICE,
+                            EXPANSION_REJECTED_EMPTY_NOTICE,
+                            raw=fill.prompt,
+                            shot=labels[fill.shot_id],
+                            reason=reason,
+                        )
+                    )
+                    continue
+                changes["prompt"] = fill.prompt
+            if not changes:
+                empty_fills.append(fill.shot_id)
+                continue
+            # Validated as a whole Shot rather than assigned field by field, which is what makes
+            # the citation/`asset_ids` reconciliation run and what turns anything the tool schema
+            # somehow let through into an error here rather than into a stored manifest.
+            candidate = Shot.model_validate({**shot.model_dump(), **changes})
+            # Only the ids *this answer* introduced. A citation that was already dangling — an
+            # asset deleted out from under a Shot yesterday — is the inspector's report to make,
+            # and refusing today's answer for it would make an unrelated stale reference into a
+            # permanent block on the Shot.
+            already_missing = set(dangling_citations(project, shot))
+            introduced = [
+                asset_id
+                for asset_id in dangling_citations(project, candidate)
+                if asset_id not in already_missing
+            ]
+            if introduced:
+                unknown_assets.append(
+                    MessageNotice(
+                        kind="refusal",
+                        text=ASSISTANT_UNKNOWN_ASSET_NOTICE.format(
+                            shot=labels[fill.shot_id],
+                            count=len(introduced),
+                            assets=", ".join(_short(asset_id) for asset_id in introduced),
+                        ),
+                    )
+                )
+                continue
+            if problems := mode_specification_problems(candidate):
+                # Reported, never a refusal: a mode with no adapter and a section laid out before
+                # its images exist are both real planning work, and the refusal that matters
+                # happens where GPU time would be spent.
+                specification.append(f"{labels[fill.shot_id]}: {' '.join(problems)}")
+            staged.append((position[fill.shot_id], candidate))
+            summaries.append(f"{labels[fill.shot_id]}: {assistant_fill_summary(changes)}")
+        # Nothing above this line has written to the project. What makes "a failure mid-sequence
+        # leaves nothing half-applied" structural is the single terminal `store.save` below —
+        # nothing is persisted until every Shot has been judged. Committing in one pass here is the
+        # second half of it: the in-memory project a later reader sees is never half-written either.
+        for index, candidate in staged:
+            project.shots[index] = candidate
+        omitted = [shot_id for shot_id in writable if shot_id not in answered]
+
+        notices: list[MessageNotice] = []
+        if staged:
+            notices.append(
+                MessageNotice(
+                    kind="change",
+                    text=ASSISTANT_APPLIED_NOTICE.format(
+                        count=len(staged), details="\n".join(summaries)
+                    ),
+                )
+            )
+        # The lock and the provenance wordings are `expand_shot_prompts`' own, reused rather than
+        # reworded. The frozen matrix asks for a refusal "in the same words a Director's click
+        # gets", and these are the words every other automated write to a Shot already uses —
+        # a second wording for one rule is how the two start describing different rules.
+        for reported, wording, kind in (
+            (locked, EXPANSION_LOCKED_NOTICE, "refusal"),
+            (rendered, EXPANSION_RENDERED_NOTICE, "refusal"),
+            (missing_targets, ASSISTANT_MISSING_TARGET_NOTICE, "refusal"),
+        ):
+            if reported:
+                notices.append(
+                    MessageNotice(
+                        kind=kind,
+                        text=wording.format(
+                            shots=", ".join(
+                                labels.get(shot_id, _short(shot_id)) for shot_id in reported
+                            )
+                        ),
+                    )
+                )
+        notices.extend(unknown_assets)
+        notices.extend(rejected)
+        if out_of_scope:
+            notices.append(
+                MessageNotice(
+                    kind="refusal",
+                    text=ASSISTANT_OUT_OF_SCOPE_NOTICE.format(
+                        count=len(out_of_scope),
+                        shots=", ".join(_short(shot_id) for shot_id in out_of_scope),
+                    ),
+                )
+            )
+        if turn.malformed:
+            notices.append(
+                rejection_notice(
+                    ASSISTANT_MALFORMED_NOTICE,
+                    ASSISTANT_MALFORMED_EMPTY_NOTICE,
+                    raw="\n".join(turn.malformed),
+                    count=len(turn.malformed),
+                )
+            )
+        for reported, wording in (
+            (omitted, ASSISTANT_OMITTED_NOTICE),
+            (empty_fills, ASSISTANT_EMPTY_FILL_NOTICE),
+            (duplicated, ASSISTANT_DUPLICATE_NOTICE),
+        ):
+            if reported:
+                notices.append(
+                    MessageNotice(
+                        kind="flag",
+                        text=wording.format(
+                            shots=", ".join(labels[shot_id] for shot_id in reported)
+                        ),
+                    )
+                )
+        if specification:
+            notices.append(
+                MessageNotice(
+                    kind="flag",
+                    text=ASSISTANT_SPECIFICATION_NOTICE.format(details="\n".join(specification)),
+                )
+            )
+        # Said only when the model produced nothing at all to act on. A turn that called the tool
+        # and had every call refused is a different failure, and every one of those refusals is
+        # already its own sentence above.
+        if not turn.fills and not turn.malformed:
+            notices.append(MessageNotice(kind="flag", text=ASSISTANT_WITHOUT_TOOL_CALL_NOTICE))
+        message = turn.message.strip() or ASSISTANT_EMPTY_MESSAGE
+        # The user's own turn is recorded, unlike expansion's — this one *was* a question, and the
+        # thread is the audit trail for what the Director asked as well as for what was written.
+        project.messages.append(TreatmentMessage(role="user", content=request.message))
         project.messages.append(assistant_reply(message, notices))
         return store.save(project)
 

@@ -199,6 +199,18 @@
             <form class="composer" id="chat-form">
               <textarea name="message" rows="3" placeholder="The verses should feel claustrophobic, then the chorus breaks into a huge sodium-lit desert…"></textarea>
               <div><span>Structured output stays editable before rendering.</span><label class="lock-toggle" title="Off by default: the reply names what it proposed to change instead of replacing the Treatment or Style bible"><input type="checkbox" id="apply-documents">Apply document changes</label><button class="primary-button" type="submit">Send to Director</button></div>
+              <!-- Assistant ProducerBot's three controls, beside the chat because that is where the
+                   Director described them: click a shot, click prefill, type the request, send.
+                   All three are `type="button"` and none of them is this form's submit -- the
+                   Director send and the assistant send are deliberately different acts, and the
+                   assistant's scope is the shot selection rather than a checkbox. Every label,
+                   title and disabled state is decided by api.js's prefillControl,
+                   assistantControl and assistantFillAllControl and applied by syncAssistantControls;
+                   the strings here are the initial paint and are asserted against those constants
+                   by tests/test_frontend_contract.py. The "Nothing is rendered" claim is
+                   api.js's SHOT_EXPANSION_NO_RENDER, the one spelling every assistant and
+                   expansion control makes. -->
+              <div class="assistant-row"><span>Assistant ProducerBot fills shots in. Nothing is rendered.</span><button class="quiet-button" type="button" id="prefill-shot" disabled title="Select a shot on the timeline first.">Prefill from shot</button><button class="quiet-button" type="button" id="assistant-fill-all" disabled title="Every shot in this plan is locked or has already been rendered, so there is nothing to fill in.">Fill every open shot</button><button class="primary-button" type="button" id="assistant-fill" disabled title="Select a shot on the timeline first.">Fill selected shot</button></div>
             </form>
           </div>
           <div class="document-column">

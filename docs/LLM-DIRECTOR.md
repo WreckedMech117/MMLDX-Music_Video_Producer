@@ -78,7 +78,31 @@ A returned id matching no shot, a shot the model omitted, a prompt that parses a
 
 The reply is appended to the project's chat thread as an assistant turn **with no preceding user turn** — expansion is a button, not a question, but it shares the thread because that thread is the audit trail for what the Director wrote. It is therefore visible in the Treatment workspace alongside chat replies, and it becomes part of the context a later chat turn sees.
 
-## Project context
+## Assistant ProducerBot
+
+`POST /api/projects/{id}/assistant/fill` is the third call, beside chat and expansion. It takes a `message` and a **required, non-empty `shot_ids`**, and it is the Director's own language model given one tool.
+
+**The selection is the consent.** There is no `apply_*` flag here. `shot_ids` decides both what the model is shown and what it may write to, and a tool call naming any other shot — including a real, unlocked, perfectly writable one elsewhere in the plan — is refused and reported. Chat and expansion answer "you may write" with a boolean; this answers "you may write **here**". That is a stronger consent, not a weaker one, because it cannot be left ticked.
+
+**One tool, and the taxonomy is its contract.** `fill_shots` takes entries whose `mode` is `ShotMode`, `role` is `AssetRole` and `singing` is `SingingState`, with the wire schema **generated from the model class** rather than transcribed — so the enums the model is allowed to say are the enums `models.py` declares, and they cannot drift. A mode the taxonomy has never had is a validation error at the edge, reported to the Director with the raw arguments beside it. Entries are validated **one at a time**: one bad mode does not discard the twenty-nine good shots in the same call. An absent field leaves that field alone; `citations` replaces the whole list.
+
+The spec asked for "a set of tools" and the honest answer turned out to be **one**. Mode, prompt, citations and singing are four halves of a single act: split into separate calls, a model that chose `first_middle_last` and then failed the citation call would leave a shot declared as something its assets cannot satisfy.
+
+**Every tool call meets the refusals a click meets.** `shot_write_refusal` is shared with expansion — same precedence, locks then render provenance, and the **same wordings verbatim** rather than reworded. The consequence already recorded for expansion therefore applies here too: **marking a shot `ready` takes it out of the assistant's reach.** The prompt gate is `batch.prompt_rejection` rather than `expansion_rejection`, deliberately: the former also catches the `"New shot"` placeholder, which a local model echoing back `current_prompt` will produce. Mode fit comes from `mode_specification_problems` and is reported as a flag, never a refusal, because planning a mode before its assets exist is the point. Unknown asset ids are caught by `dangling_citations`, and only ids *this answer* introduced count against it.
+
+**No path spends GPU time**, asserted over every outcome: no prompts, no uploads, no jobs, no status change, no approval, no asset and no Song. The Director's own description places image generation *after* the assistant's work, as their next act.
+
+**Nothing infers `singing`.** It is applied only when the tool call carried it, and then named out loud in the applied notice.
+
+**All-or-nothing per shot, and every selected shot is named** — applied, locked, rendered, unknown-asset, prompt-refused, out-of-scope, omitted, answered-empty, duplicated or missing. Nothing is persisted until every shot has been judged: a single terminal `store.save` is what prevents a half-applied manifest, not the staging that precedes it. That distinction was found by a mutation and the code's own comment had overclaimed it.
+
+Status codes: **422** for an empty or unwritable selection, refused before any model call; **503** unconfigured; **502** an unusable reply. Refused tool arguments are kept in the notice's `raw`, which `DIRECTOR_CONTEXT_EXCLUDE` strips, for the same reason the expansion route does it — so the model cannot read its own rejected output back.
+
+The payload is `timeline.assistant_input`: selection-scoped, carrying the asset library and the mode table, and carrying **no production state**. One round trip, `tool_choice: "auto"`, no `response_format`; the per-shot report is assembled by the route, not by the model.
+
+**The system prompt lives in `src/music_video_producer/assistant_prompt.py`, and it is meant to be edited.** Its own module, no interpolation, so rewording it touches no transport, no route and no behavioural test. `PROMPT_CRAFT` is split out as the half most likely to change between live runs. Two absences are deliberate and recorded in its docstring: there is **no anti-transcription clause** — literalism is the likely failure but the project's rule is to watch it on real output rather than pre-empt it, and the fix has a named home — and no worked example.
+
+## Project context## Project context
 
 The director receives the current song metadata — including the song's `lyrics` and `caption` when it has them — creative documents, assets, shots, and prior messages.
 

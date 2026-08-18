@@ -390,6 +390,32 @@ def mode_specification_problems(shot: Shot) -> list[str]:
     return problems
 
 
+def shot_label(project: Project, shot: Shot) -> str:
+    """Name a Shot the way the Director sees it on the timeline, plus its id.
+
+    Lives here rather than in `batch.py`, where it was written, because three modules now need it
+    and the dependency graph forbids two of them from reaching that one: `batch` may import
+    `timeline` and never the reverse, and `timeline.assistant_input` names Shots to the model under
+    exactly the name the reply's notices then use. A second spelling of the same scheme is how the
+    model is told about `SHOT 03` and the Director is told about a different one. `batch.shot_label`
+    re-exports this, so every existing importer is unaffected.
+
+    The clip is drawn as `SHOT 01` from the Shot's position in the **manifest** — that is what
+    `renderTimeline` numbers by — while the readiness report is ordered by position in the song. The
+    two orderings differ for any plan whose manifest order is not its time order, so a refusal that
+    carried only a number would point at the wrong clip; one that carried only the id would name
+    something that appears nowhere on screen. Both, therefore, exactly as `expansion_shot_label`
+    carries both for the same reason.
+
+    A Shot that is not in this project falls back to its bare id rather than claiming a position
+    it does not have.
+    """
+    position = next(
+        (index + 1 for index, item in enumerate(project.shots) if item.id == shot.id), 0
+    )
+    return f"SHOT {position:02d} ({shot.id})" if position else shot.id
+
+
 def dangling_citations(project: Project, shot: Shot) -> list[str]:
     """The Asset ids this Shot cites that the project's library no longer holds, in shot order.
 

@@ -6,7 +6,15 @@ from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
 
-from .models import Project, Shot
+from .models import (
+    ASSET_ROLE_LABELS,
+    SHOT_MODE_SPECS,
+    Asset,
+    Project,
+    Shot,
+    resolve_shot_mode,
+    shot_label,
+)
 
 #: MiniMax H3 is trained primarily for shot windows in this range, in seconds.
 H3_MIN_SHOT_SECONDS = 4.0
@@ -128,6 +136,159 @@ def _neighbour_framing(shot: Shot | None) -> dict[str, Any] | None:
     if shot is None:
         return None
     return {"shot_id": shot.id, "start": round(shot.start, 3), "end": round(shot.end, 3)}
+
+
+#: How much of an Asset's own words the assistant is shown. A vision summary is a paragraph and a
+#: Flux generation prompt can be far longer; a library of forty assets at full length is a project
+#: dump wearing a different key, which is the one thing this payload exists not to be.
+ASSISTANT_DESCRIPTION_LIMIT = 300
+
+
+def _asset_description(asset: Asset) -> str:
+    """What this Asset depicts, in as few characters as the honest answer takes.
+
+    The vision inspection wins over the generation prompt when there is one, because it describes
+    what the picture *is* rather than what was asked for — a Flux prompt and its output disagree
+    often enough that citing the prompt would tell the assistant about a shot that was never made.
+    An uploaded asset with neither has no description at all, and gets none rather than an invented
+    one: its name and kind are what is actually known about it.
+    """
+    described = (asset.vision.summary if asset.vision else "") or asset.prompt
+    collapsed = " ".join(described.split())
+    if len(collapsed) <= ASSISTANT_DESCRIPTION_LIMIT:
+        return collapsed
+    return f"{collapsed[:ASSISTANT_DESCRIPTION_LIMIT]}…"
+
+
+def assistant_input(project: Project, *, shot_ids: list[str]) -> dict[str, Any]:
+    """The purpose-built, trimmed input for one Assistant ProducerBot turn. Pure and I/O-free.
+
+    Built the way `expansion_input` is and for the same recorded reason — rich context is the root
+    cause of Director degradation — with three differences that follow from what this call is for:
+
+    * **Only the selected shots.** `shot_ids` is the turn's scope, and it is the scope in two
+      senses: the model is shown these shots and no others, and the route refuses to write to
+      anything outside the list. Sending the whole plan would both cost the tokens and invite the
+      model to answer for shots the Director did not select.
+    * **The library, because citing is the point.** Each Asset carries its id (copied verbatim into
+      a citation), its name, its kind and a bounded description. No path, no `prompt_id`, no
+      `created_at`, and no vision record beyond its summary.
+    * **The taxonomy, because the arity is not in the tool schema.** The schema constrains a mode to
+      the enum; only this says that `first_middle_last` cites three images in three named roles, and
+      that a mode may be plannable while `renderable` is false.
+
+    What is deliberately *not* here is production state. No `status`, `prompt_id`, `latest_output`,
+    `latest_review` or `approved_output`, and no derived "this has a take" flag either — the route
+    refuses those shots on its own evidence, exactly as expansion does, and a flag would put back
+    the state the trimming exists to keep out.
+
+    Shots are ordered by `ordered_shots` — song order — and named by `shot_label`, which is the
+    manifest position the timeline draws. The two orderings differ; the *name* is the timeline's,
+    because it is the name the Director reads on the clip and the name the reply's notices use.
+    """
+    ordered = ordered_shots(project)
+    position = {shot.id: index for index, shot in enumerate(ordered)}
+    song_duration = project.song.duration if project.song else 0.0
+    shots: list[dict[str, Any]] = []
+    for shot_id in shot_ids:
+        index = position.get(shot_id)
+        if index is None:
+            continue
+        shot = ordered[index]
+        entry: dict[str, Any] = {
+            "shot_id": shot.id,
+            "label": shot_label(project, shot),
+            "start": round(shot.start, 3),
+            "end": round(shot.end, 3),
+            "duration": round(shot.duration, 3),
+            "locked": shot.locked,
+            "current_mode": resolve_shot_mode(shot),
+            "current_prompt": shot.prompt,
+            "singing": shot.singing,
+            "use_song_audio": shot.use_song_audio,
+            "citations": [
+                {"asset_id": citation.asset_id, "role": citation.role}
+                for citation in shot.citations
+            ],
+            "outside_h3_window": not (
+                H3_MIN_SHOT_SECONDS <= shot.duration <= H3_MAX_SHOT_SECONDS
+            ),
+            "neighbours": {
+                key: framing
+                for key, framing in (
+                    ("previous", _neighbour_framing(ordered[index - 1] if index else None)),
+                    (
+                        "next",
+                        _neighbour_framing(
+                            ordered[index + 1] if index + 1 < len(ordered) else None
+                        ),
+                    ),
+                )
+                if framing is not None
+            },
+        }
+        if song_duration > 0:
+            # Clamped guidance rather than geometry, for `expansion_input`'s reason: a Shot can
+            # legitimately sit past the end of a shorter song, and "3.5 of the way through" is not
+            # a fact a model can use. `start` and `end` above carry the real timing unclamped.
+            entry["song_fraction"] = round(min(1.0, max(0.0, shot.start / song_duration)), 4)
+        section = song_section(project, shot)
+        if section:
+            entry["section"] = section
+        shots.append(entry)
+    payload: dict[str, Any] = {
+        "creative_brief": project.creative_brief,
+        "treatment": project.treatment,
+        "style_bible": project.style_bible,
+        # The taxonomy as data, derived from the table rather than described in the prompt, so a
+        # mode added to `SHOT_MODE_SPECS` reaches the assistant without anyone editing prose.
+        # `renderable` is the honest statement of the plannable-but-unrenderable pair: planning one
+        # is allowed and is refused later, at the point GPU time would be spent.
+        "modes": [
+            {
+                "mode": mode,
+                "label": spec.label,
+                "renderable": bool(spec.adapter),
+                "song_audio": spec.song_audio,
+                "roles": [
+                    {
+                        "role": requirement.role,
+                        "minimum": requirement.minimum,
+                        "maximum": requirement.maximum,
+                    }
+                    for requirement in spec.roles
+                ],
+            }
+            for mode, spec in SHOT_MODE_SPECS.items()
+        ],
+        "asset_roles": dict(ASSET_ROLE_LABELS),
+        "assets": [
+            {
+                key: value
+                for key, value in (
+                    ("asset_id", asset.id),
+                    ("name", asset.name),
+                    ("kind", asset.kind),
+                    ("description", _asset_description(asset)),
+                )
+                if value
+            }
+            for asset in project.assets
+        ],
+        "h3_shot_window": {"min": H3_MIN_SHOT_SECONDS, "max": H3_MAX_SHOT_SECONDS},
+        "shots": shots,
+    }
+    if project.song is not None:
+        # Title, length, and what the Director already said the song *is*, on `expansion_input`'s
+        # convention exactly: present when the Song carries them, absent rather than `""` when it
+        # does not, because `""` is a confident claim that the song has no words.
+        song: dict[str, Any] = {"title": project.song.title, "duration": project.song.duration}
+        if project.song.lyrics:
+            song["lyrics"] = project.song.lyrics
+        if project.song.caption:
+            song["caption"] = project.song.caption
+        payload["song"] = song
+    return payload
 
 
 def expansion_input(project: Project) -> dict[str, Any]:
