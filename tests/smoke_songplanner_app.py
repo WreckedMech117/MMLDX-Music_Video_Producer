@@ -30,6 +30,12 @@ fact rather than an error, but a measurement wildly off the request (more than
 ``DURATION_TOLERANCE_FRACTION`` of it) fails the variant, so a truncated output
 cannot pass as clean.
 
+Several helpers here are shared rather than private: ``smoke_h3_reference_app.py``
+imports ``probe``, ``resolve_output``, ``poll``, ``check_comfy``, ``request`` and the
+coercions from this module. ``probe`` in particular reports both streams -- audio for the
+songs below, video dimensions and frame count for the reference render -- so the two
+smokes cannot disagree about what is in a container. Change them with both callers in mind.
+
 Anything short of a clean run (pre-flight problems, ComfyUI offline, an unexpected
 response shape, a job error, the time ceiling) aborts non-zero on stderr without
 spending a further generation. A timeout prints no JSON block; it reports the
@@ -165,11 +171,91 @@ def request(
     return None
 
 
+def count_frames(ffprobe: str, target: str) -> int:
+    """Decode the first video stream and count what comes out. ``0`` if that fails.
+
+    Only called when the container declares no ``nb_frames``, which some muxers omit.
+    Counting is exact where the header is merely absent, and the alternative -- deriving
+    a count from duration times frame rate -- is arithmetic dressed up as a measurement,
+    which is the one thing a probe run after the GPU spend must never report.
+    """
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-print_format",
+            "json",
+            "-show_entries",
+            "stream=nb_read_frames",
+            target,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return 0
+    try:
+        data = json.loads(result.stdout or "{}")
+    except ValueError:
+        return 0
+    streams = data.get("streams") if isinstance(data, dict) else None
+    first = streams[0] if isinstance(streams, list) and streams else {}
+    return as_int(first.get("nb_read_frames") if isinstance(first, dict) else 0)
+
+
+def video_facts(ffprobe: str, target: str, video: dict[str, Any]) -> dict[str, Any]:
+    """What the video stream measures, or ``present: False`` when the file has none.
+
+    Reported alongside the audio facts rather than in a second probe, because the
+    reference smoke needs both from the same file and two implementations of "what is in
+    this container" is two answers to the question the GPU minutes were spent to settle.
+    ``frames_source`` travels with the count so a number the header supplied is never
+    confused with one this process decoded.
+    """
+    if not video:
+        return {
+            "present": False,
+            "codec": "",
+            "width": 0,
+            "height": 0,
+            "frames": 0,
+            "frames_source": "",
+            "frame_rate": "",
+            "duration_seconds": 0.0,
+        }
+    frames = as_int(video.get("nb_frames"))
+    frames_source = "nb_frames"
+    if frames <= 0:
+        frames = count_frames(ffprobe, target)
+        frames_source = "counted" if frames > 0 else "unavailable"
+    return {
+        "present": True,
+        "codec": video.get("codec_name", ""),
+        "width": as_int(video.get("width")),
+        "height": as_int(video.get("height")),
+        "frames": frames,
+        "frames_source": frames_source,
+        "frame_rate": str(video.get("avg_frame_rate") or ""),
+        "duration_seconds": round(as_float(video.get("duration")), 3),
+    }
+
+
 def probe(ffprobe: str, target: str) -> dict[str, Any]:
     """Measured stream facts, or the failure text if ``ffprobe`` cannot decode it.
 
     Every numeric field is coerced defensively: this is the one code path whose whole
     job is to report the measurement, and it runs after the GPU minutes are spent.
+
+    Both streams are reported. ``decodable`` still means *audio* decodable, unchanged, so
+    the song variants above read it exactly as before; the video stream arrives under
+    ``video`` and the audio stream's own length under ``audio_duration_seconds``, which is
+    what lets the reference smoke ask whether the two are actually synchronized rather
+    than merely both present.
     """
     result = subprocess.run(
         [
@@ -210,15 +296,25 @@ def probe(ffprobe: str, target: str) -> dict[str, Any]:
         ),
         {},
     )
+    video = next(
+        (
+            item
+            for item in streams
+            if isinstance(item, dict) and item.get("codec_type") == "video"
+        ),
+        {},
+    )
     duration = as_float(container.get("duration"), as_float(audio.get("duration")))
     return {
         "decodable": bool(audio) and duration > 0,
         "codec": audio.get("codec_name", ""),
         "sample_rate": audio.get("sample_rate", ""),
         "channels": audio.get("channels"),
+        "audio_duration_seconds": round(as_float(audio.get("duration")), 3),
         "format_name": container.get("format_name", ""),
         "duration_seconds": round(duration, 3),
         "size_bytes": as_int(container.get("size")),
+        "video": video_facts(ffprobe, target, video),
     }
 
 
@@ -269,17 +365,22 @@ def view_url(comfy_url: str, output_path: str) -> str:
     return f"{comfy_url.rstrip('/')}/view?{query}"
 
 
-def resolve_output(output_root: Path, song_path: str) -> tuple[Path | None, str]:
-    """Resolve under the ComfyUI output root, refusing any path that escapes it."""
-    if not song_path:
-        return None, "the project recorded no song path"
-    normalized = song_path.replace("\\", "/")
+def resolve_output(output_root: Path, output_path: str) -> tuple[Path | None, str]:
+    """Resolve under the ComfyUI output root, refusing any path that escapes it.
+
+    Shared with ``smoke_h3_reference_app.py``, which resolves a promoted Reference Sheet
+    and a rendered shot through it, so the refusals are worded for any stored output path
+    rather than only for a song's.
+    """
+    if not output_path:
+        return None, "the project recorded no output path"
+    normalized = output_path.replace("\\", "/")
     drive_qualified = len(normalized) > 1 and normalized[1] == ":"
     if normalized.startswith("/") or drive_qualified:
-        return None, f"refusing an absolute song path: {song_path!r}"
+        return None, f"refusing an absolute output path: {output_path!r}"
     parts = PurePosixPath(normalized).parts
     if ".." in parts:
-        return None, f"refusing a song path containing '..': {song_path!r}"
+        return None, f"refusing an output path containing '..': {output_path!r}"
     target = (output_root / Path(*parts)).resolve()
     if output_root not in target.parents:
         return None, f"resolved path escapes {output_root}: {target}"
