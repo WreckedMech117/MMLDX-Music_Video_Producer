@@ -105,10 +105,15 @@ SINGING_RULES = """About singing, which this model gets wrong in both directions
 - If the singing state is unknown, say nothing either way. Do not assume."""
 
 #: Lyrics, and the failure this project already predicted for them.
-LYRIC_RULES = """You may be given the song's words for this shot's window. Use them for
-imagery, subject and mood. Do NOT transcribe them into the prompt as text, and do not
-put them inside a dialogue tag unless the shot is marked as singing and the words are
-what is being sung."""
+LYRIC_RULES = """You may be given the song's lyrics. Read them carefully:
+
+- They are the WHOLE sheet, not this clip's words. Nothing in this project aligns lyrics
+  to time, so which lines fall over this clip is unknown. `song_fraction` tells you roughly
+  how far into the song this clip sits — treat that as a hint about mood and section, never
+  as a claim about which line is being sung here.
+- Use them for imagery, subject and mood. Do NOT transcribe them into the prompt as text.
+- Do not put a lyric inside a dialogue tag unless the shot is marked as singing AND you have
+  been told which words are sung over it. You have not been told that, so do not."""
 
 #: What not to do with the output, which is a real failure mode for local models.
 OUTPUT_RULES = f"""Return only the prompt. No preamble, no explanation, no code fence, no

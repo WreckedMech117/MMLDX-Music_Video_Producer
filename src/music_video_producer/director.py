@@ -10,6 +10,11 @@ from pydantic import BaseModel, Field, ValidationError
 from .assistant_prompt import ASSISTANT_SYSTEM_PROMPT, FILL_SHOTS_DESCRIPTION
 from .models import AssetRole, ShotMode, SingingState
 
+#: Default completion budget for one H3 expansion. Large because it has to cover a
+#: reasoning phase as well as the answer: a model on the Director's machine spent 899
+#: of 900 tokens thinking and returned nothing, and all 6000 of a 6000-token budget the
+#: same way. It answered cleanly at 4000 with thinking disabled.
+H3_EXPANSION_MAX_TOKENS = 4000
 
 class DirectorUnavailable(RuntimeError):
     pass
@@ -541,6 +546,77 @@ class DirectorClient:
             ValueError,
         ) as error:
             raise DirectorError(f"LLM director returned an invalid response: {error}") from error
+
+    async def expand_shot(
+        self,
+        *,
+        shot_input: dict[str, Any],
+        system_prompt: str,
+        max_tokens: int = H3_EXPANSION_MAX_TOKENS,
+    ) -> str:
+        """Turn one Shot's intent into an H3-format prompt. Returns the text, unparsed.
+
+        Text out, not JSON. An H3 prompt is a document with its own grammar, so wrapping it
+        in a JSON schema would only add an escaping layer for the model to get wrong on top
+        of a format it is already being asked to get right. What comes back is checked by
+        `h3_prompt.check`, at the route, where a failure can be reported to the Director
+        rather than swallowed here.
+
+        `max_tokens` is generous on purpose, and this is the one place a caller is likely to
+        want it larger still. Measured against the model loaded on the Director's machine on
+        2026-08-18: a reasoning model spent **899 of 900** tokens reasoning and returned an
+        empty `content` with `finish_reason: "length"`, and at 6000 it spent all 6000 the same
+        way. A budget that looks generous for the answer can still be nowhere near enough for
+        the thinking in front of it.
+
+        `chat_template_kwargs.enable_thinking` is an LM Studio / vLLM extension, not part of
+        the OpenAI schema. It is sent because it is the only thing that worked: `/no_think` in
+        the prompt did not suppress reasoning at all on that model, and this did. A provider
+        that rejects unknown body keys will 400, which is why the error below names the key —
+        the fix is to drop it, and a reader should not have to guess that.
+        """
+        if not self.base_url or not self.model:
+            raise DirectorUnavailable(
+                "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
+            )
+        headers = self._headers()
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(shot_input, ensure_ascii=False)},
+            ],
+            "temperature": 0.6,
+            "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        try:
+            response = await self._completion(body=body, headers=headers)
+            message = self._reply(response)
+        except (httpx.HTTPError, KeyError, IndexError, TypeError) as error:
+            raise DirectorError(
+                "LLM director returned an invalid response: "
+                f"{error}. If the provider rejected the request body, note that "
+                "chat_template_kwargs is an LM Studio / vLLM extension and may need removing."
+            ) from error
+
+        text = (message.get("content") or "").strip()
+        if text:
+            return text
+
+        # Empty content is not one failure, and the two need different words. A model that
+        # filled its budget with reasoning and never answered is a *budget* problem — the
+        # prompt may be perfect — and saying "invalid response" about it sends the reader to
+        # rewrite a prompt that was fine. Measured on this project's own machine, which is why
+        # the number is named rather than described.
+        reasoning = (message.get("reasoning_content") or "").strip()
+        if reasoning:
+            raise DirectorError(
+                f"The model spent its whole {max_tokens}-token budget reasoning and returned "
+                "no prompt. Raise the budget, or disable the model's thinking phase, or use a "
+                "model that does not reason before answering."
+            )
+        raise DirectorError("LLM director returned an empty prompt.")
 
     @staticmethod
     def _reply(response: httpx.Response) -> dict[str, Any]:

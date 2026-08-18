@@ -2,13 +2,14 @@ import json
 
 import pytest
 
-from music_video_producer.models import Project, Shot, Song
+from music_video_producer.models import AssetCitation, Project, Shot, Song
 from music_video_producer.timeline import (
     TimelineError,
     align_h3_frames,
     build_director_timeline,
     expansion_input,
     ordered_shots,
+    shot_expansion_input,
     song_section,
 )
 
@@ -333,3 +334,95 @@ def test_expansion_input_of_a_single_shot_plan_has_no_neighbours():
 
     assert built["shots"][0]["neighbours"] == {}
     assert built["shots"][0]["index"] == 0
+
+
+def _expansion_project() -> Project:
+    return Project(
+        name="Two passes",
+        treatment="A lone performer intercut with wild imagery.",
+        style_bible="Sodium amber and deep blacks.",
+        song=Song(
+            title="Harder Faster",
+            source="imported",
+            duration=154.6,
+            lyrics="[verse] there is a hunger",
+            caption="mid-tempo metal",
+        ),
+        shots=[
+            Shot(id="shot_a", start=0.0, duration=4.0, prompt="Wide on Lucy"),
+            Shot(id="shot_b", start=12.0, duration=3.75, prompt="Wolf B-roll",
+                 singing="not_singing"),
+            Shot(id="shot_c", start=20.0, duration=4.0, prompt="Close on her face"),
+        ],
+    )
+
+
+def test_the_per_shot_input_carries_the_neighbours_intents_not_their_expansions():
+    """The whole reason this pass is per-Shot rather than whole-plan.
+
+    Pass one withholds neighbour prompts because on a first pass they are placeholders. On
+    this pass they are real, and a cut that lands well needs to know what it is cutting from
+    — so intents are carried. Their *expansions* are not, and that is the line: two long-form
+    prompts per call is exactly the bloat that makes one-shot-for-all impossible.
+    """
+    project = _expansion_project()
+    project.shots[0].h3_prompt = "integrated_multimodal_description: [Shot 1] A long document."
+
+    built = shot_expansion_input(project, project.shots[1])
+
+    assert built["neighbours"]["previous"]["intent"] == "Wide on Lucy"
+    assert built["neighbours"]["next"]["intent"] == "Close on her face"
+    assert "A long document" not in json.dumps(built)
+    assert "h3_prompt" not in json.dumps(built)
+
+
+def test_the_per_shot_input_sends_the_whole_lyric_sheet_and_never_claims_it_is_the_window():
+    """Nothing aligns lyrics to time, so "the words for this window" cannot be built.
+
+    `song_section` is an empty branch for exactly this reason: there is no BPM or section
+    field on any model and no analyser. Sending the sheet under a key claiming it was this
+    clip's words would be a fabrication, so it goes as `lyrics` with `song_fraction` beside
+    it as the honest signal of position, and the specialist's prompt tells the model the
+    sheet is unaligned.
+    """
+    built = shot_expansion_input(_expansion_project(), _expansion_project().shots[1])
+
+    assert built["song"]["lyrics"] == "[verse] there is a hunger"
+    assert built["song"]["song_fraction"] == round(12.0 / 154.6, 4)
+    assert not any("window" in key for key in built["song"])
+
+
+def test_the_per_shot_input_numbers_the_reference_tags_the_model_may_use():
+    """The prompt forbids inventing a tag, and a model told only "you have two pictures"
+    will still guess at their numbers. Naming each tag beside its role removes the guess."""
+    project = _expansion_project()
+    project.shots[1].citations = [
+        AssetCitation(asset_id="asset_2", role="last", order=1),
+        AssetCitation(asset_id="asset_1", role="first", order=0),
+    ]
+
+    references = shot_expansion_input(project, project.shots[1])["shot"]["references"]
+
+    assert [entry["tag"] for entry in references] == ["<Picture 1>", "<Picture 2>"]
+    assert {entry["role"] for entry in references} == {"first frame", "last frame"}
+
+
+def test_the_per_shot_input_omits_what_a_shot_does_not_have():
+    """Absent rather than empty, the same discipline the whole-plan builder already keeps."""
+    project = Project(
+        name="Bare",
+        shots=[Shot(id="only", start=0.0, duration=4.0, prompt="A street at dawn")],
+    )
+
+    built = shot_expansion_input(project, project.shots[0])
+
+    assert "song" not in built
+    assert "neighbours" not in built
+    assert "references" not in built["shot"]
+    assert built["shot"]["index"] == 1 and built["shot"]["of"] == 1
+
+
+def test_the_per_shot_input_refuses_a_shot_from_another_project():
+    project = _expansion_project()
+    with pytest.raises(TimelineError):
+        shot_expansion_input(project, Shot(id="elsewhere", start=0.0, duration=4.0))

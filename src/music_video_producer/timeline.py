@@ -391,3 +391,97 @@ def expansion_input(project: Project) -> dict[str, Any]:
             song["caption"] = project.song.caption
         payload["song"] = song
     return payload
+
+
+def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
+    """The trimmed input for expanding **one** Shot into an H3-format prompt. Pure, I/O-free.
+
+    Per-Shot, deliberately, and the opposite shape to `expansion_input` above. That one is a
+    single whole-plan call because cross-shot variance is a property of the plan; this one is
+    one call per Shot because a single H3 prompt is long and thirty of them will not fit one
+    context — quality would degrade well before the limit. The two passes want opposite shapes
+    and this is the second.
+
+    What it carries was chosen by the Director on 2026-08-18: the Shot's own facts, the
+    **neighbours' intents**, the treatment and style bible, and the song. Explicitly *not* the
+    neighbours' expansions — those are the long form, and carrying two of them per call would
+    reintroduce exactly the bloat that makes one-shot-for-all impossible.
+
+    Neighbour *intents* rather than nothing, unlike `expansion_input`, which withholds neighbour
+    prompts on the reasoning that on a first pass they are all `""` or placeholders. On this pass
+    they are real: pass one has already run, and a cut that lands well needs to know what it is
+    cutting from.
+
+    **The lyric sheet is sent whole, and labelled as whole.** The Director asked for "the song's
+    words for this window", and that cannot be built: nothing in this project aligns lyrics to
+    time — `song_section` is an empty branch for exactly that reason, there is no BPM or section
+    field on any model, and the analyser does not exist. Sending the whole sheet under a key that
+    claimed it was this window's words would be a fabrication of precisely the kind this codebase
+    keeps catching. So it goes as `lyrics`, with `song_fraction` beside it as the honest signal of
+    where in the song this Shot sits, and the specialist's prompt is what tells the model the
+    sheet is not aligned.
+    """
+    payload: dict[str, Any] = {
+        "creative_brief": project.creative_brief,
+        "treatment": project.treatment,
+        "style_bible": project.style_bible,
+    }
+    ordered = ordered_shots(project)
+    index = next((i for i, other in enumerate(ordered) if other.id == shot.id), None)
+    if index is None:
+        raise TimelineError("that Shot is not in this project")
+
+    entry: dict[str, Any] = {
+        "id": shot.id,
+        "index": index + 1,
+        "of": len(ordered),
+        "start": shot.start,
+        "end": shot.end,
+        # The length the prompt's own cut times must fall inside. Named `duration` and not
+        # `window` because the prompt's clock starts at 00:00.000 regardless of `start`.
+        "duration": shot.duration,
+        "mode": resolve_shot_mode(shot),
+        "singing": shot.singing,
+        "intent": shot.prompt,
+    }
+    # Tags the specialist may use, numbered here rather than left to the model. The prompt
+    # forbids inventing one, and a model told "you have two pictures" will still guess at their
+    # numbers; naming each tag alongside its role removes the guess entirely. Pictures are the
+    # only kind a Shot can cite today, so every role numbers into the Picture series.
+    if shot.citations:
+        ordered_citations = sorted(shot.citations, key=lambda c: (c.role, c.order))
+        entry["references"] = [
+            {
+                "tag": f"<Picture {position}>",
+                "role": ASSET_ROLE_LABELS.get(citation.role, citation.role),
+                "asset_id": citation.asset_id,
+            }
+            for position, citation in enumerate(ordered_citations, start=1)
+        ]
+    payload["shot"] = entry
+
+    neighbours: dict[str, Any] = {}
+    if index > 0:
+        neighbours["previous"] = {"id": ordered[index - 1].id,
+                                  "intent": ordered[index - 1].prompt}
+    if index + 1 < len(ordered):
+        neighbours["next"] = {"id": ordered[index + 1].id, "intent": ordered[index + 1].prompt}
+    if neighbours:
+        payload["neighbours"] = neighbours
+
+    if project.song:
+        song: dict[str, Any] = {"title": project.song.title, "duration": project.song.duration}
+        if project.song.lyrics:
+            song["lyrics"] = project.song.lyrics
+        if project.song.caption:
+            song["caption"] = project.song.caption
+        # Where in the song this Shot sits, computed exactly as `expansion_input` computes it.
+        # It is the only honest signal available about which part of an unaligned lyric sheet
+        # this Shot might belong to.
+        song_duration = project.song.duration
+        if song_duration:
+            song["song_fraction"] = round(
+                min(1.0, max(0.0, shot.start / song_duration)), 4
+            )
+        payload["song"] = song
+    return payload
