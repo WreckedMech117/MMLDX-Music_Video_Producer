@@ -1,0 +1,338 @@
+{
+  "1987": {
+    "inputs": {
+      "PowerLoraLoaderHeaderWidget": {
+        "type": "PowerLoraLoaderHeaderWidget"
+      },
+      "lora_1": {
+        "on": true,
+        "lora": "ltx-2-19b-ic-lora-detailer.safetensors",
+        "strength": 0.9
+      },
+      "➕ Add Lora": "",
+      "model": [
+        "1996",
+        0
+      ],
+      "clip": [
+        "2002",
+        0
+      ]
+    },
+    "class_type": "Power Lora Loader (rgthree)",
+    "_meta": {
+      "title": "Power Lora Loader (rgthree)"
+    }
+  },
+  "1990": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "1991": {
+    "inputs": {
+      "value": 1920
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "LARGEST RESOLUTION"
+    }
+  },
+  "1993": {
+    "inputs": {
+      "video": "LTX-2_00074-audio.mp4",
+      "force_rate": 0,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "LTXV"
+    },
+    "class_type": "VHS_LoadVideo",
+    "_meta": {
+      "title": "Load Video (Upload) 🎥🅥🅗🅢"
+    }
+  },
+  "1994": {
+    "inputs": {
+      "frame_rate": [
+        "1992:370",
+        0
+      ],
+      "loop_count": 0,
+      "filename_prefix": "LTX2-UPSCAL",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "1992:1541",
+        0
+      ],
+      "audio": [
+        "1993",
+        2
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine 🎥🅥🅗🅢"
+    }
+  },
+  "1996": {
+    "inputs": {
+      "unet_name": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "1997": {
+    "inputs": {
+      "vae_name": "ltx-2.5-video-vae-conv-bf16.safetensors",
+      "device": "main_device",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "VAELoaderKJ",
+    "_meta": {
+      "title": "VAELoader KJ"
+    }
+  },
+  "1998": {
+    "inputs": {
+      "vae_name": "ltx-2.5-audio-vae-bf16.safetensors",
+      "device": "cpu",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "VAELoaderKJ",
+    "_meta": {
+      "title": "VAELoader KJ"
+    }
+  },
+  "2002": {
+    "inputs": {
+      "clip_name": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+      "type": "ltxv",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP - Text Encoder"
+    }
+  },
+  "2005": {
+    "inputs": {
+      "model_name": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    },
+    "class_type": "LatentUpscaleModelLoader",
+    "_meta": {
+      "title": "Load Latent Upscale Model"
+    }
+  },
+  "1992:367": {
+    "inputs": {
+      "frame_rate": [
+        "1992:370",
+        0
+      ],
+      "positive": [
+        "1992:366",
+        0
+      ],
+      "negative": [
+        "1992:366",
+        0
+      ]
+    },
+    "class_type": "LTXVConditioning",
+    "_meta": {
+      "title": "LTXVConditioning"
+    }
+  },
+  "1992:368": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "largest_size": [
+        "1991",
+        0
+      ],
+      "image": [
+        "1993",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToMaxDimension",
+    "_meta": {
+      "title": "Scale Image to Max Dimension"
+    }
+  },
+  "1992:370": {
+    "inputs": {
+      "video_info": [
+        "1993",
+        3
+      ]
+    },
+    "class_type": "VHS_VideoInfo",
+    "_meta": {
+      "title": "Video Info 🎥🅥🅗🅢"
+    }
+  },
+  "1992:372": {
+    "inputs": {
+      "noise_seed": 0
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "1992:374": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "1987",
+        0
+      ],
+      "positive": [
+        "1992:367",
+        0
+      ],
+      "negative": [
+        "1992:367",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider"
+    }
+  },
+  "1992:375": {
+    "inputs": {
+      "sigmas": "0.909375, 0.725, 0.421875, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "ManualSigmas"
+    }
+  },
+  "1992:379": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 500,
+      "temporal_overlap": 4,
+      "pixels": [
+        "1992:368",
+        0
+      ],
+      "vae": [
+        "1997",
+        0
+      ]
+    },
+    "class_type": "VAEEncodeTiled",
+    "_meta": {
+      "title": "VAE Encode (Tiled)"
+    }
+  },
+  "1992:381": {
+    "inputs": {
+      "temporal_tile_size": 56,
+      "temporal_overlap": 24,
+      "guiding_strength": 1,
+      "temporal_overlap_cond_strength": 0.5,
+      "cond_image_strength": 1,
+      "horizontal_tiles": 1,
+      "vertical_tiles": 1,
+      "spatial_overlap": 1,
+      "adain_factor": 0,
+      "guiding_start_step": 0,
+      "guiding_end_step": 1000,
+      "optional_cond_image_indices": "0",
+      "model": [
+        "1987",
+        0
+      ],
+      "vae": [
+        "1997",
+        0
+      ],
+      "noise": [
+        "1992:372",
+        0
+      ],
+      "sampler": [
+        "1990",
+        0
+      ],
+      "sigmas": [
+        "1992:375",
+        0
+      ],
+      "guider": [
+        "1992:374",
+        0
+      ],
+      "latents": [
+        "1992:379",
+        0
+      ],
+      "optional_guiding_latents": [
+        "1992:379",
+        0
+      ]
+    },
+    "class_type": "LTXVLoopingSampler",
+    "_meta": {
+      "title": "🅛🅣🅧 LTXV Looping Sampler"
+    }
+  },
+  "1992:1541": {
+    "inputs": {
+      "spatial_tiles": 4,
+      "spatial_overlap": 4,
+      "temporal_tile_length": 48,
+      "temporal_overlap": 8,
+      "last_frame_fix": false,
+      "working_device": "auto",
+      "working_dtype": "auto",
+      "vae": [
+        "1997",
+        0
+      ],
+      "latents": [
+        "1992:381",
+        0
+      ]
+    },
+    "class_type": "LTXVSpatioTemporalTiledVAEDecode",
+    "_meta": {
+      "title": "🅛🅣🅧 LTXV Spatio Temporal Tiled VAE Decode"
+    }
+  },
+  "1992:366": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "1987",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  }
+}
