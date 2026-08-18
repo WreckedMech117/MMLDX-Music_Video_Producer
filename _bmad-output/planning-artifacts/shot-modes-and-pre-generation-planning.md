@@ -102,3 +102,49 @@ Step 5 is the one that constrains the model: an image generated for a shot has a
 **The SongPlanner `max_duration` headroom rule is documented and not implemented.** `Music-Video.md`: *"max_duration: set this 50% longer than your target (60s lyrics → 90s max duration)."* `duration_seconds` tells the planner how long a song to write; `max_duration` caps the encoder's latent length. The adapter passes the same value to both, leaving no headroom, so a song whose lyrics run slightly long loses its ending. Both live SongPlanner runs were at the 30 s floor and returned 29.989 s, which is exactly where this would never show. Note honestly that the audited export *also* sets both to 200, so the creator's own example does not follow their stated advice — which is why this needs a decision rather than a silent fix.
 
 **Workflow tuning is available.** The Director has offered to adjust ComfyUI workflows and export new API versions on request. That materially changes what is buildable: a graph that is nearly right no longer has to be worked around in the adapter. Where an adapter would otherwise have to reproduce awkward wiring or drop a capability, asking for a tuned export is now the better move.
+
+
+---
+
+## The H3 prompt format, found 2026-08-18 - ProducerBot is standing in for a model that was never released
+
+The Director ran the assistant's first live smoke and judged its output "potentially sparce if it wants allot":
+
+> A grey wolf pacing through trees under amber light from behind; 35mm lens, grainy texture.
+
+That instinct was right, and the reason is stronger than sparseness. From `ComfyUI-Fantastic-MiniMaxH3-PromptBuilder`'s README, installed on this machine:
+
+> **H3 doesn't want a casual sentence - it wants a structured prompt with named sections, shot timings, speaker IDs, and tags pointing at your reference media.** MiniMax publishes a written guide for that format, and normally a separate rewriting model (`H3-Context-IR`) turns your idea into it. **That rewriter wasn't open-sourced.** This node pack is the hand-driven replacement.
+
+**So the assistant's real job is to be that rewriter.** Not to write a nicer sentence, but to produce a formally structured prompt in a documented format from a plain-language request. That is a much clearer job description than the spec had, and it is what "expands out that request as the video generator would prefer" actually means.
+
+### The format, from MiniMax's own guide
+
+The authoritative source is `Video_Prompt_Writing_Guide.pdf`, 20 pages, bundled at `custom_nodes/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder/web/`. It is a third-party document and is **not** copied into this repository - what follows are the structural rules derived from it, which is what an adapter needs.
+
+**Part one - an instruction line**, present only for the keyframe modes, always first, followed by one blank line. T2VA has none and begins directly at part two. I2VA, FL2VA and L2VA each have a fixed wording stating how each picture aligns to a time in the target video.
+
+**Part two - three named core fields**, in this order:
+
+| Field | Content |
+|---|---|
+| `integrated_multimodal_description` | Visuals, actions, shots, speakers, dialogue, singing and diegetic audio along the timeline |
+| `overall_soundscape` | Ambient sound, physical action sounds and non-verbal human sounds across the whole video |
+| `non_diegetic_music` | Score the characters cannot hear and only the audience can |
+
+**Within the description:**
+
+- `[Shot 1]` opens it and **must not carry a timestamp**. Later shots are `[Shot N] At MM:SS.mmm`, numbered in order with increasing cut times inside the video's length.
+- **A line break reads as a shot boundary**, so only `[Shot N]` may introduce one. Dialogue joins the description it belongs to rather than sitting on its own line.
+- Camera motion is written as motion type, amplitude and speed - "pushes in with small amplitude at slow speed", not "slow push in".
+- Speakers are `(S1)`, `(S2)` in the target video's speaking order; dialogue is wrapped `<d>[English] ...</d>`.
+- Reference media is tagged `<Picture 1>`, `<Video 1>`, `<Audio 1>`, `<Subject 1>`.
+- Full-reference mode adds one or two style sentences before `[Shot 1]`, subject definitions, and a `retention_analysis` whose markers (`fully_preserved`, `partially_preserved`, `attribute_transfer`, `weak_reference`, `reference`, `partially_copy`) must match how each reference was defined.
+
+**The five modes map onto ours**: T2VA, I2VA, FL2VA, L2VA and Reference - the same taxonomy `SHOT_MODE_SPECS` already declares, which is independent confirmation that the mode split is right.
+
+### What follows
+
+1. **`assistant_prompt.py` should teach the format**, and the assistant's output should be judged against it rather than against taste. This is the iteration the story shipped without.
+2. **The format is checkable.** The node pack validates shot numbering, monotonic cut times, `[Shot 1]` carrying no timestamp, balanced `<d>` tags, and references cited but never defined. Those are the same class of guarantee this project enforces elsewhere, and they can be checked before a render rather than after a bad one.
+3. **A cut time implies a length.** The pack snaps cut times to the 17k+5 grid the adapter already knows, so prompt structure and frame arithmetic are not independent concerns.
