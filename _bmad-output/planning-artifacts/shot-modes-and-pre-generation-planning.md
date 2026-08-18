@@ -148,3 +148,52 @@ The authoritative source is `Video_Prompt_Writing_Guide.pdf`, 20 pages, bundled 
 1. **`assistant_prompt.py` should teach the format**, and the assistant's output should be judged against it rather than against taste. This is the iteration the story shipped without.
 2. **The format is checkable.** The node pack validates shot numbering, monotonic cut times, `[Shot 1]` carrying no timestamp, balanced `<d>` tags, and references cited but never defined. Those are the same class of guarantee this project enforces elsewhere, and they can be checked before a render rather than after a bad one.
 3. **A cut time implies a length.** The pack snaps cut times to the 17k+5 grid the adapter already knows, so prompt structure and frame arithmetic are not independent concerns.
+
+
+---
+
+## Two passes, and a specialist per job - the Director's structure, 2026-08-18
+
+Set out by the Director after the first live assistant run:
+
+> The model was never released, fine, we understand well enough what it wants, so we could write an agent that has a sole task of replicating that prompt expansion. ProducerBot is just the one we are chatting with, specialized subagents and tools are in its box. [...] Given the length of these [...] that cant be done in one shot by one model in one context, rather it should be structured that when a shots prompt is generated the LLM knows enough context and awareness of the project and what shot it is working on to write out that shots prompt and then rinse and repeat for the next. Essentially the general shot plan which lays the shots out so they make sense and will flow together, then the expansion pass which goes through and fills in the detail.
+
+### Pass one already exists
+
+`POST /api/projects/{id}/director/expand` is a **single whole-plan call**, and `docs/LLM-DIRECTOR.md` states why in exactly these terms: *"per-shot calls cannot see each other, and cross-shot variance is the point."* That is the general shot plan - short intents, laid out so they make sense together and differ from one another. It is pass one, already built and already correct for the job.
+
+The mistake would be to read the Director's "cannot be done in one shot" as a criticism of that route. It is not. **The two passes want opposite shapes**, and that is the insight:
+
+| | Pass one - the plan | Pass two - the expansion |
+|---|---|---|
+| Call shape | One call, whole plan | One call **per shot** |
+| Why | Cross-shot variance and flow require seeing the shots together | A single H3 structured prompt is long; thirty of them will not fit one context, and quality would degrade well before the limit |
+| Output | A short intent per shot | The full `integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music` structure |
+| Failure it prevents | Thirty shots that each read as the only shot | A prompt that is a sentence where the model wanted a document |
+
+### The specialist, and what it must know
+
+ProducerBot is the conversational surface; the expansion agent is a **specialist with one job** - turn a shot's intent into H3's documented format. It is the `H3-Context-IR` replacement, and its narrowness is the point: a model doing one well-specified transformation with a good system prompt is a far better bet than the same model doing that plus conversation plus tool selection.
+
+The open design question is what a per-shot call must carry to keep continuity without paying for the whole plan. Candidates, in rough order of obviousness:
+
+- The shot's own intent, window, mode, cited assets and roles, and whether the performer is singing.
+- The treatment and style bible - the continuity contract already exists for this.
+- **The neighbours' intents**, which pass one deliberately withheld from itself. Expansion withheld neighbour prompts because on a first pass they were all placeholders; on this pass they are real, and a cut that lands well needs to know what it is cutting from.
+- The song's words **for this shot's window**, now that windowing exists.
+
+That last pair is the interesting one: the same trimming discipline `expansion_input` established applies, but the trim is different because the job is different. A per-shot payload is not a smaller whole-plan payload.
+
+### Where it is triggered
+
+Three surfaces, all the same specialist:
+
+1. **Per shot, on demand** - an "Expand prompt" control in the shot's text section, for a Director editing one shot.
+2. **Across a plan** - the pass-two sweep, shot by shot, after pass one has laid them out.
+3. **Through ProducerBot** - as a tool in its box, so a conversational request can reach it.
+
+### What this changes about what is already recorded
+
+- **`Shot.prompt` holds an intent, not an H3 prompt**, and pass two produces something structurally different and much longer. Overwriting the intent with the expansion would destroy the human-editable, human-readable thing pass one wrote, and make re-expansion impossible. These want to be two fields. That decision belongs to the Director.
+- **The existing expansion's neighbour rule was reasoned for pass one** and should be re-reasoned for pass two rather than inherited.
+- **VRAM sequencing gets more important, not less.** Thirty per-shot calls is thirty language-model calls, which is exactly the text-heavy front-loading the Director asked for on 2026-08-17 - do it all before any render, so the model loads once.
