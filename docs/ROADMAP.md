@@ -31,6 +31,9 @@
 
 ## Accepted by the Director, specced, not yet built
 
+> **Missing pipeline step, established 2026-08-18: nothing puts the real song back.** H3 *generates* its output audio — `VHS_VideoCombine.audio` comes from a `VAEDecodeAudio` on the sampler's latent, in our adapter and in both canonical exports alike — so a song attached with `use_song_audio` conditions the lip movement as `ref_audios` but never becomes the soundtrack. Measured: the rendered clip correlates with the source at ≈ 0.01 at every lag and is 3.4× louder, a regeneration rather than a copy. A finished cut therefore needs the master muxed back over the generated audio. The Director's `LTX2.5 AudioReplacer` graph is exactly that, and adapting it is unbuilt. **This is not a defect in the adapter** — it matches its evidence node for node — it is a stage the pipeline does not have yet, and it bears directly on assembly (FR-22).
+
+
 > **Open defect, found 2026-08-18: a reference shot hears the wrong part of the song.** `use_song_audio` hands the reference path the **entire song file with no offset**, so H3 lip-syncs to the first seconds of the track wherever the shot actually sits — a shot at 1:20 performs the opening bars. The text-only Director path already sends `start_second`/`end_second`; the two paths disagree. **Every live reference render in this project has used a shot at `start = 0.0`**, the one value where the bug and correct behaviour are identical, which is why no test or smoke caught it. Found by ear: the test render's audio has no intelligible words, and the mangled face follows from H3 being driven by an instrumental intro with no phonemes to sync to. Specced as `spec-song-audio-window.md`. **Consequence for everything else recorded here: no judgement about H3 face or lip-sync fidelity on this project's renders is trustworthy**, because none of them heard the right seconds.
 
 
