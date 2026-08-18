@@ -609,6 +609,132 @@ def render_again_refusal(project: Project, shot: Shot) -> tuple[int, str] | None
     return None
 
 
+#: The Shot statuses the mark-ready action owns — the two sides of a Shot's *first* render.
+#:
+#: Deliberately the exact complement of `RENDER_AGAIN_STATUSES` plus the in-flight pair, and a
+#: test pins that: every member of `ShotStatus` belongs to exactly one of the two actions, so a
+#: status added later cannot fall through both and become a Shot nothing can move.
+#:
+#: `api.js`'s MARK_READY_STATUSES is the frontend half and decides when the control is drawn at
+#: all. A contract test asserts the two lists are identical, for `RENDER_AGAIN_STATUSES`' reason:
+#: a control offered for a status the route does not own is a button whose only outcome is a
+#: refusal.
+MARK_READY_STATUSES: tuple[ShotStatus, ...] = ("draft", "ready")
+
+# Why one Shot may not be armed for, or taken back from, its first render. Each names the Shot as
+# the timeline names it, for `render_again`'s reason: a bare `shot_a1b2c3d4e5f6` appears nowhere in
+# the interface.
+#
+# The lock wording is `RENDER_AGAIN_LOCKED_REFUSAL`'s argument applied to this action rather than a
+# copy of its sentence, because the two actions do different things and a sentence about
+# "re-opening it for another render" read on a shot that has never rendered describes nothing the
+# Director did. What is shared is the rule and the remedy: a lock is a deliberate hands-off, and the
+# human who set it can undo it.
+MARK_READY_LOCKED_REFUSAL = (
+    "{shot} is locked. A lock is a deliberate hands-off on this shot, and committing it to the "
+    "render queue is exactly the kind of change it refuses. Unlock the shot first."
+)
+# A Shot past its first render is the other action's subject, and the refusal says so by name
+# rather than only refusing. Without the direction, a Director looking at a completed shot is told
+# what they may not do and nothing about what they may — and the thing they may do is one button
+# further down the same panel.
+MARK_READY_ALREADY_RENDERED_REFUSAL = (
+    "{shot} has already been through a render, so it is past the point this action is about. "
+    'Committing a shot to the queue applies to its first render; use "Render again" to re-open a '
+    "shot that has already produced a take."
+)
+# The in-flight case, separated from the settled one because the honest sentence differs and the
+# direction above would be wrong: "Render again" refuses a live render too, so sending a Director
+# there would spend a second click on a second refusal. Stated as the concrete harm, with the same
+# staleness escape `RENDER_AGAIN_IN_FLIGHT_REFUSAL` names, because job status only moves when
+# `read_job` is asked.
+MARK_READY_IN_FLIGHT_REFUSAL = (
+    "A render for {shot} has not finished, so its status is not yours to set right now. Wait for "
+    "it, or refresh the render queue if it has already finished and this project has not been "
+    "told yet."
+)
+# An approval is an editorial decision about one specific take. A Shot carrying one is not a Shot
+# waiting for its first render, whatever its status field happens to say — `approved_output` is
+# settable independently of `status`, so this is reachable without the `approved` status and must
+# not be a way past `RENDER_AGAIN_APPROVED_REFUSAL`'s argument.
+MARK_READY_APPROVED_REFUSAL = (
+    "{shot} carries an approved take, which is an editorial decision about one specific take "
+    "rather than a shot waiting to be rendered. Clear the approval first if the decision has "
+    "changed."
+)
+# Deliberately ASCII, exactly as `batch.READINESS_REFUSAL` and the render-again refusals are, and
+# for the same reason: the frontend halves are read back through node, whose stdout the contract
+# test decodes with the platform encoding on Windows.
+
+# What the Director is told after each direction, said rather than implied. Both sentences exist to
+# manage one belief and its opposite.
+#
+# Marking ready is the step immediately before the expensive one, so the thing worth saying is that
+# it is *not* the expensive one: nothing has been rendered and nothing has been spent. A bare
+# "marked ready" toast beside a button that arms a GPU job invites the reading that the job started.
+MARK_READY_NOTICE = (
+    "{shot} is committed to the render queue. Nothing has been rendered and no GPU time has been "
+    "spent by this: the queue submits it when you choose to."
+)
+# And un-committing has to say that it costs nothing, or a Director who is unsure will leave a shot
+# armed rather than risk losing the prompt they wrote.
+MARK_DRAFT_NOTICE = (
+    "{shot} is back to draft, so the render queue will not submit it. Nothing else about the shot "
+    "changed and nothing was deleted."
+)
+
+
+def mark_ready_refusal(
+    project: Project, shot: Shot, *, target: ShotStatus
+) -> tuple[int, str] | None:
+    """Why this Shot may not be moved to `target`, as (status code, sentence), or None.
+
+    One function for both directions and one place the *order* can be read, exactly as
+    `render_again_refusal` is. The order is the same argument as that function's: the first three
+    ask whether this Shot may be touched at all, and the prompt gate asks whether rendering it
+    would produce anything. A locked Shot with a blank prompt is refused for its lock, because
+    unlocking is what the Director has to do first.
+
+    The prompt gate is last, is asked only in the arming direction, and is asked **from the prompt
+    as it is right now**. Only in the arming direction because `draft` is the un-armed state:
+    refusing to disarm a Shot whose prompt was emptied would trap it armed, which is precisely
+    backwards. And from the prompt right now because marking ready is not a certificate — nothing
+    downstream may read `status == "ready"` as evidence about the prompt a Shot has *later*, which
+    is why `generate_h3` asks the same question again and why a matrix row exists for a Shot whose
+    prompt is emptied after it was marked.
+
+    Asked through `prompt_is_missing` rather than through `readiness_report`, for
+    `render_again_refusal`'s reason: both are AD-5's one implementation — `readiness_report` calls
+    `prompt_rejection` per Shot and this calls it through `prompt_is_missing`, so there is no
+    second definition of empty — but this action is about exactly one Shot and has no use for a
+    whole-plan pass. The refusal sentence is `readiness_refusal`'s, so the Director reads the same
+    instruction here as at submission.
+    """
+    # First, and ahead of everything including the status class, for `render_again`'s reason: an
+    # in-flight Shot is the one state where getting this wrong does concrete harm, and it is the
+    # state a hand-walked-back status hides. `draft` with a live job is exactly that case, so this
+    # must not be reachable only through the statuses below.
+    #
+    # 409 rather than 422, and the only refusal here that is not a 422. A live render is a state
+    # conflict — the same request will succeed once the render lands, and nothing about it is
+    # unprocessable — which is why `render_again` answers 409 for this exact shot, and answering it
+    # differently through this route was an inconsistency the Director renegotiated on 2026-08-18.
+    # The rest stay 422: locked, already-rendered, approved and the prompt gate are all facts about
+    # the Shot that no amount of waiting changes. A route test asserts this and `render_again` give
+    # one code for one live render, because the drift is what the change exists to close.
+    if shot_render_in_flight(project, shot):
+        return 409, MARK_READY_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot))
+    if shot.status not in MARK_READY_STATUSES:
+        return 422, MARK_READY_ALREADY_RENDERED_REFUSAL.format(shot=shot_label(project, shot))
+    if shot.locked:
+        return 422, MARK_READY_LOCKED_REFUSAL.format(shot=shot_label(project, shot))
+    if shot.approved_output:
+        return 422, MARK_READY_APPROVED_REFUSAL.format(shot=shot_label(project, shot))
+    if target == "ready" and prompt_is_missing(shot):
+        return 422, readiness_refusal([shot_label(project, shot)])
+    return None
+
+
 def shot_render_in_flight(project: Project, shot: Shot) -> bool:
     """True when a render for this Shot has been accepted and is not known to have finished.
 
@@ -845,8 +971,9 @@ class H3Request(BaseModel):
     height: int = Field(default=768, ge=256, le=2048, multiple_of=32)
     # `None` rather than 20 so an omitted count is distinguishable from one the Director
     # typed. The reference profiles carry different step counts — 20 for the audited
-    # export's graph, 4 for the turbo bundle — and a literal default here would silently
-    # send 20 steps into a 4-step LoRA bundle for every caller who never touched the field.
+    # export's graph, 4 for the turbo bundle, 8 for the canonical References2V one — and a
+    # literal default here would silently send 20 steps into a 4-step LoRA bundle for every
+    # caller who never touched the field.
     # An omitted count falls through to the profile's own; the text-only Director path,
     # which takes no profile, falls through to `H3_DIRECTOR_DEFAULT_STEPS` — the same 20
     # it defaulted to here before.
@@ -856,7 +983,7 @@ class H3Request(BaseModel):
     # a `Literal` is what puts the choices in `/openapi.json` and turns an unknown value
     # into a 422 before any payload is built. `tests/test_api.py` asserts the two lists
     # agree, so a profile added to the builder and not offered here fails loudly.
-    profile: Literal["default", "turbo"] = "default"
+    profile: Literal["default", "turbo", "turbo-references2v"] = "default"
 
 
 # A flag a client omits and a flag a client sends as `null` mean the same thing — "I am not
@@ -1565,6 +1692,13 @@ def create_app(
         a save displaced a blank, and that restores — a Director who pasted a sheet over an empty
         field has a real previous version, and telling them the blank is unrecoverable would be
         the conflation `Song`'s own docstring exists to avoid.
+
+        An empty slot refuses with **409**, which is `restore_document`'s code for the identical
+        question. It was 422 when this shipped, because the frozen matrix said so; the Director
+        renegotiated it on 2026-08-18 rather than leave two restore routes answering "nothing was
+        kept" with two different codes. Nothing about *which* states refuse moved with it — only
+        the number — and a route test asserts the two restores stay equal, because the drift is
+        what the change exists to close.
         """
         project = get_project(project_id)
         if project.song is None:
@@ -1573,7 +1707,7 @@ def create_app(
         previous = getattr(project.song, slot)
         if previous is None:
             raise HTTPException(
-                status_code=422,
+                status_code=409,
                 detail=SONG_CONTEXT_RESTORE_REFUSAL.format(field=SONG_CONTEXT_LABELS[field]),
             )
         setattr(project.song, slot, getattr(project.song, field))
@@ -2153,6 +2287,77 @@ def create_app(
         # nothing.
         shot.status = "ready"
         return store.save(project)
+
+    def _set_shot_commitment(project_id: str, shot_id: str, target: ShotStatus) -> Project:
+        """Move one Shot between `draft` and `ready`. The whole of both routes below.
+
+        Its own action rather than the shots write, for `render_again`'s reason and it is the
+        stronger case here because this is the *common* path rather than a repair: `PUT /shots`
+        takes the whole Shot list from the client, so a request whose only intent was "I have
+        decided to render this one" also carries — and can therefore silently overwrite — every
+        prompt, window, reference and lock in the plan, from however long ago the client loaded
+        them. These routes take **no body at all**. There is nothing on the wire for a stale client
+        to reassert, and the only field written is `status`. A route test pins that: everything
+        else in the manifest compares byte-identical across the call.
+
+        The no-op comes *after* the refusals, unlike `render_again`'s, and the difference is not an
+        oversight. `render_again` checks its no-op first because `draft` carrying the `"New shot"`
+        placeholder is the commonest state in the application and refusing it for its prompt would
+        both fail the wrong test and turn that state into an error. Here there is no such case:
+        every refusal below is a fact the Director needs whether or not the field already holds the
+        value they asked for. A `ready` Shot whose prompt has since been emptied says so rather
+        than answering a shrug, which is the only way they learn it before the render refuses it.
+
+        Not a certificate. Reaching `ready` is a decision the Director made about this Shot at this
+        moment; it is not a fact about the prompt, and `generate_h3` asks the prompt question again
+        from scratch when the shot is actually submitted. Nothing here is remembered by that gate.
+
+        The response is the whole project, as every other purpose-built action returns, so the
+        client redraws the timeline, the inspector and the queue button from one reply.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        refusal = mark_ready_refusal(project, shot, target=target)
+        if refusal:
+            raise HTTPException(status_code=refusal[0], detail=refusal[1])
+        # Nothing to change, so nothing is written and nothing is saved: an unchanged manifest must
+        # not get a fresh `updated_at`, or a request that did nothing would collide with the next
+        # `PUT /projects` optimistic-concurrency check for no reason.
+        if shot.status == target:
+            return project
+        # The whole write. Nothing else about the Shot is this action's business — a Director who
+        # arms a shot and then thinks better of it must get back exactly what they had.
+        shot.status = target
+        return store.save(project)
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/mark-ready", response_model=Project)
+    def mark_shot_ready(project_id: str, shot_id: str) -> Project:
+        """Commit one drafted Shot to the render queue. Its own action, no body.
+
+        The missing first step of the primary journey. `Shot.status` defaults to `"draft"`, the
+        queue button submits only what reads `"ready"`, and until this existed nothing in the
+        shipped interface ever wrote that — so the render pipeline was reachable only by an API
+        client, which is how every live render in this project had actually been driven.
+
+        Never automatic, and that is a rule rather than an omission. Applying a Director shot plan
+        does not do it, expansion writing prompts does not do it, and no other write may: a shot
+        becoming submittable is a decision someone made, and a Director who ran expansion to see
+        what the model suggested must not discover they had armed a whole plan for rendering.
+        """
+        return _set_shot_commitment(project_id, shot_id, "ready")
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/mark-draft", response_model=Project)
+    def mark_shot_draft(project_id: str, shot_id: str) -> Project:
+        """Take one committed Shot back out of the render queue. Its own action, no body.
+
+        How a Director un-commits, and it has to be as cheap as committing was or the commitment
+        stops being one: a decision nobody can walk back is a decision people avoid making. No
+        prompt gate on this direction — `draft` is the un-armed state, so refusing to disarm a
+        Shot whose prompt was emptied would trap it armed, which is exactly backwards.
+        """
+        return _set_shot_commitment(project_id, shot_id, "draft")
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)
     async def director_chat(project_id: str, request: DirectorRequest) -> Project:

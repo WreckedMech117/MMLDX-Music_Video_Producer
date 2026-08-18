@@ -8,18 +8,20 @@ with a live, user-managed ComfyUI (never started or stopped here):
 
     uv run python tests/preflight_h3_ultra.py [base_url] [--record]
 
-Nine payload variants are audited separately, chosen to reach every input either
+Ten payload variants are audited separately, chosen to reach every input either
 adapter can emit: one picture; the full 9 pictures + 3 videos + 3 audios, which
 fills every autogrow slot the graph offers; a video carrying its paired
 soundtrack; ``ref_image_size="max"``; the longest window that still fits the
 node's frame ceiling; and **both ends of every range the H3 request model
 allows**, because a variant that only ever sends one safe midpoint would pass the
-range check no matter where the bound moved. **Both sampling profiles** are here:
-the eight default-profile variants and one turbo variant, which is the only one
-carrying a ``LoraLoaderModelOnly`` — so the LoRA's class being registered and its
-file being installed are confirmed before any GPU time, rather than discovered by
-a submission that fails. The text-only Director graph is audited here too: it is
-the one H3 path with live render evidence, and it was covered by nothing.
+range check no matter where the bound moved. **Every sampling profile** is here:
+eight default-profile variants and one variant per LoRA-carrying profile
+(``turbo`` and ``turbo-references2v``). Those two are the only ones carrying a
+``LoraLoaderModelOnly``, and each names a *different* LoRA file — so both files
+being installed, and the class being registered, are confirmed before any GPU
+time rather than discovered by a submission that fails. The text-only Director
+graph is audited here too: it is the one H3 path with live render evidence, and
+it was covered by nothing.
 
 Beyond the shared per-node validation, six claims about the *adapters* are
 checked against the live schema:
@@ -34,8 +36,8 @@ checked against the live schema:
   ``LoraLoaderModelOnly.strength_model`` declares, so the refusal a profile gets
   at definition time is the node's rule rather than a number this project invented;
 * the model files the payloads actually name — read out of the payloads, never
-  restated here, so the turbo profile's LoRA joins the list by being *loaded*
-  rather than by being mentioned — are present in their loaders' combo options;
+  restated here, so each profile's LoRA joins the list by being *loaded* rather
+  than by being mentioned — are present in their loaders' combo options;
 * every bound ``H3Request`` enforces sits inside the bound the node enforces, so
   a request the route accepts can never be refused by ComfyUI.
 
@@ -181,14 +183,30 @@ def audit_payloads() -> list[tuple[str, dict]]:
         (
             # The turbo bundle exactly as the Director renders it: the LoRA at its
             # strength, `beta`/`euler`, and no step count, so the profile supplies its
-            # own 4. This is the only variant carrying a `LoraLoaderModelOnly`, and it is
-            # what puts the LoRA's class and filename in front of the live schema.
+            # own 4. This is one of the two variants carrying a `LoraLoaderModelOnly`, and
+            # it is what puts that class and this LoRA's filename in front of the live
+            # schema.
             "turbo-profile",
             build_h3_reference_payload(
                 prompt="<Picture 1>",
                 references=pictures[:1],
                 duration=8,
                 profile="turbo",
+                **shared,
+            ),
+        ),
+        (
+            # The canonical `MiniMaxH3Turbo References2V` bundle: a *different* LoRA file
+            # at a different strength with a different scheduler and step count, so it
+            # earns its own variant rather than being assumed covered by the one above —
+            # a filename nothing loads is a filename nothing confirms installed. Nothing
+            # has been rendered on this profile; auditing it is not evidence of a frame.
+            "turbo-references2v-profile",
+            build_h3_reference_payload(
+                prompt="<Picture 1>",
+                references=pictures[:1],
+                duration=8,
+                profile="turbo-references2v",
                 **shared,
             ),
         ),

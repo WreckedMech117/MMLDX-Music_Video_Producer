@@ -403,7 +403,7 @@ class H3SamplingProfile:
             )
 
 
-#: The two configurations that have evidence behind them, each reproduced in full.
+#: The three configurations that have evidence behind them, each reproduced in full.
 #:
 #: ``default`` is the audited export
 #: ``workflow_templates/reference_exports/h3-ultra-references-user-export.json``: node
@@ -420,8 +420,31 @@ class H3SamplingProfile:
 #: ``124`` schedules ``beta`` at 4 steps and node ``123`` selects ``euler``. That LoRA
 #: is trained for the ``ref2v`` checkpoint this adapter already loads.
 #:
-#: Only the bundles are proven. Neither the LoRA on its own nor either scheduler paired
-#: with the other profile's sampler has been rendered by anyone here.
+#: ``turbo-references2v`` is the Director's *canonical* turbo reference-to-video graph —
+#: the ComfyUI mode named ``MiniMaxH3Turbo References2V``, exported per mode on 2026-08-17
+#: and audited as
+#: ``workflow_templates/reference_exports/h3-turbo-references2v-user-export.json``: node
+#: ``2390`` (``Power Lora Loader (rgthree)``) carries a single enabled entry —
+#: ``minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors`` at strength 1.0 with
+#: ``"on": true`` — on the same ``ref2va`` UNET (node ``2417``) this adapter loads; node
+#: ``2408`` schedules ``simple`` at 8 steps and node ``2407`` selects ``euler``. Its sigma
+#: shift (``12``/``3``) and disabled sage attention are what this adapter already emits.
+#:
+#: It is named after the graph it reproduces rather than after a speed claim, because it is
+#: a *different bundle* from ``turbo`` rather than a correction of it: ``turbo`` comes from
+#: the LTX 2.5 music-video pipeline, a different LoRA at a different strength with a
+#: different scheduler and step count. Both are the Director's, both are evidenced, and
+#: mixing them would produce exactly the unproven third combination this class exists to
+#: prevent — so both ship, whole.
+#:
+#: Its LoRA reaches the graph through this adapter's ``LoraLoaderModelOnly`` rather than the
+#: export's ``Power Lora Loader (rgthree)``; the reasoning is in
+#: ``build_h3_reference_payload``. **Nothing has been rendered on this profile from this
+#: application.** It is schema-audited only: its LoRA file is confirmed installed by
+#: ``tests/preflight_h3_ultra.py``, which is not evidence of a frame.
+#:
+#: Only the bundles are proven. No LoRA on its own, and no scheduler, sampler or step count
+#: borrowed across two profiles, has been rendered by anyone here.
 H3_REFERENCE_PROFILES: dict[str, H3SamplingProfile] = {
     "default": H3SamplingProfile(
         lora=None,
@@ -436,6 +459,13 @@ H3_REFERENCE_PROFILES: dict[str, H3SamplingProfile] = {
         scheduler="beta",
         sampler="euler",
         steps=4,
+    ),
+    "turbo-references2v": H3SamplingProfile(
+        lora="minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+        lora_strength=1.0,
+        scheduler="simple",
+        sampler="euler",
+        steps=8,
     ),
 }
 
@@ -467,9 +497,22 @@ def build_h3_reference_payload(
 
     ``profile`` selects a whole configuration from ``H3_REFERENCE_PROFILES`` — LoRA,
     strength, scheduler, sampler and step default together. The default profile emits
-    exactly the graph this builder emitted before profiles existed; the turbo profile
-    inserts the Director's ``LoraLoaderModelOnly`` between ``mvp:model`` and
-    ``mvp:shift`` so everything downstream draws from the LoRA rather than the loader.
+    exactly the graph this builder emitted before profiles existed; a profile carrying a
+    LoRA inserts one ``LoraLoaderModelOnly`` between ``mvp:model`` and ``mvp:shift`` so
+    everything downstream draws from the LoRA rather than the loader.
+
+    That node class is the Director's own on the ``turbo`` profile's source graph. It is
+    **not** the class ``turbo-references2v``'s export uses: that one carries its LoRA in a
+    ``Power Lora Loader (rgthree)``, and reproducing that class here was considered and
+    deliberately rejected. Live ``/object_info`` declares *no* ``lora_*`` inputs on it —
+    its ``required`` map is empty and only ``model``/``clip`` are optional, because its
+    LoRA rows are client-side widgets — so a faithful copy would put the filename and the
+    strength where the schema cannot see them: the pre-flight could no longer confirm the
+    file is installed or the strength is in range, and would report the reproduction's own
+    widget keys as inputs that do not exist. One enabled row in that loader is the same
+    model patch ``LoraLoaderModelOnly`` applies, so the cost of the substitution is that
+    ``turbo-references2v`` is evidenced in its *values* and not in its wiring. Said here
+    because an unstated substitution is the part that would mislead.
 
     ``steps`` left as ``None`` takes the profile's own count — the number its evidence
     was rendered at. A count supplied here overrides it: the profile chooses the graph,

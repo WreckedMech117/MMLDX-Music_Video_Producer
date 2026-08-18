@@ -18,6 +18,11 @@ from music_video_producer.app import (
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
     EXPANSION_REJECTED_EMPTY_NOTICE,
+    MARK_READY_ALREADY_RENDERED_REFUSAL,
+    MARK_READY_APPROVED_REFUSAL,
+    MARK_READY_IN_FLIGHT_REFUSAL,
+    MARK_READY_LOCKED_REFUSAL,
+    MARK_READY_STATUSES,
     RENDER_AGAIN_APPROVED_REFUSAL,
     RENDER_AGAIN_IN_FLIGHT_REFUSAL,
     RENDER_AGAIN_LOCKED_REFUSAL,
@@ -44,7 +49,7 @@ from music_video_producer.app import (
     document_first_draft_notice,
     prose_claims_shots,
 )
-from music_video_producer.batch import readiness_refusal
+from music_video_producer.batch import PLACEHOLDER_PROMPT, readiness_refusal
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.director import (
@@ -763,14 +768,21 @@ def test_an_empty_previous_version_is_a_real_one_and_restores(tmp_path: Path):
 def test_song_context_restore_with_nothing_kept_is_refused_and_changes_nothing(
     tmp_path: Path, field: str
 ):
-    """An empty slot must refuse rather than blank the live text — that is the loss, not the fix."""
+    """An empty slot must refuse rather than blank the live text — that is the loss, not the fix.
+
+    Deliberately says nothing about *which* code comes back; that is
+    `test_both_restore_routes_answer_an_empty_slot_with_one_code`'s job. The two are separate on
+    purpose: this one is the guarantee that an empty slot refuses at all and that the live text
+    survives, and it has to keep failing if the `previous is None` check is dropped by someone who
+    leaves the number beside it untouched.
+    """
     client, store, _ = make_client(tmp_path)
     project = store.create(Project(name="Nothing kept"))
     import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
 
     response = restore_context(client, project.id, field)
 
-    assert response.status_code == 422
+    assert not response.is_success, response.text
     detail = response.json()["detail"]
     assert isinstance(detail, str)
     assert SONG_CONTEXT_LABELS[field] in detail
@@ -780,6 +792,42 @@ def test_song_context_restore_with_nothing_kept_is_refused_and_changes_nothing(
     assert saved.caption == IMPORTED_SONG_STYLE
     assert saved.lyrics_previous is None
     assert saved.caption_previous is None
+
+
+def test_both_restore_routes_answer_an_empty_slot_with_one_code(tmp_path: Path):
+    """Two restores, one question — "nothing was kept" — and one status code between them.
+
+    The song-context restore answered 422 for an empty slot until 2026-08-18 while the older
+    document restore answered 409 for the identical condition. The Director renegotiated it to 409:
+    one application answering the same question two ways is the defect, and the older route is the
+    precedent. Nothing about *when* either refuses moved with it.
+
+    Asserted as an equality between the two routes as well as against the literal. The literal
+    alone pins today's behaviour; the equality is what fails the next time one of them is edited
+    without the other, which is exactly how the two drifted apart in the first place.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Neither has kept anything"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+
+    codes = {
+        "song/lyrics": restore_context(client, project.id, "lyrics").status_code,
+        "song/caption": restore_context(client, project.id, "caption").status_code,
+        "document/treatment": client.post(
+            f"/api/projects/{project.id}/documents/treatment/restore"
+        ).status_code,
+        "document/style_bible": client.post(
+            f"/api/projects/{project.id}/documents/style_bible/restore"
+        ).status_code,
+    }
+
+    assert set(codes.values()) == {409}, codes
+    # Both refusals are still refusals of the same thing: nothing was written by either.
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.lyrics == IMPORTED_LYRIC_SHEET
+    assert saved.song.lyrics_previous is None
+    assert saved.treatment == ""
+    assert saved.treatment_previous == ""
 
 
 def test_song_context_restore_needs_a_song_and_a_known_field(tmp_path: Path):
@@ -1002,7 +1050,7 @@ def test_a_song_saved_before_recovery_existed_loads_with_no_slots(tmp_path: Path
     assert loaded.status_code == 200
     assert loaded.json()["song"]["lyrics_previous"] is None
     assert loaded.json()["song"]["lyrics"] == IMPORTED_LYRIC_SHEET
-    assert restore_context(client, project.id, "lyrics").status_code == 422
+    assert restore_context(client, project.id, "lyrics").status_code == 409
 
 
 def test_song_context_mapping_field_names_and_labels_cannot_drift():
@@ -2721,6 +2769,608 @@ def test_render_again_statuses_are_exactly_the_settled_ones(tmp_path: Path):
     assert settled <= set(get_args(ShotStatus))
     # The in-flight statuses and the settled ones must not overlap, or a Shot could be both.
     assert settled.isdisjoint({"queued", "running"})
+
+
+def shot_status_writes(payload) -> list[str]:
+    """Every Shot `status` value carried by a request body, however deeply it is nested.
+
+    A Shot is recognised by carrying a `prompt` alongside its `status`, which is what tells a Shot
+    dict apart from the `RenderJob` and `Song` dicts that also carry a `status` and travel in the
+    same whole-project body. The recursion is the point: `PUT /projects/{id}` binds a whole
+    `Project`, so a status write can arrive several levels down from the key anyone would grep for.
+    """
+    found: list[str] = []
+    if isinstance(payload, dict):
+        value = payload.get("status")
+        if isinstance(value, str) and "prompt" in payload:
+            found.append(value)
+        for item in payload.values():
+            found.extend(shot_status_writes(item))
+    elif isinstance(payload, list):
+        for item in payload:
+            found.extend(shot_status_writes(item))
+    return found
+
+
+class WithoutStatusWrites:
+    """A client that fails the instant a request body writes a Shot status other than `draft`.
+
+    The journey below is only evidence if it really is the journey. A single `"status": "ready"`
+    slipped into a shots save would make every assertion in it pass while proving nothing — and
+    that shortcut is not hypothetical, it is how every live render in this project has actually
+    been driven. So the constraint is enforced mechanically rather than promised in a docstring.
+
+    `"draft"` is allowed through because `app.js` stamps it onto every Shot it creates and sends it
+    back on every whole-list save; forbidding it would forbid the interface's own behaviour. What
+    is forbidden is a body that *arms* a Shot, which is the thing the application had no way to do.
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self.statuses: list[str] = []
+
+    def _guard(self, kwargs: dict) -> None:
+        for written in shot_status_writes(kwargs.get("json")):
+            self.statuses.append(written)
+            assert written == "draft", (
+                f"this journey wrote status={written!r} directly, which is the API-client "
+                "shortcut it exists to prove is no longer needed"
+            )
+
+    def post(self, url, **kwargs):
+        self._guard(kwargs)
+        return self._client.post(url, **kwargs)
+
+    def put(self, url, **kwargs):
+        self._guard(kwargs)
+        return self._client.put(url, **kwargs)
+
+    def get(self, url, **kwargs):
+        return self._client.get(url, **kwargs)
+
+
+def interface_shot(shot_id: str, prompt: str) -> dict:
+    """One Shot exactly as `app.js` puts it on the wire, field for field.
+
+    Copied from the `#add-shot` handler rather than built from the `Shot` model, because the point
+    is what the *interface* sends: it stamps `status: "draft"` and the `"New shot"` placeholder,
+    and it re-sends every field it holds on every whole-list save.
+    """
+    return {
+        "id": shot_id,
+        "start": 0,
+        "duration": 5,
+        "prompt": prompt,
+        "mode": "text",
+        "asset_ids": [],
+        "reference_labels": {},
+        "use_song_audio": False,
+        "seed": 0,
+        "status": "draft",
+        "prompt_id": "",
+        "latest_output": "",
+        "approved_output": "",
+        "locked": False,
+    }
+
+
+def test_a_shot_reaches_its_first_render_through_the_interface_alone(tmp_path: Path):
+    """The story's centrepiece: creation to a render, with nothing writing `status` by hand.
+
+    This is the test whose absence hid the gap. Every guard around rendering was tested on its own
+    and every one of them passed — the readiness gate, the status gate, the batch pre-flight, the
+    queue button's filter — while the path *through* them was never walked end to end. A journey
+    with no way to start it looks fully covered when you only ever test the doors.
+
+    `WithoutStatusWrites` is what makes it a journey rather than a demonstration. Before this
+    story the only assignment of `"ready"` anywhere on the server was `render_again`, which
+    requires a shot to have already rendered, so every step below that is not a hand-written
+    status had to exist for this to pass at all.
+
+    The two refusals in the middle are deliberate and are not padding: a shot with a placeholder,
+    and then a shot with a real prompt, are both refused *before* the mark. Writing a prompt is not
+    a decision to render, and the story's "no auto-marking" rule is exactly that assertion.
+    """
+    client, store, comfy = make_client(tmp_path)
+    guarded = WithoutStatusWrites(client)
+
+    # A fresh project, as the New project dialog creates one.
+    created = guarded.post("/api/projects", json={"name": "First render"})
+    assert created.status_code == 201, created.text
+    project_id = created.json()["id"]
+
+    def add_or_edit(prompt: str):
+        """The whole-list shots save every timeline edit goes through."""
+        return guarded.put(
+            f"/api/projects/{project_id}/shots",
+            json={"shots": [interface_shot("shot_first", prompt)]},
+        )
+
+    # Add a shot: the placeholder prompt and the draft status the interface stamps.
+    assert add_or_edit(PLACEHOLDER_PROMPT).status_code == 200
+    assert store.get(project_id).shots[0].status == "draft"
+    # Nothing the interface has done so far can submit it, and the refusal is about the prompt.
+    placeholder = submit_h3(guarded, project_id, "shot_first")
+    assert placeholder.status_code == 422
+    assert placeholder.json()["detail"] == readiness_refusal(["SHOT 01 (shot_first)"])
+
+    # Write a prompt in the shot inspector.
+    assert add_or_edit("A singer turns toward camera under sodium light").status_code == 200
+    # Still not submittable, and now for the status rather than the prompt: writing a prompt is
+    # not a decision to spend a GPU pass, and nothing may arm the shot on the Director's behalf.
+    assert store.get(project_id).shots[0].status == "draft"
+    prompted = submit_h3(guarded, project_id, "shot_first")
+    assert prompted.status_code == 422
+    assert "ready" in prompted.json()["detail"]
+    assert not comfy.prompts
+
+    # Mark it ready. This is the step the application did not have.
+    marked = guarded.post(f"/api/projects/{project_id}/shots/shot_first/mark-ready")
+    assert marked.status_code == 200, marked.text
+    assert store.get(project_id).shots[0].status == "ready"
+    # The queue button's own filter, applied to the stored plan. `renderJobs` decides what the
+    # batch may submit with exactly this expression, and until now nothing could put a shot in it.
+    assert [
+        shot.id for shot in store.get(project_id).shots if shot.status == "ready"
+    ] == ["shot_first"]
+    # The batch pre-flight the button runs before it submits agrees.
+    report = guarded.get(f"/api/projects/{project_id}/readiness").json()
+    assert report["ready"] is True
+    assert report["blocking"] == []
+
+    # And the render reaches ComfyUI.
+    queued = submit_h3(guarded, project_id, "shot_first")
+    assert queued.status_code == 202, queued.text
+    assert len(comfy.prompts) == 1
+    assert store.get(project_id).shots[0].status == "queued"
+
+    # Nothing on the way here wrote a status the interface does not write.
+    assert set(guarded.statuses) == {"draft"}
+
+
+def mark_ready(client, project_id: str, shot_id: str, **kwargs):
+    """Commit one Shot to the queue. No body, by design — see `_set_shot_commitment` in app.py."""
+    return client.post(f"/api/projects/{project_id}/shots/{shot_id}/mark-ready", **kwargs)
+
+
+def mark_draft(client, project_id: str, shot_id: str, **kwargs):
+    """Take one Shot back out of the queue. No body, for the same reason."""
+    return client.post(f"/api/projects/{project_id}/shots/{shot_id}/mark-draft", **kwargs)
+
+
+def drafted_shot(store: ProjectStore, name: str, **fields) -> Project:
+    """A project with one drafted, prompted Shot — the state the mark acts on."""
+    project = store.create(Project(name=name))
+    defaults = {
+        "id": "shot_first",
+        "start": 0,
+        "duration": 5,
+        "prompt": "A singer turns toward camera",
+        "mode": "text",
+        "status": "draft",
+    }
+    project.shots = [Shot(**{**defaults, **fields})]
+    store.save(project)
+    return store.get(project.id)
+
+
+def test_marking_ready_arms_a_drafted_shot_and_submission_then_accepts_it(tmp_path: Path):
+    """Both halves, because either alone is a half-built feature.
+
+    The status has to become `ready` — that is what the queue button filters on and what
+    `generate_h3` requires — and a submission through the ordinary route then has to be accepted,
+    which is what makes "the interface alone can start a render" true rather than plausible.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = drafted_shot(store, "Armed")
+
+    response = mark_ready(client, project.id, "shot_first")
+
+    assert response.status_code == 200, response.text
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "ready"
+    # Marking is not rendering: nothing was sent and no GPU time was spent by the click itself.
+    assert not comfy.prompts
+
+    assert submit_h3(client, project.id, "shot_first").status_code == 202
+    assert len(comfy.prompts) == 1
+
+
+def test_marking_writes_the_status_and_nothing_else(tmp_path: Path):
+    """The reason this is its own action rather than the shots write it replaces.
+
+    `PUT /shots` is the generic full-project-shaped route — it takes the whole Shot list from the
+    client — so using it to arm one Shot also reasserts every prompt, window, reference and lock
+    the client happens to be holding, from however long ago it loaded them. These routes bind no
+    body at all, so there is nothing on the wire that could do that.
+
+    Asserted as a whole-manifest comparison rather than field by field: a field-by-field check
+    only catches the fields somebody thought of, and the hazard here is precisely the field nobody
+    thought of. A body is posted too, and must be ignored — a handler that grew one later fails
+    this rather than quietly gaining the shots write's blast radius.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Narrow write")
+    stored = store.get(project.id)
+    stored.shots.append(
+        Shot(id="shot_other", start=10, duration=5, prompt="A second shot", locked=True)
+    )
+    store.save(stored)
+    before = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+
+    response = mark_ready(
+        client,
+        project.id,
+        "shot_first",
+        json={"shots": [{"id": "shot_other", "start": 0, "duration": 1, "prompt": "OVERWRITTEN"}]},
+    )
+
+    assert response.status_code == 200, response.text
+    after = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+    # The one intended difference, isolated by neutralising it and comparing everything else.
+    assert before["shots"][0]["status"] == "draft"
+    assert after["shots"][0]["status"] == "ready"
+    after["shots"][0]["status"] = before["shots"][0]["status"]
+    after["updated_at"] = before["updated_at"]
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["", "   \n\t", "New shot", "  new   SHOT  "],
+    ids=["blank", "whitespace", "placeholder", "collapsed-placeholder"],
+)
+def test_marking_ready_refuses_a_shot_with_nothing_worth_rendering(tmp_path: Path, prompt: str):
+    """The prompt gate, run at the mark and in `batch`'s own words.
+
+    Not a second opinion about what counts as a prompt: this asks `prompt_rejection` through
+    `prompt_is_missing`, which is the same function `readiness_report` asks per Shot, so the
+    placeholder and the whitespace collapse come free rather than being re-decided here. Two
+    implementations of "is this prompt worth a GPU pass" is how the mark starts arming shots the
+    render then refuses.
+
+    The refusal is `readiness_refusal`'s sentence, so the Director reads the same instruction here
+    as at submission — and it names the prompt, because that is the thing they can act on.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Nothing to render", prompt=prompt)
+
+    response = mark_ready(client, project.id, "shot_first")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == readiness_refusal(["SHOT 01 (shot_first)"])
+    assert "no prompt" in response.json()["detail"]
+    # And it was genuinely not armed, rather than refused after the write.
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "draft"
+
+
+def test_marking_back_to_draft_un_commits_a_shot_the_queue_would_have_taken(tmp_path: Path):
+    """How a Director changes their mind, and it must cost nothing.
+
+    A commitment nobody can walk back is a commitment people avoid making, so this is asserted to
+    leave the Shot otherwise untouched — the prompt they wrote is still there — and to actually
+    remove it from what the queue button submits.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Un-commit", status="ready")
+
+    response = mark_draft(client, project.id, "shot_first")
+
+    assert response.status_code == 200, response.text
+    reverted = ProjectStore(tmp_path).get(project.id).shots[0]
+    assert reverted.status == "draft"
+    assert reverted.prompt == "A singer turns toward camera"
+    # The queue button's filter no longer sees it, and the submission route refuses it again.
+    assert not [
+        shot for shot in ProjectStore(tmp_path).get(project.id).shots if shot.status == "ready"
+    ]
+    assert submit_h3(client, project.id, "shot_first").status_code == 422
+
+
+def test_marking_back_to_draft_is_allowed_even_with_no_prompt_left(tmp_path: Path):
+    """The prompt gate runs in one direction only, and this is why.
+
+    `draft` is the un-armed state. Refusing to disarm a Shot whose prompt was emptied would trap
+    it armed on the strength of the very problem the Director is presumably about to fix — exactly
+    backwards, and the one way this gate could make a plan less safe than no gate at all.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Emptied and armed", status="ready", prompt="")
+
+    assert mark_draft(client, project.id, "shot_first").status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "draft"
+
+
+@pytest.mark.parametrize("state", ["draft", "ready"])
+def test_marking_a_shot_into_the_state_it_is_already_in_changes_nothing(tmp_path: Path, state: str):
+    """A no-op, not an error — and not a write either.
+
+    The manifest is compared whole, because "nothing happened" has to include `updated_at`: a save
+    on a request that changed nothing would bump the timestamp `PUT /projects` compares against,
+    so a Director who double-clicked would be told their project changed since it was loaded.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Already there", status=state)
+    before = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+
+    call = mark_ready if state == "ready" else mark_draft
+    response = call(client, project.id, "shot_first")
+
+    assert response.status_code == 200, response.text
+    assert ProjectStore(tmp_path).get(project.id).model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize("target", ["ready", "draft"])
+def test_marking_refuses_a_locked_shot_in_either_direction(tmp_path: Path, target: str):
+    """Consistent with everything else that respects `Shot.locked`.
+
+    A lock is a deliberate hands-off, and committing a shot to a queue that spends GPU minutes is
+    exactly the class of change it exists to refuse — the same argument `expand_shot_prompts` makes
+    when it leaves a locked Shot's prompt alone, and the same one `render_again` makes. Both
+    directions, because a lock that stopped only the expensive one would still let an automated
+    caller silently un-commit a plan the Director locked down.
+
+    The remedy is stated for the reason it is there: a lock stops an action, it does not stop the
+    human who set it from unsetting it.
+    """
+    client, store, _ = make_client(tmp_path)
+    was = "draft" if target == "ready" else "ready"
+    project = drafted_shot(store, "Locked", status=was, locked=True)
+
+    call = mark_ready if target == "ready" else mark_draft
+    response = call(client, project.id, "shot_first")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == MARK_READY_LOCKED_REFUSAL.format(
+        shot="SHOT 01 (shot_first)"
+    )
+    assert "Unlock" in response.json()["detail"]
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == was
+
+    stored = store.get(project.id)
+    stored.shots[0].locked = False
+    store.save(stored)
+    assert call(client, project.id, "shot_first").status_code == 200
+
+
+@pytest.mark.parametrize("settled", ["complete", "error", "approved"])
+@pytest.mark.parametrize("target", ["ready", "draft"])
+def test_marking_refuses_a_shot_that_has_rendered_and_names_the_action_that_owns_it(
+    tmp_path: Path, settled: str, target: str
+):
+    """The other side of the first render belongs to `render_again`, and the refusal says so.
+
+    Two actions, one for each side of a Shot's first render, and neither may reach across: a shot
+    that has produced a take carries a job record, a prompt id and an output pointer, and every
+    argument `render_again` makes about approvals and previous takes applies to it. Walking its
+    status here would be that route's guard order bypassed by a route that never learned it.
+
+    The direction is asserted rather than only the code, because a refusal that says "no" and
+    stops leaves a Director looking at a completed shot with no idea that the button one row down
+    is the one they want.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Settled", status=settled, latest_output="takes/one.mp4")
+
+    call = mark_ready if target == "ready" else mark_draft
+    response = call(client, project.id, "shot_first")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail == MARK_READY_ALREADY_RENDERED_REFUSAL.format(shot="SHOT 01 (shot_first)")
+    assert "Render again" in detail
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == settled
+
+
+def test_marking_refuses_a_shot_carrying_an_approved_take(tmp_path: Path):
+    """`approved_output` is settable independently of `status`, so it needs its own refusal.
+
+    An approval is an editorial decision about one specific take. A Shot carrying one is not a Shot
+    waiting for its first render whatever its status field says, and without this the `approved`
+    status could be walked to `draft` through the generic shots write and the approval then
+    stepped over here — `render_again`'s approval argument bypassed by a route that never saw it.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Approved", status="draft", approved_output="takes/one.mp4")
+
+    response = mark_ready(client, project.id, "shot_first")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail == MARK_READY_APPROVED_REFUSAL.format(shot="SHOT 01 (shot_first)")
+    assert "Clear the approval" in detail
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "draft"
+
+
+def test_marking_refuses_a_shot_with_a_render_still_in_flight(tmp_path: Path):
+    """The second case is the one a status-only check misses, and it is the dangerous one.
+
+    `Shot.status` is exactly what the generic shots write can rewrite by hand, so a Shot can read
+    `draft` on screen while ComfyUI is still working on it. The job record is what still knows, and
+    it is keyed by `target_id` — so arming that Shot and submitting it would put two renders of one
+    shot in flight, racing on the same output prefix.
+
+    Deliberately says nothing about *which* code comes back. That is
+    `test_the_two_first_render_actions_answer_one_live_render_with_one_code`'s job, and separating
+    them is the point: this test is the guarantee that a live render refuses at all and that the
+    status stays where it was, and it has to keep failing if the check is dropped even by someone
+    who leaves the number in the source untouched.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = drafted_shot(store, "In flight", status="ready")
+    submitted = submit_h3(client, project.id, "shot_first")
+    assert submitted.status_code == 202
+
+    # The ordinary case: the Shot itself says a render is out.
+    queued = mark_draft(client, project.id, "shot_first")
+    assert not queued.is_success, queued.text
+    assert queued.json()["detail"] == MARK_READY_IN_FLIGHT_REFUSAL.format(
+        shot="SHOT 01 (shot_first)"
+    )
+    # ...and the same Shot with its status walked back by hand while the job is still out.
+    stored = store.get(project.id)
+    stored.shots[0].status = "draft"
+    store.save(stored)
+
+    hidden = mark_ready(client, project.id, "shot_first")
+    assert not hidden.is_success, "a hand-edited status hid a live render from the guard"
+    assert hidden.json()["detail"] == MARK_READY_IN_FLIGHT_REFUSAL.format(
+        shot="SHOT 01 (shot_first)"
+    )
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "draft"
+    assert len(comfy.prompts) == 1
+
+
+def test_the_two_first_render_actions_answer_one_live_render_with_one_code(tmp_path: Path):
+    """One live render, two routes that can be asked about it, and one status code between them.
+
+    `mark_ready_refusal` answered 422 for a `queued`/`running` Shot until 2026-08-18 while
+    `render_again` answered 409 for that same render, which meant a client asking "may I touch this
+    shot" got a different class of answer depending on which side of the first render it asked
+    from. The Director renegotiated it to 409: a live render is a state conflict — the identical
+    request succeeds once the job lands — where every other refusal these routes give is a fact
+    about the Shot that waiting does not change.
+
+    Asserted as an equality between the two routes as well as against the literal, because the
+    literal alone would let them drift apart again the next time one of them is edited. Both mark
+    directions are asked: the refusal is reached before the direction is looked at, and a guard
+    that answered one way for arming and another for disarming would be the same defect one level
+    down.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "One live render", status="ready")
+    assert submit_h3(client, project.id, "shot_first").status_code == 202
+
+    codes = {
+        "mark-ready": mark_ready(client, project.id, "shot_first").status_code,
+        "mark-draft": mark_draft(client, project.id, "shot_first").status_code,
+        "render-again": render_again(client, project.id, "shot_first").status_code,
+    }
+
+    assert codes == {"mark-ready": 409, "mark-draft": 409, "render-again": 409}, codes
+    assert len(set(codes.values())) == 1, codes
+    # And the alignment is only the in-flight row. Everything else the mark refuses is
+    # unprocessable content rather than a conflict, and stays 422 — a lock, an approval, a settled
+    # status and an unrenderable prompt are all true for as long as the Shot is in that state.
+    locked = drafted_shot(store, "Locked", locked=True)
+    approved = drafted_shot(store, "Approved", approved_output="takes/one.mp4")
+    settled = drafted_shot(store, "Settled", status="complete", latest_output="takes/one.mp4")
+    unprompted = drafted_shot(store, "Unprompted", prompt="")
+    others = {
+        "locked": mark_ready(client, locked.id, "shot_first").status_code,
+        "approved": mark_ready(client, approved.id, "shot_first").status_code,
+        "settled": mark_ready(client, settled.id, "shot_first").status_code,
+        "prompt": mark_ready(client, unprompted.id, "shot_first").status_code,
+    }
+    assert others == {"locked": 422, "approved": 422, "settled": 422, "prompt": 422}, others
+
+
+def test_marking_ready_is_not_a_certificate_the_render_gate_asks_again(tmp_path: Path):
+    """The design note, executed: the check is asked at both points and remembered at neither.
+
+    The tempting implementation reads `status == "ready"` as evidence that the prompt was fine —
+    it was checked at the mark, after all. It is not evidence about anything later. A prompt can be
+    deleted, or pasted over with the `"New shot"` placeholder a duplicate carries, between the mark
+    and the submission, and the gate exists to stop a GPU pass returning noise rather than to count
+    approvals.
+
+    Both emptiness cases, because the collapse is what catches a placeholder that picked up stray
+    spacing on the way through a duplicate.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = drafted_shot(store, "Emptied after marking")
+    assert mark_ready(client, project.id, "shot_first").status_code == 200
+
+    for emptied in ("", "  New   Shot  "):
+        stored = store.get(project.id)
+        stored.shots[0].prompt = emptied
+        store.save(stored)
+
+        response = submit_h3(client, project.id, "shot_first")
+
+        assert response.status_code == 422, emptied
+        assert response.json()["detail"] == readiness_refusal(["SHOT 01 (shot_first)"])
+        # Still `ready` — the mark stands, and the render refused it on the prompt it has now.
+        assert ProjectStore(tmp_path).get(project.id).shots[0].status == "ready"
+    assert not comfy.prompts
+
+
+def test_nothing_marks_a_shot_ready_as_a_side_effect(tmp_path: Path):
+    """Auto-marking is forbidden, not merely unimplemented.
+
+    It would be easy — and it would look helpful — to have expansion arm every shot it prompted,
+    or the Director's shot plan arm every shot it created. That would mean a Director who ran
+    expansion to see what the model suggested had silently armed a whole plan for rendering, and
+    the queue button is one confirm dialog away from spending real GPU minutes on it.
+
+    So every write in the application that touches Shots is driven here and the statuses are read
+    afterwards. The list is the point: the routes are enumerated rather than sampled, because the
+    hazard is a *future* write path that arms shots as a convenience, and a test that watched one
+    route would not see it.
+    """
+    director = ExpandingDirector()
+    client, store, comfy = make_client(tmp_path, director)
+    project = planned_project(store, "No side effects")
+
+    def statuses() -> list[str]:
+        return [shot.status for shot in ProjectStore(tmp_path).get(project.id).shots]
+
+    # The Director applying a shot plan, which creates and rewrites Shots wholesale.
+    applied = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Plan the video", "apply_shots": True},
+    )
+    assert applied.status_code == 200, applied.text
+    assert set(statuses()) == {"draft"}, "applying a shot plan armed a shot"
+
+    # Expansion writing a real prompt onto every Shot — the likeliest place this would creep in,
+    # because after it every Shot genuinely would pass the prompt gate.
+    expanded = client.post(f"/api/projects/{project.id}/director/expand")
+    assert expanded.status_code == 200, expanded.text
+    assert all(shot.prompt for shot in ProjectStore(tmp_path).get(project.id).shots)
+    assert set(statuses()) == {"draft"}, "expansion armed the shots it prompted"
+
+    # The whole-list shots save every timeline edit goes through.
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": saved.model_dump(mode="json")["shots"]},
+    ).status_code == 200
+    assert set(statuses()) == {"draft"}
+
+    # And the generic full-project write, which defaults every field it is not sent.
+    body = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert set(statuses()) == {"draft"}
+
+    # Nothing above reached ComfyUI either, which is the cost this rule is protecting.
+    assert not comfy.prompts
+
+
+def test_marking_404s_for_a_shot_and_a_project_that_do_not_exist(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Missing"))
+
+    for call in (mark_ready, mark_draft):
+        assert call(client, project.id, "shot_nope").status_code == 404
+        assert call(client, "no-such-project", "shot_nope").status_code == 404
+
+
+def test_every_shot_status_belongs_to_exactly_one_of_the_two_actions(tmp_path: Path):
+    """The two actions partition the status vocabulary, and this is what keeps them partitioning it.
+
+    A status added to `ShotStatus` later is on one side of a Shot's first render or the other. If
+    it falls through both lists it becomes a status no action can move a Shot out of — reachable
+    only by an API client, which is the exact hole this story closed. Making that a decision
+    somebody has to make is the whole value of asserting it.
+    """
+    unrendered = set(MARK_READY_STATUSES)
+    settled = set(RENDER_AGAIN_STATUSES)
+    in_flight = {"queued", "running"}
+
+    assert unrendered == {"draft", "ready"}
+    assert unrendered.isdisjoint(settled)
+    assert unrendered.isdisjoint(in_flight)
+    assert unrendered | settled | in_flight == set(get_args(ShotStatus))
 
 
 def test_readiness_route_404s_for_a_project_that_does_not_exist(tmp_path: Path):

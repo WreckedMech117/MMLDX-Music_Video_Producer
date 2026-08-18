@@ -101,6 +101,23 @@ def every_builder_payload() -> list[tuple[str, dict]]:
                 profile="turbo",
             ),
         ),
+        (
+            # The third profile is the same shape as the turbo one and different in every
+            # value it carries — a different LoRA file at a different strength — so it gets
+            # its own row too: a filename no payload here builds is a filename this range
+            # check never sees.
+            "h3-reference-turbo-references2v",
+            build_h3_reference_payload(
+                prompt="<Picture 1>",
+                references=[{"kind": "picture", "file": "a.png"}],
+                duration=8,
+                width=1280,
+                height=720,
+                seed=0,
+                prefix="p",
+                profile="turbo-references2v",
+            ),
+        ),
         ("ltx25-patched", patch_ltx25_dimension_boundary(template)),
     ]
 
@@ -615,10 +632,13 @@ def test_h3_reference_payload_carries_the_reference_size_to_the_conditioner():
 
 # --- Sampling profiles -----------------------------------------------------------------
 #
-# Two evidenced bundles, each reproduced whole. The tests below pin the two directions
-# that matter: the default profile emits *exactly* what the adapter emitted before
-# profiles existed, and the turbo profile reproduces the Director's own H3 stage rather
-# than borrowing half of it.
+# Three evidenced bundles, each reproduced whole. The tests below pin the directions that
+# matter: the default profile emits *exactly* what the adapter emitted before profiles
+# existed, the turbo profile reproduces the Director's own H3 stage rather than borrowing
+# half of it, and `turbo-references2v` reproduces the Director's canonical
+# `MiniMaxH3Turbo References2V` graph — a different bundle from `turbo`, not a correction
+# of it. Every profile's values are read out of the export they come from; none is typed
+# in here, because a literal in a test only proves the test agrees with itself.
 
 #: The default profile's payload for one fixed set of arguments, hashed at the commit
 #: before sampling profiles existed (`7e25ad0`, the story's baseline) by running that
@@ -811,6 +831,167 @@ def test_the_turbo_profile_reproduces_the_directors_stage_and_rewires_everything
     assert readers == {"mvp:lora"}, readers
     # The turbo graph is the default graph plus exactly one node; nothing else moved.
     assert set(payload) - set(h3_reference_payload(h3_references("picture", 1))) == {"mvp:lora"}
+
+
+def test_the_turbo_references2v_profile_matches_the_export_it_reproduces():
+    """The canonical `MiniMaxH3Turbo References2V` bundle, read out of the audited export.
+
+    Nothing here is a literal: the export is walked from the UNET loader *the adapter
+    itself names* — so a bundle sitting on some other checkpoint could not be mistaken for
+    this one — through its `Power Lora Loader (rgthree)`, forward along the model chain to
+    the one `BasicScheduler` it reaches, and on to the sampler feeding that scheduler's
+    sigmas. The shipped `turbo` profile's first test typed its four values in while the
+    default profile was checked against its file; that asymmetry was corrected, and this
+    profile is written to the corrected standard from the start.
+
+    The adapter's fixed sigma shift and sage-attention values are checked against this
+    export too, because they are part of what makes it *this* graph rather than a graph
+    with the same sampler.
+    """
+    export = json.loads(
+        (REFERENCE_EXPORTS / "h3-turbo-references2v-user-export.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    payload = h3_reference_payload(h3_references("picture", 1), profile="turbo-references2v")
+
+    def only(candidates: list[str], what: str) -> str:
+        """One node id, or a failure naming what was ambiguous rather than picking."""
+        assert len(candidates) == 1, f"{what}: {candidates}"
+        return candidates[0]
+
+    def fed_by(node_id: str, socket: str = "model") -> list[str]:
+        return [
+            other_id
+            for other_id, other in export.items()
+            if other["inputs"].get(socket) == [node_id, 0]
+        ]
+
+    loader = only(
+        [
+            node_id
+            for node_id, node in export.items()
+            if node["class_type"] == "UNETLoader"
+            and node["inputs"].get("unet_name") == payload["mvp:model"]["inputs"]["unet_name"]
+        ],
+        "loaders of the checkpoint this adapter loads",
+    )
+    power_lora = only(
+        [
+            node_id
+            for node_id in fed_by(loader)
+            if export[node_id]["class_type"] == "Power Lora Loader (rgthree)"
+        ],
+        "LoRA loaders on that checkpoint",
+    )
+    # One row, switched on. The default profile's export holds the same class with every
+    # row switched *off*, which is why "enabled" is what is counted rather than "present":
+    # the two exports differ in that flag and in nothing else about this node's shape.
+    rows = [
+        entry
+        for key, entry in export[power_lora]["inputs"].items()
+        if key.startswith("lora_") and isinstance(entry, dict)
+    ]
+    enabled = [entry for entry in rows if entry.get("on") is True]
+    assert rows, export[power_lora]["inputs"]
+    assert len(enabled) == 1, rows
+
+    reached: set[str] = set()
+    frontier = fed_by(power_lora)
+    while frontier:
+        node_id = frontier.pop()
+        if node_id in reached:
+            continue
+        reached.add(node_id)
+        frontier += fed_by(node_id)
+    scheduler = only(
+        [node_id for node_id in reached if export[node_id]["class_type"] == "BasicScheduler"],
+        "schedulers downstream of the LoRA",
+    )
+    sampler = only(
+        [
+            export[node_id]["inputs"]["sampler"][0]
+            for node_id in fed_by(scheduler, socket="sigmas")
+            if export[node_id]["class_type"] == "SamplerCustomAdvanced"
+        ],
+        "samplers on that scheduler's sigmas",
+    )
+    profile = H3_REFERENCE_PROFILES["turbo-references2v"]
+
+    assert profile.lora == enabled[0]["lora"]
+    assert profile.lora_strength == enabled[0]["strength"]
+    assert profile.scheduler == export[scheduler]["inputs"]["scheduler"]
+    assert profile.steps == export[scheduler]["inputs"]["steps"]
+    assert profile.sampler == export[sampler]["inputs"]["sampler_name"]
+
+    # The two nodes the adapter emits on every profile, against this export's own numbers.
+    shift = only(fed_by(power_lora), "nodes reading the LoRA loader")
+    attention = only(fed_by(shift), "nodes reading the sigma shift")
+    assert export[shift]["class_type"] == "MiniMaxH3SigmaShift"
+    assert export[attention]["class_type"] == "PathchSageAttentionKJ"
+    for name in ("shift_video", "shift_audio"):
+        assert payload["mvp:shift"]["inputs"][name] == export[shift]["inputs"][name], name
+    assert (
+        payload["mvp:attention"]["inputs"]["sage_attention"]
+        == export[attention]["inputs"]["sage_attention"]
+    )
+
+
+def test_the_turbo_references2v_profile_carries_its_bundle_through_the_adapters_lora_node():
+    """AC: the export's values reach the graph — through this adapter's node, deliberately.
+
+    The export carries its LoRA in a `Power Lora Loader (rgthree)`. This adapter does not
+    reproduce that class, and the choice is asserted rather than left to be discovered:
+    live `/object_info` declares no `lora_*` inputs on it at all — its required map is
+    empty and only `model`/`clip` are optional — so a faithful copy would put the filename
+    and strength where the pre-flight cannot check either, and the audit's "this LoRA is
+    installed" claim would quietly become unverifiable. The bundle is therefore evidenced
+    in its values and not in its wiring, which is a real cost and is stated in the
+    builder's docstring.
+    """
+    payload = h3_reference_payload(h3_references("picture", 1), profile="turbo-references2v")
+    profile = H3_REFERENCE_PROFILES["turbo-references2v"]
+
+    lora = payload["mvp:lora"]
+    assert lora["class_type"] == "LoraLoaderModelOnly"
+    assert lora["inputs"]["lora_name"] == profile.lora
+    assert lora["inputs"]["strength_model"] == profile.lora_strength
+    assert lora["inputs"]["model"] == ["mvp:model", 0]
+    assert payload["mvp:shift"]["inputs"]["model"] == ["mvp:lora", 0]
+    assert payload["mvp:scheduler"]["inputs"]["scheduler"] == profile.scheduler
+    assert payload["mvp:scheduler"]["inputs"]["steps"] == profile.steps
+    assert payload["mvp:sampler"]["inputs"]["sampler_name"] == profile.sampler
+    # Nothing but the LoRA still reads the raw loader, so no node samples the unpatched
+    # checkpoint; and the graph is the default graph plus exactly that one node.
+    readers = {
+        node_id
+        for node_id, node in payload.items()
+        for value in node["inputs"].values()
+        if value == ["mvp:model", 0]
+    }
+    assert readers == {"mvp:lora"}, readers
+    assert set(payload) - set(h3_reference_payload(h3_references("picture", 1))) == {"mvp:lora"}
+    assert all(node["class_type"] != "Power Lora Loader (rgthree)" for node in payload.values())
+
+
+def test_no_two_sampling_profiles_are_the_same_bundle():
+    """Three names over two configurations would be a rename presented as a third option.
+
+    `turbo` and `turbo-references2v` are both the Director's and both turbo, and the whole
+    reason both ship is that they are *different* bundles from different sources. If they
+    ever collapse onto the same five values, one of them has been edited into the other and
+    the Director is choosing between two labels for one graph.
+    """
+    bundles = {
+        (profile.lora, profile.lora_strength, profile.scheduler, profile.sampler, profile.steps)
+        for profile in H3_REFERENCE_PROFILES.values()
+    }
+
+    assert len(bundles) == len(H3_REFERENCE_PROFILES), sorted(H3_REFERENCE_PROFILES)
+    # Each LoRA-carrying profile names its own file: two profiles sharing a LoRA would make
+    # the pre-flight's per-file confirmation weaker than the number of variants suggests.
+    loras = [profile.lora for profile in H3_REFERENCE_PROFILES.values() if profile.lora]
+    assert len(set(loras)) == len(loras), loras
 
 
 @pytest.mark.parametrize("name", sorted(H3_REFERENCE_PROFILES))
@@ -1645,10 +1826,12 @@ def test_the_h3_audit_reads_its_model_files_out_of_the_payloads():
         "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         "minimax_h3_video_vae_fp16.safetensors",
         "minimax_h3_audio_vae_fp32.safetensors",
-        # The turbo profile's LoRA is in this set because a payload *loads* it, not
+        # Each turbo profile's LoRA is in this set because a payload *loads* it, not
         # because it is named here — which is what makes the live audit's "installed"
-        # claim about the file the app would actually submit.
+        # claim about the files the app would actually submit. Two different files,
+        # because the two turbo bundles come from two different graphs.
         "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
     }
     assert {class_type for class_type, _, _ in files} == {
         "UNETLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly",
@@ -1734,38 +1917,86 @@ def test_the_h3_audit_variants_take_their_steps_from_the_profiles():
         assert profile.steps in audited, (name, sorted(audited))
 
 
-def test_the_h3_audit_covers_both_sampling_profiles():
-    """AC-3: both profiles reach the live schema, and only one of them carries the LoRA.
-
-    Asserting "some variant has a LoRA" alone would pass on an audit that dropped every
-    default-profile variant, and vice versa. Both halves are named, because the audit's
-    whole claim is that each shipped configuration was validated — not that one of them
-    was, twice.
-    """
-    variants = preflight_h3_ultra.audit_payloads()
-    with_lora = {
-        label
-        for label, payload in variants
-        if any(node["class_type"] == "LoraLoaderModelOnly" for node in payload.values())
-    }
-    reference = {
-        label
-        for label, payload in variants
+def audited_reference_variants() -> list[tuple[str, dict]]:
+    """The audit's reference-graph variants; the Director-graph ones sample no profile."""
+    return [
+        (label, payload)
+        for label, payload in preflight_h3_ultra.audit_payloads()
         if any(node["class_type"] == "MiniMaxH3ReferenceToVideo" for node in payload.values())
-    }
+    ]
 
-    # Exactly one, not merely at least one: `next(iter(...))` over a set of two would pick
-    # an arbitrary variant, and the assertions below would then pass while saying nothing
-    # about the other. Which one is checked has to be determined, not incidental.
-    assert len(with_lora) == 1, sorted(with_lora)
-    assert reference - with_lora, [label for label, _ in variants]
-    turbo = dict(variants)[with_lora.pop()]
-    profile = H3_REFERENCE_PROFILES["turbo"]
-    assert turbo["mvp:lora"]["inputs"]["lora_name"] == profile.lora
-    assert turbo["mvp:lora"]["inputs"]["strength_model"] == profile.lora_strength
-    # Its step count comes from the profile rather than from a number restated in the
-    # audit, so a moved profile default moves what is audited.
-    assert turbo["mvp:scheduler"]["inputs"]["steps"] == profile.steps
+
+def audited_bundle(payload: dict) -> tuple:
+    """One audited payload reduced to the bundle it samples with, minus the step count.
+
+    The count is left out here because two variants deliberately send the request model's
+    extreme values rather than any profile's own number. It is not dropped from the claim:
+    the test below still requires, per profile, a variant carrying both the bundle and the
+    profile's own count.
+    """
+    lora = payload.get("mvp:lora", {}).get("inputs", {})
+    return (
+        lora.get("lora_name"),
+        lora.get("strength_model"),
+        payload["mvp:scheduler"]["inputs"]["scheduler"],
+        payload["mvp:sampler"]["inputs"]["sampler_name"],
+    )
+
+
+def declared_bundle(profile: H3SamplingProfile) -> tuple:
+    return (profile.lora, profile.lora_strength, profile.scheduler, profile.sampler)
+
+
+@pytest.mark.parametrize("name", sorted(H3_REFERENCE_PROFILES))
+def test_the_h3_audit_covers_every_sampling_profile(name: str):
+    """AC-3, held for every profile there is rather than for the two there were.
+
+    Parametrized over the table, so a profile added to `H3_REFERENCE_PROFILES` and not
+    given its own audit variant fails here — which is the whole difference between a
+    configuration that was checked against the live server before a GPU job and one that
+    merely looks as though it was. Asserting "some variant carries a LoRA" would pass on an
+    audit that had quietly dropped a profile and duplicated another.
+    """
+    profile = H3_REFERENCE_PROFILES[name]
+    variants = audited_reference_variants()
+    matching = [
+        label for label, payload in variants if audited_bundle(payload) == declared_bundle(profile)
+    ]
+    complete = [
+        label
+        for label, payload in variants
+        if audited_bundle(payload) == declared_bundle(profile)
+        and payload["mvp:scheduler"]["inputs"]["steps"] == profile.steps
+    ]
+
+    assert matching, (name, [label for label, _ in variants])
+    # And one of them sends the profile's own count, taken from the profile rather than
+    # restated in the audit, so a moved default moves what is audited.
+    assert complete, (name, matching)
+
+
+def test_the_h3_audit_samples_no_bundle_a_profile_does_not_declare():
+    """The other direction: the audit must not bless a combination nothing ships.
+
+    A variant assembled by hand — this LoRA with that scheduler — would be audited, would
+    pass, and would read afterwards as if the combination had been validated as a
+    configuration. Only shipped bundles are audited, and every shipped LoRA is loaded by
+    one of them.
+    """
+    declared = {declared_bundle(profile) for profile in H3_REFERENCE_PROFILES.values()}
+
+    for label, payload in audited_reference_variants():
+        assert audited_bundle(payload) in declared, (label, audited_bundle(payload))
+
+    loaded = {
+        node["inputs"]["lora_name"]
+        for _, payload in preflight_h3_ultra.audit_payloads()
+        for node in payload.values()
+        if node["class_type"] == "LoraLoaderModelOnly"
+    }
+    assert loaded == {
+        profile.lora for profile in H3_REFERENCE_PROFILES.values() if profile.lora is not None
+    }
 
 
 def test_the_h3_audit_variants_reach_both_ends_of_every_request_bound():

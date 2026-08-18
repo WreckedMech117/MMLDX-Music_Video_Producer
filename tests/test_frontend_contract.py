@@ -1079,7 +1079,7 @@ def test_rendering_the_song_sets_each_restore_button_from_its_own_stored_slot():
     """Replacing the enabled computation with a constant must not leave the suite green.
 
     The buttons are the entire interface to recovery. Always enabled, they offer a restore the
-    route refuses with a 422 the Director did nothing to earn; never enabled, the feature does not
+    route refuses with a 409 the Director did nothing to earn; never enabled, the feature does not
     exist on screen at all while every string assertion in this file still passes. So the render is
     run against the stub DOM and the buttons are read afterwards, including the case that decides
     the shape of the whole feature -- a slot holding an empty string.
@@ -3363,6 +3363,452 @@ def test_render_again_wordings_are_the_servers_own():
     assert shared["notice"] == RENDER_AGAIN_PREVIOUS_TAKE.format(shot="SHOT 03 (shot_c)")
     assert shared["first"] == "SHOT 01 (shot_a)"
     assert shared["absent"] == "shot_z"
+
+
+def test_the_mark_ready_control_is_decided_by_executing_it_for_every_state():
+    """Every state the commit control can be in, run rather than read.
+
+    Four outcomes have to be told apart and none is inferable from the others: not shown at all,
+    shown pointing one way, shown pointing the other, and shown but refused with the reason.
+    `disabled` is not the negation of `shown` -- a locked shot is shown *and* disabled, and that is
+    the case carrying the sentence worth reading.
+
+    `action` is asserted alongside the label because they are two halves of one claim: a button
+    reading "Back to draft" wired to the arming route would look right in the panel and would arm
+    the shot, and nothing about its appearance would say so.
+
+    The prompt cases are the design note of the whole feature, and the asymmetry is deliberate. The
+    gate runs in the arming direction only: `draft` is the un-armed state, so a control that
+    refused to un-commit an unprompted shot would trap it armed.
+    """
+    from music_video_producer.app import MARK_READY_STATUSES
+
+    states = run_module("""
+      import { MARK_DRAFT_HELP, MARK_DRAFT_LABEL, MARK_READY_APPROVED, MARK_READY_HELP,
+        MARK_READY_LABEL, MARK_READY_LOCKED, MARK_READY_STATUSES, READINESS_REMEDY,
+        markReadyControl } from './src/music_video_producer/web/assets/api.js';
+      const shot = (fields) => ({ id: 'shot_a', prompt: 'A singer turns toward camera', locked: false, approved_output: '', ...fields });
+      const seen = {};
+      for (const status of ['draft', 'ready', 'queued', 'running', 'complete', 'error', 'approved']) {
+        seen[status] = markReadyControl(shot({ status }));
+      }
+      console.log(JSON.stringify({
+        statuses: MARK_READY_STATUSES,
+        readyLabel: MARK_READY_LABEL,
+        draftLabel: MARK_DRAFT_LABEL,
+        readyHelp: MARK_READY_HELP,
+        draftHelp: MARK_DRAFT_HELP,
+        lockedText: MARK_READY_LOCKED,
+        approvedText: MARK_READY_APPROVED,
+        remedy: READINESS_REMEDY,
+        seen,
+        locked: markReadyControl(shot({ status: 'draft', locked: true })),
+        lockedReady: markReadyControl(shot({ status: 'ready', locked: true })),
+        approved: markReadyControl(shot({ status: 'draft', approved_output: 'takes/one.mp4' })),
+        // A locked *and* approved shot reads its lock first, because unlocking is what has to
+        // happen before anything else can -- the server's guard order, mirrored.
+        lockedAndApproved: markReadyControl(shot({ status: 'draft', locked: true, approved_output: 'takes/one.mp4' })),
+        blank: markReadyControl(shot({ status: 'draft', prompt: '' })),
+        whitespace: markReadyControl(shot({ status: 'draft', prompt: '  \\n\\t ' })),
+        placeholder: markReadyControl(shot({ status: 'draft', prompt: 'New shot' })),
+        // The other direction with the same empty prompt, which must NOT be refused.
+        emptiedAndArmed: markReadyControl(shot({ status: 'ready', prompt: '' })),
+        nothing: markReadyControl(undefined),
+      }));
+    """)
+
+    # The status list is the server's, so the control is never offered for a status the routes do
+    # not own.
+    assert states["statuses"] == list(MARK_READY_STATUSES)
+
+    # Not applicable: past the first render, and the render-again control's business instead.
+    for status in ("queued", "running", "complete", "error", "approved"):
+        assert states["seen"][status]["shown"] is False, status
+        assert states["seen"][status]["title"] == "", status
+        assert states["seen"][status]["action"] == "", status
+    # Applicable, pointing the way the shot's own status decides.
+    assert states["seen"]["draft"] == {
+        "shown": True, "disabled": False, "action": "ready",
+        "label": states["readyLabel"], "title": states["readyHelp"], "reason": "",
+    }
+    assert states["seen"]["ready"] == {
+        "shown": True, "disabled": False, "action": "draft",
+        "label": states["draftLabel"], "title": states["draftHelp"], "reason": "",
+    }
+
+    # Refused, shown, and carrying the reason -- which is the state a hide-it design loses. The
+    # label still says which way the button would have gone, so the panel does not silently
+    # relabel the action while explaining why it is off.
+    assert states["locked"]["shown"] is True
+    assert states["locked"]["disabled"] is True
+    assert states["locked"]["reason"] == states["lockedText"]
+    assert states["locked"]["label"] == states["readyLabel"]
+    assert states["lockedReady"]["label"] == states["draftLabel"]
+    assert states["lockedReady"]["reason"] == states["lockedText"]
+    assert states["approved"]["reason"] == states["approvedText"]
+    assert states["lockedAndApproved"]["reason"] == states["lockedText"]
+
+    # The gate, in the arming direction, from the prompt on screen.
+    for case in ("blank", "whitespace", "placeholder"):
+        assert states[case]["shown"] is True, case
+        assert states[case]["disabled"] is True, case
+        assert states[case]["action"] == "ready", case
+        assert states[case]["reason"].endswith(f"{states['remedy']}."), case
+    assert "no prompt" in states["blank"]["reason"]
+    assert "placeholder" in states["placeholder"]["reason"]
+    # ...and emphatically not in the other one. An armed shot whose prompt was emptied is a shot
+    # whose Director must be able to disarm it.
+    assert states["emptiedAndArmed"]["disabled"] is False
+    assert states["emptiedAndArmed"]["action"] == "draft"
+
+    # And nothing at all is not a shot with a commitment to make.
+    assert states["nothing"]["shown"] is False
+
+
+def test_the_two_first_render_controls_partition_the_status_vocabulary():
+    """Exactly one control is offered for any shot, and never neither.
+
+    The two lists are complements by construction on the server, and the browser holds its own copy
+    of each. If they drifted apart the visible failure is a status showing no control at all -- a
+    shot the Director can look at and not move, reachable only by an API client, which is precisely
+    the hole this story closed.
+    """
+    shown = run_module("""
+      import { MARK_READY_STATUSES, RENDER_AGAIN_STATUSES, markReadyControl, renderAgainControl }
+        from './src/music_video_producer/web/assets/api.js';
+      const drawn = {};
+      for (const status of ['draft', 'ready', 'queued', 'running', 'complete', 'error', 'approved']) {
+        const shot = { id: 'shot_a', prompt: 'A singer turns', locked: false, approved_output: '', status };
+        drawn[status] = { mark: markReadyControl(shot).shown, again: renderAgainControl(shot).shown };
+      }
+      console.log(JSON.stringify({ drawn, mark: MARK_READY_STATUSES, again: RENDER_AGAIN_STATUSES }));
+    """)
+
+    assert set(shown["mark"]).isdisjoint(shown["again"])
+    for status, drawn in shown["drawn"].items():
+        # `queued` and `running` are the one deliberate gap: a live render is nobody's to move, and
+        # both controls say so by not being there.
+        expected = 0 if status in ("queued", "running") else 1
+        assert [drawn["mark"], drawn["again"]].count(True) == expected, status
+
+
+def test_the_shot_inspector_draws_and_binds_the_mark_ready_control_it_was_given():
+    """The control, rendered and clicked, against the workspace's own code.
+
+    Two things this proves that no amount of source reading can. The inspector really applies what
+    `markReadyControl` decided -- so a template that drew the button for every shot, or dropped the
+    `disabled`, would fail here rather than pass on the strength of the decision function being
+    correct and unused. And the click really reaches the purpose-built route in the direction the
+    button claimed: `PUT /shots` is the generic full-project write that was the *only* way to set
+    this field before, and a control wired to it would look identical in the source while carrying
+    the whole plan on the wire.
+    """
+    rendered = run_workspace("""
+      const project = (fields) => ({
+        id: 'p1', assets: [], jobs: [], song: null,
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+                  mode: 'text', asset_ids: [], reference_labels: {}, use_song_audio: false,
+                  seed: 0, status: 'draft', prompt_id: '', latest_output: '',
+                  approved_output: '', locked: false, ...fields }],
+      });
+      const draw = (fields) => {
+        state.project = project(fields);
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+        const html = at('#shot-inspector').innerHTML;
+        return {
+          present: html.includes('id="mark-ready"'),
+          disabled: /id="mark-ready"[^>]*\\sdisabled/.test(html),
+          html,
+        };
+      };
+      const drafted = draw({});
+      const armed = draw({ status: 'ready' });
+      const locked = draw({ locked: true });
+      const approved = draw({ approved_output: 'takes/one.mp4' });
+      const placeholder = draw({ prompt: 'New shot' });
+      const rendered = draw({ status: 'complete', latest_output: 'takes/one.mp4' });
+
+      // The click, in each direction, against a server that answers with the moved project.
+      const clicked = async (fields, reply) => {
+        draw(fields);
+        globalThis.fetch = (path, options = {}) => {
+          requests.push({ path, method: options.method || 'GET', body: options.body || null });
+          return Promise.resolve({
+            ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => reply,
+          });
+        };
+        requests.length = 0;
+        toasts.length = 0;
+        await fire('#mark-ready:click', {});
+        return { requests: [...requests], status: state.project.shots[0].status, toasts: [...toasts] };
+      };
+      const toasts = [];
+      globalThis.document.createElement = () => { const item = make('<toast>'); toasts.push(item); return item; };
+      const arming = await clicked({}, project({ status: 'ready' }));
+      const disarming = await clicked({ status: 'ready' }, project({ status: 'draft' }));
+
+      console.log(JSON.stringify({
+        drafted: { present: drafted.present, disabled: drafted.disabled, label: drafted.html.includes(contract.MARK_READY_LABEL) },
+        armed: { present: armed.present, disabled: armed.disabled, label: armed.html.includes(contract.MARK_DRAFT_LABEL) },
+        locked: { present: locked.present, disabled: locked.disabled, reason: locked.html.includes(contract.MARK_READY_LOCKED) },
+        approved: { present: approved.present, disabled: approved.disabled, reason: approved.html.includes(contract.MARK_READY_APPROVED) },
+        placeholder: { present: placeholder.present, disabled: placeholder.disabled },
+        rendered: { present: rendered.present, again: rendered.html.includes('id="render-again"') },
+        arming: { ...arming, toasts: arming.toasts.map((item) => item.textContent) },
+        disarming: { ...disarming, toasts: disarming.toasts.map((item) => item.textContent) },
+        readyNotice: contract.markReadyNotice(project({}), 'shot_a', 'ready'),
+        draftNotice: contract.markReadyNotice(project({}), 'shot_a', 'draft'),
+      }));
+    """)
+
+    # Drawn where it applies, pointing the right way, and disabled where it is refused.
+    assert rendered["drafted"] == {"present": True, "disabled": False, "label": True}
+    assert rendered["armed"] == {"present": True, "disabled": False, "label": True}
+    assert rendered["locked"] == {"present": True, "disabled": True, "reason": True}
+    assert rendered["approved"] == {"present": True, "disabled": True, "reason": True}
+    assert rendered["placeholder"] == {"present": True, "disabled": True}
+    # A shot past its first render gets the other control instead, and never both.
+    assert rendered["rendered"] == {"present": False, "again": True}
+
+    # One request per click, to the purpose-built route for the direction the button claimed, with
+    # no body: nothing a stale client could reassert over the rest of the plan travelled with it.
+    assert rendered["arming"]["requests"] == [
+        {"path": "/api/projects/p1/shots/shot_a/mark-ready", "method": "POST", "body": None}
+    ]
+    assert rendered["disarming"]["requests"] == [
+        {"path": "/api/projects/p1/shots/shot_a/mark-draft", "method": "POST", "body": None}
+    ]
+    # ...and emphatically not the generic shots write, which is the only thing that could do this
+    # before and the reason it could not be done safely.
+    for direction in ("arming", "disarming"):
+        assert not any(
+            sent["path"].endswith("/shots") for sent in rendered[direction]["requests"]
+        ), direction
+
+    # The reply is adopted, so the status chip, the timeline and the queue button redraw from it.
+    assert rendered["arming"]["status"] == "ready"
+    assert rendered["disarming"]["status"] == "draft"
+    # And each direction says what did not happen, rather than leaving the Director to guess
+    # whether a render just started.
+    assert rendered["arming"]["toasts"] == [rendered["readyNotice"]]
+    assert rendered["disarming"]["toasts"] == [rendered["draftNotice"]]
+    assert "no GPU time" in rendered["readyNotice"]
+    assert "nothing was deleted" in rendered["draftNotice"]
+    assert "SHOT 01 (shot_a)" in rendered["readyNotice"]
+
+
+def test_neither_refusal_is_decided_by_its_status_code_in_the_browser():
+    """Both codes moved to 409 on 2026-08-18. This is the test that says nothing broke by it.
+
+    The renumbering was safe only because every client half recognises its own refusal by a
+    substring of the server's sentence, and that was a claim about the code rather than something
+    the suite executed. So it is executed here, and from both sides of the change: each refusal is
+    delivered to the booted workspace at **409 and at 422**, and the observable result — what was
+    toasted, what was requested next, and what the local shot status became — has to be identical.
+    A client that grew a branch on the code fails this whichever way the branch went, and it fails
+    it at the moment the branch is written rather than the next time a code moves.
+
+    That identity is only worth having with the *server's* wording in it, so the mark-ready half
+    takes its sentence and its code straight from `mark_ready_refusal` rather than from a literal
+    typed here.
+
+    The last probe is the mechanism underneath: `request` throws a bare `Error` carrying the
+    server's sentence and no status at all, so a status branch is not something a handler could
+    write today without changing `request` first. Asserted over several spellings, because
+    `error.status` is only the obvious one.
+    """
+    from music_video_producer.app import mark_ready_refusal
+    from music_video_producer.models import Project as ServerProject
+    from music_video_producer.models import Shot as ServerShot
+
+    # The server's own answer for a live render, taken from the guard rather than restated.
+    in_flight = ServerProject(name="Live")
+    in_flight.shots = [
+        ServerShot(id="shot_a", start=0, duration=5, prompt="A singer turns", status="queued")
+    ]
+    refusal = mark_ready_refusal(in_flight, in_flight.shots[0], target="draft")
+    assert refusal is not None
+    mark_code, mark_sentence = refusal
+    assert mark_code == 409, "the mark's in-flight refusal is a state conflict, as render-again's is"
+
+    song_sentence = SONG_CONTEXT_RESTORE_REFUSAL.format(field=SONG_CONTEXT_LABELS["lyrics"])
+
+    result = run_workspace(f"""
+      const songSentence = {json.dumps(song_sentence)};
+      const markSentence = {json.dumps(mark_sentence)};
+      const withSong = () => ({{
+        id: 'p1', assets: [], jobs: [], shots: [],
+        song: {{ title: 'Spine', source: 'imported', path: 'media/songs/000-master.wav',
+                duration: 180, lyrics: 'live sheet', caption: 'live style',
+                lyrics_previous: 'the kept sheet', caption_previous: null }},
+      }});
+      const withShot = () => ({{
+        id: 'p1', assets: [], jobs: [], song: null,
+        shots: [{{ id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+                  mode: 'text', asset_ids: [], reference_labels: {{}}, use_song_audio: false,
+                  seed: 0, status: 'draft', prompt_id: '', latest_output: '',
+                  approved_output: '', locked: false }}],
+      }});
+      const toasts = [];
+      globalThis.document.createElement = () => {{ const item = make('<toast>'); toasts.push(item); return item; }};
+      // Everything but the refused path answers 200 with a fresh project, so the stale-state
+      // refresh a refusal may trigger is something this can observe rather than something that
+      // rejects and hides the difference.
+      const serve = (refused, status, detail, refreshed) => {{
+        globalThis.fetch = (url, options = {{}}) => {{
+          requests.push({{ path: url, method: options.method || 'GET', body: options.body || null }});
+          const isRefused = url === refused;
+          const code = isRefused ? status : 200;
+          return Promise.resolve({{
+            ok: code < 400, status: code, statusText: 'canned',
+            headers: {{ get: () => 'application/json' }},
+            json: async () => (isRefused ? {{ detail }} : refreshed),
+          }});
+        }};
+      }};
+      const restoreUnder = async (status) => {{
+        state.project = withSong();
+        state.songContextDirty = false;
+        app.renderSong();
+        serve('/api/projects/p1/song/context/lyrics/restore', status, songSentence, withSong());
+        requests.length = 0; toasts.length = 0;
+        await fire('#restore-song-lyrics:click', {{}});
+        await flush();
+        return {{ toasts: toasts.map((item) => item.textContent), paths: requests.map((sent) => sent.path) }};
+      }};
+      const markUnder = async (status) => {{
+        state.project = withShot();
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+        serve('/api/projects/p1/shots/shot_a/mark-ready', status, markSentence, withShot());
+        requests.length = 0; toasts.length = 0;
+        await fire('#mark-ready:click', {{}});
+        await flush();
+        return {{
+          toasts: toasts.map((item) => item.textContent),
+          paths: requests.map((sent) => sent.path),
+          status: state.project.shots[0].status,
+        }};
+      }};
+      const seen = async () => {{
+        serve('/probe', 409, songSentence, {{}});
+        try {{
+          await contract.request('/probe', {{ method: 'POST' }});
+          return 'NO THROW';
+        }} catch (error) {{
+          return {{
+            message: error.message,
+            keys: Object.keys(error),
+            status: error.status ?? null,
+            statusCode: error.statusCode ?? null,
+            code: error.code ?? null,
+            response: error.response ?? null,
+          }};
+        }}
+      }};
+      console.log(JSON.stringify({{
+        restoreAt409: await restoreUnder(409), restoreAt422: await restoreUnder(422),
+        markAt409: await markUnder(409), markAt422: await markUnder(422),
+        seen: await seen(),
+      }}));
+    """)
+
+    # The whole claim, in two lines: the code the server picks makes no difference to any of it.
+    assert result["restoreAt409"] == result["restoreAt422"], result
+    assert result["markAt409"] == result["markAt422"], result
+
+    # ...and what it does under both is the right thing, or "identical" would be satisfied by two
+    # identically broken runs. The restore toasts the server's sentence and then refreshes, because
+    # a refusal against a button that should have been disabled means this client is stale.
+    assert result["restoreAt409"]["toasts"] == [song_sentence]
+    assert result["restoreAt409"]["paths"] == [
+        "/api/projects/p1/song/context/lyrics/restore",
+        "/api/projects/p1",
+    ]
+    # The mark toasts the server's sentence and stops. There is nothing stale about a live render,
+    # so there is nothing to refresh, and the shot must not move locally on a refusal.
+    assert result["markAt409"]["toasts"] == [mark_sentence]
+    assert result["markAt409"]["paths"] == ["/api/projects/p1/shots/shot_a/mark-ready"]
+    assert result["markAt409"]["status"] == "draft"
+
+    # The mechanism: the status never reaches a handler in any spelling, so a branch on it is not
+    # something that could be written by accident.
+    assert result["seen"]["message"] == song_sentence
+    assert result["seen"]["keys"] == []
+    for spelling in ("status", "statusCode", "code", "response"):
+        assert result["seen"][spelling] is None, spelling
+
+
+def test_mark_ready_wordings_are_the_servers_own():
+    """One rule, one sentence, whichever side the Director meets it on.
+
+    The lock and the approval are refused by the routes and previewed by the panel, and the two
+    notices are the server's account of what each direction did. Two hand-written wordings for one
+    rule is how the browser starts describing behaviour the server no longer has.
+    """
+    from music_video_producer.app import (
+        MARK_DRAFT_NOTICE,
+        MARK_READY_APPROVED_REFUSAL,
+        MARK_READY_LOCKED_REFUSAL,
+        MARK_READY_NOTICE,
+    )
+
+    shared = run_module("""
+      import { MARK_DRAFT_NOTICE, MARK_READY_APPROVED, MARK_READY_LOCKED, MARK_READY_NOTICE,
+        markReadyNotice } from './src/music_video_producer/web/assets/api.js';
+      const project = { shots: [{ id: 'shot_a' }, { id: 'shot_b' }, { id: 'shot_c' }] };
+      console.log(JSON.stringify({
+        locked: MARK_READY_LOCKED,
+        approved: MARK_READY_APPROVED,
+        readyNotice: MARK_READY_NOTICE,
+        draftNotice: MARK_DRAFT_NOTICE,
+        ready: markReadyNotice(project, 'shot_c', 'ready'),
+        draft: markReadyNotice(project, 'shot_c', 'draft'),
+        // An unknown direction falls to the arming sentence rather than to an empty toast: a
+        // success the Director is told nothing about is worse than one described imprecisely.
+        fallback: markReadyNotice(project, 'shot_a', undefined),
+      }));
+    """)
+
+    # The refusals are the server's sentence exactly, with "This shot" standing in for the label the
+    # server prefixes: the panel is already showing the shot, so naming it there would name it
+    # twice, and every other word has to match or the two sides describe different rules.
+    assert shared["locked"] == MARK_READY_LOCKED_REFUSAL.format(shot="This shot")
+    assert shared["approved"] == MARK_READY_APPROVED_REFUSAL.format(shot="This shot")
+    assert shared["readyNotice"] == MARK_READY_NOTICE
+    assert shared["draftNotice"] == MARK_DRAFT_NOTICE
+    assert shared["ready"] == MARK_READY_NOTICE.format(shot="SHOT 03 (shot_c)")
+    assert shared["draft"] == MARK_DRAFT_NOTICE.format(shot="SHOT 03 (shot_c)")
+    assert shared["fallback"] == MARK_READY_NOTICE.format(shot="SHOT 01 (shot_a)")
+
+
+def test_the_shot_inspector_does_not_re_decide_the_mark_ready_control():
+    """Source-level companion: the template applies the decision and never re-makes it.
+
+    The executed test above proves the decision is right and is used. This is what keeps it the
+    only copy -- a second status or prompt test written into the template is a second rule, and the
+    one that is tested is not the one that would then be drawn. The click handler is included
+    because the *direction* is the half most likely to be re-derived: `shot.status === "ready"` at
+    the fetch site reads as harmless and is a second opinion about which route to call.
+    """
+    inspector = APP_JS.read_text(encoding="utf-8").split(
+        "export function renderShotInspector", 1
+    )[1].split("\n}", 1)[0]
+    body = without_comments(inspector)
+
+    assert "const mark = markReadyControl(shot);" in body
+    assert "mark.shown" in body
+    assert 'mark.disabled ? "disabled" : ""' in body
+    assert "escapeHtml(mark.title)" in body
+    assert "escapeHtml(mark.label)" in body
+    # The direction is carried out of the decision, not recomputed at the click.
+    assert 'mark.action === "draft"' in body
+    assert "api.markShotDraft(projectId, shot.id)" in body
+    assert "api.markShotReady(projectId, shot.id)" in body
+    # No second copy of the decision, in any of its spellings.
+    for redecided in ("shot.locked", "approved_output", 'shot.status === "ready"', "promptRejection"):
+        assert redecided not in body, redecided
 
 
 def test_the_shot_inspector_does_not_re_decide_the_render_again_control():

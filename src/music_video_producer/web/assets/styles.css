@@ -265,11 +265,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .shot-readiness strong { display: block; margin-bottom: 5px; color: var(--red); font: 9px Consolas, monospace; letter-spacing: .08em; }
 .shot-readiness p { margin: 0 0 6px; font-size: 11px; }
 .shot-readiness p:last-child { margin-bottom: 0; }
-/* Why the render-again control is there but off. The button is drawn disabled rather than hidden
-   for a locked, approved or unprompted shot, so that "why can I not render this again" is answered
-   where it is asked -- and a disabled button conveys only that something is wrong, which is state
-   by appearance alone. This is the sentence. It is also the button's tooltip, for the pointer. */
-.render-again-reason { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+/* Why an inspector control is there but off -- shared by the commit control and the render-again
+   one, because they make the same kind of statement and two identical rules is how one of them
+   drifts. Both buttons are drawn disabled rather than hidden for a locked, approved or unprompted
+   shot, so that "why can I not do this" is answered where it is asked -- and a disabled button
+   conveys only that something is wrong, which is state by appearance alone. This is the sentence.
+   It is also the button's tooltip, for the pointer. */
+.control-reason { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 /* The whole readiness report, above the batch button. Blocking and sameness lines are told apart
    by the words app.js writes into them as well as by the marker colour, because a list where the
    only difference is red versus amber conveys state by colour alone. */

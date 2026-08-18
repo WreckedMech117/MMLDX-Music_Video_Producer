@@ -270,7 +270,12 @@ export function songContextControls(field) {
 }
 
 // Pure: is anything actually recoverable for this field? An always-enabled button offers a restore
-// the server refuses with 422, and the client then misreads its own bad offer as stale state.
+// the server refuses with 409, and the client then misreads its own bad offer as stale state.
+//
+// The code is named here for the reader's sake and nothing branches on it: `request` throws an
+// Error carrying the server's sentence and no status at all, so every recovery path below is
+// decided by a substring of that sentence. A contract test executes both refusals through the real
+// routes to keep this comment honest.
 //
 // The test is `null`/`undefined`, NOT emptiness, and that is the one place this deliberately does
 // not copy `documentRestoreAvailable`. `Song.lyrics_previous` is `str | None`: `null` means no save
@@ -1077,6 +1082,91 @@ export function renderAgainNotice(project, shotId) {
   return RENDER_AGAIN_PREVIOUS_TAKE.replace("{shot}", shotLabel(project, shotId));
 }
 
+// The Shot statuses the commit control is drawn for at all: app.py's MARK_READY_STATUSES, asserted
+// identical by a contract test. The exact complement of RENDER_AGAIN_STATUSES and the in-flight
+// pair -- the two actions divide the status vocabulary between them, one for each side of a Shot's
+// first render -- so a Shot always shows exactly one of the two controls and never neither.
+export const MARK_READY_STATUSES = ["draft", "ready"];
+
+export const MARK_READY_LABEL = "Mark ready to queue";
+export const MARK_DRAFT_LABEL = "Back to draft";
+// Both help strings lead with what the action does *not* do, because that is the belief worth
+// managing on either side. "Ready" sits immediately before the expensive step, so a Director who
+// reads it as "render this" would avoid the one control that starts the primary journey; and a
+// Director unsure whether un-committing loses their work will leave a shot armed rather than risk
+// it.
+export const MARK_READY_HELP =
+  "Commit this shot to the render queue. Nothing is rendered by this and no GPU time is spent " +
+  "until the queue is submitted.";
+export const MARK_DRAFT_HELP =
+  "Take this shot back out of the render queue. Nothing else about the shot changes and nothing " +
+  "is deleted.";
+// The refusals the browser can see coming, in the server's words. Drawn as a disabled control
+// carrying the reason rather than as no control at all, for the render-again control's reason:
+// "why can I not queue this" is a question the panel should answer where it is asked.
+export const MARK_READY_LOCKED =
+  "This shot is locked. A lock is a deliberate hands-off on this shot, and committing it to the " +
+  "render queue is exactly the kind of change it refuses. Unlock the shot first.";
+export const MARK_READY_APPROVED =
+  "This shot carries an approved take, which is an editorial decision about one specific take " +
+  "rather than a shot waiting to be rendered. Clear the approval first if the decision has changed.";
+
+// Everything the inspector draws for the commit control, decided here rather than in the template
+// -- `renderAgainControl`'s reason exactly. The states to tell apart are "not applicable", "shown
+// but refused, here is why" and "go ahead", in either direction, and a template holding those
+// ternaries can have its arms swapped while every string the suite greps for survives.
+//
+// `action` is carried out rather than re-derived at the click site: the label and the route have to
+// agree, and a handler that recomputed the direction from `shot.status` would be a second copy of
+// the decision that could disagree with the button the Director actually pressed.
+//
+// The prompt is checked here, from the Shot on screen, and only in the arming direction. Arming
+// because passing the gate is never a permanent property of a Shot -- the textarea writes
+// `shot.prompt` and re-renders the inspector on every change, so a Shot whose prompt is deleted
+// stops offering the commit immediately. Only arming because `draft` is the un-armed state, and a
+// control that refused to un-commit an unprompted shot would trap it armed.
+//
+// `disabled` is never inferred from `shown` and never the other way round: a locked shot is shown
+// *and* disabled, which is the case that carries the reason worth reading.
+export function markReadyControl(shot) {
+  const status = String(shot?.status ?? "");
+  if (!MARK_READY_STATUSES.includes(status)) {
+    return { shown: false, disabled: true, action: "", label: MARK_READY_LABEL, title: "", reason: "" };
+  }
+  const action = status === "ready" ? "draft" : "ready";
+  const label = action === "draft" ? MARK_DRAFT_LABEL : MARK_READY_LABEL;
+  const refuse = (reason) => ({ shown: true, disabled: true, action, label, title: reason, reason });
+  if (shot?.locked) return refuse(MARK_READY_LOCKED);
+  if (shot?.approved_output) return refuse(MARK_READY_APPROVED);
+  if (action === "ready") {
+    const rejection = promptRejection(shot);
+    if (rejection) return refuse(`${rejection} ${READINESS_REMEDY}.`);
+  }
+  return {
+    shown: true, disabled: false, action, label,
+    title: action === "draft" ? MARK_DRAFT_HELP : MARK_READY_HELP, reason: "",
+  };
+}
+
+// What each direction did, mirroring app.py's MARK_READY_NOTICE and MARK_DRAFT_NOTICE so the
+// sentence the Director reads is the one the server implements. A contract test asserts they are
+// identical.
+//
+// Said on every success rather than left to the status chip, because the belief this prevents --
+// that committing a shot started a render -- is exactly the belief a silent state change leaves in
+// place, and the next thing the Director does depends on which of the two they think happened.
+export const MARK_READY_NOTICE =
+  "{shot} is committed to the render queue. Nothing has been rendered and no GPU time has been " +
+  "spent by this: the queue submits it when you choose to.";
+export const MARK_DRAFT_NOTICE =
+  "{shot} is back to draft, so the render queue will not submit it. Nothing else about the shot " +
+  "changed and nothing was deleted.";
+
+export function markReadyNotice(project, shotId, action) {
+  const template = action === "draft" ? MARK_DRAFT_NOTICE : MARK_READY_NOTICE;
+  return template.replace("{shot}", shotLabel(project, shotId));
+}
+
 // What a batch that failed partway has to say beyond the failure itself. The Shots already
 // accepted are burning GPU minutes right now, and a bare refusal reads as "nothing happened" --
 // so the Director edits and resubmits a plan half of which is already in flight.
@@ -1278,6 +1368,13 @@ export const api = {
   // again" is how a stale client silently reverts every other shot in the plan. Nothing is
   // rendered by this and no GPU time is spent -- the re-opened shot is queued like any other.
   renderAgain: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/render-again`, { method: "POST" }),
+  // The two sides of a shot's first render, and neither carries a body. The shots write would have
+  // done this too -- it is the only thing that could, which is why no shot could reach a render
+  // through the interface at all -- but it takes the whole shot list, so a request meaning "I have
+  // decided to render this one" would also reassert every prompt, window and lock this client
+  // happens to be holding. Nothing is rendered by either and no GPU time is spent.
+  markShotReady: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-ready`, { method: "POST" }),
+  markShotDraft: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-draft`, { method: "POST" }),
   directorChat: (id, body) => request(`/api/projects/${id}/director/chat`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // Its own route, and it carries no body: expansion is not a chat turn. The whole input the
   // model sees is derived on the server from the project itself, so there is nothing here for a

@@ -78,11 +78,23 @@ Jobs persist their Comfy prompt IDs. Use **Queue → Refresh** after an applicat
 
 Comfy history can be cleared independently. If a prompt ID no longer exists, the job remains queued until a future reconciliation policy marks it stale; current code does not invent a completion.
 
+## Mark a shot ready
+
+`POST .../shots/{shot_id}/mark-ready` and `.../mark-draft`, both bodyless, plus a control in the shot inspector. This is how a shot reaches its **first** render. Until 2026-08-18 it had no path at all: `Shot.status` defaults to `draft`, the frontend only ever *read* `status === "ready"` to decide what the queue button may submit, and nothing in the interface ever wrote it — so every live render in this project's history was driven by a script or an API client.
+
+Refusals, in order: a render **in flight** (409, read from the job records as well as the status, so a hand-edited status cannot hide one); a shot that has **already rendered** — that is render-again's transition, and the message says so rather than sending you to a route that would refuse you too; a **locked** shot; a shot carrying an **approval**, which is reachable even on a `draft` shot and would otherwise route around render-again's approval argument entirely; and finally the **prompt gate**, which is `batch.prompt_rejection` — the same judgement a render makes, not a second opinion that could drift from it.
+
+Going back to `draft` has **no prompt gate**: un-committing a shot whose prompt you just emptied is exactly what you would want to do.
+
+**Marking ready is not a certificate.** The render's own gate asks again, so a shot marked ready and then emptied is still refused at submission. Marking a `ready` shot ready again is a no-op that writes nothing — but if its prompt has since been emptied it refuses and names the prompt, rather than silently succeeding.
+
+**Nothing auto-marks.** Not the Director applying a shot plan, not expansion writing prompts. Running expansion to see what the model suggests must never silently arm a whole plan for rendering. That is enforced by a test, not just by absence.
+
 ## Render a shot again
 
 `POST /api/projects/{id}/shots/{shot_id}/render-again`, and a control in the shot inspector, re-open a settled shot for one more submission by writing exactly one field — `status` back to `ready`. Before this existed, comparing two takes meant hand-editing status through the generic shots route with an API client, which is what had to be done on 2026-08-18 to compare the two sampling profiles.
 
-The readiness gate is **not** a "render once" rule, it is a "do not render nonsense" rule, so re-opening a shot that already satisfied it is not a bypass. The prompt check is asked **again** from the prompt as it stands at that moment, not remembered from the first render — a prompt edited to nothing, or back to the `"New shot"` placeholder, is refused exactly as a first render would be.
+This is the same policy as **Mark a shot ready** above, on the other side of the first render — the two are a pair, not separate rules. The readiness gate is **not** a "render once" rule, it is a "do not render nonsense" rule, so re-opening a shot that already satisfied it is not a bypass. The prompt check is asked **again** from the prompt as it stands at that moment, not remembered from the first render — a prompt edited to nothing, or back to the `"New shot"` placeholder, is refused exactly as a first render would be.
 
 Refusals, in the order they are checked: a job already **in flight** for that shot (409, decided from both the status *and* the job records, because a hand-walked-back status hides it); a shot that was never rendered (nothing to do); a **locked** shot; an **approved** take; and finally the prompt gate. The approval refusal is about meaning rather than mechanics — re-rendering over an approved take would leave the approval describing something that no longer exists.
 
