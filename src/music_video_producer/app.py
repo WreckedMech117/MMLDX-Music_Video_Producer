@@ -1169,6 +1169,23 @@ ENHANCE_NO_TAKE_REFUSAL = (
     "{shot} has not produced a take, and enhancement improves a take rather than making one. "
     "Render the shot first, then enhance the take you want to keep."
 )
+# The lip-sync gate, ruled by the Director on 2026-08-18. The enhancer measurably moves lip
+# position — `ManualSigmas` starts at 0.909375, so it re-generates rather than refines, and the
+# measured frames show a mid-vowel mouth closed — so a singing Shot loses the one thing the H3
+# reference path exists to get right. `unknown` refuses too, with the fix named: in a music
+# video an unlabelled Shot is likelier singing than not, and a wrong guess destroys lip-sync
+# silently. Only an explicit `not_singing` passes. This is the enforcement of the per-shot rule
+# the Director stated when the measurement landed: "when we do [sing], its important."
+ENHANCE_SINGING_REFUSAL = (
+    "{shot} is a singing shot, and the LTX enhancer measurably moves lip position — it "
+    "re-generates rather than refines. Enhancing it would destroy the lip-sync the render "
+    "exists to produce. Nothing was submitted."
+)
+ENHANCE_SINGING_UNKNOWN_REFUSAL = (
+    "{shot}'s singing state has never been set, and the LTX enhancer measurably moves lip "
+    "position. Set the shot's singing state first — Not singing makes it enhanceable; Singing "
+    "keeps it protected. Nothing was submitted."
+)
 # Names the path, per the matrix. A manifest pointing at a file that is gone is usually a moved
 # or cleared ComfyUI output directory, and the only way the Director can tell which is to see
 # where this looked.
@@ -3404,6 +3421,20 @@ def create_app(
             raise HTTPException(
                 status_code=409,
                 detail=ENHANCE_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # The meaning-refusal, ahead of the mechanical ones, on mark-ready's precedent: whether
+        # this Shot may be enhanced at all comes before whether its inputs exist. A singing Shot
+        # with no take should hear that it is a singing shot — telling it to render first would
+        # send the Director to spend GPU on a take this route would then refuse anyway.
+        if shot.singing == "singing":
+            raise HTTPException(
+                status_code=422,
+                detail=ENHANCE_SINGING_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        if shot.singing == "unknown":
+            raise HTTPException(
+                status_code=422,
+                detail=ENHANCE_SINGING_UNKNOWN_REFUSAL.format(shot=shot_label(project, shot)),
             )
         # Before any path is resolved: a Shot that never rendered has no take to name, and the
         # refusal for that is a different sentence from the one for a take whose file is gone.

@@ -7074,12 +7074,19 @@ def test_a_profile_on_a_text_only_shot_is_refused_rather_than_ignored(tmp_path: 
 def enhanced_shot_project(
     store, tmp_path: Path, *, take: str = "takes/shot-h3-reference_00001-audio.mp4", **shot
 ):
-    """A project whose one Shot has a take on disk under ComfyUI's output directory."""
+    """A project whose one Shot has a take on disk under ComfyUI's output directory.
+
+    The Shot is `not_singing` by default because that is the only state the singing gate
+    passes — the Director ruled that `singing` refuses outright and `unknown` refuses with
+    the fix named, since the enhancer measurably moves lip position. Tests exercising the
+    gate itself override this.
+    """
     project = store.create(Project(name="Enhance"))
     if take:
         output = tmp_path / "comfy" / "output" / Path(take)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"rendered-take")
+    shot.setdefault("singing", "not_singing")
     project.shots = [
         Shot(
             start=0,
@@ -9616,3 +9623,44 @@ def test_render_status_of_a_missing_project_is_404(tmp_path: Path):
 
     assert client.get("/api/projects/nope/render-status").status_code == 404
     assert comfy.queue_calls == 0
+
+
+def test_a_singing_shot_is_refused_enhancement_outright(tmp_path: Path):
+    """The Director's ruling enforced: the enhancer measurably moves lip position, so a
+    singing Shot loses the one thing the H3 reference path exists to get right."""
+    client, store, _comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path, singing="singing")
+
+    response = enhance(client, project)
+
+    assert response.status_code == 422
+    assert "moves lip position" in response.json()["detail"]
+    assert store.get(project.id).jobs == []
+
+
+def test_an_unlabelled_shot_is_refused_enhancement_with_the_fix_named(tmp_path: Path):
+    """`unknown` is not `not_singing`. In a music video an unlabelled Shot is likelier
+    singing than not, and a wrong guess destroys lip-sync silently — so the refusal names
+    the one-click fix rather than guessing in either direction."""
+    client, store, _comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path, singing="unknown")
+
+    response = enhance(client, project)
+
+    assert response.status_code == 422
+    assert "singing state" in response.json()["detail"]
+    assert "Not singing" in response.json()["detail"]
+    assert store.get(project.id).jobs == []
+
+
+def test_the_singing_refusal_is_heard_before_the_missing_take_one(tmp_path: Path):
+    """Mark-ready's precedent: the meaning-refusal comes before the mechanical one. Telling
+    a singing Shot to render first would send the Director to spend GPU on a take this route
+    would then refuse anyway."""
+    client, store, _comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path, take="", singing="singing")
+
+    detail = enhance(client, project).json()["detail"]
+
+    assert "moves lip position" in detail
+    assert "has not produced a take" not in detail
