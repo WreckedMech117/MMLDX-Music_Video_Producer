@@ -35,6 +35,7 @@ and fails this one.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import mimetypes
 import os
@@ -46,6 +47,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Self
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = REPO_ROOT / "test-artifacts"
@@ -81,36 +83,83 @@ def _listener_pid(port: int) -> int | None:
         return None
     try:
         output = subprocess.run(
-            ["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=20
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     for line in output.splitlines():
         parts = line.split()
-        if len(parts) >= 5 and parts[0] == "TCP" and parts[3].upper() == "LISTENING":
-            if parts[1].rsplit(":", 1)[-1] == str(port):
-                try:
-                    return int(parts[4])
-                except ValueError:
-                    return None
+        listening = len(parts) >= 5 and parts[0] == "TCP" and parts[3].upper() == "LISTENING"
+        if listening and parts[1].rsplit(":", 1)[-1] == str(port):
+            try:
+                return int(parts[4])
+            except ValueError:
+                return None
     return None
 
 
-def _describe_process(pid: int) -> str:
+def _process_tree(root: int) -> set[int]:
+    """`root` and every descendant of it, as the OS sees them right now.
+
+    Needed because the interpreter these scripts run under is a uv trampoline: `Popen` returns the
+    trampoline's PID and the real `python run.py` -- the process that binds the port -- is its
+    child. A check that demanded the listener *be* our PID rejected our own server, and a
+    `terminate()` aimed at the trampoline alone would leave the grandchild holding the port, which
+    is the stale-server bug this file exists to prevent.
+    """
+    found = {root}
     if sys.platform != "win32":
-        return f"PID {pid}"
+        return found
     try:
         output = subprocess.run(
             [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f"Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' | "
-                "ForEach-Object { $_.CreationDate.ToString('s') + ' :: ' + $_.CommandLine }",
+                (
+                    "Get-CimInstance Win32_Process | ForEach-Object "
+                    "{ $_.ProcessId.ToString() + ' ' + $_.ParentProcessId.ToString() }"
+                ),
             ],
             capture_output=True,
             text=True,
+            timeout=60,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return found
+    children: dict[int, list[int]] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    queue = [root]
+    while queue:
+        for child in children.get(queue.pop(), []):
+            if child not in found:
+                found.add(child)
+                queue.append(child)
+    return found
+
+
+def _describe_process(pid: int) -> str:
+    if sys.platform != "win32":
+        return f"PID {pid}"
+    script = (
+        f"Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' | "
+        "ForEach-Object { $_.CreationDate.ToString('s') + ' :: ' + $_.CommandLine }"
+    )
+    try:
+        output = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
             timeout=30,
+            check=False,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         output = ""
@@ -131,14 +180,15 @@ class ManagedServer:
         self.base_url = f"http://{host}:{port}"
         self.log_path = artifact_dir() / f"{label}-server.log"
         self.process: subprocess.Popen[bytes] | None = None
+        self.tree: set[int] = set()
         self.evidence: dict[str, object] = {}
 
-    def __enter__(self) -> ManagedServer:
+    def __enter__(self) -> Self:
         self.start()
         return self
 
-    def __exit__(self, *_exc: object) -> None:
-        self.stop()
+    def __exit__(self, exc_type: object, *_rest: object) -> None:
+        self.stop(quiet=exc_type is not None)
 
     # -- startup ---------------------------------------------------------------------------
     def start(self) -> None:
@@ -157,9 +207,16 @@ class ManagedServer:
             stdout=self._log,
             stderr=subprocess.STDOUT,
         )
-        self._await_health()
-        self._check_listener_is_our_child()
-        self._check_server_owns_our_data_root()
+        # Anything from here on leaves a server running if it raises, and a server left running is
+        # exactly the listener the next run must not be tempted to reuse. So it is torn down here
+        # rather than by a `__exit__` a failed `__enter__` never reaches.
+        try:
+            self._await_health()
+            self._check_listener_is_our_child()
+            self._check_server_owns_our_data_root()
+        except BaseException:
+            self.stop(quiet=True)
+            raise
 
     def _check_package_is_this_checkout(self) -> None:
         probe = subprocess.run(
@@ -168,6 +225,7 @@ class ManagedServer:
             capture_output=True,
             text=True,
             timeout=120,
+            check=False,
         )
         if probe.returncode != 0:
             raise StaleServer(
@@ -226,12 +284,14 @@ class ManagedServer:
             self.evidence["listener_pid_checked"] = False
             return
         self.evidence["listener_pid_checked"] = True
-        if pid != self.process.pid:
+        self.tree = _process_tree(self.process.pid)
+        if pid not in self.tree:
             raise StaleServer(
-                f"{self.host}:{self.port} is served by {_describe_process(pid)}, not by the "
-                f"server this script started (PID {self.process.pid}). Something took the port "
-                "between the free check and the spawn."
+                f"{self.host}:{self.port} is served by {_describe_process(pid)}, which is not the "
+                f"server this script started (PID {self.process.pid}) nor any child of it. "
+                "Something took the port between the free check and the spawn."
             )
+        self.evidence["listener_pid"] = pid
 
     def _check_server_owns_our_data_root(self) -> None:
         """The proof no pre-existing process can fake: write through the API, read from our disk.
@@ -258,17 +318,47 @@ class ManagedServer:
         self.evidence["data_root"] = str(self.data_root)
 
     # -- teardown --------------------------------------------------------------------------
-    def stop(self) -> None:
+    def stop(self, quiet: bool = False) -> None:
+        """Take the whole process tree down, and prove the port came back.
+
+        The tree, not the process: `Popen` holds a uv trampoline whose child is the server, and
+        terminating only the trampoline leaves the server bound -- manufacturing the very stale
+        listener the next run would then be tempted to reuse. A port that does not come free is
+        therefore reported loudly rather than left for the next script to trip over.
+        """
         if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self.process.pid)],
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+            else:
+                self.process.terminate()
             try:
-                self.process.wait(timeout=15)
+                self.process.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-                self.process.wait(timeout=15)
+                self.process.wait(timeout=20)
         log = getattr(self, "_log", None)
         if log is not None and not log.closed:
             log.close()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if not _listening(self.host, self.port, timeout=0.3):
+                return
+            time.sleep(0.3)
+        holder = _listener_pid(self.port)
+        message = (
+            f"{self.host}:{self.port} is still bound after this run stopped its server"
+            + (f" -- {_describe_process(holder)}" if holder else "")
+            + ". Kill it before the next run, or that run will be refused."
+        )
+        if quiet:
+            print(f"WARNING: {message}", file=sys.stderr)
+            return
+        raise StaleServer(message)
 
     def _log_tail(self, lines: int = 25) -> str:
         try:
@@ -412,6 +502,127 @@ def visible_and_clickable(driver, element, what: str) -> dict:
     return facts
 
 
+#: Installs one MutationObserver per selector and remembers when it last fired. Re-installed
+#: automatically after a navigation, because `window.__e2eQuiet` goes with the document.
+_WATCH = """
+const selector = arguments[0];
+const root = document.querySelector(selector);
+if (!root) return false;
+window.__e2eQuiet = window.__e2eQuiet || {};
+if (window.__e2eQuiet[selector] && window.__e2eQuiet[selector].root === root) return true;
+const record = {at: Date.now(), root};
+const observer = new MutationObserver(() => { record.at = Date.now(); });
+observer.observe(root, {childList: true, subtree: true, attributes: true, characterData: true});
+window.__e2eQuiet[selector] = record;
+return true;
+"""
+_QUIET_FOR = """
+const record = (window.__e2eQuiet || {})[arguments[0]];
+return record ? Date.now() - record.at : -1;
+"""
+
+
+def settle(driver, selector: str, quiet_ms: int = 700, timeout: float = 25.0) -> None:
+    """Wait until nothing has changed inside `selector` for `quiet_ms`.
+
+    The workspace re-renders on replies it does not await. Selecting a clip writes the shot list
+    back, and the *reply* to that write reloads readiness, whose reply calls `renderTimeline` --
+    which rebuilds the shot inspector's contents a second time, well after the click looked
+    finished. Elements found in between go stale, and a script that merely retried would be
+    hiding a race rather than waiting for the screen to stop moving.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not driver.execute_script(_WATCH, selector):
+            time.sleep(0.1)
+            continue
+        quiet = driver.execute_script(_QUIET_FOR, selector)
+        if quiet >= quiet_ms:
+            return
+        time.sleep(max(0.05, (quiet_ms - quiet) / 1000))
+    raise AssertionError(f"{selector} never stopped re-rendering within {timeout:.0f}s")
+
+
+def covering_element(driver, element) -> str | None:
+    """What sits on top of this control right now, or None when nothing does.
+
+    Reported rather than asserted, so a script can record an overlap it does not want to rule on.
+    The case this was written for is real: `.toast-region` is `position: fixed` in the
+    bottom-right corner at `z-index: 50`, which is where the shot inspector's own action buttons
+    are, so the toast a control raises can sit over the control that raised it.
+    """
+    facts = driver.execute_script(HIT_TEST, element)
+    return None if facts["hit"] else str(facts["topmost"])
+
+
+def clear_toasts(driver, timeout: float = 8.0) -> None:
+    """Wait out every toast on screen. They remove themselves after 4.2 s and are not dismissible.
+
+    Called before a hit test or a click on anything in the bottom-right of the screen, because a
+    live toast genuinely does intercept clicks there -- which is a fact about the application, not
+    about this harness, and is recorded by `covering_element` where it matters.
+    """
+    from selenium.webdriver.common.by import By
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not driver.find_elements(By.CSS_SELECTOR, "#toast-region .toast"):
+            return
+        time.sleep(0.25)
+
+
+def reachable_widths(driver, selector: str, widths: list[int], height: int = 900) -> dict[str, str]:
+    """At which window widths is this control still on screen and clickable?
+
+    Reported rather than asserted, because a control hidden at a narrow width is usually a
+    deliberate responsive choice -- but it is a choice nothing offline can see, and `styles.css`
+    hides three of the controls these scripts cover behind media queries. Recording the widths is
+    how that stays visible to whoever reads the run.
+
+    Leaves the window at the first width in the list.
+    """
+    from selenium.webdriver.common.by import By
+
+    verdicts: dict[str, str] = {}
+    for width in widths:
+        driver.set_window_size(width, height)
+        inner = driver.execute_script("return window.innerWidth;")
+        found = driver.find_elements(By.CSS_SELECTOR, selector)
+        if not found or not found[0].is_displayed():
+            verdict = "not displayed"
+        else:
+            try:
+                facts = visible_and_clickable(driver, found[0], selector)
+            except AssertionError as error:
+                verdict = str(error).split(":")[0][:110]
+            else:
+                verdict = "reachable" if facts["hit"] else "covered"
+        # Keyed by the window width asked for, with the viewport it produced alongside it: the
+        # two differ by the chrome, and keying on the viewport makes the result unpredictable.
+        verdicts[str(width)] = f"{verdict} (viewport {inner}px)"
+    driver.set_window_size(widths[0], height)
+    return verdicts
+
+
+def wait_for_readiness(driver, wait) -> str:
+    """Block until the readiness fetch for the loaded project has landed.
+
+    Not cosmetic. `loadProject` fires the readiness GET without awaiting it, and its reply calls
+    `renderTimeline`, which rebuilds the clips *and* the shot inspector. Any element found before
+    that lands goes stale under the script's feet -- which is what happened the first time this ran.
+    The region reads "not checked" until the report arrives and the shot counts afterwards, so its
+    text is the signal.
+    """
+    from selenium.webdriver.common.by import By
+
+    wait.until(
+        lambda browser: "a prompt"
+        in browser.find_element(By.ID, "plan-readiness").get_attribute("textContent"),
+        "the readiness report never landed, so the timeline could re-render at any moment",
+    )
+    return driver.find_element(By.ID, "plan-readiness").get_attribute("textContent")
+
+
 def clipped(driver, element) -> bool:
     """True when the element's text is wider than the box painting it, so part is not readable."""
     return bool(
@@ -423,14 +634,15 @@ def clipped(driver, element) -> bool:
 
 def wait_for_toast(driver, wait, fragment: str) -> str:
     """The toast text containing `fragment`. Toasts self-remove after 4.2s, so this is prompt."""
+    from selenium.common.exceptions import StaleElementReferenceException
     from selenium.webdriver.common.by import By
 
     def find(browser):
         for item in browser.find_elements(By.CSS_SELECTOR, "#toast-region .toast"):
-            try:
+            text = ""
+            # A toast removes itself after 4.2 s, so one can vanish between the find and the read.
+            with contextlib.suppress(StaleElementReferenceException):
                 text = item.text
-            except Exception:  # noqa: BLE001 - the toast can be removed mid-read
-                continue
             if fragment in text:
                 return text
         return False
@@ -438,13 +650,26 @@ def wait_for_toast(driver, wait, fragment: str) -> str:
     return wait.until(find, f"no toast carrying {fragment!r} appeared")
 
 
-def console_gate(driver, name: str, result: dict) -> None:
-    """Fail on any SEVERE console entry, and leave the whole log behind either way."""
+def console_gate(driver, name: str, result: dict, expected: list[str] | None = None) -> None:
+    """Fail on any SEVERE console entry, and leave the whole log behind either way.
+
+    `expected` holds fragments of entries this script *caused on purpose* -- a refusal it drove the
+    route into, for instance. They are separated out and reported under their own key rather than
+    filtered away silently, because a gate that quietly drops what it does not want to see is not
+    a gate. Anything unlisted still fails.
+    """
     logs = driver.get_log("browser")
     severe = [entry for entry in logs if entry.get("level") == "SEVERE"]
+    wanted = [
+        entry for entry in severe
+        if any(fragment in entry.get("message", "") for fragment in expected or [])
+    ]
+    unexpected = [entry for entry in severe if entry not in wanted]
     (artifact_dir() / f"{name}-console.json").write_text(json.dumps(logs, indent=2), encoding="utf-8")
-    result["severe_console_errors"] = severe
-    assert not severe, severe
+    result["severe_console_errors"] = unexpected
+    if wanted:
+        result["expected_console_errors"] = [entry["message"] for entry in wanted]
+    assert not unexpected, unexpected
 
 
 def report(name: str, result: dict) -> None:

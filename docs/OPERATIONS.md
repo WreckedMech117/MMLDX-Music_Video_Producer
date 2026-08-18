@@ -187,9 +187,30 @@ Both the repo adapter (`patch_ltx25_dimension_boundary`) and the Director's save
 
 Keep optional `PathchSageAttentionKJ` nodes bypassed unless a compatible `sageattention` installation has been verified — `sageattention` is not installed in ComfyUI's embedded Python, and an enabled node aborts the run with `ModuleNotFoundError: sageattention`.
 
+### Self-hosting browser QA (no server to start)
+
+```bash
+uv run --with selenium python tests/e2e_shot_controls.py   # default port 8767
+uv run --with selenium python tests/e2e_song_context.py    # default port 8768
+```
+
+These two **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
+
+Prerequisites: nothing listening on the port, Microsoft Edge plus its WebDriver, and `music_video_producer` importable from this checkout's `src/`. **ComfyUI does not need to be running** and no language-model host is needed. Neither script spends GPU time or reaches `/prompt`.
+
+Why they start their own server rather than accepting a URL: on 2026-08-17 a health check passed against an hour-old process still bound to the port, and a live check was one step from reporting a working feature broken on the strength of stale code. `tests/e2e_support.py`'s `ManagedServer` refuses a bound port **by name and start time**, verifies the listener is its own descendant (the `uv` trampoline means the real `python run.py` is a grandchild, so teardown is `taskkill /F /T` and then proves the port came free), and proves the responder writes into a data root this run created seconds ago. **A health check that only proves something is listening proves nothing about what.** Exit code 2 means refused before any assertion ran.
+
+`e2e_shot_controls.py` seeds five shots and four assets through shipped routes and drives mark-ready/mark-draft, render-again and the multiview promote control — asserting each is rendered, hit-testable at its centre, correctly labelled, and that a disabled button the browser honours changes nothing server-side. It never clicks promote, and asserts `jobs` is empty at the end. `e2e_song_context.py` drives the lyrics/style editor, its counters, save, the per-field restores, the clearing confirmation through the browser's real dialog, and the VRAM eject toggle — writing `machine-preferences.json` inside its own root, so your stored choice is untouched. It causes exactly one deliberate 422 (the oversized sheet), declared to the console gate by name.
+
+**Found by these scripts and not yet fixed:**
+
+- **A toast covers the shot inspector's own controls.** `.toast-region` is `position: fixed` bottom-right at `z-index: 50`, which is exactly where the inspector's buttons are. The render-again toast is six lines tall and sits over `#compile-shot` for its full 4.2 s; the first scripted run failed because a click landed on `div.toast.info`.
+- **Three controls vanish at narrow widths**, from media queries nothing offline can see: `#create-multiview` and the whole asset inspector below ~1180 px; `#shot-inspector` and both commitment controls below ~860 px; and `#vram-eject-note` below ~860 px **while its toggle stays live** — so the eject can be changed at a width where the only surface reporting what it did is gone, with no hover fallback.
+- **The app re-renders after replies it does not await.** Selecting a clip writes the shot list back, that reply reloads readiness, and that reply rebuilds the inspector long after the click looked finished, so elements go stale under a script. The new scripts wait this out with a MutationObserver rather than retrying, which is worth copying in any future browser test.
+
 ### Isolated first-run browser QA
 
-Run the app on port 8766 with an empty temporary data root, then execute:
+The three scripts below still need a **manually started** server, unlike the two above. Run the app on port 8766 with an empty temporary data root, then execute:
 
 ```bash
 DATA_ROOT="$LOCALAPPDATA/Temp/mvp-e2e-data"
