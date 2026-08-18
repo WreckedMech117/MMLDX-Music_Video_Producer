@@ -197,3 +197,44 @@ Three surfaces, all the same specialist:
 - **`Shot.prompt` holds an intent, not an H3 prompt**, and pass two produces something structurally different and much longer. Overwriting the intent with the expansion would destroy the human-editable, human-readable thing pass one wrote, and make re-expansion impossible. These want to be two fields. That decision belongs to the Director.
 - **The existing expansion's neighbour rule was reasoned for pass one** and should be re-reasoned for pass two rather than inherited.
 - **VRAM sequencing gets more important, not less.** Thirty per-shot calls is thirty language-model calls, which is exactly the text-heavy front-loading the Director asked for on 2026-08-17 - do it all before any render, so the model loads once.
+
+
+---
+
+## Corrections to the derived format rules, 2026-08-18 - read after the guide's own checklist
+
+I wrote the rules above from the node pack's README, its validator, and three pages of MiniMax's guide. Reading the guide's **Output Checklist** (its own sections 3, pages 19-20) shows my summary was directionally right, **materially incomplete, and wrong in one place.** The guide is the authority; this section supersedes mine where they differ.
+
+### One rule I had actively wrong
+
+**Camera motion.** I wrote it as "motion type, amplitude and speed" as though all three were always required. The guide asks for camera motion *written as natural action*, with **amplitude and speed only where meaningful**. My version would have produced stilted, over-specified prompts that name an amplitude for every pan — the opposite of the intent.
+
+### Formatting I had wrong
+
+In the guide's full-reference worked example, `overall_soundscape:` and `non_diegetic_music:` sit on their **own lines with the value beneath**, not inline after the colon as I showed. And **`N/A` is a legitimate value** for a field that genuinely does not apply — the checklist asks only that it be used where warranted.
+
+### Rules I did not capture at all
+
+Semantic, not syntactic — and these are the ones a checker cannot enforce but a system prompt must:
+
+- **Every cut must introduce new subject, space, state, viewpoint or time information.** A cut that shows the same thing from the same place is a wasted shot boundary.
+- **Speaker ids are stable across shots**, and a character who never vocalizes **carries no id at all**. Handing every subject an `(Sx)` is wrong.
+- `<d>` contains **only** the language tag and the verbatim speech — no stage direction inside it.
+- **Voiceover has a fixed idiom**: the speaker *says in an off-screen voiceover*, plus a closed-lips statement. It is not just dialogue with a note attached.
+- `<scenetrans>` must appear in **both** parts when a line crosses a cut; `<cutoff>` marks speech that is truncated.
+- On-screen text goes in double quotation marks and is **left untranslated**.
+- `overall_soundscape` is **one to four sentences**, and must contain **no dialogue, singing or diegetic music** — those belong in the description.
+- `non_diegetic_music` is **one to three sentences** covering instrumentation, tempo and dynamics.
+
+For full-reference mode specifically, where my summary was weakest:
+
+- **Six sections, present and in order.** I described three loose parts; there are six, and their order is checked.
+- Every label is **defined once** and used consistently across all sections; no new labels may be introduced in the summary.
+- The **task-type prefix must match the reference's actual role** — a picture used for its palette is not a subject reference.
+- **No `(Sx)` anywhere in `retention_analysis`.** Speaker ids belong to the description.
+- Relationship markers must be chosen **within the role each label was defined as**, not freely.
+- Style is established in **one or two sentences before `[Shot 1]`** — not woven through the description.
+
+### Why this matters more than a corrected list
+
+Several of these are exactly the errors a competent model writing from taste would make: giving every character a speaker id, putting stage direction inside `<d>`, describing ambience and dialogue together in `overall_soundscape`, naming an amplitude for every camera move. **They are cheap to check and expensive to discover after a render.** The checker should cover the mechanical ones; the specialist's prompt has to carry the semantic ones, because nothing else will.
