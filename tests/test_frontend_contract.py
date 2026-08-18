@@ -32,7 +32,22 @@ from music_video_producer.app import (
     document_not_requested_notice,
     document_restore_notice,
 )
-from music_video_producer.models import AssetKind, MessageNotice, Project, Shot, Song
+from music_video_producer.models import (
+    ASSET_ROLE_LABELS,
+    LEGACY_SHOT_MODES,
+    SHOT_MODE_SPECS,
+    Asset,
+    AssetCitation,
+    AssetKind,
+    MessageNotice,
+    Project,
+    Shot,
+    SingingState,
+    Song,
+    dangling_citations,
+    mode_specification_problems,
+    resolve_shot_mode,
+)
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
 API_JS = Path("src/music_video_producer/web/assets/api.js")
@@ -82,11 +97,19 @@ def scoped_control_group(document_tab: str) -> str:
 
 
 def run_module(script: str):
+    # Decoded as UTF-8 explicitly. `text=True` alone decodes node's stdout with the *platform*
+    # encoding, which on Windows is a code page that mangles every typographic character the
+    # workspace draws — the ellipsis in "Attach asset…", the em dashes in the mode select — into
+    # replacement characters, so an assertion about a string the Director really sees fails for a
+    # reason that has nothing to do with the code under test. `batch.READINESS_REFUSAL` is
+    # deliberately ASCII to dodge exactly this; that is the right call for a string two languages
+    # must agree on character for character, and the wrong one to force on the whole interface.
     result = subprocess.run(
         ["node", "--input-type=module", "--eval", script],
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     return json.loads(result.stdout)
 
@@ -129,6 +152,32 @@ const make = (selector) => ({
   querySelector: () => null, querySelectorAll: () => [],
   getBoundingClientRect: () => ({ left: 0, top: 0, width: 1000, height: 300 }),
   closest() { return this; },
+  // A minimal scoped `querySelectorAll`, over the markup this element was just given. Class
+  // selectors only, which is every scoped use in app.js.
+  //
+  // It answered `[]` before, and that was a hole rather than a simplification: a handler bound with
+  // `$$(".remove-ref", inspector)` was bound to nothing in this harness, so no test could reach one.
+  // Per-citation controls are the case that made it matter -- a role select drawn once per cited
+  // asset cannot be addressed by a fixed id, so the only way to execute one is to find it the way
+  // the panel's own code does.
+  //
+  // Each match is registered under `<selector>[<data-id>]`, so a test fires it as
+  // `.citation-role[asset_wolf]:change` and sets `.value` on the same element the handler reads.
+  querySelectorAll(selector) {
+    if (!selector.startsWith(".")) return [];
+    const wanted = selector.slice(1);
+    const found = [];
+    for (const match of String(this.innerHTML || "").matchAll(/<(\\w+)\\s([^>]*?)>/g)) {
+      const attributes = match[2];
+      const classes = ((/class="([^"]*)"/.exec(attributes) || [null, ""])[1]).split(/\\s+/);
+      if (!classes.includes(wanted)) continue;
+      const id = (/data-id="([^"]*)"/.exec(attributes) || [null, ""])[1];
+      const element = at(selector + "[" + id + "]");
+      element.dataset.id = id;
+      found.push(element);
+    }
+    return found;
+  },
 });
 const at = (selector) => {
   if (!registry.has(selector)) registry.set(selector, make(selector));
@@ -5363,3 +5412,384 @@ def test_the_inspector_offers_promotion_for_an_object_and_sends_the_object_templ
     # The click on a kind the feature does not cover sends nothing at all, so a stale
     # selection cannot reach the route behind the inspector's back.
     assert fired["unsupported"] == []
+# --------------------------------------------------------------------------------------------
+# Shot mode and asset roles, across the language boundary.
+# --------------------------------------------------------------------------------------------
+
+# Every shot shape the two implementations are compared over. One list, used by all three parity
+# tests below, because the value of a cross-language comparison is entirely in what it covers: a
+# matrix that omitted the disagreement cases would prove only that two copies of the easy path
+# agree. Each entry names the state it exists to pin.
+SHOT_PARITY_CASES = {
+    # The two shapes that exist in every project saved before this change.
+    "legacy_references": {"asset_ids": ["asset_a", "asset_b"], "use_song_audio": False},
+    "legacy_text": {"asset_ids": [], "use_song_audio": False},
+    "legacy_song_only": {"asset_ids": [], "use_song_audio": True},
+    # A legacy `mode` string, which is a dropdown position and not a declaration.
+    "legacy_mode_string": {"mode": "text", "asset_ids": ["asset_a"]},
+    # Declarations, fitting and not.
+    "declared_text": {"mode": "text_to_video"},
+    "declared_text_with_assets": {"mode": "text_to_video", "asset_ids": ["asset_a"]},
+    "declared_text_with_song": {"mode": "text_to_video", "use_song_audio": True},
+    "declared_references": {"mode": "references", "asset_ids": ["asset_a"], "use_song_audio": True},
+    "first_last_complete": {
+        "mode": "first_last",
+        "citations": [
+            {"asset_id": "asset_a", "role": "first", "order": 0},
+            {"asset_id": "asset_b", "role": "last", "order": 0},
+        ],
+    },
+    "first_last_missing_one": {
+        "mode": "first_last",
+        "citations": [{"asset_id": "asset_a", "role": "first", "order": 0}],
+    },
+    "first_middle_last_missing_middle": {
+        "mode": "first_middle_last",
+        "citations": [
+            {"asset_id": "asset_a", "role": "first", "order": 0},
+            {"asset_id": "asset_b", "role": "last", "order": 0},
+        ],
+    },
+    "extend_without_source": {"mode": "extend"},
+    "image_to_video_with_two": {
+        "mode": "image_to_video",
+        "citations": [
+            {"asset_id": "asset_a", "role": "first", "order": 0},
+            {"asset_id": "asset_b", "role": "first", "order": 1},
+        ],
+    },
+    # Ordering within a role, with an explicit order that contradicts list position.
+    "ordered_references": {
+        "citations": [
+            {"asset_id": "asset_c", "role": "reference", "order": 2},
+            {"asset_id": "asset_b", "role": "reference", "order": 1},
+            {"asset_id": "asset_m", "role": "middle", "order": 0},
+        ],
+    },
+}
+
+
+def parity_shots() -> list[dict]:
+    """The matrix as whole shot objects, in one fixed order both languages iterate."""
+    return [
+        {
+            "id": f"shot_{name}", "start": 0, "duration": 5, "prompt": "A singer turns",
+            "mode": None, "asset_ids": [], "citations": [], "reference_labels": {},
+            "singing": "unknown", "use_song_audio": False, "seed": 0, "status": "draft",
+            "prompt_id": "", "latest_output": "", "approved_output": "", "locked": False,
+            **fields,
+        }
+        for name, fields in SHOT_PARITY_CASES.items()
+    ]
+
+
+def test_the_shot_mode_table_is_the_same_table_in_both_languages():
+    """`api.js`'s SHOT_MODES against `models.SHOT_MODE_SPECS`, field for field.
+
+    Two hand-written copies of what a mode requires is how the inspector starts drawing a shot as
+    complete that the route then refuses — and the inspector is where a Director decides whether to
+    spend a render. The order is compared too, because it is the order the mode select offers and a
+    reordering that put an unrenderable mode first would change what a new shot is nudged towards.
+    """
+    offered = run_module("""
+      import { SHOT_MODES, ASSET_ROLE_LABELS, SINGING_STATES, LEGACY_SHOT_MODES }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ SHOT_MODES, ASSET_ROLE_LABELS, SINGING_STATES, LEGACY_SHOT_MODES }));
+    """)
+
+    assert [entry["value"] for entry in offered["SHOT_MODES"]] == list(SHOT_MODE_SPECS)
+    for entry in offered["SHOT_MODES"]:
+        spec = SHOT_MODE_SPECS[entry["value"]]
+        assert entry["label"] == spec.label, entry["value"]
+        assert entry["song_audio"] == spec.song_audio, entry["value"]
+        assert entry["adapter"] == spec.adapter, entry["value"]
+        assert entry["roles"] == [
+            {"role": requirement.role, "minimum": requirement.minimum, "maximum": requirement.maximum}
+            for requirement in spec.roles
+        ], entry["value"]
+
+    assert offered["ASSET_ROLE_LABELS"] == ASSET_ROLE_LABELS
+    assert [entry["value"] for entry in offered["SINGING_STATES"]] == list(get_args(SingingState))
+    # `unknown` is first, so a select that has never been touched reads as the honest absence
+    # rather than as a claim about the performance.
+    assert offered["SINGING_STATES"][0]["value"] == "unknown"
+    assert set(offered["LEGACY_SHOT_MODES"]) == set(LEGACY_SHOT_MODES)
+
+
+def test_both_languages_resolve_the_same_mode_for_the_same_shot():
+    """`resolveShotMode` against `resolve_shot_mode`, over every case in the matrix.
+
+    Executed on both sides rather than read, because this is the branch that decides what a render
+    *is*. A browser that resolved a shot differently from the server would draw one mode in the
+    inspector and submit another, and the only place that disagreement would ever surface is in the
+    finished video.
+    """
+    shots = parity_shots()
+    resolved = run_module(f"""
+      import {{ resolveShotMode }} from './src/music_video_producer/web/assets/api.js';
+      const shots = {json.dumps(shots)};
+      console.log(JSON.stringify(shots.map(resolveShotMode)));
+    """)
+
+    assert resolved == [resolve_shot_mode(Shot.model_validate(shot)) for shot in shots]
+    # The matrix really does exercise more than one answer, or this would pass on a pair of
+    # constants that both return "references".
+    assert len(set(resolved)) >= 4
+
+
+def test_both_languages_name_the_same_missing_roles():
+    """`shotSpecificationProblems` against `mode_specification_problems`, sentence for sentence.
+
+    Compared as full strings and not as counts: the inspector prints these to the Director, the
+    route puts them in its 422, and the whole point is that the two say the same thing. A browser
+    reporting a different reason from the one the refusal will give is a Director fixing the wrong
+    thing.
+    """
+    shots = parity_shots()
+    problems = run_module(f"""
+      import {{ shotSpecificationProblems }} from './src/music_video_producer/web/assets/api.js';
+      const shots = {json.dumps(shots)};
+      console.log(JSON.stringify(shots.map(shotSpecificationProblems)));
+    """)
+
+    expected = [mode_specification_problems(Shot.model_validate(shot)) for shot in shots]
+    assert problems == expected
+    # And the matrix contains real problems as well as clean shots, so agreement is not agreement
+    # about a list that is always empty.
+    assert any(entry for entry in expected)
+    assert any(not entry for entry in expected)
+
+
+def test_both_languages_reconcile_citations_and_asset_ids_identically():
+    """`reconcileShotCitations` against `Shot`'s own validator.
+
+    The client half exists because the shots write does not adopt its own reply — it re-renders
+    from local state — so a browser that only wrote `citations` would go on drawing a stale
+    `asset_ids` until the next full project load. That makes this a second implementation of a
+    model invariant, which is exactly the kind that drifts.
+    """
+    shots = parity_shots()
+    reconciled = run_module(f"""
+      import {{ reconcileShotCitations }} from './src/music_video_producer/web/assets/api.js';
+      const shots = {json.dumps(shots)};
+      console.log(JSON.stringify(shots.map((shot) => {{
+        reconcileShotCitations(shot);
+        return {{ asset_ids: shot.asset_ids, citations: shot.citations }};
+      }})));
+    """)
+
+    for entry, shot in zip(reconciled, shots, strict=True):
+        model = Shot.model_validate(shot)
+        assert entry["asset_ids"] == model.asset_ids, shot["id"]
+        assert [(item["asset_id"], item["role"]) for item in entry["citations"]] == [
+            (item.asset_id, item.role) for item in model.citations
+        ], shot["id"]
+
+
+def test_the_inspector_draws_the_mode_it_resolves_and_declares_only_what_was_chosen():
+    """The mode control, rendered and used, against the workspace's own code.
+
+    Source reading cannot tell a select that is bound to `shot.mode` from one that is drawn and
+    never read, and it cannot tell `""` from `null` on the wire — which is the whole difference
+    between "the Director has not declared a mode" and a validation error. So the panel is drawn,
+    the select is fired, and what the save actually sent is read back off the request.
+    """
+    rendered = run_workspace("""
+      const project = (fields) => ({
+        id: 'p1', jobs: [], song: null,
+        assets: [{ id: 'asset_a', name: 'Grey wolf', kind: 'prop', path: 'media/wolf.png' }],
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A wolf crosses the clearing',
+                  mode: null, asset_ids: [], citations: [], reference_labels: {},
+                  singing: 'unknown', use_song_audio: false, seed: 0, status: 'draft',
+                  prompt_id: '', latest_output: '', approved_output: '', locked: false, ...fields }],
+      });
+      const draw = (fields) => {
+        state.project = project(fields);
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+        return at('#shot-inspector').innerHTML;
+      };
+      const undeclaredText = draw({});
+      const undeclaredReferences = draw({ asset_ids: ['asset_a'] });
+      const declared = draw({ mode: 'first_middle_last', citations: [{ asset_id: 'asset_a', role: 'first', order: 0 }] });
+
+      // Declare a mode through the select and read what reached the wire.
+      draw({});
+      at('#shot-mode').value = 'first_last';
+      at('#shot-singing').value = 'singing';
+      requests.length = 0;
+      fire('#shot-mode:change', {});
+      // The shots write is a chained promise, so the request is not on the wire until the
+      // microtask queue drains. Reading `requests` without this asserts about a save that has not
+      // happened yet -- and would pass just as happily against a handler that never saved at all.
+      await flush();
+      const declaredWrite = JSON.parse(requests[requests.length - 1].body).shots[0];
+
+      // And take the declaration back off again.
+      draw({ mode: 'first_last' });
+      at('#shot-mode').value = '';
+      at('#shot-singing').value = 'unknown';
+      requests.length = 0;
+      fire('#shot-mode:change', {});
+      await flush();
+      const undeclaredWrite = JSON.parse(requests[requests.length - 1].body).shots[0];
+
+      console.log(JSON.stringify({
+        undeclaredText, undeclaredReferences, declared,
+        declaredWrite: { mode: declaredWrite.mode, singing: declaredWrite.singing },
+        undeclaredWrite: { mode: undeclaredWrite.mode, singing: undeclaredWrite.singing },
+      }));
+    """)
+
+    # An undeclared shot says so *and* says what it renders as, because "not declared" on its own
+    # tells the Director nothing about what pressing render would do.
+    assert "Not declared — renders as Text to video" in rendered["undeclaredText"]
+    assert "Not declared — renders as References to video" in rendered["undeclaredReferences"]
+    # A declared mode is the selected option, and every mode is offered — including the ones with
+    # no adapter, which are labelled rather than hidden.
+    assert '<option value="first_middle_last" selected>' in rendered["declared"]
+    for mode, spec in SHOT_MODE_SPECS.items():
+        assert f'value="{mode}"' in rendered["declared"], mode
+        if not spec.adapter:
+            assert f"{spec.label} — no adapter yet" in rendered["declared"], mode
+
+    # `null` and not `""`. The model's field is `ShotMode | None` precisely so that "undeclared" is
+    # representable, and `""` is not a member of the Literal.
+    assert rendered["declaredWrite"] == {"mode": "first_last", "singing": "singing"}
+    assert rendered["undeclaredWrite"] == {"mode": None, "singing": "unknown"}
+    assert Shot(start=0, duration=5, **rendered["declaredWrite"]).mode == "first_last"
+    assert Shot(start=0, duration=5, **rendered["undeclaredWrite"]).mode is None
+
+
+def test_the_inspector_shows_a_role_per_citation_and_writes_the_role_that_was_chosen():
+    """Roles are editable where the shot is edited, and the write carries them.
+
+    The role is the thing that has to be changeable: the same wolf is a middle frame in this shot
+    and a plain reference in the next, and a role stored on the asset would have forced a duplicate
+    per part. So the row is drawn per citation, every role is offered on every row, and the change
+    is followed all the way onto the wire.
+    """
+    rendered = run_workspace("""
+      state.project = {
+        id: 'p1', jobs: [], song: null,
+        assets: [
+          { id: 'asset_wolf', name: 'Grey wolf', kind: 'prop', path: 'media/wolf.png' },
+          { id: 'asset_stage', name: 'Stage', kind: 'setting', path: 'media/stage.png' },
+        ],
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A wolf crosses the clearing',
+                  mode: 'first_last', asset_ids: ['asset_wolf', 'asset_stage'],
+                  citations: [
+                    { asset_id: 'asset_wolf', role: 'reference', order: 0 },
+                    { asset_id: 'asset_stage', role: 'reference', order: 1 },
+                  ],
+                  reference_labels: {}, singing: 'unknown', use_song_audio: false, seed: 0,
+                  status: 'draft', prompt_id: '', latest_output: '', approved_output: '',
+                  locked: false }],
+      };
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      const html = at('#shot-inspector').innerHTML;
+
+      // Re-role the wolf to the first frame through the control the Director would use: the select
+      // the panel drew for that citation, found the way the panel's own binding found it.
+      at('.citation-role[asset_wolf]').value = 'first';
+      requests.length = 0;
+      fire('.citation-role[asset_wolf]:change', {});
+      await flush();
+      const rolled = JSON.parse(requests[requests.length - 1].body).shots[0];
+
+      // And remove the other one, through its own control.
+      requests.length = 0;
+      fire('.remove-ref[asset_stage]:click', {});
+      await flush();
+      const removed = JSON.parse(requests[requests.length - 1].body).shots[0];
+
+      console.log(JSON.stringify({
+        html,
+        rolled: { citations: rolled.citations, asset_ids: rolled.asset_ids },
+        removed: { citations: removed.citations, asset_ids: removed.asset_ids },
+        rerolled: at('#shot-inspector').innerHTML,
+        problems: contract.shotSpecificationProblems(state.project.shots[0]),
+      }));
+    """)
+
+    # A row per citation, each with its own role select bound to that asset.
+    assert rendered["html"].count('class="citation-role"') == 2
+    assert 'data-id="asset_wolf"' in rendered["html"]
+    assert 'data-id="asset_stage"' in rendered["html"]
+    # Every role is offered, not only the ones this mode declares: a Director re-pointing a shot
+    # does it one control at a time, and hiding `middle` until the mode was already right would
+    # make the order of those two clicks matter.
+    for role, label in ASSET_ROLE_LABELS.items():
+        assert f'<option value="{role}"' in rendered["html"], role
+        assert label in rendered["html"], role
+
+    # The role really reached the wire, and the reference projection no longer claims the wolf —
+    # which is what stops the render sending it as reference picture one under a mode that says it
+    # is the first frame.
+    assert [(item["asset_id"], item["role"]) for item in rendered["rolled"]["citations"]] == [
+        ("asset_wolf", "first"), ("asset_stage", "reference")
+    ]
+    assert rendered["rolled"]["asset_ids"] == ["asset_stage"]
+    # And what the server would make of that body is the same thing, rather than the client's own
+    # idea of it.
+    saved = Shot.model_validate({"start": 0, "duration": 5, **rendered["rolled"]})
+    assert saved.asset_ids == ["asset_stage"]
+
+    # Removing a citation removes exactly that one, in both fields.
+    assert [item["asset_id"] for item in rendered["removed"]["citations"]] == ["asset_wolf"]
+    assert rendered["removed"]["asset_ids"] == []
+
+    # And the panel reports exactly what the route would refuse the shot for.
+    assert rendered["problems"] == mode_specification_problems(
+        Shot(
+            start=0, duration=5, mode="first_last",
+            citations=[AssetCitation(asset_id="asset_wolf", role="first")],
+        )
+    )
+    assert rendered["problems"]
+
+
+def test_a_citation_whose_asset_is_gone_is_drawn_rather_than_skipped():
+    """The deleted-asset row, proven by executing the panel that used to swallow it.
+
+    The attached list used to return `""` for a citation whose asset was missing, so a shot could
+    look like it had dropped an attachment it was in fact still sending — and the route refuses
+    that shot with `Unknown reference asset`, a refusal the Director had no way to see coming.
+    """
+    rendered = run_workspace("""
+      state.project = {
+        id: 'p1', jobs: [], song: null,
+        assets: [{ id: 'asset_stage', name: 'Stage', kind: 'setting', path: 'media/stage.png' }],
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A wolf crosses the clearing',
+                  mode: null, asset_ids: ['asset_gone', 'asset_stage'],
+                  citations: [], reference_labels: {}, singing: 'unknown', use_song_audio: false,
+                  seed: 0, status: 'draft', prompt_id: '', latest_output: '', approved_output: '',
+                  locked: false }],
+      };
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      console.log(JSON.stringify({
+        html: at('#shot-inspector').innerHTML,
+        dangling: contract.danglingCitations(state.project, state.project.shots[0]),
+        label: contract.CITATION_MISSING_LABEL,
+      }));
+    """)
+
+    assert rendered["dangling"] == ["asset_gone"]
+    assert rendered["html"].count('class="citation-row') == 2
+    # Named in words as well as flagged by the row's class, for the reason the readiness flag
+    # carries both: colour alone is state by appearance.
+    assert rendered["label"] in rendered["html"]
+    assert "citation-missing" in rendered["html"]
+    assert "asset_gone" in rendered["html"]
+    # The surviving asset is still drawn normally beside it, so the panel is not simply broken.
+    assert "Stage" in rendered["html"]
+
+    # And the same fact from the server's own function, so the two halves agree about which
+    # citations are dangling rather than each having its own idea.
+    project = Project(name="Gone")
+    project.assets = [Asset(id="asset_stage", name="Stage", kind="setting", path="media/stage.png")]
+    assert dangling_citations(
+        project, Shot(start=0, duration=5, asset_ids=["asset_gone", "asset_stage"])
+    ) == rendered["dangling"]

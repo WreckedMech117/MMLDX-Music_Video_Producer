@@ -54,8 +54,10 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - stable `id`
 - `start`, `duration`, computed `end`
 - editable `prompt`
-- `mode`: text, image, reference
-- attached `asset_ids[]`
+- `mode`: `ShotMode | None`, where **`None` means undeclared** — see below
+- `citations[]`: `{asset_id, role, order}` — what the shot cites and what for
+- `asset_ids[]`: the reference-role **projection** of `citations`, kept for compatibility
+- `singing`: `SingingState`, one of `unknown` / `singing` / `not_singing`
 - stable `reference_labels` and optional `use_song_audio`
 - `seed`
 - `status`
@@ -66,6 +68,16 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - `locked`
 
 Shot timing is measured in seconds against the master song. Director compilation converts it to frames only at the workflow boundary.
+
+**A shot declares what it is; it is no longer inferred.** `generate_h3` used to choose between the text-only and reference paths by asking whether `asset_ids` happened to be empty, so a shot could not say what it was meant to be or be wrong about it before a render. `SHOT_MODE_SPECS` is now a table — label, per-role minimum and maximum, whether the mode can take song audio, and which adapter it routes to — so adding a mode is a row rather than a branch.
+
+**`None` means undeclared, and that is deliberate.** A `Shot.mode` field already existed as a dropdown position nobody read, carrying legacy strings. Reading those as declarations would have changed what existing shots render, so they resolve to *undeclared* instead, and the new vocabulary deliberately shares no spelling with them (`"reference"` became `"references"`) so the two can never be confused. An undeclared shot resolves the way it always behaved — citations present means references, absent means text-only — and renders a byte-identical payload, pinned by digests taken from the previous commit.
+
+**Roles live on the citation, never on the asset.** The same library asset is a reference in one shot and a middle frame in another; the wolf is not "a middle frame", it is a middle frame *in this shot*. Putting the role on the asset would force a duplicate per part and make a plan unrevisable. `citations` is the truth and `asset_ids` is its projection onto the reference role, kept in agreement by a model validator in both directions — so a legacy manifest migrates on read without being rewritten, and re-roling an asset to `middle` stops it being sent as a reference picture.
+
+**`singing` is tri-state on purpose.** It is a `Literal`, not `bool | None`, so `if not shot.singing` cannot quietly mean "not singing". `unknown` is not `not_singing`: the LTX enhancer moves lip position, so a wrong default in either direction is worse than an honest absence. **Nothing infers it** — a test greps all of `src/` for any assignment that would. It is a property of the *performance*, not of the mode, because a references shot may or may not be a singing shot.
+
+**Four modes are plannable and not yet renderable.** A mode with no adapter is refused at render with a clear reason rather than hidden, because laying out a first/middle/last section before its adapter exists is useful planning work. Three rows from the planning table are deliberately *not* modes: image editing is a `length: 5` reference render and so a parameter of `references`; enhancement is an operation on a take with its own route; and slicing and audio replacement are file utilities.
 
 ## TreatmentMessage
 

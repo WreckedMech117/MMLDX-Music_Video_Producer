@@ -28,6 +28,7 @@ from .director import (
     document_rejection,
 )
 from .models import (
+    SHOT_MODE_SPECS,
     Asset,
     MessageNotice,
     Project,
@@ -37,6 +38,9 @@ from .models import (
     Song,
     TreatmentMessage,
     VisionInspectionRecord,
+    citations_in_role,
+    mode_specification_problems,
+    resolve_shot_mode,
 )
 from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
 from .store import ProjectNotFound, ProjectStore
@@ -135,6 +139,70 @@ def multiview_refusal() -> str:
     named = f"{', '.join(kinds[:-1])} or {kinds[-1]}" if len(kinds) > 1 else kinds[0]
     return f"A completed {named} image is required for multiview generation"
 
+
+# A mode this application can plan but cannot render, refused at the point of spending GPU time.
+#
+# Plannable and unrenderable is a deliberate pair, not an oversight to be tidied away: a Director
+# laying out a first/middle/last section before that adapter exists is doing real work, and a mode
+# that disappeared from the interface until its adapter landed would make that work impossible.
+# What must never happen is the other failure — a mode that looks renderable and is not — which is
+# what this sentence exists to prevent, naming the modes that *do* render so the refusal is
+# actionable rather than only true.
+MODE_WITHOUT_ADAPTER_REFUSAL = (
+    "{shot} is a {mode} shot, which this application can plan but cannot yet render: no adapter "
+    "has been built for it. Nothing was sent to ComfyUI and no GPU time was spent. The modes that "
+    "render today are {available}."
+)
+
+# A shot whose mode and whose citations disagree, refused rather than resolved.
+#
+# The alternative is worse than a refusal and is what this branch used to do by omission: build the
+# payload the attachments imply and log the render under a mode that was never applied. A GPU job
+# recorded as one thing and rendered as another is invisible afterwards, which is the argument the
+# profile and selector refusals below already make twice.
+MODE_UNSPECIFIED_REFUSAL = (
+    "{shot} is not fully specified for its mode. {problems} Nothing was sent to ComfyUI and no "
+    "GPU time was spent."
+)
+
+#: Every graph builder `generate_h3` actually has a branch for.
+#:
+#: Checked against `SHOT_MODE_SPECS` at import, on `_withheld_fields`' argument. The hole this
+#: closes is specific and silent: the route picks the reference branch on one adapter name and
+#: falls through to the text-only graph otherwise, so a mode given a *third* adapter name in the
+#: table — the next mode to be built — would pass the "can this render" gate and then render as
+#: text-to-video, logged as though its own adapter had run. That is the one failure this story is
+#: forbidden to introduce, and it has no symptom at the point it happens. The application refusing
+#: to start does.
+H3_ADAPTERS = frozenset({"h3-director", "h3-reference"})
+
+if _unbuildable := {
+    mode: spec.adapter
+    for mode, spec in SHOT_MODE_SPECS.items()
+    if spec.adapter and spec.adapter not in H3_ADAPTERS
+}:
+    raise RuntimeError(
+        f"SHOT_MODE_SPECS names adapters generate_h3 cannot build: {sorted(_unbuildable)}. Give "
+        "the route a branch for each and add its name to H3_ADAPTERS, or leave the mode's adapter "
+        'as "" so it is refused at render rather than rendered as something else.'
+    )
+
+
+def mode_without_adapter_refusal(shot_name: str, mode: str) -> str:
+    """The 422 for a plannable-but-unrenderable mode, naming what does render.
+
+    The list of renderable modes is derived from `SHOT_MODE_SPECS` rather than written out, for
+    `multiview_refusal`'s reason: a hardcoded list goes stale in exactly the direction that leaves
+    a Director staring at a mode the refusal says is unavailable and the route accepts.
+    """
+    available = sorted(
+        spec.label for spec in SHOT_MODE_SPECS.values() if spec.adapter
+    )
+    named = f"{', '.join(available[:-1])} and {available[-1]}" if len(available) > 1 else available[0]
+    return MODE_WITHOUT_ADAPTER_REFUSAL.format(
+        shot=shot_name, mode=SHOT_MODE_SPECS[mode].label, available=named
+    )
+
 # Every field a `Song` carries, classified into what the Director is shown and what is withheld.
 #
 # This is two *sets* rather than the one exclusion path the shape appears to want, and the reason
@@ -166,6 +234,7 @@ def _withheld_fields(
     *,
     visible: frozenset[str],
     withheld: frozenset[str],
+    family: str,
 ) -> set[str]:
     """The fields of `model` to strip from the Director's context, or a loud refusal.
 
@@ -177,6 +246,12 @@ def _withheld_fields(
     computation. Deriving the answer instead (say, "every field ending `_previous`") would move
     the silent-omission problem rather than solve it — a slot named `lyrics_backup` would be
     derived out of the exclusion just as quietly as a path fails to match it.
+
+    `family` names the pair of constants the refusal tells the next writer to edit — `"SONG"` for
+    `SONG_DIRECTOR_VISIBLE`/`_WITHHELD`, `"SHOT"` for the Shot pair. Passed rather than derived
+    from `model.__name__`, because this check is applied to two models and to test subclasses of
+    them: a derived name sends someone to a constant that does not exist, and it does so in the one
+    message whose whole job is to say what to do.
     """
     declared = set(model.model_fields) | set(model.model_computed_fields)
     where = model.__name__
@@ -188,8 +263,9 @@ def _withheld_fields(
     if unclassified := declared - visible - withheld:
         raise RuntimeError(
             f"{where}: {sorted(unclassified)} is not classified as shown to the Director or "
-            "withheld from it. Add it to SONG_DIRECTOR_VISIBLE or SONG_DIRECTOR_WITHHELD — a "
-            "recovery slot left unclassified would be echoed back into every prompt."
+            f"withheld from it. Add it to {family}_DIRECTOR_VISIBLE or {family}_DIRECTOR_WITHHELD "
+            "— an unclassified field is echoed into every Director prompt by default, and a "
+            "recovery slot echoed there is the version the Director deliberately discarded."
         )
     if stale := (visible | withheld) - declared:
         raise RuntimeError(
@@ -197,6 +273,56 @@ def _withheld_fields(
             "classification of a field that does not exist covers nothing."
         )
     return set(withheld)
+
+
+# Every field a `Shot` carries, classified the same way `Song` is — and the answer to the question
+# this story was told to ask, which was whether Shots were classified at all or only Songs.
+#
+# They were not. Only `Song` had a pair of sets, so every field ever added to `Shot` has entered
+# the Director's prompt the moment it was declared, with nobody deciding that it should. This story
+# added three at once — `mode`, `citations` and `singing` — which is exactly the situation the
+# guard exists for, so it is extended rather than the three fields being waved through.
+#
+# **Nothing is withheld, and that is a deliberate empty set rather than an unfinished one.** Taking
+# a field *out* of the dump changes what the Director is prompted with, which is Ask First and is
+# not what this story is for; `latest_review`, `approved_output` and `prompt_id` are the obvious
+# candidates and stay in because they were in it yesterday. What the classification buys today is
+# that the *next* field cannot arrive without that decision being made — the application refuses to
+# start until it is. `DIRECTOR_CONTEXT_EXCLUDE` below carries no `shots` key at all while this set
+# is empty, so the dump is byte-identical to the one the Director got before this change.
+#
+# The three new fields are classified visible on their own merits, not by default. They are plan
+# facts — what this shot is, what it cites, whether the performer sings — and they are the facts an
+# assistant asked to fill a plan in would need to read. `mode` was already in the dump under its
+# old spelling, so withholding it would be a removal.
+SHOT_DIRECTOR_VISIBLE = frozenset(
+    {
+        "id",
+        "start",
+        "duration",
+        "end",
+        "prompt",
+        "mode",
+        "asset_ids",
+        "citations",
+        "reference_labels",
+        "singing",
+        "use_song_audio",
+        "seed",
+        "status",
+        "prompt_id",
+        "latest_output",
+        "latest_review",
+        "approved_output",
+        "locked",
+    }
+)
+SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset()
+
+#: The check, run for its refusal. Empty today; see `SHOT_DIRECTOR_VISIBLE`.
+SHOT_DIRECTOR_WITHHELD_FIELDS = _withheld_fields(
+    Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
+)
 
 
 # What the Director's project dump leaves out. The recovery slots are *derived* from the
@@ -216,7 +342,16 @@ DIRECTOR_CONTEXT_EXCLUDE: dict[str, Any] = {
     # list of names anyone has to remember to extend, it is whatever `Song` declares and nobody
     # classified as visible. See SONG_DIRECTOR_WITHHELD.
     "song": _withheld_fields(
-        Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD
+        Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD, family="SONG"
+    ),
+    # Present only once something is actually withheld from a Shot, so classifying every field as
+    # visible leaves this mapping — and therefore the Director's prompt — exactly as it was. An
+    # unconditional `{"shots": {"__all__": set()}}` would be an empty exclusion that looks like a
+    # policy, and the next reader would have to run it to find out it excludes nothing.
+    **(
+        {"shots": {"__all__": SHOT_DIRECTOR_WITHHELD_FIELDS}}
+        if SHOT_DIRECTOR_WITHHELD_FIELDS
+        else {}
     ),
     **{f"{field}{RECOVERY_SLOT_SUFFIX}": True for field in DOCUMENT_LABELS},
 }
@@ -2248,11 +2383,48 @@ def create_app(
             )
         if shot.status != "ready":
             raise HTTPException(status_code=422, detail="Shot must be ready before H3 submission")
-        if shot.asset_ids or shot.use_song_audio:
+        # What this shot *is*, asked of the shot rather than read off its attachments.
+        #
+        # This line replaced `if shot.asset_ids or shot.use_song_audio:`, and the replacement is
+        # the whole story: that condition could only ever produce two answers, so a taxonomy of six
+        # shot kinds had nowhere to live and a Director could not be wrong about a mode before
+        # spending a render on it. `resolve_shot_mode` keeps the old condition as its *fallback*,
+        # which is what makes every Shot saved before this change route exactly where it did — see
+        # the byte-identical payload assertions in `tests/test_api.py`.
+        mode = resolve_shot_mode(shot)
+        spec = SHOT_MODE_SPECS[mode]
+        # Before the payload and before ComfyUI, in that order and for the same reason every other
+        # refusal on this route is: a mode with no adapter cannot be built, so the only question is
+        # whether the Director finds out here or from a 502 after the submission.
+        if not spec.adapter:
+            raise HTTPException(
+                status_code=422,
+                detail=mode_without_adapter_refusal(shot_label(project, shot), mode),
+            )
+        # Then whether the shot fits the mode it declared. Unreachable for every Shot that existed
+        # before this change: an undeclared Shot resolves to `references`, whose citation minimum
+        # is zero and which is the one mode that takes the master song, so nothing it can be
+        # carrying is a problem. It is reachable only from a declaration, which is exactly when
+        # being wrong before the render is the point.
+        if problems := mode_specification_problems(shot):
+            raise HTTPException(
+                status_code=422,
+                detail=MODE_UNSPECIFIED_REFUSAL.format(
+                    shot=shot_label(project, shot), problems=" ".join(problems)
+                ),
+            )
+        if spec.adapter == "h3-reference":
             references: list[dict[str, Any]] = []
             tags: list[str] = []
             numbers = {"picture": 0, "video": 0, "audio": 0}
-            for asset_id in shot.asset_ids:
+            # The reference-role citations in order, which the model guarantees is `asset_ids` in
+            # order for every Shot that has ever been saved — see `Shot._reconcile_citations`.
+            # Read from the citations rather than from the flat list because the citations are the
+            # truth: a Shot whose wolf has been given the middle-frame role must stop sending it
+            # as reference picture three, and `asset_ids` is the projection that stops naming it.
+            for asset_id in [
+                citation.asset_id for citation in citations_in_role(shot, "reference")
+            ]:
                 asset = next((item for item in project.assets if item.id == asset_id), None)
                 if not asset:
                     raise HTTPException(status_code=422, detail=f"Unknown reference asset: {asset_id}")
@@ -2329,6 +2501,10 @@ def create_app(
             except ValueError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
         else:
+            # `h3-director`, and nothing else can reach here: the adapter gate above refuses `""`,
+            # and the import-time check beside `H3_ADAPTERS` refuses a table naming any third
+            # adapter this route has no branch for.
+            #
             # A sampling profile names a *reference*-graph configuration, and this branch
             # builds the text-only Director graph, which has no evidenced profile: it loads
             # a different checkpoint pair through `MiniMaxH3DirectorCS`, and the installed

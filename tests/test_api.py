@@ -21,6 +21,7 @@ from music_video_producer.app import (
     DOCUMENT_REJECTED_NOTICE,
     ENHANCE_PREFIX_SUFFIX,
     EXPANSION_REJECTED_EMPTY_NOTICE,
+    H3_ADAPTERS,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
     MARK_READY_APPROVED_REFUSAL,
     MARK_READY_IN_FLIGHT_REFUSAL,
@@ -33,6 +34,8 @@ from music_video_producer.app import (
     RENDER_AGAIN_STATUSES,
     SHOT_CLAIM_MISMATCH_NOTICE,
     SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
+    SHOT_DIRECTOR_VISIBLE,
+    SHOT_DIRECTOR_WITHHELD,
     SHOT_PLAN_EMPTY_NOTICE,
     SHOT_WINDOW_NOTICE,
     SONG_CAPTION_LIMIT,
@@ -66,17 +69,28 @@ from music_video_producer.director import (
     ShotExpansion,
 )
 from music_video_producer.models import (
+    ASSET_ROLE_LABELS,
+    LEGACY_SHOT_MODES,
     NOTICE_RAW_LIMIT,
+    SHOT_MODE_SPECS,
     Asset,
+    AssetCitation,
     AssetKind,
+    AssetRole,
     MessageNotice,
     NoticeKind,
     Project,
     Shot,
+    ShotMode,
     ShotStatus,
+    SingingState,
     Song,
     TreatmentMessage,
     VisionInspectionRecord,
+    citations_in_role,
+    dangling_citations,
+    mode_specification_problems,
+    resolve_shot_mode,
 )
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import expansion_input
@@ -1141,6 +1155,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
             SongWithANewField,
             visible=SONG_DIRECTOR_VISIBLE,
             withheld=SONG_DIRECTOR_WITHHELD,
+            family="SONG",
         )
 
     # It names the field and says what to do about it, because a loud failure nobody can act on is
@@ -1154,6 +1169,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
         SongWithANewField,
         visible=SONG_DIRECTOR_VISIBLE,
         withheld=SONG_DIRECTOR_WITHHELD | {"bpm_previous"},
+        family="SONG",
     )
     assert "bpm_previous" in covered
     song = SongWithANewField(title="t", source="imported", bpm_previous="128")
@@ -1165,6 +1181,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
         SongWithANewField,
         visible=SONG_DIRECTOR_VISIBLE | {"bpm_previous"},
         withheld=SONG_DIRECTOR_WITHHELD,
+        family="SONG",
     )
     assert "bpm_previous" in song.model_dump(exclude=shown)
 
@@ -1175,6 +1192,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
             Song,
             visible=SONG_DIRECTOR_VISIBLE,
             withheld=SONG_DIRECTOR_WITHHELD | {"lyrics_backup"},
+            family="SONG",
         )
     assert "lyrics_backup" in str(stale.value)
 
@@ -1184,6 +1202,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
             Song,
             visible=SONG_DIRECTOR_VISIBLE | {"lyrics_previous"},
             withheld=SONG_DIRECTOR_WITHHELD,
+            family="SONG",
         )
     assert "lyrics_previous" in str(overlap.value)
 
@@ -1191,7 +1210,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
     # this module succeed at all — asserted rather than assumed, so a future edit that silences the
     # guard by widening a set to `Song.model_fields` fails here.
     assert _withheld_fields(
-        Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD
+        Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD, family="SONG"
     ) == {"lyrics_previous", "caption_previous"}
     assert not SONG_DIRECTOR_VISIBLE & SONG_DIRECTOR_WITHHELD
 
@@ -1846,10 +1865,14 @@ def test_h3_reference_tags_are_numbered_per_kind_in_attachment_order(tmp_path: P
 def test_h3_routes_to_the_reference_payload_only_when_something_is_attached(tmp_path: Path):
     """FR-20's routing rule, as the pair it is — each asserting the other's marker is absent.
 
-    The condition is `shot.asset_ids or shot.use_song_audio`, and `Shot.mode` is never
-    consulted, so a Shot that says `mode="text"` while carrying an Asset still renders as a
-    reference shot. Asserting only that the expected node is present would pass for a
-    payload that carried both branches' nodes.
+    The route now branches on `resolve_shot_mode`, and this is the *undeclared* half of it: both
+    Shots here carry a legacy `mode` string, which resolves to "no declaration was ever made", so
+    each routes on what it behaves as. That is the migration, and it is why the Shot saying
+    `mode="text"` while carrying an Asset still renders as a reference shot — exactly as it did
+    before the mode became declarable.
+
+    Asserting only that the expected node is present would pass for a payload that carried both
+    branches' nodes.
     """
     client, store, comfy = make_client(tmp_path)
     project = store.create(Project(name="Routing"))
@@ -3731,7 +3754,12 @@ def test_director_shot_application_preserves_existing_shot_provenance(tmp_path: 
             start=1,
             duration=4,
             prompt="Manual draft",
-            mode="image",
+            # A *declared* mode in the current vocabulary. `"image"` was the legacy value here,
+            # and it is now resolved to "undeclared" on load — see `LEGACY_SHOT_MODES` — so
+            # asserting it survived would have asserted the migration did not happen. What this
+            # test is about is that a Director shot application does not reset a declaration the
+            # Director made, which needs a declaration that can be made.
+            mode="image_to_video",
             asset_ids=["asset_reference"],
             seed=44,
             status="approved",
@@ -3752,7 +3780,7 @@ def test_director_shot_application_preserves_existing_shot_provenance(tmp_path: 
     assert shot.id == original_id
     assert shot.prompt == "A widening corridor"
     assert shot.asset_ids == ["asset_reference"]
-    assert shot.mode == "image"
+    assert shot.mode == "image_to_video"
     assert shot.seed == 44
     assert shot.status == "approved"
     assert shot.prompt_id == "render-1"
@@ -7481,3 +7509,599 @@ def test_the_route_offers_every_aspect_ratio_the_selector_knows(tmp_path: Path):
     # Director's frame rather than looking like a caller who asked for 1344x768.
     assert H3Request().width is None
     assert H3Request().height is None
+# --------------------------------------------------------------------------------------------
+# Shot mode and asset roles.
+# --------------------------------------------------------------------------------------------
+
+# The two payloads this application built at commit f281606, digested. These are the load-bearing
+# numbers of the whole shot-mode change: it touched the branch that decides what every render *is*,
+# and the only convincing evidence that it is safe is that the same Shot still produces the same
+# bytes. They were captured from `git show HEAD:` before a line of it was written.
+#
+# Taken from **f281606 and not from anything older**, deliberately. That commit windowed the song
+# audio a reference shot is conditioned on, so a Shot with `use_song_audio` is knowingly no longer
+# byte-identical to a commit before it. Baselining further back would have frozen the bug this
+# project had just fixed and reported the fix as the regression.
+H3_REFERENCE_PAYLOAD_DIGEST = "e523c516a524409ee6cf3c2c7017d047b254f3f4ef3a0008a751e6fac432e9e8"
+H3_TEXT_PAYLOAD_DIGEST = "3745c41171949a07e46009843ebe38bb14efaab3bd5056d20de0fa9b3eb9733a"
+
+DIGEST_PROJECT_ID = "project_deadbeef0001"
+DIGEST_SHOT_REFERENCE = "shot_deadbeef0002"
+DIGEST_SHOT_TEXT = "shot_deadbeef0003"
+DIGEST_ASSET_LEAD = "asset_deadbeef0004"
+DIGEST_ASSET_PAN = "asset_deadbeef0005"
+
+
+def payload_digest(payload: dict, root: Path) -> str:
+    """One H3 payload as a stable SHA-256, with the machine's temporary directory taken out.
+
+    Every other input is pinned by the fixture below — ids, seeds, the song's duration — so the
+    only thing that varies between two runs is where pytest put `tmp_path`. That path is embedded
+    in the payload twice over: once as a plain string and once more inside `media_state`, which is
+    itself a JSON string, so the separators come back doubly escaped. All four spellings are
+    normalised, longest first, and getting that wrong is not hypothetical: it produced a digest
+    that changed on every run and looked exactly like a regression.
+    """
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    base = str(root.resolve())
+    forms = {
+        base,
+        base.replace("\\", "/"),
+        base.replace("\\", "\\\\"),
+        base.replace("\\", "\\\\\\\\"),
+    }
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "<root>")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def digest_project(tmp_path: Path):
+    """The two Shot shapes that existed before modes were declarable, with everything pinned.
+
+    Both Shots are written the way a manifest saved before this change writes them: a flat
+    `asset_ids` list, no `citations`, no `mode`. That is the point — the digests must be produced
+    by Shots that made no declaration, because those are the Shots this change promised not to move.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(id=DIGEST_PROJECT_ID, name="Digest"))
+    media = store.media_dir(DIGEST_PROJECT_ID)
+    (media / "lead.png").write_bytes(b"lead-png")
+    (media / "pan.mp4").write_bytes(b"pan-mp4")
+    (media / "duet.flac").write_bytes(b"fLaCfake")
+    project.assets = [
+        Asset(id=DIGEST_ASSET_LEAD, name="Lead vocalist", kind="character", path="media/lead.png"),
+        Asset(id=DIGEST_ASSET_PAN, name="Camera pan", kind="video", path="media/pan.mp4"),
+    ]
+    project.song = Song(title="Duet", source="imported", path="media/duet.flac", duration=30.0)
+    project.shots = [
+        Shot(
+            id=DIGEST_SHOT_REFERENCE,
+            start=4.0,
+            duration=5.0,
+            prompt="The two vocalists perform the chorus together.",
+            asset_ids=[DIGEST_ASSET_LEAD, DIGEST_ASSET_PAN],
+            reference_labels={DIGEST_ASSET_LEAD: "lead vocalist"},
+            use_song_audio=True,
+            seed=1234,
+            status="ready",
+        ),
+        Shot(
+            id=DIGEST_SHOT_TEXT,
+            start=12.0,
+            duration=6.0,
+            prompt="A grey wolf walks through a wet forest.",
+            seed=5678,
+            status="ready",
+        ),
+    ]
+    store.save(project)
+    return client, store, comfy
+
+
+def test_both_existing_shot_shapes_still_build_the_byte_identical_payload(tmp_path: Path):
+    """The one test this whole change had to earn: the same Shot, the same bytes.
+
+    `generate_h3` used to decide what a render *was* by asking whether `asset_ids` happened to be
+    non-empty. That branch is now `resolve_shot_mode`, and every behavioural assertion in this file
+    would still pass if the reference path had quietly started sending its media in a different
+    order, numbering its tags differently, or resolving one file by another route. A digest cannot.
+
+    Both shapes, because the change had two ways to go wrong and they are not the same way: the
+    reference branch moved from iterating `asset_ids` to iterating the reference-role citations, and
+    the text branch is reached through a new gate that could refuse it or route past it.
+    """
+    client, _, comfy = digest_project(tmp_path)
+
+    for shot_id in (DIGEST_SHOT_REFERENCE, DIGEST_SHOT_TEXT):
+        assert submit_h3(client, DIGEST_PROJECT_ID, shot_id).status_code == 202
+
+    assert payload_digest(comfy.prompts[0], tmp_path) == H3_REFERENCE_PAYLOAD_DIGEST
+    assert payload_digest(comfy.prompts[1], tmp_path) == H3_TEXT_PAYLOAD_DIGEST
+
+
+def test_migrating_a_shot_to_citations_does_not_move_the_payload_either(tmp_path: Path):
+    """The same two digests from Shots whose citations were written out in full.
+
+    The migration has two ends: a manifest that carries only `asset_ids` and a client that has since
+    saved the same Shot back with its `citations` populated. Both must render identically, or the
+    first save a Director makes after this change silently re-renders every shot differently.
+    """
+    client, store, comfy = digest_project(tmp_path)
+    project = store.get(DIGEST_PROJECT_ID)
+    # Round-tripped through the wire, which is how the migration actually reaches the manifest.
+    body = json.loads(project.model_dump_json())["shots"]
+    assert [citation["role"] for citation in body[0]["citations"]] == ["reference", "reference"]
+    assert client.put(f"/api/projects/{DIGEST_PROJECT_ID}/shots", json={"shots": body}).status_code == 200
+
+    for shot_id in (DIGEST_SHOT_REFERENCE, DIGEST_SHOT_TEXT):
+        assert submit_h3(client, DIGEST_PROJECT_ID, shot_id).status_code == 202
+
+    assert payload_digest(comfy.prompts[0], tmp_path) == H3_REFERENCE_PAYLOAD_DIGEST
+    assert payload_digest(comfy.prompts[1], tmp_path) == H3_TEXT_PAYLOAD_DIGEST
+
+
+def test_a_legacy_mode_string_is_not_a_declaration(tmp_path: Path):
+    """`"text"`, `"image"` and `"reference"` load as "nobody declared anything".
+
+    The inspector wrote one of these onto every Shot it ever created and **nothing read it**, so
+    the stored value records a dropdown position rather than a decision. Reading it as a
+    declaration now would change what an existing Shot renders — a Shot saying `"text"` while
+    carrying an Asset would stop being a reference shot — which is the one thing this change was
+    forbidden to do. They are resolved by behaviour instead, which is what they already meant.
+    """
+    for legacy in sorted(LEGACY_SHOT_MODES):
+        shot = Shot(start=0, duration=5, mode=legacy)
+        assert shot.mode is None, legacy
+
+    # And the new vocabulary shares no spelling with the old, which is what keeps the two
+    # distinguishable forever rather than only until someone re-uses a name.
+    assert not LEGACY_SHOT_MODES & set(get_args(ShotMode))
+
+    # A declared mode survives the same construction untouched.
+    assert Shot(start=0, duration=5, mode="first_middle_last").mode == "first_middle_last"
+
+
+def test_an_undeclared_shot_resolves_to_the_mode_it_already_behaves_as():
+    """The migration, as the pure function the route asks. Both matrix rows for existing Shots."""
+    with_assets = Shot(start=0, duration=5, asset_ids=["asset_lead"])
+    song_only = Shot(start=0, duration=5, use_song_audio=True)
+    bare = Shot(start=0, duration=5)
+
+    assert resolve_shot_mode(with_assets) == "references"
+    assert resolve_shot_mode(song_only) == "references"
+    assert resolve_shot_mode(bare) == "text_to_video"
+
+    # A declaration wins over the attachments, in both directions. That is what declaring is for.
+    assert resolve_shot_mode(Shot(start=0, duration=5, asset_ids=["a"], mode="text_to_video")) == "text_to_video"
+    assert resolve_shot_mode(Shot(start=0, duration=5, mode="extend")) == "extend"
+
+
+def test_a_shot_cites_assets_and_never_copies_them():
+    """One Asset, two Shots, two roles — and the Asset untouched by either.
+
+    The Director's plan reuses the same wolf, location or character across many shots, so a Shot
+    that copied an Asset would make the plan unrevisable. The role is therefore on the citation:
+    the wolf is a middle frame *in this shot* and a plain reference in another.
+    """
+    wolf = Asset(id="asset_wolf", name="Grey wolf", kind="prop", path="media/wolf.png")
+    before = wolf.model_dump()
+    middle = Shot(
+        start=0, duration=5, mode="first_middle_last",
+        citations=[AssetCitation(asset_id="asset_wolf", role="middle")],
+    )
+    reference = Shot(
+        start=5, duration=5, mode="references",
+        citations=[AssetCitation(asset_id="asset_wolf", role="reference")],
+    )
+
+    assert citations_in_role(middle, "middle")[0].asset_id == "asset_wolf"
+    assert citations_in_role(reference, "reference")[0].asset_id == "asset_wolf"
+    assert citations_in_role(middle, "reference") == []
+    # Nothing about the Asset knows either role, which is the whole design: a role on the Asset
+    # would force a duplicate of the wolf per part it plays.
+    assert wolf.model_dump() == before
+    assert not hasattr(wolf, "role")
+
+
+def test_ordering_within_a_role_is_preserved():
+    """FR-19's determinism, surviving a list that now holds more than one role.
+
+    The sort is stable and keyed on `order`, so citations that share an order — the default, and
+    what every migrated Shot has — keep their list position rather than being reshuffled between
+    two reads of the same manifest.
+    """
+    shot = Shot(
+        start=0, duration=5,
+        citations=[
+            AssetCitation(asset_id="asset_c", role="reference"),
+            AssetCitation(asset_id="asset_a", role="middle"),
+            AssetCitation(asset_id="asset_b", role="reference"),
+        ],
+    )
+
+    assert [item.asset_id for item in citations_in_role(shot, "reference")] == ["asset_c", "asset_b"]
+    # `asset_ids` is the projection of exactly that, in exactly that order, which is what lets the
+    # render path move onto citations without moving a byte.
+    assert shot.asset_ids == ["asset_c", "asset_b"]
+
+    # An explicit order overrides list position, and only within the role.
+    reordered = Shot(
+        start=0, duration=5,
+        citations=[
+            AssetCitation(asset_id="asset_c", role="reference", order=2),
+            AssetCitation(asset_id="asset_b", role="reference", order=1),
+        ],
+    )
+    assert reordered.asset_ids == ["asset_b", "asset_c"]
+
+
+def test_citations_and_asset_ids_are_reconciled_in_both_directions():
+    """One fact, stored twice, kept that way rather than allowed to drift.
+
+    `citations` is the truth and `asset_ids` is its projection onto the reference role. The
+    direction that matters most is the second one: a Shot whose wolf has been given the middle-frame
+    role must stop claiming it as a reference attachment, or the render would go on sending it as
+    reference picture three under a mode that says it is the middle frame.
+    """
+    migrated = Shot(start=0, duration=5, asset_ids=["asset_a", "asset_b"])
+    assert [(item.asset_id, item.role, item.order) for item in migrated.citations] == [
+        ("asset_a", "reference", 0), ("asset_b", "reference", 1)
+    ]
+
+    reroled = Shot(
+        start=0, duration=5, mode="first_last",
+        asset_ids=["asset_a", "asset_b"],
+        citations=[
+            AssetCitation(asset_id="asset_a", role="first"),
+            AssetCitation(asset_id="asset_b", role="last"),
+        ],
+    )
+    assert reroled.asset_ids == []
+
+
+def test_a_shot_reports_what_its_mode_is_missing():
+    """The matrix's "mode and assets disagree" row: named, not resolved.
+
+    Every sentence is built from `SHOT_MODE_SPECS`, so a mode added to that table is described
+    without a wording being written for it. Reported rather than repaired, because inventing which
+    of two images is the middle one is exactly the guess a role exists to stop.
+    """
+    one_image = Shot(
+        start=0, duration=5, mode="first_last",
+        citations=[AssetCitation(asset_id="asset_a", role="first")],
+    )
+    problems = mode_specification_problems(one_image)
+
+    assert len(problems) == 1
+    assert "First / last frame needs 1 last frame, and this shot cites 0." == problems[0]
+
+    # A role the mode does not have is a problem in the other direction, and so is asking for the
+    # master song on a mode with no slot for one — which would otherwise be dropped in silence.
+    stray = Shot(
+        start=0, duration=5, mode="text_to_video",
+        citations=[AssetCitation(asset_id="asset_a", role="reference")],
+        use_song_audio=True,
+    )
+    assert mode_specification_problems(stray) == [
+        "Text to video has no reference role, and this shot cites 1.",
+        (
+            "Text to video has no slot for the master song, so the audio reference this shot "
+            "asks for would not be sent."
+        ),
+    ]
+
+    # And nothing at all to say about the two shapes that already exist, which is what makes the
+    # refusal in `generate_h3` unreachable for every Shot saved before this change.
+    assert mode_specification_problems(Shot(start=0, duration=5, asset_ids=["a"], use_song_audio=True)) == []
+    assert mode_specification_problems(Shot(start=0, duration=5)) == []
+
+
+def test_a_deleted_asset_is_reported_and_never_silently_dropped(tmp_path: Path):
+    """The matrix's deleted-asset row, at the model and at the route.
+
+    Two halves, because a report nobody reaches is not a report: the pure function names the
+    citation, and the route refuses the submission rather than rendering a shot short of what it
+    cites. Silently rendering without it would spend a full GPU pass on something nobody asked for.
+    """
+    project = Project(name="Deleted")
+    project.assets = [Asset(id="asset_kept", name="Kept", kind="image", path="media/kept.png")]
+    shot = Shot(start=0, duration=5, asset_ids=["asset_kept", "asset_gone"])
+
+    assert dangling_citations(project, shot) == ["asset_gone"]
+
+    client, store, comfy = make_client(tmp_path)
+    live = store.create(Project(name="Deleted live"))
+    lead = upload_asset(client, live.id, "Lead", "character", "lead.png")
+    shot_id = reference_shot(store, live.id, asset_ids=[lead["id"], "asset_gone"])
+
+    refused = submit_h3(client, live.id, shot_id)
+
+    assert refused.status_code == 422
+    assert "asset_gone" in refused.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_a_mode_with_no_adapter_is_plannable_and_refused_at_render(tmp_path: Path):
+    """The matrix's no-adapter row. Saved without complaint, refused before any GPU time.
+
+    Plannable *and* unrenderable is the deliberate pair. A Director laying out a first/middle/last
+    section before that adapter exists is doing real work, and a mode that vanished from the plan
+    until its adapter landed would make that work impossible. What must never happen is the other
+    failure — a mode that looks renderable and is not — which is what the refusal prevents.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Unbuilt"))
+    lead = upload_asset(client, project.id, "Lead", "character", "lead.png")
+    shot_id = reference_shot(
+        store, project.id, mode="first_middle_last",
+        citations=[
+            AssetCitation(asset_id=lead["id"], role="first"),
+            AssetCitation(asset_id=lead["id"], role="middle"),
+            AssetCitation(asset_id=lead["id"], role="last"),
+        ],
+    )
+
+    # It saved, it loaded, and it is still the mode the Director chose.
+    assert store.get(project.id).shots[0].mode == "first_middle_last"
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    detail = refused.json()["detail"]
+    assert "First / middle / last" in detail
+    # It names what *does* render, so the refusal is actionable rather than only true — and it
+    # names it from the table, so a mode that gains an adapter is described without an edit here.
+    assert "References to video" in detail and "Text to video" in detail
+    assert comfy.prompts == []
+
+
+def test_a_declared_mode_that_does_not_fit_its_citations_is_refused_before_the_render(tmp_path: Path):
+    """A declaration the attachments contradict costs nothing, because it never reaches ComfyUI.
+
+    The alternative is what this branch used to do by omission: build the payload the attachments
+    imply and log the render under a mode that was never applied. A GPU job recorded as one thing
+    and rendered as another is invisible afterwards.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Disagreement"))
+    lead = upload_asset(client, project.id, "Lead", "character", "lead.png")
+    shot_id = reference_shot(store, project.id, asset_ids=[lead["id"]], mode="text_to_video")
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    assert "not fully specified" in refused.json()["detail"]
+    assert "Text to video has no reference role" in refused.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_whether_the_performer_is_singing_is_expressible_and_nothing_infers_it(tmp_path: Path):
+    """Three states, and `unknown` is not `not_singing`.
+
+    The Director's constraint is per shot, not global: a performer laying on a bed has no lip-sync
+    to protect and the LTX enhancer is pure gain on that shot, while a singing shot has lip position
+    to lose — the enhancement measurably moves it. So this is a property of the performance, not of
+    the mode, and it must be independently expressible from both.
+
+    Nothing may infer it. A shot whose state was never set is `unknown`, which is not the same as
+    "not singing", and a destructive default in either direction is worse than an honest absence.
+    """
+    assert set(get_args(SingingState)) == {"unknown", "singing", "not_singing"}
+    assert Shot(start=0, duration=5).singing == "unknown"
+
+    # Independent of the mode in both directions: a references shot may or may not be singing, and
+    # so may a first/last one.
+    for mode in ("references", "first_last", None):
+        for singing in get_args(SingingState):
+            shot = Shot(start=0, duration=5, mode=mode, singing=singing)
+            assert shot.singing == singing, (mode, singing)
+
+    # Nothing in the source infers it. Grepped rather than argued, because the failure mode is a
+    # helpful default added later by someone who did not read this docstring.
+    source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in Path("src/music_video_producer").rglob("*.py")
+    )
+    for guess in ('singing = "singing"', 'singing = "not_singing"', 'singing="singing"'):
+        assert guess not in source, guess
+
+    # And it is durable: it survives the wire, the manifest and a reload.
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Performance"))
+    shot = Shot(start=0, duration=5, prompt="A singer turns", singing="not_singing")
+    project.shots = [shot]
+    store.save(project)
+    assert store.get(project.id).shots[0].singing == "not_singing"
+    reloaded = client.get(f"/api/projects/{project.id}").json()["shots"][0]
+    assert reloaded["singing"] == "not_singing"
+
+
+def test_modes_roles_and_singing_survive_every_write_path_that_takes_a_shot(tmp_path: Path):
+    """The round-trip row, over **both** sibling write paths rather than only the obvious one.
+
+    `PUT /shots` is the one the workspace uses; `PUT /projects/{id}` takes a whole client-supplied
+    `Project` whose every field is defaulted, and it is twice now been the guard hole left open —
+    a whole-manifest save writes every defaulted field, including the ones a client that predates
+    them omits. Both are asserted here so a new Shot field cannot survive one and be erased by the
+    other.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Round trip"))
+    project.shots = [
+        Shot(
+            id="shot_roundtrip", start=0, duration=5, prompt="A wolf crosses the clearing",
+            mode="first_middle_last", singing="singing",
+            citations=[
+                AssetCitation(asset_id="asset_a", role="first", order=0),
+                AssetCitation(asset_id="asset_b", role="middle", order=0),
+                AssetCitation(asset_id="asset_c", role="last", order=0),
+            ],
+        )
+    ]
+    store.save(project)
+
+    def assert_intact(shot: Shot) -> None:
+        assert shot.mode == "first_middle_last"
+        assert shot.singing == "singing"
+        assert [(item.asset_id, item.role) for item in shot.citations] == [
+            ("asset_a", "first"), ("asset_b", "middle"), ("asset_c", "last")
+        ]
+
+    assert_intact(store.get(project.id).shots[0])
+
+    body = client.get(f"/api/projects/{project.id}").json()
+    assert client.put(f"/api/projects/{project.id}/shots", json={"shots": body["shots"]}).status_code == 200
+    assert_intact(store.get(project.id).shots[0])
+
+    whole = client.get(f"/api/projects/{project.id}").json()
+    assert client.put(f"/api/projects/{project.id}", json=whole).status_code == 200
+    assert_intact(store.get(project.id).shots[0])
+
+
+def test_a_manifest_written_before_modes_existed_loads_without_being_rewritten(tmp_path: Path):
+    """Migration by resolution, not by rewriting files nobody touched.
+
+    The manifest on disk is the one this project wrote yesterday, byte for byte, until something
+    saves it. Reading it produces the mode it already behaved as; the file is unchanged.
+    """
+    _, store, _ = make_client(tmp_path)
+    project = store.create(Project(id="project_legacyaaaa01", name="Legacy"))
+    manifest = store.manifest_path(project.id)
+    manifest.write_text(
+        json.dumps(
+            {
+                "id": "project_legacyaaaa01",
+                "name": "Legacy",
+                "shots": [
+                    {"id": "shot_old", "start": 0, "duration": 5, "prompt": "A corridor",
+                     "mode": "text", "asset_ids": ["asset_lead"], "seed": 0, "status": "draft"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = manifest.read_bytes()
+
+    shot = store.get(project.id).shots[0]
+
+    assert shot.mode is None
+    assert resolve_shot_mode(shot) == "references"
+    assert shot.asset_ids == ["asset_lead"]
+    assert [(item.asset_id, item.role) for item in shot.citations] == [("asset_lead", "reference")]
+    assert shot.singing == "unknown"
+    # Nothing wrote. A migration that rewrote every manifest on load would touch files whose
+    # contents nobody changed, and would do it before anyone had asked for anything.
+    assert manifest.read_bytes() == before
+
+
+def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_sees():
+    """The guard `Song` had, extended to `Shot` — and the answer to whether it was there already.
+
+    It was not. Only `Song` was classified, so every field ever added to `Shot` entered the
+    Director's prompt the moment it was declared, with nobody deciding that it should. This change
+    added three at once, which is exactly the situation the guard exists for.
+
+    Nothing is withheld today and that is a decision rather than an omission: taking a field *out*
+    of the dump changes what the Director is prompted with, which is Ask First. What the
+    classification buys is that the *next* field cannot arrive without the decision being made.
+    """
+
+    class ShotWithANewField(Shot):
+        director_notes_previous: str = ""
+
+    with pytest.raises(RuntimeError) as unclassified:
+        _withheld_fields(
+            ShotWithANewField,
+            visible=SHOT_DIRECTOR_VISIBLE,
+            withheld=SHOT_DIRECTOR_WITHHELD,
+            family="SHOT",
+        )
+
+    assert "director_notes_previous" in str(unclassified.value)
+    # It names the Shot pair and not the Song pair, which is the whole reason `family` is passed
+    # rather than derived: a message sending the next writer to the wrong constant is worse than
+    # no message, because they will edit the wrong one and the guard will still be green.
+    assert "SHOT_DIRECTOR_WITHHELD" in str(unclassified.value)
+    assert "SONG_DIRECTOR_WITHHELD" not in str(unclassified.value)
+
+    # The live classification is complete right now — which is what makes importing `app` succeed
+    # at all — and every one of the three fields this change added is on exactly one side.
+    assert _withheld_fields(
+        Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
+    ) == set()
+    assert not SHOT_DIRECTOR_VISIBLE & SHOT_DIRECTOR_WITHHELD
+    assert {"mode", "citations", "singing"} <= SHOT_DIRECTOR_VISIBLE
+
+    # And the Director's context is untouched: no `shots` key at all while nothing is withheld, so
+    # the dump is the dump that was being sent before this change.
+    assert "shots" not in DIRECTOR_CONTEXT_EXCLUDE
+
+
+def test_every_mode_that_claims_an_adapter_has_a_branch_that_builds_it():
+    """The silent hole: a table entry the route accepts and then renders as something else.
+
+    `generate_h3` picks the reference branch on one adapter name and falls through to the text-only
+    graph otherwise. A mode given a *third* adapter name — the next mode to be built — would pass
+    the "can this render" gate and then render as text-to-video, logged as though its own adapter
+    had run. That failure has no symptom at the point it happens; the application refusing to start
+    does.
+    """
+    assert H3_ADAPTERS == {"h3-director", "h3-reference"}
+    for mode, spec in SHOT_MODE_SPECS.items():
+        assert not spec.adapter or spec.adapter in H3_ADAPTERS, mode
+
+    # The two the route actually has, named by the modes that use them, so a rename of either is
+    # caught here rather than in a live render.
+    assert SHOT_MODE_SPECS["references"].adapter == "h3-reference"
+    assert SHOT_MODE_SPECS["text_to_video"].adapter == "h3-director"
+    # Everything else is plannable and unrenderable, which is the state this story leaves them in.
+    assert {mode for mode, spec in SHOT_MODE_SPECS.items() if not spec.adapter} == {
+        "image_to_video", "first_last", "first_middle_last", "extend"
+    }
+
+
+def test_the_mode_table_covers_every_declared_mode_and_role():
+    """No mode without a spec, and no role without a label. A table entry is the unit of extension."""
+    assert set(SHOT_MODE_SPECS) == set(get_args(ShotMode))
+    assert set(ASSET_ROLE_LABELS) == set(get_args(AssetRole))
+    for mode, spec in SHOT_MODE_SPECS.items():
+        assert spec.label, mode
+        for requirement in spec.roles:
+            assert requirement.role in ASSET_ROLE_LABELS, mode
+            assert 0 <= requirement.minimum <= requirement.maximum, mode
+    # Only the reference graph has a slot for the master song, which is what makes asking for one
+    # anywhere else a refusal rather than a silent drop.
+    assert {mode for mode, spec in SHOT_MODE_SPECS.items() if spec.song_audio} == {"references"}
+    # The references mode is the only one that can be fully specified with nothing cited, which is
+    # what makes every Shot that exists today unable to trip the specification refusal.
+    assert SHOT_MODE_SPECS["references"].roles[0].minimum == 0
+
+
+def test_declaring_references_on_an_empty_shot_routes_to_the_reference_graph(tmp_path: Path):
+    """The one shape where the declaration and the old inference genuinely disagree.
+
+    A Shot that cites nothing and does not use the song is exactly what the old condition called
+    text-to-video, and it is what a Director gets the moment they pick "References to video" on a
+    new shot and have not attached anything yet. Under the declaration it is a reference shot, and
+    the reference adapter refuses it in its own words rather than quietly rendering a text-only
+    take under a mode that says otherwise.
+
+    Asserted through the refusal because there is no payload to inspect — which is the point: the
+    old condition would have produced one, from the wrong graph.
+
+    Nothing that exists today can reach this. `references` is only *declarable*, never inferred for
+    an empty Shot, so no manifest written before this change can be in this state.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Empty references"))
+    shot_id = reference_shot(store, project.id, mode="references")
+
+    # It is fully specified for its mode — the reference role's minimum is zero, because a
+    # song-only shot is a real and valid references shot.
+    assert mode_specification_problems(store.get(project.id).shots[0]) == []
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == "At least one H3 reference is required"
+    assert comfy.prompts == []

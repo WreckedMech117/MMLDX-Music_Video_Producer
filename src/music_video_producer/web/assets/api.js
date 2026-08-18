@@ -1148,6 +1148,132 @@ export function markReadyControl(shot) {
   };
 }
 
+// The shot-mode taxonomy, mirroring `models.SHOT_MODE_SPECS` field for field. A contract test
+// executes both and asserts the two tables are identical, because two hand-written copies of what a
+// mode requires is how the inspector starts drawing a shot as complete that the route then refuses.
+//
+// Order matters: it is the order the mode select offers, so it is data here rather than markup.
+export const SHOT_MODES = [
+  { value: "text_to_video", label: "Text to video", roles: [], song_audio: false, adapter: "h3-director" },
+  { value: "image_to_video", label: "Image to video", roles: [{ role: "first", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
+  { value: "first_last", label: "First / last frame", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
+  { value: "first_middle_last", label: "First / middle / last", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "middle", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
+  { value: "references", label: "References to video", roles: [{ role: "reference", minimum: 0, maximum: 15 }], song_audio: true, adapter: "h3-reference" },
+  { value: "extend", label: "Extend an existing video", roles: [{ role: "source_video", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
+];
+
+// How each role reads in a sentence, mirroring `models.ASSET_ROLE_LABELS`. The insertion order is
+// the order a role select offers, so it is one list rather than a table plus a separate ordering.
+export const ASSET_ROLE_LABELS = {
+  reference: "reference",
+  first: "first frame",
+  middle: "middle frame",
+  last: "last frame",
+  source_video: "source video",
+};
+
+// Whether the performer is singing, mirroring `models.SingingState`. `unknown` is first and is what
+// an unset shot reads as -- it is deliberately *not* "not singing", because the enhancer moves lip
+// position and a wrong value in either direction costs the Director something real. Nothing here
+// infers it from the mode, the assets or anything else.
+export const SINGING_STATES = [
+  { value: "unknown", label: "Not decided" },
+  { value: "singing", label: "Performer is singing" },
+  { value: "not_singing", label: "Performer is not singing" },
+];
+
+// The three `mode` strings saved before the field meant anything, mirroring
+// `models.LEGACY_SHOT_MODES`. A project loaded from an older manifest arrives with the field
+// already resolved to `null` by the server, so this exists for the one case the server cannot
+// reach: a shot this client is still holding in memory from before a reload.
+export const LEGACY_SHOT_MODES = ["text", "image", "reference"];
+
+export function shotModeSpec(mode) {
+  return SHOT_MODES.find((entry) => entry.value === mode) || null;
+}
+
+// This shot's citations, whatever shape it arrived in. Mirrors `Shot._reconcile_citations`' read
+// side: `citations` is the truth, and a shot carrying only the flat `asset_ids` is one saved before
+// roles existed, whose assets were all references.
+export function shotCitations(shot) {
+  if (shot?.citations?.length) {
+    return shot.citations.map((citation, index) => ({
+      asset_id: citation.asset_id,
+      role: citation.role || "reference",
+      order: Number.isFinite(citation.order) ? citation.order : index,
+    }));
+  }
+  return (shot?.asset_ids || []).map((asset_id, index) => ({ asset_id, role: "reference", order: index }));
+}
+
+// The citations in one role, ordered. A *stable* sort, so citations sharing an order -- the default,
+// and what every migrated shot has -- keep their list position and FR-19's numbering survives.
+export function citationsInRole(shot, role) {
+  return shotCitations(shot)
+    .map((citation, index) => ({ citation, index }))
+    .sort((left, right) => left.citation.order - right.citation.order || left.index - right.index)
+    .filter((entry) => entry.citation.role === role)
+    .map((entry) => entry.citation);
+}
+
+// What this shot renders as: its declaration, or the mode it already behaves as. Mirrors
+// `models.resolve_shot_mode`, including the fallback, which is the branch the server used to make
+// inline -- assets or the master song mean the reference graph, nothing means the text-only one.
+export function resolveShotMode(shot) {
+  const declared = shot?.mode;
+  if (declared && !LEGACY_SHOT_MODES.includes(declared)) return declared;
+  return shotCitations(shot).length || shot?.use_song_audio ? "references" : "text_to_video";
+}
+
+// Everything this shot is missing or carrying wrongly for its mode, in the server's own sentences.
+// Mirrors `models.mode_specification_problems`; a contract test runs both over the same shots and
+// asserts the two lists match, so the inspector cannot call a shot complete that the route refuses.
+export function shotSpecificationProblems(shot) {
+  const spec = shotModeSpec(resolveShotMode(shot));
+  if (!spec) return [];
+  const counted = {};
+  for (const citation of shotCitations(shot)) counted[citation.role] = (counted[citation.role] || 0) + 1;
+  const problems = [];
+  for (const requirement of spec.roles) {
+    const held = counted[requirement.role] || 0;
+    const label = ASSET_ROLE_LABELS[requirement.role];
+    if (held < requirement.minimum) {
+      problems.push(`${spec.label} needs ${requirement.minimum} ${label}, and this shot cites ${held}.`);
+    } else if (held > requirement.maximum) {
+      problems.push(`${spec.label} takes at most ${requirement.maximum} ${label}, and this shot cites ${held}.`);
+    }
+  }
+  const declared = spec.roles.map((requirement) => requirement.role);
+  for (const role of Object.keys(ASSET_ROLE_LABELS)) {
+    if (declared.includes(role) || !counted[role]) continue;
+    problems.push(`${spec.label} has no ${ASSET_ROLE_LABELS[role]} role, and this shot cites ${counted[role]}.`);
+  }
+  if (shot?.use_song_audio && !spec.song_audio) {
+    problems.push(`${spec.label} has no slot for the master song, so the audio reference this shot asks for would not be sent.`);
+  }
+  return problems;
+}
+
+// The cited assets this project's library no longer holds. Mirrors `models.dangling_citations`.
+// Reported and never quietly skipped: the inspector used to render nothing at all for a citation
+// whose asset was gone, so a shot could look like it had lost an attachment it was still sending.
+export function danglingCitations(project, shot) {
+  const library = new Set((project?.assets || []).map((asset) => asset.id));
+  return shotCitations(shot).filter((citation) => !library.has(citation.asset_id)).map((citation) => citation.asset_id);
+}
+
+export const CITATION_MISSING_LABEL = "Missing from the library";
+
+// The write side of the same reconciliation, applied in place so this client's copy of a shot never
+// disagrees with what the server will store. The shots write does not adopt its own reply -- it
+// deliberately re-renders from local state -- so a client that only wrote `citations` would go on
+// drawing a stale `asset_ids` until the next full project load.
+export function reconcileShotCitations(shot) {
+  shot.citations = shotCitations(shot);
+  shot.asset_ids = citationsInRole(shot, "reference").map((citation) => citation.asset_id);
+  return shot;
+}
+
 // What each direction did, mirroring app.py's MARK_READY_NOTICE and MARK_DRAFT_NOTICE so the
 // sentence the Director reads is the one the server implements. A contract test asserts they are
 // identical.

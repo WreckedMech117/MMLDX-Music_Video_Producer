@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, renderAgainControl, renderAgainNotice, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, CITATION_MISSING_LABEL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -608,8 +608,8 @@ function renderReferences() {
   const assets = new Map((state.project?.assets || []).map((asset) => [asset.id, asset]));
   const refs = [];
   for (const shot of state.project?.shots || []) {
-    shot.asset_ids.forEach((id, index) => {
-      const asset = assets.get(id);
+    shotCitations(shot).forEach((citation, index) => {
+      const asset = assets.get(citation.asset_id);
       if (asset) refs.push(`<span class="ref-pill" style="left:${shot.start * state.pixelsPerSecond + index * 12}px;width:${Math.max(55, shot.duration * state.pixelsPerSecond - index * 12)}px">${escapeHtml(asset.name)}</span>`);
     });
   }
@@ -655,7 +655,10 @@ function bindClip(clip) {
     event.preventDefault();
     const id = event.dataTransfer.getData("text/asset-id");
     const shot = state.project.shots.find((item) => item.id === clip.dataset.shotId);
-    if (id && !shot.asset_ids.includes(id)) shot.asset_ids.push(id);
+    if (id && !shotCitations(shot).some((citation) => citation.asset_id === id)) {
+      shot.citations = [...shotCitations(shot), { asset_id: id, role: "reference", order: shotCitations(shot).length }];
+      reconcileShotCitations(shot);
+    }
     saveShotsSilently();
     renderTimeline();
   });
@@ -687,6 +690,48 @@ function restoreInspectorEdit(inspector, place) {
   if (typeof place.start === "number" && element.setSelectionRange) element.setSelectionRange(place.start, place.end);
 }
 
+// The mode select's options. "Not declared" is a real, selectable value rather than a placeholder:
+// it is what every shot saved before modes were declarable carries, and a Director who declared a
+// mode by accident has to be able to take it back. It names the mode the shot resolves to, because
+// "not declared" on its own tells the Director nothing about what pressing render would do.
+//
+// A mode with no adapter is offered and labelled as such. Hiding it would make the plan unable to
+// express a section the Director is really planning; offering it unlabelled would be the one thing
+// this must never do -- a mode that looks renderable and is not.
+function shotModeOptions(shot) {
+  const declared = SHOT_MODES.some((entry) => entry.value === shot.mode) ? shot.mode : "";
+  const resolved = SHOT_MODES.find((entry) => entry.value === resolveShotMode(shot));
+  const auto = `<option value="" ${declared ? "" : "selected"}>Not declared — renders as ${escapeHtml(resolved ? resolved.label : "")}</option>`;
+  return auto + SHOT_MODES.map((entry) => `<option value="${entry.value}" ${declared === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}${entry.adapter ? "" : " — no adapter yet"}</option>`).join("");
+}
+
+// One row per citation: what it is, what role it plays in *this* shot, and a way to remove it.
+//
+// Every role is offered on every row, not only the roles this shot's mode declares. A Director
+// re-pointing a shot from references to first/middle/last does it one control at a time, and a
+// select that hid `middle` until the mode was already right would make the order of those two
+// clicks matter. What the mode declares is reported by `shotSpecificationProblems` instead.
+//
+// A citation whose asset is gone renders as a row saying so, rather than as nothing. The list used
+// to skip it silently, which meant a shot could look like it had dropped an attachment it was in
+// fact still sending -- and the route refuses that shot with `Unknown reference asset`, a refusal
+// the Director had no way to see coming.
+function shotCitationRows(shot, assets) {
+  const cited = shotCitations(shot);
+  const numbering = { picture: 0, video: 0, audio: 0 };
+  return cited.map((citation) => {
+    const asset = assets.find((item) => item.id === citation.asset_id);
+    let tag = CITATION_MISSING_LABEL;
+    if (asset) {
+      const kind = asset.kind === "video" ? "video" : asset.kind === "audio" ? "audio" : "picture";
+      numbering[kind] += 1;
+      tag = `${kind === "video" ? "Video" : kind === "audio" ? "Audio" : "Picture"} ${numbering[kind]}`;
+    }
+    const roles = Object.entries(ASSET_ROLE_LABELS).map(([role, label]) => `<option value="${role}" ${citation.role === role ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
+    return `<div class="citation-row${asset ? "" : " citation-missing"}"><span class="citation-name">${escapeHtml(tag)}: ${escapeHtml(asset ? asset.name : citation.asset_id)}</span><select class="citation-role" data-id="${citation.asset_id}">${roles}</select><button class="quiet-button remove-ref" data-id="${citation.asset_id}">×</button></div>`;
+  }).join("");
+}
+
 // Exported for the executed frontend contract, on the `renderSong` precedent: the render-again
 // control is drawn, enabled and bound in here, and a test that only read this source could not
 // tell a control that is bound to the purpose-built route from one bound to the generic shots
@@ -707,6 +752,19 @@ export function renderShotInspector() {
   // empty box. The sameness lines are the other half: a near-duplicate pair is only something the
   // Director can differentiate or accept deliberately if it is named where its prompt is edited.
   const readiness = shotInspectorReadiness(readinessReport, shot);
+  // Every citation this shot holds, in the one shape the rest of this panel reads. Derived once and
+  // before the template, because the attach select filters against it and the rows number against
+  // it, and two independent derivations of "what does this shot cite" is how a select starts
+  // offering an asset the list below already shows.
+  const cited = shotCitations(shot);
+  // What this shot is missing or carrying wrongly for its mode, in the server's own sentences.
+  // Drawn where the mode is chosen, because that is where it becomes wrong and where it is fixed --
+  // and it is a report rather than a gate here for the same reason it is one on the server: a
+  // first/middle/last section laid out before its adapter exists is real planning work.
+  const specification = shotSpecificationProblems(shot);
+  const specificationHtml = specification.length
+    ? `<div class="shot-readiness sameness">${specification.map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>`
+    : "";
   // Whether this shot may be re-opened, and why not when it may not -- decided by
   // `renderAgainControl`, which the contract tests execute for every status and every refusal.
   // Nothing about that decision is re-made in the template below: it applies `shown`, `disabled`
@@ -730,12 +788,30 @@ export function renderShotInspector() {
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode"><option value="reference" ${shot.mode === "reference" ? "selected" : ""}>Reference + audio</option><option value="image" ${shot.mode === "image" ? "selected" : ""}>Image to video</option><option value="text" ${shot.mode === "text" ? "selected" : ""}>Text to video</option></select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>References<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !shot.asset_ids.includes(asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shot.asset_ids.map((id) => { const asset = assets.find((item) => item.id === id); if (!asset) return ""; const sameKind = shot.asset_ids.map((ref) => assets.find((item) => item.id === ref)).filter((item) => item && (item.kind === asset.kind || (!["video", "audio"].includes(item.kind) && !["video", "audio"].includes(asset.kind)))); const tag = asset.kind === "video" ? "Video" : asset.kind === "audio" ? "Audio" : "Picture"; return `<button class="quiet-button remove-ref" data-id="${id}">${tag} ${sameKind.indexOf(asset) + 1}: ${escapeHtml(asset.name)} ×</button>`; }).join(" ")}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
-  ["shot-start", "shot-duration", "shot-mode", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
-  $("#shot-asset-select").addEventListener("change", (event) => { if (event.target.value) { shot.asset_ids.push(event.target.value); saveShotsSilently(); renderTimeline(); } });
-  $$(".remove-ref", inspector).forEach((button) => button.addEventListener("click", () => { shot.asset_ids = shot.asset_ids.filter((id) => id !== button.dataset.id); saveShotsSilently(); renderTimeline(); }));
+  ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
+  // Attach, re-role and remove all go through `reconcileShotCitations`, which is the client half of
+  // the model's own reconciliation. Writing `citations` without it would leave this client drawing a
+  // stale `asset_ids` until the next full project load -- the shots write deliberately does not
+  // adopt its own reply -- and writing `asset_ids` without it would lose the role.
+  $("#shot-asset-select").addEventListener("change", (event) => {
+    if (!event.target.value) return;
+    shot.citations = [...cited, { asset_id: event.target.value, role: "reference", order: cited.length }];
+    reconcileShotCitations(shot);
+    saveShotsSilently(); renderTimeline();
+  });
+  $$(".citation-role", inspector).forEach((select) => select.addEventListener("change", () => {
+    shot.citations = shotCitations(shot).map((citation) => citation.asset_id === select.dataset.id ? { ...citation, role: select.value } : citation);
+    reconcileShotCitations(shot);
+    saveShotsSilently(); renderTimeline();
+  }));
+  $$(".remove-ref", inspector).forEach((button) => button.addEventListener("click", () => {
+    shot.citations = shotCitations(shot).filter((citation) => citation.asset_id !== button.dataset.id);
+    reconcileShotCitations(shot);
+    saveShotsSilently(); renderTimeline();
+  }));
   $("#compile-shot").addEventListener("click", compileSelectedShot);
   $("#analyze-take")?.addEventListener("click", async () => {
     try { state.project = await api.analyzeLatestTake(state.project.id, shot.id); renderTimeline(); toast("Latest take review saved"); }
@@ -800,7 +876,14 @@ function updateShotFromInspector() {
   const shot = selectedShot();
   shot.start = Math.max(0, Number($("#shot-start").value));
   shot.duration = Math.max(.5, Number($("#shot-duration").value));
-  shot.mode = $("#shot-mode").value;
+  // `null` rather than `""`: an empty select means the Director has not declared a mode, and the
+  // model's field is `ShotMode | None` precisely so that "undeclared" is representable. Sending ""
+  // would be a validation error, and defaulting it to any mode here would be this client making the
+  // declaration on the Director's behalf -- the exact thing the mode exists to stop.
+  shot.mode = $("#shot-mode").value || null;
+  // Nothing infers this and nothing may. An unset select reads `unknown`, which is not "not
+  // singing": the enhancer moves lip position, so a value nobody chose is worse than no value.
+  shot.singing = $("#shot-singing").value;
   shot.prompt = $("#shot-prompt").value;
   shot.seed = Math.max(0, Number($("#shot-seed").value));
   shot.use_song_audio = $("#shot-song-audio").checked;
@@ -1037,7 +1120,10 @@ function attachSelectedAsset() {
   const asset = selectedAsset();
   const shot = selectedShot();
   if (!asset || !shot) return;
-  if (!shot.asset_ids.includes(asset.id)) shot.asset_ids.push(asset.id);
+  if (!shotCitations(shot).some((citation) => citation.asset_id === asset.id)) {
+    shot.citations = [...shotCitations(shot), { asset_id: asset.id, role: "reference", order: shotCitations(shot).length }];
+    reconcileShotCitations(shot);
+  }
   saveShotsSilently();
   renderTimeline();
   toast(`${asset.name} attached to shot`);
@@ -1300,7 +1386,7 @@ function bindEvents() {
     // The placeholder comes from the one constant the readiness rule reads, because the server
     // blocks exactly this string: a second spelling here would create Shots the timeline draws as
     // prompted and the route then refuses.
-    const shot = { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start, duration: Math.min(5, Math.max(.5, projectDuration() - start)), prompt: PLACEHOLDER_PROMPT, mode: "reference", asset_ids: [], seed: 0, status: "draft", prompt_id: "", approved_output: "", locked: false };
+    const shot = { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start, duration: Math.min(5, Math.max(.5, projectDuration() - start)), prompt: PLACEHOLDER_PROMPT, mode: null, asset_ids: [], citations: [], singing: "unknown", seed: 0, status: "draft", prompt_id: "", approved_output: "", locked: false };
     shots.push(shot); state.selectedShotId = shot.id; saveShotsSilently(); renderTimeline();
   });
   $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + shot.duration; copy.status = "draft"; state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently(); renderTimeline(); });

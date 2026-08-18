@@ -265,6 +265,20 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .shot-readiness strong { display: block; margin-bottom: 5px; color: var(--red); font: 9px Consolas, monospace; letter-spacing: .08em; }
 .shot-readiness p { margin: 0 0 6px; font-size: 11px; }
 .shot-readiness p:last-child { margin-bottom: 0; }
+/* One cited asset, its role in this shot, and a way to remove it. A row rather than the single
+   button this used to be, because the role is the thing that has to be changeable: the same wolf
+   is a middle frame here and a plain reference in the next shot, and a role stored on the asset
+   would have forced a duplicate per part.
+
+   The missing state is a border colour *and* the words "Missing from the library" in the name, for
+   the reason the readiness flag carries both: colour alone is state by appearance. A citation whose
+   asset was deleted used to render as nothing at all, which made a shot look like it had dropped an
+   attachment it was in fact still sending to the render. */
+.citation-row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.citation-row .citation-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); }
+.citation-row select { flex: 0 0 auto; width: auto; font-size: 11px; }
+.citation-row.citation-missing { border-left: 3px solid var(--red-edge); padding-left: 6px; }
+.citation-row.citation-missing .citation-name { color: var(--red); }
 /* Why an inspector control is there but off -- shared by the commit control and the render-again
    one, because they make the same kind of statement and two identical rules is how one of them
    drifts. Both buttons are drawn disabled rather than hidden for a locked, approved or unprompted
