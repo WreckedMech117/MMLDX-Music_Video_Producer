@@ -3,6 +3,7 @@ import copy
 import hashlib
 import io
 import json
+import math
 import re
 import tempfile
 import tokenize
@@ -17,12 +18,19 @@ import pytest
 from music_video_producer.app import SongPlannerRequest
 from music_video_producer.timeline import align_h3_frames
 from music_video_producer.workflows import (
+    H3_ASPECT_RATIOS,
+    H3_DEFAULT_ASPECT_RATIO,
+    H3_DEFAULT_MEGAPIXELS,
+    H3_DEFAULT_MULTIPLE,
     H3_DEFAULT_PROFILE,
     H3_DIRECTOR_DEFAULT_STEPS,
     H3_DIRECTOR_MAX_FRAMES,
     H3_DIRECTOR_MAX_SECONDS,
     H3_FRAME_RATE,
     H3_LORA_STRENGTH_LIMITS,
+    H3_MEGAPIXEL_LIMITS,
+    H3_MULTIPLE_LIMITS,
+    H3_REFERENCE_DIMENSION_LIMITS,
     H3_REFERENCE_LIMITS,
     H3_REFERENCE_MAX_FRAMES,
     H3_REFERENCE_PROFILES,
@@ -55,6 +63,8 @@ from music_video_producer.workflows import (
     normalize_to_divisor,
     patch_ltx25_dimension_boundary,
     reachable_node_ids,
+    select_resolution,
+    song_audio_window,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -172,6 +182,14 @@ def every_builder_payload() -> list[tuple[str, dict]]:
 # appear. `LatentUpscaleModelLoader` stays here, and deliberately: the enhancement graph
 # does **not** load it — it is one of the two orphans in that export — so nothing audited
 # puts it in front of the live schema.
+#
+# `ResolutionSelector` left the list without any payload ever submitting it. It is the
+# first entry recorded through `run_audit`'s `extra_classes`: `select_resolution`
+# reproduces its arithmetic in Python — the H3 graph takes two integers, not a node — so
+# the class appears in no payload while its option list and its two numeric ranges are
+# exactly what that reproduction has to keep matching. Recording it is what lets the
+# offline half of the suite check the reproduction against the schema rather than only
+# against itself.
 UNRECORDED_CLASSES = frozenset({
     "ComfyMathExpression",
     "DualCLIPLoader", "EmptySD3LatentImage", "FluxGuidance", "FrameInterpolate",
@@ -181,7 +199,7 @@ UNRECORDED_CLASSES = frozenset({
     "LTXVSeparateAVLatent", "LatentUpscaleModelLoader", "LoadImage",
     "MathExpression|pysssss",
     "ModelSamplingFlux", "PrimitiveFloat",
-    "PrimitiveStringMultiline", "RTXVideoSuperResolution", "ResolutionSelector",
+    "PrimitiveStringMultiline", "RTXVideoSuperResolution",
     "SaveImage", "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
     "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask", "VAEDecodeTiled",
     "VAEEncode", "VHS_LoadAudio", "VHS_LoadImagePath", "easy cleanGpuUsed",
@@ -914,6 +932,282 @@ def test_h3_reference_payload_carries_the_reference_size_to_the_conditioner():
     for size in ("match", "max"):
         payload = h3_reference_payload(h3_references("picture", 1), ref_image_size=size)
         assert payload["mvp:condition"]["inputs"]["ref_image_size"] == size
+
+
+# --- Frame selection -------------------------------------------------------------------
+#
+# The Director's pipeline sizes its frame with `ResolutionSelector` — megapixels, an aspect
+# ratio and a multiple — and this adapter took two raw integers. The two are not the same
+# control: the second can express a size the model was never tuned for, and it is how this
+# project came to render everything at a number nobody chose.
+
+
+def test_the_selector_reproduces_the_directors_own_measured_frame():
+    """0.6 MP at 16:9 on a multiple of 32 is 1056x608, and that is measured, not derived.
+
+    Node `115` of `h3-ltx25-user-export.json` carries those three values, and the
+    2026-08-17 boundary run recorded the H3 base they produced on this machine as
+    1056x608 — `33x32` by `19x32`. Pinned as a literal on purpose: the arithmetic is a
+    reproduction of someone else's node, so the thing worth asserting is agreement with
+    the observation, not agreement with the formula written next to it.
+    """
+    export = json.loads(
+        (REFERENCE_EXPORTS / "h3-ltx25-user-export.json").read_text(encoding="utf-8")
+    )
+    selector = export["115"]
+    assert selector["class_type"] == "ResolutionSelector"
+    assert selector["inputs"] == {
+        "aspect_ratio": H3_DEFAULT_ASPECT_RATIO,
+        "megapixels": H3_DEFAULT_MEGAPIXELS,
+        "multiple": H3_DEFAULT_MULTIPLE,
+    }
+
+    assert select_resolution(**selector["inputs"]) == (1056, 608)
+    # And the defaults are those same three values, so a request that names no geometry
+    # gets the frame the export selects rather than one that merely resembles it.
+    assert select_resolution() == (1056, 608)
+    # 0.64 MP and 1.737:1 — *larger* than 0.6 MP and *not* 16:9, because each axis rounds
+    # independently. Asserted because the drift is the node's behaviour and a "fix" that
+    # made the result closer to nominal would silently stop matching the Director's frame.
+    assert 1056 * 608 == 642048
+    assert (1056 / 32, 608 / 32) == (33.0, 19.0)
+
+
+def test_the_selector_rounds_the_way_the_installed_node_rounds():
+    """Line-for-line against `comfy_extras.nodes_resolution`, over every option.
+
+    Reimplemented here rather than imported: the point is that two independent
+    transcriptions of the same eight-line function agree, across the whole option list and
+    both ends of the megapixel range, including the sizes whose half-cell lands on .5 and
+    so depend on `round` being banker's rounding rather than `floor(x + 0.5)`.
+    """
+    for aspect_ratio, (w_ratio, h_ratio) in H3_ASPECT_RATIOS.items():
+        for megapixels in (0.1, 0.6, 1.0, 2.5, 16.0):
+            for multiple in (8, 32, 64):
+                total_pixels = megapixels * 1024 * 1024
+                scale = math.sqrt(total_pixels / (w_ratio * h_ratio))
+                expected = (
+                    round(w_ratio * scale / multiple) * multiple,
+                    round(h_ratio * scale / multiple) * multiple,
+                )
+                floor, ceiling = H3_REFERENCE_DIMENSION_LIMITS
+                if not all(floor <= axis <= ceiling for axis in expected):
+                    # Legal for the selector, refused for H3 — 16 MP at 21:9 is 6208 px
+                    # wide but 0.1 MP at 21:9 on a multiple of 64 is 0 px tall. Both are
+                    # the "absurd megapixels" row, and both are refused before submission.
+                    with pytest.raises(ValueError):
+                        select_resolution(
+                            megapixels=megapixels,
+                            aspect_ratio=aspect_ratio,
+                            multiple=multiple,
+                        )
+                    continue
+                assert (
+                    select_resolution(
+                        megapixels=megapixels, aspect_ratio=aspect_ratio, multiple=multiple
+                    )
+                    == expected
+                ), (aspect_ratio, megapixels, multiple)
+
+
+def test_the_selector_refuses_what_the_nodes_will_not_take():
+    """Every refusal happens locally, before any GPU time, naming the range it broke."""
+    low, high = H3_MEGAPIXEL_LIMITS
+    for megapixels in (low - 0.01, high + 0.01, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="egapixels"):
+            select_resolution(megapixels=megapixels)
+    # Both ends still build: a refusal that fires at the boundary is the same defect
+    # wearing the opposite sign.
+    assert select_resolution(megapixels=low, aspect_ratio="1:1 (Square)")
+    assert select_resolution(megapixels=high, aspect_ratio="1:1 (Square)")
+
+    minimum, maximum = H3_MULTIPLE_LIMITS
+    for multiple in (minimum - 1, maximum + 1, 32.0, True):
+        with pytest.raises(ValueError, match="multiple"):
+            select_resolution(multiple=multiple)
+    with pytest.raises(ValueError, match="Unknown aspect ratio"):
+        select_resolution(aspect_ratio="16:9")
+
+
+def test_the_h3_multiple_is_the_same_grid_the_ltx_boundary_repair_found():
+    """32 twice, for two reasons, asserted equal rather than aliased.
+
+    `LTX25_DIVISOR` is the LTX 2.5 VAE's spatial compression; `H3_DEFAULT_MULTIPLE` is
+    what the Director's selector is set to and what `MiniMaxH3ReferenceToVideo` declares as
+    its width/height step. They are the same number today and either could move alone, so
+    the agreement is checked rather than assumed by sharing a name.
+    """
+    assert H3_DEFAULT_MULTIPLE == LTX25_DIVISOR == 32
+    schema = recorded_object_info()["MiniMaxH3ReferenceToVideo"]["input"]["required"]
+    assert schema["width"][1]["step"] == H3_DEFAULT_MULTIPLE
+    assert schema["height"][1]["step"] == H3_DEFAULT_MULTIPLE
+
+
+def test_the_reference_payload_selects_a_frame_or_is_given_one_but_never_both():
+    """The four rows of the geometry matrix, at the builder.
+
+    Explicit dimensions are byte-identical to what they were, which is what the pinned
+    smoke and every existing test in this file depend on; an omission selects the
+    Director's frame; and a request carrying both is refused rather than resolved by
+    precedence, because a caller who sent two different intentions has not chosen either.
+    """
+    references = h3_references("picture", 1)
+    arguments = {"prompt": "p", "references": references, "duration": 8, "seed": 0, "prefix": "p"}
+
+    explicit = build_h3_reference_payload(**arguments, width=640, height=384)
+    assert (
+        explicit["mvp:condition"]["inputs"]["width"],
+        explicit["mvp:condition"]["inputs"]["height"],
+    ) == (640, 384)
+
+    selected = build_h3_reference_payload(**arguments)
+    assert (
+        selected["mvp:condition"]["inputs"]["width"],
+        selected["mvp:condition"]["inputs"]["height"],
+    ) == (1056, 608)
+    # Naming the selector's three inputs explicitly reaches the same frame, so the default
+    # is those values rather than a hardcoded pair that happens to match them.
+    named = build_h3_reference_payload(
+        **arguments,
+        megapixels=H3_DEFAULT_MEGAPIXELS,
+        aspect_ratio=H3_DEFAULT_ASPECT_RATIO,
+        multiple=H3_DEFAULT_MULTIPLE,
+    )
+    assert named == selected
+
+    with pytest.raises(ValueError, match="not both"):
+        build_h3_reference_payload(**arguments, width=640, height=384, megapixels=0.6)
+    with pytest.raises(ValueError, match="not both"):
+        build_h3_reference_payload(**arguments, width=640, height=384, multiple=32)
+    # Half an explicit frame is not a frame: without this, `width=640` alone would take its
+    # height from the selector and quietly render 640x608.
+    with pytest.raises(ValueError, match="only width"):
+        build_h3_reference_payload(**arguments, width=640)
+    with pytest.raises(ValueError, match="only height"):
+        build_h3_reference_payload(**arguments, height=384)
+    with pytest.raises(ValueError, match="whole number of pixels"):
+        build_h3_reference_payload(**arguments, width=640, height=16)
+
+
+# --- The song audio window -------------------------------------------------------------
+#
+# `MiniMaxH3ReferenceToVideo` has no window input of any kind — it is not the Director node
+# and takes no `start_second`/`end_second`. A reference audio's window is expressed in
+# `MiniMaxH3MediaLoader`'s `media_state`, as `{"trim": {"start": s, "end": s}}` on the item,
+# which `media_io.load_audio` slices the decoded waveform with. That is the only place a
+# window can be said at all on this path.
+
+
+def test_every_shot_gets_a_window_including_the_one_at_zero_seconds():
+    """A shot hears its own seconds. **Every** shot, 0 s included.
+
+    An earlier draft returned `None` at 0 s to keep that shot's payload byte-identical to the
+    pre-fix one, on the recorded premise that the conditioner already trimmed a whole-file
+    reference to the render window. That premise is false —
+    `MiniMaxH3ReferenceToVideo._encode_ref_audio` VAE-encodes the entire waveform and never
+    truncates — so silence at 0 s preserved the *defect* rather than the behaviour, and
+    preserved it for the shot most likely to exist in a fresh project. Renegotiated by the
+    Director on 2026-08-18; see the Spec Change Log in `spec-song-audio-window.md`.
+
+    The loader drops a `start` of 0 (`_trim`'s `num()` keeps a value only when `v > 0`) but
+    keeps the `end` beside it, and `_slice_audio` reads a missing start as `start or 0.0`, so
+    `{"start": 0.0, "end": 3.75}` slices exactly `[0, 3.75]`. Sending it costs nothing and
+    says what was meant.
+    """
+    assert song_audio_window(start=80, duration=4, song_duration=154) == {
+        "start": 80,
+        "end": 84,
+    }
+    assert song_audio_window(start=12, duration=3.75, song_duration=154) == {
+        "start": 12,
+        "end": 15.75,
+    }
+    assert song_audio_window(start=0, duration=3.75, song_duration=154) == {
+        "start": 0,
+        "end": 3.75,
+    }
+    assert song_audio_window(start=0.001, duration=1, song_duration=154) == {
+        "start": 0.001,
+        "end": 1.001,
+    }
+    # Nothing anywhere returns "no window". The 0 s shot being a special case is precisely
+    # what was renegotiated away, so the absence of the special case is what is asserted --
+    # not merely that 0 s happens to produce the right pair today.
+    assert all(
+        song_audio_window(start=start, duration=1, song_duration=154) is not None
+        for start in (0, 0.0, 0.001, 1, 153)
+    )
+
+
+def test_a_window_past_the_end_of_the_song_is_refused_naming_both_numbers():
+    """The node clamps; this refuses.
+
+    `media_io._slice_audio` ends at `min(total, end * sample_rate)`, so a window running
+    past the file is silently shortened and the render proceeds against fewer seconds than
+    were asked for — with nothing anywhere recording the difference. Refusing costs
+    nothing and happens before any GPU time.
+    """
+    with pytest.raises(ValueError) as past:
+        song_audio_window(start=152, duration=3.75, song_duration=154)
+    assert "155.75s" in str(past.value) and "154s" in str(past.value)
+
+    with pytest.raises(ValueError) as longer:
+        song_audio_window(start=0, duration=200, song_duration=154)
+    assert "200s" in str(longer.value) and "154s" in str(longer.value)
+
+    # Exactly at the end is not past it.
+    assert song_audio_window(start=150, duration=4, song_duration=154) == {
+        "start": 150,
+        "end": 154,
+    }
+    # A Song that never recorded its length cannot be compared against, so the window is
+    # still sent rather than the project being blocked over a field nobody filled in.
+    assert song_audio_window(start=900, duration=4, song_duration=0) == {
+        "start": 900,
+        "end": 904,
+    }
+    for bad in (float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            song_audio_window(start=bad, duration=4, song_duration=154)
+
+
+def test_the_reference_payload_carries_a_window_and_refuses_a_broken_one():
+    """The `trim` reaches `media_state`, and a malformed one is refused rather than dropped.
+
+    The loader's `_trim` silently discards anything it cannot read as a positive number, so
+    a broken window does not fail — it renders the whole file and looks exactly like a shot
+    that asked for none. That is this story's own failure mode, so it is caught where it is
+    visible.
+    """
+    windowed = build_h3_reference_payload(
+        prompt="p",
+        references=[
+            {"kind": "audio", "file": "F:/refs/song.mp3", "trim": {"start": 12.0, "end": 15.75}}
+        ],
+        duration=3.75,
+        seed=0,
+        prefix="p",
+    )
+    media = json.loads(windowed["mvp:references"]["inputs"]["media_state"])
+    assert media[0]["trim"] == {"start": 12.0, "end": 15.75}
+
+    for broken in (
+        {"start": 12.0},
+        {"end": 15.75},
+        {"start": -1.0, "end": 15.75},
+        {"start": 15.75, "end": 12.0},
+        {"start": 12.0, "end": 12.0},
+        {"start": "12", "end": "15.75"},
+        [12.0, 15.75],
+    ):
+        with pytest.raises(ValueError):
+            build_h3_reference_payload(
+                prompt="p",
+                references=[{"kind": "audio", "file": "F:/refs/song.mp3", "trim": broken}],
+                duration=3.75,
+                seed=0,
+                prefix="p",
+            )
 
 
 # --- Sampling profiles -----------------------------------------------------------------
@@ -2010,8 +2304,15 @@ def test_the_h3_audit_wires_every_check_it_defines():
         preflight_h3_ultra.check_lora_strength_range,
         preflight_h3_ultra.check_model_files,
         preflight_h3_ultra.check_request_bounds,
+        preflight_h3_ultra.check_aspect_ratios,
+        preflight_h3_ultra.check_default_geometry,
     }
-    assert len(preflight_h3_ultra.CHECKS) == 6
+    assert len(preflight_h3_ultra.CHECKS) == 8
+    # And the class those last two read is named for recording, or they would check the live
+    # schema and nothing else: absent from the fixture, both report "publishes nothing" in the
+    # offline half of the suite, which reads as a real failure and is not.
+    assert "ResolutionSelector" in preflight_h3_ultra.EXTRA_CLASSES
+    assert "ResolutionSelector" in recorded_object_info()
 
 
 def test_each_h3_check_passes_the_real_schema_and_names_a_moved_one():
@@ -2078,6 +2379,36 @@ def test_each_h3_check_passes_the_real_schema_and_names_a_moved_one():
         "H3Request.steps accepts 100" in problem
         for problem in preflight_h3_ultra.check_request_bounds(request)
     )
+    # The selector's own two ranges, restated on `H3Request` and checked the same way.
+    megapixels = copy.deepcopy(schema)
+    megapixels["ResolutionSelector"]["input"]["required"]["megapixels"][1]["max"] = 4.0
+    assert any(
+        "H3Request.megapixels accepts 16.0" in problem
+        for problem in preflight_h3_ultra.check_request_bounds(megapixels)
+    )
+
+    ratios = copy.deepcopy(schema)
+    options = ratios["ResolutionSelector"]["input"]["required"]["aspect_ratio"][1]["options"]
+    options[options.index("16:9 (Widescreen)")] = "16:9 (Wide)"
+    assert any(
+        "16:9 (Wide)" in problem
+        for problem in preflight_h3_ultra.check_aspect_ratios(ratios)
+    )
+
+    # The one geometry error ComfyUI would *not* catch: `step` is declared and not validated,
+    # so an off-grid default reaches the GPU rather than the validator.
+    grid = copy.deepcopy(schema)
+    grid["MiniMaxH3ReferenceToVideo"]["input"]["required"]["width"][1]["step"] = 64
+    assert any(
+        "width 1056 is off" in problem and "step of 64" in problem
+        for problem in preflight_h3_ultra.check_default_geometry(grid)
+    )
+    ceilinged = copy.deepcopy(schema)
+    ceilinged["MiniMaxH3ReferenceToVideo"]["input"]["required"]["height"][1]["max"] = 512
+    assert any(
+        "height 608 is above" in problem
+        for problem in preflight_h3_ultra.check_default_geometry(ceilinged)
+    )
 
 
 def test_the_h3_audit_covers_both_h3_graphs():
@@ -2142,6 +2473,38 @@ def test_the_reference_smoke_names_a_profile_and_sends_no_step_count():
     assert smoke.RENDER_STEPS == H3_REFERENCE_PROFILES[smoke.RENDER_PROFILE].steps
 
 
+def test_the_reference_smoke_covers_the_two_other_fixtures_that_hid_a_defect():
+    """The same guard, for the same reason, over the start and the frame.
+
+    The step count was the first cost-saving fixture mistaken for a property of the system.
+    `start = 0.0` was the second: it is the one start where a missing audio offset and a
+    correct one produce identical bytes, so a smoke pinned there could not fail however
+    wrong the code was. 640x384 was the third: 0.25 MP against the Director's 0.6, chosen
+    to save GPU minutes, and the resolution every recorded quality judgement was made at.
+
+    All three are now unpinnable from the request body, and this checks that rather than
+    trusting the docstring that says so.
+    """
+    import smoke_h3_reference_app as smoke
+
+    # No geometry in the body: the run renders at whatever the application selects, which
+    # is the number a Director actually gets.
+    assert "width" not in smoke.RENDER_REQUEST, smoke.RENDER_REQUEST
+    assert "height" not in smoke.RENDER_REQUEST, smoke.RENDER_REQUEST
+    assert "megapixels" not in smoke.RENDER_REQUEST, smoke.RENDER_REQUEST
+    # And what it asserts afterwards is that same selection, read from the adapter rather
+    # than typed, so the pin cannot outlive the default it describes.
+    assert (smoke.RENDER_WIDTH, smoke.RENDER_HEIGHT) == select_resolution() == (1056, 608)
+    # Past the intro of the master track, and emphatically not the blind spot. Asserted on
+    # the constant rather than on the window: every shot carries a window now, 0 s included,
+    # so a run at 0 s would send one and still prove nothing -- 0 s is the start whose window
+    # covers the same seconds a missing offset would have.
+    assert smoke.SHOT_START_SECONDS >= 8.0
+    assert song_audio_window(
+        start=smoke.SHOT_START_SECONDS, duration=smoke.SHOT_DURATION_SECONDS, song_duration=0
+    ) == {"start": 12.0, "end": 15.75}
+
+
 def test_the_reference_smoke_reads_what_was_sampled_out_of_comfyuis_own_record():
     """The record has to say what the *server* built, not what the constants mean.
 
@@ -2165,6 +2528,51 @@ def test_the_reference_smoke_reads_what_was_sampled_out_of_comfyuis_own_record()
     default = h3_reference_payload(h3_references("picture", 1))
     assert smoke.submitted_sampling(default) == smoke.profile_declares("default")
     assert smoke.submitted_sampling(default)["lora"] == ""
+
+    # The frame and the song window are read back the same way and for the same reason: a
+    # `trim` the loader cannot read is dropped silently, so a run that completes and measures
+    # correctly is not evidence the model heard the right seconds -- only the recorded graph
+    # is. Driven here against a real payload rather than only on a live run.
+    windowed = build_h3_reference_payload(
+        prompt="p",
+        references=[
+            {"kind": "picture", "file": "F:/refs/lead.png"},
+            {
+                "kind": "audio",
+                "file": "F:/refs/master.mp3",
+                "label": "master song",
+                "trim": {"start": 12.0, "end": 15.75},
+            },
+        ],
+        duration=3.75,
+        seed=0,
+        prefix="p",
+    )
+    assert smoke.submitted_geometry(windowed) == {
+        "width": 1056,
+        "height": 608,
+        "length": 90,
+    }
+    assert smoke.submitted_song_window(windowed) == {
+        "file": "F:/refs/master.mp3",
+        "trim": {"start": 12.0, "end": 15.75},
+    }
+    # A song reference carrying no window reports `trim: None` rather than looking absent,
+    # which at a non-zero start is exactly the defect the live run must be able to see.
+    unwindowed = build_h3_reference_payload(
+        prompt="p",
+        references=[{"kind": "audio", "file": "F:/refs/master.mp3", "label": "master song"}],
+        duration=3.75,
+        seed=0,
+        prefix="p",
+    )
+    assert smoke.submitted_song_window(unwindowed) == {
+        "file": "F:/refs/master.mp3",
+        "trim": None,
+    }
+    # And a graph with no master song at all is an empty mapping, never a wrong answer.
+    assert smoke.submitted_song_window(default) == {}
+    assert smoke.submitted_song_window({}) == {}
 
     # A shape it cannot read is a named gap, never a wrong answer. The index is not
     # trusted either: the graph is found by shape, so a reordered tuple still resolves.

@@ -13,6 +13,12 @@ status writes on their own routes; none of them submits anything. The promote co
 submit, so it is inspected and never clicked -- its rendered presence and enabled state are the
 whole assertion, which is exactly what changed today when `prop` and `setting` joined `character`.
 
+Since 2026-08-18 it also gates the three defects the first browser run found, none of which the
+offline harness can reach: that a live toast does not intercept a click meant for the control that
+raised it, that neither inspector is hidden by a media query at any width this script measures, and
+that choosing which shot to look at does not write the whole shot list back or rebuild the panel
+under the Director's hands. The toast overlap used to be recorded here as an observation.
+
 Every fixture is built through shipped routes. Nothing is hand-written into a manifest.
 
 Run from the repo root -- it starts and proves its own server, and takes no base URL::
@@ -43,12 +49,15 @@ from e2e_support import (
     put_json,
     reachable_widths,
     report,
+    resource_hits,
     settle,
+    toasts_over,
     visible_and_clickable,
     wait_for_readiness,
     wait_for_toast,
 )
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -124,6 +133,9 @@ def select_clip(driver, wait, shot_id: str):
     select nothing. A real click is the point.
     """
     clear_toasts(driver)
+    # The track before the clip: a reply landing between finding a clip and clicking it detaches
+    # the element, and a retry there would hide the race rather than wait for it.
+    settle(driver, "#shots-track")
     clip = wait.until(
         lambda browser: browser.find_element(
             By.CSS_SELECTOR, f'#shots-track .shot-clip[data-shot-id="{shot_id}"]'
@@ -178,7 +190,12 @@ def main() -> None:
             select_project(driver, wait, project_id)
             # Before anything is read off the timeline: the readiness reply rebuilds the clips and
             # the inspector, and every reference taken ahead of it is stale the moment it lands.
-            result["readiness_region"] = " ".join(wait_for_readiness(driver, wait).split())[:160]
+            # This plan's own report, named by its shot count: the app loads the first project in
+            # the root before this script selects the one it seeded, and that project's empty
+            # report would otherwise be taken as the signal that this one's had landed.
+            result["readiness_region"] = " ".join(
+                wait_for_readiness(driver, wait, f"of {len(SHOTS)} shots").split()
+            )[:160]
             driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
             wait.until(
                 lambda browser: len(browser.find_elements(By.CSS_SELECTOR, "#shots-track .shot-clip"))
@@ -273,15 +290,36 @@ def main() -> None:
             again.click()
             reopened = wait_for_toast(driver, wait, "is open for another render")
             assert "is not deleted" in reopened, reopened
-            # Measured while that toast is still up, and recorded rather than judged. `.toast-region`
-            # is `position: fixed` in the bottom-right corner at `z-index: 50`, which is where the
-            # shot inspector's own buttons are, and the render-again toast is six lines tall. So the
-            # panel that raised it can be partly un-clickable for the 4.2 s it stands, and this is
-            # the first run that could see that -- it is invisible to a stub DOM, and it is what
-            # made this script's own first pass fail. Whether it is acceptable is the Director's call.
-            result["toast_over_inspector_controls"] = {
+            # Asserted while that toast is still up. This was an observation until 2026-08-18:
+            # `.toast-region` is `position: fixed` in the bottom-right corner at `z-index: 50`,
+            # which is where the shot inspector's own buttons are, and the render-again toast is six
+            # lines tall -- so a click meant for `#compile-shot` landed on `div.toast.info`, and the
+            # confirmation of what the Director had just done blocked the next thing they tried.
+            #
+            # The outcome is asserted rather than the mechanism, because either answer is a fix: the
+            # region may keep its corner as long as it takes no clicks, or it may move out of the
+            # inspector's region entirely. `toasts_over` records which of the two this run saw, so a
+            # reader can tell an overlap that is harmless from a corner that is simply clear.
+            standing_over = toasts_over(driver, control(driver, "#compile-shot"))
+            covering = {
                 selector: covering_element(driver, control(driver, selector))
                 for selector in ("#compile-shot", "#shot-prompt", "#shot-seed")
+            }
+            assert not any(covering.values()), (
+                f"a toast is intercepting clicks meant for the shot inspector's own controls: "
+                f"{covering}"
+            )
+            # And the press itself, not only the hit test. Compile is the one control here that can
+            # be fired through a live toast to prove the press arrives: it is a dry run that queues
+            # nothing, spends no GPU time and changes no stored state.
+            compile_button = control(driver, "#compile-shot")
+            visible_and_clickable(driver, compile_button, "the compile button under a live toast")
+            compile_button.click()
+            compiled = wait_for_toast(driver, wait, "Director data ready")
+            result["toast_over_inspector_controls"] = {
+                "toasts_standing_over_compile": standing_over,
+                "covering": covering,
+                "click_through_while_toast_up": " ".join(compiled.split())[:120],
             }
             wait.until(lambda browser: status_chip(browser) == "ready")
             assert stored_status(server.base_url, project_id, "shot_settled") == "ready"
@@ -316,6 +354,71 @@ def main() -> None:
             assert status_chip(driver) == "queued", status_chip(driver)
             visible_and_clickable(driver, control(driver, "#compile-shot"), "the compile button")
             result["in_flight_shot_offers_neither_control"] = True
+
+            # --- Choosing which shot to look at is not an edit ---------------------------------
+            # Selecting a clip used to write the whole shot list back on pointerup whether or not
+            # anything had moved. The reply to that write reloaded readiness, and the reply to
+            # *that* rebuilt the inspector -- two renders after the click looked finished, over a
+            # panel the Director was already reading. Read out of the browser's own resource
+            # timings, because what is being asserted is what the client chose to send.
+            shots_path = f"/api/projects/{project_id}/shots"
+            readiness_path = f"/api/projects/{project_id}/readiness"
+            writes = resource_hits(driver, shots_path)
+            reads = resource_hits(driver, readiness_path)
+            select_clip(driver, wait, "shot_draft")
+            assert resource_hits(driver, shots_path) == writes, (
+                "selecting a clip wrote the whole shot list back; the reply to that write reloads "
+                "readiness and the reply to that rebuilds the inspector under the Director's hands"
+            )
+            assert resource_hits(driver, readiness_path) == reads, (
+                "selecting a clip reloaded readiness, which redraws the timeline and the panel"
+            )
+            # The counter is not blind. A real edit still saves, and still refreshes the readiness
+            # the saved prompt could have changed -- without this the assertion above would pass
+            # just as well against a page that had stopped talking to the server at all.
+            audio_box = control(driver, "#shot-song-audio")
+            visible_and_clickable(driver, audio_box, "the master-audio reference checkbox")
+            audio_box.click()
+            wait.until(lambda browser: resource_hits(browser, shots_path) == writes + 1)
+            wait.until(lambda browser: resource_hits(browser, readiness_path) == reads + 1)
+            settle(driver, "#shot-inspector")
+            result["selection_is_not_a_write"] = {"selection": 0, "edit": 1}
+
+            # --- A rebuild under the Director's hands keeps their place ------------------------
+            # The panel is rebuilt with `innerHTML` by replies nobody awaited, so everything typed
+            # since the last `change` went with it. Driven here through the zoom control, which
+            # calls the same `renderTimeline` the readiness reply calls but synchronously, and
+            # through a scripted `.click()`, which moves no focus -- the race without the timing.
+            typed = "A corridor that holds one beat too long."
+            prompt_box = control(driver, "#shot-prompt")
+            prompt_box.click()
+            prompt_box.send_keys(Keys.CONTROL, "a")
+            prompt_box.send_keys(typed)
+            driver.execute_script("document.querySelector('#zoom-in').click();")
+            kept = driver.execute_script(
+                "const box = document.querySelector('#shot-prompt');"
+                "return {focused: document.activeElement === box, value: box.value,"
+                " caret: box.selectionStart};"
+            )
+            assert kept["value"] == typed, (
+                f"a rebuild discarded what was typed into the prompt box: {kept}"
+            )
+            assert kept["focused"], "a rebuild took the caret out of the box being typed into"
+            assert kept["caret"] == len(typed), kept
+            result["edit_survives_a_rebuild"] = kept
+            # Committed, so nothing is left unsaved for the tab close -- the beforeunload guard
+            # would otherwise hold a dialog open at quit. Blurred through the page rather than by
+            # tabbing out of an element handle: the blur fires `change`, `change` rebuilds this
+            # panel, and the handle the keystroke was addressed to is detached by the time the
+            # keystroke lands. That is the same rebuild the assertions above are about, met from
+            # the other side.
+            driver.execute_script(
+                "const box = document.querySelector('#shot-prompt');"
+                "box.blur();"
+                "box.dispatchEvent(new Event('change', {bubbles: true}));"
+            )
+            wait.until(lambda browser: resource_hits(browser, shots_path) >= writes + 2)
+            settle(driver, "#shot-inspector")
 
             # --- The promote control, driven but deliberately never fired ----------------------
             driver.find_element(By.CSS_SELECTOR, '[data-panel="assets"]').click()
@@ -362,15 +465,36 @@ def main() -> None:
             )
             result["nothing_submitted"] = True
 
-            # --- Where these controls stop being reachable -------------------------------------
+            # --- These controls stop being reachable nowhere ----------------------------------
+            # Until 2026-08-18 they did: `.asset-layout .inspector` was `display: none` below
+            # 1180px and `.timeline-layout .shot-inspector` below 860px. Neither panel has a second
+            # surface -- the promote control exists only in the asset inspector, and mark-ready,
+            # render-again and the shot prompt only in the shot inspector -- so those queries took
+            # the actions off the screen rather than rearranging them. Both panels reflow now.
             widths = [1600, 1280, 1024, 820]
-            reach = {"#create-multiview": reachable_widths(driver, "#create-multiview", widths)}
+            reach = {
+                "#create-multiview": reachable_widths(driver, "#create-multiview", widths),
+                "#asset-inspector": reachable_widths(driver, "#asset-inspector", widths),
+            }
             driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
             wait.until(EC.visibility_of_element_located((By.ID, "shot-inspector")))
-            reach["#shot-inspector"] = reachable_widths(driver, "#shot-inspector", widths)
+            for selector in ("#shot-inspector", "#mark-ready", "#compile-shot"):
+                reach[selector] = reachable_widths(driver, selector, widths)
             result["reachable_widths"] = reach
-            assert reach["#create-multiview"]["1600"].startswith("reachable"), reach
-            assert reach["#shot-inspector"]["1600"].startswith("reachable"), reach
+            # The controls, at every width. A button is small enough that "reachable" is the whole
+            # question for it.
+            for selector in ("#create-multiview", "#mark-ready", "#compile-shot"):
+                for width, verdict in reach[selector].items():
+                    assert verdict.startswith("reachable"), (selector, width, reach[selector])
+            # The panels themselves are asserted only to be *drawn*: stacked into one column a
+            # narrow window they are taller than the viewport, which is a scroll rather than a
+            # disappearance, and "not displayed" is the verdict that means the media query is back.
+            for selector in ("#asset-inspector", "#shot-inspector"):
+                for width, verdict in reach[selector].items():
+                    assert not verdict.startswith("not displayed"), (
+                        f"{selector} is hidden by a media query at {width}px, taking the only "
+                        f"controls of their kind with it: {reach[selector]}"
+                    )
 
             driver.save_screenshot(str(artifact_dir() / f"{NAME}.png"))
             console_gate(driver, NAME, result)

@@ -637,7 +637,16 @@ function bindClip(clip) {
       state.dirty = true;
       renderTimeline();
     };
-    const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); saveShotsSilently(); };
+    // Only when the pointer actually moved the shot. A plain selection click is not an edit, and
+    // saving one sent the whole shot list back for nothing: the reply to that write reloaded
+    // readiness, and the reply to *that* rebuilt the inspector a second time, long after the click
+    // looked finished. Comparing against `original` rather than tracking a flag, because a drag
+    // that returns to where it started has also changed nothing.
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (shot.start !== original.start || shot.duration !== original.duration) saveShotsSilently();
+    };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   });
@@ -652,6 +661,32 @@ function bindClip(clip) {
   });
 }
 
+// This panel is rebuilt by replies nobody awaited -- a readiness report landing after a shot save
+// calls `renderTimeline`, which lands here. The rebuild is right: readiness decides the blocked
+// flag and the sameness lines, and a panel left alone would keep reporting a block the Director
+// has just fixed. So the Director's place is carried across it rather than the rebuild skipped.
+// Without this, the caret and every character typed since the last `change` vanished under the
+// answer to a request they never made.
+//
+// Only the focused control, only when it is inside this panel, and only when the panel is being
+// redrawn for the same shot -- a rebuild that follows a selection change must show the new shot's
+// stored text rather than the previous one's uncommitted edit, which is what the stamp is for.
+function captureInspectorEdit(inspector, shotId) {
+  const active = document.activeElement;
+  if (!active?.id || inspector.dataset?.shotId !== shotId || !inspector.contains?.(active)) return null;
+  return { id: active.id, value: active.value, start: active.selectionStart, end: active.selectionEnd };
+}
+
+function restoreInspectorEdit(inspector, place) {
+  const element = place && $("#" + place.id, inspector);
+  if (!element?.focus) return;
+  if (place.value !== undefined && element.value !== place.value) element.value = place.value;
+  element.focus();
+  // `selectionStart` is null on a number input and `setSelectionRange` throws there, so the caret
+  // is only restored where the browser reports one.
+  if (typeof place.start === "number" && element.setSelectionRange) element.setSelectionRange(place.start, place.end);
+}
+
 // Exported for the executed frontend contract, on the `renderSong` precedent: the render-again
 // control is drawn, enabled and bound in here, and a test that only read this source could not
 // tell a control that is bound to the purpose-built route from one bound to the generic shots
@@ -662,8 +697,10 @@ export function renderShotInspector() {
   const inspector = $("#shot-inspector");
   if (!shot) {
     inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>No shot selected</h2><p>Add a shot to begin. Shots are rendered independently in H3's reliable 4–15 second range.</p>`;
+    if (inspector.dataset) inspector.dataset.shotId = "";
     return;
   }
+  const place = captureInspectorEdit(inspector, shot.id);
   const assets = state.project.assets || [];
   // The refusal sends the Director here -- "Write a prompt in the shot inspector" -- so the panel
   // has to show which Shot is blocked and why, rather than looking like an ordinary shot with an
@@ -694,6 +731,8 @@ export function renderShotInspector() {
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
   inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode"><option value="reference" ${shot.mode === "reference" ? "selected" : ""}>Reference + audio</option><option value="image" ${shot.mode === "image" ? "selected" : ""}>Image to video</option><option value="text" ${shot.mode === "text" ? "selected" : ""}>Text to video</option></select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>References<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !shot.asset_ids.includes(asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shot.asset_ids.map((id) => { const asset = assets.find((item) => item.id === id); if (!asset) return ""; const sameKind = shot.asset_ids.map((ref) => assets.find((item) => item.id === ref)).filter((item) => item && (item.kind === asset.kind || (!["video", "audio"].includes(item.kind) && !["video", "audio"].includes(asset.kind)))); const tag = asset.kind === "video" ? "Video" : asset.kind === "audio" ? "Audio" : "Picture"; return `<button class="quiet-button remove-ref" data-id="${id}">${tag} ${sameKind.indexOf(asset) + 1}: ${escapeHtml(asset.name)} ×</button>`; }).join(" ")}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  if (inspector.dataset) inspector.dataset.shotId = shot.id;
+  restoreInspectorEdit(inspector, place);
   ["shot-start", "shot-duration", "shot-mode", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
   $("#shot-asset-select").addEventListener("change", (event) => { if (event.target.value) { shot.asset_ids.push(event.target.value); saveShotsSilently(); renderTimeline(); } });
   $$(".remove-ref", inspector).forEach((button) => button.addEventListener("click", () => { shot.asset_ids = shot.asset_ids.filter((id) => id !== button.dataset.id); saveShotsSilently(); renderTimeline(); }));

@@ -51,6 +51,8 @@ from .timeline import (
 from .vram import CliUnloader, LlmEjector
 from .workflows import (
     H3_DEFAULT_PROFILE,
+    H3_DIRECTOR_DEFAULT_HEIGHT,
+    H3_DIRECTOR_DEFAULT_WIDTH,
     LTX25_ENHANCE_SEED,
     WorkflowCatalog,
     build_flux_payload,
@@ -61,6 +63,7 @@ from .workflows import (
     build_music3_payload,
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
+    song_audio_window,
 )
 
 # The one wording for what a Song change costs, shared by every route that changes or
@@ -1058,8 +1061,42 @@ class TimelineCompileResponse(BaseModel):
 
 
 class H3Request(BaseModel):
-    width: int = Field(default=1344, ge=256, le=2048, multiple_of=32)
-    height: int = Field(default=768, ge=256, le=2048, multiple_of=32)
+    # `None` rather than 1344/768, for `steps`' reason one field down: an omitted size has to
+    # be distinguishable from one the Director typed, because the reference path now resolves
+    # an omission through `select_resolution` while an explicit size is honoured exactly. A
+    # literal default here would make every caller who never touched the field look like a
+    # caller who asked for 1344x768 — which is how this project came to render everything at a
+    # size nobody chose.
+    #
+    # The bounds are unchanged, so a size that was accepted before is accepted now and one
+    # that was refused is still refused. `multiple_of=32` is what keeps an explicit frame on
+    # the same grid the selector rounds to; the reference default, 1056x608, satisfies it.
+    width: int | None = Field(default=None, ge=256, le=2048, multiple_of=32)
+    height: int | None = Field(default=None, ge=256, le=2048, multiple_of=32)
+    # The Director's own control surface: `ResolutionSelector`'s three inputs, with its own
+    # declared ranges so an out-of-range figure is a 422 here rather than a ComfyUI validation
+    # failure seen as an opaque 502 after submission. All three are `None` by default, and all
+    # three are refused alongside an explicit width/height — see `build_h3_reference_payload`.
+    megapixels: float | None = Field(default=None, ge=0.1, le=16.0)
+    # Spelled out as a `Literal` rather than derived from `H3_ASPECT_RATIOS`, for the reason
+    # `profile` is: a `Literal` is what puts the choices in `/openapi.json` and turns an
+    # unknown value into a 422 before any payload is built. `tests/test_api.py` asserts this
+    # list and the builder's table agree, so an option added to one and not the other fails
+    # loudly rather than quietly refusing something ComfyUI would have accepted.
+    aspect_ratio: (
+        Literal[
+            "1:1 (Square)",
+            "2:3 (Portrait Photo)",
+            "3:2 (Photo)",
+            "3:4 (Portrait Standard)",
+            "4:3 (Standard)",
+            "9:16 (Portrait Widescreen)",
+            "16:9 (Widescreen)",
+            "21:9 (Ultrawide)",
+        ]
+        | None
+    ) = None
+    multiple: int | None = Field(default=None, ge=8, le=128)
     # `None` rather than 20 so an omitted count is distinguishable from one the Director
     # typed. The reference profiles carry different step counts — 20 for the audited
     # export's graph, 4 for the turbo bundle, 8 for the canonical References2V one — and a
@@ -2236,11 +2273,33 @@ def create_app(
             if shot.use_song_audio:
                 if not project.song or not project.song.path:
                     raise HTTPException(status_code=422, detail="A completed project song is required")
+                # The shot's own window, from the same two numbers the timeline draws it with
+                # and the same two the text-only path already sends. Without this the loader
+                # gets the whole file and H3 is conditioned on the opening of the track no
+                # matter where the shot sits — the bug this reference render existed to expose
+                # and could not, because every live run so far started at 0 s.
+                #
+                # Sent for *every* shot, 0 s included: the conditioner does not truncate a
+                # reference audio, so a 0 s shot with no window rides the whole track through
+                # every sampling step exactly like any other. See `song_audio_window`.
+                try:
+                    window = song_audio_window(
+                        start=shot.start,
+                        duration=shot.duration,
+                        song_duration=project.song.duration,
+                    )
+                except ValueError as error:
+                    # Before `comfy.submit`, so a window past the end of the song costs no GPU
+                    # time. The alternative is the node's own `_slice_audio`, which clamps the
+                    # end to the file length and renders a shorter window than asked for
+                    # without saying so.
+                    raise HTTPException(status_code=422, detail=str(error)) from error
                 references.append(
                     {
                         "kind": "audio",
                         "file": str(resolve_song_path(project_id, project.song)),
                         "label": "master song",
+                        "trim": window,
                     }
                 )
                 numbers["audio"] += 1
@@ -2251,8 +2310,15 @@ def create_app(
                     references=references,
                     duration=shot.duration,
                     seed=shot.seed,
+                    # All five `None` when the request omitted them, which the builder reads
+                    # as "select the Director pipeline's own 0.6 MP / 16:9 / 32 frame". An
+                    # explicit width and height are honoured exactly; supplying both kinds of
+                    # geometry is refused there rather than resolved by precedence here.
                     width=request.width,
                     height=request.height,
+                    megapixels=request.megapixels,
+                    aspect_ratio=request.aspect_ratio,
+                    multiple=request.multiple,
                     # `None` when the request omitted it, which the builder reads as
                     # "use the profile's own count" — see `H3Request.steps`.
                     steps=request.steps,
@@ -2285,6 +2351,29 @@ def create_app(
                         f"evidenced profile. Attach a reference or drop the profile."
                     ),
                 )
+            # The same refusal, for the same reason, one field over. `ResolutionSelector` is
+            # node `115` of the *reference* chain's export; this branch builds
+            # `MiniMaxH3DirectorCS`, which sizes its own frame through `custom_width` /
+            # `custom_height` / `divisible_by` / `resize_method`, and no frame from this graph
+            # has been measured at 0.6 MP. Accepting the field and resolving it anyway would
+            # queue a full-price render at a size this path has no evidence for, logged as
+            # though it had been chosen — and only the refusal is visible afterwards.
+            selector_fields = [
+                name
+                for name in ("megapixels", "aspect_ratio", "multiple")
+                if getattr(request, name) is not None
+            ]
+            if selector_fields:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{', '.join(selector_fields)} selects a frame the way the reference "
+                        f"chain's ResolutionSelector does. {shot_label(project, shot)} has no "
+                        f"references, so it renders through the text-only Director graph, "
+                        f"which sizes its own frame and has no measured selection. Attach a "
+                        f"reference, or give this shot an explicit width and height."
+                    ),
+                )
             try:
                 timeline = build_director_timeline(
                     [shot], window_start=shot.start, window_duration=shot.duration, fps=24
@@ -2297,8 +2386,14 @@ def create_app(
                     duration=shot.duration,
                     requested_frames=timeline.aligned_frames,
                     seed=shot.seed,
-                    width=request.width,
-                    height=request.height,
+                    # This path's own default, unchanged from the one `H3Request` carried
+                    # before the size became optional: an omitted frame here is still
+                    # 1344x768. See `H3_DIRECTOR_DEFAULT_WIDTH` for why it did not move with
+                    # the reference path's.
+                    width=H3_DIRECTOR_DEFAULT_WIDTH if request.width is None else request.width,
+                    height=(
+                        H3_DIRECTOR_DEFAULT_HEIGHT if request.height is None else request.height
+                    ),
                     steps=request.steps,
                     start=shot.start,
                     prefix=f"music-video-producer/{project_id}/shots/{shot.id}-h3",

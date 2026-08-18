@@ -301,25 +301,63 @@ dialog::backdrop { background: #000b; }
 dialog form { padding: 22px; }
 dialog p { color: var(--muted); line-height: 1.5; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
-.toast-region { position: fixed; right: 18px; bottom: 18px; z-index: 50; display: grid; gap: 8px; }
-.toast { width: min(380px, calc(100vw - 36px)); padding: 11px 13px; border: 1px solid var(--line-strong); border-left: 3px solid var(--acid); border-radius: var(--radius); background: #1b1e1d; box-shadow: 0 12px 40px #0008; font-size: 12px; }
+/* Non-interactive on purpose. A toast carries no control -- no dismiss, no link, nothing focusable
+   -- and removes itself after 4.2 s, so it has no business owning a pixel. It is fixed in the
+   bottom-right corner, which is exactly where both inspectors keep their action buttons, and on
+   2026-08-18 a click meant for #compile-shot landed on div.toast.info instead: the confirmation of
+   what the Director had just done blocked the next thing they tried to do.
+   Refusing pointer events rather than moving the region, because every corner of this layout holds
+   a control in some workspace -- the inspectors bottom-right, "Import song" and "Generate with
+   Flux" bottom-left, the waveform actions top-right, the rail top-left -- so relocating trades one
+   collision for another, while passing the click through fixes it in every workspace and at every
+   width. Set on `.toast` as well as the region so a toast that later gains its own background,
+   border or handler still cannot swallow a click aimed at what is underneath it. */
+.toast-region { position: fixed; right: 18px; bottom: 18px; z-index: 50; display: grid; gap: 8px; pointer-events: none; }
+.toast { width: min(380px, calc(100vw - 36px)); padding: 11px 13px; border: 1px solid var(--line-strong); border-left: 3px solid var(--acid); border-radius: var(--radius); background: #1b1e1d; box-shadow: 0 12px 40px #0008; font-size: 12px; pointer-events: none; }
 .toast.error { border-left-color: var(--red); }
 @media (max-width: 1180px) {
   .topbar { grid-template-columns: 220px minmax(170px, 1fr) auto; }
   .transport-mini { display: none; }
-  .asset-layout { grid-template-columns: 290px 1fr; }
-  .asset-layout .inspector { display: none; }
+  /* The asset inspector is the only surface that carries #create-multiview, #analyze-asset and
+     #attach-asset; there is no second place to promote an asset from. Hiding it here removed three
+     actions outright below 1180px rather than rearranging them, which is why a Director on a
+     1200px window could not reach the promote control at all. It is reflowed into a full-width row
+     under the library instead of dropped: `.panel` already scrolls, so the only thing narrowing
+     costs is the third column. */
+  .asset-layout { grid-template-columns: 290px 1fr; grid-template-rows: minmax(480px, 1fr) auto; height: auto; }
+  .asset-layout .inspector { grid-column: 1 / -1; }
+  /* The preview is a square, so spanning the row would make it as tall as the row is wide and push
+     the promote button a screen and a half down. Capped so the reflowed panel stays a panel. */
+  .asset-layout .inspector .asset-preview { max-width: 280px; }
   .song-layout { grid-template-columns: 330px minmax(420px, 1fr); }
 }
 @media (max-width: 860px) {
   :root { --rail: 68px; }
   .brand-name, .system-state > span:not(.status-dot) { display: none; }
+  /* The rule above takes #vram-eject-note with it -- it is a span in the system state -- and the
+     eject box used to stay live beside the gap it left. That is half a control: a machine-wide
+     render behaviour the Director could still change, with the only surface that reports what the
+     change did gone, and no hover fallback either, because the note's own title carries where the
+     setting came from rather than the note's sentence. So the box goes with its note.
+     Hidden rather than reflowed, unlike the two inspectors below: the topbar is a single
+     fixed-height row that the whole `.app-shell` grid is sized from, so there is nowhere here to
+     move a 220px sentence to. This is a standing preference rather than anything needed mid-task,
+     and widening the window brings the pair back together. */
+  #vram-eject-toggle { display: none; }
   .topbar { grid-template-columns: 60px 1fr auto; }
   .panel { padding: 16px; }
   .rail-item { padding-left: 10px; font-size: 10px; }
   .song-layout, .treatment-layout, .asset-layout, .timeline-layout, .queue-layout { grid-template-columns: 1fr; height: auto; }
+  /* One column now, so the two-column row template the 1180px query set has nothing left to say;
+     without this the generator panel keeps a 480px floor it no longer needs. */
+  .asset-layout { grid-template-rows: auto; }
   .song-stage { min-height: 450px; }
-  .timeline-layout .shot-inspector { display: none; }
+  /* The shot inspector is not hidden here any more. It holds the only mark-ready, render-again and
+     compile controls in the application, and the shot prompt is edited nowhere else, so hiding it
+     below 860px took the commitment step off the screen entirely. This query already collapses
+     `.timeline-layout` to one column and lets the workspace scroll, so the panel simply stacks
+     under the timeline. */
+  .timeline-layout .shot-inspector { min-height: 320px; }
   .workspace { overflow: auto; }
   .panel { overflow: visible; }
 }

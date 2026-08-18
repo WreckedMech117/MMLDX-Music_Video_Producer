@@ -2861,6 +2861,90 @@
     "python_module": "comfy_extras.nodes_custom_sampler",
     "search_aliases": null
   },
+  "ResolutionSelector": {
+    "api_node": false,
+    "category": "utilities",
+    "deprecated": false,
+    "description": "Calculate width and height from aspect ratio and megapixel target. Useful for setting up Empty Latent Image dimensions.",
+    "dev_only": false,
+    "display_name": "Resolution Selector",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "aspect_ratio": [
+          "COMBO",
+          {
+            "default": "1:1 (Square)",
+            "multiselect": false,
+            "options": [
+              "1:1 (Square)",
+              "2:3 (Portrait Photo)",
+              "3:2 (Photo)",
+              "3:4 (Portrait Standard)",
+              "4:3 (Standard)",
+              "9:16 (Portrait Widescreen)",
+              "16:9 (Widescreen)",
+              "21:9 (Ultrawide)"
+            ],
+            "tooltip": "The aspect ratio for the output dimensions."
+          }
+        ],
+        "megapixels": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 16.0,
+            "min": 0.1,
+            "step": 0.1,
+            "tooltip": "Target total megapixels. 1.0 MP \u2248 1024x1024 for square."
+          }
+        ],
+        "multiple": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 8,
+            "max": 128,
+            "min": 8,
+            "step": 4,
+            "tooltip": "Nearest multiple of the result to set the selected resolution to."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "aspect_ratio",
+        "megapixels",
+        "multiple"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ResolutionSelector",
+    "output": [
+      "INT",
+      "INT"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "width",
+      "height"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      "Calculated width in pixels multiplied by the selected multiple.",
+      "Calculated height in pixels multiplied by the selected multiple."
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_resolution",
+    "search_aliases": null
+  },
   "SamplerCustomAdvanced": {
     "api_node": false,
     "category": "model/sampling/custom",

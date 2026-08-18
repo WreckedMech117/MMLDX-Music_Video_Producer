@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import subprocess
 import wave
@@ -80,6 +81,9 @@ from music_video_producer.models import (
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import expansion_input
 from music_video_producer.workflows import (
+    H3_ASPECT_RATIOS,
+    H3_DIRECTOR_DEFAULT_HEIGHT,
+    H3_DIRECTOR_DEFAULT_WIDTH,
     H3_DIRECTOR_MAX_FRAMES,
     H3_REFERENCE_MAX_FRAMES,
     LTX25_ENHANCE_DETAILER_STRENGTH,
@@ -7171,3 +7175,309 @@ def test_the_enhancement_route_takes_no_body_and_exposes_no_sampling_controls(tm
     assert payload["mvp:sigmas"]["inputs"]["sigmas"] == LTX25_ENHANCE_SIGMAS
     assert payload["mvp:detailer"]["inputs"]["strength_model"] == LTX25_ENHANCE_DETAILER_STRENGTH
     assert payload["mvp:prompt"]["inputs"]["text"] == ""
+
+
+# --- The song audio window and the frame it renders into -------------------------------
+#
+# Two fixes that arrived together and are tested together, because the live comparison
+# render exercises both: a shot at roughly 12 s, at 0.6 MP, driven by the seconds of the
+# song it actually occupies.
+
+
+def windowed_project(store, client, *, start: float, duration: float):
+    """One ready reference Shot at `start`, with a picture and the master song.
+
+    The Song's `duration` is 154 s -- the real master track's length -- so the refusal
+    boundary these tests probe is the one the live render will meet.
+    """
+    project = store.create(Project(name="Window"))
+    lead = upload_asset(client, project.id, "Lead vocalist", "character", "lead.png")
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Harder Faster (Female Cover)", "duration": "154"},
+        files={"file": ("harder.mp3", b"ID3fake-mp3-bytes", "audio/mpeg")},
+    )
+    project = store.get(project.id)
+    project.shots = [
+        Shot(
+            start=start,
+            duration=duration,
+            prompt="The vocalist sings to camera under one amber light.",
+            asset_ids=[lead["id"]],
+            use_song_audio=True,
+            status="ready",
+            seed=7,
+        )
+    ]
+    store.save(project)
+    return store.get(project.id)
+
+
+def submitted_media(comfy) -> list[dict]:
+    return json.loads(comfy.prompts[-1]["mvp:references"]["inputs"]["media_state"])
+
+
+def test_a_reference_shot_hears_its_own_part_of_the_song(tmp_path: Path):
+    """The window is the Shot's own `start` and `duration`, the two the timeline draws.
+
+    Before this the route handed the loader the whole file with no offset, so H3 was
+    conditioned on the opening of the track wherever the Shot sat. On this master the
+    lyrics do not begin until about 8 s, so a 0-3.75 s window contains no sung words at
+    all -- which is what "voices but no phonetics" was.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=12.0, duration=3.75)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
+    assert song["trim"] == {"start": 12.0, "end": 15.75}
+    # The visual window and the audio window are the same window: `length` is the frame
+    # count for the same 3.75 s, so nothing lets the two diverge silently.
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["length"] == 90
+
+
+def test_a_moved_shot_renders_its_new_window_with_no_stale_offset(tmp_path: Path):
+    """The window is derived per submission, so there is nowhere for an old one to live."""
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=12.0, duration=3.75)
+    shot_id = project.shots[0].id
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert submitted_media(comfy)[-1]["trim"] == {"start": 12.0, "end": 15.75}
+
+    moved = store.get(project.id)
+    moved.shots[0].start = 96.5
+    store.save(moved)
+    rearm_shot(store, project.id, shot_id)
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert submitted_media(comfy)[-1]["trim"] == {"start": 96.5, "end": 100.25}
+
+
+def test_a_shot_at_zero_seconds_is_windowed_like_any_other(tmp_path: Path):
+    """The 0 s shot is no longer a special case, and this asserts the *difference*.
+
+    This test previously claimed the opposite -- byte-identity with the pre-fix payload at
+    0 s -- on the spec's recorded premise that the conditioner already trimmed a whole-file
+    reference to the render window, making 0 s the case where the bug and the correct
+    behaviour coincided. That premise is false:
+    `MiniMaxH3ReferenceToVideo._encode_ref_audio` VAE-encodes the entire waveform and never
+    truncates. Byte-identity at 0 s therefore preserved the *defect* -- a 3.75 s shot riding
+    154 seconds of song through every sampling step -- and preserved it for the shot most
+    likely to exist in a fresh project. Renegotiated by the Director on 2026-08-18, and the
+    name is changed with the claim so it stays honest about what it proves.
+
+    The consequence is stated here rather than left to be inferred: **no reference payload
+    carrying the master song is byte-identical to a pre-fix one any more.** Every one of them
+    was conditioned on the whole track, so there is nothing left worth preserving. That is
+    what the digest comparison below now demonstrates -- inequality, hashed, rather than
+    equality.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=0.0, duration=3.75)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    submitted = comfy.prompts[-1]
+    song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
+    assert song["trim"] == {"start": 0.0, "end": 3.75}
+
+    # What the route used to send: the same graph with no window on the song at all.
+    shipped = build_h3_reference_payload(
+        prompt=submitted["mvp:condition"]["inputs"]["prompt"],
+        references=[
+            {key: value for key, value in item.items() if key not in {"enabled", "trim"}}
+            for item in submitted_media(comfy)
+        ],
+        duration=3.75,
+        seed=7,
+        width=submitted["mvp:condition"]["inputs"]["width"],
+        height=submitted["mvp:condition"]["inputs"]["height"],
+        prefix=submitted["mvp:save"]["inputs"]["filename_prefix"],
+    )
+
+    assert submitted != shipped
+    assert (
+        hashlib.sha256(json.dumps(submitted, separators=(",", ":")).encode()).hexdigest()
+        != hashlib.sha256(json.dumps(shipped, separators=(",", ":")).encode()).hexdigest()
+    )
+    # And the difference is exactly the window, nothing else: adding it back to the rebuild
+    # closes the gap. A change that also moved a sampler or a loader would fail here.
+    with_window = build_h3_reference_payload(
+        prompt=submitted["mvp:condition"]["inputs"]["prompt"],
+        references=submitted_media(comfy),
+        duration=3.75,
+        seed=7,
+        width=submitted["mvp:condition"]["inputs"]["width"],
+        height=submitted["mvp:condition"]["inputs"]["height"],
+        prefix=submitted["mvp:save"]["inputs"]["filename_prefix"],
+    )
+    assert submitted == with_window
+
+
+def test_a_window_past_the_end_of_the_song_costs_no_gpu_time(tmp_path: Path):
+    """Refused before submission, naming both numbers, with nothing queued.
+
+    The node would clamp instead: `media_io._slice_audio` ends at `min(total, ...)`, so
+    the render would proceed against fewer seconds than were asked for and nothing would
+    record the difference.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=152.0, duration=3.75)
+
+    response = submit_h3(client, project.id, project.shots[0].id)
+
+    assert response.status_code == 422
+    assert "155.75s" in response.json()["detail"]
+    assert "154s" in response.json()["detail"]
+    assert comfy.prompts == []
+    # And nothing was written: the Shot is still `ready`, not `queued`.
+    assert store.get(project.id).shots[0].status == "ready"
+
+    # A shot longer than the whole song is the same refusal with both numbers named.
+    long_project = windowed_project(store, client, start=0.0, duration=200.0)
+    long_response = submit_h3(client, long_project.id, long_project.shots[0].id)
+    assert long_response.status_code == 422
+    assert "200s" in long_response.json()["detail"]
+    assert "154s" in long_response.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_the_text_only_director_path_keeps_its_own_window_untouched(tmp_path: Path):
+    """The path that was already correct is not touched, and grows no `trim`.
+
+    `MiniMaxH3DirectorCS` takes `start_second`/`end_second` directly; the reference path's
+    window lives in the media loader's `media_state`. Two different nodes expressing the
+    same idea two different ways, and this asserts neither borrowed the other's.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Text only"))
+    project.shots = [
+        Shot(start=12.0, duration=3.75, prompt="A wide establishing shot.", status="ready")
+    ]
+    store.save(project)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    payload = comfy.prompts[-1]
+    assert "mvp:references" not in payload
+    director = payload["2343"]["inputs"]
+    assert (director["start_second"], director["end_second"]) == (12.0, 15.75)
+    # The key, not the substring: `VHS_VideoCombine.trim_to_audio` contains "trim" and
+    # always has.
+    assert all("trim" not in node["inputs"] for node in payload.values())
+
+
+def test_a_reference_render_defaults_to_the_directors_own_frame(tmp_path: Path):
+    """No geometry in the request selects 0.6 MP / 16:9 / 32 -- 1056x608.
+
+    The measured H3 base from the 2026-08-17 boundary run, and the size the Director's own
+    `ResolutionSelector` produces. What the route sent before was 1344x768, which nothing
+    ever measured; what the smoke pinned was 640x384, which was chosen to save GPU time.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=12.0, duration=3.75)
+    shot_id = project.shots[0].id
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    conditioner = comfy.prompts[-1]["mvp:condition"]["inputs"]
+    assert (conditioner["width"], conditioner["height"]) == (1056, 608)
+
+    # An explicit frame is honoured exactly, unchanged from today.
+    rearm_shot(store, project.id, shot_id)
+    assert submit_h3(client, project.id, shot_id, width=640, height=384).status_code == 202
+    explicit = comfy.prompts[-1]["mvp:condition"]["inputs"]
+    assert (explicit["width"], explicit["height"]) == (640, 384)
+
+    # The selector's own three inputs reach the same frame by name.
+    rearm_shot(store, project.id, shot_id)
+    named_response = submit_h3(
+        client,
+        project.id,
+        shot_id,
+        megapixels=0.6,
+        aspect_ratio="16:9 (Widescreen)",
+        multiple=32,
+    )
+    assert named_response.status_code == 202
+    named = comfy.prompts[-1]["mvp:condition"]["inputs"]
+    assert (named["width"], named["height"]) == (1056, 608)
+
+
+def test_a_request_naming_a_frame_two_ways_is_refused_rather_than_resolved(tmp_path: Path):
+    """Both kinds of geometry in one request is a 422, and nothing is queued.
+
+    Silently preferring either one produces a render nobody asked for while looking like a
+    render somebody did -- the same argument the sampling-profile refusal makes one field
+    over, and for the same reason: only the refusal is visible afterwards.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=12.0, duration=3.75)
+    shot_id = project.shots[0].id
+
+    response = submit_h3(client, project.id, shot_id, width=640, height=384, megapixels=0.6)
+
+    assert response.status_code == 422
+    assert "not both" in response.json()["detail"]
+    assert comfy.prompts == []
+    assert store.get(project.id).shots[0].status == "ready"
+
+    # Out of the selector's declared range is refused by the request model itself, before
+    # any payload exists.
+    assert submit_h3(client, project.id, shot_id, megapixels=99.0).status_code == 422
+    assert submit_h3(client, project.id, shot_id, multiple=7).status_code == 422
+    assert submit_h3(client, project.id, shot_id, aspect_ratio="16:9").status_code == 422
+    assert comfy.prompts == []
+
+
+def test_the_selector_fields_are_refused_on_a_text_only_shot(tmp_path: Path):
+    """The same refusal `profile` gets, one field over and for the same reason.
+
+    `ResolutionSelector` is node `115` of the *reference* chain; this branch builds
+    `MiniMaxH3DirectorCS`, which sizes its own frame and has never been measured at
+    0.6 MP. Accepting the field and resolving it anyway would queue a full-price render at
+    a size this path has no evidence for, logged as though it had been chosen.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Text only"))
+    project.shots = [
+        Shot(start=0, duration=3.75, prompt="A wide establishing shot.", status="ready")
+    ]
+    store.save(project)
+    shot_id = project.shots[0].id
+
+    response = submit_h3(client, project.id, shot_id, megapixels=0.6)
+
+    assert response.status_code == 422
+    assert "megapixels" in response.json()["detail"]
+    assert comfy.prompts == []
+
+    # Its own default is unchanged: an omitted frame here is still 1344x768.
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    director = comfy.prompts[-1]["2343"]["inputs"]
+    assert (director["custom_width"], director["custom_height"]) == (
+        H3_DIRECTOR_DEFAULT_WIDTH,
+        H3_DIRECTOR_DEFAULT_HEIGHT,
+    )
+
+
+def test_the_route_offers_every_aspect_ratio_the_selector_knows(tmp_path: Path):
+    """The `Literal` and the adapter's table must not drift apart.
+
+    A ratio in the table and not offered here is unreachable per render; one offered here
+    that the table does not know would be a 500 on submission instead of a 422 on
+    validation.
+    """
+    from music_video_producer.app import H3Request
+
+    annotation = H3Request.model_fields["aspect_ratio"].annotation
+    offered = {value for arg in get_args(annotation) for value in get_args(arg)}
+
+    assert offered == set(H3_ASPECT_RATIOS)
+    assert H3Request().aspect_ratio is None
+    assert H3Request().megapixels is None
+    assert H3Request().multiple is None
+    # The size fields default to unset, which is what lets an omission select the
+    # Director's frame rather than looking like a caller who asked for 1344x768.
+    assert H3Request().width is None
+    assert H3Request().height is None

@@ -27,7 +27,41 @@ considered; a failed promotion spends the second job on nothing, so it does not 
 
 ``duration=3.75`` rather than a round 4 s: the reference builder pads to the 17k+5 grid, so
 4.0 s becomes 107 frames and 4.458 s while 3.75 s is exactly 90 frames and a measured 3.750 s
-the assertion needs no allowance for. The requested geometry is 640x384.
+the assertion needs no allowance for.
+
+**READ THIS BEFORE CHANGING A NUMBER IN THIS FILE.**
+
+Three times now, a value chosen here to make this run cheap has been mistaken for a property
+of the system, and every conclusion drawn afterwards was void:
+
+1. **4 steps.** Hardcoded against the 20-step default profile, producing an undersampled
+   frame that said nothing about picture quality. The turbo profile's LoRA was then adopted
+   partly on the strength of it.
+2. **``start = 0.0``.** Chosen because a shot at the start of the song is the simplest thing
+   to write. It is also the one start whose correct window covers the same seconds the buggy
+   whole-file reference began with -- so the reference path never sending an offset at all
+   survived three live renders and a schema audit. It was found by ear, not by this file.
+   Worse, on this particular master the first 3.75 s are instrumental: H3 was conditioned on
+   wordless intro atmospherics and regenerated exactly that, which is what the Director heard
+   as "voices but no phonetics".
+3. **640x384.** 0.25 MP, chosen to save GPU minutes, against the 0.6 MP the Director's own
+   pipeline uses. On a full-body framing the face occupies the same *fraction* of frame
+   either way, so ours landed on tens of pixels of height. Every quality judgement this
+   project recorded -- the 4-step versus 20-step comparison, the turbo assessment, the
+   "coherent cinematic frame" verdict -- was made at a resolution where facial detail cannot
+   survive, and none of them stands.
+
+The pattern is the same each time and nothing in a passing test says it: **the fixture was
+not representative, and the test could not tell.** So before changing any constant above, ask
+the question that would have caught all three -- *which value would make this run pass even if
+the code were wrong?* -- and if the answer is the value you are about to write, cover a second
+one as well.
+
+Concretely, today: the geometry is **not** pinned here, it is read from ``select_resolution``,
+so this run measures the frame a Director actually gets. The start is **12 s**, past this
+track's intro, not 0. The step count comes from the profile. If you find yourself adding a
+``width``, a ``steps`` or a ``start`` of 0 back into the request to make a run cheaper, you
+are writing item 4.
 
 The **step count is taken from the sampling profile, not chosen here.** The first run of this
 script hardcoded a 4-step override against the default profile -- a 20-step graph with no
@@ -52,9 +86,17 @@ master song from ``audio/``. One picture reference plus the song is deliberate -
 minimum window that exercises both the ``<Picture 1>`` tag and the ``<Audio N> is the master
 song for synchronization`` tag the route appends for ``use_song_audio``, and a second
 reference would change what the render proves without making it prove more. The library also
-holds a location image; it is knowingly left unattached. Note that the master song runs far
-longer than the Shot window and the route hands the node the whole file, which is the shipped
-behaviour this run measures rather than something to work around here.
+holds a location image; it is knowingly left unattached.
+
+The master song runs far longer than the Shot window, and the route now hands the media loader
+the Shot's own window -- ``{"trim": {"start": 12.0, "end": 15.75}}`` -- rather than the whole
+file. That reference audio is **conditioning**, not the output track: ``MiniMaxH3ReferenceToVideo``
+encodes it into audio conditioning tokens, and the muxed ``-audio.mp4`` this run measures is
+decoded from the sampler's own latent, exactly as the canonical exports wire it. So the output
+audio is a *regeneration* of the conditioned window and is not expected to resemble the master
+track -- measured at ~0.01 correlation against it, and 3.4x louder. Nothing here should ever
+assert that it does. Muxing the real track back over a finished cut is a separate pipeline step
+(the Director's ``LTX2.5 AudioReplacer`` graph) that this application does not yet have.
 
 The probe target is chosen **by name, not by taking ``output_files[0]``**: a completed H3 shot
 leaves three files behind (a ``.png``, a silent ``.mp4`` and a muxed ``-audio.mp4``) and only
@@ -108,7 +150,12 @@ from smoke_songplanner_app import (
 
 from music_video_producer.config import Settings
 from music_video_producer.timeline import align_h3_frames
-from music_video_producer.workflows import H3_FRAME_RATE, H3_REFERENCE_PROFILES
+from music_video_producer.workflows import (
+    H3_FRAME_RATE,
+    H3_REFERENCE_PROFILES,
+    select_resolution,
+    song_audio_window,
+)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8766"
 PROJECT_NAME = "H3 Reference Smoke QA"
@@ -141,23 +188,38 @@ SHOT_PROMPT = (
     "The character from the reference sheet sings to camera in a dim warehouse under one amber "
     "light, slow push in, stable face and wardrobe, one continuous take."
 )
-SHOT_START_SECONDS = 0.0
+#: **Not 0.0, and never again 0.0 without a second run that is.** 12 s is past this master
+#: track's instrumental intro -- the Director places the first sung words at about 8-10 s --
+#: so the reference audio handed to H3 contains phonemes to sync to. At 0.0 it did not, and
+#: 0.0 is also the one start where a missing offset and a correct one produce identical
+#: bytes, which is exactly why three live renders passed over the defect. See the module
+#: docstring.
+SHOT_START_SECONDS = 12.0
 #: 3.75 s is exactly 90 frames on the 17k+5 grid; see the module docstring.
 SHOT_DURATION_SECONDS = 3.75
 EXPECTED_FRAMES = 90
 SHOT_SEED = 20260819
-RENDER_WIDTH = 640
-RENDER_HEIGHT = 384
+#: The frame the *application* selects when nothing asks for one -- 0.6 MP at 16:9 on a
+#: multiple of 32, which is 1056x608. Derived from `select_resolution` rather than typed, so
+#: this run cannot pin a size the route has stopped producing: the assertion below is that
+#: the render came back at the default, not that it came back at two numbers written here.
+RENDER_WIDTH, RENDER_HEIGHT = select_resolution()
 #: Which evidenced sampling bundle this run submits. The route takes the name; the step
 #: count below is read back from the same table only so the printed record can say what was
 #: requested. Nothing here sends a step count, so the server's answer and this number cannot
 #: disagree -- and changing the profile changes both together, which is the whole point.
 RENDER_PROFILE = "turbo"
 RENDER_STEPS = H3_REFERENCE_PROFILES[RENDER_PROFILE].steps
-#: The body the render submission sends, named rather than inlined so a test can assert it
-#: carries a profile and **no** step count without opening a socket. A `steps` key here is
-#: the defect this story removed.
-RENDER_REQUEST = {"width": RENDER_WIDTH, "height": RENDER_HEIGHT, "profile": RENDER_PROFILE}
+#: The body the render submission sends, named rather than inlined so a test can assert what
+#: it carries without opening a socket.
+#:
+#: **No geometry and no step count.** Both were once written here, both were cost-saving
+#: choices, and both became the numbers every conclusion about this pipeline was drawn from.
+#: The request now names only the sampling profile, so the frame is the application's own
+#: selection and the step count is the profile's -- and what this run measures is what a
+#: Director pressing render actually gets. A `width`, a `height` or a `steps` key added back
+#: here re-creates the defect, whatever number it carries.
+RENDER_REQUEST = {"profile": RENDER_PROFILE}
 
 #: The master song: the real track from the asset library, imported through the shipped route.
 #: `use_song_audio` on the Shot is what appends it as a further audio reference, so this is the
@@ -290,6 +352,55 @@ def submitted_sampling(graph: dict) -> dict[str, Any]:
         "sampler": sampler.get("sampler_name", ""),
         "steps": scheduler.get("steps"),
     }
+
+
+def graph_node(graph: dict, class_type: str) -> dict:
+    """The one node of ``class_type``, or an empty mapping if there is not exactly one."""
+    found = [
+        node.get("inputs", {})
+        for node in graph.values()
+        if isinstance(node, dict) and node.get("class_type") == class_type
+    ]
+    return found[0] if len(found) == 1 and isinstance(found[0], dict) else {}
+
+
+def submitted_geometry(graph: dict) -> dict[str, Any]:
+    """The frame the server was actually given, read back for `submitted_sampling`'s reason.
+
+    The request now sends no width or height at all, so the size is the application's
+    selection rather than anything this file typed. Reading it out of the recorded graph is
+    what makes the printed record a fact about the render instead of a restatement of a
+    constant -- and it is the number the frame comparison is against.
+    """
+    conditioner = graph_node(graph, "MiniMaxH3ReferenceToVideo")
+    return {
+        "width": conditioner.get("width"),
+        "height": conditioner.get("height"),
+        "length": conditioner.get("length"),
+    }
+
+
+def submitted_song_window(graph: dict) -> dict[str, Any]:
+    """The window the master song was handed, read out of the media loader's own state.
+
+    This is the whole point of the run. The window lives in `MiniMaxH3MediaLoader`'s
+    `media_state` -- `MiniMaxH3ReferenceToVideo` has no window input of any kind -- and a
+    `trim` the loader cannot read is dropped silently, so the only way to know a window
+    reached the model is to read back what the server recorded.
+
+    An empty mapping means no master-song reference was found; `{"trim": None}` means one
+    was found carrying no window, which at a non-zero start is the defect this run exists
+    to catch.
+    """
+    loader = graph_node(graph, "MiniMaxH3MediaLoader")
+    try:
+        items = json.loads(loader.get("media_state") or "[]")
+    except (TypeError, ValueError):
+        return {}
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("label") == "master song":
+            return {"file": item.get("file"), "trim": item.get("trim")}
+    return {}
 
 
 def profile_declares(name: str) -> dict[str, Any]:
@@ -624,6 +735,8 @@ def run(base_url: str, ffprobe: str, output_root: Path, record: dict[str, Any]) 
     render["submitted_sampling_source"] = (
         f"ComfyUI /history/{prompt_id}" if graph else f"unavailable: {why}"
     )
+    render["submitted_geometry"] = submitted_geometry(graph) if graph else {}
+    render["submitted_song_window"] = submitted_song_window(graph) if graph else {}
 
     if job["status"] != "complete":
         fail(
@@ -690,6 +803,31 @@ def run(base_url: str, ffprobe: str, output_root: Path, record: dict[str, Any]) 
             f"{json.dumps(submitted)} where the profile declares "
             f"{json.dumps(render['profile_declares'])}, so the render is not the "
             f"configuration this run claims to have measured"
+        )
+    # The window the master song was actually handed, checked the same way and for the same
+    # reason. A `trim` the loader cannot read is dropped *silently*, so a run that completed
+    # and measured correctly is not evidence that the model heard the right seconds -- only
+    # the recorded graph is. This assertion is the one this run exists for.
+    window = render["submitted_song_window"]
+    expected_window = song_audio_window(
+        start=SHOT_START_SECONDS, duration=SHOT_DURATION_SECONDS, song_duration=0
+    )
+    if not window:
+        note(f"  song window not confirmed: {render['submitted_sampling_source']}")
+    elif window.get("trim") != expected_window:
+        abort(
+            f"the master song was submitted with trim {json.dumps(window.get('trim'))} where "
+            f"a {SHOT_START_SECONDS:g}s shot needs {json.dumps(expected_window)}; the render "
+            f"heard a different part of the song than the one this run claims to have measured"
+        )
+    geometry = render["submitted_geometry"]
+    if geometry and (geometry.get("width"), geometry.get("height")) != (
+        RENDER_WIDTH,
+        RENDER_HEIGHT,
+    ):
+        abort(
+            f"the conditioner was submitted at {geometry.get('width')}x{geometry.get('height')} "
+            f"where the application's own selection is {RENDER_WIDTH}x{RENDER_HEIGHT}"
         )
     if not video.get("present"):
         abort("the completed output carries no video stream")
@@ -771,6 +909,18 @@ def main() -> None:
             f"a {SHOT_DURATION_SECONDS:g}s window now aligns to {aligned} frames, not "
             f"{EXPECTED_FRAMES}; the assertions this run makes are stale, so nothing was "
             "submitted"
+        )
+
+    # The audio window, checked the same way and for the same reason. Every shot now carries
+    # one, 0 s included, so the guard is on the *fixture* rather than on the return value: a
+    # run at 0 s would still send a window and still pass, and would still tell us nothing --
+    # 0 s is the start where a shot's window and the first seconds of the track are the same
+    # seconds, so no offset can be observed. Song length is checked at the route.
+    if SHOT_START_SECONDS <= 0:
+        abort(
+            "SHOT_START_SECONDS is 0, the one start whose window is indistinguishable from no "
+            "offset at all, so this run would prove nothing about which part of the song was "
+            "heard; nothing was submitted. See the module docstring."
         )
 
     comfy_url, comfy_version = check_comfy(base_url)

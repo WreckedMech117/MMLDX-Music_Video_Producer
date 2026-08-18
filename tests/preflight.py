@@ -571,6 +571,7 @@ def run_audit(
     base_url: str,
     record: bool,
     checks: Sequence[Callable[[dict], list[str]]] = (),
+    extra_classes: Sequence[str] = (),
     fetch: Callable[[str], dict] | None = None,
     fixture_path: Path = FIXTURE_PATH,
 ) -> None:
@@ -581,6 +582,14 @@ def run_audit(
     problems: a failing one fails the audit, and **a failing audit never records
     a fixture**, because a fixture recorded from a schema the payload does not
     satisfy would make every offline test agree with the defect.
+
+    ``extra_classes`` are classes a ``check`` *reads* but no payload submits —
+    ``ResolutionSelector``, whose arithmetic an adapter may reproduce locally rather
+    than wire into a graph. Without them such a class is absent from the recorded
+    fixture, and the offline half of the suite would find the check reporting "this
+    node publishes nothing" against a fixture that simply never heard of it: a
+    failure that looks like a real one and is not. Recorded like any other class, so
+    a bound that moves upstream is still reported as ``changed``.
 
     ``fetch`` and ``fixture_path`` exist so this function is *executed by tests*
     rather than only by the two scripts. Everything below the fetch — the checks
@@ -612,7 +621,10 @@ def run_audit(
         if record:
             print("Fixture NOT recorded: the audit found problems")
         raise SystemExit(1)
-    classes = sorted({node["class_type"] for _, payload in variants for node in payload.values()})
+    classes = sorted(
+        {node["class_type"] for _, payload in variants for node in payload.values()}
+        | set(extra_classes)
+    )
     if record:
         recorded = record_fixture(object_info, classes, path=fixture_path)
         print(

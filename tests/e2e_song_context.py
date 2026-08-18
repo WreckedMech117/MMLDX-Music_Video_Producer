@@ -8,6 +8,10 @@ are on screen beside them, whether the save and restore buttons are where a Dire
 them, whether the browser honours a `disabled` restore, and whether the browser's own confirm
 dialog actually appears in front of a destructive save. Those are the assertions below.
 
+Since 2026-08-18 it also gates two of the defects the first browser run found: that the save
+confirmation does not stand in front of the button that raised it, and that the eject box and the
+note reporting what an eject did are on screen together at every width or at neither.
+
 The eject toggle is driven for real, which is safe and does not need a GPU: the control writes a
 machine preference through its own route, and the setting reaches ComfyUI only through the
 pre-submission hook. Nothing here submits anything. The preference file lives under the data root,
@@ -38,14 +42,17 @@ from e2e_support import (
     ManagedServer,
     StaleServer,
     artifact_dir,
+    clear_toasts,
     clipped,
     console_gate,
+    covering_element,
     edge_driver,
     get_json,
     post_json,
     post_multipart,
     reachable_widths,
     report,
+    toasts_over,
     visible_and_clickable,
     wait_for_toast,
 )
@@ -141,6 +148,14 @@ def main() -> None:
             # that opens them. The identity project the server proof created has no song, so this
             # is the shut arm, rendered -- the state a save that could only 404 would come from.
             select_project(wait, str(server.evidence["identity_project"]))
+            # The switch is a fetch and `select_project` only proves the selector moved. The badge
+            # is written by the same `renderSong` that shuts this block, so it is the signal that
+            # the reply has landed -- without it the read below can happen while the previous
+            # project, which has a song, is still the one on screen.
+            wait.until(
+                lambda browser: browser.find_element(By.ID, "song-source").text.strip() == "EMPTY",
+                "the project with no song never finished loading",
+            )
             shut = wait.until(EC.visibility_of_element_located((By.ID, "song-lyrics")))
             assert not shut.is_enabled(), "the lyrics box is open in a project with no song"
             for element_id in ("song-style", "save-song-context", "restore-song-lyrics",
@@ -205,8 +220,22 @@ def main() -> None:
 
             # --- The save reaches the server and only the two context fields move --------------
             before = stored_song(server.base_url, project_id)
+            # Cleared first, every time, before a wait that is keyed on a toast's wording. Toasts
+            # stand for 4.2 s and this script raises several "Song context saved" ones, so a wait
+            # that found an earlier one would return before the save it is waiting for had been
+            # answered -- and the next line reads the server.
+            clear_toasts(driver)
             save.click()
             wait_for_toast(driver, wait, "Song context saved")
+            # The confirmation must not stand in the way of the button that raised it. Same defect
+            # the shot inspector found on 2026-08-18 -- `.toast-region` is fixed bottom-right at
+            # `z-index: 50` -- checked again here because the fix has to hold in every workspace,
+            # and this is the one where a Director saves twice in a row most readily.
+            saved_toast_over = toasts_over(driver, save)
+            assert covering_element(driver, save) is None, (
+                "the 'Song context saved' toast is intercepting clicks meant for the save button"
+            )
+            result["toast_over_save_button"] = saved_toast_over
             after = stored_song(server.base_url, project_id)
             assert after["lyrics"] == LYRICS, after["lyrics"]
             assert (after["path"], after["duration"], after["source"]) == (
@@ -305,6 +334,7 @@ def main() -> None:
             style = driver.find_element(By.ID, "song-style")
             style.clear()
             style.send_keys(STYLE)
+            clear_toasts(driver)
             driver.find_element(By.ID, "save-song-context").click()
             wait_for_toast(driver, wait, "Song context saved")
             settled = stored_song(server.base_url, project_id)
@@ -379,19 +409,30 @@ def main() -> None:
             assert driver.find_element(By.ID, "vram-eject-note").text.strip() == expected_note
             result["eject_survives_reload"] = True
 
-            # --- Where these controls stop being reachable -------------------------------------
-            result["reachable_widths"] = {
-                "#vram-eject": reachable_widths(driver, "#vram-eject", [1600, 1280, 1024, 820]),
-                "#vram-eject-note": reachable_widths(
-                    driver, "#vram-eject-note", [1600, 1280, 1024, 820]
-                ),
-                "#save-song-context": reachable_widths(
-                    driver, "#save-song-context", [1600, 1280, 1024, 820]
-                ),
+            # --- Where these controls stop being reachable, and what goes with them -------------
+            widths = [1600, 1280, 1024, 820]
+            reach = {
+                "#vram-eject": reachable_widths(driver, "#vram-eject", widths),
+                "#vram-eject-note": reachable_widths(driver, "#vram-eject-note", widths),
+                "#save-song-context": reachable_widths(driver, "#save-song-context", widths),
             }
-            assert result["reachable_widths"]["#vram-eject"]["1280"].startswith("reachable"), (
-                result["reachable_widths"]
-            )
+            result["reachable_widths"] = reach
+            assert reach["#vram-eject"]["1280"].startswith("reachable"), reach
+            assert reach["#save-song-context"]["820"].startswith("reachable"), reach
+            # The eject box and its note, at every width, together or not at all. The note is the
+            # only surface that reports what an eject actually did, and the box's own title carries
+            # where the setting came from rather than the note's sentence, so there is no hover
+            # fallback for it. Below 860px `.system-state > span:not(.status-dot)` hid the note and
+            # left the box live: the Director could change a machine-wide render behaviour at a
+            # width where nothing was left to tell them what it did. Half a control is worse than
+            # none, and the topbar is one fixed-height row with nowhere to reflow a sentence to, so
+            # the box goes with its note.
+            for width in map(str, widths):
+                box, note_verdict = reach["#vram-eject"][width], reach["#vram-eject-note"][width]
+                assert box.startswith("not displayed") == note_verdict.startswith("not displayed"), (
+                    f"at {width}px the eject box and the note reporting what it did are not on "
+                    f"screen together: box {box!r}, note {note_verdict!r}"
+                )
 
             driver.save_screenshot(str(artifact_dir() / f"{NAME}.png"))
             # The one SEVERE entry this script means to cause: the oversized save above is driven

@@ -59,6 +59,10 @@ repo_src_on_path()
 from music_video_producer.app import H3Request
 from music_video_producer.timeline import align_h3_frames
 from music_video_producer.workflows import (
+    H3_ASPECT_RATIOS,
+    H3_DEFAULT_ASPECT_RATIO,
+    H3_DEFAULT_MEGAPIXELS,
+    H3_DEFAULT_MULTIPLE,
     H3_DIRECTOR_MAX_FRAMES,
     H3_DIRECTOR_MAX_SECONDS,
     H3_FRAME_RATE,
@@ -68,6 +72,7 @@ from music_video_producer.workflows import (
     H3_SPLIT_OFFSETS,
     build_h3_director_payload,
     build_h3_reference_payload,
+    select_resolution,
 )
 
 #: The autogrow group each per-kind limit governs, and the splitter output prefix each kind's
@@ -97,6 +102,13 @@ REQUEST_BOUNDS = (
     ("width", "MiniMaxH3ReferenceToVideo", "width"),
     ("height", "MiniMaxH3ReferenceToVideo", "height"),
     ("steps", "BasicScheduler", "steps"),
+    # The selector's own two numeric inputs. `H3Request` restates their ranges so an
+    # out-of-range figure is a 422 rather than a ComfyUI validation failure seen as an opaque
+    # 502; restated numbers are exactly what this audit exists to keep honest. `ResolutionSelector`
+    # is never submitted — `select_resolution` reproduces its arithmetic locally — but its
+    # declared ranges are still the ones the reproduction has to respect.
+    ("megapixels", "ResolutionSelector", "megapixels"),
+    ("multiple", "ResolutionSelector", "multiple"),
 )
 
 #: The longest window whose aligned frame count still fits `H3_REFERENCE_MAX_FRAMES`:
@@ -208,6 +220,33 @@ def audit_payloads() -> list[tuple[str, dict]]:
                 duration=8,
                 profile="turbo-references2v",
                 **shared,
+            ),
+        ),
+        (
+            # What the application actually submits when the Director touches no geometry
+            # field: `select_resolution`'s 0.6 MP / 16:9 / 32 frame, 1056x608. Named as its
+            # own variant because every other variant here pins a size explicitly, and the
+            # default is the one this project renders at — the size that was 640x384 in the
+            # smoke and 1344x768 on the route, neither of which anybody chose.
+            "default-geometry",
+            build_h3_reference_payload(
+                prompt="<Picture 1> <Audio 1>",
+                # With the shot's own window on the song, which is the other thing this
+                # project submits by default now. A `trim` the loader cannot read is dropped
+                # silently, so putting one in front of the live schema is the only way the
+                # audit sees it at all.
+                references=[
+                    *pictures[:1],
+                    {
+                        "kind": "audio",
+                        "file": "F:/refs/master.mp3",
+                        "label": "master song",
+                        "trim": {"start": 12.0, "end": 15.75},
+                    },
+                ],
+                duration=3.75,
+                seed=0,
+                prefix="preflight",
             ),
         ),
         (
@@ -420,6 +459,89 @@ def check_request_bounds(object_info: dict) -> list[str]:
     return problems
 
 
+def check_aspect_ratios(object_info: dict) -> list[str]:
+    """The adapter's aspect table against the combo the live selector publishes.
+
+    ``select_resolution`` reproduces ``ResolutionSelector``'s arithmetic locally rather than
+    submitting the node, so nothing at ``/prompt`` would ever catch a ratio this table gets
+    wrong — a renamed option or a transposed pair would simply render a differently shaped
+    frame than the Director's graph does, forever, and correctly according to itself.
+
+    Equality rather than containment: the adapter is restating the node's own option list,
+    not choosing a subset of it.
+    """
+    spec = (
+        object_info.get("ResolutionSelector", {})
+        .get("input", {})
+        .get("required", {})
+        .get("aspect_ratio")
+    )
+    options = combo_options(spec)
+    if options is None:
+        return ["aspect ratios: ResolutionSelector.aspect_ratio publishes no combo options"]
+    if set(options) != set(H3_ASPECT_RATIOS):
+        missing = sorted(set(options) - set(H3_ASPECT_RATIOS))
+        extra = sorted(set(H3_ASPECT_RATIOS) - set(options))
+        return [
+            (
+                f"aspect ratios: the adapter's table and ResolutionSelector's options differ "
+                f"— missing {missing}, unknown {extra}"
+            )
+        ]
+    return []
+
+
+def check_default_geometry(object_info: dict) -> list[str]:
+    """The default frame against the node that has to accept it.
+
+    Two claims, and the second is the one worth having. First, that 0.6 MP at 16:9 on a
+    multiple of 32 still selects the 1056x608 the 2026-08-17 boundary run measured — a
+    number this project reproduces rather than derives, so a change in the arithmetic must
+    be seen rather than absorbed. Second, that the selected frame sits inside
+    ``MiniMaxH3ReferenceToVideo``'s declared width/height range *and* on its declared step,
+    because ComfyUI validates the min and max but not the step, so an off-grid frame is the
+    one geometry error that would reach the GPU rather than the validator.
+    """
+    problems: list[str] = []
+    width, height = select_resolution(
+        megapixels=H3_DEFAULT_MEGAPIXELS,
+        aspect_ratio=H3_DEFAULT_ASPECT_RATIO,
+        multiple=H3_DEFAULT_MULTIPLE,
+    )
+    if (width, height) != (1056, 608):
+        problems.append(
+            f"default geometry: {H3_DEFAULT_MEGAPIXELS:g} MP at {H3_DEFAULT_ASPECT_RATIO} on "
+            f"a multiple of {H3_DEFAULT_MULTIPLE} now selects {width}x{height}, not the "
+            f"1056x608 measured from the Director's own pipeline"
+        )
+    for axis, value in (("width", width), ("height", height)):
+        spec = (
+            object_info.get("MiniMaxH3ReferenceToVideo", {})
+            .get("input", {})
+            .get("required", {})
+            .get(axis)
+        )
+        minimum, maximum = numeric_bounds(spec)
+        step = (spec[1] or {}).get("step") if isinstance(spec, list) and len(spec) > 1 else None
+        if minimum is not None and value < minimum:
+            problems.append(
+                f"default geometry: {axis} {value} is below "
+                f"MiniMaxH3ReferenceToVideo.{axis}'s minimum of {minimum}"
+            )
+        if maximum is not None and value > maximum:
+            problems.append(
+                f"default geometry: {axis} {value} is above "
+                f"MiniMaxH3ReferenceToVideo.{axis}'s maximum of {maximum}"
+            )
+        if step and value % step:
+            problems.append(
+                f"default geometry: {axis} {value} is off "
+                f"MiniMaxH3ReferenceToVideo.{axis}'s step of {step}, which ComfyUI does not "
+                f"validate — this reaches the GPU rather than the validator"
+            )
+    return problems
+
+
 #: Every check this audit runs. Named as one tuple so a test can assert the audit wires all
 #: of them: a check deleted from here is a check that still passes its own unit test while
 #: the live audit stops performing it.
@@ -430,12 +552,27 @@ CHECKS = (
     check_lora_strength_range,
     check_model_files,
     check_request_bounds,
+    check_aspect_ratios,
+    check_default_geometry,
 )
+
+
+#: Classes this audit *reads* but never submits. ``select_resolution`` reproduces
+#: ``ResolutionSelector``'s arithmetic in Python rather than wiring the node into the graph —
+#: the graph takes two integers — so the class appears in no payload, and without naming it
+#: here its options and bounds would be checked live and nowhere else.
+EXTRA_CLASSES = ("ResolutionSelector",)
 
 
 def main() -> None:
     base_url, record = parse_arguments(sys.argv[1:])
-    run_audit(audit_payloads(), base_url=base_url, record=record, checks=CHECKS)
+    run_audit(
+        audit_payloads(),
+        base_url=base_url,
+        record=record,
+        checks=CHECKS,
+        extra_classes=EXTRA_CLASSES,
+    )
 
 
 if __name__ == "__main__":

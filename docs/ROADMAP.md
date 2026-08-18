@@ -31,6 +31,11 @@
 
 ## Accepted by the Director, specced, not yet built
 
+> **Every quality verdict this project has recorded is void, established 2026-08-18.** The 4-step versus 20-step comparison, the turbo profile assessment, the "coherent cinematic frame" verdict — all were made from live renders at **640×384, 0.25 MP**, a size chosen only to make a smoke run cheap. The Director's own pipeline selects 0.6 MP. On a full-body framing the face occupies the same *fraction* of frame either way, so ours landed on tens of pixels of height, which is the reported "insanely poor quality details in the face". Two further faults compounded it: the test shot sat at 0 s where that track has no lyrics (singing starts at 8–10 s), and the reference audio was never windowed at all, so a 3.75 s shot was conditioned on the whole 154 s song. **No conclusion about H3 fidelity should be carried forward from any render made before this date.**
+>
+> Worth naming, because it is now three for three: **4-step sampling, `start = 0.0`, and 640×384 were each chosen to make a test cheap, and each became the value every conclusion was drawn from.** Nothing in a passing test says "this sample is not representative."
+
+
 > **Missing pipeline step, established 2026-08-18: nothing puts the real song back.** H3 *generates* its output audio — `VHS_VideoCombine.audio` comes from a `VAEDecodeAudio` on the sampler's latent, in our adapter and in both canonical exports alike — so a song attached with `use_song_audio` conditions the lip movement as `ref_audios` but never becomes the soundtrack. Measured: the rendered clip correlates with the source at ≈ 0.01 at every lag and is 3.4× louder, a regeneration rather than a copy. A finished cut therefore needs the master muxed back over the generated audio. The Director's `LTX2.5 AudioReplacer` graph is exactly that, and adapting it is unbuilt. **This is not a defect in the adapter** — it matches its evidence node for node — it is a stage the pipeline does not have yet, and it bears directly on assembly (FR-22).
 
 

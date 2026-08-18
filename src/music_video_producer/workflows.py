@@ -202,6 +202,18 @@ H3_DIRECTOR_MAX_SECONDS = 1000.0
 #: rendered live that way.
 H3_DIRECTOR_DEFAULT_STEPS = 20
 
+#: The frame the text-only Director path uses when the request names none. This was
+#: ``H3Request.width``/``height``'s own default until the reference path grew a
+#: ``ResolutionSelector`` and those fields had to become "unset" so an omitted size could fall
+#: through to the selection. The numbers are unchanged, and this path is deliberately *not*
+#: offered the selector: ``MiniMaxH3DirectorCS`` is a different node with its own
+#: ``divisible_by``/``resize_method`` pair, node ``115`` of ``h3-ltx25-user-export.json`` sits
+#: in the reference chain rather than this one, and no frame from this graph has been measured
+#: at 0.6 MP. Moving it would be a size change nobody evidenced, on the one H3 path that is
+#: currently correct.
+H3_DIRECTOR_DEFAULT_WIDTH = 1344
+H3_DIRECTOR_DEFAULT_HEIGHT = 768
+
 
 def _finite(name: str, value: float) -> float:
     """A window value ComfyUI could act on. ``inf`` and ``nan`` are neither.
@@ -480,15 +492,202 @@ H3_DEFAULT_PROFILE = "default"
 H3_REFERENCE_MAX_FRAMES = 3600
 
 
+#: The aspect ratios ``ResolutionSelector`` declares, copied from
+#: ``comfy_extras/nodes_resolution.py``'s ``ASPECT_RATIOS`` and confirmed against live
+#: ``/object_info`` on 2026-08-18. Names are the combo's own strings because that is what the
+#: Director's graph stores in node ``115`` of ``h3-ltx25-user-export.json``; a renamed key here
+#: would stop matching the export it exists to reproduce.
+H3_ASPECT_RATIOS: dict[str, tuple[int, int]] = {
+    "1:1 (Square)": (1, 1),
+    "2:3 (Portrait Photo)": (2, 3),
+    "3:2 (Photo)": (3, 2),
+    "3:4 (Portrait Standard)": (3, 4),
+    "4:3 (Standard)": (4, 3),
+    "9:16 (Portrait Widescreen)": (9, 16),
+    "16:9 (Widescreen)": (16, 9),
+    "21:9 (Ultrawide)": (21, 9),
+}
+
+#: The ranges ``ResolutionSelector`` declares for its two numeric inputs. Outside them ComfyUI
+#: rejects the prompt at validation, the same failure ``H3_REFERENCE_MAX_FRAMES`` exists to
+#: prevent, so they are refused locally for the same reason and checked against the live schema
+#: by ``tests/preflight_h3_ultra.py``.
+H3_MEGAPIXEL_LIMITS = (0.1, 16.0)
+H3_MULTIPLE_LIMITS = (8, 128)
+
+#: The width/height range ``MiniMaxH3ReferenceToVideo`` declares. A megapixel figure inside
+#: ``ResolutionSelector``'s own range can still round to a frame H3 refuses — 16 MP at 21:9 is
+#: 6208 px wide — so the *selected* size is checked against the node that has to accept it, not
+#: only against the selector that produced it.
+H3_REFERENCE_DIMENSION_LIMITS = (32, 16384)
+
+#: The Director's own selection, read from node ``115`` (``ResolutionSelector``, titled
+#: "Resolution Selector (Size)") of
+#: ``workflow_templates/reference_exports/h3-ltx25-user-export.json``. Reproduced here rather
+#: than approximated: the 2026-08-17 boundary run measured the H3 base this produced as
+#: 1056x608 — ``33x32`` by ``19x32`` — and ``test_workflows.py`` pins that number.
+H3_DEFAULT_MEGAPIXELS = 0.6
+H3_DEFAULT_ASPECT_RATIO = "16:9 (Widescreen)"
+
+#: The divisor the Director's selector uses, which is the same 32 the LTX boundary repair had
+#: to discover the hard way (``LTX25_DIVISOR``, below) and the same step
+#: ``MiniMaxH3ReferenceToVideo`` declares on ``width``/``height``. Asserted equal to
+#: ``LTX25_DIVISOR`` in ``tests/test_workflows.py`` rather than aliased to it, because the two
+#: are the same number for two different reasons and either could move alone.
+H3_DEFAULT_MULTIPLE = 32
+
+
+def select_resolution(
+    *,
+    megapixels: float = H3_DEFAULT_MEGAPIXELS,
+    aspect_ratio: str = H3_DEFAULT_ASPECT_RATIO,
+    multiple: int = H3_DEFAULT_MULTIPLE,
+) -> tuple[int, int]:
+    """Choose a frame the way the Director's ``ResolutionSelector`` chooses one.
+
+    This is a line-for-line reproduction of ``comfy_extras.nodes_resolution``'s
+    ``ResolutionSelector.execute``, read from the installed source rather than inferred from
+    its outputs::
+
+        total_pixels = megapixels * 1024 * 1024
+        scale = sqrt(total_pixels / (w_ratio * h_ratio))
+        width = round(w_ratio * scale / multiple) * multiple
+
+    Three details in that are load-bearing and none of them are obvious:
+
+    * the megapixel is **1024x1024**, not 1000000, so 0.6 MP is 629145.6 pixels;
+    * the rounding is Python's ``round`` — banker's rounding, half to even — and reproducing
+      it with ``math.floor(x + 0.5)`` would move sizes whose half-cell lands exactly on .5;
+    * each axis rounds **independently**, so the result is on the grid but its ratio is only
+      approximately the one asked for. 0.6 MP at 16:9 gives 1056x608, which is 1.737:1 and
+      0.64 MP — larger than requested, and *not* 16:9. That drift is the node's behaviour and
+      reproducing it faithfully matters more than being closer to the nominal figure.
+
+    The rounding is returned, not hidden: callers get the size that will actually be sent, and
+    the reference payload carries exactly these numbers, so what is rendered is what the
+    manifest and the smoke read back.
+    """
+    if aspect_ratio not in H3_ASPECT_RATIOS:
+        raise ValueError(
+            f"Unknown aspect ratio: {aspect_ratio!r}; ResolutionSelector offers "
+            f"{', '.join(H3_ASPECT_RATIOS)}"
+        )
+    # `bool` is an `int`, and `multiple=True` would round every axis to 1 px while looking like
+    # a plausible flag at the call site. Type and range in one condition so both arrive as the
+    # `ValueError` the route translates into a 422; a `TypeError` here would escape as a 500.
+    minimum, maximum = H3_MULTIPLE_LIMITS
+    if (
+        not isinstance(multiple, int)
+        or isinstance(multiple, bool)
+        or not minimum <= multiple <= maximum
+    ):
+        raise ValueError(
+            f"ResolutionSelector accepts a whole-number multiple between {minimum} and "
+            f"{maximum}, not {multiple!r}"
+        )
+    if (
+        not isinstance(megapixels, (int, float))
+        or isinstance(megapixels, bool)
+        or not math.isfinite(megapixels)
+    ):
+        raise ValueError(f"Megapixels must be a finite number, not {megapixels!r}")
+    low, high = H3_MEGAPIXEL_LIMITS
+    if not low <= megapixels <= high:
+        raise ValueError(
+            f"ResolutionSelector accepts between {low:g} and {high:g} megapixels, "
+            f"not {megapixels:g}"
+        )
+    w_ratio, h_ratio = H3_ASPECT_RATIOS[aspect_ratio]
+    total_pixels = megapixels * 1024 * 1024
+    scale = math.sqrt(total_pixels / (w_ratio * h_ratio))
+    width = round(w_ratio * scale / multiple) * multiple
+    height = round(h_ratio * scale / multiple) * multiple
+    # Checked after the arithmetic, against the node that receives the result: a legal
+    # megapixel figure can still round to a frame `MiniMaxH3ReferenceToVideo` refuses, and
+    # that refusal would otherwise arrive as an opaque 502 after the submission round-trip.
+    floor, ceiling = H3_REFERENCE_DIMENSION_LIMITS
+    for name, value in (("width", width), ("height", height)):
+        if not floor <= value <= ceiling:
+            raise ValueError(
+                f"{megapixels:g} MP at {aspect_ratio} on a multiple of {multiple} selects "
+                f"{width}x{height}, whose {name} is outside the H3 node's {floor}-{ceiling} "
+                f"pixel range"
+            )
+    return width, height
+
+
+#: The window a reference audio file is cut to, expressed as ``MiniMaxH3MediaLoader`` expresses
+#: it. Established on 2026-08-18 from the installed node rather than assumed:
+#:
+#: * the loader's only input is ``media_state``, a JSON list, and each item may carry
+#:   ``{"trim": {"start": s, "end": s}}`` in seconds. ``nodes.py``'s ``_trim`` reads those two
+#:   keys and hands them to ``media_io.load_audio``, which slices the decoded waveform;
+#: * ``_trim``'s ``num()`` keeps a value only when ``v > 0``, so a ``start`` of 0 is read by the
+#:   loader as *no start* — but the ``end`` beside it survives, and ``_slice_audio`` reads a
+#:   missing start as ``start or 0.0``. A window of ``{"start": 0.0, "end": 3.75}`` therefore
+#:   slices ``[0, 3.75]``, which is exactly right. Sending it costs nothing and says what was
+#:   meant;
+#: * ``MiniMaxH3ReferenceToVideo`` has **no** window input of any kind. It is not the Director
+#:   node and does not take ``start_second``/``end_second``. The loader's ``trim`` is the only
+#:   place a reference audio window can be expressed at all.
+#:
+#: ``media_io._slice_audio`` clamps the end to the file's length (``b = min(total, ...)``), so a
+#: window past the end of the song is silently shortened by the node. That is the clamp
+#: ``song_audio_window`` refuses locally instead.
+def song_audio_window(
+    *, start: float, duration: float, song_duration: float
+) -> dict[str, float]:
+    """The ``trim`` a master-song reference carries for a shot at ``start``. Always a window.
+
+    **Every** shot gets one, 0 s included. An earlier draft returned ``None`` at 0 s so that
+    shot's payload stayed byte-identical to the pre-fix one, on the recorded premise that the
+    conditioner already trimmed a whole-file reference to the render window — so 0 s was the
+    case where the bug and the correct behaviour coincided. That premise is false:
+    ``MiniMaxH3ReferenceToVideo._encode_ref_audio`` VAE-encodes the entire waveform and never
+    truncates. Byte-identity at 0 s therefore preserved *the defect*, and preserved it for the
+    shot most likely to exist in a fresh project — a 3.75 s shot at 0 s riding 154 seconds of
+    song through every sampling step while its neighbour at 12 s rode 3.75. Renegotiated by the
+    Director on 2026-08-18; see the Spec Change Log in ``spec-song-audio-window.md``.
+
+    The consequence, stated plainly because it is easy to assume otherwise: **no reference
+    payload carrying the master song is byte-identical to a pre-fix one any more.** Every one
+    of them was conditioned on the whole track, so there is nothing left to preserve.
+
+    ``song_duration`` of 0 means the stored Song never recorded a length. Nothing can be
+    compared against an unknown, so no refusal is raised; the window is still sent. Refusing
+    instead would block every project whose song length was never written, which is a different
+    bug from the one this fixes.
+    """
+    _finite("Shot start", start)
+    _finite("Shot duration", duration)
+    _finite("Song duration", song_duration)
+    if start < 0:
+        raise ValueError(f"A shot cannot start before the song does, at {start:g}s")
+    if duration <= 0:
+        raise ValueError(f"A shot must last longer than zero seconds, not {duration:g}s")
+    end = start + duration
+    if song_duration > 0 and end > song_duration:
+        raise ValueError(
+            f"A shot from {start:g}s to {end:g}s runs past the end of the master song, "
+            f"which is {song_duration:g}s long. The window would be silently shortened to "
+            f"{max(0.0, song_duration - start):g}s of audio, so it is refused instead — "
+            f"move or shorten the shot."
+        )
+    return {"start": start, "end": end}
+
+
 def build_h3_reference_payload(
     *,
     prompt: str,
     references: list[dict[str, Any]],
     duration: float,
-    width: int,
-    height: int,
     seed: int,
     prefix: str,
+    width: int | None = None,
+    height: int | None = None,
+    megapixels: float | None = None,
+    aspect_ratio: str | None = None,
+    multiple: int | None = None,
     steps: int | None = None,
     ref_image_size: str = "match",
     profile: str = H3_DEFAULT_PROFILE,
@@ -517,6 +716,21 @@ def build_h3_reference_payload(
     ``steps`` left as ``None`` takes the profile's own count — the number its evidence
     was rendered at. A count supplied here overrides it: the profile chooses the graph,
     the Director chooses the effort.
+
+    **Geometry comes one way or the other, never both.** ``width``/``height`` are an explicit
+    frame and are honoured exactly — a caller asking for 640x384 gets 640x384, byte for byte,
+    which is what the pinned smoke and every existing test depend on. ``megapixels`` /
+    ``aspect_ratio`` / ``multiple`` are the control the Director's own ``ResolutionSelector``
+    exposes and are resolved through ``select_resolution``. Supplying both is refused rather
+    than resolved by precedence: a caller who sent 0.6 MP *and* 640x384 has two different
+    intentions in one request, and silently honouring either one produces a render nobody
+    asked for while looking like a render somebody did.
+
+    Omitting all five takes ``H3_DEFAULT_MEGAPIXELS`` at ``H3_DEFAULT_ASPECT_RATIO`` on
+    ``H3_DEFAULT_MULTIPLE`` — 1056x608, the size the Director's pipeline actually produces on
+    this machine. That is a **change** from the 1344x768 this builder's callers defaulted to
+    before, and it is deliberate: 1344x768 was never measured against the Director's graph,
+    while 1056x608 was.
     """
     # Before anything else in this function, so an unknown profile is refused before a
     # payload is built rather than after the references validate. The type is checked as
@@ -531,6 +745,46 @@ def build_h3_reference_payload(
         )
     sampling = H3_REFERENCE_PROFILES[profile]
     sampled_steps = sampling.steps if steps is None else steps
+    # Geometry, resolved once and before any reference is looked at, so a request carrying
+    # two contradictory ways to say how big the frame is fails on that rather than on
+    # whichever unrelated thing it happens to trip over next.
+    explicit = {"width": width, "height": height}
+    selected = {"megapixels": megapixels, "aspect_ratio": aspect_ratio, "multiple": multiple}
+    given_explicit = [name for name, value in explicit.items() if value is not None]
+    given_selected = [name for name, value in selected.items() if value is not None]
+    if given_explicit and given_selected:
+        raise ValueError(
+            "A frame is described either by an explicit width and height or by megapixels, "
+            f"aspect ratio and multiple — not both. This request sent "
+            f"{', '.join(given_explicit)} and {', '.join(given_selected)}."
+        )
+    if given_explicit and len(given_explicit) != 2:
+        # Half an explicit frame is not a frame. Without this, `width=640` alone would fall
+        # through to the selector for its height and silently render 640x608.
+        raise ValueError(
+            f"An explicit frame needs both width and height; this request sent only "
+            f"{given_explicit[0]}"
+        )
+    if given_explicit:
+        # Type and range together, so both reach the route as the `ValueError` it turns into a
+        # 422 rather than as a `TypeError` it does not catch.
+        floor, ceiling = H3_REFERENCE_DIMENSION_LIMITS
+        for name, value in explicit.items():
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not floor <= value <= ceiling
+            ):
+                raise ValueError(
+                    f"An explicit {name} must be a whole number of pixels between {floor} "
+                    f"and {ceiling}, which the H3 node accepts, not {value!r}"
+                )
+    else:
+        width, height = select_resolution(
+            megapixels=H3_DEFAULT_MEGAPIXELS if megapixels is None else megapixels,
+            aspect_ratio=H3_DEFAULT_ASPECT_RATIO if aspect_ratio is None else aspect_ratio,
+            multiple=H3_DEFAULT_MULTIPLE if multiple is None else multiple,
+        )
     counts = {
         kind: sum(1 for item in references if item.get("kind") == kind)
         for kind in H3_REFERENCE_LIMITS
@@ -561,6 +815,30 @@ def build_h3_reference_payload(
             f"{H3_REFERENCE_MAX_FRAMES}-frame maximum "
             f"({H3_REFERENCE_MAX_FRAMES / H3_FRAME_RATE:g}s at {H3_FRAME_RATE} fps)"
         )
+    # Every `trim` that reaches `media_state`, checked here rather than trusted from the
+    # caller. The loader's `_trim` silently drops anything it cannot read as a positive
+    # number — a string, a `null`, a negative — so a malformed window does not fail, it
+    # renders the whole file and looks exactly like a shot that asked for no window. That is
+    # the failure mode this whole story exists to remove, so it is refused where it is
+    # visible instead. See `song_audio_window` for how the loader expresses a window at all.
+    for item in references:
+        window = item.get("trim")
+        if window is None:
+            continue
+        # Both keys required rather than defaulted: the loader reads them independently and a
+        # trim carrying only one is a half-window that renders without complaint.
+        if not isinstance(window, dict) or {"start", "end"} - set(window):
+            raise ValueError(
+                f"A reference trim must name both start and end seconds, not {window!r}"
+            )
+        window_start = _finite("Reference trim start", window["start"])
+        window_end = _finite("Reference trim end", window["end"])
+        if window_start < 0:
+            raise ValueError(f"A reference trim cannot start before 0s, at {window_start:g}s")
+        if window_end <= window_start:
+            raise ValueError(
+                f"A reference trim from {window_start:g}s to {window_end:g}s selects nothing"
+            )
     media_state = json.dumps(
         [{**item, "enabled": item.get("enabled", True)} for item in references],
         separators=(",", ":"),

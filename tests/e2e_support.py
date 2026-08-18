@@ -546,21 +546,65 @@ def settle(driver, selector: str, quiet_ms: int = 700, timeout: float = 25.0) ->
 def covering_element(driver, element) -> str | None:
     """What sits on top of this control right now, or None when nothing does.
 
-    Reported rather than asserted, so a script can record an overlap it does not want to rule on.
-    The case this was written for is real: `.toast-region` is `position: fixed` in the
-    bottom-right corner at `z-index: 50`, which is where the shot inspector's own action buttons
-    are, so the toast a control raises can sit over the control that raised it.
+    Written on 2026-08-18 to record an overlap nobody had ruled on yet: `.toast-region` is
+    `position: fixed` in the bottom-right corner at `z-index: 50`, which is where the shot
+    inspector's own action buttons are, so the toast a control raises sat over the control that
+    raised it. The ruling since is that a toast takes no clicks, and both scripts assert this
+    comes back None while one is standing over the control. Still returns rather than raises, so a
+    script can record the overlap alongside the verdict.
     """
     facts = driver.execute_script(HIT_TEST, element)
     return None if facts["hit"] else str(facts["topmost"])
 
 
+#: Every toast whose painted box intersects the target's, with the pointer-events value the
+#: browser resolved for it. Geometry only -- it says nothing about who would receive a click.
+_TOASTS_OVER = """
+const box = arguments[0].getBoundingClientRect();
+return [...document.querySelectorAll('#toast-region .toast')]
+  .map((toast) => ({toast, rect: toast.getBoundingClientRect()}))
+  .filter(({rect}) => rect.left < box.right && rect.right > box.left
+    && rect.top < box.bottom && rect.bottom > box.top)
+  .map(({toast}) => toast.className + ' [pointer-events: '
+    + getComputedStyle(toast).pointerEvents + '] ' + toast.textContent.slice(0, 60));
+"""
+
+
+def toasts_over(driver, element) -> list[str]:
+    """Which toasts are standing over this control right now, by geometry alone.
+
+    The companion to `covering_element`, and the reason the toast assertion is not vacuous:
+    "nothing is intercepting the click" is only worth asserting while something is genuinely on
+    top of the control, and this is what reports whether anything is. A run where this comes back
+    empty has proven the corner is clear rather than that the overlap is harmless -- both are
+    acceptable outcomes, and a reader can tell which one happened.
+    """
+    return [str(entry) for entry in driver.execute_script(_TOASTS_OVER, element)]
+
+
+def resource_hits(driver, suffix: str) -> int:
+    """How many requests this page has made to a URL ending in `suffix`, since it loaded.
+
+    Read out of the browser's own resource timings rather than a server log, because what is being
+    asserted is what the *client* chose to send. Used to prove a negative: selecting a clip must
+    not write the whole shot list back, because the reply to that write reloads readiness and the
+    reply to that rebuilds the inspector long after the click looked finished.
+    """
+    return int(
+        driver.execute_script(
+            "return performance.getEntriesByType('resource')"
+            ".filter((entry) => entry.name.endsWith(arguments[0])).length;",
+            suffix,
+        )
+    )
+
+
 def clear_toasts(driver, timeout: float = 8.0) -> None:
     """Wait out every toast on screen. They remove themselves after 4.2 s and are not dismissible.
 
-    Called before a hit test or a click on anything in the bottom-right of the screen, because a
-    live toast genuinely does intercept clicks there -- which is a fact about the application, not
-    about this harness, and is recorded by `covering_element` where it matters.
+    Kept even though `.toast-region` no longer takes pointer events: a toast still *covers* what is
+    under it, so a hit test run with one up would be measuring the wrong thing anywhere the script
+    is not deliberately testing the overlap.
     """
     from selenium.webdriver.common.by import By
 
@@ -604,7 +648,7 @@ def reachable_widths(driver, selector: str, widths: list[int], height: int = 900
     return verdicts
 
 
-def wait_for_readiness(driver, wait) -> str:
+def wait_for_readiness(driver, wait, fragment: str = "a prompt") -> str:
     """Block until the readiness fetch for the loaded project has landed.
 
     Not cosmetic. `loadProject` fires the readiness GET without awaiting it, and its reply calls
@@ -612,13 +656,20 @@ def wait_for_readiness(driver, wait) -> str:
     that lands goes stale under the script's feet -- which is what happened the first time this ran.
     The region reads "not checked" until the report arrives and the shot counts afterwards, so its
     text is the signal.
+
+    Pass `fragment` when another project's report could satisfy the default one. The app loads the
+    first project in the root before a script selects the one it seeded, and an empty plan renders
+    "0 of 0 shots have a prompt." -- which contains the default fragment, so a script that took it
+    as its own signal carried on while its real report was still in flight, and had its clips
+    rebuilt underneath it. Something naming this plan's own shot count is the honest wait.
     """
     from selenium.webdriver.common.by import By
 
     wait.until(
-        lambda browser: "a prompt"
+        lambda browser: fragment
         in browser.find_element(By.ID, "plan-readiness").get_attribute("textContent"),
-        "the readiness report never landed, so the timeline could re-render at any moment",
+        f"no readiness report carrying {fragment!r} landed, so the timeline could re-render at "
+        "any moment",
     )
     return driver.find_element(By.ID, "plan-readiness").get_attribute("textContent")
 
