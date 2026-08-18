@@ -238,3 +238,20 @@ For full-reference mode specifically, where my summary was weakest:
 ### Why this matters more than a corrected list
 
 Several of these are exactly the errors a competent model writing from taste would make: giving every character a speaker id, putting stage direction inside `<d>`, describing ambience and dialogue together in `overall_soundscape`, naming an amplitude for every camera move. **They are cheap to check and expensive to discover after a render.** The checker should cover the mechanical ones; the specialist's prompt has to carry the semantic ones, because nothing else will.
+
+
+---
+
+## Eight rulings, 2026-08-18 (second decision round)
+
+**Pipeline:**
+1. **H3 keyframe adapter first** — the `MiniMaxH3 I2V-FLframe` graph (`fl2va` checkpoint), covering both first-frame-only and first/last, staying in the lip-sync-capable family. Serves the Director's own described flow: generate an image, use it as the first frame.
+2. **Enhancer gate: `singing` refused; `unknown` refused with the fix named** ("set the singing state first" — one click). Only `not_singing` passes. A wrong guess silently destroys lip-sync, and in a music video an unlabelled shot is likelier singing than not.
+3. **Per-clip Generate is one click, gates still run** — the click on *this* clip is the consent; it performs the arming transition itself when the prompt/mode/lock gates pass, then renders. Batch keeps the two-act flow (arm-a-plan report → Generate All).
+4. **Sequence: finishing lane (approval → assembly) as the main lane, with the keyframe adapter built in parallel.**
+
+**Layout:**
+5. **Video playback is a launch requirement for the Monitor** — the Director overrode the audio-first recommendation. The first layout pass therefore includes take-serving (a route that plays takes in the browser), which the approval work needs regardless: the two lanes share this dependency, so it is built once, early.
+6. **One shared composer**, docked with the chat, prefill beside it.
+7. **Width floor 1440**, docks collapsing below it (bin/chat to icons first, inspector to a drawer); the e2e width matrix re-baselines against these points.
+8. **Song setup lives in a Song stage tab**, always one click away.
