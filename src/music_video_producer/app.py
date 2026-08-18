@@ -326,9 +326,22 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
         "locked",
     }
 )
-SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset()
+#: `h3_prompt` is withheld, and this is the first thing ever withheld from a Shot.
+#:
+#: Not a removal. The comment above rules that taking an existing field *out* of the dump is Ask
+#: First, and that still holds — but this field has never been in it, so classifying it withheld
+#: adds nothing to the prompt rather than subtracting something from it.
+#:
+#: Withheld on the numbers. An expansion is the long form: MiniMax's own worked examples run well
+#: past a thousand characters, and a thirty-shot plan would add tens of thousands of characters —
+#: many thousands of tokens — to *every* chat turn. The recorded root cause of Director degradation
+#: in this project is rich context, so shipping the machine-facing form into the conversational
+#: model's prompt would be the largest single context regression here, in exchange for nothing: the
+#: chat Director writes treatments and intents, and the expansion specialist gets its own
+#: purpose-built payload rather than this dump.
+SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset({"h3_prompt"})
 
-#: The check, run for its refusal. Empty today; see `SHOT_DIRECTOR_VISIBLE`.
+#: The check, run for its refusal. See `SHOT_DIRECTOR_VISIBLE`.
 SHOT_DIRECTOR_WITHHELD_FIELDS = _withheld_fields(
     Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
 )

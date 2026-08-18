@@ -258,6 +258,19 @@ class Shot(BaseModel):
     start: float = Field(ge=0)
     duration: float = Field(gt=0)
     prompt: str = ""
+    # The H3-format expansion of `prompt`, in the structure MiniMax's prompt guide documents:
+    # an optional instruction line and three named fields, with shot markers, cut times, speaker
+    # ids and reference tags inside the first. See `h3_prompt.py`.
+    #
+    # Deliberately a *second* field rather than a replacement. `prompt` holds the short intent a
+    # human wrote or the whole-plan expansion produced; this holds the long machine-facing form
+    # derived from it. Overwriting `prompt` would destroy the readable, editable thing the plan
+    # pass wrote and leave nothing to re-expand from — the expansion has to be repeatable, because
+    # the first one will not be the good one.
+    #
+    # Empty means "not expanded", which is a real state and not a defect: a Shot is plannable long
+    # before it is expanded, and the render path falls back to `prompt` exactly as it always did.
+    h3_prompt: str = ""
     # Defaulted to `None` — undeclared — rather than to any mode. A default here is a declaration
     # nobody made, and the one thing this field exists to end is a Shot whose kind was decided by
     # something other than the Director.

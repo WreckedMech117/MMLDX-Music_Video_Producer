@@ -8127,9 +8127,14 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     Director's prompt the moment it was declared, with nobody deciding that it should. This change
     added three at once, which is exactly the situation the guard exists for.
 
-    Nothing is withheld today and that is a decision rather than an omission: taking a field *out*
-    of the dump changes what the Director is prompted with, which is Ask First. What the
-    classification buys is that the *next* field cannot arrive without the decision being made.
+    Exactly one field is withheld: `h3_prompt`. That is not the removal the classification's own
+    comment calls Ask First — the field has never been in the dump, so withholding it adds nothing
+    to the prompt rather than subtracting something from it. It is withheld on the numbers: a
+    thirty-shot plan of H3-format expansions would add many thousands of tokens to *every* chat
+    turn, and rich context is this project's recorded cause of Director degradation.
+
+    What the classification buys either way is that the *next* field cannot arrive without the
+    decision being made.
     """
 
     class ShotWithANewField(Shot):
@@ -8151,16 +8156,62 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     assert "SONG_DIRECTOR_WITHHELD" not in str(unclassified.value)
 
     # The live classification is complete right now — which is what makes importing `app` succeed
-    # at all — and every one of the three fields this change added is on exactly one side.
+    # at all — and every field is on exactly one side.
     assert _withheld_fields(
         Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
-    ) == set()
+    ) == {"h3_prompt"}
     assert not SHOT_DIRECTOR_VISIBLE & SHOT_DIRECTOR_WITHHELD
-    assert {"mode", "citations", "singing"} <= SHOT_DIRECTOR_VISIBLE
+    assert {"mode", "citations", "singing", "prompt"} <= SHOT_DIRECTOR_VISIBLE
 
-    # And the Director's context is untouched: no `shots` key at all while nothing is withheld, so
-    # the dump is the dump that was being sent before this change.
-    assert "shots" not in DIRECTOR_CONTEXT_EXCLUDE
+    # The one thing withheld, and the exclusion it produces. The key exists *because* something is
+    # withheld — it is derived from the classification rather than written by hand, so a field
+    # classified withheld cannot fail to be excluded, and a field classified visible cannot be
+    # excluded by a stale path someone forgot to update.
+    assert SHOT_DIRECTOR_WITHHELD == {"h3_prompt"}
+    assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {"__all__": {"h3_prompt"}}
+
+    # And the intent is still shown. Withholding the expansion is only defensible because the thing
+    # it was expanded *from* still reaches the Director: a chat turn can still see what each shot is
+    # meant to be, in the short readable form, which is the form a conversation can work with.
+    assert "prompt" not in SHOT_DIRECTOR_WITHHELD
+
+
+def test_an_h3_expansion_never_reaches_the_directors_context(tmp_path):
+    """The classification says withheld; this proves the dump honours it.
+
+    Asserted against what the model was actually handed rather than against the exclusion mapping,
+    because the mapping being right and the dump being right are two different claims. A key
+    present but empty, or a nested path that stopped matching after a rename, would both satisfy
+    the classification test above and still ship the expansion into every chat turn.
+
+    The expansion text is searched for in the *serialised* context, not just checked key by key:
+    the point is that this text is nowhere in what gets encoded into the prompt.
+    """
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="Expansions stay out"))
+
+    expansion = (
+        "integrated_multimodal_description: [Shot 1] A grey wolf paces through birch trunks.\n"
+        "overall_soundscape: Wind moves through branches over dry needles underfoot.\n"
+        "non_diegetic_music: N/A"
+    )
+    shot = Shot(start=0.0, duration=4.0, prompt="Wolf B-roll", h3_prompt=expansion)
+    client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": [json.loads(shot.model_dump_json())]},
+    )
+    assert store.get(project.id).shots[0].h3_prompt == expansion
+
+    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "What is this?"})
+
+    context = director.contexts[0]
+    serialised = json.dumps(context)
+    assert "h3_prompt" not in context["shots"][0]
+    assert "integrated_multimodal_description" not in serialised
+    assert "paces through birch trunks" not in serialised
+    # The intent is still there, which is the only reason withholding the expansion is defensible.
+    assert context["shots"][0]["prompt"] == "Wolf B-roll"
 
 
 def test_every_mode_that_claims_an_adapter_has_a_branch_that_builds_it():
