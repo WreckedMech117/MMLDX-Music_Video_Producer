@@ -15,16 +15,22 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
 from .batch import (
+    TERMINAL_JOB_STATUSES,
     ReadinessReport,
+    RenderStatusReport,
+    apply_job_history,
     prompt_is_missing,
     prompt_rejection,
     readiness_refusal,
     readiness_report,
+    reconcile_render_jobs,
+    render_status_report,
     shot_label,
 )
 from .comfy import ComfyClient, ComfyError
 from .config import Settings
 from .director import (
+    DirectorBudgetExhausted,
     DirectorClient,
     DirectorError,
     DirectorUnavailable,
@@ -1658,6 +1664,9 @@ class ShotExpansionResult(BaseModel):
     #: which is the same argument `MessageNotice.raw` makes for refused Director output.
     prompt: str = ""
     note: str = ""
+    #: How many model calls the answer cost, out of `EXPANSION_ATTEMPTS`. Diagnostic signal
+    #: about the model — a shot that took three tries is worth the Director knowing.
+    attempts: int = 1
 
 
 #: Why a whole-plan sweep is refused before any model call, on `EXPANSION_WITHOUT_SHOTS`' argument.
@@ -1689,13 +1698,13 @@ EXPAND_PROMPTS_WITHOUT_INTENT_NOTICE = (
 #: Director can read and judge it without it ever reaching the next call, which is the argument
 #: `EXPANSION_REJECTED_NOTICE` already makes for refused Director output.
 EXPAND_PROMPTS_MALFORMED_NOTICE = (
-    "NOT saved for {shot}: the answer is not a well-formed H3 prompt. {problems} The returned text "
-    "is kept beside this notice for inspection and is left out of the context of the next Director "
-    "call. The shot is exactly as it was."
+    "NOT saved for {shot}: the answer is not a well-formed H3 prompt after {attempts} attempt(s). "
+    "{problems} The last attempt's text is kept beside this notice for inspection and is left out "
+    "of the context of the next Director call. The shot is exactly as it was."
 )
 EXPAND_PROMPTS_MALFORMED_EMPTY_NOTICE = (
-    "NOT saved for {shot}: the answer is not a well-formed H3 prompt. {problems} There is no "
-    "returned text. The shot is exactly as it was."
+    "NOT saved for {shot}: the answer is not a well-formed H3 prompt after {attempts} attempt(s). "
+    "{problems} There is no returned text. The shot is exactly as it was."
 )
 #: One shot's model call failing while the rest of the sweep carried on. Its own sentence because
 #: the remedy is not the Director's: nothing about the shot is wrong.
@@ -1736,6 +1745,77 @@ class ShotExpansionOutcome:
     problems: tuple[str, ...] = ()
     #: The host's own words, for `failed`.
     detail: str = ""
+    #: How many model calls this outcome cost. 1 for every kind that answered first time, and for
+    #: every kind that never called the model at all. Reported rather than hidden, because a shot
+    #: that took three tries is diagnostic signal about the model, not noise.
+    attempts: int = 1
+
+
+#: How many model calls one shot's expansion may cost: the first attempt plus three automatic
+#: retries, the Director's own ruling after a live plan-wide run ("some failed and took a couple
+#: tries due to formatting, 3 auto retries per would be fine"). Only two failures are worth a
+#: retry — a checker-rejected answer, which retries as a corrective follow-up turn carrying the
+#: failed text and the checker's sentences, and a reasoning-budget exhaustion, which is sampling
+#: luck (roughly 1 call in 6 on this machine's model) and independent across calls. Every other
+#: `DirectorError` — and `DirectorUnavailable` above all — is a fact that will be identical on the
+#: next attempt, so retrying it spends the Director's seconds to learn nothing.
+EXPANSION_ATTEMPTS = 4
+
+#: Appended to a shot's name in a sweep notice when its answer cost more than one model call.
+EXPANSION_TRIES_SUFFIX = " (took {attempts} tries)"
+
+
+async def attempt_expansion(
+    project: Project, shot: Shot, *, director: DirectorClient
+) -> ShotExpansionOutcome:
+    """One shot's expansion, with up to `EXPANSION_ATTEMPTS` model calls behind one outcome.
+
+    This is the level both call paths reach — `expand_shots` for the sweep and the ProducerBot
+    tool, `expand_shot_prompt` for the inspector's single-shot route — so the retry loop exists
+    exactly once. It stops at the first well-formed answer; a malformed one retries with the
+    checker's problems fed back as a corrective turn (`DirectorClient.expand_shot` documents the
+    shape), and a budget exhaustion retries clean, with the temperature's natural variation as
+    the fallback benefit either way. When every attempt fails, the *last* attempt's text and
+    problems are the report, and nothing is ever stored here — the caller decides that, and only
+    for `expanded`.
+
+    `DirectorUnavailable` propagates untouched: it is a configuration fact, identical on every
+    attempt, and both callers already map it to their own 503.
+    """
+    expect_instruction = resolve_shot_mode(shot) in H3_KEYFRAME_MODES
+    payload = shot_expansion_input(project, shot)
+    system = h3_system_prompt(expect_instruction=expect_instruction)
+    rejected = ""
+    rejected_problems: tuple[str, ...] = ()
+    last = ShotExpansionOutcome(shot.id, "failed", detail="no attempt was made")
+    for attempt in range(1, EXPANSION_ATTEMPTS + 1):
+        try:
+            text = await director.expand_shot(
+                shot_input=payload,
+                system_prompt=system,
+                rejected=rejected,
+                rejected_problems=rejected_problems,
+            )
+        except DirectorBudgetExhausted as error:
+            last = ShotExpansionOutcome(
+                shot.id, "failed", detail=str(error), attempts=attempt
+            )
+            continue
+        except DirectorError as error:
+            return ShotExpansionOutcome(
+                shot.id, "failed", detail=str(error), attempts=attempt
+            )
+        checked = h3_check(
+            text, duration=shot.duration, expect_instruction=expect_instruction
+        )
+        if checked.well_formed:
+            return ShotExpansionOutcome(shot.id, "expanded", text=text, attempts=attempt)
+        rejected = text
+        rejected_problems = tuple(problem.message for problem in checked.problems)
+        last = ShotExpansionOutcome(
+            shot.id, "malformed", text=text, problems=rejected_problems, attempts=attempt
+        )
+    return last
 
 
 async def expand_shots(
@@ -1748,7 +1828,8 @@ async def expand_shots(
     context, and quality degrades well before the limit. `director/expand` is pass one and keeps
     its single-call shape because cross-shot variance is a property of the plan; this is the
     opposite shape for the opposite reason, run once per shot with `shot_expansion_input`'s
-    per-shot payload.
+    per-shot payload. Each shot's call is `attempt_expansion`, so "one call per shot" is now
+    "up to `EXPANSION_ATTEMPTS` calls per shot", stopping at the first well-formed answer.
 
     **Each shot is judged on its own and a refusal on one does not stop the rest.** That is the
     frozen matrix's own sentence, and it is why `DirectorError` is caught per shot and recorded as
@@ -1780,29 +1861,7 @@ async def expand_shots(
         if prompt_is_missing(shot):
             outcomes.append(ShotExpansionOutcome(shot.id, "no_intent"))
             continue
-        expect_instruction = resolve_shot_mode(shot) in H3_KEYFRAME_MODES
-        try:
-            text = await director.expand_shot(
-                shot_input=shot_expansion_input(project, shot),
-                system_prompt=h3_system_prompt(expect_instruction=expect_instruction),
-            )
-        except DirectorError as error:
-            outcomes.append(ShotExpansionOutcome(shot.id, "failed", detail=str(error)))
-            continue
-        checked = h3_check(
-            text, duration=shot.duration, expect_instruction=expect_instruction
-        )
-        if not checked.well_formed:
-            outcomes.append(
-                ShotExpansionOutcome(
-                    shot.id,
-                    "malformed",
-                    text=text,
-                    problems=tuple(problem.message for problem in checked.problems),
-                )
-            )
-            continue
-        outcomes.append(ShotExpansionOutcome(shot.id, "expanded", text=text))
+        outcomes.append(await attempt_expansion(project, shot, director=director))
     return outcomes
 
 
@@ -1857,11 +1916,24 @@ def expansion_sweep_notices(
     text rides in `raw` instead, which `DIRECTOR_CONTEXT_EXCLUDE` drops — the same split
     `EXPANSION_REJECTED_NOTICE` uses, and the reason `SHOT_DIRECTOR_WITHHELD` exists at all.
     """
-    grouped: dict[str, list[str]] = {}
+    grouped: dict[str, list[ShotExpansionOutcome]] = {}
     for outcome in outcomes:
-        grouped.setdefault(outcome.kind, []).append(outcome.shot_id)
-    def named(ids: list[str]) -> str:
-        return ", ".join(labels.get(shot_id, _short(shot_id)) for shot_id in ids)
+        grouped.setdefault(outcome.kind, []).append(outcome)
+
+    def named(group: list[ShotExpansionOutcome]) -> str:
+        # A shot that cost more than one model call says so beside its name. That is the
+        # Director's diagnostic signal about the model — a plan where every shot took three
+        # tries is a fact about the model or the prompt, and hiding it would erase the only
+        # place it shows.
+        return ", ".join(
+            labels.get(outcome.shot_id, _short(outcome.shot_id))
+            + (
+                EXPANSION_TRIES_SUFFIX.format(attempts=outcome.attempts)
+                if outcome.attempts > 1
+                else ""
+            )
+            for outcome in group
+        )
 
     notices: list[MessageNotice] = []
     if applied := grouped.get("applied"):
@@ -1894,14 +1966,15 @@ def expansion_sweep_notices(
                 raw=outcome.text,
                 shot=labels.get(outcome.shot_id, _short(outcome.shot_id)),
                 problems=" ".join(outcome.problems),
+                attempts=outcome.attempts,
             )
         )
     # Grouped by the host's own sentence: one dead host produces one message repeated, and a wall
     # of identical notices is how a report stops being read.
-    failures: dict[str, list[str]] = {}
+    failures: dict[str, list[ShotExpansionOutcome]] = {}
     for outcome in outcomes:
         if outcome.kind == "failed":
-            failures.setdefault(outcome.detail, []).append(outcome.shot_id)
+            failures.setdefault(outcome.detail, []).append(outcome)
     for detail, reported in failures.items():
         notices.append(
             MessageNotice(
@@ -4035,7 +4108,9 @@ def create_app(
         write an intent first would send the Director to do work that would then be refused.
 
         **A malformed answer is not stored.** The checker runs before the write, and a prompt
-        that fails it is returned with its problems rather than saved. Storing it would put a
+        that fails it is retried — `attempt_expansion` owns the loop and its budget, shared
+        with the sweep so the two paths cannot drift — and only when every attempt fails is
+        the last one returned with its problems rather than saved. Storing it would put a
         broken prompt in the manifest that the *next render* would submit, which is exactly the
         outcome checking before a render exists to prevent — and the failure would surface as a
         bad take rather than as a message.
@@ -4058,30 +4133,28 @@ def create_app(
 
         mode = resolve_shot_mode(shot)
         try:
-            text = await director.expand_shot(
-                shot_input=shot_expansion_input(project, shot),
-                system_prompt=h3_system_prompt(
-                    expect_instruction=mode in H3_KEYFRAME_MODES
-                ),
-            )
+            outcome = await attempt_expansion(project, shot, director=director)
         except DirectorUnavailable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
-        except DirectorError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-
-        checked = h3_check(
-            text,
-            duration=shot.duration,
-            expect_instruction=mode in H3_KEYFRAME_MODES,
-        )
-        if not checked.well_formed:
+        if outcome.kind == "failed":
+            raise HTTPException(status_code=502, detail=outcome.detail)
+        if outcome.kind == "malformed":
             return ShotExpansionResult(
                 project=project,
                 applied=False,
-                problems=[problem.message for problem in checked.problems],
-                prompt=text,
+                problems=list(outcome.problems),
+                prompt=outcome.text,
                 note=EXPAND_PROMPT_MALFORMED,
+                attempts=outcome.attempts,
             )
+
+        # Re-checked pure so the advisory problems ride along with an applied answer, exactly
+        # as they always have: `attempt_expansion` only reports problems for a refusal.
+        checked = h3_check(
+            outcome.text,
+            duration=shot.duration,
+            expect_instruction=mode in H3_KEYFRAME_MODES,
+        )
 
         # Re-read after the await for the reason `director_chat` documents: the Shot may have
         # been locked, rendered or deleted while the model was thinking, and the answer was
@@ -4099,13 +4172,14 @@ def create_app(
                 detail=wording.format(shot=shot_label(project, current)),
             )
 
-        current.h3_prompt = text
+        current.h3_prompt = outcome.text
         store.save(project)
         return ShotExpansionResult(
             project=project,
             applied=True,
             problems=[problem.message for problem in checked.problems],
-            prompt=text,
+            prompt=outcome.text,
+            attempts=outcome.attempts,
         )
 
     @app.post("/api/projects/{project_id}/shots/expand-prompts", response_model=Project)
@@ -4507,22 +4581,46 @@ def create_app(
         project.messages.append(assistant_reply(message, notices))
         return store.save(project)
 
+    @app.get(
+        "/api/projects/{project_id}/render-status", response_model=RenderStatusReport
+    )
+    async def read_render_status(project_id: str) -> RenderStatusReport:
+        """AD-1's poll endpoint: one reconciliation tick, then the fixed report shape.
+
+        A GET the browser calls on a two-second interval while the project has open jobs, so
+        every property that matters here is about cost and quiet: an idle project makes no
+        ComfyUI request at all, one tick fetches `/queue` once however many jobs are open,
+        the manifest is rewritten only when something actually moved, and a dead ComfyUI is a
+        200 with `comfy_online: false` rather than a 502 — a poll loop must never turn a
+        ComfyUI restart into a toast every two seconds.
+        """
+        project = get_project(project_id)
+        outcome = await reconcile_render_jobs(project, comfy)
+        if outcome.changed:
+            store.save(project)
+        return render_status_report(project, comfy_online=outcome.comfy_online)
+
     @app.get("/api/projects/{project_id}/jobs/{job_id}", response_model=RenderJob)
     async def read_job(project_id: str, job_id: str) -> RenderJob:
+        """One job, refreshed. Delegates its mutation to `batch.apply_job_history`.
+
+        The completion logic used to live inline here, which is exactly the double ownership
+        AD-1 forbids once a polling endpoint exists: two hand-written copies of "what does a
+        finished job do to the project" is how the manual refresh and the poll start telling
+        different stories about one Shot. This route keeps its own transport contract — a
+        dead ComfyUI is this caller's 502, where the poll degrades quietly — and its
+        history-first shape, which the smoke scripts drive one job at a time.
+        """
         project = get_project(project_id)
         job = next((item for item in project.jobs if item.id == job_id), None)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        if job.prompt_id and job.status not in {"complete", "error", "cancelled"}:
+        if job.prompt_id and job.status not in TERMINAL_JOB_STATUSES:
             try:
                 history = await comfy.history(job.prompt_id)
             except ComfyError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
-            job.status = (
-                history.status
-                if history.status in {"queued", "running", "complete", "error"}
-                else "running"
-            )
+            apply_job_history(project, job, history)
             if job.status == "queued":
                 # History is empty for both waiting and executing prompts. Only the live
                 # queue distinguishes them, so a running render is not reported as queued.
@@ -4532,61 +4630,6 @@ def create_app(
                     located = "absent"
                 if located == "running":
                     job.status = "running"
-            job.output_files = [
-                "/".join(
-                    part.replace("\\", "/").strip("/")
-                    for part in (item.get("subfolder", ""), item.get("filename", ""))
-                    if part
-                )
-                for item in history.outputs
-            ]
-            job.error = history.error
-            if job.status == "complete":
-                if job.kind in {"flux", "multiview"}:
-                    asset = next((item for item in project.assets if item.id == job.target_id), None)
-                    if asset and job.output_files:
-                        asset.path = job.output_files[0]
-                # Only the Song this job actually produced may adopt its output. `target_id`
-                # is the constant string "song" for every music job, so the prompt id is the
-                # only thing tying a completion to a particular Song. Without this check a
-                # job that finished after the Song was removed re-attached its audio to
-                # whatever Song was there — and in the other order it overwrote an *imported*
-                # song's `path` with a generated file while `source` still said "imported".
-                # A mismatched output is not lost: it stays listed on the job's
-                # `output_files`, which is where an orphaned take is recovered from.
-                elif (
-                    job.kind == "music"
-                    and project.song
-                    and project.song.prompt_id == job.prompt_id
-                    and job.output_files
-                ):
-                    project.song.path = job.output_files[0]
-                elif job.kind == "h3":
-                    shot = next((item for item in project.shots if item.id == job.target_id), None)
-                    if shot:
-                        shot.status = "complete"
-                        if job.output_files:
-                            # The pointer moves; the file it used to name does not. ComfyUI
-                            # numbers its outputs from the filename prefix, so a re-render of
-                            # one shot writes `…_00002` beside `…_00001` — and this job's own
-                            # `output_files` goes on naming whichever it produced. That is the
-                            # whole of what "the previous take is not silently lost" means:
-                            # nothing here is a take list, and nothing should be read as one.
-                            #
-                            # `latest_review` is dropped when, and only when, the take it
-                            # describes stops being the latest one. It is a vision inspection of
-                            # a *specific* file; carrying it across a new take would leave the
-                            # inspector reporting on the previous render under the new take's
-                            # name, which is worse than showing nothing — and it is now reachable
-                            # from the interface, because a shot can be re-opened and rendered
-                            # again. Re-run "Inspect latest take" for the new one.
-                            if job.output_files[0] != shot.latest_output:
-                                shot.latest_review = None
-                            shot.latest_output = job.output_files[0]
-            elif job.kind == "h3" and job.status == "error":
-                shot = next((item for item in project.shots if item.id == job.target_id), None)
-                if shot:
-                    shot.status = "error"
             store.save(project)
         return job
 

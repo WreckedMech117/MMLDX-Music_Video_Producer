@@ -32,6 +32,7 @@ from music_video_producer.app import (
     document_not_requested_notice,
     document_restore_notice,
 )
+from music_video_producer.batch import TERMINAL_JOB_STATUSES, reconcilable_jobs
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
     LEGACY_SHOT_MODES,
@@ -41,6 +42,7 @@ from music_video_producer.models import (
     AssetKind,
     MessageNotice,
     Project,
+    RenderJob,
     Shot,
     SingingState,
     Song,
@@ -5948,6 +5950,11 @@ def test_the_shot_mode_table_is_the_same_table_in_both_languages():
         assert entry["label"] == spec.label, entry["value"]
         assert entry["song_audio"] == spec.song_audio, entry["value"]
         assert entry["adapter"] == spec.adapter, entry["value"]
+        # The workflow name the mode select prints, held to the server's table so which MiniMax
+        # graph a mode employs is decided in exactly one place — and held to the adapter, so a
+        # mode can never name a workflow it cannot render through or render through one unnamed.
+        assert entry["workflow"] == spec.workflow, entry["value"]
+        assert bool(spec.workflow) == bool(spec.adapter), entry["value"]
         assert entry["roles"] == [
             {"role": requirement.role, "minimum": requirement.minimum, "maximum": requirement.maximum}
             for requirement in spec.roles
@@ -6091,12 +6098,16 @@ def test_the_inspector_draws_the_mode_it_resolves_and_declares_only_what_was_cho
     assert "Not declared — renders as Text to video" in rendered["undeclaredText"]
     assert "Not declared — renders as References to video" in rendered["undeclaredReferences"]
     # A declared mode is the selected option, and every mode is offered — including the ones with
-    # no adapter, which are labelled rather than hidden.
+    # no adapter, which are labelled rather than hidden. A renderable mode names the workflow it
+    # renders through, from the spec table and never hand-typed here, because "Text to video"
+    # alone never told the Director the MiniMax H3 Director graph is what that click employs.
     assert '<option value="first_middle_last" selected>' in rendered["declared"]
     for mode, spec in SHOT_MODE_SPECS.items():
         assert f'value="{mode}"' in rendered["declared"], mode
-        if not spec.adapter:
-            assert f"{spec.label} — no adapter yet" in rendered["declared"], mode
+        if spec.adapter:
+            assert f"{spec.label} — renders through {spec.workflow}" in rendered["declared"], mode
+        else:
+            assert f"{spec.label} — planned, not yet renderable" in rendered["declared"], mode
 
     # `null` and not `""`. The model's field is `ShotMode | None` precisely so that "undeclared" is
     # representable, and `""` is not a member of the Literal.
@@ -6630,3 +6641,420 @@ def test_the_two_expansion_toasts_do_not_read_each_others_markers():
     """)
 
     assert counts == {"oneReadsOne": 4, "oneReadsTwo": 0, "twoReadsTwo": 2, "twoReadsOne": 0}
+
+
+# --------------------------------------------------------------------------------------------
+# Render polling -- the client half of AD-1, executed rather than read.
+# --------------------------------------------------------------------------------------------
+
+
+def poll_project(**overrides) -> str:
+    """One project mid-Flux-render, as `state.project` holds it, for the workspace tests."""
+    project = {
+        "id": "p1", "name": "Poll", "song": None, "shots": [], "messages": [],
+        "assets": [{
+            "id": "a1", "name": "Lead singer", "kind": "character", "path": "",
+            "source": "flux", "prompt_id": "pr1", "created_at": "2026-08-18T00:00:00Z",
+        }],
+        "jobs": [{
+            "id": "j1", "kind": "flux", "status": "queued", "prompt_id": "pr1",
+            "target_id": "a1", "seed": 7, "output_files": [], "error": "",
+        }],
+    }
+    project.update(overrides)
+    return json.dumps(project)
+
+
+#: The poll answer that settles that render, in the route's fixed shape.
+POLL_COMPLETION = {
+    "active": False,
+    "comfy_online": True,
+    "jobs": [{
+        "id": "j1", "kind": "flux", "status": "complete", "prompt_id": "pr1",
+        "target_id": "a1", "seed": 7,
+        "output_files": ["music-video-producer/p1/assets/singer_00001_.png"], "error": "",
+    }],
+    "shots": [],
+    "assets": [{"asset_id": "a1", "path": "music-video-producer/p1/assets/singer_00001_.png"}],
+    "song": None,
+}
+
+
+def test_the_polling_constants_mirror_the_server_and_the_ad():
+    """AD-1 in numbers: a 2 s interval, and the same definition of "settled" on both sides."""
+    offered = run_module("""
+      import { RENDER_POLL_INTERVAL_MS, TERMINAL_JOB_STATUSES }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ RENDER_POLL_INTERVAL_MS, TERMINAL_JOB_STATUSES }));
+    """)
+
+    assert offered["RENDER_POLL_INTERVAL_MS"] == 2000
+    assert set(offered["TERMINAL_JOB_STATUSES"]) == set(TERMINAL_JOB_STATUSES)
+
+
+def test_both_languages_agree_on_which_projects_have_renders_in_flight():
+    """`hasActiveRenderJobs` against `batch.reconcilable_jobs`, over every status × prompt-id.
+
+    This predicate is the whole polling contract -- the browser polls exactly while it is true
+    -- so the two sides disagreeing is a client that polls an idle project forever, or one that
+    never sees a live job finish."""
+    cases = []
+    for status in ("queued", "running", "complete", "error", "cancelled"):
+        for prompt_id in ("pr1", ""):
+            cases.append({
+                "id": f"j_{status}_{'with' if prompt_id else 'without'}",
+                "kind": "flux", "status": status, "prompt_id": prompt_id, "target_id": "a",
+            })
+    projects = [{"jobs": [case]} for case in cases] + [{"jobs": []}, {"jobs": cases}]
+
+    answers = run_module(f"""
+      import {{ hasActiveRenderJobs }} from './src/music_video_producer/web/assets/api.js';
+      const projects = {json.dumps(projects)};
+      console.log(JSON.stringify(projects.map(hasActiveRenderJobs)));
+    """)
+
+    for answer, held in zip(answers, projects, strict=True):
+        project = Project(name="Parity")
+        project.jobs = [RenderJob.model_validate(job) for job in held["jobs"]]
+        assert answer == bool(reconcilable_jobs(project)), held
+    # The matrix produces both answers, or this pins nothing.
+    assert True in answers and False in answers
+
+
+def test_apply_render_status_patches_render_facts_and_only_render_facts():
+    """The 2 s patch, executed over the hazards it exists to avoid.
+
+    A poll answer can be a request older than a click the Director just made, and the whole-list
+    shots save re-asserts every local field -- so what matters as much as the completion landing
+    is everything the patch refuses to touch: a settled job never regresses, a draft/ready shot
+    is never moved, a landed asset is never un-landed, another Song's audio is never adopted,
+    and a job the report predates is kept so polling does not stop watching it."""
+    verdict = run_module(f"""
+      import {{ applyRenderStatus }} from './src/music_video_producer/web/assets/api.js';
+      const report = {json.dumps(POLL_COMPLETION)};
+      const completion = {{
+        project: {{
+          id: 'p1',
+          assets: [{{ id: 'a1', name: 'Lead singer', path: '', prompt_id: 'pr1' }}],
+          shots: [], song: null,
+          jobs: [{{ id: 'j1', kind: 'flux', status: 'queued', prompt_id: 'pr1', target_id: 'a1',
+                   output_files: [], error: '' }}],
+        }},
+      }};
+      const completionChanges = applyRenderStatus(completion.project, report);
+
+      const guarded = {{
+        project: {{
+          id: 'p1',
+          assets: [{{ id: 'a1', name: 'Lead singer', path: 'already/landed_00001_.png' }}],
+          shots: [
+            {{ id: 's_ready', status: 'ready', prompt: 'typed', latest_output: '', latest_review: null }},
+            {{ id: 's_running', status: 'running', latest_output: 'old/take_00001.mp4',
+               latest_review: {{ summary: 'previous take' }} }},
+          ],
+          song: {{ title: 'Mine', path: 'songs/mine.flac', prompt_id: 'song-mine' }},
+          jobs: [
+            {{ id: 'j_done', kind: 'h3', status: 'complete', prompt_id: 'pr-done', target_id: 's_ready',
+               output_files: ['kept.mp4'], error: '' }},
+            {{ id: 'j_new', kind: 'h3', status: 'queued', prompt_id: 'pr-new', target_id: 's_x',
+               output_files: [], error: '' }},
+          ],
+        }},
+      }};
+      const staleReport = {{
+        active: false, comfy_online: true,
+        jobs: [
+          // A stale snapshot claiming the settled job is still running: must not regress it.
+          {{ id: 'j_done', kind: 'h3', status: 'running', prompt_id: 'pr-done', target_id: 's_ready',
+             output_files: [], error: '' }},
+          // j_new is absent: the report predates its submission and must not delete it.
+          // And a job this client has never seen is adopted, not dropped.
+          {{ id: 'j_other', kind: 'h3', status: 'running', prompt_id: 'pr-other', target_id: 's_running',
+             output_files: [], error: '' }},
+        ],
+        shots: [
+          // A stale 'draft' over the Director's fresh 'ready': refused.
+          {{ shot_id: 's_ready', status: 'draft', latest_output: '' }},
+          // A real completion of an in-flight shot: applied, and the old review displaced.
+          {{ shot_id: 's_running', status: 'complete', latest_output: 'new/take_00002.mp4' }},
+        ],
+        assets: [
+          // An empty path over a landed file is what a stale snapshot says about an upload
+          // it predates: refused.
+          {{ asset_id: 'a1', path: '' }},
+        ],
+        song: {{ path: 'songs/other_00001_.flac', prompt_id: 'song-other' }},
+      }};
+      const guardedChanges = applyRenderStatus(guarded.project, staleReport);
+
+      console.log(JSON.stringify({{
+        completionChanges,
+        completedAsset: completion.project.assets[0].path,
+        completedJob: completion.project.jobs[0].status,
+        guardedChanges,
+        keptJob: guarded.project.jobs.find((job) => job.id === 'j_done').status,
+        keptNewJob: Boolean(guarded.project.jobs.find((job) => job.id === 'j_new')),
+        adoptedJob: Boolean(guarded.project.jobs.find((job) => job.id === 'j_other')),
+        readyShot: guarded.project.shots[0].status,
+        landedShot: {{
+          status: guarded.project.shots[1].status,
+          output: guarded.project.shots[1].latest_output,
+          review: guarded.project.shots[1].latest_review,
+        }},
+        keptAsset: guarded.project.assets[0].path,
+        keptSong: guarded.project.song.path,
+      }}));
+    """)
+
+    assert verdict["completionChanges"]["jobs"] is True
+    assert verdict["completionChanges"]["assets"] is True
+    assert [job["id"] for job in verdict["completionChanges"]["settled"]] == ["j1"]
+    assert verdict["completedAsset"] == "music-video-producer/p1/assets/singer_00001_.png"
+    assert verdict["completedJob"] == "complete"
+
+    assert verdict["keptJob"] == "complete"
+    assert verdict["keptNewJob"] is True
+    assert verdict["adoptedJob"] is True
+    assert verdict["readyShot"] == "ready"
+    assert verdict["landedShot"] == {
+        "status": "complete", "output": "new/take_00002.mp4", "review": None,
+    }
+    assert verdict["keptAsset"] == "already/landed_00001_.png"
+    assert verdict["keptSong"] == "songs/mine.flac"
+    assert verdict["guardedChanges"]["settled"] == []
+
+
+def test_settled_toasts_name_the_target_and_never_dress_an_error_as_good_news():
+    sentences = run_module("""
+      import { renderSettledToast } from './src/music_video_producer/web/assets/api.js';
+      const project = {
+        assets: [{ id: 'a1', name: 'Lead singer' }],
+        shots: [{ id: 's1' }],
+        song: { title: 'Night Signal' },
+      };
+      console.log(JSON.stringify({
+        flux: renderSettledToast(project, { kind: 'flux', status: 'complete', target_id: 'a1' }),
+        h3: renderSettledToast(project, { kind: 'h3', status: 'complete', target_id: 's1' }),
+        music: renderSettledToast(project, { kind: 'music', status: 'complete', target_id: 'song' }),
+        failed: renderSettledToast(project, { kind: 'flux', status: 'error', target_id: 'a1',
+                                              error: 'KSampler: out of memory' }),
+      }));
+    """)
+
+    assert sentences["flux"] == "Render complete: Lead singer is ready"
+    assert sentences["h3"] == "Render complete: SHOT 01 (s1) is ready"
+    assert sentences["music"] == "Render complete: Night Signal is ready"
+    assert sentences["failed"].startswith("Render failed for Lead singer")
+    assert "KSampler: out of memory" in sentences["failed"]
+    assert "complete" not in sentences["failed"]
+
+
+def test_the_poll_timer_exists_exactly_while_the_project_has_open_jobs():
+    """The interval is scheduled at AD-1's 2 s when a job is open, never doubled, stood down
+    when the last job settles, and never scheduled for an idle or absent project."""
+    timers = run_workspace(f"""
+      const scheduled = [];
+      let cleared = 0;
+      let nextHandle = 0;
+      globalThis.setInterval = (fn, ms) => {{ scheduled.push(ms); nextHandle += 1; return nextHandle; }};
+      globalThis.clearInterval = () => {{ cleared += 1; }};
+
+      state.project = null;
+      app.syncRenderPolling();
+      const withoutProject = {{ scheduled: [...scheduled], cleared }};
+
+      state.project = {json.dumps(json.loads(poll_project()))};
+      app.syncRenderPolling();
+      const started = {{ scheduled: [...scheduled], cleared }};
+      app.syncRenderPolling();
+      const steady = {{ scheduled: [...scheduled], cleared }};
+
+      state.project.jobs[0].status = 'complete';
+      app.syncRenderPolling();
+      const stopped = {{ scheduled: [...scheduled], cleared }};
+
+      // A job that is open but has no prompt id has nothing to poll for.
+      state.project.jobs = [{{ id: 'j2', kind: 'post', status: 'queued', prompt_id: '', target_id: 'x' }}];
+      app.syncRenderPolling();
+      const unpollable = {{ scheduled: [...scheduled], cleared }};
+
+      console.log(JSON.stringify({{ withoutProject, started, steady, stopped, unpollable }}));
+    """)
+
+    assert timers["withoutProject"] == {"scheduled": [], "cleared": 0}
+    assert timers["started"] == {"scheduled": [2000], "cleared": 0}
+    assert timers["steady"] == {"scheduled": [2000], "cleared": 0}
+    assert timers["stopped"] == {"scheduled": [2000], "cleared": 1}
+    assert timers["unpollable"] == {"scheduled": [2000], "cleared": 1}
+
+
+def test_a_poll_tick_lands_a_completion_on_every_surface_without_a_click():
+    """The live defect, executed: the tick alone moves the asset card off RENDERING, marks the
+    job row complete, and says out loud that the render finished."""
+    landed = run_workspace("""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      state.project = __PROJECT__;
+      await flush();
+      requests.length = 0;
+
+      await app.pollRenderStatus();
+      await flush();
+
+      console.log(JSON.stringify({
+        polled: requests.map((entry) => ({ path: entry.path, method: entry.method })),
+        assetPath: state.project.assets[0].path,
+        grid: at('#asset-grid').innerHTML,
+        jobs: at('#job-list').innerHTML,
+        toasts,
+      }));
+    """.replace("__PROJECT__", poll_project()),
+        responses={"/api/projects/p1/render-status": {"body": POLL_COMPLETION}},
+    )
+
+    assert landed["polled"] == [{"path": "/api/projects/p1/render-status", "method": "GET"}]
+    assert landed["assetPath"] == "music-video-producer/p1/assets/singer_00001_.png"
+    # The card now carries the image where RENDERING stood, drawn by the tick and nothing else.
+    assert "RENDERING" not in landed["grid"]
+    assert "singer_00001_.png" in landed["grid"]
+    assert '<img src=' in landed["grid"]
+    assert 'complete' in landed["jobs"]
+    assert landed["toasts"] == ["Render complete: Lead singer is ready"]
+
+
+def test_an_idle_project_and_a_guarded_write_each_produce_zero_poll_requests():
+    """The tick's three refusals, driven: no open jobs means no request at all, and a shot write
+    in flight (an expansion holding its read-to-save window open) skips the tick rather than
+    interleaving with it -- the docs/LLM-DIRECTOR.md guard, honoured by the poll."""
+    quiet = run_workspace("""
+      state.project = __PROJECT__;
+      state.project.jobs[0].status = 'complete';
+      await flush();
+      requests.length = 0;
+      await app.pollRenderStatus();
+      const idle = requests.length;
+
+      // Re-open the job, then start an expansion whose call never returns: the write flag is up.
+      state.project.jobs[0].status = 'queued';
+      state.health = { llm: { configured: true } };
+      state.project.shots = [{ id: 's1', start: 0, duration: 5, prompt: 'A singer turns',
+        mode: null, citations: [], asset_ids: [], singing: 'unknown', seed: 0, status: 'draft',
+        prompt_id: '', latest_output: '', approved_output: '', locked: false, h3_prompt: '' }];
+      state.selectedShotId = 's1';
+      app.renderShotInspector();
+      const settle = globalThis.fetch;
+      globalThis.fetch = (path, options = {}) => {
+        if (path.endsWith('/expand-prompt')) return new Promise(() => {});
+        return settle(path, options);
+      };
+      requests.length = 0;
+      fire('#expand-prompt:click');
+      await app.pollRenderStatus();
+      const guarded = requests.filter((entry) => entry.path.includes('render-status')).length;
+
+      console.log(JSON.stringify({ idle, guarded }));
+    """.replace("__PROJECT__", poll_project()),
+        responses={"/api/projects/p1/render-status": {"body": POLL_COMPLETION}},
+    )
+
+    assert quiet == {"idle": 0, "guarded": 0}
+
+
+def test_the_manual_refresh_reconciles_once_instead_of_fanning_out_per_job():
+    """The queue panel's Refresh, rewired: one render-status call and one project reload, and
+    never the per-job GET fan-out AD-1 calls out (forty jobs were forty queue reads)."""
+    refreshed = run_workspace("""
+      const scheduled = [];
+      globalThis.setInterval = (fn, ms) => { scheduled.push(ms); return scheduled.length; };
+      state.project = __PROJECT__;
+      state.project.jobs = Array.from({ length: 5 }, (_, index) => ({
+        id: 'j' + index, kind: 'flux', status: 'queued', prompt_id: 'pr' + index,
+        target_id: 'a1', seed: 0, output_files: [], error: '',
+      }));
+      await flush();
+      requests.length = 0;
+      scheduled.length = 0;
+      await fire('#refresh-jobs:click', {});
+      await flush();
+      console.log(JSON.stringify({ paths: requests.map((entry) => entry.path), scheduled }));
+    """.replace("__PROJECT__", poll_project()),
+        responses={
+            "/api/projects/p1/render-status": {"body": POLL_COMPLETION},
+            "/api/projects/p1": {"body": json.loads(poll_project())},
+        },
+    )
+
+    paths = refreshed["paths"]
+    assert paths.count("/api/projects/p1/render-status") == 1
+    assert "/api/projects/p1" in paths
+    assert not any("/jobs/" in path for path in paths), paths
+    # The reload repainted the queue panel, and the panel's render is what schedules the poll:
+    # a project arriving with an open job starts the 2 s loop without any handler knowing it.
+    assert refreshed["scheduled"] == [2000]
+
+
+def test_generation_submits_are_shut_while_their_own_request_is_in_flight():
+    """The double-render's other half: the Flux form holds a fixed seed, so the live submit
+    button during the silent seconds was an invitation to queue the identical image twice. The
+    button is executed through both arms -- held shut while the request hangs, restored with its
+    own label when the request settles."""
+    driven = run_workspace("""
+      const NAMES = ['name', 'kind', 'prompt', 'aspect', 'steps', 'guidance', 'seed'];
+      globalThis.FormData = class {
+        constructor(form) {
+          this.pairs = NAMES.map((name) => [name, form.elements[name].value]);
+        }
+        [Symbol.iterator]() { return this.pairs[Symbol.iterator](); }
+      };
+      const form = at('#flux-form');
+      form.elements.name.value = 'Lead singer';
+      form.elements.kind.value = 'character';
+      form.elements.prompt.value = 'portrait';
+      form.elements.aspect.value = '1024x1024';
+      form.elements.steps.value = '4';
+      form.elements.guidance.value = '4';
+      form.elements.seed.value = '7';
+      state.project = __PROJECT__;
+      await flush();
+
+      const button = at('#flux-submit');
+      button.textContent = 'Generate with Flux';
+
+      // The failing arm restores the control: a refused submission must not leave it dead.
+      requests.length = 0;
+      await fire('#flux-form:submit', { preventDefault() {}, currentTarget: form });
+      await flush();
+      const restored = { disabled: button.disabled, label: button.textContent, sent: requests.length };
+
+      // The hanging arm holds it shut -- and a second submission fired anyway (nothing obliges
+      // every event path to be a browser honouring the disabled attribute) is refused without
+      // reaching the network.
+      const settle = globalThis.fetch;
+      globalThis.fetch = (path, options = {}) => {
+        requests.push({ path, method: options.method || 'GET' });
+        if (path.endsWith('/generate/flux')) return new Promise(() => {});
+        return Promise.reject(new Error('no'));
+      };
+      requests.length = 0;
+      fire('#flux-form:submit', { preventDefault() {}, currentTarget: form });
+      const inFlight = { disabled: button.disabled, label: button.textContent, sent: requests.length };
+      fire('#flux-form:submit', { preventDefault() {}, currentTarget: form });
+      const refused = { disabled: button.disabled, label: button.textContent, sent: requests.length };
+
+      const musicHandlerBound = Boolean(listeners.get('#music-form:submit'));
+      console.log(JSON.stringify({ restored, inFlight, refused, musicHandlerBound }));
+    """.replace("__PROJECT__", poll_project()))
+
+    assert driven["restored"] == {"disabled": False, "label": "Generate with Flux", "sent": 1}
+    assert driven["inFlight"] == {"disabled": True, "label": "Queuing…", "sent": 1}
+    # The second click while in flight queued nothing: the identical-seed double render is shut.
+    assert driven["refused"] == {"disabled": True, "label": "Queuing…", "sent": 1}
+    assert driven["musicHandlerBound"] is True
+
+    # The music form's submit carries the same protection, asserted in its source because its
+    # driven test (test_the_song_form_sends_the_headroom_it_shows...) already executes the
+    # handler end to end and would fail on an unrestored button.
+    handler = without_comments(app_js_block('musicForm.addEventListener("submit"', "\n  });"))
+    assert '$("#music-submit")' in handler
+    assert "button.disabled = true" in handler
+    assert "finally { button.disabled = false; button.textContent = label; }" in handler

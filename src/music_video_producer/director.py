@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from base64 import b64encode
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
@@ -26,6 +27,31 @@ class DirectorUnavailable(RuntimeError):
 
 class DirectorError(RuntimeError):
     pass
+
+
+class DirectorBudgetExhausted(DirectorError):
+    """The model spent its whole completion budget reasoning and returned no answer.
+
+    A subclass rather than a message-match because a *caller* has to tell this apart from
+    every other `DirectorError`: it is the one provider failure that is worth retrying —
+    measured at roughly 1 call in 6 on this project's machine, and independent across calls
+    because sampling is — where a transport error or a rejected request body will fail the
+    same way on every attempt. Matching on the message text would make that decision
+    hostage to a wording chosen for the Director to read.
+    """
+
+
+#: The corrective follow-up on a retry after the checker refused an answer. Sent as a user
+#: turn *after* the failed answer itself is replayed as an assistant turn, so the model is
+#: correcting a concrete text it can see rather than being asked to reroll from nothing.
+#: The problems are the checker's own sentences, verbatim: they name the field and the rule,
+#: which is exactly the target a rewrite needs.
+H3_RETRY_PROMPT = (
+    "That answer was rejected by the format checker and was not saved. What is wrong with "
+    "it, in the checker's own words:\n{problems}\n"
+    "Rewrite the prompt so every one of those problems is fixed. Keep everything that was "
+    "already right. Return only the corrected prompt, nothing else."
+)
 
 
 class PlannedShot(BaseModel):
@@ -632,8 +658,17 @@ class DirectorClient:
         shot_input: dict[str, Any],
         system_prompt: str,
         max_tokens: int = H3_EXPANSION_MAX_TOKENS,
+        rejected: str = "",
+        rejected_problems: Sequence[str] = (),
     ) -> str:
         """Turn one Shot's intent into an H3-format prompt. Returns the text, unparsed.
+
+        ``rejected`` and ``rejected_problems`` make one call a *corrective retry*: when
+        ``rejected`` is non-empty, the failed answer is replayed as an assistant turn and
+        `H3_RETRY_PROMPT` follows as a user turn carrying the checker's sentences, so the
+        model has a concrete text and a named defect to fix rather than a fresh roll. The
+        caller owns the loop and the attempt budget — this method stays one call either
+        way, because the checker that decides "rejected" lives beside the caller, not here.
 
         Text out, not JSON. An H3 prompt is a document with its own grammar, so wrapping it
         in a JSON schema would only add an escaping layer for the model to get wrong on top
@@ -659,12 +694,23 @@ class DirectorClient:
                 "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
             )
         headers = self._headers()
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(shot_input, ensure_ascii=False)},
+        ]
+        if rejected:
+            messages.append({"role": "assistant", "content": rejected})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": H3_RETRY_PROMPT.format(
+                        problems="\n".join(f"- {problem}" for problem in rejected_problems)
+                    ),
+                }
+            )
         body = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(shot_input, ensure_ascii=False)},
-            ],
+            "messages": messages,
             "temperature": 0.6,
             "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -690,7 +736,7 @@ class DirectorClient:
         # the number is named rather than described.
         reasoning = (message.get("reasoning_content") or "").strip()
         if reasoning:
-            raise DirectorError(
+            raise DirectorBudgetExhausted(
                 f"The model spent its whole {max_tokens}-token budget reasoning and returned "
                 "no prompt. Raise the budget, or disable the model's thinking phase, or use a "
                 "model that does not reason before answering."

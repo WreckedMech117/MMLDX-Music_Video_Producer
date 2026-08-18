@@ -1277,14 +1277,30 @@ export function markReadyControl(shot) {
 // mode requires is how the inspector starts drawing a shot as complete that the route then refuses.
 //
 // Order matters: it is the order the mode select offers, so it is data here rather than markup.
+//
+// `workflow` is the graph a renderable mode renders through, under the name the Director knows it
+// by, and `""` for a mode with no adapter. The mode select prints it, so which MiniMax workflow a
+// mode employs is readable before the click; the mirror test holds it to the server's table, which
+// is the one place the mode→workflow mapping is decided.
 export const SHOT_MODES = [
-  { value: "text_to_video", label: "Text to video", roles: [], song_audio: false, adapter: "h3-director" },
-  { value: "image_to_video", label: "Image to video", roles: [{ role: "first", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
-  { value: "first_last", label: "First / last frame", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
-  { value: "first_middle_last", label: "First / middle / last", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "middle", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
-  { value: "references", label: "References to video", roles: [{ role: "reference", minimum: 0, maximum: 15 }], song_audio: true, adapter: "h3-reference" },
-  { value: "extend", label: "Extend an existing video", roles: [{ role: "source_video", minimum: 1, maximum: 1 }], song_audio: false, adapter: "" },
+  { value: "text_to_video", label: "Text to video", roles: [], song_audio: false, adapter: "h3-director", workflow: "the MiniMax H3 Director graph" },
+  { value: "image_to_video", label: "Image to video", roles: [{ role: "first", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
+  { value: "first_last", label: "First / last frame", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
+  { value: "first_middle_last", label: "First / middle / last", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "middle", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
+  { value: "references", label: "References to video", roles: [{ role: "reference", minimum: 0, maximum: 15 }], song_audio: true, adapter: "h3-reference", workflow: "MiniMax H3 References-to-Video (with the sampling profiles)" },
+  { value: "extend", label: "Extend an existing video", roles: [{ role: "source_video", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
 ];
+
+// How one option in the mode select reads: the mode's own label, then either the workflow it
+// really renders through or the honest admission that nothing renders it yet. A pure function
+// rather than a ternary inside the template string, so the sentence a Director spends GPU minutes
+// on the strength of is executed by a test instead of read — and so "planned" wording can never be
+// drawn on a mode that has an adapter, whichever way the template is later rearranged.
+export function shotModeOptionLabel(entry) {
+  if (!entry) return "";
+  if (!entry.adapter) return `${entry.label} — planned, not yet renderable`;
+  return `${entry.label} — renders through ${entry.workflow}`;
+}
 
 // How each role reads in a sentence, mirroring `models.ASSET_ROLE_LABELS`. The insertion order is
 // the order a role select offers, so it is one list rather than a table plus a separate ordering.
@@ -1869,6 +1885,130 @@ export function multiviewPlan(asset) {
   return { prompt, ready: Boolean(asset.path) };
 }
 
+// -------------------------------------------------------------------------------------------
+// Render polling -- the client half of AD-1's transport decision. Every decision here is pure
+// and executed under node by the contract tests; app.js only owns the timer and the repaints.
+// -------------------------------------------------------------------------------------------
+
+// The statuses a job never leaves, mirroring `batch.TERMINAL_JOB_STATUSES`; a contract test holds
+// the two sets together, because a client that polls for a status the server calls settled polls
+// forever, and one that calls settled what the server still reconciles stops watching a live job.
+export const TERMINAL_JOB_STATUSES = ["complete", "error", "cancelled"];
+
+// AD-1's interval: 2 s while a batch is active, zero requests while none is. Shot renders run
+// 288-438 s, so this is two orders of magnitude finer than the event rate it watches.
+export const RENDER_POLL_INTERVAL_MS = 2000;
+
+// Whether this project has renders whose answer still lives on ComfyUI -- the whole polling
+// contract, mirroring `batch.reconcilable_jobs`. A job with no prompt id has nothing to look up,
+// so counting it would poll forever for an answer no tick can deliver.
+export function hasActiveRenderJobs(project) {
+  return (project?.jobs || []).some(
+    (job) => job.prompt_id && !TERMINAL_JOB_STATUSES.includes(job.status),
+  );
+}
+
+// The shot statuses a reconciliation tick is allowed to move, and the only ones. The report is a
+// snapshot that can be a request older than a click the Director just made, and the whole-list
+// shots save writes every field it holds -- so a stale `draft` patched over a fresh `ready` here
+// would be re-asserted onto the server by the next drag. Restricting the patch to the render
+// path's own transitions (queued/running -> complete/error) makes a stale snapshot harmless: it
+// can only decline to move a shot, never march one backwards.
+const RENDER_IN_FLIGHT_SHOT_STATUSES = ["queued", "running"];
+const RENDER_SETTLED_SHOT_STATUSES = ["complete", "error"];
+
+// Apply one poll answer to the project the Director is looking at, in place, and say what moved.
+//
+// A patch, deliberately not a `loadProject`: the Director may be mid-keystroke in the shot
+// inspector or mid-paste in the song context editors, and a full reload every two seconds is the
+// editor-wiping defect this application keeps having to fix. So only render-facing fields move,
+// each under its own guard:
+//
+// * jobs are merged by id -- a known job takes the report's status/outputs/error unless it is
+//   already terminal locally (a settled job never regresses under a stale snapshot), an unknown
+//   one is appended, and a local job the report has never heard of is KEPT: it was submitted
+//   after the snapshot was taken, and dropping it would stop the very polling that will see it.
+// * shots move only along the render path -- see the status lists above.
+// * an asset adopts a landed file and never un-lands one: `path` is patched only when the report
+//   has one and it differs, because `"" over file` is what a stale snapshot says about an upload
+//   it predates.
+// * the song's audio is adopted only when the loaded Song's `prompt_id` matches the report's --
+//   the browser's copy of `apply_job_history`'s guard, for the browser's copy of the race.
+//
+// Returns `{jobs, shots, assets, song, settled}`: which surfaces need repainting, plus every job
+// this answer settled, so the caller can say out loud that a render finished -- the silence that
+// caused a double render is the defect this whole path exists to end.
+export function applyRenderStatus(project, report) {
+  const changes = { jobs: false, shots: false, assets: false, song: false, settled: [] };
+  if (!project || !report) return changes;
+  const held = new Map((project.jobs || []).map((job) => [job.id, job]));
+  for (const job of report.jobs || []) {
+    const known = held.get(job.id);
+    if (!known) {
+      project.jobs = [...(project.jobs || []), job];
+      changes.jobs = true;
+      continue;
+    }
+    if (TERMINAL_JOB_STATUSES.includes(known.status)) continue;
+    const same = known.status === job.status && known.error === job.error
+      && JSON.stringify(known.output_files || []) === JSON.stringify(job.output_files || []);
+    if (same) continue;
+    if (RENDER_SETTLED_SHOT_STATUSES.includes(job.status)) changes.settled.push(job);
+    known.status = job.status;
+    known.output_files = job.output_files || [];
+    known.error = job.error || "";
+    changes.jobs = true;
+  }
+  for (const entry of report.shots || []) {
+    const shot = (project.shots || []).find((item) => item.id === entry.shot_id);
+    if (!shot) continue;
+    const moved = RENDER_SETTLED_SHOT_STATUSES.includes(entry.status)
+      && RENDER_IN_FLIGHT_SHOT_STATUSES.includes(shot.status);
+    if (!moved) continue;
+    // A new take displaces the previous take's review -- the mirror of the server's own rule,
+    // for the copy of the shot this client keeps drawing until the next full load.
+    if (entry.latest_output && entry.latest_output !== shot.latest_output) shot.latest_review = null;
+    shot.status = entry.status;
+    if (entry.latest_output) shot.latest_output = entry.latest_output;
+    changes.shots = true;
+  }
+  for (const entry of report.assets || []) {
+    const asset = (project.assets || []).find((item) => item.id === entry.asset_id);
+    if (!asset || !entry.path || asset.path === entry.path) continue;
+    asset.path = entry.path;
+    changes.assets = true;
+  }
+  if (
+    report.song?.path
+    && project.song
+    && project.song.prompt_id === report.song.prompt_id
+    && project.song.path !== report.song.path
+  ) {
+    project.song.path = report.song.path;
+    changes.song = true;
+  }
+  return changes;
+}
+
+// What a settled render says for itself, named the way the Director knows its target. One
+// sentence per job, decided here rather than in the poll loop, so the wording is executed by the
+// contract tests -- a completion that reads as an error, or an error that reads as good news, is
+// the kind of inversion only an executed string catches.
+export function renderSettledToast(project, job) {
+  let name = job.target_id || job.kind;
+  if (job.kind === "flux" || job.kind === "multiview") {
+    name = (project?.assets || []).find((asset) => asset.id === job.target_id)?.name || "an asset";
+  } else if (job.kind === "h3" || job.kind === "ltx") {
+    name = shotLabel(project, job.target_id);
+  } else if (job.kind === "music") {
+    name = project?.song?.title || "the song";
+  }
+  if (job.status === "error") {
+    return `Render failed for ${name}: ${job.error || "ComfyUI reported an execution error"}`;
+  }
+  return `Render complete: ${name} is ready`;
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.
@@ -1963,6 +2103,10 @@ export const api = {
   // notices.
   assistantFill: (id, body) => request(`/api/projects/${id}/assistant/fill`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   job: (projectId, jobId) => request(`/api/projects/${projectId}/jobs/${jobId}`),
+  // AD-1's poll endpoint: one GET reconciles every open job against ComfyUI's /queue (fetched
+  // once per tick) and /history (only for jobs the queue no longer holds), and answers with the
+  // fixed jobs+states shape `applyRenderStatus` patches in. Never a per-job fan-out from here.
+  renderStatus: (id) => request(`/api/projects/${id}/render-status`),
   workflows: () => request("/api/workflows"),
   // Machine-scoped, so neither call carries a project id. The GET is what refreshes the
   // after-the-fact report; the PUT is the only thing that changes the setting, and the server

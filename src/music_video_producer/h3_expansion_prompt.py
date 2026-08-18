@@ -102,13 +102,26 @@ SEMANTIC_RULES = f"""Rules about content, which matter more than the formatting:
 #: direction: a performance written as singing when it is not produces mouth movement
 #: with nothing behind it, and the reverse throws away lip-sync the model would
 #: otherwise have got right. `unknown` means say nothing about it.
+#:
+#: The `<d>`-tag clause in the not_singing bullet was measured before it shipped
+#: (2026-08-18): the live defect it targets — a lyric line inside a dialogue tag on a
+#: not_singing shot — recurred at baseline at 1/12 well-formed answers on the
+#: high-temptation payload (performer's face, chorus landing, marked not_singing),
+#: and with the clause the defect was 0/8 with no other counter worsening. Those
+#: denominators are small: the no-backfire half is what the measurement established,
+#: the efficacy half rests on the clause saying in the singing-state frame what
+#: LYRIC_RULES already says in the lyrics frame. It deliberately quotes no example
+#: lyric — a prohibition carrying a concrete forbidden string has already been
+#: measured on this machine to *teach* the string rather than forbid it.
 SINGING_RULES = """About singing, which this model gets wrong in both directions:
 
 - If the shot is marked as singing, the performer is singing the song's words over
   this window. Write that as what it looks like — mouth movement matching the lyric,
   breath, effort — and let the words themselves do the rest.
-- If the shot is marked as not singing, the performer does not vocalize the song.
-  Do not write lip movement matching the music.
+- If the shot is marked as not singing, no one in it performs the song: do not write
+  lip movement matching the music, and write no <d> tag containing any of the song's
+  words. If the words matter to the shot, show their effect as imagery and action
+  instead.
 - If the singing state is unknown, say nothing either way. Do not assume."""
 
 #: Lyrics, and the failure this project already predicted for them.

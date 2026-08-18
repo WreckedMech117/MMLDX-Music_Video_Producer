@@ -4,6 +4,26 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-18 — Completion reaches the screen, and a sweep stops needing luck
+
+Two streams landed together, both from the Director's live session.
+
+**The polling gap.** The Director generated a character; ComfyUI rendered it and the asset card said "Rendering" forever, because **no automatic polling existed anywhere in the frontend** — the only timer in `app.js` dismissed toasts, and `refreshJobs` was bound solely to the manual queue-panel button. The silence invited a second click, and the form's fixed seed made ComfyUI render the identical image twice. The architecture spine had ruled on the transport (AD-1: 2 s polling, one `/queue` fetch per tick) on 2026-08-16, and it was never implemented.
+
+- Built as ruled: `GET /api/projects/{id}/render-status` reconciles once per tick; an idle project makes zero requests; the browser timer exists **iff** the project has open jobs. The completion mutation moved out of `read_job` into `apply_job_history`, so Shot.status has exactly one completion writer.
+- The frontend patch is **monotone** — settled jobs never regress, assets never un-land — because the whole-list shots PUT re-asserts every local field, and a stale patch would be written back to the server by the next drag. The sibling-write-path hazard, again, in a new costume.
+- The report shape carries **no inspector-editable field**, so a poll can structurally never overwrite typing; and a tick is skipped while `shotWriteInFlight`, so it can never interleave with a sweep's read-to-save window.
+- Verified in a real browser against a scripted ComfyUI double: idle = zero polling requests over three intervals; completion reached toast, queue row and painted asset card with no click; polling stood down after the last job settled; `/prompt` hits asserted = 0.
+- A vanished prompt (ComfyUI restarted mid-render) keeps its status rather than being invented an error — parity with manual refresh, pinned by a test.
+
+**Expansion retries, per the Director's ruling.** Up to four calls per shot through one shared loop under all three doors. A checker-rejected answer retries as a corrective follow-up turn carrying the checker's own sentences; budget exhaustion got its own error type and retries clean; unavailability never retries. Attempt counts are reported everywhere because a shot that took three tries is diagnostic signal.
+
+**The `not_singing` dialogue rule shipped with its honesty intact.** Baseline reproduced the live defect exactly once in 12 well-formed answers — a verbatim lyric inside `<d>[English]…</d>` with "she does not sing it" written around it. The shipped rule quotes no example lyric (the copy-the-prohibition trap that sank an earlier rule), and the stated claim is only that it does not backfire; 0/8 against 1/12 proves nothing about efficacy and says so.
+
+**Two process findings worth keeping:**
+- **An inverse string replacement is not a byte restore.** Two `app.js` mutation restores re-anchored at the wrong occurrence of an identical string; the SHA-256 gate is what caught it. The hash check is the restore verification — the replacement is just an attempt.
+- **`enable_thinking: false` did not survive a model reload.** Mid-measurement, LM Studio resumed spending entire budgets on reasoning (7 of 10 calls) despite the flag — probe-confirmed host drift. A sweep suddenly full of "took N tries" after a model reload is telling you about the host, and it is exactly the failure class the retries absorb.
+
 ## 2026-08-18 — A shot can say what it is
 
 Closed under `spec-shot-mode-foundation.md` — the keystone the whole shot-mode direction rests on. `generate_h3` chose between the text-only and reference paths by asking whether `asset_ids` happened to be empty, so a shot could not declare its kind or be wrong about it before a render.

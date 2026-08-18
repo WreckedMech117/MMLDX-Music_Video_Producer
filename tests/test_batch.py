@@ -5,6 +5,7 @@
 """
 
 from pathlib import Path
+from typing import get_args
 
 from music_video_producer.batch import (
     NEAR_DUPLICATE_OVERLAP,
@@ -16,16 +17,33 @@ from music_video_producer.batch import (
     SHOT_WITHOUT_PROMPT,
     SHOTS_LACK_VARIANCE,
     SHOTS_SHARE_ONE_PROMPT,
+    TERMINAL_JOB_STATUSES,
     VARIANCE_WARNING_LIMIT,
+    AssetRenderState,
+    ShotRenderState,
+    SongRenderState,
     _overlap,
     _words,
     prompt_is_missing,
     prompt_rejection,
+    queue_locations,
     readiness_refusal,
     readiness_report,
+    reconcilable_jobs,
+    reconcile_render_jobs,
+    render_status_report,
     shot_label,
 )
-from music_video_producer.models import Project, Shot
+from music_video_producer.comfy import ComfyError, HistoryResult
+from music_video_producer.models import (
+    Asset,
+    JobStatus,
+    Project,
+    RenderJob,
+    Shot,
+    Song,
+    VisionInspectionRecord,
+)
 
 
 def plan(*prompts: str) -> Project:
@@ -407,3 +425,298 @@ def test_the_refusal_of_an_empty_plan_says_the_plan_is_empty():
     """
     assert readiness_refusal([]) == PLAN_WITHOUT_SHOTS
     assert "no prompt on ." not in readiness_refusal([])
+
+
+# --------------------------------------------------------------------------------------------
+# Render reconciliation -- AD-1's tick, against a scripted ComfyUI that counts every question.
+# --------------------------------------------------------------------------------------------
+
+
+class ScriptedComfy:
+    """A ComfyUI double that records exactly what the reconciler asked it.
+
+    `queue_payload` is the real ``/queue`` shape: two buckets of ``[number, prompt_id, ...]``
+    lists. `histories` maps a prompt id to a `HistoryResult`; an unlisted id answers as
+    ComfyUI answers for a prompt it has never finished -- an empty history, status "queued".
+    Setting `queue_error` fails the queue call the way a dead server does.
+    """
+
+    def __init__(self, running=(), pending=(), histories=None):
+        self.queue_payload = {
+            "queue_running": [[1, prompt_id, {}] for prompt_id in running],
+            "queue_pending": [[2, prompt_id, {}] for prompt_id in pending],
+        }
+        self.histories = histories or {}
+        self.queue_error = False
+        self.history_errors: set[str] = set()
+        self.queue_calls = 0
+        self.history_calls: list[str] = []
+
+    async def queue(self):
+        self.queue_calls += 1
+        if self.queue_error:
+            raise ComfyError("Cannot reach ComfyUI")
+        return self.queue_payload
+
+    async def history(self, prompt_id):
+        self.history_calls.append(prompt_id)
+        if prompt_id in self.history_errors:
+            raise ComfyError("history unavailable")
+        return self.histories.get(prompt_id) or HistoryResult(
+            prompt_id=prompt_id, status="queued"
+        )
+
+
+def render_plan() -> Project:
+    """A project mid-render: one open job per kind of surface a completion reaches."""
+    project = Project(name="Reconcile")
+    project.assets = [
+        Asset(
+            id="asset_flux",
+            name="Lead singer",
+            kind="character",
+            path="",
+            source="flux",
+            prompt_id="prompt-flux",
+        ),
+    ]
+    project.shots = [
+        Shot(
+            id="shot_h3",
+            start=0,
+            duration=5,
+            prompt="A singer turns",
+            status="queued",
+            prompt_id="prompt-h3",
+        ),
+    ]
+    project.song = Song(title="Spine", source="generated", path="", prompt_id="prompt-music")
+    project.jobs = [
+        RenderJob(
+            id="job_flux",
+            kind="flux",
+            status="queued",
+            prompt_id="prompt-flux",
+            target_id="asset_flux",
+        ),
+        RenderJob(
+            id="job_h3", kind="h3", status="queued", prompt_id="prompt-h3", target_id="shot_h3"
+        ),
+        RenderJob(
+            id="job_music",
+            kind="music",
+            status="queued",
+            prompt_id="prompt-music",
+            target_id="song",
+        ),
+        RenderJob(
+            id="job_done",
+            kind="flux",
+            status="complete",
+            prompt_id="prompt-done",
+            target_id="asset_gone",
+        ),
+    ]
+    return project
+
+
+def completed(prompt_id: str, filename: str) -> HistoryResult:
+    return HistoryResult(
+        prompt_id=prompt_id,
+        status="complete",
+        outputs=[{"subfolder": "music-video-producer\\p\\out", "filename": filename}],
+    )
+
+
+async def test_an_idle_project_asks_comfyui_nothing_at_all():
+    """The zero-request half of AD-1: no open job, no `/queue`, no `/history`, no anything."""
+    project = Project(name="Idle")
+    project.jobs = [
+        RenderJob(kind="flux", status="complete", prompt_id="prompt-1", target_id="a"),
+        # Non-terminal but with no prompt id: nothing to look up, so nothing may be asked.
+        RenderJob(kind="post", status="queued", prompt_id="", target_id="b"),
+    ]
+    comfy = ScriptedComfy()
+
+    outcome = await reconcile_render_jobs(project, comfy)
+
+    assert outcome.changed is False
+    assert outcome.comfy_online is True
+    assert comfy.queue_calls == 0
+    assert comfy.history_calls == []
+    assert reconcilable_jobs(project) == []
+
+
+async def test_one_tick_fetches_the_queue_once_and_history_only_for_absent_jobs():
+    """The fan-out AD-1 forbids: N open jobs used to be N `/queue` reads of one answer."""
+    project = render_plan()
+    comfy = ScriptedComfy(
+        running=("prompt-h3",),
+        pending=("prompt-music",),
+        histories={"prompt-flux": completed("prompt-flux", "singer_00001_.png")},
+    )
+
+    outcome = await reconcile_render_jobs(project, comfy)
+
+    assert comfy.queue_calls == 1
+    # Only the job the queue no longer holds is asked about; the two still in it are settled
+    # from the queue answer alone, and the already-terminal job is never asked about at all.
+    assert comfy.history_calls == ["prompt-flux"]
+    assert outcome.changed is True
+    statuses = {job.id: job.status for job in project.jobs}
+    assert statuses == {
+        "job_flux": "complete",
+        "job_h3": "running",
+        "job_music": "queued",
+        "job_done": "complete",
+    }
+    # The completion reached the thing the job was producing, through the shared adoption.
+    assert project.assets[0].path == "music-video-producer/p/out/singer_00001_.png"
+
+
+async def test_a_dead_comfyui_degrades_the_tick_instead_of_raising():
+    """The poll endpoint answers every two seconds; a restart must not become an error spray."""
+    project = render_plan()
+    before = [job.status for job in project.jobs]
+    comfy = ScriptedComfy()
+    comfy.queue_error = True
+
+    outcome = await reconcile_render_jobs(project, comfy)
+
+    assert outcome.comfy_online is False
+    assert outcome.changed is False
+    assert [job.status for job in project.jobs] == before
+    assert comfy.history_calls == []
+
+
+async def test_one_failed_history_lookup_skips_that_job_and_reconciles_the_rest():
+    project = render_plan()
+    comfy = ScriptedComfy(
+        histories={
+            "prompt-flux": completed("prompt-flux", "singer_00001_.png"),
+            "prompt-music": completed("prompt-music", "spine_00001_.flac"),
+        },
+    )
+    comfy.history_errors = {"prompt-h3"}
+
+    outcome = await reconcile_render_jobs(project, comfy)
+
+    assert outcome.comfy_online is True
+    assert outcome.changed is True
+    statuses = {job.id: job.status for job in project.jobs}
+    # The failed lookup left its job exactly as it was, for the next tick to ask again.
+    assert statuses["job_h3"] == "queued"
+    assert statuses["job_flux"] == "complete"
+    assert statuses["job_music"] == "complete"
+    assert project.song.path == "music-video-producer/p/out/spine_00001_.flac"
+
+
+async def test_a_vanished_prompt_keeps_its_status_rather_than_inventing_an_error():
+    """Absent from the queue with an empty history is "nothing known yet", not a failure.
+
+    It is also what the manual per-job refresh has always reported for that state, and the two
+    paths must not tell different stories about one job.
+    """
+    project = render_plan()
+    comfy = ScriptedComfy()
+
+    outcome = await reconcile_render_jobs(project, comfy)
+
+    assert outcome.changed is False
+    assert {job.status for job in project.jobs} == {"queued", "complete"}
+    assert sorted(comfy.history_calls) == ["prompt-flux", "prompt-h3", "prompt-music"]
+
+
+async def test_h3_completion_moves_the_shot_and_displaces_the_stale_review():
+    project = render_plan()
+    project.shots[0].latest_output = "old/take_00001.mp4"
+    project.shots[0].latest_review = VisionInspectionRecord(summary="the previous take")
+    comfy = ScriptedComfy(histories={"prompt-h3": completed("prompt-h3", "take_00002.mp4")})
+
+    await reconcile_render_jobs(project, comfy)
+
+    shot = project.shots[0]
+    assert shot.status == "complete"
+    assert shot.latest_output == "music-video-producer/p/out/take_00002.mp4"
+    assert shot.latest_review is None
+
+
+async def test_an_h3_execution_error_marks_the_shot_and_carries_the_reason():
+    project = render_plan()
+    comfy = ScriptedComfy(
+        histories={
+            "prompt-h3": HistoryResult(
+                prompt_id="prompt-h3", status="error", error="KSampler: out of memory"
+            )
+        }
+    )
+
+    outcome = await reconcile_render_jobs(project, comfy)
+
+    assert outcome.changed is True
+    assert project.shots[0].status == "error"
+    job = next(job for job in project.jobs if job.id == "job_h3")
+    assert job.status == "error"
+    assert job.error == "KSampler: out of memory"
+
+
+async def test_music_adoption_is_keyed_by_prompt_id_not_by_whatever_song_is_loaded():
+    """`apply_job_history` through the reconciler keeps the guard the per-job route had."""
+    project = render_plan()
+    project.song.prompt_id = "a-different-song"
+    comfy = ScriptedComfy(
+        histories={"prompt-music": completed("prompt-music", "orphan_00001_.flac")}
+    )
+
+    await reconcile_render_jobs(project, comfy)
+
+    # The output is not lost -- it stays on the job -- but the loaded Song is untouched.
+    assert project.song.path == ""
+    job = next(job for job in project.jobs if job.id == "job_music")
+    assert job.status == "complete"
+    assert job.output_files == ["music-video-producer/p/out/orphan_00001_.flac"]
+
+
+def test_queue_locations_reads_both_buckets_of_the_real_queue_shape():
+    located = queue_locations(
+        {
+            "queue_running": [[0, "prompt-a", {"nodes": {}}]],
+            "queue_pending": [[1, "prompt-b"], [2, "prompt-c"], "not-a-list"],
+        }
+    )
+
+    assert located == {"prompt-a": "running", "prompt-b": "queued", "prompt-c": "queued"}
+    assert queue_locations({}) == {}
+
+
+def test_terminal_statuses_are_the_complement_of_what_reconciliation_touches():
+    """The set the browser mirrors. Every JobStatus is on exactly one side of it."""
+    assert TERMINAL_JOB_STATUSES == {"complete", "error", "cancelled"}
+    assert set(get_args(JobStatus)) - TERMINAL_JOB_STATUSES == {"queued", "running"}
+
+
+def test_the_status_report_is_the_fixed_shape_and_carries_no_editable_field():
+    """AD-1's poll answer: jobs plus derived states, and nothing the inspector edits.
+
+    The browser patches this straight onto the project the Director is typing into, so a field
+    like `prompt` appearing here is the poll acquiring the means to overwrite typing with a
+    two-second-old snapshot. The field lists are asserted exactly for that reason.
+    """
+    project = render_plan()
+    report = render_status_report(project, comfy_online=False)
+
+    assert report.active is True
+    assert report.comfy_online is False
+    assert [job.id for job in report.jobs] == [job.id for job in project.jobs]
+    assert set(ShotRenderState.model_fields) == {"shot_id", "status", "latest_output"}
+    assert set(AssetRenderState.model_fields) == {"asset_id", "path"}
+    assert set(SongRenderState.model_fields) == {"path", "prompt_id"}
+    assert report.shots[0].shot_id == "shot_h3"
+    assert report.assets[0].asset_id == "asset_flux"
+    assert report.song.prompt_id == "prompt-music"
+
+    # And with every job settled, `active` goes false -- which is the browser's stop signal.
+    for job in project.jobs:
+        job.status = "complete"
+    assert render_status_report(project).active is False
+    assert render_status_report(Project(name="No song")).song is None

@@ -21,6 +21,7 @@ from music_video_producer.app import (
     DOCUMENT_REJECTED_NOTICE,
     ENHANCE_PREFIX_SUFFIX,
     EXPAND_PROMPTS_WITHOUT_SHOTS,
+    EXPANSION_ATTEMPTS,
     EXPANSION_REJECTED_EMPTY_NOTICE,
     H3_ADAPTERS,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
@@ -70,6 +71,7 @@ from music_video_producer.batch import PLACEHOLDER_PROMPT, readiness_refusal, sh
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.director import (
+    DirectorBudgetExhausted,
     DirectorError,
     DirectorResult,
     DirectorUnavailable,
@@ -123,6 +125,14 @@ class FakeComfy:
         self.uploads = []
         self.history_error = False
         self.submit_error = False
+        # The /queue answer the reconciliation endpoint reads once per tick. Empty by default,
+        # which sends every open job to `history` -- exactly what the per-job refresh always did,
+        # so no existing test changes meaning. `queue_calls` counts the reads so a test can
+        # assert the endpoint's once-per-tick promise and the idle project's zero.
+        self.queue_payload = {"queue_running": [], "queue_pending": []}
+        self.queue_error = False
+        self.queue_calls = 0
+        self.history_calls = 0
 
     async def health(self):
         return {"online": True, "url": "http://fake"}
@@ -133,7 +143,14 @@ class FakeComfy:
         self.prompts.append(prompt)
         return type("Submission", (), {"prompt_id": "p-101", "number": 1})()
 
+    async def queue(self):
+        self.queue_calls += 1
+        if self.queue_error:
+            raise ComfyError("ComfyUI is unreachable")
+        return self.queue_payload
+
     async def history(self, prompt_id):
+        self.history_calls += 1
         if self.history_error:
             raise ComfyError("history unavailable")
         return type(
@@ -9029,8 +9046,9 @@ def test_the_sweep_reports_every_shot_it_could_not_write_and_says_why(tmp_path: 
         assert label in content, label
     # And only the writable, well-formed one was written.
     assert [bool(shot.h3_prompt) for shot in stored.shots] == [True, False, False, False, False]
-    # The model was never asked about the three that could not be written.
-    assert len(director.inputs) == 2
+    # The model was never asked about the three that could not be written. The well-formed
+    # answer cost one call; the persistently malformed one cost its whole retry budget.
+    assert len(director.inputs) == 1 + EXPANSION_ATTEMPTS
 
 
 def test_the_sweep_refuses_a_locked_shot_before_the_model_is_asked(tmp_path: Path):
@@ -9215,3 +9233,386 @@ def test_the_sweep_never_puts_an_expansion_into_the_directors_context(tmp_path: 
     # ...and the intents, which the expansion was written from, are still there. Withholding the
     # expansion is only defensible because the thing it was expanded from still reaches the model.
     assert "Wolf in birch" in context
+
+
+# ---------------------------------------------------------------------------------------------
+# Automatic retries: up to EXPANSION_ATTEMPTS model calls behind one expansion
+# ---------------------------------------------------------------------------------------------
+
+
+MALFORMED_EXPANSION = "A grey wolf pacing through trees. 35mm, grainy."
+
+
+class ScriptedRetryDirector(FakeDirector):
+    """Answers each `expand_shot` call from a script, recording the corrective feedback.
+
+    The script is consumed strictly in order and an exhausted script *raises*, which is the
+    trap the retry tests rely on: a loop that keeps calling past its scripted answers fails
+    loudly rather than looking like a model that kept agreeing.
+    """
+
+    def __init__(self, script: list):
+        self.script = list(script)
+        self.calls: list[dict] = []
+
+    async def expand_shot(
+        self, *, shot_input, system_prompt, rejected="", rejected_problems=(), **_
+    ):
+        self.calls.append(
+            {
+                "shot": shot_input["shot"]["id"],
+                "rejected": rejected,
+                "problems": tuple(rejected_problems),
+            }
+        )
+        step = self.script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+def test_a_malformed_answer_is_retried_with_the_checkers_problems_fed_back(tmp_path: Path):
+    """The Director's ruling after a live plan-wide run: "some failed and took a couple tries
+    due to formatting, 3 auto retries per would be fine."
+
+    The retry is a corrective follow-up turn rather than a fresh roll: the failed text and the
+    checker's own sentences ride along, so the model has a target. The first well-formed answer
+    is the one that lands, and the result says what it cost.
+    """
+    director = ScriptedRetryDirector([MALFORMED_EXPANSION, GOOD_EXPANSION])
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store)
+
+    body = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt").json()
+
+    assert body["applied"] is True
+    assert body["attempts"] == 2
+    assert store.get(project_id).shots[0].h3_prompt == GOOD_EXPANSION
+    assert len(director.calls) == 2
+    # The first call carried no feedback; the second carried the failed text and the problems.
+    assert director.calls[0]["rejected"] == ""
+    assert director.calls[0]["problems"] == ()
+    assert director.calls[1]["rejected"] == MALFORMED_EXPANSION
+    # The problems are the checker's own sentences about that text -- prose with none of the
+    # three named fields -- which is what gives the retry a target.
+    assert any("No core fields found" in problem for problem in director.calls[1]["problems"])
+
+
+def test_retries_stop_at_the_first_well_formed_answer(tmp_path: Path):
+    """One good answer, one call. The scripted director has exactly one answer, so a loop that
+    kept going past a well-formed one would raise out of the empty script rather than pass."""
+    director = ScriptedRetryDirector([GOOD_EXPANSION])
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store)
+
+    body = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt").json()
+
+    assert body["applied"] is True
+    assert body["attempts"] == 1
+    assert len(director.calls) == 1
+
+
+def test_a_shot_that_never_answers_well_formed_reports_its_last_attempt_and_stores_nothing(
+    tmp_path: Path,
+):
+    """All four attempts spent, the last attempt's text and problems reported, nothing stored.
+
+    A malformed expansion is never stored -- that invariant predates the retries and must
+    survive them: the retry loop's final answer is exactly as unstorable as a first attempt's.
+    """
+    script = [f"{MALFORMED_EXPANSION} (attempt {n})" for n in range(1, EXPANSION_ATTEMPTS + 1)]
+    director = ScriptedRetryDirector(list(script))
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store)
+
+    body = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt").json()
+
+    assert body["applied"] is False
+    assert body["attempts"] == EXPANSION_ATTEMPTS
+    assert len(director.calls) == EXPANSION_ATTEMPTS
+    # The report is the LAST attempt's, which is the one the Director would want to judge.
+    assert body["prompt"] == script[-1]
+    assert body["problems"]
+    assert store.get(project_id).shots[0].h3_prompt == ""
+
+
+def test_a_budget_exhaustion_is_retried_and_a_recovery_mid_budget_lands(tmp_path: Path):
+    """The 1-in-6 reasoning-budget exhaustion is sampling luck, so a clean retry -- no feedback
+    turn, there is no failed text to correct -- is worth its call. The sweep's notice says what
+    the recovery cost, because a plan of shots taking three tries is signal about the model."""
+    director = ScriptedRetryDirector(
+        [DirectorBudgetExhausted("spent its whole budget reasoning"), GOOD_EXPANSION]
+    )
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [Shot(start=0.0, duration=4.0, prompt="Wolf in birch")])
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    assert stored.shots[0].h3_prompt == GOOD_EXPANSION
+    assert len(director.calls) == 2
+    # A budget retry carries no corrective feedback: there is nothing to correct.
+    assert director.calls[1]["rejected"] == ""
+    assert "(took 2 tries)" in stored.messages[-1].content
+
+
+def test_a_budget_that_never_recovers_is_a_failed_shot_after_its_whole_retry_budget(
+    tmp_path: Path,
+):
+    director = ScriptedRetryDirector(
+        [DirectorBudgetExhausted("spent its whole budget reasoning")] * EXPANSION_ATTEMPTS
+    )
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [Shot(start=0.0, duration=4.0, prompt="Wolf in birch")])
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    assert stored.shots[0].h3_prompt == ""
+    assert len(director.calls) == EXPANSION_ATTEMPTS
+    content = stored.messages[-1].content
+    assert "the model call for them failed" in content
+    assert f"(took {EXPANSION_ATTEMPTS} tries)" in content
+
+
+def test_an_unavailable_director_is_never_retried(tmp_path: Path):
+    """`DirectorUnavailable` is a configuration fact, identical on every attempt. Retrying it
+    would spend the Director's seconds to learn nothing, so both doors ask exactly once."""
+    unavailable = DirectorUnavailable("LLM director is not configured.")
+    director = ScriptedRetryDirector([unavailable] * (EXPANSION_ATTEMPTS * 2))
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store)
+
+    single = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+    assert single.status_code == 503
+    assert len(director.calls) == 1
+
+    sweep = client.post(SWEEP.format(project=project_id))
+    assert sweep.status_code == 503
+    assert len(director.calls) == 2
+
+
+def test_a_transport_error_is_not_retried_either(tmp_path: Path):
+    """Only two failures are worth a retry: a checker-rejected answer and a budget exhaustion.
+    A dead host will be exactly as dead on the next attempt, and four timeouts against a hung
+    model would hold the Director's request open four times as long for the same sentence."""
+    director = ScriptedRetryDirector([DirectorError("connection refused")])
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(client, store)
+
+    response = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+
+    assert response.status_code == 502
+    assert "connection refused" in response.json()["detail"]
+    assert len(director.calls) == 1
+    assert store.get(project_id).shots[0].h3_prompt == ""
+
+
+def test_a_recovery_on_a_retry_is_visible_in_the_sweeps_written_notice(tmp_path: Path):
+    """The attempt count must not lie in either direction: a first-try shot carries no
+    annotation, and a third-try shot says three."""
+    director = ScriptedRetryDirector(
+        [
+            GOOD_EXPANSION,  # first shot: first try
+            MALFORMED_EXPANSION,
+            MALFORMED_EXPANSION,
+            GOOD_EXPANSION,  # second shot: third try
+        ]
+    )
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+    ])
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    assert [shot.h3_prompt for shot in stored.shots] == [GOOD_EXPANSION] * 2
+    content = stored.messages[-1].content
+    labels = {shot.id: shot_label(stored, shot) for shot in stored.shots}
+    assert "H3 prompts written for 2 shot(s)" in content
+    assert f"{labels[stored.shots[0].id]}," in content
+    assert f"{labels[stored.shots[0].id]} (took" not in content
+    assert f"{labels[stored.shots[1].id]} (took 3 tries)" in content
+
+
+# --------------------------------------------------------------------------------------------
+# The render-status poll endpoint -- AD-1's transport, through the route.
+# --------------------------------------------------------------------------------------------
+
+
+def flux_job(client, store, comfy, name: str) -> tuple[str, dict]:
+    """A project with one Flux render genuinely in flight, built through the shipped route."""
+    project = store.create(Project(name=name))
+    job = client.post(
+        f"/api/projects/{project.id}/generate/flux",
+        json={
+            "name": "Lead singer",
+            "kind": "character",
+            "prompt": "portrait",
+            "width": 1024,
+            "height": 1024,
+            "steps": 4,
+            "guidance": 4,
+            "seed": 1,
+        },
+    ).json()
+    return project.id, job
+
+
+def test_render_status_completes_a_flux_job_and_persists_what_it_learned(tmp_path: Path):
+    """The live defect: ComfyUI finished, and nothing the Director could see ever said so.
+
+    The poll answer has to carry the completion on every surface at once -- the job row, the
+    asset's landed file -- and the manifest has to hold it afterwards, because the next full
+    project load must not resurrect a RENDERING card for a render that landed."""
+    client, store, comfy = make_client(tmp_path)
+    project_id, _job = flux_job(client, store, comfy, "Poll completes")
+
+    async def completed_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "complete",
+                "outputs": [
+                    {
+                        "subfolder": f"music-video-producer\\{project_id}\\assets",
+                        "filename": "Lead singer_00001_.png",
+                    }
+                ],
+                "error": "",
+            },
+        )()
+
+    comfy.history = completed_history
+    response = client.get(f"/api/projects/{project_id}/render-status")
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["comfy_online"] is True
+    # The last open job settled on this tick, so the browser's stop signal is in the answer.
+    assert report["active"] is False
+    assert [item["status"] for item in report["jobs"]] == ["complete"]
+    landed = f"music-video-producer/{project_id}/assets/Lead singer_00001_.png"
+    assert report["assets"][0]["path"] == landed
+    assert comfy.queue_calls == 1
+    saved = store.get(project_id)
+    assert saved.assets[0].path == landed
+    assert saved.jobs[0].status == "complete"
+
+
+def test_render_status_reads_the_queue_once_and_reports_running_from_it(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project_id, job = flux_job(client, store, comfy, "Poll queue once")
+    comfy.queue_payload = {
+        "queue_running": [[0, job["prompt_id"], {}]],
+        "queue_pending": [],
+    }
+    # History would answer "complete"; a prompt still in the live queue must never reach it.
+    comfy.history_calls = 0
+
+    report = client.get(f"/api/projects/{project_id}/render-status").json()
+
+    assert report["active"] is True
+    assert report["jobs"][0]["status"] == "running"
+    assert comfy.queue_calls == 1
+    assert comfy.history_calls == 0
+
+
+def test_render_status_on_an_idle_project_asks_comfyui_nothing(tmp_path: Path):
+    """The other half of the polling contract: a project with nothing open costs nothing."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Idle poll"))
+
+    report = client.get(f"/api/projects/{project.id}/render-status").json()
+
+    assert report == {
+        "active": False,
+        "comfy_online": True,
+        "jobs": [],
+        "shots": [],
+        "assets": [],
+        "song": None,
+    }
+    assert comfy.queue_calls == 0
+    assert comfy.history_calls == 0
+
+
+def test_render_status_degrades_to_200_when_comfyui_is_down(tmp_path: Path):
+    """The poll runs every two seconds; a ComfyUI restart must not be an error every tick.
+
+    Same outage, two contracts: the manual per-job refresh keeps its 502 -- a click deserves
+    the honest failure -- while the poll answers 200 with `comfy_online: false` and the jobs
+    as last known, so the queue panel keeps its last real answer instead of blanking."""
+    client, store, comfy = make_client(tmp_path)
+    project_id, job = flux_job(client, store, comfy, "Poll outage")
+    comfy.queue_error = True
+    comfy.history_error = True
+
+    report = client.get(f"/api/projects/{project_id}/render-status")
+    refresh = client.get(f"/api/projects/{project_id}/jobs/{job['id']}")
+
+    assert report.status_code == 200
+    assert report.json()["comfy_online"] is False
+    assert report.json()["active"] is True
+    assert report.json()["jobs"][0]["status"] == "queued"
+    assert refresh.status_code == 502
+    saved = store.get(project_id)
+    assert saved.jobs[0].status == "queued"
+
+
+def test_render_status_and_the_per_job_refresh_tell_one_story(tmp_path: Path):
+    """Both routes delegate the completion to `batch.apply_job_history` -- prove it holds.
+
+    Two projects with identical in-flight H3 renders; one reconciled by the poll, one by the
+    per-job GET. The shot and job they leave behind must be field-for-field identical, because
+    two hand-written copies of "what a finished job does" is the drift AD-1 forbids."""
+    client, store, comfy = make_client(tmp_path)
+    outcomes = {}
+    for name, refresh in (("via-poll", True), ("via-job", False)):
+        project = store.create(Project(name=name))
+        project.shots = [
+            Shot(id="shot_a", start=0, duration=5, prompt="Turn", status="ready")
+        ]
+        store.save(project)
+        job = client.post(
+            f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={}
+        ).json()
+
+        async def completed_history(prompt_id):
+            return type(
+                "History",
+                (),
+                {
+                    "prompt_id": prompt_id,
+                    "status": "complete",
+                    "outputs": [{"subfolder": "shots", "filename": "take_00001.mp4"}],
+                    "error": "",
+                },
+            )()
+
+        comfy.history = completed_history
+        if refresh:
+            client.get(f"/api/projects/{project.id}/render-status")
+        else:
+            client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+        saved = store.get(project.id)
+        outcomes[name] = (
+            saved.shots[0].status,
+            saved.shots[0].latest_output,
+            saved.jobs[-1].status,
+            saved.jobs[-1].output_files,
+        )
+
+    assert outcomes["via-poll"] == outcomes["via-job"]
+    assert outcomes["via-poll"][0] == "complete"
+
+
+def test_render_status_of_a_missing_project_is_404(tmp_path: Path):
+    client, _, comfy = make_client(tmp_path)
+
+    assert client.get("/api/projects/nope/render-status").status_code == 404
+    assert comfy.queue_calls == 0

@@ -166,18 +166,31 @@ class ShotModeSpec:
     `song_audio` is whether the mode takes the master song as an audio reference. Only the
     reference graph has a slot for one, so declaring it here is what stops a text-to-video shot
     from being submitted with `use_song_audio` set and having it silently dropped.
+
+    `workflow` is the workflow the adapter renders through, under the name the Director knows
+    it by, or `""` for a mode with no adapter. It exists because "Text to video" alone told
+    the Director nothing about *which* graph a render would spend GPU minutes on — the mode
+    select prints it, so which MiniMax workflow a mode employs is readable before the click
+    rather than discovered in ComfyUI's console. It lives here, on the one table everything
+    derives mode facts from, so nobody hand-types a parallel mode→workflow list; the invariant
+    that a mode names a workflow exactly when it has an adapter is pinned by a test.
     """
 
     label: str
     roles: tuple[RoleRequirement, ...]
     song_audio: bool
     adapter: str
+    workflow: str = ""
 
 
 #: The taxonomy as data. Adding a mode is a row here; nothing branches on a mode name.
 SHOT_MODE_SPECS: dict[ShotMode, ShotModeSpec] = {
     "text_to_video": ShotModeSpec(
-        label="Text to video", roles=(), song_audio=False, adapter="h3-director"
+        label="Text to video",
+        roles=(),
+        song_audio=False,
+        adapter="h3-director",
+        workflow="the MiniMax H3 Director graph",
     ),
     "image_to_video": ShotModeSpec(
         label="Image to video",
@@ -210,6 +223,7 @@ SHOT_MODE_SPECS: dict[ShotMode, ShotModeSpec] = {
         roles=(RoleRequirement("reference", 0, 15),),
         song_audio=True,
         adapter="h3-reference",
+        workflow="MiniMax H3 References-to-Video (with the sampling profiles)",
     ),
     "extend": ShotModeSpec(
         label="Extend an existing video",

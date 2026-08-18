@@ -487,3 +487,95 @@ def test_document_rejection_allows_prose_starting_with_a_bracket():
 
     prose = "[Opening] The performer steps into frame under a single amber bulb."
     assert document_rejection(prose, "An existing treatment of similar length here.") == ""
+
+
+@pytest.mark.asyncio
+async def test_expand_shot_replays_a_rejected_answer_as_a_corrective_turn():
+    """The retry's wire shape: the failed text as an assistant turn, then `H3_RETRY_PROMPT`
+    carrying the checker's own sentences as the next user turn.
+
+    That order is the mechanism -- the model is correcting a concrete answer it can see in its
+    own conversation, not being asked to reroll from nothing. And without `rejected`, the call
+    stays exactly two messages, so an ordinary first attempt carries no ghost of a retry.
+    """
+    from music_video_producer.director import H3_RETRY_PROMPT
+
+    bodies = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "a corrected prompt"}}]}
+        )
+
+    director = DirectorClient(
+        base_url="http://llm.test/v1",
+        model="local-director",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await director.expand_shot(shot_input={"shot": {"id": "s1"}}, system_prompt="Rules.")
+    assert [message["role"] for message in bodies[0]["messages"]] == ["system", "user"]
+
+    await director.expand_shot(
+        shot_input={"shot": {"id": "s1"}},
+        system_prompt="Rules.",
+        rejected="A malformed answer.",
+        rejected_problems=("No [Shot 1] opening.", "overall_soundscape is missing."),
+    )
+    messages = bodies[1]["messages"]
+    assert [message["role"] for message in messages] == [
+        "system", "user", "assistant", "user",
+    ]
+    assert messages[2]["content"] == "A malformed answer."
+    assert messages[3]["content"] == H3_RETRY_PROMPT.format(
+        problems="- No [Shot 1] opening.\n- overall_soundscape is missing."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reasoning_budget_exhaustion_is_its_own_error_kind():
+    """`DirectorBudgetExhausted`, a `DirectorError` subclass, because a caller has to tell the
+    one retryable provider failure apart from the ones that will fail identically next time --
+    and matching on message text would make that decision hostage to a wording."""
+    from music_video_producer.director import DirectorBudgetExhausted
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "thinking, at great length, about wolves",
+                        },
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+        )
+
+    director = DirectorClient(
+        base_url="http://llm.test/v1",
+        model="local-director",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(DirectorBudgetExhausted, match="budget reasoning"):
+        await director.expand_shot(shot_input={"shot": {"id": "s1"}}, system_prompt="Rules.")
+    assert issubclass(DirectorBudgetExhausted, DirectorError)
+
+    # An empty answer with no reasoning behind it stays the generic error: retrying it is not
+    # the budget case's bet, and the caller's catch distinguishes the two by type.
+    async def empty_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": ""}}]})
+
+    empty = DirectorClient(
+        base_url="http://llm.test/v1",
+        model="local-director",
+        transport=httpx.MockTransport(empty_handler),
+    )
+    with pytest.raises(DirectorError) as caught:
+        await empty.expand_shot(shot_input={"shot": {"id": "s1"}}, system_prompt="Rules.")
+    assert not isinstance(caught.value, DirectorBudgetExhausted)

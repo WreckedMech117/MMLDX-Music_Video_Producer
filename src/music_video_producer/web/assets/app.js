@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -26,6 +26,14 @@ let readinessLoadRevision = 0;
 // about the panel it sits in. Cleared the moment an expansion is applied: the answer that failed
 // stops being the last thing that happened to that shot.
 let lastExpansionReport = null;
+// The render poll's timer handle, or 0 while no poll is scheduled. AD-1's transport decision in
+// one pair of facts: the interval exists exactly while the loaded project has jobs whose answer
+// still lives on ComfyUI, and an idle project holds 0 here and issues no request at all.
+let renderPollTimer = 0;
+// Whether a poll answer is currently awaited. One tick at a time: a slow answer must not stack a
+// second request behind it, and — because ticks are therefore serialized — every snapshot is
+// applied in the order the server produced it.
+let renderPollInFlight = false;
 
 function toast(message, kind = "info") {
   const item = document.createElement("div");
@@ -632,11 +640,21 @@ async function createMultiview() {
   const promotion = multiviewPlan(asset);
   if (!promotion) return;
   const prompt = promotion.prompt;
+  // Shut while its own request is in flight — a generation control, so it gets the generation
+  // controls' protection against the second click a silent submission invites. Optional-chained
+  // because the reload rebuilds the inspector, so the element may be gone by the finally.
+  const projectId = state.project.id;
+  const button = $("#create-multiview");
+  if (button) button.disabled = true;
   try {
-    await api.generateMultiview(state.project.id, asset.id, { prompt, seed: 0 });
-    await loadProject(state.project.id);
+    await api.generateMultiview(projectId, asset.id, { prompt, seed: 0 });
     toast("Krea multiview job queued");
+    if (state.project?.id === projectId) await loadProject(projectId);
   } catch (error) { toast(error.message, "error"); }
+  finally {
+    const control = $("#create-multiview");
+    if (control) control.disabled = false;
+  }
 }
 
 function projectDuration() {
@@ -783,11 +801,16 @@ function restoreInspectorEdit(inspector, place) {
 // A mode with no adapter is offered and labelled as such. Hiding it would make the plan unable to
 // express a section the Director is really planning; offering it unlabelled would be the one thing
 // this must never do -- a mode that looks renderable and is not.
+//
+// Every option's sentence is `shotModeOptionLabel`, which reads the workflow name off the mode
+// table `models.SHOT_MODE_SPECS` mirrors into SHOT_MODES: a renderable mode names the MiniMax
+// graph it renders through, and a planned one says so honestly. Nothing about that wording is
+// decided in this template.
 function shotModeOptions(shot) {
   const declared = SHOT_MODES.some((entry) => entry.value === shot.mode) ? shot.mode : "";
   const resolved = SHOT_MODES.find((entry) => entry.value === resolveShotMode(shot));
   const auto = `<option value="" ${declared ? "" : "selected"}>Not declared — renders as ${escapeHtml(resolved ? resolved.label : "")}</option>`;
-  return auto + SHOT_MODES.map((entry) => `<option value="${entry.value}" ${declared === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}${entry.adapter ? "" : " — no adapter yet"}</option>`).join("");
+  return auto + SHOT_MODES.map((entry) => `<option value="${entry.value}" ${declared === entry.value ? "selected" : ""}>${escapeHtml(shotModeOptionLabel(entry))}</option>`).join("");
 }
 
 // One row per citation: what it is, what role it plays in *this* shot, and a way to remove it.
@@ -1052,10 +1075,86 @@ async function compileSelectedShot() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+// Start or stop the render poll from what is on screen right now. Called from `renderJobs`
+// because every path that changes the job list already goes through it -- a project load, every
+// submission's reload, a poll tick that settled something -- so the timer follows the jobs
+// without any submission handler knowing polling exists. The decision itself is
+// `hasActiveRenderJobs`, the executed mirror of the server's own "is anything open" predicate.
+//
+// Exported for the executed frontend contract, on `renderShotInspector`'s precedent: whether a
+// timer is scheduled at all, and stood down when the last job settles, is invisible to a source
+// read and is the whole difference between this fix and the silence it replaces.
+export function syncRenderPolling() {
+  const wanted = Boolean(state.project) && hasActiveRenderJobs(state.project);
+  if (wanted && !renderPollTimer) {
+    renderPollTimer = setInterval(pollRenderStatus, RENDER_POLL_INTERVAL_MS);
+  } else if (!wanted && renderPollTimer) {
+    clearInterval(renderPollTimer);
+    renderPollTimer = 0;
+  }
+}
+
+// One reconciliation tick: ask the app's own API what ComfyUI did, patch the project in place,
+// and repaint only the surfaces something actually reached. Exported for the executed frontend
+// contract, on `renderShotInspector`'s precedent: what has to be provable is that a completed job
+// lands on the asset grid, the clips and the queue panel without a click, and that an idle or
+// guarded tick sends nothing -- none of which a source read can tell from a loop that never runs.
+//
+// Three refusals before the request, each load-bearing:
+// * no project — nothing to ask about;
+// * a tick already in flight — a slow answer must not stack requests behind it;
+// * `shotWriteInFlight` — an expansion or assistant fill holds a read-to-save window open
+//   (docs/LLM-DIRECTOR.md's known cost), and this loop must neither reload the project under it
+//   nor patch shots it is about to rewrite. The tick is skipped, not queued: the next one is at
+//   most two seconds away.
+//
+// The patch is `applyRenderStatus`, never `loadProject`: a reload every two seconds is the
+// editor-wiping defect this file keeps having to fix, so only render-facing fields move and the
+// inspector rebuild (when a shot really changed) goes through the same focus-preserving
+// `renderTimeline` path every other unawaited reply already uses. Failures are silent by design:
+// the server answers 200 with `comfy_online: false` while ComfyUI is down, and an unreachable app
+// server must not become a toast every two seconds.
+export async function pollRenderStatus() {
+  if (!state.project || renderPollInFlight || shotWriteInFlight) return;
+  // The timer is stood down when the last job settles, but a tick already dispatched -- or a
+  // job settled between ticks by the manual refresh -- must refuse on its own: an idle project
+  // generates zero requests is the contract, not a usually-true consequence of the timer.
+  if (!hasActiveRenderJobs(state.project)) {
+    syncRenderPolling();
+    return;
+  }
+  const projectId = state.project.id;
+  renderPollInFlight = true;
+  try {
+    const report = await api.renderStatus(projectId);
+    // The Director switched projects, or a guarded write began, while this answer was in
+    // flight. Dropping it loses nothing: the reconciliation is saved on the server.
+    if (state.project?.id !== projectId || shotWriteInFlight) return;
+    const changed = applyRenderStatus(state.project, report);
+    if (changed.assets) renderAssets();
+    if (changed.song) renderSong();
+    if (changed.shots) renderTimeline();
+    // `renderJobs` re-runs `syncRenderPolling`, which is how the loop stops itself on the tick
+    // that settles the last open job. The explicit call covers a tick that changed nothing
+    // visible but should still stand the timer down -- a job settled by the manual refresh.
+    if (changed.jobs) renderJobs();
+    else syncRenderPolling();
+    for (const job of changed.settled) {
+      toast(renderSettledToast(state.project, job), job.status === "error" ? "error" : "info");
+    }
+  } catch {
+    // Quiet on purpose; the next tick asks again, and a dead app server is its own banner.
+  } finally {
+    renderPollInFlight = false;
+  }
+}
+
 function renderJobs() {
   const jobs = state.project?.jobs || [];
   const list = $("#job-list");
   const queueable = (state.project?.shots || []).filter((shot) => shot.status === "ready");
+  // The poll follows the job list, and this is the one place every version of that list passes.
+  syncRenderPolling();
   // Both reasons the button can be off, decided in one place: nothing to queue, and a batch the
   // route will certainly refuse. The second was invisible until the click -- the button was
   // enabled purely from the ready count -- so a Director spent the click to be told no.
@@ -1539,25 +1638,59 @@ function bindEvents() {
     const change = confirmSongChange("Queue song generation? It replaces this project's song as soon as the job is submitted.");
     if (!change.proceed) return;
     plan.body.confirm_song_replacement = change.confirmed;
+    // Shut while its own request is in flight — the same protection the Flux form carries, for
+    // the same reason: a song generation with no visible consequence invites the second click
+    // that queues the identical job. The project id is captured before the awaits because the
+    // selector stays live throughout.
+    const projectId = state.project.id;
+    const button = $("#music-submit");
+    // The same re-entrancy refusal the Flux submit makes: in flight means shut, whatever
+    // fired the event.
+    if (button.disabled) return;
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Queuing…";
     try {
       if (plan.endpoint === "songplanner") {
         if (!window.confirm("Queue SongPlanner generation? It loads the 12B Gemma-3 planner plus the Music 3 stack and can use significant GPU time.")) return;
-        await api.generateSongPlanner(state.project.id, plan.body);
+        await api.generateSongPlanner(projectId, plan.body);
         toast("SongPlanner job queued");
       } else {
-        await api.generateMusic(state.project.id, plan.body);
+        await api.generateMusic(projectId, plan.body);
         toast("Music 3 job queued");
       }
-      await loadProject(state.project.id);
+      if (state.project?.id === projectId) await loadProject(projectId);
     }
     catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; button.textContent = label; }
   });
+  // Shut while its own request is in flight, like every other control that spends something.
+  // This is the double-render defect itself: the form holds a fixed seed, so with no feedback a
+  // second click queued the identical image — the live submit button was the invitation. The id
+  // this render belongs to is captured before the await, because the project selector stays live
+  // and a submission must land on the project the Director was looking at when they clicked.
   $("#flux-form").addEventListener("submit", async (event) => {
     event.preventDefault(); if (!requireProject()) return;
     const data = Object.fromEntries(new FormData(event.currentTarget));
     const [width, height] = data.aspect.split("x").map(Number);
-    try { await api.generateFlux(state.project.id, { name: data.name, kind: data.kind, prompt: data.prompt, width, height, steps: Number(data.steps), guidance: Number(data.guidance), seed: Number(data.seed) }); await loadProject(state.project.id); state.activePanel = "assets"; toast("Flux image job queued"); }
+    const projectId = state.project.id;
+    const button = $("#flux-submit");
+    // A browser refuses to submit a form whose submit button is disabled, but nothing obliges
+    // every event path to be a browser's: the same refusal is made here, so a second submission
+    // while the first is in flight is impossible rather than merely unlikely.
+    if (button.disabled) return;
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Queuing…";
+    try {
+      await api.generateFlux(projectId, { name: data.name, kind: data.kind, prompt: data.prompt, width, height, steps: Number(data.steps), guidance: Number(data.guidance), seed: Number(data.seed) });
+      toast("Flux image job queued");
+      // The reload is what puts the new asset card on the grid as RENDERING and starts the
+      // render poll that will land its image — the "something happened" the silence lacked.
+      if (state.project?.id === projectId) await loadProject(projectId);
+    }
     catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; button.textContent = label; }
   });
   $("#upload-asset-button").addEventListener("click", () => $("#asset-file").click());
   $("#asset-file").addEventListener("change", async (event) => {
@@ -1764,13 +1897,24 @@ function bindEvents() {
   window.addEventListener("beforeunload", (event) => { if (unsavedWorkPending(state)) event.preventDefault(); });
 }
 
+// The manual refresh, now one reconciliation call instead of a per-job GET fan-out -- forty open
+// jobs used to be forty requests that each fetched ComfyUI's queue again, which is exactly the
+// shape AD-1 forbids. The full project reload stays: unlike the 2 s poll this is a click, a
+// decision to resynchronise everything, and it is the path that picks up server-side changes the
+// poll's narrow patch deliberately leaves alone.
 async function refreshJobs() {
   if (!state.project) return;
+  const projectId = state.project.id;
   try {
-    const results = await Promise.allSettled(state.project.jobs.filter((job) => !["complete", "error", "cancelled"].includes(job.status)).map((job) => api.job(state.project.id, job.id)));
-    await loadProject(state.project.id);
-    const failed = results.filter((result) => result.status === "rejected").length;
-    toast(failed ? `Queue refreshed with ${failed} downstream error${failed === 1 ? "" : "s"}` : "Queue refreshed", failed ? "error" : "info");
+    const report = await api.renderStatus(projectId);
+    if (state.project?.id !== projectId) return;
+    await loadProject(projectId);
+    toast(
+      report.comfy_online
+        ? "Queue refreshed"
+        : "Queue refreshed, but ComfyUI could not be reached; job states are as last known",
+      report.comfy_online ? "info" : "error",
+    );
   } catch (error) { toast(error.message, "error"); }
 }
 

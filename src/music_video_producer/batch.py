@@ -1,9 +1,15 @@
-"""Whether a Shot Plan is fit to submit, derived on demand and never stored.
+"""Whether a Shot Plan is fit to submit, and what its renders have done since — AD-5's module.
 
-AD-5's module. Everything here is pure: it reads a `Project` and returns a report. Nothing is
-written back onto the manifest, because readiness is computable from the prompts themselves and
-anything computable from the manifest is computed rather than persisted — a stored `ready` flag
-is a second source of truth that goes stale the moment a prompt is edited.
+The readiness half is pure: it reads a `Project` and returns a report. Nothing is written back
+onto the manifest, because readiness is computable from the prompts themselves and anything
+computable from the manifest is computed rather than persisted — a stored `ready` flag is a
+second source of truth that goes stale the moment a prompt is edited.
+
+The reconciliation half below it is AD-1's: one implementation of "what did ComfyUI do to this
+project's jobs", used by the polling endpoint and delegated to by the per-job route, so
+`Shot.status` has exactly one writer on the completion path. Its decisions
+(`queue_locations`, `apply_job_history`, `render_status_report`) are pure; only
+`reconcile_render_jobs` touches the network, through the client it is handed.
 
 `timeline.py` must never import this module; this module may import `timeline.py`. The
 dependency runs one way so the window math stays a pure leaf.
@@ -14,8 +20,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from itertools import combinations
+from typing import Any
 
-from .models import Project, Shot, shot_label
+from pydantic import BaseModel
+
+from .comfy import ComfyError, HistoryResult
+from .models import Project, RenderJob, Shot, ShotStatus, shot_label
 from .timeline import ordered_shots
 
 #: Re-exported, not redefined. `shot_label` moved to `models.py` when `timeline.assistant_input`
@@ -26,12 +36,20 @@ __all__ = [
     "NEAR_DUPLICATE_OVERLAP",
     "PLACEHOLDER_PROMPT",
     "READINESS_REFUSAL",
+    "TERMINAL_JOB_STATUSES",
     "ReadinessNote",
     "ReadinessReport",
+    "RenderReconciliation",
+    "RenderStatusReport",
+    "apply_job_history",
     "prompt_is_missing",
     "prompt_rejection",
+    "queue_locations",
     "readiness_refusal",
     "readiness_report",
+    "reconcilable_jobs",
+    "reconcile_render_jobs",
+    "render_status_report",
     "shot_label",
 ]
 
@@ -337,4 +355,256 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
         warnings=warnings,
         warnings_computed=include_warnings,
         warnings_omitted=omitted,
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# Render reconciliation — AD-1's one implementation of "what did ComfyUI do to these jobs".
+# --------------------------------------------------------------------------------------------
+
+#: The statuses a job never leaves. Everything else is a job whose answer still lives on
+#: ComfyUI, and the set is what both halves of the transport decision key on: the backend
+#: reconciles exactly the jobs outside it, and the browser polls exactly while one exists.
+#: `api.js`'s TERMINAL_JOB_STATUSES is the frontend half; a contract test holds the two
+#: together, because a client that polls for a status the server calls settled polls forever.
+TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"complete", "error", "cancelled"})
+
+#: The history statuses adopted verbatim onto a job. Anything else ComfyUI invents — it has
+#: reported bare "success" strings before `HistoryResult` normalised them — reads as "running",
+#: which is the only honest reading of "there is an entry and it is not finished".
+_ADOPTED_HISTORY_STATUSES = frozenset({"queued", "running", "complete", "error"})
+
+
+def reconcilable_jobs(project: Project) -> list[RenderJob]:
+    """The jobs whose answer still lives on ComfyUI, in manifest order.
+
+    Non-terminal **and** carrying a prompt id: a job with no prompt id has nothing to look up,
+    so counting it would keep a client polling for an answer no tick can ever deliver. That
+    also makes this the definition of "this project has renders in flight" — the poll endpoint
+    reports `active` from it, and the browser's `hasActiveRenderJobs` mirrors it exactly.
+    """
+    return [
+        job
+        for job in project.jobs
+        if job.prompt_id and job.status not in TERMINAL_JOB_STATUSES
+    ]
+
+
+def queue_locations(payload: dict[str, Any]) -> dict[str, str]:
+    """Every prompt in ComfyUI's ``/queue`` answer, mapped to ``"running"`` or ``"queued"``.
+
+    The same reading `ComfyClient.queue_state` makes for one prompt — each bucket holds
+    ``[number, prompt_id, …]`` lists, so membership is "any element equals the id" — taken
+    over the whole payload once, because taking it per job is the fan-out AD-1 exists to
+    prevent: forty jobs made forty ``/queue`` calls that all parsed the same answer.
+    """
+    located: dict[str, str] = {}
+    for key, state in (("queue_running", "running"), ("queue_pending", "queued")):
+        for item in payload.get(key, []):
+            if not isinstance(item, list):
+                continue
+            for part in item:
+                if isinstance(part, str):
+                    located[part] = state
+    return located
+
+
+def apply_job_history(project: Project, job: RenderJob, history: HistoryResult) -> None:
+    """Write one ComfyUI history answer onto the job, and onto whatever the job was producing.
+
+    The one place a completion moves project state — the per-job route and the reconciler both
+    delegate here, so `Shot.status`, an Asset's landed file and a Song's audio path cannot be
+    adopted by two subtly different rules. Everything in here is a decision about data already
+    fetched; nothing touches the network.
+    """
+    job.status = (
+        history.status if history.status in _ADOPTED_HISTORY_STATUSES else "running"
+    )
+    job.output_files = [
+        "/".join(
+            part.replace("\\", "/").strip("/")
+            for part in (item.get("subfolder", ""), item.get("filename", ""))
+            if part
+        )
+        for item in history.outputs
+    ]
+    job.error = history.error
+    if job.status == "complete":
+        if job.kind in {"flux", "multiview"}:
+            asset = next((item for item in project.assets if item.id == job.target_id), None)
+            if asset and job.output_files:
+                asset.path = job.output_files[0]
+        # Only the Song this job actually produced may adopt its output. `target_id`
+        # is the constant string "song" for every music job, so the prompt id is the
+        # only thing tying a completion to a particular Song. Without this check a
+        # job that finished after the Song was removed re-attached its audio to
+        # whatever Song was there — and in the other order it overwrote an *imported*
+        # song's `path` with a generated file while `source` still said "imported".
+        # A mismatched output is not lost: it stays listed on the job's
+        # `output_files`, which is where an orphaned take is recovered from.
+        elif (
+            job.kind == "music"
+            and project.song
+            and project.song.prompt_id == job.prompt_id
+            and job.output_files
+        ):
+            project.song.path = job.output_files[0]
+        elif job.kind == "h3":
+            shot = next((item for item in project.shots if item.id == job.target_id), None)
+            if shot:
+                shot.status = "complete"
+                if job.output_files:
+                    # The pointer moves; the file it used to name does not. ComfyUI
+                    # numbers its outputs from the filename prefix, so a re-render of
+                    # one shot writes `…_00002` beside `…_00001` — and this job's own
+                    # `output_files` goes on naming whichever it produced. That is the
+                    # whole of what "the previous take is not silently lost" means:
+                    # nothing here is a take list, and nothing should be read as one.
+                    #
+                    # `latest_review` is dropped when, and only when, the take it
+                    # describes stops being the latest one. It is a vision inspection of
+                    # a *specific* file; carrying it across a new take would leave the
+                    # inspector reporting on the previous render under the new take's
+                    # name, which is worse than showing nothing — and it is now reachable
+                    # from the interface, because a shot can be re-opened and rendered
+                    # again. Re-run "Inspect latest take" for the new one.
+                    if job.output_files[0] != shot.latest_output:
+                        shot.latest_review = None
+                    shot.latest_output = job.output_files[0]
+    elif job.kind == "h3" and job.status == "error":
+        shot = next((item for item in project.shots if item.id == job.target_id), None)
+        if shot:
+            shot.status = "error"
+
+
+@dataclass(slots=True)
+class RenderReconciliation:
+    """What one reconciliation tick did.
+
+    `changed` is whether anything on the project moved, which is exactly "does this need
+    saving" — a tick that learned nothing must not rewrite the manifest every two seconds.
+    `comfy_online` is whether ComfyUI answered the one `/queue` call; `False` means the tick
+    degraded to a no-op, which is a fact the report carries rather than an error anybody
+    raises. The Director's server keeps answering 200 while ComfyUI restarts.
+    """
+
+    changed: bool = False
+    comfy_online: bool = True
+
+
+async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconciliation:
+    """One tick of AD-1's reconciliation: ``/queue`` once, ``/history`` only where needed.
+
+    `comfy` is the app's `ComfyClient` (or a test double). The order is the decision:
+
+    * nothing to reconcile means **no request at all** — an idle project costs ComfyUI nothing;
+    * ``/queue`` is fetched exactly once per tick, however many jobs are open, and a job found
+      in it is settled from that answer alone — history is empty until a prompt finishes, so
+      asking would learn nothing;
+    * ``/history/{id}`` is fetched only for open jobs absent from the queue, which is the one
+      state where history is the thing that knows;
+    * a dead ComfyUI fails the tick quietly (`comfy_online=False`, nothing touched) and one
+      job's failed history lookup skips that job and keeps going — the next tick asks again.
+
+    A job absent from both the queue and history keeps the status it has, exactly as the
+    manual per-job refresh always left it: inventing an error for it would mark a prompt
+    "failed" in the seconds ComfyUI takes to admit a restart, and the honest answer is that
+    nothing is known yet.
+    """
+    open_jobs = reconcilable_jobs(project)
+    if not open_jobs:
+        return RenderReconciliation(changed=False, comfy_online=True)
+    try:
+        located = queue_locations(await comfy.queue())
+    except ComfyError:
+        return RenderReconciliation(changed=False, comfy_online=False)
+    changed = False
+    for job in open_jobs:
+        in_queue = located.get(job.prompt_id)
+        if in_queue is not None:
+            if job.status != in_queue:
+                job.status = in_queue
+                changed = True
+            continue
+        try:
+            history = await comfy.history(job.prompt_id)
+        except ComfyError:
+            continue
+        before = (job.status, list(job.output_files), job.error)
+        apply_job_history(project, job, history)
+        if (job.status, job.output_files, job.error) != before:
+            changed = True
+    return RenderReconciliation(changed=changed, comfy_online=True)
+
+
+class ShotRenderState(BaseModel):
+    """One Shot's render-facing facts — the fields a completion moves, and nothing else.
+
+    Deliberately not the whole Shot. The browser patches these onto the copy it is holding
+    while the Director may be mid-keystroke in that Shot's prompt box, so the report must not
+    carry a single field the shot inspector edits — carrying `prompt` here would hand the
+    poll loop the means to overwrite typing with a two-second-old snapshot.
+    """
+
+    shot_id: str
+    status: ShotStatus
+    latest_output: str = ""
+
+
+class AssetRenderState(BaseModel):
+    """One Asset's landed file. `path` is empty while its render is still in flight."""
+
+    asset_id: str
+    path: str = ""
+
+
+class SongRenderState(BaseModel):
+    """The Song's audio path, keyed by the prompt id that produced it.
+
+    `prompt_id` is carried for the browser's version of the adoption guard in
+    `apply_job_history`: a stale report naming a previous Song's audio must not be patched
+    onto whatever Song is loaded now, and the prompt id is the only thing that ties the two.
+    """
+
+    path: str = ""
+    prompt_id: str = ""
+
+
+class RenderStatusReport(BaseModel):
+    """AD-1's fixed poll answer: the jobs, plus the states their completions move.
+
+    `active` is the browser's whole polling contract — poll again in two seconds if and only
+    if it is true. `comfy_online` is the degraded-tick flag; the jobs and states alongside it
+    are then simply the project as last known, so a ComfyUI restart never blanks a queue
+    panel that was painted from real answers.
+    """
+
+    active: bool
+    comfy_online: bool
+    jobs: list[RenderJob]
+    shots: list[ShotRenderState]
+    assets: list[AssetRenderState]
+    song: SongRenderState | None = None
+
+
+def render_status_report(
+    project: Project, *, comfy_online: bool = True
+) -> RenderStatusReport:
+    """The poll answer for this project as it stands. Pure — reconcile first, then report."""
+    return RenderStatusReport(
+        active=bool(reconcilable_jobs(project)),
+        comfy_online=comfy_online,
+        jobs=project.jobs,
+        shots=[
+            ShotRenderState(
+                shot_id=shot.id, status=shot.status, latest_output=shot.latest_output
+            )
+            for shot in project.shots
+        ],
+        assets=[
+            AssetRenderState(asset_id=asset.id, path=asset.path) for asset in project.assets
+        ],
+        song=SongRenderState(path=project.song.path, prompt_id=project.song.prompt_id)
+        if project.song
+        else None,
     )

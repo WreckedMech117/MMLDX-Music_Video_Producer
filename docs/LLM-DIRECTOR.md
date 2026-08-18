@@ -144,7 +144,7 @@ A `DirectorError` on one Shot is *that Shot's* outcome and the sweep continues; 
 
 The tool is typed to **nothing but the Shot id** — an expansion has no vocabulary to get wrong, unlike `fill_shots`. It runs *after* the fills, so a Shot filled in and expanded in the same turn expands from the intent that turn just wrote. It may not name a Shot outside the turn's selection. The assistant is told only `expanded: bool` and never the expansion itself: the boolean is what makes the tool usable, and the text is what would degrade the model.
 
-**A known cost, not a defect to discover later.** A sweep holds the read-to-save window open for the length of N model calls. The browser closes that window with `shotWriteInFlight`, but a *second* client editing the same project during a sweep would lose its edit. Single-Director use is unaffected.
+**A known cost, not a defect to discover later.** A sweep holds the read-to-save window open for the length of N model calls. The browser closes that window with `shotWriteInFlight` — and the 2 s render poll honours the same flag, skipping its tick rather than interleaving a reconciliation patch mid-sweep. A *second* client editing the same project during a sweep would still lose its edit. Single-Director use is unaffected.
 
 ## Project context
 

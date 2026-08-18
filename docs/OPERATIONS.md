@@ -131,7 +131,11 @@ The failure this guards against is self-reinforcing: the whole project is sent a
 
 Job refresh reads `/history/<prompt-id>`, and ComfyUI writes no history entry until a prompt finishes. History alone therefore cannot tell an executing render from a pending one, and before this was fixed a twelve-minute H3 render reported `queued` throughout.
 
-Refresh now consults `/queue` whenever history is still empty, so an executing render reports `running`. If a job appears stuck, confirm against the ComfyUI server directly: the running entry carries the same prompt ID, and free VRAM drops sharply while the model stack is resident.
+**Job state now reaches the interface without a click.** `GET /api/projects/{id}/render-status` is the AD-1 reconciliation endpoint: one `/queue` read per tick, `/history` only for open jobs absent from the queue, and an idle project generates **zero** ComfyUI requests. The browser polls it every 2 s **only while the project has non-terminal jobs** — the timer stands up when a job is queued and stands down when the last one settles — so completion lands on the asset card, the shot clip and the queue row with no click, and a toast names what finished. ComfyUI being down is a quiet `comfy_online: false`, never an error spray, and a poll tick is skipped while a shot write is in flight so it can never interleave with a sweep's read-to-save window. The manual **Refresh** button remains as one reconciliation call plus a reload (it used to fan out one request per job). A job absent from both `/queue` and `/history` — ComfyUI restarted mid-render — keeps its status rather than being invented an error; "Render again" is the way out, and the project keeps polling until it is resolved.
+
+**Generation submits guard themselves now.** The Flux, Music and multiview submit controls disable and read "Queuing…" while a request is in flight. This closed a live defect: with no polling and no guard, a completed render was invisible, the silence invited a second click, and the form's fixed seed made ComfyUI render the identical image twice.
+
+Refresh consults `/queue` whenever history is still empty, so an executing render reports `running`. If a job appears stuck, confirm against the ComfyUI server directly: the running entry carries the same prompt ID, and free VRAM drops sharply while the model stack is resident.
 
 ### Checking models with /object_info
 
