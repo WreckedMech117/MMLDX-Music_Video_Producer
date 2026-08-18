@@ -4,6 +4,27 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-18 — The first render with all three inputs correct
+
+Three variables were wrong at once, and a three-way comparison separates them. All three frames are the same shot, same seed, same turbo bundle, frame 45.
+
+| Render | Frame | Window | Face |
+|---|---|---|---|
+| Original | 640×384 (0.25 MP) | none — conditioned on all 154 s | Blurred and malformed; eyes indistinct |
+| Control | 640×384 (0.25 MP) | `trim 12.0–15.75` | **Coherent** — properly formed mouth and eyes, still soft |
+| Corrected | **1056×608** (0.64 MP) | `trim 12.0–15.75` | **Resolved** — teeth, eyeliner, blood-tear makeup, earrings, separated hair strands |
+
+The control run existed only to isolate the two fixes, and it earned its GPU minutes: **the two contributions are different in kind.**
+
+- **The audio window bought coherence.** Conditioned on the track's 12–15.75 s — where the Director actually sings — H3 produces a properly formed face and mouth shapes that correspond to phonemes. The original was conditioned on 154 seconds of song dominated by a wordless intro, and produced the malformed mouth the Director described as "phantoms trying to speak from a tomb".
+- **Resolution bought detail.** At the same window, going from 0.25 MP to the Director's own 0.64 MP is what makes eyeliner, teeth and makeup exist at all. It does not fix a malformed face — the control proves that was the window's doing.
+
+Had only the resolution been changed, the result would have been a sharper malformed face, and the conclusion would probably have been that H3's identity fidelity is poor. Had only the window been fixed, the face would have been correct and still too soft to judge, and the conclusion would probably have been that the resolution was fine. **Either fix alone would have supported a confident wrong verdict**, which is the argument for the control run rather than a two-variable comparison.
+
+Verified in the submitted graph, read back from `/history`: `width 1056`, `height 608`, `length 90`, master song `"trim": {"start": 12.0, "end": 15.75}`, turbo LoRA at 0.7 with `beta`/`euler`/4 steps. Measured output: 1056×608, 90 frames, 3.750 s video against 3.744 s audio, sync delta −0.006 s. Elapsed 136.8 s.
+
+Unchanged and still true: the output audio does **not** resemble the master track, because H3 regenerates it from the conditioning window. That is by design and is not a defect.
+
 ## 2026-08-18 — Three cheap test values, mistaken for three properties of the system
 
 The Director looked at a rendered clip and said the face was badly degraded and the audio had "voices but not speaking words — phantoms trying to speak from a tomb, haunting but no phonetics". Chasing that produced four corrections, three of which are mine, and one genuine defect.
