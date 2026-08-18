@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, renderAgainControl, renderAgainNotice, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, renderAgainControl, renderAgainNotice, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -521,7 +521,10 @@ function renderAssets() {
   renderAssetInspector();
 }
 
-function renderAssetInspector() {
+// Exported for the same reason `renderSong` and `renderShotInspector` are: it decides
+// whether a control exists at all, and a decision like that has to be executed by a test
+// rather than read out of the template string it lives in.
+export function renderAssetInspector() {
   const asset = selectedAsset();
   const inspector = $("#asset-inspector");
   if (!asset) {
@@ -530,7 +533,10 @@ function renderAssetInspector() {
   }
   const url = assetImageUrl(asset);
   const vision = asset.vision ? `<div class="meta-list"><b>Vision summary</b><span>${escapeHtml(asset.vision.summary)}</span><b>Continuity</b><span>${escapeHtml(asset.vision.continuity_cues.join(" · ") || "—")}</span><b>Risks</b><span>${escapeHtml(asset.vision.risks.join(" · ") || "None")}</span></div>` : "";
-  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${asset.kind === "character" ? `<button class="primary-button full" id="create-multiview" ${asset.path ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button>`;
+  // One source for "is this promotable" — the same function the click reads to pick the
+  // template — so the button and what it sends can never disagree about the asset's kind.
+  const promotion = multiviewPlan(asset);
+  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button>`;
   $("#attach-asset")?.addEventListener("click", attachSelectedAsset);
   $("#create-multiview")?.addEventListener("click", createMultiview);
   $("#analyze-asset")?.addEventListener("click", async () => {
@@ -542,7 +548,13 @@ function renderAssetInspector() {
 async function createMultiview() {
   const asset = selectedAsset();
   if (!asset || !state.project) return;
-  const prompt = `Preserve the exact identity, facial features, body type and wardrobe of this character. Convert the character into a clean four-panel character sheet showing a face close-up, front full body, side full body and back full body view. Consistent neutral lighting and proportions across every view.`;
+  // The template is chosen by the asset's kind, not by the one sentence this used to hold:
+  // a prop gets the object template, a character gets the character one. Re-checked at the
+  // click rather than trusted from render time, because the selection can move under a
+  // refresh between the two.
+  const promotion = multiviewPlan(asset);
+  if (!promotion) return;
+  const prompt = promotion.prompt;
   try {
     await api.generateMultiview(state.project.id, asset.id, { prompt, seed: 0 });
     await loadProject(state.project.id);

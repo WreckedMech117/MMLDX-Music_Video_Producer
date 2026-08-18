@@ -127,8 +127,11 @@ CHARACTER_NAME = "Lucy"
 #: What the reference map calls this Asset in the prompt the route builds. Set explicitly so the
 #: tag reads as direction rather than as a filename.
 CHARACTER_LABEL = "Lucy, the lead singer"
+#: The count this used to open with ("in four views") is gone and the views it names are not:
+#: a probe asked the QuadView LoRA for four and got six, so the number was a prediction about
+#: the output rather than part of the request. Everything the sentence asks for is unchanged.
 MULTIVIEW_PROMPT = (
-    "Character sheet of the same person in four views on a plain neutral backdrop: front, "
+    "Character sheet of the same person on a plain neutral backdrop: front, "
     "three-quarter, profile, and back. Identical face, hair, and wardrobe in every view, even "
     "studio lighting, full body, no text."
 )

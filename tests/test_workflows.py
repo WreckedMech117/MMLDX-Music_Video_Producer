@@ -1,11 +1,16 @@
+import ast
 import copy
 import hashlib
+import io
 import json
+import re
 import tempfile
+import tokenize
 from pathlib import Path
 
 import preflight
 import preflight_h3_ultra
+import preflight_ltx25_enhance
 import preflight_songplanner
 import pytest
 
@@ -23,17 +28,33 @@ from music_video_producer.workflows import (
     H3_REFERENCE_PROFILES,
     H3_SPLIT_OFFSETS,
     LTX25_DIVISOR,
+    LTX25_ENHANCE_CFG,
+    LTX25_ENHANCE_DETAILER_LORA,
+    LTX25_ENHANCE_DETAILER_STRENGTH,
+    LTX25_ENHANCE_LARGEST_SIZE,
+    LTX25_ENHANCE_PROMPT,
+    LTX25_ENHANCE_SAMPLER,
+    LTX25_ENHANCE_SEED,
+    LTX25_ENHANCE_SIGMAS,
+    LTX25_ENHANCE_SOURCE_EXTENSIONS,
+    MULTIVIEW_CFG,
+    MULTIVIEW_DENOISE,
+    MULTIVIEW_SAMPLER,
+    MULTIVIEW_SCHEDULER,
+    MULTIVIEW_STEPS,
     H3SamplingProfile,
     WorkflowCatalog,
     build_flux_payload,
     build_h3_director_payload,
     build_h3_reference_payload,
+    build_ltx25_enhance_payload,
     build_multiview_payload,
     build_music3_payload,
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
     normalize_to_divisor,
     patch_ltx25_dimension_boundary,
+    reachable_node_ids,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +140,12 @@ def every_builder_payload() -> list[tuple[str, dict]]:
             ),
         ),
         ("ltx25-patched", patch_ltx25_dimension_boundary(template)),
+        (
+            # The one shape this builder has: every sampling value the export fixes is a
+            # constant here rather than a control, so there is no second combination.
+            "ltx25-enhance",
+            build_ltx25_enhance_payload(source_video="J:/comfy/output/take_00001.mp4", prefix="p"),
+        ),
     ]
 
 
@@ -137,14 +164,22 @@ def every_builder_payload() -> list[tuple[str, dict]]:
 # audited payload. It was uncovered while only the Krea multiview and LTX graphs used
 # it, and nothing audited those; now the H3 audit records it, so the Krea LoRAs are
 # range-checked offline as a side effect.
+#
+# `preflight_ltx25_enhance.py --record` removed thirteen more, four of which were on
+# this list because only the *unaudited* combined LTX export used them: `CFGGuider`,
+# `CLIPTextEncode`, `LTXVConditioning` and `ManualSigmas`. The enhancement adapter
+# submits all four, so they are recorded now and range-checked offline everywhere they
+# appear. `LatentUpscaleModelLoader` stays here, and deliberately: the enhancement graph
+# does **not** load it — it is one of the two orphans in that export — so nothing audited
+# puts it in front of the live schema.
 UNRECORDED_CLASSES = frozenset({
-    "CFGGuider", "CLIPTextEncode", "ComfyMathExpression",
+    "ComfyMathExpression",
     "DualCLIPLoader", "EmptySD3LatentImage", "FluxGuidance", "FrameInterpolate",
     "FrameInterpolationModelLoader", "GetImageSize", "ImageResizeKJv2",
     "Krea2EditGroundedEncode", "Krea2EditModelPatch", "LTXVAudioVAEDecode", "LTXVAudioVAEEncode",
-    "LTXVConcatAVLatent", "LTXVConditioning", "LTXVImgToVideoInplace", "LTXVLatentUpsampler",
+    "LTXVConcatAVLatent", "LTXVImgToVideoInplace", "LTXVLatentUpsampler",
     "LTXVSeparateAVLatent", "LatentUpscaleModelLoader", "LoadImage",
-    "ManualSigmas", "MathExpression|pysssss",
+    "MathExpression|pysssss",
     "ModelSamplingFlux", "PrimitiveFloat",
     "PrimitiveStringMultiline", "RTXVideoSuperResolution", "ResolutionSelector",
     "SaveImage", "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
@@ -473,6 +508,257 @@ def test_multiview_payload_uses_uploaded_character_and_quadview_lora():
     assert payload["119"]["inputs"]["prompt"].startswith("Preserve this character")
     assert payload["53"]["inputs"]["seed"] == 88
     assert payload["29"]["inputs"]["filename_prefix"] == "mvp/multiview/lead"
+
+
+#: The creator's saved character-sheet graph, byte-identical to the file on the ComfyUI
+#: machine, kept here so the claims this suite makes about it are checkable offline.
+#:
+#: **Editor format, not API format.** It carries `nodes`/`links`/`groups` and a `mode` on
+#: every node, which is exactly why it is the evidence for "those two samplers are
+#: bypassed" — an API export has no `mode` field at all and could not answer the question.
+#: It is reference evidence and must never be submitted to `/prompt`.
+KREA_SHEET_EXPORT = REFERENCE_EXPORTS / "krea2-charactersheet-user-export.json"
+
+#: ComfyUI's `mode` values, for the two this graph uses. 0 runs; 4 is bypassed — the node
+#: is skipped and its input is passed through to whatever it fed.
+NODE_MODE_ACTIVE = 0
+NODE_MODE_BYPASSED = 4
+
+#: KSampler's widget order in a saved graph, which is what makes the pipeline
+#: documentation's "8-step euler at CFG 0.3" a misreading rather than a disagreement:
+#: `widgets_values[3]` is cfg and `widgets_values[6]` is denoise, so a 0.3 read as CFG is
+#: the denoise value pulled three slots early.
+KSAMPLER_WIDGETS = ("seed", "control_after_generate", "steps", "cfg", "sampler_name",
+                    "scheduler", "denoise")
+
+
+def krea_sheet_nodes() -> dict[int, dict]:
+    """Every node of the creator's saved sheet graph, keyed by its id."""
+    graph = json.loads(KREA_SHEET_EXPORT.read_text(encoding="utf-8"))
+    return {node["id"]: node for node in graph["nodes"]}
+
+
+def ksampler_settings(node: dict) -> dict:
+    """One saved KSampler's widgets, read by position into names."""
+    assert node["type"] == "KSampler", node["type"]
+    return dict(zip(KSAMPLER_WIDGETS, node["widgets_values"], strict=True))
+
+
+def test_the_creator_sheet_export_is_not_mutated():
+    """The evidence the pin below rests on, held byte-identical to the creator's file."""
+    digest = hashlib.sha256(KREA_SHEET_EXPORT.read_bytes()).hexdigest()
+
+    assert digest == "ac36130b6be2caa4b624cf2b4739a142c3150a2f7001b7dcba49ee0a99bee399"
+
+
+def test_the_sheet_is_one_pass_and_the_creator_graph_says_why():
+    """Read this before "fixing" the two sampling passes `Music-Video.md` says are missing.
+
+    The pipeline documentation beside the graph says the sheet is *"Three KSamplers:
+    10-step euler for the initial sheet, 8-step euler at CFG 0.3 for the refine pass,
+    8-step res_multistep for the final output."* Every clause of that is contradicted by
+    the file it describes, and this test asserts the contradiction against the file rather
+    than restating it in prose, so the next reader who tries the change fails here and is
+    told what the evidence is.
+
+    The three passes were built on 2026-08-18 and reverted the same day. Two of the
+    samplers are bypassed and are not in the sheet path at all — they generate an optional
+    *character portrait* that can become the sheet's input image — and stacking them after
+    the sheet would have needed a denoise value no source specifies. That is a third
+    combination nobody has rendered, shipped as a default, changing every reference sheet
+    in the project on the strength of a prose error. It is the same hazard that made the
+    H3 sampling profiles reproduce whole evidenced bundles instead of blending them.
+    """
+    nodes = krea_sheet_nodes()
+    samplers = {node_id: node for node_id, node in nodes.items() if node["type"] == "KSampler"}
+
+    # Three exist. Exactly one of them runs.
+    assert sorted(samplers) == [53, 146, 172]
+    assert nodes[53]["mode"] == NODE_MODE_ACTIVE
+    assert nodes[146]["mode"] == NODE_MODE_BYPASSED
+    assert nodes[172]["mode"] == NODE_MODE_BYPASSED
+
+    # And the bypassed pair is not merely disabled, it is somewhere else: the sheet's own
+    # groups sit at positive x, and those two are a thousand units to the left, in a group
+    # the creator titled "2nd Sampling" — the second pass of the *portrait* generator.
+    groups = json.loads(KREA_SHEET_EXPORT.read_text(encoding="utf-8"))["groups"]
+    titles = {group["title"]: group["bounding"][0] for group in groups}
+    assert "2nd Sampling" in titles
+    assert titles["2nd Sampling"] < 0
+    for sheet_group in ("CharSheet - Sampling", "CharSheet - Condition", "CharSheet - MODELS"):
+        assert titles[sheet_group] > 0, sheet_group
+
+    # The adapter is node 53, value for value, read out of the file rather than retyped.
+    sheet = ksampler_settings(nodes[53])
+    payload = build_multiview_payload(image_name="a.png", prompt="p", seed=7, prefix="p")
+    sampler = payload["53"]["inputs"]
+
+    assert sampler["steps"] == sheet["steps"] == MULTIVIEW_STEPS
+    assert sampler["cfg"] == sheet["cfg"] == MULTIVIEW_CFG
+    assert sampler["sampler_name"] == sheet["sampler_name"] == MULTIVIEW_SAMPLER
+    assert sampler["scheduler"] == sheet["scheduler"] == MULTIVIEW_SCHEDULER
+    assert sampler["denoise"] == sheet["denoise"] == MULTIVIEW_DENOISE
+
+    # One pass in the payload, because one pass is what the sheet path has.
+    assert [node["class_type"] for node in payload.values()].count("KSampler") == 1
+
+    # The prose's "CFG 0.3" is the bypassed refine's *denoise*; its cfg is 1.0 like every
+    # other sampler here. Asserted so a reader who trusts the prose sees where 0.3 lives.
+    refine = ksampler_settings(nodes[172])
+    assert refine["cfg"] == 1.0
+    assert refine["denoise"] == 0.3
+    # And `res_multistep` is the *first* of the bypassed pair, not a final pass: node 172
+    # takes its latent straight from node 146, so 146 runs before it.
+    assert ksampler_settings(nodes[146])["sampler_name"] == "res_multistep"
+    latent_link = next(item for item in nodes[172]["inputs"] if item["name"] == "latent_image")
+    links = {link[0]: link for link in json.loads(KREA_SHEET_EXPORT.read_text(encoding="utf-8"))["links"]}
+    assert links[latent_link["link"]][1] == 146
+
+
+#: The multiview payload exactly as it shipped before objects could be promoted.
+#:
+#: This story added a refine and a final pass and then took them out again. A digest is the
+#: cleanest statement that the revert was complete: not "three samplers became one" but
+#: "every byte of the submitted graph is what it was", which also covers the node ids, the
+#: LoRA names, the resize and the link topology that the revert had no business touching.
+SHIPPED_MULTIVIEW_PAYLOAD_DIGEST = (
+    "81a440e23e523b9eaee5fe05c45923d22e5f294618461fd57df5672cede09ca2"
+)
+
+
+def test_the_multiview_payload_is_byte_identical_to_what_shipped():
+    """Recorded from `git show HEAD:...workflows.py` before the passes were added."""
+    payload = build_multiview_payload(
+        image_name="mvp_character.png", prompt="a prompt", seed=88, prefix="mvp/multiview/lead"
+    )
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    assert hashlib.sha256(serialized.encode()).hexdigest() == SHIPPED_MULTIVIEW_PAYLOAD_DIGEST
+
+
+#: Node classes that would only ever be in a sheet graph to take the sheet apart.
+#:
+#: The prohibition is on *assuming a panel count*, and the way that assumption reaches a
+#: payload is a node that crops, splits or indexes the decoded sheet. Named as classes
+#: rather than checked as a word, because "the builder emits no cropper" is a fact about
+#: the graph that gets submitted, and a comment cannot satisfy it.
+PANEL_SPLITTING_CLASSES = frozenset({
+    "ImageCrop", "ImageFromBatch", "ImageBatch", "RepeatImageBatch", "LatentFromBatch",
+    "LatentCrop", "LatentBatch", "ImageSplit", "ImageBatchGet", "SplitImageWithAlpha",
+})
+
+
+def test_multiview_graph_neither_splits_nor_batches_the_sheet():
+    """A LoRA called QuadView, asked for four views, returned six.
+
+    So the sheet's panel count is not knowable in advance and the graph must not act as
+    though it were. One image in, one image out, batch size 1: nothing crops it, nothing
+    indexes into a batch, and the save writes the sheet whole.
+    """
+    payload = build_multiview_payload(
+        image_name="a.png", prompt="p", seed=0, prefix="mvp/multiview/ship"
+    )
+    classes = {node["class_type"] for node in payload.values()}
+
+    assert classes & PANEL_SPLITTING_CLASSES == set()
+    assert payload["135"]["inputs"]["batch_size"] == 1
+    assert [node["class_type"] for node in payload.values()].count("SaveImage") == 1
+    assert payload["29"]["inputs"]["images"] == ["54", 0]
+
+
+def test_multiview_latent_size_matches_the_creator_file_not_its_note():
+    """1536x1024, which is what the graph carries and 1.57 MP rather than the noted 1 MP.
+
+    The creator's Resolution note says "1MP is the sweet spot"; the file's own
+    EmptySD3LatentImage is 1536x1024. Pinned here so the discrepancy is a recorded
+    decision — the file won — rather than something the next reader re-litigates from the
+    note and silently changes under every sheet already in a manifest.
+    """
+    payload = build_multiview_payload(image_name="a.png", prompt="p", seed=0, prefix="p")
+
+    assert payload["135"]["inputs"]["width"] == 1536
+    assert payload["135"]["inputs"]["height"] == 1024
+
+
+#: A number of panels, poses, angles or views, written as a digit or as a word.
+#:
+#: "four-panel", "4 panel", "six views", "three poses" — the shapes a count reaches a prompt
+#: or a constant in. "three-quarter view" does not match and must not: it is an angle's name,
+#: not a tally, and both templates use it.
+PANEL_COUNT_PATTERN = re.compile(
+    r"(?i)\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)[\s_-]*"
+    r"(?:panel|pose|angle|view)s?\b"
+)
+
+
+def executable_source(path: Path) -> str:
+    """`path` with its comments and docstrings removed, so only what *runs* is scanned.
+
+    A comment is where the reasoning lives, and the reasoning here is largely *about* the
+    counts that must not be asserted — the probe that asked for four and got six is worth
+    writing down in every file that was changed because of it. Stripping them is what keeps
+    this guard about behaviour instead of about vocabulary.
+    """
+    if path.suffix != ".py":
+        return "\n".join(
+            line for line in path.read_text(encoding="utf-8").splitlines()
+            if not line.strip().startswith("//")
+        )
+    text = path.read_text(encoding="utf-8")
+    docstrings = set()
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if ast.get_docstring(node, clean=False) is None:
+            continue
+        docstrings.update(range(node.body[0].lineno, node.body[0].end_lineno + 1))
+    return "\n".join(
+        token.string
+        for token in tokenize.generate_tokens(io.StringIO(text).readline)
+        if token.type != tokenize.COMMENT and token.start[0] not in docstrings
+    )
+
+
+def test_nothing_that_runs_states_a_number_of_panels():
+    """Not in code, not in a prompt, not in a test — the one thing this feature may not know.
+
+    A LoRA named QuadView, handed a prompt asking for four views, returned six. Any code
+    that had counted, cropped or indexed panels would have been wrong on the first object
+    ever promoted, and the *prompt* is the place a count gets written without feeling like
+    an assumption at all: "a clean four-panel character sheet" reads as direction and is
+    actually a prediction about output nobody has seen.
+
+    Scanned across the application and its tests rather than at the multiview builder,
+    because the sheet is read by the reference path and the H3 adapter too, and a count
+    asserted anywhere is a count this feature has to live with.
+    """
+    # The scanner must be able to fail. A negative existential that silently stopped
+    # matching would pass forever, on a codebase that had reintroduced every count.
+    #
+    # The number and the noun are separate literals, joined only at runtime: this file is
+    # inside the scan, and a probe written out whole would be a count in a test — the exact
+    # thing being forbidden — reported against this very line.
+    for number, noun in (("four", "-panel"), ("six", " views"), ("4", " panels")):
+        assert PANEL_COUNT_PATTERN.search(f"a clean {number}{noun} sheet"), f"{number}{noun}"
+    # And must not fire on the angle both templates name.
+    assert not PANEL_COUNT_PATTERN.search("a three-quarter view of the whole object")
+
+    scanned = sorted(
+        path
+        for directory in ("src", "tests")
+        for suffix in ("*.py", "*.js", "*.html")
+        for path in (REPO_ROOT / directory).rglob(suffix)
+        if "__pycache__" not in path.parts
+    )
+    assert len(scanned) > 20, "the scan found almost nothing; the walk is broken"
+
+    counts = [
+        f"{path.relative_to(REPO_ROOT)}: {found.group(0)!r}"
+        for path in scanned
+        for found in [PANEL_COUNT_PATTERN.search(executable_source(path))]
+        if found
+    ]
+    assert counts == [], counts
 
 
 def test_h3_director_payload_is_self_contained_and_semantically_patched():
@@ -2135,3 +2421,427 @@ def test_ltx25_patch_applies_the_divisor_floor_when_the_source_size_is_known():
         assert inputs["height"] >= LTX25_DIVISOR
     # The divisor the floor uses and the one the node is handed are the same number.
     assert normal["mvp:ltx-size-normalize"]["inputs"]["divisible_by"] == LTX25_DIVISOR
+
+
+# The audited evidence for the LTX 2.5 enhancement adapter, its single output node, and the
+# digest that says the file has not moved under the tests that read it.
+LTX25_ENHANCER_EXPORT = REFERENCE_EXPORTS / "ltx25-enhancer-user-export.json"
+LTX25_ENHANCER_EXPORT_SHA256 = (
+    "6f6c70102b8b8e244847518cdbe4a90881dc4782cfbd6b3e2b03eaca4b66fd37"
+)
+LTX25_ENHANCER_OUTPUT_NODE = "1994"
+
+# The two node classes the adapter substitutes, and nothing else. Declared as data so the
+# comparison below can hold every other class to equality: a substitution that grew a third
+# entry would otherwise disappear into a looser assertion. Each is justified in
+# `build_ltx25_enhance_payload`; both keep the same outputs in the same order, which is why
+# the wiring comparison further down is a like-for-like one.
+LTX25_ENHANCE_SUBSTITUTIONS = {
+    "VHS_LoadVideo": "VHS_LoadVideoPath",
+    "Power Lora Loader (rgthree)": "LoraLoader",
+}
+
+
+def ltx25_enhancer_export() -> dict:
+    return json.loads(LTX25_ENHANCER_EXPORT.read_text(encoding="utf-8"))
+
+
+def ltx25_enhance_payload(**overrides) -> dict:
+    arguments = {
+        "source_video": "J:/comfy/output/music-video-producer/p/shots/s-h3-reference_00001.mp4",
+        "prefix": "music-video-producer/p/shots/s-ltx25-enhance",
+    }
+    return build_ltx25_enhance_payload(**{**arguments, **overrides})
+
+
+def test_the_ltx25_enhancer_export_is_not_mutated():
+    """The evidence every test below reads, pinned. It is immutable per AGENTS.md."""
+    digest = hashlib.sha256(LTX25_ENHANCER_EXPORT.read_bytes()).hexdigest()
+
+    assert digest == LTX25_ENHANCER_EXPORT_SHA256
+
+
+def test_the_enhancer_export_carries_orphaned_loaders_the_adapter_must_not_inherit():
+    """The trap, measured off the file rather than restated from the spec.
+
+    20 nodes, 18 reachable from the single `VHS_VideoCombine`. The two that are not are an
+    audio `VAELoaderKJ` and a `LatentUpscaleModelLoader`, inherited from whatever graph this
+    export was cut out of. Both name a real model file, and both files would end up in a
+    dependency list built from `export.values()` — which is the failure the whole adapter is
+    shaped around, so it is asserted here before anything asserts the adapter avoids it.
+
+    `LatentUpscaleModelLoader` earns its own line: despite the name, no latent upscale runs
+    in the executed path at all.
+    """
+    export = ltx25_enhancer_export()
+
+    reachable = reachable_node_ids(export, [LTX25_ENHANCER_OUTPUT_NODE])
+    orphaned = set(export) - reachable
+
+    assert len(export) == 20
+    assert len(reachable) == 18
+    assert {export[node_id]["class_type"] for node_id in orphaned} == {
+        "VAELoaderKJ",
+        "LatentUpscaleModelLoader",
+    }
+    # The audio VAE is the orphaned `VAELoaderKJ`; the *video* one of the same class is
+    # reachable, so the class is a dependency even though that file is not. A dependency
+    # rule written per class rather than per node would get this exactly wrong.
+    assert {export[node_id]["inputs"].get("vae_name") for node_id in orphaned} == {
+        "ltx-2.5-audio-vae-bf16.safetensors",
+        None,
+    }
+    assert "VAELoaderKJ" in {export[node_id]["class_type"] for node_id in reachable}
+    # No latent upscaler anywhere ComfyUI would execute.
+    assert "LatentUpscaleModelLoader" not in {
+        export[node_id]["class_type"] for node_id in reachable
+    }
+
+
+def test_the_enhance_payload_is_the_reachable_subgraph_and_nothing_else():
+    """AC: the adapter is built from the 18, not from the 20.
+
+    Compared as a class multiset against the export's own reachable nodes, with the two
+    substitutions applied from `LTX25_ENHANCE_SUBSTITUTIONS` — so a node quietly added or
+    dropped fails here, and so does a third substitution nobody declared.
+    """
+    export = ltx25_enhancer_export()
+    reachable = reachable_node_ids(export, [LTX25_ENHANCER_OUTPUT_NODE])
+    expected = sorted(
+        LTX25_ENHANCE_SUBSTITUTIONS.get(
+            export[node_id]["class_type"], export[node_id]["class_type"]
+        )
+        for node_id in reachable
+    )
+
+    payload = ltx25_enhance_payload()
+
+    assert sorted(node["class_type"] for node in payload.values()) == expected
+    # And the payload is itself fully reachable from its own output: a node built here that
+    # nothing downstream reads would be dead weight submitted to a GPU.
+    assert reachable_node_ids(payload, ["mvp:save"]) == set(payload)
+
+
+def test_the_enhance_payload_declares_only_the_models_the_reachable_subgraph_loads():
+    """The specific harm the orphans would do, stated as the four files and the two absences.
+
+    Derived on both sides: the expectation is read out of the export's reachable nodes, and
+    the payload's list is read out of the payload. Neither is a list typed into this test.
+    """
+    export = ltx25_enhancer_export()
+    reachable = reachable_node_ids(export, [LTX25_ENHANCER_OUTPUT_NODE])
+    orphaned = set(export) - reachable
+
+    def files(node_ids) -> set[str]:
+        return {
+            filename
+            for node_id in node_ids
+            for value in export[node_id]["inputs"].values()
+            for filename in preflight_ltx25_enhance.nested_model_files(value)
+        }
+
+    payload = ltx25_enhance_payload()
+    loaded = {
+        value
+        for node in payload.values()
+        for value in node["inputs"].values()
+        if isinstance(value, str) and value.endswith(".safetensors")
+    }
+
+    assert loaded == files(reachable)
+    assert len(loaded) == 4
+    # Named, because "equal to the reachable set" would still pass if the reachable set had
+    # somehow acquired them. These are the two a node-list dependency scan would add, and a
+    # pre-flight demanding either refuses a machine that can do this work.
+    assert files(orphaned) == {
+        "ltx-2.5-audio-vae-bf16.safetensors",
+        "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    }
+    assert loaded.isdisjoint(files(orphaned))
+
+
+def test_the_enhance_payload_carries_the_sources_audio_straight_to_the_saver():
+    """The audio guarantee, as wiring: the only audio in the graph is the source's own.
+
+    Three assertions rather than one, because "the saver reads the loader" alone would still
+    hold in a graph that had grown an audio VAE feeding something else. The source's third
+    output is `audio` in the live schema, and it is checked by index because that is what the
+    payload actually wires.
+    """
+    payload = ltx25_enhance_payload()
+    source = next(
+        node_id for node_id, node in payload.items() if node["class_type"] == "VHS_LoadVideoPath"
+    )
+
+    assert payload["mvp:save"]["inputs"]["audio"] == [source, 2]
+    # Nothing synthesises, decodes or re-encodes audio anywhere in this graph.
+    assert not any(
+        "audio" in node["class_type"].lower() for node in payload.values()
+    ), sorted(node["class_type"] for node in payload.values())
+    assert all(
+        node["inputs"].get("vae_name") != "ltx-2.5-audio-vae-bf16.safetensors"
+        for node in payload.values()
+    )
+
+
+def test_the_source_take_is_the_only_input_and_nothing_regenerates_it():
+    """The frozen "Always": the take is an input, and nothing here may re-run H3."""
+    source = "J:/comfy/output/music-video-producer/p/shots/s-h3-reference_00003-audio.mp4"
+
+    payload = ltx25_enhance_payload(source_video=source)
+
+    assert payload["mvp:source"]["inputs"]["video"] == source
+    # The frames entering the VAE encode are the source's, through the lanczos scale and
+    # nothing else.
+    assert payload["mvp:scale"]["inputs"]["image"] == ["mvp:source", 0]
+    assert payload["mvp:encode"]["inputs"]["pixels"] == ["mvp:scale", 0]
+    # No H3 stage, and no empty-latent node that could stand in for one: every latent in the
+    # graph descends from the encoded source.
+    assert not any("MiniMaxH3" in node["class_type"] for node in payload.values())
+    assert payload["mvp:sample"]["inputs"]["latents"] == ["mvp:encode", 0]
+    assert payload["mvp:sample"]["inputs"]["optional_guiding_latents"] == ["mvp:encode", 0]
+
+
+def test_the_enhance_payload_reproduces_the_exports_fixed_sampling():
+    """Every Ask First value read out of the export rather than retyped here.
+
+    The spec marks the sigmas, the detailer strength and the prompt as Ask First, and nothing
+    has been asked — so the test that they are reproduced has to compare against the file,
+    not against literals that would agree with a typo in the builder.
+    """
+    export = ltx25_enhancer_export()
+
+    def only(class_type: str, node_ids: set[str]) -> dict:
+        matches = [
+            node_id for node_id in node_ids if export[node_id]["class_type"] == class_type
+        ]
+        assert len(matches) == 1, f"{class_type}: {matches}"
+        return export[matches[0]]["inputs"]
+
+    reachable = reachable_node_ids(export, [LTX25_ENHANCER_OUTPUT_NODE])
+    payload = ltx25_enhance_payload()
+
+    assert LTX25_ENHANCE_SIGMAS == only("ManualSigmas", reachable)["sigmas"]
+    assert LTX25_ENHANCE_SIGMAS.count(",") == 3, "three steps plus the terminating zero"
+    assert LTX25_ENHANCE_CFG == only("CFGGuider", reachable)["cfg"]
+    assert LTX25_ENHANCE_SAMPLER == only("KSamplerSelect", reachable)["sampler_name"]
+    assert LTX25_ENHANCE_SEED == only("RandomNoise", reachable)["noise_seed"]
+    assert LTX25_ENHANCE_PROMPT == only("CLIPTextEncode", reachable)["text"] == ""
+    assert LTX25_ENHANCE_LARGEST_SIZE == only("INTConstant", reachable)["value"]
+    # The detailer sits one level down, inside the rgthree loader's widget dict — which is
+    # exactly why the adapter substitutes a node whose schema can see it.
+    rgthree = only("Power Lora Loader (rgthree)", reachable)
+    rows = [value for key, value in rgthree.items() if key.startswith("lora_")]
+    assert len(rows) == 1 and rows[0]["on"] is True, rgthree
+    assert LTX25_ENHANCE_DETAILER_LORA == rows[0]["lora"]
+    assert LTX25_ENHANCE_DETAILER_STRENGTH == rows[0]["strength"]
+    # And the values reach the payload. One rgthree row with a single strength patches the
+    # model and the CLIP alike, which is what the substituted `LoraLoader` reproduces.
+    detailer = payload["mvp:detailer"]["inputs"]
+    assert detailer["lora_name"] == LTX25_ENHANCE_DETAILER_LORA
+    assert detailer["strength_model"] == detailer["strength_clip"] == LTX25_ENHANCE_DETAILER_STRENGTH
+    assert payload["mvp:prompt"]["inputs"]["text"] == ""
+
+
+def test_the_enhance_payload_reproduces_the_exports_tiling_and_scaling():
+    """The rest of the executed path, value for value, against the export's reachable nodes.
+
+    Includes the temporal tiling on purpose. It is not exposed and it is not tuned here, but
+    it is the thing most likely to change the output's frame count — so the numbers being the
+    export's is the only reason the live measurement will describe the audited graph.
+    """
+    export = ltx25_enhancer_export()
+    reachable = reachable_node_ids(export, [LTX25_ENHANCER_OUTPUT_NODE])
+    payload = ltx25_enhance_payload()
+
+    def exported(class_type: str) -> dict:
+        matches = [
+            node_id for node_id in reachable if export[node_id]["class_type"] == class_type
+        ]
+        assert len(matches) == 1, f"{class_type}: {matches}"
+        return export[matches[0]]["inputs"]
+
+    def built(class_type: str) -> dict:
+        matches = [
+            node_id for node_id, node in payload.items() if node["class_type"] == class_type
+        ]
+        assert len(matches) == 1, f"{class_type}: {matches}"
+        return payload[matches[0]]["inputs"]
+
+    for class_type in (
+        "ImageScaleToMaxDimension",
+        "VAEEncodeTiled",
+        "LTXVLoopingSampler",
+        "LTXVSpatioTemporalTiledVAEDecode",
+    ):
+        # Literal values only: the links differ because the node ids do, and they are
+        # compared structurally by the reachability test above.
+        source_values = {
+            name: value
+            for name, value in exported(class_type).items()
+            if not isinstance(value, list)
+        }
+        assert {
+            name: value for name, value in built(class_type).items() if name in source_values
+        } == source_values, class_type
+    assert built("LTXVLoopingSampler")["temporal_tile_size"] == 56
+    assert built("LTXVLoopingSampler")["temporal_overlap"] == 24
+
+
+def test_the_enhance_payload_takes_its_frame_rate_from_the_source_rather_than_a_literal():
+    """A number this adapter invented would silently retime the enhanced take.
+
+    `VHS_VideoInfo`'s output 0 is `source_fps`, and both the saver and the LTX conditioning
+    read it — as the export does. Nothing here asserts anything about frame *count*: that is
+    a live measurement, and this is about rate.
+    """
+    payload = ltx25_enhance_payload()
+
+    assert payload["mvp:source_info"]["inputs"]["video_info"] == ["mvp:source", 3]
+    assert payload["mvp:save"]["inputs"]["frame_rate"] == ["mvp:source_info", 0]
+    assert payload["mvp:conditioning"]["inputs"]["frame_rate"] == ["mvp:source_info", 0]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        "   ",
+        "J:/comfy/output/take_00001.png",
+        "J:/comfy/output/take_00001",
+        '"J:/comfy/output/take_00001.mp4"',
+        " J:/comfy/output/take_00001.mp4 ",
+    ],
+)
+def test_the_builder_refuses_a_source_the_loader_cannot_open_as_given(source: str):
+    """Refused locally so the reason is legible, rather than as a `/prompt` rejection.
+
+    The quoted and padded cases are not pedantry: VHS strips both off the path before opening
+    it, so a value like that names one file to whoever checked it exists and a different one
+    to the node.
+    """
+    with pytest.raises(ValueError):
+        ltx25_enhance_payload(source_video=source)
+
+
+def test_the_builder_accepts_every_container_the_node_declares():
+    """The other side of the refusal: the adapter's list is not narrower than the node's."""
+    for extension in LTX25_ENHANCE_SOURCE_EXTENSIONS:
+        payload = ltx25_enhance_payload(source_video=f"J:/comfy/output/take_00001.{extension}")
+        assert payload["mvp:source"]["inputs"]["video"].endswith(extension)
+    # Case is the file system's business, not the node's.
+    assert ltx25_enhance_payload(source_video="J:/comfy/output/TAKE.MP4")
+
+
+def test_the_enhance_payload_validates_against_the_recorded_object_info():
+    """The offline half of the pre-flight, so a schema drift fails in CI rather than live."""
+    object_info = recorded_object_info()
+    label, payload = preflight_ltx25_enhance.audit_payloads()[0]
+
+    assert preflight.validate(label, payload, object_info) == []
+    assert preflight.unbounded_numeric_inputs(label, payload, object_info) == []
+
+
+def test_the_enhance_audit_wires_every_check_it_defines():
+    """A check dropped from `CHECKS` still passes its own test while the audit stops running it."""
+    defined = {
+        name
+        for name in dir(preflight_ltx25_enhance)
+        if name.startswith("check_") and callable(getattr(preflight_ltx25_enhance, name))
+    }
+
+    assert {check.__name__ for check in preflight_ltx25_enhance.CHECKS} == defined
+
+
+def test_each_enhance_check_passes_the_recorded_schema_and_names_a_moved_one():
+    """Every check is exercised in both directions: clean, and against a schema that moved."""
+    object_info = recorded_object_info()
+
+    for check in preflight_ltx25_enhance.CHECKS:
+        assert check(object_info) == [], check.__name__
+
+    moved = copy.deepcopy(object_info)
+    moved["UNETLoader"]["input"]["required"]["unet_name"][0] = ["something-else.safetensors"]
+    assert any(
+        "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors" in problem
+        for problem in preflight_ltx25_enhance.check_model_files(moved)
+    )
+
+    moved = copy.deepcopy(object_info)
+    moved["VHS_LoadVideoPath"]["input"]["required"]["video"][1]["vhs_path_extensions"] = ["mp4"]
+    assert preflight_ltx25_enhance.check_source_extensions(moved) != []
+
+
+def test_the_enhance_audit_refuses_a_dependency_list_built_from_the_node_list(monkeypatch):
+    """The mutation this whole design exists to survive, driven through the audit itself.
+
+    A payload that also built the export's orphaned loaders — the shape a node-list scan
+    produces — must fail the reachability check by name, and must fail it for both files.
+    """
+    honest = preflight_ltx25_enhance.audit_payloads()
+
+    def from_the_node_list() -> list[tuple[str, dict]]:
+        label, payload = honest[0]
+        payload = {
+            **copy.deepcopy(payload),
+            "mvp:audio_vae": {
+                "class_type": "VAELoaderKJ",
+                "inputs": {
+                    "vae_name": "ltx-2.5-audio-vae-bf16.safetensors",
+                    "device": "cpu",
+                    "weight_dtype": "bf16",
+                },
+            },
+            "mvp:latent_upscaler": {
+                "class_type": "LatentUpscaleModelLoader",
+                "inputs": {
+                    "model_name": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+                },
+            },
+        }
+        return [(label, payload)]
+
+    monkeypatch.setattr(preflight_ltx25_enhance, "audit_payloads", from_the_node_list)
+
+    problems = preflight_ltx25_enhance.check_dependencies_come_from_the_reachable_subgraph(
+        recorded_object_info()
+    )
+
+    assert len(problems) >= 2
+    for filename in (
+        "ltx-2.5-audio-vae-bf16.safetensors",
+        "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    ):
+        assert any(filename in problem and "orphaned" in problem for problem in problems), problems
+
+
+def test_nothing_in_the_enhancement_path_claims_the_frame_count_is_preserved():
+    """The frozen "Never", enforced against the source rather than trusted.
+
+    The reference chain's LTX stage turned 192 frames into 185, this graph tiles temporally,
+    and what it does to a frame count is unknown until it is measured. So no builder, route,
+    pre-flight or test on this path may assert that an output frame count equals an input's —
+    including this file. The check is a read of the source text because the failure mode is a
+    line of code nobody wrote yet.
+    """
+    sources = [
+        REPO_ROOT / "src/music_video_producer/workflows.py",
+        REPO_ROOT / "src/music_video_producer/app.py",
+        REPO_ROOT / "tests/preflight_ltx25_enhance.py",
+        REPO_ROOT / "tests/test_api.py",
+        Path(__file__),
+    ]
+    # `frame_count` is the loader's second output name, and an assertion *about* it is what
+    # this forbids. The needle is spliced from two pieces so this line does not match itself:
+    # written whole, the guard's only finding would be the guard.
+    pattern = re.compile(r"assert[^\n]*" + "frame" + "_count")
+
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        assert not pattern.search(text), source
+    # And the adapter never caps or resamples the loaded frames, which would make the count a
+    # thing this application chose rather than a thing it measured.
+    payload = ltx25_enhance_payload()
+    assert payload["mvp:source"]["inputs"]["frame_load_cap"] == 0
+    assert payload["mvp:source"]["inputs"]["select_every_nth"] == 1
+    assert payload["mvp:source"]["inputs"]["force_rate"] == 0

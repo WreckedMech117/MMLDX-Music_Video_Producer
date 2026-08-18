@@ -51,10 +51,12 @@ from .timeline import (
 from .vram import CliUnloader, LlmEjector
 from .workflows import (
     H3_DEFAULT_PROFILE,
+    LTX25_ENHANCE_SEED,
     WorkflowCatalog,
     build_flux_payload,
     build_h3_director_payload,
     build_h3_reference_payload,
+    build_ltx25_enhance_payload,
     build_multiview_payload,
     build_music3_payload,
     build_songplanner_invented_payload,
@@ -102,6 +104,33 @@ SongContextField = Literal["lyrics", "caption"]
 
 #: The suffix every single-slot recovery field in this application carries.
 RECOVERY_SLOT_SUFFIX = "_previous"
+
+# The Asset kinds a Krea multiview sheet can be promoted from, mapped to the subject the
+# sheet is *of*. Two subjects, two prompt templates: a character sheet asks for a face
+# close-up and full-body turns of a person, and no rewording of that sentence describes a
+# cargo ship. `api.js`'s MULTIVIEW_SUBJECTS is the frontend half — it holds the templates,
+# because the template is a default the Director may replace on the way out, not something
+# the route imposes — and a contract test executes both sides and holds the kinds level.
+#
+# The gate this replaced read `kind != "character"`, which was never a statement about what
+# Krea can do: a probe promoted a Flux cargo ship through this exact path by labelling it a
+# character and got a clean, consistent sheet back. The capability was there; the refusal
+# was ours. What the probe had to fake was the *label*, so the fix is that a prop is
+# promotable as a prop.
+MULTIVIEW_SUBJECTS = {"character": "character", "prop": "object", "setting": "object"}
+
+
+def multiview_refusal() -> str:
+    """The 422 sentence, naming every kind that *can* be promoted.
+
+    Derived from MULTIVIEW_SUBJECTS rather than written out, because the failure this
+    refusal exists to prevent is a Director staring at a promotable asset whose button
+    the route disagrees about — and a hardcoded sentence goes stale in exactly the
+    direction that produces it.
+    """
+    kinds = sorted(MULTIVIEW_SUBJECTS)
+    named = f"{', '.join(kinds[:-1])} or {kinds[-1]}" if len(kinds) > 1 else kinds[0]
+    return f"A completed {named} image is required for multiview generation"
 
 # Every field a `Song` carries, classified into what the Director is shown and what is withheld.
 #
@@ -755,6 +784,68 @@ def shot_render_in_flight(project: Project, shot: Shot) -> bool:
         job.kind == "h3" and job.target_id == shot.id and job.status in RENDER_IN_FLIGHT_STATUSES
         for job in project.jobs
     )
+
+
+def shot_enhancement_in_flight(project: Project, shot: Shot) -> bool:
+    """True when an LTX 2.5 enhancement for this Shot has been accepted and has not landed.
+
+    Its own function rather than a `kind` added to `shot_render_in_flight`, because the two
+    read different signals and only one of them may read `Shot.status`. An enhancement
+    deliberately does not touch the Shot at all — not its status, not its `latest_output` —
+    so that a take being enhanced is left exactly as it was. The job records are therefore
+    the *only* evidence an enhancement is running, and folding this into the render check
+    would make a live H3 render and a live enhancement indistinguishable in the sentence the
+    Director reads.
+
+    Job status only ever moves when `read_job` is asked, so an enhancement that finished
+    while nobody was polling still reads `queued` here. That is the safe direction: the cost
+    is a refusal that says to refresh the queue, against two enhancements racing on one
+    output prefix.
+    """
+    return any(
+        job.kind == "ltx" and job.target_id == shot.id and job.status in RENDER_IN_FLIGHT_STATUSES
+        for job in project.jobs
+    )
+
+
+# Why one Shot's take may not be sent to the LTX 2.5 enhancer. Each names the Shot as the
+# timeline names it, for `render_again`'s reason: a bare `shot_a1b2c3d4e5f6` appears nowhere in
+# the interface.
+#
+# Enhancement takes a *take* as its input, so the thing that must exist is a rendered file — not
+# a prompt, and not a status. This route deliberately asks no readiness question: the graph's
+# prompt is empty, so a Shot with no prompt would enhance exactly as well as one with a prompt,
+# and refusing it would be a gate borrowed from a path that generates.
+ENHANCE_NO_TAKE_REFUSAL = (
+    "{shot} has not produced a take, and enhancement improves a take rather than making one. "
+    "Render the shot first, then enhance the take you want to keep."
+)
+# Names the path, per the matrix. A manifest pointing at a file that is gone is usually a moved
+# or cleared ComfyUI output directory, and the only way the Director can tell which is to see
+# where this looked.
+ENHANCE_MISSING_TAKE_REFUSAL = (
+    "{shot}'s take is recorded as {path} and there is no file there. Nothing was submitted. "
+    "The take may have been moved or the ComfyUI output directory cleared."
+)
+# Concurrency, stated as the concrete harm rather than as a busy signal, with the same staleness
+# escape the render refusals name. Covers a live render as well as a live enhancement: enhancing
+# a take while the shot is re-rendering means spending GPU minutes on a take that is about to
+# stop being the shot's latest one.
+ENHANCE_IN_FLIGHT_REFUSAL = (
+    "Work on {shot} has not finished. Enhancing a take while a render or another enhancement is "
+    "still running would spend GPU minutes on a take that may be about to change, so nothing was "
+    "submitted. Wait for it, or refresh the render queue if it has already finished and this "
+    "project has not been told yet."
+)
+#: The filename prefix an enhancement writes under, appended to the shot's own. Its whole job is
+#: to be *different* from the H3 prefixes: ComfyUI numbers its outputs per prefix, so an
+#: enhancement sharing the render's prefix would take the next number in that shot's take
+#: sequence and become indistinguishable from a take. A separate prefix is what puts the enhanced
+#: file beside the take rather than in the middle of the series.
+ENHANCE_PREFIX_SUFFIX = "-ltx25-enhance"
+# Deliberately ASCII, exactly as `batch.READINESS_REFUSAL` and the render-again refusals are, and
+# for the same reason: the frontend halves are read back through node, whose stdout the contract
+# test decodes with the platform encoding on Windows.
 
 
 def prose_claims_shots(message: str) -> bool:
@@ -1930,11 +2021,8 @@ def create_app(
         source = next((item for item in project.assets if item.id == asset_id), None)
         if not source:
             raise HTTPException(status_code=404, detail="Asset not found")
-        if source.kind != "character" or not source.path:
-            raise HTTPException(
-                status_code=422,
-                detail="A completed character image is required for multiview generation",
-            )
+        if source.kind not in MULTIVIEW_SUBJECTS or not source.path:
+            raise HTTPException(status_code=422, detail=multiview_refusal())
         source_root = (
             store.media_dir(project_id).resolve()
             if source.source == "upload"
@@ -1946,7 +2034,7 @@ def create_app(
             else (source_root / Path(source.path)).resolve()
         )
         if source_root not in source_path.parents or not source_path.is_file():
-            raise HTTPException(status_code=404, detail="Character source image was not found")
+            raise HTTPException(status_code=404, detail="Multiview source image was not found")
         upload_name = f"mvp_{project_id}_{source.id}{source_path.suffix.lower()}"
         content_type = "image/png" if source_path.suffix.lower() == ".png" else "image/jpeg"
         try:
@@ -1956,7 +2044,16 @@ def create_app(
             )
             child = Asset(
                 name=f"{source.name} · multiview",
-                kind="character",
+                # The sheet is the same subject as what it was promoted from, so the child
+                # carries the source's kind. For a character that is exactly what this line
+                # said before — character in, character out — so no sheet already in a
+                # manifest means anything different than it did. For a ship it is the whole
+                # point: promotion must not be the step that files a prop as a person.
+                #
+                # Nothing downstream reads this for a decision that could change: the H3
+                # reference adapter buckets every non-audio, non-video kind to "picture",
+                # and shot attachment does not filter by kind at all.
+                kind=source.kind,
                 path="",
                 source="krea-multiview",
                 parent_id=source.id,
@@ -2222,6 +2319,113 @@ def create_app(
             prompt_id=submission.prompt_id,
             target_id=shot.id,
             seed=shot.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
+        return job
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/enhance/ltx25",
+        response_model=RenderJob,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def enhance_with_ltx25(project_id: str, shot_id: str) -> RenderJob:
+        """Submit one Shot's existing take to the standalone LTX 2.5 enhancer. No body.
+
+        The gap this closes: LTX 2.5 was reachable only by regenerating H3 from scratch inside
+        the reference chain, so improving a shot the Director liked cost another full H3 pass
+        and produced a different picture. Here the take is the *input*.
+
+        **Nothing on this path re-runs H3.** The payload has no MiniMax node in it at all — see
+        `build_ltx25_enhance_payload`, which the audited export is checked against node by node.
+
+        **Nothing here writes to the Shot.** Not `status`, not `latest_output`, not
+        `latest_review`, not `prompt_id`. Only a `RenderJob` is appended. Three consequences,
+        and the third is the one that stops the first two from being read as more than they are:
+
+        * the enhanced video is written under `ENHANCE_PREFIX_SUFFIX`, a different filename
+          prefix from any render's, so ComfyUI numbers it in its own series and it lands beside
+          the take rather than over it or in the middle of it;
+        * `read_job` has no branch for `kind="ltx"`, so a *completed* enhancement moves no
+          pointer either. The shot goes on naming the take that was enhanced, and the enhanced
+          file is reachable through `RenderJob.output_files` on the job that produced it;
+        * deciding which of the two is the take is take comparison, which this application does
+          not do. None of the above is a take list.
+
+        No body, for `render_again`'s reason and more strongly: this route has no controls at
+        all. The export fixes the sigmas, the detailer strength and the prompt, exposing any of
+        them is marked Ask First and has not been asked, and a request model with nothing in it
+        is a place for a future field to arrive without a decision.
+
+        No readiness gate, and that is deliberate rather than an omission. `generate_h3` refuses
+        an unprompted Shot because a prompt is what its graph turns into a picture; this graph's
+        prompt is **empty**, so a Shot with no prompt enhances exactly as well as one with a
+        prompt. Borrowing that gate here would refuse a real take for a field the work does not
+        read. What must exist is the take, which is what the two refusals below check.
+
+        Frame count is not claimed, here or anywhere on this path. The LTX boundary in the
+        reference chain measurably did not preserve it (192 in, 185 out), this graph tiles
+        temporally, and what it does is a measurement to be taken with `ffprobe` on the output —
+        not a number this route can promise.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        # First, ahead of everything, for `mark_ready_refusal`'s reason: an in-flight Shot is the
+        # one state where getting this wrong does concrete harm. 409 rather than 422 and for the
+        # same reason it is 409 there — a live job is a state conflict, and the same request
+        # succeeds once it lands.
+        if shot_render_in_flight(project, shot) or shot_enhancement_in_flight(project, shot):
+            raise HTTPException(
+                status_code=409,
+                detail=ENHANCE_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # Before any path is resolved: a Shot that never rendered has no take to name, and the
+        # refusal for that is a different sentence from the one for a take whose file is gone.
+        if not shot.latest_output:
+            raise HTTPException(
+                status_code=422,
+                detail=ENHANCE_NO_TAKE_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # `analyze_latest_take`'s resolution, containment check included, so a `latest_output`
+        # carrying `..` cannot reach outside ComfyUI's output directory and hand an arbitrary
+        # file to the node. The status differs from that route's 404 on purpose: the matrix
+        # specifies 422 here, and it is the right code — the request names a Shot that exists,
+        # and what cannot be processed is the state its manifest describes.
+        output_root = (settings.comfy_root / "output").resolve()
+        source = (output_root / Path(shot.latest_output)).resolve()
+        if output_root not in source.parents or not source.is_file():
+            raise HTTPException(
+                status_code=422,
+                detail=ENHANCE_MISSING_TAKE_REFUSAL.format(
+                    shot=shot_label(project, shot), path=shot.latest_output
+                ),
+            )
+        try:
+            payload = build_ltx25_enhance_payload(
+                # Forward slashes on Windows too: the value is a plain string to VHS, which
+                # opens it with `os.path`, and a backslash path survives the JSON round-trip
+                # doubled and unreadable in every log and error message on the way.
+                source_video=source.as_posix(),
+                prefix=(
+                    f"music-video-producer/{project_id}/shots/{shot.id}{ENHANCE_PREFIX_SUFFIX}"
+                ),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        # The whole write. The Shot itself is untouched: see this route's docstring.
+        job = RenderJob(
+            kind="ltx",
+            prompt_id=submission.prompt_id,
+            target_id=shot.id,
+            # The seed the graph fixes, recorded so the job says what was sampled rather than
+            # defaulting to a 0 that happens to match.
+            seed=LTX25_ENHANCE_SEED,
         )
         project.jobs.append(job)
         store.save(project)

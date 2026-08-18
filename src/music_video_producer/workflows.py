@@ -736,10 +736,56 @@ def patch_ltx25_dimension_boundary(
     return payload
 
 
+#: The sheet's one sampling pass, as node 53 of the creator's graph carries it.
+#:
+#: Named rather than inlined so the pre-flight can check the sampler against the live
+#: server's option list, and so the test that pins these values against
+#: ``krea2-charactersheet-user-export.json`` has one thing to compare.
+#:
+#: **This is one pass and it stays one pass.** ``Music-Video.md`` says the sheet is
+#: "Three KSamplers: 10-step euler for the initial sheet, 8-step euler at CFG 0.3 for
+#: the refine pass, 8-step res_multistep for the final output", and the graph it
+#: describes does not support any part of that sentence:
+#:
+#: * The graph's three samplers are node 53 (``mode: 0``) and nodes 146 and 172, both
+#:   ``mode: 4`` — bypassed on load. Only 53 is in the sheet path; the ``CharSheet-*``
+#:   groups sit at positive x, while 146 and 172 live in a group titled ``2nd Sampling``
+#:   at x ≈ -1129, feeding an optional *character portrait generator* whose output can
+#:   become the sheet's input image.
+#: * "CFG 0.3" is node 172's ``denoise``. KSampler's widget order is (seed, control,
+#:   steps, cfg, sampler_name, scheduler, denoise); all three samplers carry cfg 1.0.
+#: * ``res_multistep`` is node 146, the *first* of that pair, not the final pass.
+#:
+#: Adding those two passes after the sheet was tried on 2026-08-18 and reverted. They are
+#: not a documented combination — they are a third combination nobody has rendered, and
+#: the final pass's denoise had to be invented outright because no source specifies one.
+#: Shipping it as the default would have changed every reference sheet in the project on
+#: the strength of a prose error. ``test_the_sheet_is_one_pass_and_the_creator_graph_says_why``
+#: pins this, and it is the test to read before "fixing" the missing passes.
+MULTIVIEW_STEPS = 10
+MULTIVIEW_SAMPLER = "euler"
+MULTIVIEW_SCHEDULER = "simple"
+MULTIVIEW_CFG = 1.0
+MULTIVIEW_DENOISE = 1.0
+
+
 def build_multiview_payload(
     *, image_name: str, prompt: str, seed: int, prefix: str
 ) -> dict[str, dict[str, Any]]:
-    """Krea 2 identity edit using the installed QuadView character-sheet LoRA."""
+    """Krea 2 identity edit using the installed QuadView multi-view LoRA.
+
+    Node ids are the creator's: 182/123/148/152/127/149/150/73/135/120/119/85/53/54/29
+    are copied from the ``CharSheet-*`` groups of
+    ``workflow_templates/reference_exports/krea2-charactersheet-user-export.json``, which
+    is exactly the reachable sheet path and nothing else. One sampling pass, because that
+    is all the sheet path has — see ``MULTIVIEW_STEPS`` above for what the pipeline
+    documentation claims instead and why it is wrong.
+
+    Nothing here depends on how many views the sheet comes back with. The pass runs on the
+    whole latent and the save writes the whole image, so a sheet of four panels and a sheet
+    of six go through this graph unchanged — which is what a probe found the QuadView LoRA
+    actually does when asked for four.
+    """
     return {
         "182": {"class_type": "LoadImage", "inputs": {"image": image_name}},
         "123": {
@@ -837,14 +883,14 @@ def build_multiview_payload(
             "inputs": {
                 "model": ["120", 0],
                 "seed": seed,
-                "steps": 10,
-                "cfg": 1.0,
-                "sampler_name": "euler",
-                "scheduler": "simple",
+                "steps": MULTIVIEW_STEPS,
+                "cfg": MULTIVIEW_CFG,
+                "sampler_name": MULTIVIEW_SAMPLER,
+                "scheduler": MULTIVIEW_SCHEDULER,
                 "positive": ["119", 0],
                 "negative": ["85", 0],
                 "latent_image": ["135", 0],
-                "denoise": 1.0,
+                "denoise": MULTIVIEW_DENOISE,
             },
         },
         "54": {
@@ -854,5 +900,334 @@ def build_multiview_payload(
         "29": {
             "class_type": "SaveImage",
             "inputs": {"images": ["54", 0], "filename_prefix": prefix},
+        },
+    }
+
+
+def reachable_node_ids(graph: dict[str, dict[str, Any]], roots: list[str]) -> set[str]:
+    """Every node ``roots`` depend on, following ``[node, output]`` links backwards.
+
+    The rule that produced ``build_ltx25_enhance_payload``, written as a function rather
+    than left as a claim in a comment, so a test can check the adapter against it and the
+    pre-flight can say what it audited.
+
+    A saved ComfyUI graph is the *editor's* set of nodes, not the executed one. ComfyUI
+    executes backwards from the output nodes, so a loader nothing downstream reads is never
+    loaded and its model file is not a dependency at all — it is a leftover from whichever
+    parent graph the export was cut out of. Building a dependency list from
+    ``graph.values()`` therefore declares files the task never touches, and a pre-flight
+    built on that list refuses to run on a machine that is perfectly capable of the work.
+
+    ``roots`` are the ids the caller knows to be outputs. Passed in rather than detected,
+    because "is an output node" is a property of the node *class* — ``OUTPUT_NODE`` in
+    ComfyUI, which a payload does not carry — and guessing it from the graph would be the
+    same kind of inference this function exists to replace.
+    """
+    missing = [node_id for node_id in roots if node_id not in graph]
+    if missing:
+        raise ValueError(f"Not in this graph: {', '.join(sorted(missing))}")
+    reached: set[str] = set()
+    frontier = list(roots)
+    while frontier:
+        node_id = frontier.pop()
+        if node_id in reached:
+            continue
+        reached.add(node_id)
+        for value in graph[node_id].get("inputs", {}).values():
+            # The link shape ComfyUI's API format uses, and the only way one node names
+            # another. A bare string input that happens to look like a node id is a value,
+            # not an edge, so the length and the integer output index are both checked.
+            if (
+                isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], str)
+                and isinstance(value[1], int)
+                and not isinstance(value[1], bool)
+                and value[0] in graph
+            ):
+                frontier.append(value[0])
+    return reached
+
+
+#: The longest side ``ImageScaleToMaxDimension`` scales the source's frames to, from the
+#: export's ``INTConstant`` (node ``1991``, titled "LARGEST RESOLUTION"). Reproduced as a
+#: constant rather than exposed: it is the resolution the graph's evidence was produced at,
+#: and this adapter's job is to reach that graph rather than to retune it.
+#:
+#: Despite the sibling ``LatentUpscaleModelLoader`` sitting in the export, **there is no
+#: latent upscale in the executed path**. That loader is orphaned; the only resize here is
+#: this lanczos pixel-space scale ahead of the VAE encode.
+LTX25_ENHANCE_LARGEST_SIZE = 1920
+
+#: The sampling the export fixes, reproduced whole and deliberately not offered as controls.
+#: Exposing the sigmas, the detailer strength or the prompt is marked Ask First in the spec
+#: and has not been asked, so each is a constant here: three sigma steps, cfg 1 through a
+#: ``CFGGuider``, ``euler``, seed 0, and an **empty** prompt. Three steps at cfg 1 with an
+#: IC-LoRA detailer is a refinement pass rather than a generation — which is the whole reason
+#: the take being enhanced survives recognisably.
+LTX25_ENHANCE_SIGMAS = "0.909375, 0.725, 0.421875, 0.0"
+LTX25_ENHANCE_CFG = 1.0
+LTX25_ENHANCE_SAMPLER = "euler"
+LTX25_ENHANCE_SEED = 0
+LTX25_ENHANCE_PROMPT = ""
+
+#: The IC-LoRA that supplies the detail, and the strength the export applies it at.
+LTX25_ENHANCE_DETAILER_LORA = "ltx-2-19b-ic-lora-detailer.safetensors"
+LTX25_ENHANCE_DETAILER_STRENGTH = 0.9
+
+#: The three models the reachable subgraph loads besides the LoRA above. Named here so the
+#: payload can be built from them; the pre-flight still reads its file list *out of a built
+#: payload* rather than from this block — see ``tests/preflight_ltx25_enhance.py``. The audio
+#: VAE and the latent upscaler that also appear in the export are absent, and that is the
+#: point: nothing reachable from the output loads either one.
+LTX25_ENHANCE_UNET = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
+LTX25_ENHANCE_VIDEO_VAE = "ltx-2.5-video-vae-conv-bf16.safetensors"
+LTX25_ENHANCE_CLIP = "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
+
+#: The container extensions ``VHS_LoadVideoPath`` accepts, which the live schema publishes as
+#: ``video[1]["vhs_path_extensions"]``. Not this adapter's policy — refused locally only so a
+#: take in a container the node cannot open is named here instead of arriving as an opaque
+#: rejection from ``/prompt`` validation. ``tests/preflight_ltx25_enhance.py`` checks this
+#: tuple against the live schema rather than trusting it.
+LTX25_ENHANCE_SOURCE_EXTENSIONS = ("webm", "mp4", "mkv", "gif", "mov")
+
+
+def build_ltx25_enhance_payload(*, source_video: str, prefix: str) -> dict[str, dict[str, Any]]:
+    """Enhance an existing video through the standalone LTX 2.5 graph.
+
+    Derived from ``workflow_templates/reference_exports/ltx25-enhancer-user-export.json`` —
+    20 nodes of which **18 are reachable** from its single ``VHS_VideoCombine``. This builds
+    those 18 and no others. ``reachable_node_ids`` is the rule, and ``tests/test_workflows.py``
+    checks this payload against the export through it rather than against a list retyped here.
+
+    The two it does not build are ``VAELoaderKJ`` on ``ltx-2.5-audio-vae-bf16.safetensors``
+    and ``LatentUpscaleModelLoader`` on
+    ``ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors``. Both are orphans inherited
+    from the parent graph the export was cut from, and declaring either as a dependency would
+    make the pre-flight refuse a machine that can do this work. The second also misleads by
+    name: **no latent upscale runs here**. The executed path is ``ImageScaleToMaxDimension``
+    (lanczos, against ``LTX25_ENHANCE_LARGEST_SIZE``) → ``VAEEncodeTiled`` →
+    ``LTXVLoopingSampler`` → ``LTXVSpatioTemporalTiledVAEDecode``, and the detail comes from
+    the IC-LoRA.
+
+    **Nothing here regenerates the take.** ``source_video`` is loaded and re-sampled; there is
+    no MiniMax H3 node in this graph at all, and the only image entering the VAE encode is the
+    source's own frames.
+
+    **The audio is the source's**, straight from the loader's third output to the saver, with
+    no audio VAE, no audio decode and no synthesis anywhere in the graph. A source with no
+    audio track needs no special case: ``VHS_VideoCombine`` reads ``audio['waveform']`` inside
+    a ``try``, and an absent track leaves it unset, so the saver writes video only. Nothing can
+    invent a track because nothing here can produce one.
+
+    **The output frame count is not claimed to equal the input's.** Two things in this path can
+    change it and neither is predicted here: the loader's ``format="LTXV"`` conforms the loaded
+    frames to the node's own grid, and ``LTXVLoopingSampler`` tiles temporally (tile 56, overlap
+    24). The reference chain's LTX stage turned 192 frames into 185. Measure the result with
+    ``ffprobe``; do not assume.
+
+    Two node classes are substituted for schema-visibility, both stated because an unstated
+    substitution is the part that would mislead:
+
+    * ``VHS_LoadVideo`` → ``VHS_LoadVideoPath``. The export's loader takes a filename from a
+      combo of ComfyUI's *input* directory, which live ``/object_info`` publishes empty on this
+      installation. A rendered take lives under ComfyUI's **output** directory, so there is no
+      filename that node could be given. ``VHS_LoadVideoPath`` is the same loader with a
+      ``STRING`` path — identical outputs in identical order (``IMAGE``, ``frame_count``,
+      ``audio``, ``video_info``), so the wiring is unchanged.
+    * ``Power Lora Loader (rgthree)`` → ``LoraLoader``. Live ``/object_info`` declares *no*
+      ``lora_*`` inputs on the rgthree loader — its rows are client-side widgets — so a
+      faithful copy would put the filename and the strength where the pre-flight cannot see
+      them, which is the reasoning ``build_h3_reference_payload`` already records for its own
+      substitution. ``LoraLoader`` is used rather than that function's ``LoraLoaderModelOnly``
+      because this graph draws **both** the model and the CLIP through the loader, and one
+      enabled rgthree row with a single strength applies that strength to both. The cost is the
+      same one stated there: this adapter is evidenced in its *values* and not in that node's
+      wiring.
+    """
+    if not isinstance(source_video, str) or not source_video.strip():
+        raise ValueError("An LTX 2.5 enhancement needs a source video path")
+    # VHS strips surrounding whitespace and one leading/trailing quote off the path before
+    # opening it (``utils.strip_path``). The file a caller checked on disk and the file the
+    # node then opens must be the same one, so a value that would be rewritten is refused
+    # rather than silently repointed.
+    if source_video != source_video.strip().strip('"'):
+        raise ValueError(
+            f"The source video path must not be quoted or padded: VHS would rewrite "
+            f"{source_video!r} before opening it"
+        )
+    extension = source_video.rsplit(".", 1)[-1].lower() if "." in source_video else ""
+    if extension not in LTX25_ENHANCE_SOURCE_EXTENSIONS:
+        raise ValueError(
+            f"LTX 2.5 enhancement reads {', '.join(LTX25_ENHANCE_SOURCE_EXTENSIONS)}; "
+            f"{source_video} is not one of those"
+        )
+    return {
+        "mvp:source": {
+            "class_type": "VHS_LoadVideoPath",
+            "inputs": {
+                "video": source_video,
+                "force_rate": 0,
+                "custom_width": 0,
+                "custom_height": 0,
+                "frame_load_cap": 0,
+                "skip_first_frames": 0,
+                "select_every_nth": 1,
+                "format": "LTXV",
+            },
+        },
+        # The source's own timing, read back off the loader. Both the saver's frame rate and
+        # the LTX conditioning's take it from here, exactly as the export does, so a 24 fps
+        # take is enhanced and written at 24 fps without this adapter guessing a number.
+        "mvp:source_info": {
+            "class_type": "VHS_VideoInfo",
+            "inputs": {"video_info": ["mvp:source", 3]},
+        },
+        "mvp:largest_size": {
+            "class_type": "INTConstant",
+            "inputs": {"value": LTX25_ENHANCE_LARGEST_SIZE},
+        },
+        "mvp:scale": {
+            "class_type": "ImageScaleToMaxDimension",
+            "inputs": {
+                "upscale_method": "lanczos",
+                "largest_size": ["mvp:largest_size", 0],
+                "image": ["mvp:source", 0],
+            },
+        },
+        "mvp:model": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": LTX25_ENHANCE_UNET, "weight_dtype": "default"},
+        },
+        "mvp:clip": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": LTX25_ENHANCE_CLIP, "type": "ltxv", "device": "default"},
+        },
+        "mvp:video_vae": {
+            "class_type": "VAELoaderKJ",
+            "inputs": {
+                "vae_name": LTX25_ENHANCE_VIDEO_VAE,
+                "device": "main_device",
+                "weight_dtype": "bf16",
+            },
+        },
+        "mvp:detailer": {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "model": ["mvp:model", 0],
+                "clip": ["mvp:clip", 0],
+                "lora_name": LTX25_ENHANCE_DETAILER_LORA,
+                "strength_model": LTX25_ENHANCE_DETAILER_STRENGTH,
+                "strength_clip": LTX25_ENHANCE_DETAILER_STRENGTH,
+            },
+        },
+        "mvp:prompt": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": LTX25_ENHANCE_PROMPT, "clip": ["mvp:detailer", 1]},
+        },
+        # One encode feeds both sides, as the export does: at cfg 1 the guider never evaluates
+        # a separate negative branch, so a second empty encode would cost time and change
+        # nothing.
+        "mvp:conditioning": {
+            "class_type": "LTXVConditioning",
+            "inputs": {
+                "frame_rate": ["mvp:source_info", 0],
+                "positive": ["mvp:prompt", 0],
+                "negative": ["mvp:prompt", 0],
+            },
+        },
+        "mvp:guider": {
+            "class_type": "CFGGuider",
+            "inputs": {
+                "cfg": LTX25_ENHANCE_CFG,
+                "model": ["mvp:detailer", 0],
+                "positive": ["mvp:conditioning", 0],
+                "negative": ["mvp:conditioning", 1],
+            },
+        },
+        "mvp:sigmas": {
+            "class_type": "ManualSigmas",
+            "inputs": {"sigmas": LTX25_ENHANCE_SIGMAS},
+        },
+        "mvp:sampler": {
+            "class_type": "KSamplerSelect",
+            "inputs": {"sampler_name": LTX25_ENHANCE_SAMPLER},
+        },
+        "mvp:noise": {
+            "class_type": "RandomNoise",
+            "inputs": {"noise_seed": LTX25_ENHANCE_SEED},
+        },
+        "mvp:encode": {
+            "class_type": "VAEEncodeTiled",
+            "inputs": {
+                "tile_size": 512,
+                "overlap": 64,
+                "temporal_size": 500,
+                "temporal_overlap": 4,
+                "pixels": ["mvp:scale", 0],
+                "vae": ["mvp:video_vae", 0],
+            },
+        },
+        # The encoded source is fed twice on purpose: as the latents being sampled and as
+        # ``optional_guiding_latents``, which is what makes this an enhancement *of that take*
+        # rather than a generation that happens to start near it. Guiding latents are the
+        # node's own documented pairing with an IC-LoRA.
+        "mvp:sample": {
+            "class_type": "LTXVLoopingSampler",
+            "inputs": {
+                "temporal_tile_size": 56,
+                "temporal_overlap": 24,
+                "guiding_strength": 1,
+                "temporal_overlap_cond_strength": 0.5,
+                "cond_image_strength": 1,
+                "horizontal_tiles": 1,
+                "vertical_tiles": 1,
+                "spatial_overlap": 1,
+                "adain_factor": 0,
+                "guiding_start_step": 0,
+                "guiding_end_step": 1000,
+                "optional_cond_image_indices": "0",
+                "model": ["mvp:detailer", 0],
+                "vae": ["mvp:video_vae", 0],
+                "noise": ["mvp:noise", 0],
+                "sampler": ["mvp:sampler", 0],
+                "sigmas": ["mvp:sigmas", 0],
+                "guider": ["mvp:guider", 0],
+                "latents": ["mvp:encode", 0],
+                "optional_guiding_latents": ["mvp:encode", 0],
+            },
+        },
+        "mvp:decode": {
+            "class_type": "LTXVSpatioTemporalTiledVAEDecode",
+            "inputs": {
+                "spatial_tiles": 4,
+                "spatial_overlap": 4,
+                "temporal_tile_length": 48,
+                "temporal_overlap": 8,
+                "last_frame_fix": False,
+                "working_device": "auto",
+                "working_dtype": "auto",
+                "vae": ["mvp:video_vae", 0],
+                "latents": ["mvp:sample", 0],
+            },
+        },
+        "mvp:save": {
+            "class_type": "VHS_VideoCombine",
+            "inputs": {
+                "frame_rate": ["mvp:source_info", 0],
+                "loop_count": 0,
+                "filename_prefix": prefix,
+                "format": "video/h264-mp4",
+                "pix_fmt": "yuv420p",
+                "crf": 19,
+                "save_metadata": True,
+                "trim_to_audio": False,
+                "pingpong": False,
+                "save_output": True,
+                "images": ["mvp:decode", 0],
+                # The source's audio, carried through untouched. This is the *only* audio in
+                # the graph: there is no audio VAE and no audio decode anywhere in it.
+                "audio": ["mvp:source", 2],
+            },
         },
     }

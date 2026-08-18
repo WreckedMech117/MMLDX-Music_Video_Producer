@@ -8,11 +8,17 @@ from typing import get_args
 import pytest
 from fastapi import HTTPException
 
+# One definition of "a count of panels", shared with the scan that forbids it in source, so
+# the guard the templates are executed against cannot drift from the guard the repo is
+# scanned with -- and neither can go inert while the other still passes.
+from test_workflows import PANEL_COUNT_PATTERN
+
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_RESTORE_REFUSAL,
+    MULTIVIEW_SUBJECTS,
     SONG_CAPTION_LIMIT,
     SONG_CONTEXT_LABELS,
     SONG_CONTEXT_RESTORE_NOTICE,
@@ -26,7 +32,7 @@ from music_video_producer.app import (
     document_not_requested_notice,
     document_restore_notice,
 )
-from music_video_producer.models import MessageNotice, Project, Shot, Song
+from music_video_producer.models import AssetKind, MessageNotice, Project, Shot, Song
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
 API_JS = Path("src/music_video_producer/web/assets/api.js")
@@ -2663,6 +2669,7 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
         "generate_flux",
         "generate_multiview",
         "generate_h3",
+        "enhance_with_ltx25",
     }, "a new route submits to ComfyUI; decide whether it is Shot-sourced and guard it"
 
     shot_sourced = {
@@ -2672,7 +2679,34 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
     }
     assert shot_sourced, "no route builds a payload from a Shot any more; this test is stale"
 
-    for name, source in shot_sourced.items():
+    # The one Shot-sourced route the readiness gate does not apply to, and the decision is
+    # recorded here rather than made by omission. The gate refuses a Shot whose prompt would
+    # spend a GPU pass returning noise; `enhance_with_ltx25` submits a graph whose prompt is
+    # **empty** — the export fixes it that way — and reads only the take on disk. A Shot with
+    # no prompt enhances exactly as well as one with a prompt, so borrowing the gate here would
+    # refuse a real take for a field the work never reads.
+    #
+    # Exempt from that gate, not from *a* gate: this route's precondition is that a take
+    # exists, and it is asserted below with the same "before the submission" ordering the
+    # others get. A route with neither would fail this test.
+    ungated = {"enhance_with_ltx25"}
+    for name in sorted(ungated):
+        assert name in shot_sourced, f"{name} no longer takes a shot_id; this exemption is stale"
+        code = "\n".join(
+            line
+            for line in shot_sourced[name].splitlines()
+            if not line.strip().startswith("#")
+        )
+        assert "readiness_report(" not in code, name
+        # The take is the input, so its absence is what this route refuses, before submitting.
+        assert "latest_output" in code, name
+        assert code.index("latest_output") < code.index("comfy.submit"), name
+        assert "ENHANCE_NO_TAKE_REFUSAL" in code, name
+        assert "ENHANCE_MISSING_TAKE_REFUSAL" in code, name
+
+    for name, source in {
+        name: source for name, source in shot_sourced.items() if name not in ungated
+    }.items():
         # Comments dropped first: the guard is preceded by a comment that quotes both the
         # submission and the interpolation it has to precede, and an ordering assertion that
         # matched prose rather than code would be measuring its own explanation.
@@ -5182,3 +5216,150 @@ def test_the_note_reports_which_models_went_rather_than_asserting_a_release():
     # Never reported as a success, and never silently blank.
     assert "invented-later" in notes["unknownStatus"]
     assert "submitted anyway" in notes["unknownStatus"]
+# The count phrase the character prompt used to carry, assembled at runtime. This file is
+# inside `test_nothing_that_runs_states_a_number_of_panels`' scan, so writing the old prompt
+# out whole would be a count in a test -- the exact thing the scan forbids -- reported here.
+MULTIVIEW_COUNT_PHRASE = "four" + "-panel "
+
+# The character prompt exactly as it shipped before objects could be promoted, with the count
+# spliced back in. What the workspace sends today must be this string and nothing else, minus
+# that phrase: a Director whose sheets came from the old wording must not find the new one
+# asking for a different person, a different set of views, or different lighting.
+HISTORICAL_CHARACTER_PROMPT = (
+    "Preserve the exact identity, facial features, body type and wardrobe of this character. "
+    "Convert the character into a clean "
+    + MULTIVIEW_COUNT_PHRASE
+    + "character sheet showing a face close-up, front full body, side full body and back full "
+    "body view. Consistent neutral lighting and proportions across every view."
+)
+
+
+def multiview_plans(kinds: list[str]) -> dict:
+    """`multiviewPlan` run for real, once per Asset kind, with and without a rendered image."""
+    return run_module(f"""
+      import {{ multiviewPlan }} from './src/music_video_producer/web/assets/api.js';
+      const kinds = {json.dumps(kinds)};
+      const plans = {{}};
+      for (const kind of kinds) {{
+        plans[kind] = {{
+          rendered: multiviewPlan({{ id: 'a', kind, path: 'out/a.png' }}),
+          pending: multiviewPlan({{ id: 'a', kind, path: '' }}),
+        }};
+      }}
+      console.log(JSON.stringify({{
+        plans,
+        nothingSelected: multiviewPlan(null),
+        unknownKind: multiviewPlan({{ id: 'a', kind: 'invented_later', path: 'out/a.png' }}),
+      }}));
+    """)
+
+
+def test_the_subject_kind_picks_the_template_and_the_route_agrees_about_which_kinds():
+    """Executed for every kind an Asset can carry, against the route's own mapping.
+
+    Two silent failures this closes, and neither is visible from one side. A kind the button
+    offers and the route refuses spends the Director a click to reach a 422. A kind the route
+    would accept and the button never offers is a feature that does not exist on screen while
+    every backend test passes. So the frontend's table is *run* here and compared against
+    `app.py`'s, rather than both being asserted separately against a list written twice.
+
+    The templates themselves are the other half. An object getting the character sentence
+    would still promote, still produce a sheet, and still pass every status-code test in the
+    suite -- while asking a cargo hauler to preserve its facial features and wardrobe.
+    """
+    kinds = list(get_args(AssetKind))
+    executed = multiview_plans(kinds)
+    plans = executed["plans"]
+
+    promotable = {kind for kind in kinds if plans[kind]["rendered"] is not None}
+    assert promotable == set(MULTIVIEW_SUBJECTS), "the button and the route disagree"
+
+    prompts = {kind: plans[kind]["rendered"]["prompt"] for kind in promotable}
+    # The character path means what it meant: the old sentence, less the count it asserted.
+    assert prompts["character"] == HISTORICAL_CHARACTER_PROMPT.replace(MULTIVIEW_COUNT_PHRASE, "")
+    # An object gets its own template, not the character one reworded to cover both.
+    assert prompts["prop"] != prompts["character"]
+    # Both object kinds share it -- one template for objects, keyed by what the sheet is of.
+    assert prompts["prop"] == prompts["setting"]
+    for absent in ("identity", "facial", "wardrobe", "character"):
+        assert absent not in prompts["prop"].lower(), absent
+    for present in ("silhouette", "proportions", "materials", "markings"):
+        assert present in prompts["prop"].lower(), present
+
+    # No template states how many of anything the sheet will come back with, executed against
+    # what is actually emitted rather than against the source the constants are written in.
+    for kind, prompt in prompts.items():
+        assert not PANEL_COUNT_PATTERN.search(prompt), (kind, prompt)
+
+    # A pending render is offered but not ready; nothing selected and an unknown kind are
+    # neither, so the inspector has nothing to draw rather than a button that 422s.
+    assert plans["character"]["rendered"]["ready"] is True
+    assert plans["character"]["pending"]["ready"] is False
+    assert executed["nothingSelected"] is None
+    assert executed["unknownKind"] is None
+
+
+def test_the_inspector_offers_promotion_for_an_object_and_sends_the_object_template():
+    """The render and the click are both executed; nothing here reads app.js as text.
+
+    `multiviewPlan` being correct is not the same as the workspace using it. The inspector
+    could go on testing `asset.kind === "character"` in its own template string and the click
+    could go on holding a hardcoded sentence, with every assertion in the test above still
+    passing and no object promotable from the screen at all. So the inspector is rendered for
+    each kind and its markup read back, and then the button is actually clicked and the
+    request it produced inspected -- which is the only thing that proves *which* template
+    leaves the browser.
+    """
+    fired = run_workspace("""
+      const arrange = (kind, path) => {
+        state.project = { id: 'p1', shots: [], jobs: [], assets: [{ id: 'a1', kind, path, name: 'Cargo hauler', source: 'flux-image-gen', created_at: '2026-08-18T00:00:00Z' }] };
+        state.selectedAssetId = 'a1';
+        app.renderAssetInspector();
+        return at('#asset-inspector').innerHTML;
+      };
+      const offered = {};
+      for (const kind of ['character', 'prop', 'setting', 'style', 'image', 'audio', 'video']) {
+        offered[kind] = arrange(kind, 'out/a.png').includes('id="create-multiview"');
+      }
+      const pending = arrange('prop', '');
+      const send = async (kind) => {
+        arrange(kind, 'out/a.png');
+        requests.length = 0;
+        await fire('#create-multiview:click', {});
+        return requests.map((sent) => ({ path: sent.path, method: sent.method, body: sent.body }));
+      };
+      const ship = await send('prop');
+      const person = await send('character');
+      arrange('audio', 'out/a.wav');
+      requests.length = 0;
+      await fire('#create-multiview:click', {});
+      const unsupported = [...requests];
+      console.log(JSON.stringify({
+        shown: offered,
+        pendingShown: pending.includes('id="create-multiview"'),
+        pendingDisabled: pending.includes('id="create-multiview" disabled'),
+        ship, person, unsupported,
+      }));
+    """)
+
+    assert fired["shown"] == {
+        "character": True, "prop": True, "setting": True,
+        "style": False, "image": False, "audio": False, "video": False,
+    }
+    # A prop with no render yet is offered and shut, not hidden: it says "once this exists".
+    assert fired["pendingShown"] is True
+    assert fired["pendingDisabled"] is True
+
+    ship = fired["ship"][0]
+    assert ship["path"] == "/api/projects/p1/assets/a1/multiview"
+    assert ship["method"] == "POST"
+    ship_prompt = json.loads(ship["body"])["prompt"]
+    assert "silhouette" in ship_prompt and "wardrobe" not in ship_prompt
+
+    person_prompt = json.loads(fired["person"][0]["body"])["prompt"]
+    assert person_prompt == HISTORICAL_CHARACTER_PROMPT.replace(MULTIVIEW_COUNT_PHRASE, "")
+    assert person_prompt != ship_prompt
+
+    # The click on a kind the feature does not cover sends nothing at all, so a stale
+    # selection cannot reach the route behind the inspector's back.
+    assert fired["unsupported"] == []

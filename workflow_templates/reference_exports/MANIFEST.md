@@ -22,4 +22,12 @@ They are **reference evidence**, not graphs submitted directly by Music Video Pr
 
 Imported: 2026-08-16; the three exports above added 2026-08-18 from the Director's per-mode API exports.
 
+**One file here is a saved editor graph, not an API export.**
+
+| File | SHA-256 | Audit status |
+|---|---|---|
+| `krea2-charactersheet-user-export.json` | `ac36130b6be2caa4b624cf2b4739a142c3150a2f7001b7dcba49ee0a99bee399` | 45 nodes; **saved editor format** (`nodes`/`links`/`groups`, with a `mode` on every node) copied byte-identically from `J:\Hermes-Remote\comfyui\workflowsbackup\MusicVideo Pipeline (Advance)\Krea2_CharacterSheet-20260814.json`. Not API format and **never submittable** — it is here because the question it answers cannot be answered by an API export, which carries no `mode` field. Three `KSampler`s: node 53 is `mode: 0` and is the whole of the sheet path; nodes 146 and 172 are `mode: 4` (bypassed) and belong to an optional character-*portrait* generator in a group titled `2nd Sampling` at x ≈ -1129, while the `CharSheet-*` groups sit at positive x. **`Music-Video.md` beside it is wrong about this graph** and should not be built from: it calls the sheet "Three KSamplers", reads node 172's `denoise` 0.3 as CFG (widget order is seed, control, steps, cfg, sampler_name, scheduler, denoise; all three samplers are cfg 1.0), calls `res_multistep` the final pass when node 146 is the first of the bypassed pair, and states the QuadView LoRA "forces the 4-panel layout" when a 2026-08-18 probe asked for four views and got six. Its Resolution note says 1 MP is the sweet spot while the file's own `EmptySD3LatentImage` is 1536×1024 (1.57 MP), which is what the adapter emits |
+
+Added 2026-08-18, as the evidence for the single-pass pin in `tests/test_workflows.py`.
+
 **A caution about the wider 2026-08-17 export set.** The Director separated the nested subgraphs into per-mode API graphs under `J:\Hermes-Remote\comfyui\workflowsbackup\API-Workflows`. Several of the smaller ones carry **orphaned loader nodes** — `LTX2.5 AudioReplacer` has 8 nodes of which only 3 (`LoadAudio`, `VHS_LoadVideo`, `VHS_VideoCombine`) are reachable from its output, and `LTX2.5 VideoSlicer` has 9 of which 3 are reachable. The rest are UNET/VAE/CLIP loaders inherited from the parent graph. ComfyUI will not execute them, but any adapter built from these files must be derived from the *reachable* subgraph rather than from the node list, or it will declare model dependencies the task does not need.

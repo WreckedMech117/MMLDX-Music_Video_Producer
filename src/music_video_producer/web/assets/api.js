@@ -1304,6 +1304,47 @@ export function vramEjectToast(status) {
     : "The language model will be left loaded. Renders share the card with it.";
 }
 
+// The default prompt a character is promoted with. Word for word what it has always been,
+// less the two characters of "four-panel ": a probe asked the QuadView LoRA for four views
+// and it returned six, so that phrase was a claim about the output rather than a request
+// for it. Everything the sentence *asks* for is untouched — the same identity clause, the
+// same four named views, the same lighting and proportion constraint — because sheets an
+// existing Director already has must not come back as a different person.
+export const MULTIVIEW_CHARACTER_PROMPT = `Preserve the exact identity, facial features, body type and wardrobe of this character. Convert the character into a clean character sheet showing a face close-up, front full body, side full body and back full body view. Consistent neutral lighting and proportions across every view.`;
+
+// Its own template, not the character one with the nouns swapped. An object has no face,
+// no wardrobe and no front/back asymmetry to hold, and the things that do have to hold —
+// silhouette, materials, livery, the scale of one part against another — have no wording in
+// the character sentence at all. The views are the ones the ship probe asked for and got.
+export const MULTIVIEW_OBJECT_PROMPT = `Preserve the exact design, silhouette, proportions, materials, colour and surface markings of this object. Convert the object into a clean reference sheet showing a front view, a three-quarter view, a side view and a rear view of the whole object. Consistent neutral lighting, consistent scale and identical detailing across every view, against a plain neutral background.`;
+
+// Which Asset kinds can be promoted, and what each is promoted with. `app.py`'s
+// MULTIVIEW_SUBJECTS is the route half and holds the same kinds; a contract test runs both
+// and fails if they drift, because the two failure modes — a button whose route refuses it,
+// and a promotable kind with no button — are both invisible from either side alone.
+//
+// Neither template names a number of panels or views, and nothing that reads them counts:
+// the sheet is handed to Krea whole and comes back whole.
+export const MULTIVIEW_SUBJECTS = {
+  character: MULTIVIEW_CHARACTER_PROMPT,
+  prop: MULTIVIEW_OBJECT_PROMPT,
+  setting: MULTIVIEW_OBJECT_PROMPT,
+};
+
+// The one decision behind the promote control: may this asset be promoted, is it ready to
+// be, and with what. Returns null for a kind the feature does not cover, so the inspector
+// omits the button entirely rather than offering one the route answers with a 422.
+//
+// A pure function rather than an expression inside the inspector's template string, so the
+// rule can be executed by a test for every kind an Asset can carry instead of read.
+export function multiviewPlan(asset) {
+  const prompt = asset && MULTIVIEW_SUBJECTS[asset.kind];
+  if (!prompt) return null;
+  // `path` is empty until the source render lands. The button is shown but shut, which says
+  // "this can be promoted, once it exists" — omitting it would say the wrong thing.
+  return { prompt, ready: Boolean(asset.path) };
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.

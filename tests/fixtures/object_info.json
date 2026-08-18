@@ -129,6 +129,70 @@
     "python_module": "comfy_extras.nodes_custom_sampler",
     "search_aliases": null
   },
+  "CFGGuider": {
+    "api_node": false,
+    "category": "model/sampling/guiders",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "CFG Guider",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "cfg": [
+          "FLOAT",
+          {
+            "default": 8.0,
+            "max": 100.0,
+            "min": 0.0,
+            "round": 0.01,
+            "step": 0.1
+          }
+        ],
+        "model": [
+          "MODEL",
+          {}
+        ],
+        "negative": [
+          "CONDITIONING",
+          {}
+        ],
+        "positive": [
+          "CONDITIONING",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "model",
+        "positive",
+        "negative",
+        "cfg"
+      ]
+    },
+    "is_input_list": false,
+    "name": "CFGGuider",
+    "output": [
+      "GUIDER"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "GUIDER"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_custom_sampler",
+    "search_aliases": null
+  },
   "CLIPLoader": {
     "category": "model/loaders",
     "description": "Recipes:\nsd: clip-l\nstable cascade: clip-g\nsd3: t5 xxl / clip-g / clip-l\nstable audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\nhidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B\njoyimage: qwen3-vl 8B\nlens: gpt-oss-20b\npixeldit: gemma 2 2B elm\nminimax: MiniMax H3 Qwen3-VL or Music3 Qwen/RVQ",
@@ -229,6 +293,62 @@
     "python_module": "nodes",
     "search_aliases": []
   },
+  "CLIPTextEncode": {
+    "category": "model/conditioning",
+    "description": "Encodes a text prompt using a CLIP model into an embedding that can be used to guide the diffusion model towards generating specific images.",
+    "display_name": "CLIP Text Encode (Prompt)",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "clip": [
+          "CLIP",
+          {
+            "tooltip": "The CLIP model used for encoding the text."
+          }
+        ],
+        "text": [
+          "STRING",
+          {
+            "dynamicPrompts": true,
+            "multiline": true,
+            "tooltip": "The text to be encoded."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "text",
+        "clip"
+      ]
+    },
+    "is_input_list": false,
+    "name": "CLIPTextEncode",
+    "output": [
+      "CONDITIONING"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "CONDITIONING"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      "A conditioning containing the embedded text used to guide the diffusion model."
+    ],
+    "python_module": "nodes",
+    "search_aliases": [
+      "text",
+      "prompt",
+      "text prompt",
+      "positive prompt",
+      "negative prompt",
+      "encode text",
+      "text encoder",
+      "encode prompt"
+    ]
+  },
   "ConditioningZeroOut": {
     "category": "model/conditioning/transform",
     "description": "",
@@ -319,6 +439,114 @@
     ],
     "price_badge": null,
     "python_module": "comfy_extras.nodes_minimax_music",
+    "search_aliases": null
+  },
+  "INTConstant": {
+    "category": "KJNodes/constants",
+    "description": "",
+    "display_name": "INT Constant",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "value": [
+          "INT",
+          {
+            "default": 0,
+            "max": 18446744073709551615,
+            "min": -18446744073709551615
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "value"
+      ]
+    },
+    "is_input_list": false,
+    "name": "INTConstant",
+    "output": [
+      "INT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "value"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": [
+      "integer",
+      "value"
+    ]
+  },
+  "ImageScaleToMaxDimension": {
+    "api_node": false,
+    "category": "image/upscaling",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "Scale Image to Max Dimension",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "image": [
+          "IMAGE",
+          {}
+        ],
+        "largest_size": [
+          "INT",
+          {
+            "default": 512,
+            "max": 16384,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "upscale_method": [
+          "COMBO",
+          {
+            "multiselect": false,
+            "options": [
+              "area",
+              "lanczos",
+              "bilinear",
+              "nearest-exact",
+              "bilinear",
+              "bicubic"
+            ]
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "image",
+        "upscale_method",
+        "largest_size"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ImageScaleToMaxDimension",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "IMAGE"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_images",
     "search_aliases": null
   },
   "KSampler": {
@@ -632,6 +860,515 @@
     "python_module": "comfy_extras.nodes_custom_sampler",
     "search_aliases": null
   },
+  "LTXVConditioning": {
+    "api_node": false,
+    "category": "model/conditioning/ltxv",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "frame_rate": [
+          "FLOAT",
+          {
+            "default": 25.0,
+            "max": 1000.0,
+            "min": 0.0,
+            "step": 0.01
+          }
+        ],
+        "negative": [
+          "CONDITIONING",
+          {}
+        ],
+        "positive": [
+          "CONDITIONING",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "positive",
+        "negative",
+        "frame_rate"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVConditioning",
+    "output": [
+      "CONDITIONING",
+      "CONDITIONING"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "positive",
+      "negative"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt",
+    "search_aliases": null
+  },
+  "LTXVLoopingSampler": {
+    "category": "sampling",
+    "description": "",
+    "display_name": "\ud83c\udd5b\ud83c\udd63\ud83c\udd67 LTXV Looping Sampler",
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "adain_factor": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "max": 1.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "The strength of the AdaIn operation used to fix the statistics of each new generated temporal tile, to prevent accumulated oversaturation."
+          }
+        ],
+        "guiding_end_step": [
+          "INT",
+          {
+            "default": 1000,
+            "max": 1000,
+            "min": 0,
+            "tooltip": "The step at which the guiding latents stop to be used."
+          }
+        ],
+        "guiding_start_step": [
+          "INT",
+          {
+            "default": 0,
+            "max": 1000,
+            "min": 0,
+            "tooltip": "The step at which the guiding latents start to be used."
+          }
+        ],
+        "optional_cond_image_indices": [
+          "STRING",
+          {
+            "default": "0",
+            "tooltip": "The indices of the keyframes to use for the sampling, separated by commas. The indices are counted from the end of the video."
+          }
+        ],
+        "optional_cond_images": [
+          "IMAGE",
+          {
+            "tooltip": "The image to use for conditioning the first frame in the video (i2v setup). If not provided, the first frame will be unconditioned (t2v setup). The image will be resized to the size of the first frame."
+          }
+        ],
+        "optional_guiding_latents": [
+          "LATENT",
+          {
+            "tooltip": "The latents to use for guiding the sampling, typically with an IC-LoRA."
+          }
+        ],
+        "optional_negative_index_latents": [
+          "LATENT",
+          {
+            "tooltip": "Special optional latents to condition on a negative index before each new temporal tile as a way to provide long term context during video generation."
+          }
+        ],
+        "optional_normalizing_latents": [
+          "LATENT",
+          {
+            "tooltip": "The latents to use for normalizing the output latents, they will be used to normalize the output latents to the same statistics as the input latents."
+          }
+        ],
+        "optional_positive_conditionings": [
+          "CONDITIONING",
+          {
+            "tooltip": "Optional way to provide changing positive prompts, one per temporal tile, using the MultiPromptProvider node."
+          }
+        ]
+      },
+      "required": {
+        "cond_image_strength": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 1.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "The strength of the conditioning on the optional_cond_images."
+          }
+        ],
+        "guider": [
+          "GUIDER",
+          {
+            "tooltip": "The guider to use, must be a STGGuiderAdvanced."
+          }
+        ],
+        "guiding_strength": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 1.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "The strength of the conditioning on guiding latents, when optional_guiding_latents are provided."
+          }
+        ],
+        "horizontal_tiles": [
+          "INT",
+          {
+            "default": 1,
+            "max": 6,
+            "min": 1,
+            "tooltip": "Number of horizontal spatial tiles."
+          }
+        ],
+        "latents": [
+          "LATENT",
+          {
+            "tooltip": "The latents to use for creating the long video, they can be guiding latents or empty latents when no guidance is used."
+          }
+        ],
+        "model": [
+          "MODEL",
+          {
+            "tooltip": "The diffusion model to use."
+          }
+        ],
+        "noise": [
+          "NOISE",
+          {
+            "tooltip": "The noise to use."
+          }
+        ],
+        "sampler": [
+          "SAMPLER",
+          {
+            "tooltip": "The sampler to use."
+          }
+        ],
+        "sigmas": [
+          "SIGMAS",
+          {
+            "tooltip": "The sigmas to use."
+          }
+        ],
+        "spatial_overlap": [
+          "INT",
+          {
+            "default": 1,
+            "max": 8,
+            "min": 1,
+            "tooltip": "Overlap between spatial tiles."
+          }
+        ],
+        "temporal_overlap": [
+          "INT",
+          {
+            "default": 24,
+            "max": 80,
+            "min": 16,
+            "step": 8,
+            "tooltip": "The overlap between the temporal tiles, in pixel frames."
+          }
+        ],
+        "temporal_overlap_cond_strength": [
+          "FLOAT",
+          {
+            "default": 0.5,
+            "max": 1.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "The strength of the conditioning on the latents from the previous temporal tile."
+          }
+        ],
+        "temporal_tile_size": [
+          "INT",
+          {
+            "default": 80,
+            "max": 1000,
+            "min": 24,
+            "step": 8,
+            "tooltip": "The size of the temporal tile to use for the sampling, in pixel frames, in addition to the overlapping region."
+          }
+        ],
+        "vae": [
+          "VAE",
+          {
+            "tooltip": "The VAE to use."
+          }
+        ],
+        "vertical_tiles": [
+          "INT",
+          {
+            "default": 1,
+            "max": 6,
+            "min": 1,
+            "tooltip": "Number of vertical spatial tiles."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "optional_cond_images",
+        "optional_guiding_latents",
+        "adain_factor",
+        "optional_positive_conditionings",
+        "optional_negative_index_latents",
+        "guiding_start_step",
+        "guiding_end_step",
+        "optional_cond_image_indices",
+        "optional_normalizing_latents"
+      ],
+      "required": [
+        "model",
+        "vae",
+        "noise",
+        "sampler",
+        "sigmas",
+        "guider",
+        "latents",
+        "temporal_tile_size",
+        "temporal_overlap",
+        "guiding_strength",
+        "temporal_overlap_cond_strength",
+        "cond_image_strength",
+        "horizontal_tiles",
+        "vertical_tiles",
+        "spatial_overlap"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVLoopingSampler",
+    "output": [
+      "LATENT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "denoised_output"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-LTXVideo",
+    "search_aliases": []
+  },
+  "LTXVSpatioTemporalTiledVAEDecode": {
+    "category": "latent",
+    "description": "",
+    "display_name": "\ud83c\udd5b\ud83c\udd63\ud83c\udd67 LTXV Spatio Temporal Tiled VAE Decode",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "last_frame_fix": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "If true, the last frame will be repeated and discarded after the decoding."
+          }
+        ],
+        "latents": [
+          "LATENT",
+          {
+            "tooltip": "The latent samples to decode."
+          }
+        ],
+        "spatial_overlap": [
+          "INT",
+          {
+            "default": 1,
+            "max": 8,
+            "min": 0,
+            "tooltip": "The overlap between the spatial tiles. (in latent frames)"
+          }
+        ],
+        "spatial_tiles": [
+          "INT",
+          {
+            "default": 4,
+            "max": 8,
+            "min": 1,
+            "tooltip": "The number of spatial tiles to use, horizontal and vertical."
+          }
+        ],
+        "temporal_overlap": [
+          "INT",
+          {
+            "default": 1,
+            "max": 8,
+            "min": 0,
+            "tooltip": "The overlap between the temporal tiles, in latent frames."
+          }
+        ],
+        "temporal_tile_length": [
+          "INT",
+          {
+            "default": 16,
+            "max": 1000,
+            "min": 2,
+            "tooltip": "The length of the temporal tile to use for the sampling, in latent frames, including the overlapping region."
+          }
+        ],
+        "vae": [
+          "VAE",
+          {
+            "tooltip": "The VAE to use."
+          }
+        ],
+        "working_device": [
+          [
+            "cpu",
+            "auto"
+          ],
+          {
+            "default": "auto",
+            "tooltip": "The device to use for the decoding. auto->same as the latents."
+          }
+        ],
+        "working_dtype": [
+          [
+            "float16",
+            "float32",
+            "auto"
+          ],
+          {
+            "default": "auto",
+            "tooltip": "The data type to use for the decoding. auto->same as the latents."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "vae",
+        "latents",
+        "spatial_tiles",
+        "spatial_overlap",
+        "temporal_tile_length",
+        "temporal_overlap",
+        "last_frame_fix",
+        "working_device",
+        "working_dtype"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVSpatioTemporalTiledVAEDecode",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "image"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-LTXVideo",
+    "search_aliases": []
+  },
+  "LoraLoader": {
+    "category": "model/loaders",
+    "description": "This LoRA loader is used to modify both diffusion and CLIP models, altering the way in which latents are denoised such as applying styles. Multiple LoRA nodes can be linked together.",
+    "display_name": "Load LoRA (Model and CLIP)",
+    "essentials_category": "Image Generation",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "clip": [
+          "CLIP",
+          {
+            "tooltip": "The CLIP model the LoRA will be applied to."
+          }
+        ],
+        "lora_name": [
+          [
+            "csetiarcane-nfjinx-v1-6000.safetensors",
+            "krea2\\Krea2-realism-V2.safetensors",
+            "krea2\\QuadView_krea2_v1.safetensors",
+            "ltx-2-19b-ic-lora-detailer.safetensors",
+            "ltx-2.3-22b-distilled-lora-384.safetensors",
+            "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+            "minimax_h3_turbo_4step_ckpt500_comfyui_pruned.safetensors",
+            "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors"
+          ],
+          {
+            "tooltip": "The name of the LoRA."
+          }
+        ],
+        "model": [
+          "MODEL",
+          {
+            "tooltip": "The diffusion model the LoRA will be applied to."
+          }
+        ],
+        "strength_clip": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 100.0,
+            "min": -100.0,
+            "step": 0.01,
+            "tooltip": "How strongly to modify the CLIP model. This value can be negative."
+          }
+        ],
+        "strength_model": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 100.0,
+            "min": -100.0,
+            "step": 0.01,
+            "tooltip": "How strongly to modify the diffusion model. This value can be negative."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "model",
+        "clip",
+        "lora_name",
+        "strength_model",
+        "strength_clip"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LoraLoader",
+    "output": [
+      "MODEL",
+      "CLIP"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_name": [
+      "MODEL",
+      "CLIP"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      "The modified diffusion model.",
+      "The modified CLIP model."
+    ],
+    "python_module": "nodes",
+    "search_aliases": [
+      "lora",
+      "load lora",
+      "apply lora",
+      "lora loader",
+      "lora model"
+    ]
+  },
   "LoraLoaderModelOnly": {
     "category": "model/loaders",
     "description": "This LoRAs loader is used to modify the diffusion model, altering the way in which latents are denoised such as applying styles. Multiple LoRA nodes can be linked together.",
@@ -910,6 +1647,55 @@
       "lyrics",
       "caption",
       "music3"
+    ]
+  },
+  "ManualSigmas": {
+    "api_node": false,
+    "category": "model/sampling/sigmas",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": true,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "sigmas": [
+          "STRING",
+          {
+            "default": "1, 0.5",
+            "multiline": false
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "sigmas"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ManualSigmas",
+    "output": [
+      "SIGMAS"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "SIGMAS"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_custom_sampler",
+    "search_aliases": [
+      "custom noise schedule",
+      "define sigmas"
     ]
   },
   "MiniMaxH3DirectorCS": {
@@ -2431,6 +3217,88 @@
       "latent to audio"
     ]
   },
+  "VAEEncodeTiled": {
+    "category": "model/latent",
+    "description": "",
+    "display_name": "VAE Encode (Tiled)",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "overlap": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 64,
+            "max": 4096,
+            "min": 0,
+            "step": 32
+          }
+        ],
+        "pixels": [
+          "IMAGE"
+        ],
+        "temporal_overlap": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 8,
+            "max": 4096,
+            "min": 4,
+            "step": 4,
+            "tooltip": "Only used for video VAEs: Amount of frames to overlap."
+          }
+        ],
+        "temporal_size": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 64,
+            "max": 4096,
+            "min": 8,
+            "step": 4,
+            "tooltip": "Only used for video VAEs: Amount of frames to encode at a time."
+          }
+        ],
+        "tile_size": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 512,
+            "max": 4096,
+            "min": 64,
+            "step": 64
+          }
+        ],
+        "vae": [
+          "VAE"
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "pixels",
+        "vae",
+        "tile_size",
+        "overlap",
+        "temporal_size",
+        "temporal_overlap"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VAEEncodeTiled",
+    "output": [
+      "LATENT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "LATENT"
+    ],
+    "output_node": false,
+    "python_module": "nodes",
+    "search_aliases": []
+  },
   "VAELoader": {
     "category": "model/loaders",
     "description": "",
@@ -2481,6 +3349,298 @@
     ],
     "output_node": false,
     "python_module": "nodes",
+    "search_aliases": []
+  },
+  "VAELoaderKJ": {
+    "category": "KJNodes/vae",
+    "description": "",
+    "display_name": "VAELoader KJ",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "device": [
+          [
+            "main_device",
+            "cpu"
+          ]
+        ],
+        "vae_name": [
+          [
+            "LTX23_audio_vae_bf16.safetensors",
+            "LTX23_video_vae_bf16.safetensors",
+            "LTX_vae.safetensors",
+            "ae.safetensors",
+            "ae.sft",
+            "hunyuan_video_vae_bf16.safetensors",
+            "ltx-2.5-audio-vae-bf16.safetensors",
+            "ltx-2.5-video-vae-bf16.safetensors",
+            "ltx-2.5-video-vae-conv-bf16.safetensors",
+            "minimax_h3_audio_vae_fp32.safetensors",
+            "minimax_h3_t1_image_vae_step1597.safetensors",
+            "minimax_h3_video_vae_fp16.safetensors",
+            "minimax_music3_dav.safetensors",
+            "qwen_image_vae.safetensors",
+            "taesd",
+            "taesdxl",
+            "taesd3",
+            "taef1",
+            "pixel_space"
+          ]
+        ],
+        "weight_dtype": [
+          [
+            "bf16",
+            "fp16",
+            "fp32"
+          ]
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "vae_name",
+        "device",
+        "weight_dtype"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VAELoaderKJ",
+    "output": [
+      "VAE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "VAE"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": []
+  },
+  "VHS_LoadVideoPath": {
+    "category": "Video Helper Suite \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "description": "Load Video (Path) \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62<div style=\"font-size: 0.8em\"><div id=VHS_shortdesc>Loads a video from an arbitrary path</div></div><div style=\"font-size: 0.8em\"><div vhs_title=\"Inputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Inputs: <div vhs_title=\"meta_batch\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">meta_batch: (optional) Connect to a Meta Batch manager to divide extremely long sequences into sub batches. See the documentation for Meta Batch Manager</div></div><div vhs_title=\"vae\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">vae: (optional) If provided the node will output latents instead of images. This drastically reduces the required RAM (not VRAM) when working with long (100+ frames) sequences<div style=\"font-size: 1em\">Using this is strongly encouraged unless connecting to a node that requires a blue image connection such as Apply Controllnet</div></div></div></div></div><div vhs_title=\"Outputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Outputs: <div vhs_title=\"IMAGE\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">IMAGE: The loaded images</div></div><div vhs_title=\"frame_count\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">frame_count: The length of images just returned</div></div><div vhs_title=\"audio\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">audio: The audio from the loaded video</div></div><div vhs_title=\"video_info\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">video_info: Exposes additional info about the video such as the source frame rate, or the total length</div></div><div vhs_title=\"LATENT\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">LATENT: The loaded images pre-converted to latents. Only available when a vae is connected</div></div></div></div><div vhs_title=\"Widgets\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Widgets: <div vhs_title=\"video\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">video: The video file to be loaded.<div style=\"font-size: 1em\">You can also select an image to load it as a single frame</div><div style=\"font-size: 1em\">This is a VHS_PATH input. When edited, it provides a list of possible valid files or directories</div><div style=\"font-size: 1em\"><video preload=\"none\" src=https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite/assets/4284322/729b7185-1fca-41d8-bc8d-a770bb2a5ce6 muted loop controls controlslist=\"nodownload noremoteplayback noplaybackrate\" style=\"width: 0px; min-width: 100%\" class=\"VHS_loopedvideo\"></div><div style=\"font-size: 1em\">The current top-most completion may be selected with Tab</div><div style=\"font-size: 1em\">You can navigate up a directory by pressing Ctrl+B (or Ctrl+W if supported by browser)</div><div style=\"font-size: 1em\">The filter on suggested file types can be disabled by pressing Ctrl+G.</div><div style=\"font-size: 1em\">If converted to an input, this functions as a string</div></div></div><div vhs_title=\"force_rate\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">force_rate: Drops or duplicates frames so that the produced output has the target frame rate. Many motion models are trained on videos of a specific frame rate and will give better results if input matches that frame rate. If set to 0, all frames are returned. May give unusual results with inputs that have a variable frame rate like animated gifs. Reducing this value can also greatly reduce the execution time and memory requirements.</div></div><div vhs_title=\"force_size\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">force_size: Previously was used to provide suggested resolutions. Instead, custom_width and custom_height can be disabled by setting to 0.</div></div><div vhs_title=\"custom_width\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">custom_width: Allows for an arbitrary width to be entered, cropping to maintain aspect ratio if both are set</div></div><div vhs_title=\"custom_height\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">custom_height: Allows for an arbitrary height to be entered, cropping to maintain aspect ratio if both are set</div></div><div vhs_title=\"frame_load_cap\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">frame_load_cap: The maximum number of frames to load. If 0, all frames are loaded.</div></div><div vhs_title=\"skip_first_frames\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">skip_first_frames: A number of frames which are discarded before producing output.</div></div><div vhs_title=\"select_every_nth\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">select_every_nth: Similar to frame rate. Keeps only the first of every n frames and discard the rest. Has better compatibility with variable frame rate inputs such as gifs. When combined with force_rate, select_every_nth_applies after force_rate so the resulting output has a frame rate equivalent to force_rate/select_every_nth. select_every_nth does not apply to skip_first_frames</div></div><div vhs_title=\"format\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">format: Updates other widgets so that only values supported by the given format can be entered and provides recommended defaults.</div></div><div vhs_title=\"videopreview\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">videopreview: Displays a preview for the selected video input. Will only be shown if Advanced Previews is enabled. This preview will reflect the frame_load_cap, force_rate, skip_first_frames, and select_every_nth values chosen. If the video has audio, it will also be previewed when moused over. Additional preview options can be accessed with right click.</div></div></div></div></div>",
+    "display_name": "Load Video (Path) \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "force_size": "STRING",
+        "unique_id": "UNIQUE_ID"
+      },
+      "optional": {
+        "format": [
+          [
+            "None",
+            "AnimateDiff",
+            "Mochi",
+            "LTXV",
+            "Hunyuan",
+            "Cosmos",
+            "Wan"
+          ],
+          {
+            "default": "AnimateDiff",
+            "formats": {
+              "AnimateDiff": {
+                "dim": [
+                  8,
+                  0,
+                  512,
+                  512
+                ],
+                "target_rate": 8
+              },
+              "Cosmos": {
+                "dim": [
+                  16,
+                  0,
+                  1280,
+                  704
+                ],
+                "frames": [
+                  8,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "Hunyuan": {
+                "dim": [
+                  16,
+                  0,
+                  848,
+                  480
+                ],
+                "frames": [
+                  4,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "LTXV": {
+                "dim": [
+                  32,
+                  0,
+                  768,
+                  512
+                ],
+                "frames": [
+                  8,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "Mochi": {
+                "dim": [
+                  16,
+                  0,
+                  848,
+                  480
+                ],
+                "frames": [
+                  6,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "None": {},
+              "Wan": {
+                "dim": [
+                  8,
+                  0,
+                  832,
+                  480
+                ],
+                "frames": [
+                  4,
+                  1
+                ],
+                "target_rate": 16
+              }
+            }
+          }
+        ],
+        "meta_batch": [
+          "VHS_BatchManager"
+        ],
+        "vae": [
+          "VAE"
+        ]
+      },
+      "required": {
+        "custom_height": [
+          "INT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 8192,
+            "min": 0
+          }
+        ],
+        "custom_width": [
+          "INT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 8192,
+            "min": 0
+          }
+        ],
+        "force_rate": [
+          "FLOAT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 60,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "frame_load_cap": [
+          "INT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 9007199254740991,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "select_every_nth": [
+          "INT",
+          {
+            "default": 1,
+            "max": 9007199254740991,
+            "min": 1,
+            "step": 1
+          }
+        ],
+        "skip_first_frames": [
+          "INT",
+          {
+            "default": 0,
+            "max": 9007199254740991,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "video": [
+          "STRING",
+          {
+            "placeholder": "X://insert/path/here.mp4",
+            "vhs_path_extensions": [
+              "webm",
+              "mp4",
+              "mkv",
+              "gif",
+              "mov"
+            ]
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "force_size",
+        "unique_id"
+      ],
+      "optional": [
+        "meta_batch",
+        "vae",
+        "format"
+      ],
+      "required": [
+        "video",
+        "force_rate",
+        "custom_width",
+        "custom_height",
+        "frame_load_cap",
+        "skip_first_frames",
+        "select_every_nth"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VHS_LoadVideoPath",
+    "output": [
+      "IMAGE",
+      "INT",
+      "AUDIO",
+      "VHS_VIDEOINFO"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "IMAGE",
+      "frame_count",
+      "audio",
+      "video_info"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-VideoHelperSuite",
     "search_aliases": []
   },
   "VHS_VideoCombine": {
@@ -2985,6 +4145,65 @@
       "Filenames"
     ],
     "output_node": true,
+    "python_module": "custom_nodes.ComfyUI-VideoHelperSuite",
+    "search_aliases": []
+  },
+  "VHS_VideoInfo": {
+    "category": "Video Helper Suite \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "description": "Video Info \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62<div style=\"font-size: 0.8em\"><div id=VHS_shortdesc>Splits information on a video into a numerous outputs</div></div><div style=\"font-size: 0.8em\"><div vhs_title=\"Inputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Inputs: <div vhs_title=\"video_info\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">video_info: A connection to a Load Video node</div></div></div></div><div vhs_title=\"Outputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Outputs: <div vhs_title=\"source_fps\ud83d\udfe8\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">source_fps\ud83d\udfe8: The frame rate of the video</div></div><div vhs_title=\"source_frame_count\ud83d\udfe8\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">source_frame_count\ud83d\udfe8: How many total frames the video contains before accounting for frame rate or select_every_nth</div></div><div vhs_title=\"source_duration\ud83d\udfe8\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">source_duration\ud83d\udfe8: The length of images just returned in seconds</div></div><div vhs_title=\"source_width\ud83d\udfe8\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">source_width\ud83d\udfe8: The width</div></div><div vhs_title=\"source_height\ud83d\udfe8\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">source_height\ud83d\udfe8: The height</div></div><div vhs_title=\"loaded_fps\ud83d\udfe6\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">loaded_fps\ud83d\udfe6: The frame rate after accounting for force_rate and select_every_nth. This output is of particular use as it can be connected to the converted frame_rate input of a Video Combine node to ensure audio remains synchronized.</div></div><div vhs_title=\"loaded_frame_count\ud83d\udfe6\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">loaded_frame_count\ud83d\udfe6: The number of frames returned by the current execution. Identical to the frame_count returned by the node itself</div></div><div vhs_title=\"loaded_duration\ud83d\udfe6\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">loaded_duration\ud83d\udfe6: The duration in seconds of returned images after accounting for frame_load_cap</div></div><div vhs_title=\"loaded_width\ud83d\udfe6\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">loaded_width\ud83d\udfe6: The width of the video after scaling. These coordinates are in image space even if loading to latent space</div></div><div vhs_title=\"loaded_height\ud83d\udfe6\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">loaded_height\ud83d\udfe6: The height of the video after scaling. These coordinates are in image space even if loading to latent space</div></div></div></div></div>",
+    "display_name": "Video Info \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "video_info": [
+          "VHS_VIDEOINFO"
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "video_info"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VHS_VideoInfo",
+    "output": [
+      "FLOAT",
+      "INT",
+      "FLOAT",
+      "INT",
+      "INT",
+      "FLOAT",
+      "INT",
+      "FLOAT",
+      "INT",
+      "INT"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "source_fps\ud83d\udfe8",
+      "source_frame_count\ud83d\udfe8",
+      "source_duration\ud83d\udfe8",
+      "source_width\ud83d\udfe8",
+      "source_height\ud83d\udfe8",
+      "loaded_fps\ud83d\udfe6",
+      "loaded_frame_count\ud83d\udfe6",
+      "loaded_duration\ud83d\udfe6",
+      "loaded_width\ud83d\udfe6",
+      "loaded_height\ud83d\udfe6"
+    ],
+    "output_node": false,
     "python_module": "custom_nodes.ComfyUI-VideoHelperSuite",
     "search_aliases": []
   }

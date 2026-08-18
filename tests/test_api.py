@@ -1,3 +1,4 @@
+import copy
 import json
 import subprocess
 import wave
@@ -17,12 +18,14 @@ from music_video_producer.app import (
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
+    ENHANCE_PREFIX_SUFFIX,
     EXPANSION_REJECTED_EMPTY_NOTICE,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
     MARK_READY_APPROVED_REFUSAL,
     MARK_READY_IN_FLIGHT_REFUSAL,
     MARK_READY_LOCKED_REFUSAL,
     MARK_READY_STATUSES,
+    MULTIVIEW_SUBJECTS,
     RENDER_AGAIN_APPROVED_REFUSAL,
     RENDER_AGAIN_IN_FLIGHT_REFUSAL,
     RENDER_AGAIN_LOCKED_REFUSAL,
@@ -47,6 +50,7 @@ from music_video_producer.app import (
     create_app,
     document_change_notice,
     document_first_draft_notice,
+    multiview_refusal,
     prose_claims_shots,
 )
 from music_video_producer.batch import PLACEHOLDER_PROMPT, readiness_refusal
@@ -78,6 +82,9 @@ from music_video_producer.timeline import expansion_input
 from music_video_producer.workflows import (
     H3_DIRECTOR_MAX_FRAMES,
     H3_REFERENCE_MAX_FRAMES,
+    LTX25_ENHANCE_DETAILER_STRENGTH,
+    LTX25_ENHANCE_SEED,
+    LTX25_ENHANCE_SIGMAS,
     build_h3_reference_payload,
 )
 
@@ -3557,11 +3564,129 @@ def test_multiview_rejects_asset_paths_outside_project_media(tmp_path: Path):
 
     response = client.post(
         f"/api/projects/{project.id}/assets/{project.assets[0].id}/multiview",
-        json={"prompt": "four views", "seed": 1},
+        json={"prompt": "front, side and back views", "seed": 1},
     )
 
     assert response.status_code == 404
     assert comfy.uploads == []
+
+
+@pytest.mark.parametrize("kind", ["prop", "setting"])
+def test_an_object_is_promoted_without_being_labelled_a_character(tmp_path: Path, kind: str):
+    """The refusal was ours, not Krea's.
+
+    A probe promoted a Flux cargo ship through this exact route by uploading it as a
+    character, and got back a clean, consistent sheet — front, three-quarter, side, rear,
+    hull markings and proportions holding. The only thing it had to fake was the label. So
+    the gate opens for the kinds a sheet can be *of*, and the ship stays a prop: the child
+    the promotion creates carries the source's kind, and nothing in the manifest says a
+    spaceship is a person.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Objects"))
+    uploaded = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "Cargo hauler", "kind": kind},
+        files={"file": ("ship.png", b"png-data", "image/png")},
+    ).json()
+    asset_id = uploaded["assets"][0]["id"]
+
+    response = client.post(
+        f"/api/projects/{project.id}/assets/{asset_id}/multiview",
+        json={"prompt": "Preserve the exact design of this object", "seed": 5},
+    )
+
+    assert response.status_code == 202
+    saved = store.get(project.id)
+    child = saved.assets[-1]
+    assert child.parent_id == asset_id
+    assert child.kind == kind, "a promoted object must not be filed as a character"
+    assert child.source == "krea-multiview"
+    assert saved.jobs[-1].kind == "multiview"
+    # The same graph as a character's: the subject picks the prompt and nothing else.
+    assert comfy.prompts[-1]["127"]["inputs"]["lora_name"].endswith("QuadView_krea2_v1.safetensors")
+    assert comfy.prompts[-1]["119"]["inputs"]["prompt"].startswith("Preserve the exact design")
+
+
+def test_a_promoted_character_sheet_is_still_a_character(tmp_path: Path):
+    """The kind the child carries is now the source's, and for a character that is the same.
+
+    Worth its own test rather than trusting the parametrized one above: `parent_id` is read
+    by the library and the child's `kind` by the reference path, so a change that made every
+    sheet inherit correctly *except* the case that already existed would be the one nobody
+    noticed until an old project stopped listing its sheets under characters.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Character"))
+    uploaded = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "Mara", "kind": "character"},
+        files={"file": ("mara.png", b"png-data", "image/png")},
+    ).json()
+
+    response = client.post(
+        f"/api/projects/{project.id}/assets/{uploaded['assets'][0]['id']}/multiview",
+        json={"prompt": "Preserve Mara", "seed": 1},
+    )
+
+    assert response.status_code == 202
+    assert store.get(project.id).assets[-1].kind == "character"
+
+
+@pytest.mark.parametrize("kind", ["style", "image", "audio", "video"])
+def test_a_kind_with_no_template_is_refused_by_a_message_naming_what_can_be(
+    tmp_path: Path, kind: str
+):
+    """A refusal that only says no leaves the Director guessing which asset to reach for.
+
+    The sentence is built from the same mapping the gate reads, so the kinds it names are
+    the kinds that actually pass — a hardcoded list would go stale in the direction that
+    sends a Director to upload a prop the route then refuses.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Unsupported"))
+    suffix, media = {
+        "audio": (".wav", "audio/wav"),
+        "video": (".mp4", "video/mp4"),
+    }.get(kind, (".png", "image/png"))
+    uploaded = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "Not a subject", "kind": kind},
+        files={"file": (f"media{suffix}", b"data", media)},
+    ).json()
+
+    response = client.post(
+        f"/api/projects/{project.id}/assets/{uploaded['assets'][0]['id']}/multiview",
+        json={"prompt": "anything", "seed": 0},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail == multiview_refusal()
+    # Every kind that *would* have worked is named. Asserted against the mapping rather
+    # than against the sentence, so adding a subject without extending the refusal fails.
+    for promotable in MULTIVIEW_SUBJECTS:
+        assert promotable in detail, detail
+    # Refused before anything reached the GPU or the manifest.
+    assert comfy.prompts == []
+    assert len(store.get(project.id).assets) == 1
+
+
+def test_a_promotable_kind_with_no_image_yet_is_refused_the_same_way(tmp_path: Path):
+    """The matrix's "wrong media" row: a prop that has not rendered is not promotable yet."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Pending"))
+    project.assets.append(Asset(name="Unrendered hauler", kind="prop", path="", source="flux"))
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/assets/{project.assets[0].id}/multiview",
+        json={"prompt": "Preserve the exact design of this object", "seed": 0},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == multiview_refusal()
+    assert comfy.prompts == []
 
 
 def test_health_reports_standalone_identity_and_comfy_state(tmp_path: Path):
@@ -6759,3 +6884,290 @@ def test_a_profile_on_a_text_only_shot_is_refused_rather_than_ignored(tmp_path: 
     reference_id = reference_shot(store, project.id, asset_ids=[lead["id"]])
     assert submit_h3(client, project.id, reference_id, profile="turbo").status_code == 202
     assert "mvp:lora" in comfy.prompts[-1]
+
+
+# --- LTX 2.5 enhancement -----------------------------------------------------------------
+#
+# The route's own tests. Every row of the spec's I/O matrix that a route can answer is here;
+# the two it cannot are elsewhere by design — "model absent" is the pre-flight's
+# (`tests/preflight_ltx25_enhance.py`), and "frame count is measured, never assumed" is a live
+# `ffprobe` reading plus the source guard in `tests/test_workflows.py`.
+
+
+def enhanced_shot_project(
+    store, tmp_path: Path, *, take: str = "takes/shot-h3-reference_00001-audio.mp4", **shot
+):
+    """A project whose one Shot has a take on disk under ComfyUI's output directory."""
+    project = store.create(Project(name="Enhance"))
+    if take:
+        output = tmp_path / "comfy" / "output" / Path(take)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"rendered-take")
+    project.shots = [
+        Shot(
+            start=0,
+            duration=5,
+            prompt="Lantern light across the corridor",
+            latest_output=take,
+            status="complete",
+            **shot,
+        )
+    ]
+    store.save(project)
+    return project
+
+
+def enhance(client, project, shot=None):
+    shot_id = (shot or project.shots[0]).id
+    return client.post(f"/api/projects/{project.id}/shots/{shot_id}/enhance/ltx25")
+
+
+def test_enhancing_a_take_submits_it_as_input_and_never_re_runs_h3(tmp_path: Path):
+    """The matrix's first row, and the frozen "Always" that goes with it.
+
+    The take is submitted as the graph's input, the payload has no MiniMax node in it at all,
+    and the output prefix is not the render's — so ComfyUI numbers the enhanced file in its
+    own series rather than as the next take.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+
+    response = enhance(client, project)
+
+    assert response.status_code == 202
+    job = response.json()
+    assert job["kind"] == "ltx"
+    assert job["target_id"] == project.shots[0].id
+    assert len(comfy.prompts) == 1
+    payload = comfy.prompts[0]
+    source = payload["mvp:source"]["inputs"]["video"]
+    assert source.endswith("takes/shot-h3-reference_00001-audio.mp4")
+    assert Path(source).is_file()
+    # Nothing on this path regenerates the take.
+    assert not any("MiniMaxH3" in node["class_type"] for node in payload.values())
+    # A different prefix from any render's, which is what puts the enhanced file beside the
+    # take instead of in the middle of its numbered series.
+    prefix = payload["mvp:save"]["inputs"]["filename_prefix"]
+    assert prefix.endswith(ENHANCE_PREFIX_SUFFIX)
+    assert "-h3" not in prefix.rsplit("/", 1)[-1].replace(ENHANCE_PREFIX_SUFFIX, "")
+
+
+def test_enhancing_a_take_carries_the_sources_own_audio_and_synthesises_none(tmp_path: Path):
+    """The matrix's audio rows, at the route.
+
+    Both of them, because the graph answers both the same way: the only audio input the saver
+    has is the source loader's own third output, so a take with audio keeps it and a silent
+    take has nothing to invent one from. There is no audio VAE, no audio decode, and no branch
+    here that behaves differently for a silent source.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+
+    assert enhance(client, project).status_code == 202
+
+    payload = comfy.prompts[0]
+    assert payload["mvp:save"]["inputs"]["audio"] == ["mvp:source", 2]
+    assert not any("audio" in node["class_type"].lower() for node in payload.values())
+    assert not any(
+        isinstance(value, str) and "audio-vae" in value
+        for node in payload.values()
+        for value in node["inputs"].values()
+    )
+
+
+def test_a_silent_take_is_enhanced_without_a_second_code_path(tmp_path: Path):
+    """The "source without audio" row: handled, and handled by *not* being a special case.
+
+    The route does not probe the file, so the graph it submits for a silent take is the graph
+    it submits for one with a soundtrack. `VHS_VideoCombine` reads `audio['waveform']` inside a
+    try and writes video only when there is none — nothing here can invent a track because
+    nothing here can produce one.
+    """
+    client, store, comfy = make_client(tmp_path)
+    with_audio = enhanced_shot_project(store, tmp_path)
+    assert enhance(client, with_audio).status_code == 202
+
+    silent_client, silent_store, silent_comfy = make_client(tmp_path / "silent")
+    silent = enhanced_shot_project(
+        silent_store, tmp_path / "silent", take="takes/shot-h3-reference_00001.mp4"
+    )
+    assert enhance(silent_client, silent).status_code == 202
+
+    def without_paths(payload: dict) -> dict:
+        stripped = copy.deepcopy(payload)
+        stripped["mvp:source"]["inputs"]["video"] = ""
+        stripped["mvp:save"]["inputs"]["filename_prefix"] = ""
+        return stripped
+
+    assert without_paths(silent_comfy.prompts[0]) == without_paths(comfy.prompts[0])
+
+
+def test_a_shot_that_never_rendered_is_refused_before_a_payload_is_built(tmp_path: Path):
+    """The matrix's "no take" row. Enhancement improves a take; it cannot make one."""
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path, take="")
+    project.shots[0].status = "draft"
+    store.save(project)
+
+    response = enhance(client, project)
+
+    assert response.status_code == 422
+    assert "has not produced a take" in response.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_a_take_whose_file_is_gone_is_refused_and_the_path_is_named(tmp_path: Path):
+    """The matrix's "missing file" row, including the part that makes it actionable.
+
+    Naming the path is the point: a manifest pointing at nothing is usually a moved or cleared
+    output directory, and the Director cannot tell which without seeing where this looked.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+    (tmp_path / "comfy" / "output" / project.shots[0].latest_output).unlink()
+
+    response = enhance(client, project)
+
+    assert response.status_code == 422
+    assert project.shots[0].latest_output in response.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_a_take_pointer_that_escapes_the_output_directory_is_refused(tmp_path: Path):
+    """`latest_output` is manifest data, and a manifest can be edited or arrive stale.
+
+    Without the containment check a `..` in that field would hand an arbitrary file on the
+    machine to a node that opens it by path.
+    """
+    client, store, comfy = make_client(tmp_path)
+    outside = tmp_path / "elsewhere.mp4"
+    outside.write_bytes(b"not-a-take")
+    project = enhanced_shot_project(store, tmp_path, take="")
+    project.shots[0].latest_output = "../../elsewhere.mp4"
+    store.save(project)
+
+    response = enhance(client, project)
+
+    assert response.status_code == 422
+    assert comfy.prompts == []
+
+
+def test_an_enhancement_already_in_flight_refuses_a_second_one(tmp_path: Path):
+    """The matrix's 409 row, and the harm it names.
+
+    Read off the job records alone, because an enhancement deliberately writes nothing to the
+    Shot — so `Shot.status` cannot know about one and the jobs are the only evidence.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+    assert enhance(client, project).status_code == 202
+    assert store.get(project.id).jobs[-1].status == "queued"
+
+    second = enhance(client, project)
+
+    assert second.status_code == 409
+    assert "has not finished" in second.json()["detail"]
+    assert len(comfy.prompts) == 1
+
+
+def test_a_render_in_flight_also_refuses_an_enhancement(tmp_path: Path):
+    """A take that is about to be superseded is not worth GPU minutes.
+
+    Answered 409 rather than 422 for `mark_ready_refusal`'s reason: a live job is a state
+    conflict, and the same request succeeds once it lands.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+    project.shots[0].status = "running"
+    store.save(project)
+
+    response = enhance(client, project)
+
+    assert response.status_code == 409
+    assert comfy.prompts == []
+
+
+def test_enhancing_writes_nothing_to_the_shot_and_the_take_survives_completion(tmp_path: Path):
+    """The matrix's last row, across the whole lifecycle rather than only at submission.
+
+    The take is still on disk *and still identified*: `latest_output` goes on naming it after
+    the enhancement completes, because `read_job` has no branch for `kind="ltx"`. The enhanced
+    file is not lost — it stays on the job that produced it, which is where a take that is not
+    tracked is recovered from.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+    take = tmp_path / "comfy" / "output" / project.shots[0].latest_output
+    before = store.get(project.id).shots[0].model_dump(mode="json")
+
+    job = enhance(client, project).json()
+
+    assert store.get(project.id).shots[0].model_dump(mode="json") == before
+    enhanced = f"music-video-producer/{project.id}/shots/{project.shots[0].id}-ltx25-enhance"
+    comfy.history = completed_history_for(
+        [{"subfolder": enhanced.rsplit("/", 1)[0], "filename": "s-ltx25-enhance_00001-audio.mp4"}]
+    )
+
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "complete"
+    saved = ProjectStore(tmp_path).get(project.id)
+    # The shot is byte-identical to what it was before the enhancement was ever submitted.
+    assert saved.shots[0].model_dump(mode="json") == before
+    assert saved.shots[0].latest_output == before["latest_output"]
+    assert take.is_file()
+    # And the enhanced file is reachable, on the job rather than on the shot.
+    assert saved.jobs[-1].output_files == [
+        f"{enhanced.rsplit('/', 1)[0]}/s-ltx25-enhance_00001-audio.mp4"
+    ]
+
+
+def test_an_enhancement_seed_is_the_one_the_graph_fixes_not_the_shots(tmp_path: Path):
+    """The job records what was sampled, which is the export's seed rather than the Shot's.
+
+    A job carrying the Shot's seed would be a record of a number this graph never used.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path, seed=4242)
+
+    job = enhance(client, project).json()
+
+    assert job["seed"] == LTX25_ENHANCE_SEED
+    assert comfy.prompts[0]["mvp:noise"]["inputs"]["noise_seed"] == LTX25_ENHANCE_SEED
+
+
+def test_enhancing_an_unknown_shot_is_a_404_and_a_downstream_failure_is_a_502(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+
+    assert client.post(f"/api/projects/{project.id}/shots/shot_nope/enhance/ltx25").status_code == 404
+
+    comfy.submit_error = True
+    failed = enhance(client, project)
+
+    assert failed.status_code == 502
+    # Nothing was recorded for a submission that never happened.
+    assert store.get(project.id).jobs == []
+
+
+def test_the_enhancement_route_takes_no_body_and_exposes_no_sampling_controls(tmp_path: Path):
+    """The Ask First fields are not reachable, including by a client that sends them.
+
+    The sigmas, the detailer strength and the prompt are marked Ask First and nothing has been
+    asked, so the route has no request model at all — a body naming any of them is ignored and
+    the submitted graph is the export's.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = enhanced_shot_project(store, tmp_path)
+
+    response = client.post(
+        f"/api/projects/{project.id}/shots/{project.shots[0].id}/enhance/ltx25",
+        json={"sigmas": "1, 0", "strength": 0.1, "prompt": "make it cinematic"},
+    )
+
+    assert response.status_code == 202
+    payload = comfy.prompts[0]
+    assert payload["mvp:sigmas"]["inputs"]["sigmas"] == LTX25_ENHANCE_SIGMAS
+    assert payload["mvp:detailer"]["inputs"]["strength_model"] == LTX25_ENHANCE_DETAILER_STRENGTH
+    assert payload["mvp:prompt"]["inputs"]["text"] == ""

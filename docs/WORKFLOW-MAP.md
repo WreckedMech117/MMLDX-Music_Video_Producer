@@ -214,6 +214,30 @@ The Director's saved editor workflow was repaired in place on 2026-08-17: node `
 
 **Live boundary run 2026-08-17.** The patched graph was submitted once as prompt `a64a0460-64e6-4a14-b207-e644bf9bda5d` and ran to `success` in 17 min 36 s. Measured with `ffprobe`: H3 base 1056×608 / 192 frames → SeedVR2 1250×720 / 192 frames → LTX 2.5 **2496×1408** / 185 frames → FILM + RTX VSR 3744×2112 / 369 frames at 48 fps. The LTX subgraph applies a 2× latent upsample, so 2496×1408 is exactly 2 × 1248×704 — measured confirmation the normalizer produced a 32-divisible size where the previous three runs died at `VAEEncode`. Note the frame count is not preserved: 192 in, 185 out (8k+1), which assembly must account for alongside H3's 17k+5 alignment.
 
+**Where the 8k+1 grid actually comes from, found 2026-08-18.** The 192 → 185 frame change was recorded as a property of "the LTX stage". There is a more specific cause available: `VHS_LoadVideo`'s `format: "LTXV"` declares `frames: [8, 1]`, so the **loader conforms the clip to an 8k+1 grid on the way in** — 185 is 8 × 23 + 1. The `LTXVLoopingSampler`'s temporal tiling (tile 56, overlap 24) may also act on it, so this is a second and upstream cause rather than a replacement explanation, and nothing here asserts which dominates. What it does mean is that a graph loading video through VHS with the LTXV format is already on that grid before a sampler runs.
+
+## LTX 2.5 enhancement (standalone)
+
+**Immutable source:** `workflow_templates/reference_exports/ltx25-enhancer-user-export.json` (SHA-256 in the reference-exports `MANIFEST.md`).
+
+**Purpose:** improve a take the Director already likes, without regenerating it. Until this existed, LTX was reachable only by re-running H3 inside the reference chain, so every attempt at a better final image cost a full H3 pass *and* produced a different picture.
+
+**Adapter path:** `build_ltx25_enhance_payload(source_video, prefix)` — 18 nodes, the export's **reachable subgraph and nothing else**. `reachable_node_ids(graph, roots)` exists as a function rather than a comment so the tests and the pre-flight can both hold the adapter to that rule.
+
+**Models, exactly four:** `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors`, `ltx-2.5-video-vae-conv-bf16.safetensors`, `gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors`, and `ltx-2-19b-ic-lora-detailer.safetensors` at 0.9.
+
+**Two orphans it does not load.** The export carries 20 nodes; `LatentUpscaleModelLoader` and an audio `VAELoaderKJ` are unreachable from its output. Despite the name there is **no latent upscale in the executed path** — the flow is `ImageScaleToMaxDimension` (lanczos, longest side 1920) → `VAEEncodeTiled` → `LTXVLoopingSampler` → `LTXVSpatioTemporalTiledVAEDecode`, with the detail coming from the LoRA. Audio reaches the saver directly from the loader.
+
+**Reachability must be per node, not per class.** The orphaned audio VAE is a `VAELoaderKJ`, and so is the *reachable* video VAE. A class-level dependency rule would have silently dropped a model the graph genuinely needs.
+
+**Two node substitutions, both forced by live schema.** `VHS_LoadVideo` cannot be reproduced: its `video` combo enumerates ComfyUI's **input** directory and a take lives under **output**, so the published options are empty for our purposes — `VHS_LoadVideoPath` is used instead, same four outputs in the same order. And the detailer's `Power Lora Loader (rgthree)` publishes no `lora_*` inputs at all, with the filename buried in a widget dict, so `LoraLoader` carries it (model *and* CLIP here, unlike the H3 reference adapter's model-only substitution). The consequence is the same one recorded for the turbo profiles: **evidenced in values, not in wiring.**
+
+**The pre-flight caught its own blind spot before any GPU time.** Its first run reported three model dependencies instead of four, because the rgthree nesting hid the LoRA filename — exactly the failure the audit exists to catch, found offline rather than as an opaque 502.
+
+**No Director-facing controls.** Sigmas (`0.909375, 0.725, 0.421875, 0.0`), cfg 1, `euler`, seed 0, an empty prompt and the 0.9 detailer strength are all reproduced and none are exposed; the spec marks tuning them as a separate decision. The route writes **nothing** to the Shot, so the take it enhances is untouched — the enhanced file appears only on the job's `output_files`.
+
+**Frame count is measured, never asserted.** A guard test greps the adapter, the route, the pre-flight and the test files for any assertion that output frames equal input frames, and fails if one appears.
+
 ## Readiness matrix
 
 | Workflow | Catalog discovery | API payload | Unit tests | Live prior model validation | App submission |

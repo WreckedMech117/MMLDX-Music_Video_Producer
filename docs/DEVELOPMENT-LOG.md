@@ -4,6 +4,36 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-18 — Enhance a take instead of regenerating it, and a prose file that cannot be trusted
+
+Two adapters worked in parallel. One closed a long-open gap; the other overturned the premise it was written on, which is the more useful of the two outcomes.
+
+### The LTX 2.5 enhancer
+
+Closed under `spec-ltx25-enhancer-adapter.md`. LTX was reachable only by regenerating H3 inside the reference chain, so improving a take cost a full H3 pass and produced a different picture.
+
+- **Four things the export contradicted, each found by reading it rather than the description.** The orphan is the *audio* `VAELoaderKJ` **node**, not the class — the reachable video VAE is the same class, so a per-class dependency rule would have dropped a model the graph needs. `VHS_LoadVideo` cannot be reproduced at all: its `video` combo enumerates ComfyUI's **input** directory while a take lives under **output**, so `VHS_LoadVideoPath` carries it. The detailer LoRA is invisible at the top level of `Power Lora Loader (rgthree)`, the same finding the turbo profile hit from the other direction. And the frame-count grid has an **earlier cause than the sampler**: the VHS loader's `format: "LTXV"` declares `frames: [8, 1]`, so the clip is conformed to 8k+1 *at load* — 185 is 8 × 23 + 1. That is a second, upstream cause rather than a replacement for the tiling explanation, and nothing claims which dominates.
+- **The pre-flight caught its own blind spot before any GPU time**, reporting three model dependencies instead of four because the rgthree nesting hid the filename. That is the audit doing exactly the job it exists for, offline rather than as an opaque 502.
+- **The route writes nothing to the Shot.** Mutations that let the enhancement share the render's filename prefix, write status or `prompt_id` at submission, or move `latest_output` on completion are each caught. Enhancement is deliberately not approval.
+- **8 mutations, 8 killed**, run against an isolated copy so the concurrent agent's tree was never touched. Including dependencies taken from the 20-node list instead of the 18 reachable, and a test that asserts output frames equal input frames — which fails a guard that greps the adapter, route, pre-flight and tests for exactly that claim.
+- Deliberately not built: no UI, since take comparison is what would make a second output meaningful on screen and remains unbuilt; and no locked/approved refusals, since neither is in the matrix and neither is endangered by a route that writes nothing.
+
+### `Music-Video.md` is not a reliable description of `Krea2_CharacterSheet-20260814.json`
+
+This entry exists because **I asserted the opposite, prominently and wrongly**, and the correction is worth more than the story that produced it.
+
+I read the creator's prose — "three KSamplers: 10-step euler for the initial sheet, 8-step euler at CFG 0.3 for the refine pass, 8-step res_multistep for the final output" — and concluded that our multiview adapter ran one third of the documented pipeline, calling it the single largest lever on reference fidelity in the project. Reading the graph settles it the other way, on five counts:
+
+- The file has **45** nodes, not 44.
+- It has three `KSampler`s but **only one is in the sheet path**. Node `53` is `mode=0`; nodes `146` and `172` are both **`mode=4`, bypassed on load**, and sit in a "2nd Sampling" group at x ≈ −1129 while every `CharSheet-*` group is at positive x. They generate a character *portrait* that may optionally become the sheet's input image.
+- "8-step euler at **CFG 0.3**" is a **widget-order misread**. The order is `[seed, control, steps, cfg, sampler, scheduler, denoise]`, so node `172` is cfg **1.0**, denoise **0.3**.
+- `res_multistep` is the **first** of that bypassed pair, not the final pass; the euler pass runs after it.
+- The "refine prompt toggle to regenerate weak panels" drives an LLM prompt-**enhancement** subgraph that expands the character description. It has nothing to do with panels.
+
+**Our adapter already matched the creator's active sheet path value for value.** The two extra passes were therefore reverted rather than shipped: they are bypassed in the source, are not part of the sheet path, and the final pass's denoise had to be *invented* because no source specifies it. Shipping them would have changed every reference sheet in the project on the strength of a prose error — the same "third combination nobody has rendered, presented as proven" hazard that made the H3 sampling profiles reproduce whole bundles instead of blending them. The single pass is now pinned against the export, with node `53`'s `mode=0` and `146`/`172`'s `mode=4` asserted, so the next person who reads the prose and "fixes" the missing passes fails a test that explains why.
+
+Also resolved from the same file: the prose's "1 MP sweet spot" is a note the creator did not follow — the graph emits 1536×1024, 1.57 MP, exactly what the adapter emits. Nothing changed, and it is now pinned so it is not re-litigated from the note.
+
 ## 2026-08-18 — A third sampling profile, and a node class that cannot be copied
 
 The Director's per-mode API exports of 2026-08-17 revealed that the shipped `turbo` profile — derived from the "04 - H3 Music Video - LTX 2.5 READY" pipeline — is **not** the bundle the canonical `MiniMaxH3Turbo References2V` mode uses. Both are real. The Director chose to keep the shipped one and add the canonical alongside it, each reproducing its own source whole rather than being blended into a third combination nobody has rendered.
