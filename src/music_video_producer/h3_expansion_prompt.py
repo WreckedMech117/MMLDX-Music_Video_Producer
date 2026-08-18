@@ -87,7 +87,14 @@ SEMANTIC_RULES = f"""Rules about content, which matter more than the formatting:
   dynamics.
 - On-screen text goes in double quotation marks and is left untranslated.
 - Write what a camera could record. Do not write intentions, backstory or what a
-  character is feeling unless it is visible."""
+  character is feeling unless it is visible.
+- Light sources belong to the location that has them. The style bible describes the
+  LOOK — palette, contrast, lens, grain, wardrobe — and that applies everywhere. Named
+  practicals do not. If the treatment gives one location a lamp, a window or a fixture,
+  that fixture stays in that location; another location is lit by whatever is plausibly
+  in it.
+- Only the subjects this shot is about appear in it. A performer described elsewhere in
+  the treatment does not walk into a shot whose intent does not mention them."""
 
 #: Singing, which is where this project's own evidence bites.
 #:

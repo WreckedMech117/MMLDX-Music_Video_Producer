@@ -18,6 +18,7 @@ from music_video_producer.h3_prompt import (
     NOT_APPLICABLE,
     check,
     check_dialogue,
+    check_orphan_cuts,
     check_retention,
     check_shots,
 )
@@ -233,3 +234,26 @@ def test_fields_run_together_on_one_line_are_diagnosed_as_that() -> None:
     messages = [problem.message for problem in result.problems]
     assert all("appears mid-line" in message for message in messages), messages
     assert not any("is missing" in message for message in messages), messages
+
+
+def test_a_cut_time_with_no_shot_marker_is_prose_not_a_cut() -> None:
+    """Found by measuring the live model, not by reading the guide.
+
+    Asked for a short clip, it wrote `[Shot 1] ... At 00:02.500 A grey wolf steps ...
+    At 00:03.750 Close on her face` — and every other check here passed it. It reads as a
+    three-shot prompt and is not one: H3 takes shot boundaries from `[Shot N]`, so those
+    times are prose inside one continuous shot.
+
+    Worth checking precisely because it is invisible to the eye that wrote it. The intent is
+    legible to a human reader, which is exactly what makes it easy to ship.
+    """
+    problems = check_orphan_cuts(
+        "[Shot 1] She stands still. At 00:02.500 A wolf steps in. At 00:03.750 Close on her."
+    )
+    assert len(problems) == 2
+    assert all("no [Shot N] in front of it" in problem.message for problem in problems)
+
+
+def test_a_cut_time_belonging_to_a_shot_marker_is_not_flagged() -> None:
+    """The guard must not fire on the correct form, or it would reject every real prompt."""
+    assert not check_orphan_cuts("[Shot 1] She stands. [Shot 2] At 00:02.500 A wolf steps in.")

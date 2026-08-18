@@ -66,6 +66,10 @@ _DIALOGUE_BLOCK = re.compile(r"<d>\s*(\[[^\]]+\])?", re.DOTALL)
 _SPEAKER = re.compile(r"\(S(\d+)(?:\s*,\s*S(\d+))*\)")
 _SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
 
+#: Any `At MM:SS.mmm`, wherever it appears. Used to find cut times that carry no `[Shot N]`
+#: in front of them — see `check_orphan_cuts`.
+_ANY_CUT = re.compile(r"At (\d{2}):(\d{2})\.(\d{3})")
+
 
 @dataclass(frozen=True)
 class Problem:
@@ -213,6 +217,32 @@ def check_shots(description: str, *, duration: float | None = None) -> list[Prob
     return problems
 
 
+def check_orphan_cuts(description: str) -> list[Problem]:
+    """Cut times that carry no `[Shot N]` in front of them.
+
+    Found by measurement rather than by reading the guide: a model asked for a short clip
+    wrote `[Shot 1] … At 00:02.500 A grey wolf steps … At 00:03.750 Close on her face`, and
+    every other check here passed it. It looked like a three-shot prompt and is not one — H3
+    reads shot boundaries from `[Shot N]`, so those times are prose. The clip would render as
+    one continuous shot with two stray timestamps described inside it.
+
+    This is worth checking precisely because it is invisible to the eye that wrote it: the
+    intent is legible to a human reader, which is what makes it easy to ship.
+    """
+    problems: list[Problem] = []
+    marked = {match.start(2) for match in _SHOT.finditer(description)
+              if match.group(2) is not None}
+    for cut in _ANY_CUT.finditer(description):
+        if cut.start(1) in marked:
+            continue
+        problems.append(Problem(
+            CORE_FIELDS[0],
+            f"'At {cut.group(1)}:{cut.group(2)}.{cut.group(3)}' has no [Shot N] in front of "
+            "it, so it is prose rather than a cut. Every cut time belongs to a shot marker.",
+        ))
+    return problems
+
+
 def check_dialogue(description: str) -> list[Problem]:
     """`<d>` tags balanced, and each opening one carrying a language tag."""
     problems: list[Problem] = []
@@ -317,6 +347,7 @@ def check(prompt: str, *, duration: float | None = None,
         parsed.problems.append(Problem(CORE_FIELDS[0], f"{CORE_FIELDS[0]} is missing."))
     else:
         parsed.problems.extend(check_shots(description, duration=duration))
+        parsed.problems.extend(check_orphan_cuts(description))
         parsed.problems.extend(check_dialogue(description))
     reported = frozenset(problem.field for problem in parsed.problems)
     parsed.problems.extend(
