@@ -56,6 +56,7 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - editable `prompt`
 - `mode`: `ShotMode | None`, where **`None` means undeclared** — see below
 - `citations[]`: `{asset_id, role, order}` — what the shot cites and what for
+- `h3_prompt`: the H3-format expansion of `prompt`; empty means not expanded
 - `asset_ids[]`: the reference-role **projection** of `citations`, kept for compatibility
 - `singing`: `SingingState`, one of `unknown` / `singing` / `not_singing`
 - stable `reference_labels` and optional `use_song_audio`
@@ -68,6 +69,10 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - `locked`
 
 Shot timing is measured in seconds against the master song. Director compilation converts it to frames only at the workflow boundary.
+
+**Two prompt fields, and the second is not a replacement.** `prompt` holds the short readable intent a human wrote or pass one produced; `h3_prompt` holds the long machine-facing expansion in MiniMax's documented format. Overwriting the intent would destroy what pass one wrote and leave nothing to re-expand from — and the first expansion will not be the good one. Empty means *not expanded*, which is a real state: a Shot is plannable long before it is expanded, and the render path falls back to `prompt` exactly as it always did.
+
+`h3_prompt` is **withheld from the Director's context** — the first field ever withheld from a Shot. Not a removal, since it was never in the dump: withholding it adds nothing to the prompt rather than subtracting something. Withheld on the numbers, because a thirty-Shot plan of expansions would add many thousands of tokens to *every* chat turn, and rich context is this project's recorded cause of Director degradation. The chat Director writes treatments and intents; the expansion specialist gets its own purpose-built payload rather than this dump.
 
 **A shot declares what it is; it is no longer inferred.** `generate_h3` used to choose between the text-only and reference paths by asking whether `asset_ids` happened to be empty, so a shot could not say what it was meant to be or be wrong about it before a render. `SHOT_MODE_SPECS` is now a table — label, per-role minimum and maximum, whether the mode can take song audio, and which adapter it routes to — so adding a mode is a row rather than a branch.
 

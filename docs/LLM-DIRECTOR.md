@@ -102,7 +102,37 @@ The payload is `timeline.assistant_input`: selection-scoped, carrying the asset 
 
 **The system prompt lives in `src/music_video_producer/assistant_prompt.py`, and it is meant to be edited.** Its own module, no interpolation, so rewording it touches no transport, no route and no behavioural test. `PROMPT_CRAFT` is split out as the half most likely to change between live runs. Two absences are deliberate and recorded in its docstring: there is **no anti-transcription clause** — literalism is the likely failure but the project's rule is to watch it on real output rather than pre-empt it, and the fix has a named home — and no worked example.
 
-## Project context## Project context
+## H3 prompt expansion — pass two
+
+`POST /api/projects/{id}/shots/{shot_id}/expand-prompt` takes **no body** and turns one Shot's intent into an H3-format prompt. It is the second of two passes, and the two want **opposite shapes**:
+
+| | Pass one — `director/expand` | Pass two — `expand-prompt` |
+|---|---|---|
+| Call shape | One call, whole plan | One call **per Shot** |
+| Why | Flow and cross-shot variance need the Shots seen together | One H3 prompt is long; thirty will not fit one context, and quality degrades well before the limit |
+| Output | A short intent per Shot, into `Shot.prompt` | The full three-field structure, into `Shot.h3_prompt` |
+
+Reading "this cannot be done in one call" as a criticism of pass one is the obvious mistake and the wrong one. Pass one is correct as it is.
+
+**Why this exists at all.** H3 does not want a sentence. MiniMax publishes a 20-page format guide, and a rewriting model — `H3-Context-IR` — was supposed to turn an idea into that format. **It was never open-sourced.** This route is its replacement, which is a much narrower job than "write a good prompt" and is why the specialist is separate from ProducerBot's persona.
+
+**Two fields, never one.** `Shot.prompt` keeps the human-readable intent; `Shot.h3_prompt` holds the expansion. Overwriting the intent would destroy what pass one wrote and leave nothing to re-expand from — and the first expansion will not be the good one. `h3_prompt` is **withheld from the Director's context**, the first field ever withheld from a Shot: a thirty-Shot plan of expansions would add many thousands of tokens to every chat turn, and rich context is this project's recorded cause of Director degradation. Withholding it is not a removal, because it was never in the dump.
+
+**A malformed answer is never stored.** `h3_prompt.check` runs before the write; a prompt that fails comes back with its problems and the Shot is untouched. Storing it would put a broken prompt in the manifest that the *next render* submits, so the failure would surface as a bad take rather than a message. The refused text is returned so it can be read and judged — the argument `MessageNotice.raw` already makes.
+
+**What the checker can and cannot decide** is the important distinction. It checks the mechanical rules: field order, `[Shot 1]` carrying no timestamp, shots numbered in order, cut times strictly increasing and inside the clip, `<d>` balanced and language-tagged, sentence bounds on the two sound fields, no speaker id in `retention_analysis`. It **cannot** check that every cut introduces new information, that only vocalizing characters carry ids, or that amplitude is given only where meaningful. Those live in `h3_expansion_prompt.py` because nothing else will carry them, and a clean check means well-*formed*, not well-*written*.
+
+**Refusals** are the shared ones — `shot_write_refusal` then `prompt_is_missing` — and the order matters: a locked Shot hears it is locked rather than being told to write an intent it would then be refused for. The snapshot is re-read after the await and the refusal re-checked, because a Shot can be locked or rendered while the model is thinking.
+
+**The payload** is `timeline.shot_expansion_input`: the Shot's own facts, the **neighbours' intents**, the treatment and style bible, and the song. Not the neighbours' expansions — two long-form prompts per call is the bloat that makes one-shot-for-all impossible. Neighbour intents *are* carried here where pass one withholds them, because on this pass they are real rather than placeholders, and a cut that lands well needs to know what it is cutting from.
+
+**One claim it refuses to make.** The Director asked for "the song's words for this window", and that cannot be built: nothing in this project aligns lyrics to time — `song_section` is an empty branch for exactly that reason. The whole sheet goes as `lyrics` with `song_fraction` beside it as the honest position signal, and the specialist's prompt tells the model the sheet is unaligned and that `song_fraction` is a hint about section and mood, never a claim about which line is sung here. Aligning lyrics is a real unbuilt feature, and it is the same empty slot FR-26 left.
+
+**Scoped to the reference render.** `reference_prompt` submits the expansion when a Shot has one and the exact pre-change string when it does not — that equality is the safety argument for the whole feature. When an expansion is used the "Reference map:" preamble is **dropped**, because an H3 prompt must open with its instruction line or its first field and prose in front of that breaks the format; the tags are not lost, since the specialist is handed them and writes them into the description. The text-only Director path is untouched: it feeds `shot.prompt` into a structured timeline *segment*, and a three-field document there is an unevidenced shape.
+
+**Model behaviour worth knowing before debugging a prompt.** Measured on the Director's own machine, 2026-08-18: a reasoning model spent **899 of 900** tokens thinking and returned empty content, and all 6000 of a 6000-token budget the same way. `/no_think` in the prompt did not suppress it; `chat_template_kwargs: {"enable_thinking": false}` did, though not reliably — the same flag gave 467 reasoning tokens on a short system prompt and 1494 on a longer one. So an empty completion beside a full `reasoning_content` is reported as a **budget** problem naming the number, not as an invalid response: calling it invalid would send a reader to rewrite a prompt that was fine. `chat_template_kwargs` is an LM Studio / vLLM extension and the error names it, because a stricter provider will 400 and the fix is to drop it.
+
+## Project context
 
 The director receives the current song metadata — including the song's `lyrics` and `caption` when it has them — creative documents, assets, shots, and prior messages.
 
