@@ -1,4 +1,4 @@
-"""Browser QA for the shot inspector's two commitment controls, and the promote control.
+"""Browser QA for the shot inspector's commitment and expansion controls, and the promote control.
 
 None of these had ever been driven in a browser. All three are proven offline by *executing* their
 deciding logic -- `markReadyControl`, `renderAgainControl`, `multiviewPlan` -- against a stub DOM
@@ -12,6 +12,12 @@ what a Director could see and click, and on what the server holds afterwards.
 status writes on their own routes; none of them submits anything. The promote control *would*
 submit, so it is inspected and never clicked -- its rendered presence and enabled state are the
 whole assertion, which is exactly what changed today when `prop` and `setting` joined `character`.
+
+Since pass two of the H3 expansion landed it also drives "Expand prompt" and the plan-wide sweep,
+which spend language-model calls rather than GPU minutes and are therefore *pressed*. Their
+assertions are written for either answer the model can give, because a local model returning a
+malformed prompt is the expected case the whole feature exists to catch: what has to hold is that
+the creative intent is never overwritten and that a refused answer is never stored.
 
 Since 2026-08-18 it also gates the three defects the first browser run found, none of which the
 offline harness can reach: that a live toast does not intercept a click meant for the control that
@@ -215,7 +221,11 @@ def main() -> None:
                 "both commitment controls are drawn at once; their status lists are supposed to "
                 "partition the vocabulary"
             )
-            assert control(driver, ".control-reason") is None, (
+            # Scoped to the control it belongs to, not the first `.control-reason` in the panel.
+            # Since pass two the inspector draws a second refusable control -- "Expand prompt",
+            # above this one -- so a bare class selector reads that one's reason and asserts the
+            # wrong sentence. The browser run caught exactly that.
+            assert control(driver, "#mark-ready + .control-reason") is None, (
                 "an enabled control is carrying a refusal reason"
             )
             assert status_chip(driver) == "draft", status_chip(driver)
@@ -255,7 +265,11 @@ def main() -> None:
             blocked = control(driver, "#mark-ready")
             visible_and_clickable(driver, blocked, "the mark-ready button on an unprompted shot")
             assert not blocked.is_enabled(), "an unprompted shot offers a live commit button"
-            reason = control(driver, ".control-reason")
+            # Scoped to the control it belongs to, not the first `.control-reason` in the panel.
+            # Since pass two the inspector draws a second refusable control -- "Expand prompt",
+            # above this one -- so a bare class selector reads that one's reason and asserts the
+            # wrong sentence. The browser run caught exactly that.
+            reason = control(driver, "#mark-ready + .control-reason")
             assert reason is not None and reason.is_displayed(), (
                 "the refusal is not rendered where the Director is being refused"
             )
@@ -334,7 +348,11 @@ def main() -> None:
             locked = control(driver, "#render-again")
             visible_and_clickable(driver, locked, "the render-again button on a locked shot")
             assert not locked.is_enabled(), "a locked shot offers a live render-again button"
-            locked_reason = control(driver, ".control-reason")
+            # Scoped to the control it belongs to, not the first `.control-reason` in the panel.
+            # Since pass two the inspector draws a second refusable control -- "Expand prompt",
+            # above this one -- so a bare class selector reads that one's reason and asserts the
+            # wrong sentence. The browser run caught exactly that.
+            locked_reason = control(driver, "#render-again + .control-reason")
             assert locked_reason is not None and locked_reason.is_displayed(), (
                 "the lock refusal is not rendered in the panel"
             )
@@ -419,6 +437,121 @@ def main() -> None:
             )
             wait.until(lambda browser: resource_hits(browser, shots_path) >= writes + 2)
             settle(driver, "#shot-inspector")
+
+            # --- The H3 expansion controls ----------------------------------------------------
+            # Added 2026-08-18 with pass two. Every state of `expandPromptControl` is already
+            # executed offline against a stub DOM, so nothing here re-proves the decision: what a
+            # stub structurally cannot see is a control that never renders, a button hidden by CSS,
+            # a handler bound to an element that is gone, or a `disabled` attribute the browser does
+            # not honour -- and a brand-new control carries all four.
+            #
+            # **No GPU is spent and nothing reaches `/prompt`.** The expansion routes queue nothing;
+            # what they spend is one language-model call, which is the point of driving them here.
+            expansion: dict[str, object] = {}
+            for shot_id, expected in (
+                ("shot_draft", "enabled"),
+                ("shot_blank", "creative intent"),
+                ("shot_locked", "locked"),
+                ("shot_settled", "already rendered"),
+            ):
+                select_clip(driver, wait, shot_id)
+                button = control(driver, "#expand-prompt")
+                assert button is not None, f"{shot_id} draws no expand-prompt control at all"
+                facts = visible_and_clickable(driver, button, f"the expand-prompt button on {shot_id}")
+                if expected == "enabled":
+                    assert button.is_enabled(), "a prompted, open shot offers a dead expand button"
+                    assert button.text.strip() == "Expand prompt", button.text
+                    assert "Nothing is rendered" in (button.get_attribute("title") or ""), (
+                        button.get_attribute("title")
+                    )
+                    expansion[shot_id] = {"enabled": True, "geometry": facts}
+                    continue
+                assert not button.is_enabled(), f"{shot_id} offers a live expand button"
+                reason = control(driver, "#expand-prompt + .control-reason")
+                assert reason is not None and reason.is_displayed(), (
+                    f"the refusal for {shot_id} is not rendered where the Director is refused"
+                )
+                assert expected in reason.text.lower(), reason.text
+                # A `disabled` attribute the browser actually honours, rather than a grey button
+                # that still fires. Nothing offline can tell those apart.
+                button.click()
+                expansion[shot_id] = {"enabled": False, "reason": " ".join(reason.text.split())[:140]}
+            after_disabled = get_json(f"{server.base_url}/api/projects/{project_id}")
+            assert all(not shot["h3_prompt"] for shot in after_disabled["shots"]), (
+                "a disabled expand button still expanded a shot"
+            )
+
+            # The live call. Whichever way the model answers, two things hold: the creative intent
+            # is not overwritten, and an answer the format checker refuses is not stored. Both
+            # outcomes are asserted rather than one being treated as a flake, because a local model
+            # returning a malformed prompt is the *expected* case this feature exists to catch.
+            select_clip(driver, wait, "shot_draft")
+            intent_before = next(
+                shot["prompt"] for shot in after_disabled["shots"] if shot["id"] == "shot_draft"
+            )
+            control(driver, "#expand-prompt").click()
+            expanded = wait_for_toast(driver, WebDriverWait(driver, 300), "H3 prompt")
+            settle(driver, "#shot-inspector")
+            stored = next(
+                shot for shot in get_json(f"{server.base_url}/api/projects/{project_id}")["shots"]
+                if shot["id"] == "shot_draft"
+            )
+            assert stored["prompt"] == intent_before, (
+                "the expansion overwrote the creative intent it was written from"
+            )
+            applied = "written for" in expanded
+            if applied:
+                assert stored["h3_prompt"], "the toast claims a prompt was written and none was"
+                assert control(driver, "#shot-h3-prompt") is not None, (
+                    "the expansion was stored and the panel does not show it"
+                )
+                assert control(driver, "#expand-prompt").text.strip() == "Expand prompt again"
+            else:
+                assert stored["h3_prompt"] == "", (
+                    "a malformed answer reached the manifest, where the next render would submit it"
+                )
+                report_block = control(driver, "#expansion-report")
+                assert report_block is not None and report_block.is_displayed(), (
+                    "a refused answer was thrown away instead of being shown"
+                )
+            expansion["live_single"] = {
+                "toast": " ".join(expanded.split())[:200],
+                "applied": applied,
+                "intent_unchanged": stored["prompt"] == intent_before,
+            }
+
+            # The plan-wide sweep, from the Director workspace. Only one shot in this plan is
+            # writable and prompted, so this is one further model call; the other four are refused
+            # without one and have to be named anyway.
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="treatment"]').click()
+            sweep = wait.until(EC.visibility_of_element_located((By.ID, "expand-h3-prompts")))
+            visible_and_clickable(driver, sweep, "the plan-wide H3 sweep button")
+            assert sweep.is_enabled(), "a plan with shots offers a dead sweep button"
+            assert "one call per shot" in (sweep.get_attribute("title") or ""), (
+                sweep.get_attribute("title")
+            )
+            clear_toasts(driver)
+            sweep.click()
+            swept = wait_for_toast(driver, WebDriverWait(driver, 600), "H3 prompt")
+            thread = driver.find_element(By.ID, "chat-thread").text
+            after_sweep = get_json(f"{server.base_url}/api/projects/{project_id}")
+            # Every shot is named, which is what "reported individually" means: a shot the sweep
+            # skipped in silence is indistinguishable from one it forgot.
+            for shot in after_sweep["shots"]:
+                assert shot["id"] in thread, (
+                    f"{shot['id']} was swept and never mentioned in the report: {thread[-600:]}"
+                )
+            assert "no intent to expand from" in thread
+            assert "they are locked" in thread
+            expansion["live_sweep"] = {
+                "toast": " ".join(swept.split())[:200],
+                "written": sum(1 for shot in after_sweep["shots"] if shot["h3_prompt"]),
+                "report": " ".join(thread.split())[-900:],
+            }
+            result["h3_expansion"] = expansion
+            assert not after_sweep["jobs"], "expansion queued a render; it must never reach /prompt"
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            wait.until(EC.visibility_of_element_located((By.ID, "shot-inspector")))
 
             # --- The promote control, driven but deliberately never fired ----------------------
             driver.find_element(By.CSS_SELECTOR, '[data-panel="assets"]').click()

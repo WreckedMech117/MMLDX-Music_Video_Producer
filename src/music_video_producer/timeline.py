@@ -204,6 +204,13 @@ def assistant_input(project: Project, *, shot_ids: list[str]) -> dict[str, Any]:
             "locked": shot.locked,
             "current_mode": resolve_shot_mode(shot),
             "current_prompt": shot.prompt,
+            # Whether this Shot has an H3 expansion, and **never the expansion itself.** The
+            # assistant has a tool that asks for one, so it needs to know which shots already have
+            # one or it will re-expand a whole plan on every request; a boolean answers that at the
+            # cost of one token. The text is what `SHOT_DIRECTOR_WITHHELD` keeps out of the chat
+            # dump — MiniMax's own worked examples run past a thousand characters each — and this
+            # payload is not the exception to that, it is the same model on the same machine.
+            "expanded": bool(shot.h3_prompt.strip()),
             "singing": shot.singing,
             "use_song_audio": shot.use_song_audio,
             "citations": [

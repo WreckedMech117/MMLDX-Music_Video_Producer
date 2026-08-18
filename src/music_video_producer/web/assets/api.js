@@ -1540,6 +1540,138 @@ export function assistantToast(project) {
   return ASSISTANT_TOAST.replace("{count}", filled).replace("{plural}", filled === 1 ? "" : "s");
 }
 
+// ---------------------------------------------------------------------------------------------
+// The H3 expansion specialist, pass two
+// ---------------------------------------------------------------------------------------------
+
+// The Director's own words for what this control is: "an 'Expand Prompt' button in the text section
+// of the shots for if they want to edit a shots individual prompt". It sits under the creative
+// intent it expands, because that is the thing it reads and the thing it must be seen not to
+// overwrite.
+export const EXPAND_PROMPT_CONTROL = "#expand-prompt";
+export const EXPAND_PROMPT_LABEL = "Expand prompt";
+// A different label when there is already an expansion, decided here rather than by the template.
+// "Expand prompt" over a shot that already has one reads as an offer to add a second, and the
+// matrix's re-expansion row says plainly that it replaces: the label is where that is said before
+// the click.
+export const EXPAND_PROMPT_AGAIN_LABEL = "Expand prompt again";
+export const EXPAND_PROMPT_HELP =
+  "Turn this shot's creative intent into MiniMax H3's structured prompt format, in one call to the " +
+  `expansion specialist. The creative intent is not overwritten. ${SHOT_EXPANSION_NO_RENDER} and no shot window is changed.`;
+export const EXPAND_PROMPT_AGAIN_HELP =
+  "Write this shot's H3 prompt again from its creative intent, replacing the one it has. The " +
+  `creative intent is not overwritten, so this is repeatable. ${SHOT_EXPANSION_NO_RENDER} and no shot window is changed.`;
+// Why the control is off, in the browser's voice. Mirrors app.py's EXPAND_PROMPT_LOCKED,
+// EXPAND_PROMPT_RENDERED and EXPAND_PROMPT_WITHOUT_INTENT in *substance* rather than word for word,
+// on `assistantControl`'s precedent: those are `{shot}`-templated sentences written for a refusal
+// the Director has already clicked into, and these are hover text on a control that names its own
+// shot by sitting inside its panel.
+export const EXPAND_PROMPT_LOCKED =
+  "This shot is locked. A lock is a deliberate hands-off, and rewriting its prompt is exactly the kind of change it refuses. Unlock the shot first.";
+export const EXPAND_PROMPT_RENDERED =
+  "This shot has already rendered, so its prompt is the record of what produced a take rather than an intention. Use Render again if you want a different take.";
+export const EXPAND_PROMPT_WITHOUT_INTENT =
+  "Write the creative intent above first. This pass turns an intent into the H3 format; it does not invent one, which is what the Director's shot expansion is for.";
+
+// The one decision behind the per-shot control: may this shot be expanded, and with which words.
+// A pure function rather than an expression inside the inspector's template, on `markReadyControl`'s
+// precedent, so every state can be executed by a test instead of read.
+//
+// The refusal order is the server's, and it is not cosmetic: `shot_write_refusal` before the prompt
+// gate, so a locked shot with no intent hears that it is locked rather than being sent to write an
+// intent that would then be refused anyway. Phase one pinned that order with its own test; this is
+// the same rule, one screen earlier.
+export function expandPromptControl(shot) {
+  if (!shot) return { shown: false, disabled: true, label: EXPAND_PROMPT_LABEL, title: "", reason: "" };
+  const expanded = Boolean(String(shot.h3_prompt || "").trim());
+  const label = expanded ? EXPAND_PROMPT_AGAIN_LABEL : EXPAND_PROMPT_LABEL;
+  const refusal = shotWriteRefusal(shot);
+  if (refusal) {
+    const reason = refusal === "locked" ? EXPAND_PROMPT_LOCKED : EXPAND_PROMPT_RENDERED;
+    return { shown: true, disabled: true, label, title: reason, reason };
+  }
+  if (promptIsMissing(shot)) {
+    return { shown: true, disabled: true, label, title: EXPAND_PROMPT_WITHOUT_INTENT, reason: EXPAND_PROMPT_WITHOUT_INTENT };
+  }
+  return { shown: true, disabled: false, label, title: expanded ? EXPAND_PROMPT_AGAIN_HELP : EXPAND_PROMPT_HELP, reason: "" };
+}
+
+// The plan-wide sweep's control. Off when there is nothing to sweep, and never off for a plan whose
+// shots are merely locked or unprompted: unlike `assistantFillAllControl`, this route sends no
+// selection at all, so filtering here would be this client deciding what the report says about
+// shots it never mentioned.
+export const EXPAND_ALL_PROMPTS_CONTROL = "#expand-h3-prompts";
+export const EXPAND_ALL_PROMPTS_LABEL = "Expand into H3 prompts";
+export const EXPAND_ALL_PROMPTS_HELP =
+  "Run the H3 expansion specialist once for every shot in the plan, one call per shot, each judged " +
+  `on its own. Creative intents are not overwritten and a malformed answer is reported rather than saved. ${SHOT_EXPANSION_NO_RENDER}.`;
+// The whole-plan refusal, mirroring app.py's EXPAND_PROMPTS_WITHOUT_SHOTS. A contract test asserts
+// the two are identical: two hand-written wordings for one rule is how the pre-emptive toast starts
+// describing a rule the server no longer has.
+export const EXPAND_ALL_PROMPTS_WITHOUT_SHOTS =
+  "This project has no shots to expand into H3 prompts. Expansion writes onto shots that already " +
+  "exist and never creates one, so add shots to the timeline first.";
+
+export function expandAllPromptsControl(project) {
+  const shots = project?.shots || [];
+  if (!shots.length) return { disabled: true, title: EXPAND_ALL_PROMPTS_WITHOUT_SHOTS };
+  return { disabled: false, title: EXPAND_ALL_PROMPTS_HELP };
+}
+
+// What one sweep did, read out of the reply rather than diffed off the shots -- `shotExpansionToast`'s
+// argument, and stronger here because `h3_prompt` is not drawn on the timeline at all, so a diff
+// would have nothing on screen to be checked against.
+export const EXPAND_ALL_PROMPTS_MARKER = "H3 prompts written for";
+const EXPAND_ALL_PROMPTS_PATTERN = new RegExp(`${EXPAND_ALL_PROMPTS_MARKER} (\\d+) shot\\(s\\):`);
+export const EXPAND_ALL_PROMPTS_TOAST =
+  `{count} H3 prompt{plural} written by this sweep. ${SHOT_EXPANSION_NO_RENDER}, and the reply says per shot what happened to the rest.`;
+export const EXPAND_ALL_PROMPTS_UNCHANGED_TOAST =
+  "No H3 prompt was written; the reply says, per shot, what the specialist returned and why none of it was saved.";
+
+export function expandAllPromptsWritten(project) {
+  const match = EXPAND_ALL_PROMPTS_PATTERN.exec(assistantReply(project) ?? "");
+  return match ? Number(match[1]) : 0;
+}
+
+export function expandAllPromptsToast(project) {
+  const written = expandAllPromptsWritten(project);
+  if (!written) return EXPAND_ALL_PROMPTS_UNCHANGED_TOAST;
+  return EXPAND_ALL_PROMPTS_TOAST.replace("{count}", written).replace("{plural}", written === 1 ? "" : "s");
+}
+
+// What one per-shot expansion did, taken from the route's own `applied` flag rather than inferred.
+// The malformed case is deliberately not summarised into "something went wrong": the checker's
+// sentences are the actionable half, and they are shown in the panel by `expansionReportHtml` --
+// this is only the line that says which of the two happened.
+export const EXPAND_PROMPT_APPLIED_TOAST =
+  `H3 prompt written for {shot}. Its creative intent is unchanged. ${SHOT_EXPANSION_NO_RENDER}.`;
+export const EXPAND_PROMPT_MALFORMED_TOAST =
+  "{shot} was NOT changed: the answer is not a well-formed H3 prompt. What came back, and what is wrong with it, is below the creative intent.";
+
+export function expandPromptToast(result, label) {
+  const template = result?.applied ? EXPAND_PROMPT_APPLIED_TOAST : EXPAND_PROMPT_MALFORMED_TOAST;
+  return template.replace("{shot}", label);
+}
+
+// The malformed answer, rendered where the Director can act on it. A toast carrying five checker
+// sentences and a thousand characters of returned prompt is a toast nobody reads, and the report is
+// the whole reason a refused answer is returned at all rather than dropped.
+//
+// Keyed to the shot it is about, so a report cannot outlive its selection: switching shots and
+// finding the previous shot's failure under this one's intent would be a straightforwardly false
+// claim about the panel it is drawn in.
+export const EXPANSION_REPORT_TITLE = "The last answer was not saved";
+
+export function expansionReport(report, shot) {
+  if (!report || !shot || report.shotId !== shot.id) return { shown: false, title: "", problems: [], prompt: "" };
+  return {
+    shown: true,
+    title: EXPANSION_REPORT_TITLE,
+    problems: report.problems || [],
+    prompt: report.prompt || "",
+  };
+}
+
 // What each direction did, mirroring app.py's MARK_READY_NOTICE and MARK_DRAFT_NOTICE so the
 // sentence the Director reads is the one the server implements. A contract test asserts they are
 // identical.
@@ -1813,6 +1945,17 @@ export const api = {
   // model sees is derived on the server from the project itself, so there is nothing here for a
   // message to travel in — and nothing that could queue a render.
   expandShots: (id) => request(`/api/projects/${id}/director/expand`, { method: "POST" }),
+  // Pass two, one shot. No body for `expandShots`' reason and one more: everything the specialist
+  // needs is already on the shot, so there is nothing here a stale client could assert. The reply
+  // is not the project -- it is the project *plus* whether the answer was applied, what the format
+  // checker said, and the text itself, because a refused prompt is something the Director reads
+  // and judges rather than something to throw away.
+  expandShotPrompt: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/expand-prompt`, { method: "POST" }),
+  // Pass two, the whole plan: one model call per shot, on the server, judged per shot. No body --
+  // every shot in the plan is swept, including the ones nothing can be written to, so there is no
+  // selection for this to carry. The reply is the whole project with the per-shot report in its
+  // notices. Nothing is rendered by it and no GPU time is spent.
+  expandPlanPrompts: (id) => request(`/api/projects/${id}/shots/expand-prompts`, { method: "POST" }),
   // Assistant ProducerBot. The body carries the Director's own words and the shots they selected,
   // and the selection is the turn's consent: the server refuses a tool call naming anything else,
   // so this is the one place the scope of an assistant turn is decided. No render is queued by it

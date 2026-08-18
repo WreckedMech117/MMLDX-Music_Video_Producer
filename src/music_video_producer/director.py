@@ -7,7 +7,11 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
-from .assistant_prompt import ASSISTANT_SYSTEM_PROMPT, FILL_SHOTS_DESCRIPTION
+from .assistant_prompt import (
+    ASSISTANT_SYSTEM_PROMPT,
+    EXPAND_PROMPTS_DESCRIPTION,
+    FILL_SHOTS_DESCRIPTION,
+)
 from .models import AssetRole, ShotMode, SingingState
 
 #: Default completion budget for one H3 expansion. Large because it has to cover a
@@ -62,7 +66,8 @@ class ShotExpansion(BaseModel):
     shots: list[ExpandedShot]
 
 
-#: The one tool Assistant ProducerBot has. One rather than several, and the count is a decision:
+#: Assistant ProducerBot's first tool, and for a long time its only one. One rather than several,
+#: and the count was a decision:
 #:
 #: every extra tool is another shape a local model can get wrong, and the four things this replaces
 #: — declare a mode, write a prompt, cite assets in roles, record the performance — are the four
@@ -71,8 +76,22 @@ class ShotExpansion(BaseModel):
 #: its citations cannot satisfy; together, the whole specification is one call that is applied or
 #: refused as a unit. Nothing else the assistant might plausibly be given is allowed: approving a
 #: take, marking a shot ready, deleting a shot, writing a Song and anything that spends GPU time are
-#: all outside this feature, so the honest surface really is one tool.
+#: all outside this feature.
 FILL_SHOTS_TOOL = "fill_shots"
+
+#: The second tool, and the reason the count above went from one to two rather than staying at one.
+#:
+#: It is not a fifth half of "what is this shot". Filling a shot in *writes the intent*; expanding
+#: it *transforms an intent that already exists* into H3's structured format, through a different
+#: system prompt, a different payload and one model call per shot. Folding it into `fill_shots`
+#: would have made a single tool call mean "write this, and also spend N further calls on it",
+#: which is exactly the kind of hidden second act a Director cannot decline.
+#:
+#: ProducerBot is the surface and the specialist is in its box: this tool is how a conversational
+#: request reaches the specialist at all. It routes through the same `shot_write_refusal` and the
+#: same prompt gate a Director's own click meets — a tool that cannot be refused is a guard hole —
+#: and, exactly like `fill_shots`, it may only name shots the turn's selection already contains.
+EXPAND_PROMPTS_TOOL = "expand_prompts"
 
 
 class ShotCitationFill(BaseModel):
@@ -153,6 +172,38 @@ class FillShotsArguments(BaseModel):
     shots: list[ShotFill] = Field(description="One entry per shot to fill in.")
 
 
+class ShotExpansionRequest(BaseModel):
+    """One Shot the model wants expanded into H3's structured format, addressed **by id**.
+
+    Deliberately carries nothing else. `ShotFill` is typed to the shot vocabulary because a mode,
+    a role and a performance state are all things a model can plausibly get wrong in words; an
+    expansion has no such vocabulary to get wrong — everything it needs is already on the Shot and
+    its project, which is why the route this reaches sends no body either. The *only* thing the
+    model contributes is which shot, so the only thing to validate is that it named one.
+
+    A separate model from `ShotFill` rather than a reuse of it, for `ShotCitationFill`'s reason:
+    they agree on `shot_id` today, and the day `ShotFill` gains a field is the day reusing it would
+    make that field settable through a tool that has no business setting anything.
+    """
+
+    shot_id: str = Field(
+        min_length=1,
+        description="The id of one of the shots in plan.shots, copied verbatim. Any other id is discarded.",
+    )
+
+
+class ExpandPromptsArguments(BaseModel):
+    """The `expand_prompts` argument object, and the source of its JSON schema.
+
+    A list, on `FillShotsArguments`' argument: a model that has to emit thirty separate tool calls
+    to expand thirty shots will emit some other number. One call naming many shots — and then, on
+    the server, **one model call per shot**, which is the whole point of pass two and is not
+    something this schema can express or the model needs to know.
+    """
+
+    shots: list[ShotExpansionRequest] = Field(description="One entry per shot to expand.")
+
+
 def _model_facing_schema(model: type[BaseModel]) -> dict[str, Any]:
     """`model`'s JSON schema with the class docstrings taken back out.
 
@@ -187,7 +238,15 @@ def assistant_tools() -> list[dict[str, Any]]:
                 "description": FILL_SHOTS_DESCRIPTION,
                 "parameters": _model_facing_schema(FillShotsArguments),
             },
-        }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": EXPAND_PROMPTS_TOOL,
+                "description": EXPAND_PROMPTS_DESCRIPTION,
+                "parameters": _model_facing_schema(ExpandPromptsArguments),
+            },
+        },
     ]
 
 
@@ -204,6 +263,10 @@ class AssistantTurn(BaseModel):
 
     message: str = ""
     fills: list[ShotFill] = Field(default_factory=list)
+    #: The shots the model asked to have expanded into H3's format, in the order it named them.
+    #: Kept apart from `fills` rather than merged into it, because the two are applied by different
+    #: machinery at different costs: a fill is a field assignment, an expansion is a model call.
+    expansions: list[ShotExpansionRequest] = Field(default_factory=list)
     malformed: list[str] = Field(default_factory=list)
 
 
@@ -227,13 +290,23 @@ def parse_assistant_reply(reply: dict[str, Any]) -> AssistantTurn:
     had. The last one is the case the whole typed surface exists for, and it is why entries are
     validated **one at a time**: validating the list as a whole would let one bad mode discard
     twenty-nine good shots.
+
+    Both tools are parsed by the same loop, keyed off the name the model called. The two argument
+    objects share the `shots` key on purpose — one shape for the model to learn — and differ only
+    in the model each entry is validated against, which is what decides whether a bad entry lands
+    in `fills`, in `expansions`, or in `malformed`.
     """
+    accepted: dict[str, type[BaseModel]] = {
+        FILL_SHOTS_TOOL: ShotFill,
+        EXPAND_PROMPTS_TOOL: ShotExpansionRequest,
+    }
     content = reply.get("content")
     turn = AssistantTurn(message=content.strip() if isinstance(content, str) else "")
     calls = reply.get("tool_calls")
     for call in calls if isinstance(calls, list) else []:
         function = call.get("function") if isinstance(call, dict) else None
-        if not isinstance(function, dict) or function.get("name") != FILL_SHOTS_TOOL:
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(function, dict) or name not in accepted:
             turn.malformed.append(_raw_argument(call))
             continue
         arguments = function.get("arguments")
@@ -247,11 +320,17 @@ def parse_assistant_reply(reply: dict[str, Any]) -> AssistantTurn:
         if not isinstance(entries, list):
             turn.malformed.append(_raw_argument(arguments))
             continue
+        model = accepted[name]
         for entry in entries:
             try:
-                turn.fills.append(ShotFill.model_validate(entry))
+                validated = model.model_validate(entry)
             except ValidationError:
                 turn.malformed.append(_raw_argument(entry))
+                continue
+            if isinstance(validated, ShotFill):
+                turn.fills.append(validated)
+            else:
+                turn.expansions.append(validated)
     return turn
 
 

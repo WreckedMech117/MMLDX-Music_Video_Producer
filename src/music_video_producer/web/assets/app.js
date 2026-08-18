@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -20,6 +20,12 @@ let waveformLoadRevision = 0;
 // data: it is derived, never saved, and never sent back.
 let readinessReport = null;
 let readinessLoadRevision = 0;
+// The last H3 expansion this client was refused, as `{shotId, problems, prompt}`, or null. Held
+// here for `readinessReport`'s reason -- it is derived, never saved and never sent back -- and
+// keyed to its shot, because a report drawn under a different shot's intent would be a false claim
+// about the panel it sits in. Cleared the moment an expansion is applied: the answer that failed
+// stops being the last thing that happened to that shot.
+let lastExpansionReport = null;
 
 function toast(message, kind = "info") {
   const item = document.createElement("div");
@@ -667,6 +673,9 @@ function renderTimeline() {
   // change, every project load and every reply already goes through it -- wiring them to the click
   // handler instead would leave them stale after a load, a delete or a lock set elsewhere.
   syncAssistantControls();
+  // The whole-plan H3 sweep lives beside the pass-one expansion in the Director workspace, and its
+  // only question is whether this plan has any shots -- which is a thing this function owns.
+  syncExpansionControls();
   if (state.audioBuffer) drawWaveform($("#timeline-waveform"), state.audioBuffer, "#6f7d3d");
   updateTimelinePlayhead();
 }
@@ -861,13 +870,31 @@ export function renderShotInspector() {
   const markHtml = mark.shown
     ? `<button class="quiet-button full" id="mark-ready" ${mark.disabled ? "disabled" : ""} title="${escapeHtml(mark.title)}">${escapeHtml(mark.label)}</button>${mark.reason ? `<p class="control-reason">${escapeHtml(mark.reason)}</p>` : ""}`
     : "";
+  // The H3 expansion, drawn under the creative intent it was written from. Decided by
+  // `expandPromptControl`, which the contract tests execute for every state and every refusal;
+  // nothing about that decision is re-made here.
+  //
+  // The textarea appears only when this shot has an expansion, and its presence is therefore the
+  // panel's answer to "is this shot expanded". An always-empty box on every unexpanded shot would
+  // be a second prompt field competing with the intent for the Director's attention, in a panel
+  // whose whole difficulty is that `prompt` and `h3_prompt` are not the same thing. It is editable
+  // because the frozen block says both fields are independently editable, and it saves through the
+  // ordinary shots write like every other field here.
+  const expand = expandPromptControl(shot);
+  const report = expansionReport(lastExpansionReport, shot);
+  const expandHtml = expand.shown
+    ? `${shot.h3_prompt ? `<label>H3 structured prompt<textarea id="shot-h3-prompt" rows="10">${escapeHtml(shot.h3_prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="expand-prompt" ${expand.disabled ? "disabled" : ""} title="${escapeHtml(expand.title)}">${escapeHtml(expand.label)}</button>${expand.reason ? `<p class="control-reason">${escapeHtml(expand.reason)}</p>` : ""}${report.shown ? `<div class="shot-readiness blocked" id="expansion-report"><strong>${escapeHtml(report.title)}</strong>${report.problems.map((line) => `<p>${escapeHtml(line)}</p>`).join("")}${report.prompt ? `<textarea rows="8" readonly>${escapeHtml(report.prompt)}</textarea>` : ""}</div>` : ""}`
+    : "";
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label><label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
+  // Bound separately and optionally: the H3 box is drawn only for a shot that has an expansion, so
+  // adding it to the list above would throw on every shot that does not.
+  $("#shot-h3-prompt")?.addEventListener("change", updateShotFromInspector);
   // Attach, re-role and remove all go through `reconcileShotCitations`, which is the client half of
   // the model's own reconciliation. Writing `citations` without it would leave this client drawing a
   // stale `asset_ids` until the next full project load -- the shots write deliberately does not
@@ -934,6 +961,42 @@ export function renderShotInspector() {
       toast(markReadyNotice(project, shot.id, mark.action));
     } catch (error) { toast(error.message, "error"); }
   });
+  // Pass two for one shot. Its own route and no body, for the reason `render-again` records: the
+  // shots write is the generic whole-list one, and a request meaning "expand this one" must not
+  // also reassert every prompt, window and lock this client happens to be holding.
+  //
+  // Silent shot saves are shut out for the call in the same two halves the whole-plan expansion
+  // uses, and through the same flag. Both are needed: awaiting the pending chain drains the saves
+  // queued *before* the click, and the flag refuses the ones a drag would queue during it -- either
+  // would otherwise land a shot list from before the expansion and revert what was just written.
+  //
+  // The reply carries whether it was applied, so the toast is read off that rather than diffed. A
+  // refused answer is not thrown away: it goes into `lastExpansionReport`, keyed to this shot, and is
+  // drawn under the intent by the re-render below.
+  $("#expand-prompt")?.addEventListener("click", async () => {
+    if (!requireProject()) return;
+    if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to expand a shot's prompt.", "error");
+    const projectId = state.project.id;
+    const button = $("#expand-prompt");
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Expanding…";
+    shotWriteInFlight = "expansion";
+    try {
+      await shotSaveChain;
+      const result = await api.expandShotPrompt(projectId, shot.id);
+      // The Director switched projects while the model was thinking. The expansion is saved on the
+      // server, so nothing is lost by dropping this reply, whereas applying it here would show one
+      // project's work under another's name.
+      if (state.project?.id !== projectId) return;
+      const shotLabelText = shotLabel(result.project, shot.id);
+      lastExpansionReport = result.applied ? null : { shotId: shot.id, problems: result.problems, prompt: result.prompt };
+      state.project = result.project;
+      renderTimeline();
+      toast(expandPromptToast(result, shotLabelText), result.applied ? "info" : "error");
+    } catch (error) { toast(error.message, "error"); }
+    finally { shotWriteInFlight = ""; button.disabled = false; button.textContent = label; }
+  });
   $("#render-again")?.addEventListener("click", async () => {
     if (!requireProject()) return;
     const projectId = state.project.id;
@@ -961,6 +1024,17 @@ function updateShotFromInspector() {
   // singing": the enhancer moves lip position, so a value nobody chose is worse than no value.
   shot.singing = $("#shot-singing").value;
   shot.prompt = $("#shot-prompt").value;
+  // Read back only when this shot has an expansion, which is exactly when the box was drawn.
+  //
+  // The condition is the shot's own field and deliberately not "is the element on the page": the
+  // template decided from the shot, so the read-back decides from the shot, and the two cannot
+  // disagree. Reading unconditionally is the mutation that matters, and its consequence is worse
+  // than a blank: the panel is rebuilt with `innerHTML` while the previous shot's box may still be
+  // reachable, so an unrelated edit -- a seed, a checkbox -- would copy ONE SHOT'S EXPANSION ONTO
+  // ANOTHER through the whole-list save. `h3_prompt` is the one field this client otherwise carries
+  // round-trip without ever touching, so nothing on screen would show it until a render submitted
+  // the wrong document.
+  if (shot.h3_prompt?.trim()) shot.h3_prompt = $("#shot-h3-prompt").value;
   shot.seed = Math.max(0, Number($("#shot-seed").value));
   shot.use_song_audio = $("#shot-song-audio").checked;
   state.dirty = true;
@@ -1115,6 +1189,60 @@ async function expandShotPrompts() {
     toast(shotExpansionToast(state.project));
   } catch (error) { toast(error.message, "error"); }
   finally { shotWriteInFlight = ""; button.disabled = false; button.textContent = label; }
+}
+
+// Pass two over the whole plan: one model call per shot, on the server, each judged on its own.
+// Deliberately the same shape as `expandShotPrompts` above rather than a new one -- the project id
+// captured before the await, the pending save chain drained, the in-flight flag held for the whole
+// call, the reply adopted only if the Director is still looking at the project it answers -- because
+// it is the same hazard for longer. This call is N model calls rather than one, so every window it
+// leaves open is open N times as long.
+//
+// The reply is the whole project, so the document editors are re-rendered from it and the same
+// unsaved-edits gate every other server-overwrites-the-editors path asks is asked here. One
+// question and not two: what pressing this costs -- one model call per shot -- is on the button's
+// own hover text before the click, where a Director deciding whether to press it can read it,
+// rather than in a dialog that fires after they already have.
+//
+// The toast is read out of the reply, not diffed off the shots: `h3_prompt` is not drawn on the
+// timeline at all, so there is nothing on screen for a diff to be checked against.
+async function expandPlanPrompts() {
+  if (!requireProject()) return;
+  if (!state.project.shots.length) return toast(EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, "error");
+  if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to expand shots into H3 prompts.", "error");
+  if (!confirmDiscardingDocumentEdits(`Expand all ${state.project.shots.length} shot(s) into H3 prompts? That is one model call per shot and takes a while. No creative intent is overwritten, but the whole project comes back, so the editors are re-rendered from the text stored on the server.`)) return;
+  const projectId = state.project.id;
+  const button = $(EXPAND_ALL_PROMPTS_CONTROL);
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Expanding…";
+  shotWriteInFlight = "expansion";
+  try {
+    await shotSaveChain;
+    const expanded = await api.expandPlanPrompts(projectId);
+    if (state.project?.id !== projectId) return;
+    state.project = expanded;
+    // The report the panel is holding describes a single-shot call from before this sweep, and the
+    // sweep has just answered for that shot again.
+    lastExpansionReport = null;
+    markDocumentsSaved();
+    renderAll();
+    toast(expandAllPromptsToast(state.project));
+  } catch (error) { toast(error.message, "error"); }
+  finally { shotWriteInFlight = ""; button.disabled = false; button.textContent = label; syncExpansionControls(); }
+}
+
+// The sweep control's state, repainted from the project on screen. Its own function rather than a
+// line inside `syncAssistantControls` because the two answer different questions -- that one is
+// about the shot *selection*, this one about whether the plan has any shots at all -- and it is
+// called from `renderTimeline` for the same reason: every selection change, project load and reply
+// already goes through it.
+export function syncExpansionControls() {
+  const control = $(EXPAND_ALL_PROMPTS_CONTROL);
+  if (!control) return;
+  const sweep = expandAllPromptsControl(state.project);
+  control.disabled = sweep.disabled;
+  control.title = sweep.title;
 }
 
 function saveShotsSilently() {
@@ -1513,6 +1641,10 @@ function bindEvents() {
   });
   $("#send-treatment").addEventListener("click", () => document.querySelector('[data-panel="treatment"]').click());
   $("#expand-shot-prompts").addEventListener("click", expandShotPrompts);
+  // Pass two, beside pass one and in that order on screen, because that is the order the two run
+  // in: pass one lays the shots out so they flow together and writes each one's intent, pass two
+  // turns each intent into H3's structured format one call at a time.
+  $(EXPAND_ALL_PROMPTS_CONTROL).addEventListener("click", expandPlanPrompts);
   $("#add-shot").addEventListener("click", () => {
     if (!requireProject()) return;
     const shots = state.project.shots;

@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 from collections import Counter
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -1657,6 +1658,260 @@ class ShotExpansionResult(BaseModel):
     #: which is the same argument `MessageNotice.raw` makes for refused Director output.
     prompt: str = ""
     note: str = ""
+
+
+#: Why a whole-plan sweep is refused before any model call, on `EXPANSION_WITHOUT_SHOTS`' argument.
+EXPAND_PROMPTS_WITHOUT_SHOTS = (
+    "This project has no shots to expand into H3 prompts. Expansion writes onto shots that already "
+    "exist and never creates one, so add shots to the timeline first."
+)
+
+#: What one sweep did, per shot. Every wording here either *is* one the single-shot route and the
+#: whole-plan pass-one expansion already use, or is new because only a sweep can produce it.
+#:
+#: The lock and provenance sentences are deliberately `EXPANSION_LOCKED_NOTICE` and
+#: `EXPANSION_RENDERED_NOTICE` themselves rather than rewordings: the frozen matrix asks for a
+#: refusal "in the same words", and a second spelling of one rule is how the two start describing
+#: different rules.
+EXPAND_PROMPTS_WRITTEN_NOTICE = (
+    "H3 prompts written for {count} shot(s): {shots}. Each was checked against the format's own "
+    "rules before it was stored. Nothing was rendered and no GPU time was spent."
+)
+#: The prompt gate, plural. `EXPAND_PROMPT_WITHOUT_INTENT` is the single-shot wording and says the
+#: same thing about one shot; this is the sweep's, because listing twenty shots through a
+#: `{shot}`-shaped sentence twenty times is not a report anyone reads.
+EXPAND_PROMPTS_WITHOUT_INTENT_NOTICE = (
+    "Not expanded because they have no intent to expand from: {shots}. Pass one writes the short "
+    "intent and this pass turns it into the H3 format, so write or generate those first."
+)
+#: A malformed answer, per shot. `raw` carries what the model returned — bounded by
+#: `NOTICE_RAW_LIMIT` and dropped from the Director's context by `DIRECTOR_CONTEXT_EXCLUDE` — so the
+#: Director can read and judge it without it ever reaching the next call, which is the argument
+#: `EXPANSION_REJECTED_NOTICE` already makes for refused Director output.
+EXPAND_PROMPTS_MALFORMED_NOTICE = (
+    "NOT saved for {shot}: the answer is not a well-formed H3 prompt. {problems} The returned text "
+    "is kept beside this notice for inspection and is left out of the context of the next Director "
+    "call. The shot is exactly as it was."
+)
+EXPAND_PROMPTS_MALFORMED_EMPTY_NOTICE = (
+    "NOT saved for {shot}: the answer is not a well-formed H3 prompt. {problems} There is no "
+    "returned text. The shot is exactly as it was."
+)
+#: One shot's model call failing while the rest of the sweep carried on. Its own sentence because
+#: the remedy is not the Director's: nothing about the shot is wrong.
+EXPAND_PROMPTS_FAILED_NOTICE = (
+    "Not expanded because the model call for them failed: {shots}. The rest of the sweep carried "
+    "on and their shots are unchanged, so expanding them again is all this needs. The host said: "
+    "{detail}"
+)
+#: The reply's own sentence. The specialist returns a prompt and never prose, so unlike pass one
+#: and unlike the assistant there is no model message to carry — and a reply that is a bare
+#: separator followed by notices is not a reply.
+EXPAND_PROMPTS_MESSAGE = (
+    "The H3 expansion specialist was run once for each shot, and each answer was judged on its own."
+)
+
+
+#: What happened to one Shot in a sweep, before anything has been written.
+#:
+#: `expanded` is not `applied`: it means the model answered and the answer passed the format check,
+#: which is a judgement about text. Whether it may be *stored* is decided later, against the
+#: project as it is at commit time, and `apply_expansions` is what turns this into `applied`,
+#: `locked`, `rendered` or `missing`.
+ExpansionKind = Literal[
+    "applied", "expanded", "malformed", "locked", "rendered", "no_intent", "failed", "missing"
+]
+
+
+@dataclass(frozen=True)
+class ShotExpansionOutcome:
+    """One shot's result from a sweep. Frozen, because a sweep reports rather than accumulates."""
+
+    shot_id: str
+    kind: ExpansionKind
+    #: What the model returned, applied or refused. Empty for every kind that never called it.
+    text: str = ""
+    #: The checker's own sentences. Populated for `malformed`, and empty otherwise — a well-formed
+    #: prompt can still carry advisory problems, and those are not what this field is for.
+    problems: tuple[str, ...] = ()
+    #: The host's own words, for `failed`.
+    detail: str = ""
+
+
+async def expand_shots(
+    project: Project, shots: list[Shot], *, director: DirectorClient
+) -> list[ShotExpansionOutcome]:
+    """Expand each Shot in turn. **N model calls, not one.** Writes nothing, anywhere.
+
+    This is pass two applied to many shots, and the sequence is the feature rather than an
+    implementation detail: one H3 prompt is a long document, thirty of them will not fit one
+    context, and quality degrades well before the limit. `director/expand` is pass one and keeps
+    its single-call shape because cross-shot variance is a property of the plan; this is the
+    opposite shape for the opposite reason, run once per shot with `shot_expansion_input`'s
+    per-shot payload.
+
+    **Each shot is judged on its own and a refusal on one does not stop the rest.** That is the
+    frozen matrix's own sentence, and it is why `DirectorError` is caught per shot and recorded as
+    that shot's outcome rather than raised. The cost is honest and worth naming: if the model host
+    dies part-way through, the remaining shots are still attempted and each still waits for its own
+    failure. Stopping instead would be faster and would break the guarantee, and the guarantee is
+    the one the Director wrote down.
+
+    `DirectorUnavailable` is the exception, and deliberately propagates. It means the language
+    model is not *configured* — a fact about this installation, identical for every shot — so
+    retrying it N times would produce N identical sentences and no information.
+
+    **Nothing here writes.** Every outcome is returned and the caller commits them in one pass, so
+    a failure part-way through this loop leaves both the manifest and the in-memory project
+    untouched rather than half-written. `assistant_fill`'s staging makes the same guarantee for the
+    same reason.
+
+    `project` is the snapshot every payload is built from, so every call sees one consistent plan —
+    including the neighbours' intents, which would otherwise shift under the sweep as it ran.
+    """
+    outcomes: list[ShotExpansionOutcome] = []
+    for shot in shots:
+        # Write-refusal before prompt-gate, which is the order phase one pinned with its own test:
+        # a locked shot with an empty intent must hear that it is locked, because telling it to
+        # write an intent first sends the Director to do work that would then be refused anyway.
+        if reason := shot_write_refusal(shot):
+            outcomes.append(ShotExpansionOutcome(shot.id, reason))
+            continue
+        if prompt_is_missing(shot):
+            outcomes.append(ShotExpansionOutcome(shot.id, "no_intent"))
+            continue
+        expect_instruction = resolve_shot_mode(shot) in H3_KEYFRAME_MODES
+        try:
+            text = await director.expand_shot(
+                shot_input=shot_expansion_input(project, shot),
+                system_prompt=h3_system_prompt(expect_instruction=expect_instruction),
+            )
+        except DirectorError as error:
+            outcomes.append(ShotExpansionOutcome(shot.id, "failed", detail=str(error)))
+            continue
+        checked = h3_check(
+            text, duration=shot.duration, expect_instruction=expect_instruction
+        )
+        if not checked.well_formed:
+            outcomes.append(
+                ShotExpansionOutcome(
+                    shot.id,
+                    "malformed",
+                    text=text,
+                    problems=tuple(problem.message for problem in checked.problems),
+                )
+            )
+            continue
+        outcomes.append(ShotExpansionOutcome(shot.id, "expanded", text=text))
+    return outcomes
+
+
+def apply_expansions(
+    project: Project, outcomes: list[ShotExpansionOutcome]
+) -> list[ShotExpansionOutcome]:
+    """Commit the well-formed expansions onto `project`, in memory, in one pass.
+
+    Three rules, each of which is a phase-one decision this must not undo:
+
+    * **A malformed expansion is never stored.** It arrives here as `malformed` and is passed
+      through untouched, so there is no branch that could write one. A broken prompt in the
+      manifest is one the *next render* submits, and the failure would surface as a bad take
+      rather than as a message.
+    * **`Shot.prompt` is never overwritten.** Only `h3_prompt` is assigned. The intent is what
+      re-expansion works from, and the first expansion will not be the good one.
+    * **Every refusal is re-checked here**, against the project as it is now rather than as it was
+      when the payload was built. A sweep is many model calls long, so a shot can be locked,
+      rendered or deleted while it runs, and an answer written against a plan that no longer
+      describes it must not land. `expand_shot_prompt` re-reads after its single await for exactly
+      this reason; a sweep has more windows, not fewer.
+    """
+    held = {shot.id: shot for shot in project.shots}
+    committed: list[ShotExpansionOutcome] = []
+    for outcome in outcomes:
+        if outcome.kind != "expanded":
+            committed.append(outcome)
+            continue
+        shot = held.get(outcome.shot_id)
+        if shot is None:
+            committed.append(replace(outcome, kind="missing"))
+            continue
+        if reason := shot_write_refusal(shot):
+            committed.append(replace(outcome, kind=reason))
+            continue
+        shot.h3_prompt = outcome.text
+        committed.append(replace(outcome, kind="applied"))
+    return committed
+
+
+def expansion_sweep_notices(
+    outcomes: list[ShotExpansionOutcome], labels: dict[str, str]
+) -> list[MessageNotice]:
+    """One sweep's report, per shot, in the order every other route on this module reports.
+
+    What changed goes first — it is the thing the Director pressed the button for, and dressing a
+    confirmation as caution is how caution stops being read — then the deliberate refusals, then
+    the flags. Every shot that was swept appears in exactly one of them.
+
+    **No expansion text is in any `text` here.** `assistant_reply` concatenates these sentences
+    into `TreatmentMessage.content`, and content *is* in the Director's context dump. The refused
+    text rides in `raw` instead, which `DIRECTOR_CONTEXT_EXCLUDE` drops — the same split
+    `EXPANSION_REJECTED_NOTICE` uses, and the reason `SHOT_DIRECTOR_WITHHELD` exists at all.
+    """
+    grouped: dict[str, list[str]] = {}
+    for outcome in outcomes:
+        grouped.setdefault(outcome.kind, []).append(outcome.shot_id)
+    def named(ids: list[str]) -> str:
+        return ", ".join(labels.get(shot_id, _short(shot_id)) for shot_id in ids)
+
+    notices: list[MessageNotice] = []
+    if applied := grouped.get("applied"):
+        notices.append(
+            MessageNotice(
+                kind="change",
+                text=EXPAND_PROMPTS_WRITTEN_NOTICE.format(
+                    count=len(applied), shots=named(applied)
+                ),
+            )
+        )
+    for kind, wording in (
+        ("locked", EXPANSION_LOCKED_NOTICE),
+        ("rendered", EXPANSION_RENDERED_NOTICE),
+        ("missing", ASSISTANT_MISSING_TARGET_NOTICE),
+        ("no_intent", EXPAND_PROMPTS_WITHOUT_INTENT_NOTICE),
+    ):
+        if reported := grouped.get(kind):
+            notices.append(
+                MessageNotice(kind="refusal", text=wording.format(shots=named(reported)))
+            )
+    # Per shot rather than grouped, because each carries its own problems and its own refused text.
+    for outcome in outcomes:
+        if outcome.kind != "malformed":
+            continue
+        notices.append(
+            rejection_notice(
+                EXPAND_PROMPTS_MALFORMED_NOTICE,
+                EXPAND_PROMPTS_MALFORMED_EMPTY_NOTICE,
+                raw=outcome.text,
+                shot=labels.get(outcome.shot_id, _short(outcome.shot_id)),
+                problems=" ".join(outcome.problems),
+            )
+        )
+    # Grouped by the host's own sentence: one dead host produces one message repeated, and a wall
+    # of identical notices is how a report stops being read.
+    failures: dict[str, list[str]] = {}
+    for outcome in outcomes:
+        if outcome.kind == "failed":
+            failures.setdefault(outcome.detail, []).append(outcome.shot_id)
+    for detail, reported in failures.items():
+        notices.append(
+            MessageNotice(
+                kind="flag",
+                text=EXPAND_PROMPTS_FAILED_NOTICE.format(
+                    shots=named(reported), detail=_short(detail, limit=200)
+                ),
+            )
+        )
+    return notices
 
 
 class AssistantRequest(BaseModel):
@@ -3853,13 +4108,67 @@ def create_app(
             prompt=text,
         )
 
+    @app.post("/api/projects/{project_id}/shots/expand-prompts", response_model=Project)
+    async def expand_plan_prompts(project_id: str) -> Project:
+        """Expand every shot in the plan into H3's format. Pass two, over the whole plan.
+
+        **N sequential model calls, one per shot** — `expand_shots` is what makes that true and
+        says why. This route is the plan-wide half of `expand_shot_prompt` above, and the two share
+        every rule: the same refusals in the same order, the same format check before any write,
+        and the same field.
+
+        No body. Every shot is judged, including the ones nothing can be written to, because "why
+        did nothing happen to that shot" is the question a sweep has to answer — a locked shot the
+        sweep silently skipped is indistinguishable to the Director from one it forgot.
+
+        **Nothing is persisted until every shot has been judged.** There is one terminal
+        `store.save`, and `apply_expansions` commits in one pass after the loop, so a failure
+        part-way through leaves the manifest and the in-memory project untouched rather than
+        half-applied. Phase one's own mutation testing established that the terminal save is what
+        makes that structural, rather than the staging in front of it.
+
+        The project is re-read after the sweep for `director_chat`'s reason, and here it matters
+        more than anywhere else in this module: the sweep is many model calls long, so a shot can
+        be locked, rendered or deleted several times over while it runs.
+        """
+        # The one snapshot every payload is built from, so every call sees a consistent plan.
+        snapshot = get_project(project_id)
+        if not snapshot.shots:
+            raise HTTPException(status_code=422, detail=EXPAND_PROMPTS_WITHOUT_SHOTS)
+        # Song order, which is the order the Director watches the video in and the order the
+        # neighbours' intents make sense in — "rinse and repeat for the next", in their own words.
+        swept = ordered_shots(snapshot)
+        try:
+            outcomes = await expand_shots(snapshot, swept, director=director)
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+        project = get_project(project_id)
+        # Re-checked rather than assumed from the snapshot, exactly as expansion re-checks: saving
+        # a reply about a plan that no longer has any shots would leave the thread asserting a
+        # sweep of nothing.
+        if not project.shots:
+            raise HTTPException(status_code=422, detail=EXPAND_PROMPTS_WITHOUT_SHOTS)
+        committed = apply_expansions(project, outcomes)
+        labels = {shot.id: shot_label(project, shot) for shot in project.shots}
+        project.messages.append(
+            assistant_reply(
+                EXPAND_PROMPTS_MESSAGE, expansion_sweep_notices(committed, labels)
+            )
+        )
+        return store.save(project)
+
     @app.post("/api/projects/{project_id}/assistant/fill", response_model=Project)
     async def assistant_fill(project_id: str, request: AssistantRequest) -> Project:
         """Fill in the selected Shots from one plain-language request. Assistant ProducerBot.
 
-        The Director's language model with one tool, `fill_shots`, whose arguments are the shot
-        taxonomy itself — `ShotMode`, `AssetRole`, `SingingState` — so a malformed answer is a
-        validation error at the edge rather than a plausible string in the manifest.
+        The Director's language model with two tools. `fill_shots`' arguments are the shot taxonomy
+        itself — `ShotMode`, `AssetRole`, `SingingState` — so a malformed answer is a validation
+        error at the edge rather than a plausible string in the manifest. `expand_prompts` is how a
+        conversational request reaches the H3 expansion specialist: ProducerBot is the surface and
+        the specialists are in its box, so the specialist has no chat of its own. It costs one model
+        call *per shot named*, runs after the fills so it expands the intent this turn wrote, and
+        passes through `expand_shots` — every refusal a Director's own click meets, unchanged.
 
         Six properties are load-bearing, and each has a test that breaks if it stops holding:
 
@@ -4066,6 +4375,49 @@ def create_app(
             project.shots[index] = candidate
         omitted = [shot_id for shot_id in writable if shot_id not in answered]
 
+        # The second tool, and it is a second *act* rather than a second field to assign: each shot
+        # named here costs its own model call to the expansion specialist. It runs after the fills
+        # are committed above, so a shot the model filled in and asked to expand in one turn is
+        # expanded from the intent it has just written rather than from the one it replaced.
+        #
+        # The scope rule is `fill_shots`' own, and it has to be: a tool that could reach a shot the
+        # Director did not select would widen what the assistant can act *on*, which is the guard
+        # the whole selection-as-consent design exists to hold. The write refusal and the prompt
+        # gate are not re-implemented here either — `expand_shots` applies both, in the order phase
+        # one pinned — so `open_to_writing` is only about scope.
+        wanted: list[str] = []
+        for asked in turn.expansions:
+            if asked.shot_id not in open_to_writing:
+                # A shot the selection already reports on — locked, or carrying provenance — is not
+                # reported again as out of scope, on the fill loop's argument exactly.
+                if asked.shot_id in labels:
+                    continue
+                if asked.shot_id not in out_of_scope:
+                    out_of_scope.append(asked.shot_id)
+                continue
+            # First mention wins. Expanding one shot twice in a turn would spend two model calls to
+            # keep the second answer, which is a coin toss the Director is paying for.
+            if asked.shot_id not in wanted:
+                wanted.append(asked.shot_id)
+        expansions: list[ShotExpansionOutcome] = []
+        if wanted:
+            # Rebuilt after the staged fills landed: the map above holds the Shot objects those
+            # candidates replaced, so a payload built from it would describe the pre-fill shot.
+            current = {shot.id: shot for shot in project.shots}
+            try:
+                expansions = await expand_shots(
+                    project, [current[shot_id] for shot_id in wanted], director=director
+                )
+            except DirectorUnavailable as error:
+                # Reported per shot rather than raised, unlike the sweep route. `director.assist`
+                # has already answered, so this is all but unreachable — and raising here would
+                # throw away a whole turn of good fills over the expansion half of it.
+                expansions = [
+                    ShotExpansionOutcome(shot_id, "failed", detail=str(error))
+                    for shot_id in wanted
+                ]
+            expansions = apply_expansions(project, expansions)
+
         notices: list[MessageNotice] = []
         if staged:
             notices.append(
@@ -4138,10 +4490,15 @@ def create_app(
                     text=ASSISTANT_SPECIFICATION_NOTICE.format(details="\n".join(specification)),
                 )
             )
-        # Said only when the model produced nothing at all to act on. A turn that called the tool
+        # The expansion half of the turn, as one block after the fill's report. Its own ordering is
+        # `expansion_sweep_notices`' — what was written, then what was refused, then what is worth
+        # a look — and it reads after the fill because that is the order the two acts happened in.
+        notices.extend(expansion_sweep_notices(expansions, labels))
+        # Said only when the model produced nothing at all to act on. A turn that called a tool
         # and had every call refused is a different failure, and every one of those refusals is
-        # already its own sentence above.
-        if not turn.fills and not turn.malformed:
+        # already its own sentence above. `expansions` counts: a turn that only asked for
+        # expansions called a tool, and telling it that it answered in prose would be false.
+        if not turn.fills and not turn.expansions and not turn.malformed:
             notices.append(MessageNotice(kind="flag", text=ASSISTANT_WITHOUT_TOOL_CALL_NOTICE))
         message = turn.message.strip() or ASSISTANT_EMPTY_MESSAGE
         # The user's own turn is recorded, unlike expansion's — this one *was* a question, and the

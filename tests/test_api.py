@@ -20,6 +20,7 @@ from music_video_producer.app import (
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
     ENHANCE_PREFIX_SUFFIX,
+    EXPAND_PROMPTS_WITHOUT_SHOTS,
     EXPANSION_REJECTED_EMPTY_NOTICE,
     H3_ADAPTERS,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
@@ -8850,3 +8851,367 @@ def test_a_keyframe_shot_is_told_to_write_one(tmp_path: Path):
     client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
 
     assert "must open with the instruction line" in director.prompts[0]
+
+
+# ---------------------------------------------------------------------------------------------
+# The plan-wide sweep: pass two, one model call per shot
+# ---------------------------------------------------------------------------------------------
+
+
+class SweepingDirector(FakeDirector):
+    """One answer per shot, keyed by the shot's intent, recording every call it was handed.
+
+    Keyed by intent rather than returning one fixed string so a test can make exactly one shot in
+    a plan malformed -- which is the only way to assert that a refusal on one does not stop the
+    rest, and that the malformed one is the only one left unwritten.
+    """
+
+    def __init__(self, answers: dict[str, str] | None = None, default: str = GOOD_EXPANSION):
+        self.answers = answers or {}
+        self.default = default
+        self.inputs: list[dict] = []
+        self.prompts: list[str] = []
+        #: Intents that raise instead of answering, as `{intent: exception}`.
+        self.raises: dict[str, Exception] = {}
+
+    async def expand_shot(self, *, shot_input, system_prompt, **_):
+        self.inputs.append(shot_input)
+        self.prompts.append(system_prompt)
+        intent = shot_input["shot"]["intent"]
+        if intent in self.raises:
+            raise self.raises[intent]
+        return self.answers.get(intent, self.default)
+
+
+def _plan(client, store, shots: list[Shot]) -> str:
+    project = store.create(Project(name="Sweep"))
+    client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": [json.loads(shot.model_dump_json()) for shot in shots]},
+    )
+    return project.id
+
+
+SWEEP = "/api/projects/{project}/shots/expand-prompts"
+
+
+def test_the_sweep_is_one_model_call_per_shot_and_not_one_call(tmp_path: Path):
+    """The whole point of pass two, and the thing the Director set out explicitly.
+
+    A single call over the plan is pass one and already exists. If this route ever collapses into
+    one call it has silently become a second copy of `director/expand`, writing the wrong field.
+    """
+    director = SweepingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+        Shot(start=8.0, duration=4.0, prompt="Lucy turns to camera"),
+    ])
+
+    response = client.post(SWEEP.format(project=project_id))
+
+    assert response.status_code == 200
+    assert len(director.inputs) == 3
+    # Each call carried one shot's own payload, not the plan.
+    assert [held["shot"]["intent"] for held in director.inputs] == [
+        "Wolf in birch", "The clearing widens", "Lucy turns to camera",
+    ]
+    stored = store.get(project_id)
+    assert [shot.h3_prompt for shot in stored.shots] == [GOOD_EXPANSION] * 3
+    # The intents survive. `Shot.prompt` is what re-expansion works from.
+    assert [shot.prompt for shot in stored.shots] == [
+        "Wolf in birch", "The clearing widens", "Lucy turns to camera",
+    ]
+
+
+def test_a_malformed_answer_mid_sweep_is_reported_and_the_rest_still_land(tmp_path: Path):
+    """The frozen matrix's own sentence: a failure on one does not stop the rest.
+
+    And phase one's rule applied per shot: the malformed one is not stored. Storing it would put a
+    broken prompt in the manifest that the next render would submit.
+    """
+    director = SweepingDirector({"The clearing widens": "A clearing, 35mm, grainy."})
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+        Shot(start=8.0, duration=4.0, prompt="Lucy turns to camera"),
+    ])
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    assert [bool(shot.h3_prompt) for shot in stored.shots] == [True, False, True]
+    assert stored.shots[1].h3_prompt == ""
+    reply = stored.messages[-1]
+    assert "H3 prompts written for 2 shot(s)" in reply.content
+    assert "not a well-formed H3 prompt" in reply.content
+    # The refused text is kept for inspection, out of band. It is in `raw`, which
+    # `DIRECTOR_CONTEXT_EXCLUDE` drops, and never in a sentence the next call would read.
+    malformed = [notice for notice in reply.notices if "well-formed" in notice.text]
+    assert len(malformed) == 1
+    assert malformed[0].raw == "A clearing, 35mm, grainy."
+    assert "A clearing, 35mm, grainy." not in reply.content
+
+
+def test_a_transport_failure_on_one_shot_does_not_stop_the_sweep(tmp_path: Path):
+    director = SweepingDirector()
+    director.raises["The clearing widens"] = DirectorError("connection refused")
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+        Shot(start=8.0, duration=4.0, prompt="Lucy turns to camera"),
+    ])
+
+    response = client.post(SWEEP.format(project=project_id))
+
+    assert response.status_code == 200
+    # The third shot was still attempted, which is the assertion: a `raise` on the second would
+    # have ended the sweep with one prompt written and two shots unnamed.
+    assert len(director.inputs) == 3
+    stored = store.get(project_id)
+    assert [bool(shot.h3_prompt) for shot in stored.shots] == [True, False, True]
+    assert "connection refused" in stored.messages[-1].content
+
+
+def test_nothing_is_persisted_until_every_shot_has_been_judged(tmp_path: Path):
+    """One terminal save, and it is what makes "nothing half-applied" structural.
+
+    Driven by a failure the route does not catch: an answer for shot one is well-formed, and shot
+    two raises something that is not a `DirectorError`. If the write happened per shot, shot one's
+    expansion would be on disk under a request that 500'd.
+    """
+    director = SweepingDirector()
+    director.raises["The clearing widens"] = RuntimeError("the host went away mid-sweep")
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+    ])
+
+    with pytest.raises(RuntimeError):
+        client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    assert [shot.h3_prompt for shot in stored.shots] == ["", ""]
+    # And nothing was written to the thread either, so the manifest carries no claim about a sweep
+    # that did not finish.
+    assert stored.messages == []
+
+
+def test_the_sweep_reports_every_shot_it_could_not_write_and_says_why(tmp_path: Path):
+    """Applied, malformed, locked, rendered and no-intent, each named, the way `assistant_fill`
+    reports. A shot the sweep silently skipped is indistinguishable from one it forgot."""
+    director = SweepingDirector({"The clearing widens": "A clearing, 35mm, grainy."})
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+        Shot(start=8.0, duration=4.0, prompt="A take nobody may touch", locked=True),
+        Shot(start=12.0, duration=4.0, prompt="Already shot", prompt_id="abc", status="complete"),
+        Shot(start=16.0, duration=4.0, prompt="New shot"),
+    ])
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    content = stored.messages[-1].content
+    labels = {shot.id: shot_label(stored, shot) for shot in stored.shots}
+    assert f"H3 prompts written for 1 shot(s): {labels[stored.shots[0].id]}" in content
+    assert labels[stored.shots[1].id] in content and "well-formed" in content
+    assert f"they are locked: {labels[stored.shots[2].id]}" in content
+    assert labels[stored.shots[3].id] in content and "already depends on the prompt" in content
+    assert f"no intent to expand from: {labels[stored.shots[4].id]}" in content
+    # Every shot appears in the report, which is what "reported individually" means.
+    for label in labels.values():
+        assert label in content, label
+    # And only the writable, well-formed one was written.
+    assert [bool(shot.h3_prompt) for shot in stored.shots] == [True, False, False, False, False]
+    # The model was never asked about the three that could not be written.
+    assert len(director.inputs) == 2
+
+
+def test_the_sweep_refuses_a_locked_shot_before_the_model_is_asked(tmp_path: Path):
+    """A refusal that costs a model call is a refusal that costs the Director seconds."""
+    director = SweepingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="A take nobody may touch", locked=True),
+    ])
+
+    client.post(SWEEP.format(project=project_id))
+
+    assert director.inputs == []
+
+
+def test_the_sweep_reports_a_lock_ahead_of_a_missing_intent(tmp_path: Path):
+    """Phase one's refusal order, applied per shot by the sweep. A locked shot with an empty intent
+    must hear that it is locked; telling it to write an intent first sends the Director to do work
+    that would then be refused anyway."""
+    director = SweepingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="New shot", locked=True),
+    ])
+
+    client.post(SWEEP.format(project=project_id))
+
+    content = store.get(project_id).messages[-1].content
+    assert "they are locked" in content
+    assert "no intent to expand from" not in content
+
+
+def test_a_shot_locked_while_the_sweep_ran_is_not_written_and_is_named(tmp_path: Path):
+    """The sweep is many model calls long, so the project can move under it repeatedly.
+
+    The lock is applied between the first call and the second, which is exactly the window
+    `expand_shot_prompt` re-reads for after its single await.
+    """
+    client_box: dict = {}
+
+    class LockingDirector(SweepingDirector):
+        async def expand_shot(self, *, shot_input, system_prompt, **_):
+            text = await super().expand_shot(shot_input=shot_input, system_prompt=system_prompt)
+            if shot_input["shot"]["intent"] == "Wolf in birch":
+                store, project_id = client_box["fixture"]
+                held = store.get(project_id)
+                held.shots[1].locked = True
+                store.save(held)
+            return text
+
+    director = LockingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+    ])
+    client_box["fixture"] = (store, project_id)
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    assert stored.shots[0].h3_prompt == GOOD_EXPANSION
+    # The answer was written against a project that no longer describes this shot, so it does not
+    # land -- and the lock is reported rather than the write being silently dropped.
+    assert stored.shots[1].h3_prompt == ""
+    assert "they are locked" in stored.messages[-1].content
+
+
+def test_a_shot_deleted_while_the_sweep_ran_is_reported_as_missing(tmp_path: Path):
+    client_box: dict = {}
+
+    class DeletingDirector(SweepingDirector):
+        async def expand_shot(self, *, shot_input, system_prompt, **_):
+            text = await super().expand_shot(shot_input=shot_input, system_prompt=system_prompt)
+            if shot_input["shot"]["intent"] == "Wolf in birch":
+                store, project_id = client_box["fixture"]
+                held = store.get(project_id)
+                held.shots = held.shots[:1]
+                store.save(held)
+            return text
+
+    director = DeletingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+    ])
+    client_box["fixture"] = (store, project_id)
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    assert len(stored.shots) == 1
+    assert stored.shots[0].h3_prompt == GOOD_EXPANSION
+    assert "no longer has them" in stored.messages[-1].content
+
+
+def test_an_empty_plan_is_refused_before_any_expansion_call(tmp_path: Path):
+    director = SweepingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="Nothing to sweep"))
+
+    response = client.post(SWEEP.format(project=project.id))
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == EXPAND_PROMPTS_WITHOUT_SHOTS
+    assert director.inputs == []
+
+
+def test_an_unconfigured_model_is_unavailable_for_the_whole_sweep(tmp_path: Path):
+    """503, not one `failed` line per shot. It is a fact about this installation, identical for
+    every shot, so N calls would produce N identical sentences and no information."""
+
+    class UnconfiguredDirector(SweepingDirector):
+        async def expand_shot(self, *, shot_input, system_prompt, **_):
+            raise DirectorUnavailable("LLM director is not configured.")
+
+    director = UnconfiguredDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [Shot(start=0.0, duration=4.0, prompt="Wolf in birch")])
+
+    response = client.post(SWEEP.format(project=project_id))
+
+    assert response.status_code == 503
+    assert store.get(project_id).messages == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"locked": True}, "they are locked"),
+        ({"prompt_id": "abc", "status": "complete"}, "already depends on the prompt"),
+    ],
+)
+def test_the_sweep_and_the_single_shot_route_refuse_the_same_states(
+    tmp_path: Path, kwargs: dict, expected: str
+):
+    """The two paths implement the same rules and must not drift.
+
+    Phase one's route was deliberately not rebuilt onto the sweep engine -- it has its own HTTP
+    contract, pinned by its own tests -- so this is the assertion that keeps the duplication
+    honest: the same shot, refused for the same reason, through both doors, with no model call
+    spent by either.
+    """
+    director = SweepingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(
+        client, store, [Shot(start=0.0, duration=4.0, prompt="Wolf in birch", **kwargs)]
+    )
+    shot_id = store.get(project_id).shots[0].id
+
+    single = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+    client.post(SWEEP.format(project=project_id))
+
+    assert single.status_code == 422
+    assert director.inputs == []
+    assert expected in store.get(project_id).messages[-1].content
+    assert store.get(project_id).shots[0].h3_prompt == ""
+
+
+def test_the_sweep_never_puts_an_expansion_into_the_directors_context(tmp_path: Path):
+    """The recorded cause of Director degradation, and the reason `h3_prompt` is withheld at all.
+
+    The sweep writes a reply into the thread, and `TreatmentMessage.content` *is* in the dump. So
+    the report's sentences must name shots and outcomes and never carry the expansion itself.
+    """
+    director = SweepingDirector({"The clearing widens": "A clearing, 35mm, grainy."})
+    client, store = make_client_with_director(tmp_path, director)
+    project_id = _plan(client, store, [
+        Shot(start=0.0, duration=4.0, prompt="Wolf in birch"),
+        Shot(start=4.0, duration=4.0, prompt="The clearing widens"),
+    ])
+
+    client.post(SWEEP.format(project=project_id))
+
+    stored = store.get(project_id)
+    context = json.dumps(
+        stored.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE), ensure_ascii=False
+    )
+    assert GOOD_EXPANSION not in context
+    assert "A clearing, 35mm, grainy." not in context
+    # ...and the intents, which the expansion was written from, are still there. Withholding the
+    # expansion is only defensible because the thing it was expanded from still reaches the model.
+    assert "Wolf in birch" in context

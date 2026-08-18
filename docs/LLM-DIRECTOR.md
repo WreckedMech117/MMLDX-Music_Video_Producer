@@ -132,6 +132,16 @@ Reading "this cannot be done in one call" as a criticism of pass one is the obvi
 
 **Model behaviour worth knowing before debugging a prompt.** Measured on the Director's own machine, 2026-08-18: a reasoning model spent **899 of 900** tokens thinking and returned empty content, and all 6000 of a 6000-token budget the same way. `/no_think` in the prompt did not suppress it; `chat_template_kwargs: {"enable_thinking": false}` did, though not reliably — the same flag gave 467 reasoning tokens on a short system prompt and 1494 on a longer one. So an empty completion beside a full `reasoning_content` is reported as a **budget** problem naming the number, not as an invalid response: calling it invalid would send a reader to rewrite a prompt that was fine. `chat_template_kwargs` is an LM Studio / vLLM extension and the error names it, because a stricter provider will 400 and the fix is to drop it.
 
+**Three doors, one engine.** `expand_shots` runs the calls and **writes nothing**; `apply_expansions` commits in a single pass afterwards, re-checking every refusal against the project as it is *then*; `expansion_sweep_notices` renders the report. They are three functions rather than one so that "nothing is persisted until every Shot has been judged" is a testable claim rather than a described one.
+
+The doors are the single-Shot route above, `POST /api/projects/{id}/shots/expand-prompts` for the whole plan, and `expand_prompts` — ProducerBot's second tool. The sweep takes **no body** and sweeps every Shot including ones nothing can be written to, because a Shot skipped in silence is indistinguishable from one the sweep forgot. Each is named in the report: `applied`, `malformed`, `locked`, `rendered`, `no_intent`, `missing`, `failed`.
+
+A `DirectorError` on one Shot is *that Shot's* outcome and the sweep continues; `DirectorUnavailable` is a 503 for the whole sweep, because it is a configuration fact that would be identical for every Shot. Worth knowing in practice: the 4000-token budget still exhausts on reasoning roughly one call in six on this machine's model, which in a sweep is one `failed` line and the rest carrying on.
+
+The tool is typed to **nothing but the Shot id** — an expansion has no vocabulary to get wrong, unlike `fill_shots`. It runs *after* the fills, so a Shot filled in and expanded in the same turn expands from the intent that turn just wrote. It may not name a Shot outside the turn's selection. The assistant is told only `expanded: bool` and never the expansion itself: the boolean is what makes the tool usable, and the text is what would degrade the model.
+
+**A known cost, not a defect to discover later.** A sweep holds the read-to-save window open for the length of N model calls. The browser closes that window with `shotWriteInFlight`, but a *second* client editing the same project during a sweep would lose its edit. Single-Director use is unaffected.
+
 ## Project context
 
 The director receives the current song metadata — including the song's `lyrics` and `caption` when it has them — creative documents, assets, shots, and prior messages.

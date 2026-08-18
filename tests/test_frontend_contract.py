@@ -44,6 +44,7 @@ from music_video_producer.models import (
     Shot,
     SingingState,
     Song,
+    TreatmentMessage,
     dangling_citations,
     mode_specification_problems,
     resolve_shot_mode,
@@ -2366,14 +2367,20 @@ def test_expansion_shuts_out_the_silent_shot_saves_that_would_revert_it():
     assert handler.index('shotWriteInFlight = "expansion";') < handler.index("await shotSaveChain")
     assert 'finally { shotWriteInFlight = "";' in handler
     # The flag is shared with Assistant ProducerBot, which needs exactly the same protection and
-    # would otherwise get a second copy of it. Each writer raises it in exactly one place and the
-    # two names are the only ones there are, so a third path silently blocking every timeline save
-    # still fails here -- which is what this assertion was written to catch.
+    # would otherwise get a second copy of it. Two *names* and only two, so a third path silently
+    # blocking every timeline save under a name nothing explains still fails here -- which is what
+    # this assertion was written to catch.
+    #
+    # Four raisers under those two names since pass two landed: the pass-one expansion, the per-shot
+    # H3 expansion, the whole-plan H3 sweep, and the assistant fill. All three expansion writers
+    # revert the same work in the same way and correctly say the same sentence about it, which is
+    # exactly the sharing the string was introduced for -- what the wording distinguishes is a fill
+    # from an expansion, not one expansion route from another.
     raisers = re.findall(r'shotWriteInFlight = "(\w+)"', source)
-    assert sorted(raisers) == ["assistant", "expansion"], raisers
+    assert sorted(raisers) == ["assistant", "expansion", "expansion", "expansion"], raisers
     # Released in a `finally` by each of them, so a failed or refused write does not wedge every
     # timeline save off for the life of the page.
-    assert source.count('finally { shotWriteInFlight = "";') == 2, source
+    assert source.count('finally { shotWriteInFlight = "";') == len(raisers), source
 
     # The refusal lives in the one function every silent save goes through, ahead of both the
     # queueing and the dirty flags -- a save that is refused was never pending.
@@ -6231,3 +6238,395 @@ def test_a_citation_whose_asset_is_gone_is_drawn_rather_than_skipped():
     assert dangling_citations(
         project, Shot(start=0, duration=5, asset_ids=["asset_gone", "asset_stage"])
     ) == rendered["dangling"]
+
+
+# ---------------------------------------------------------------------------------------------
+# The H3 expansion controls: the shot inspector's "Expand prompt", and the plan-wide sweep
+# ---------------------------------------------------------------------------------------------
+
+H3_EXPANSION = (
+    "integrated_multimodal_description: [Shot 1] A grey wolf crosses the clearing.\n"
+    "overall_soundscape: Dry needles compress underfoot.\n"
+    "non_diegetic_music: A low cello figure, slow."
+)
+
+
+def expansion_shot(**fields) -> str:
+    """One shot literal for the workspace harness, in the shape a project reply carries."""
+    base = {
+        "id": "shot_a", "start": 0, "duration": 5, "prompt": "A wolf crosses the clearing",
+        "h3_prompt": "", "mode": None, "asset_ids": [], "citations": [], "reference_labels": {},
+        "singing": "unknown", "use_song_audio": False, "seed": 0, "status": "draft",
+        "prompt_id": "", "latest_output": "", "approved_output": "", "locked": False,
+    }
+    return json.dumps({**base, **fields})
+
+
+def test_the_expand_prompt_control_decides_every_state_from_the_servers_own_rules():
+    """Executed for every state, because the states are the feature.
+
+    The refusal *order* is the load-bearing part and is phase one's: `shot_write_refusal` before
+    the prompt gate, so a locked shot with no intent hears that it is locked rather than being sent
+    to write an intent that would then be refused anyway.
+    """
+    decided = run_module("""
+      import { expandPromptControl } from './src/music_video_producer/web/assets/api.js';
+      const shot = (fields) => ({ id: 's', prompt: 'A wolf crosses the clearing', h3_prompt: '',
+                                  status: 'draft', locked: false, prompt_id: '',
+                                  latest_output: '', approved_output: '', ...fields });
+      console.log(JSON.stringify({
+        none: expandPromptControl(null),
+        open: expandPromptControl(shot({})),
+        expanded: expandPromptControl(shot({ h3_prompt: 'integrated_multimodal_description: x' })),
+        locked: expandPromptControl(shot({ locked: true })),
+        rendered: expandPromptControl(shot({ status: 'complete', prompt_id: 'abc' })),
+        blank: expandPromptControl(shot({ prompt: '' })),
+        placeholder: expandPromptControl(shot({ prompt: 'New shot' })),
+        lockedAndBlank: expandPromptControl(shot({ locked: true, prompt: '' })),
+      }));
+    """)
+
+    assert decided["none"]["shown"] is False
+    assert decided["open"] == {
+        "shown": True, "disabled": False, "label": "Expand prompt",
+        "title": decided["open"]["title"], "reason": "",
+    }
+    # A shot that already has one says so before the click: the matrix's re-expansion row is a
+    # replacement, and "Expand prompt" over an expanded shot reads as an offer to add a second.
+    assert decided["expanded"]["label"] == "Expand prompt again"
+    assert decided["expanded"]["disabled"] is False
+    # Every refusal is drawn as a shut control carrying its reason, never as no control at all.
+    for state in ("locked", "rendered", "blank", "placeholder", "lockedAndBlank"):
+        assert decided[state]["shown"] is True, state
+        assert decided[state]["disabled"] is True, state
+        assert decided[state]["reason"], state
+        assert decided[state]["title"] == decided[state]["reason"], state
+    assert "locked" in decided["locked"]["reason"].lower()
+    assert "already rendered" in decided["rendered"]["reason"].lower()
+    assert "creative intent" in decided["blank"]["reason"].lower()
+    assert decided["placeholder"]["reason"] == decided["blank"]["reason"]
+    # Phase one's order, one screen earlier.
+    assert decided["lockedAndBlank"]["reason"] == decided["locked"]["reason"]
+
+
+def test_the_inspector_draws_the_expand_control_under_the_intent_and_the_expansion_beside_it():
+    """Drawn where the Director edits the text, which is what the Director asked for in their own
+    words. Executed rather than read, because a control that renders and one that is bound to a
+    handler are two different claims and only one of them is greppable."""
+    rendered = run_workspace(f"""
+      const draw = (shot) => {{
+        state.project = {{ id: 'p1', jobs: [], song: null, assets: [], shots: [shot] }};
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+        return at('#shot-inspector').innerHTML;
+      }};
+      console.log(JSON.stringify({{
+        open: draw({expansion_shot()}),
+        expanded: draw({expansion_shot(h3_prompt=H3_EXPANSION)}),
+        locked: draw({expansion_shot(locked=True)}),
+        blank: draw({expansion_shot(prompt="")}),
+      }}));
+    """)
+
+    # The control is present in every state, and sits between the creative intent and the seed --
+    # in the text section, under the thing it expands.
+    for state, markup in rendered.items():
+        assert 'id="expand-prompt"' in markup, state
+        assert markup.index("shot-prompt") < markup.index('id="expand-prompt"'), state
+        assert markup.index('id="expand-prompt"') < markup.index("shot-seed"), state
+
+    # The expansion box is drawn only for a shot that has one, so its presence is the panel's
+    # answer to "is this shot expanded".
+    assert 'id="shot-h3-prompt"' not in rendered["open"]
+    assert 'id="shot-h3-prompt"' in rendered["expanded"]
+    assert "A grey wolf crosses the clearing." in rendered["expanded"]
+    # ...and it is editable, not a read-only display: the frozen block says both fields are
+    # independently editable.
+    box = re.search(r'<textarea id="shot-h3-prompt"[^>]*>', rendered["expanded"])
+    assert box and "readonly" not in box.group(0), rendered["expanded"]
+    assert "Expand prompt again" in rendered["expanded"]
+
+    # A refused control is drawn shut, with its reason on screen rather than only in hover text.
+    for state in ("locked", "blank"):
+        button = re.search(r'<button[^>]*id="expand-prompt"[^>]*>', rendered[state])
+        assert button and "disabled" in button.group(0), state
+        assert 'class="control-reason"' in rendered[state], state
+    assert "disabled" not in re.search(r'<button[^>]*id="expand-prompt"[^>]*>', rendered["open"]).group(0)
+    # The creative intent is never labelled as the H3 prompt, and vice versa: this panel's whole
+    # difficulty is that the two are different things.
+    assert "Creative intent" in rendered["expanded"]
+    assert "H3 structured prompt" in rendered["expanded"]
+
+
+def test_pressing_expand_prompt_sends_the_purpose_built_route_and_writes_no_shot_list():
+    """Its own route and no body. The shots write is the generic whole-list one, so a request
+    meaning "expand this one" through it would reassert every prompt, window and lock this client
+    happens to be holding -- which is how a stale client silently reverts the plan."""
+    applied = {
+        "project": {
+            "id": "p1", "jobs": [], "song": None, "assets": [], "messages": [],
+            "shots": [json.loads(expansion_shot(h3_prompt=H3_EXPANSION))],
+        },
+        "applied": True, "problems": [], "prompt": H3_EXPANSION, "note": "",
+    }
+    result = run_workspace(f"""
+      state.health = {{ llm: {{ configured: true }} }};
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [], messages: [],
+                        shots: [{expansion_shot()}] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      requests.length = 0;
+      await fire('#expand-prompt:click', {{}});
+      await flush();
+      console.log(JSON.stringify({{
+        requests: requests.map((item) => ({{ path: item.path, method: item.method, body: item.body }})),
+        html: at('#shot-inspector').innerHTML,
+      }}));
+    """, {"/api/projects/p1/shots/shot_a/expand-prompt": {"body": applied}})
+
+    assert [item["path"] for item in result["requests"]] == [
+        "/api/projects/p1/shots/shot_a/expand-prompt"
+    ]
+    assert result["requests"][0]["method"] == "POST"
+    assert result["requests"][0]["body"] is None
+    # The reply is adopted, so the panel now shows the expansion and offers to replace it.
+    assert 'id="shot-h3-prompt"' in result["html"]
+    assert "Expand prompt again" in result["html"]
+
+
+def test_a_refused_expansion_is_reported_in_the_panel_and_the_intent_is_untouched():
+    """The whole reason a refused answer is returned rather than dropped.
+
+    A toast carrying five checker sentences and a thousand characters of returned prompt is a toast
+    nobody reads, so the report is drawn under the intent, where the Director can act on it.
+    """
+    refused = {
+        "project": {
+            "id": "p1", "jobs": [], "song": None, "assets": [], "messages": [],
+            "shots": [json.loads(expansion_shot())],
+        },
+        "applied": False,
+        "problems": ["integrated_multimodal_description is missing.", "No [Shot 1] opening."],
+        "prompt": "A grey wolf pacing through trees. 35mm, grainy.",
+        "note": "The model's answer is not a well-formed H3 prompt, so it was not saved.",
+    }
+    result = run_workspace(f"""
+      state.health = {{ llm: {{ configured: true }} }};
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [], messages: [],
+                        shots: [{expansion_shot()}, {expansion_shot(id="shot_b", start=5)}] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      await fire('#expand-prompt:click', {{}});
+      await flush();
+      const refusedHtml = at('#shot-inspector').innerHTML;
+      // ...and the report does not follow the Director to the next shot.
+      state.selectedShotId = 'shot_b';
+      app.renderShotInspector();
+      console.log(JSON.stringify({{ refusedHtml, otherHtml: at('#shot-inspector').innerHTML }}));
+    """, {"/api/projects/p1/shots/shot_a/expand-prompt": {"body": refused}})
+
+    assert 'id="expansion-report"' in result["refusedHtml"]
+    for problem in refused["problems"]:
+        assert problem in result["refusedHtml"], problem
+    # The refused text itself, so it can be read and judged.
+    assert "A grey wolf pacing through trees. 35mm, grainy." in result["refusedHtml"]
+    # Nothing was stored, so no expansion box is drawn and the intent is still the intent.
+    assert 'id="shot-h3-prompt"' not in result["refusedHtml"]
+    assert "A wolf crosses the clearing" in result["refusedHtml"]
+    # Keyed to its shot: a failure drawn under a different shot's intent would be a false claim
+    # about the panel it sits in.
+    assert 'id="expansion-report"' not in result["otherHtml"]
+
+
+def test_editing_the_expansion_writes_h3_prompt_and_leaves_the_intent_alone():
+    """The box saves through the ordinary shots write, so this follows the edit onto the wire.
+
+    `h3_prompt` is the one field this client otherwise carries round-trip without ever touching, so
+    a bug in the read-back is invisible until a render submits the wrong document.
+    """
+    written = run_workspace(f"""
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [],
+                        shots: [{expansion_shot(h3_prompt=H3_EXPANSION)}] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      // The stub renders markup rather than parsing it, so the boxes the handler reads back have
+      // to be seeded the way the browser would have. The intent is seeded to what it already says,
+      // which is the point: an edit to the expansion must leave it exactly there.
+      at('#shot-prompt').value = 'A wolf crosses the clearing';
+      at('#shot-h3-prompt').value = 'integrated_multimodal_description: [Shot 1] Edited by hand.';
+      requests.length = 0;
+      fire('#shot-h3-prompt:change', {{}});
+      await flush();
+      const edited = JSON.parse(requests[requests.length - 1].body).shots[0];
+      console.log(JSON.stringify({{ h3: edited.h3_prompt, prompt: edited.prompt }}));
+    """)
+
+    assert written["h3"] == "integrated_multimodal_description: [Shot 1] Edited by hand."
+    assert written["prompt"] == "A wolf crosses the clearing"
+
+
+def test_an_ordinary_edit_never_copies_one_shots_expansion_onto_another():
+    """The mutation this guards: reading `#shot-h3-prompt` back unconditionally.
+
+    The box is drawn only for a shot that has an expansion, so the read-back has to be conditional
+    -- and the condition has to be the *shot's own field*, not whether the element is reachable. An
+    unguarded read takes whatever that box last held, which after looking at an expanded shot is
+    that shot's expansion. An unrelated edit on the next shot -- a seed, a checkbox -- would then
+    write it onto that one through the whole-list save, and nothing on screen would say so until a
+    render submitted the wrong document.
+
+    Driven exactly that way: look at the expanded shot, then at the plain one, then nudge its seed.
+    """
+    written = run_workspace(f"""
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [],
+                        shots: [{expansion_shot(h3_prompt=H3_EXPANSION)},
+                                {expansion_shot(id="shot_b", start=5, prompt="Lucy turns")}] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      // What the browser would have put in the box for the expanded shot.
+      at('#shot-h3-prompt').value = {json.dumps(H3_EXPANSION)};
+      state.selectedShotId = 'shot_b';
+      app.renderShotInspector();
+      at('#shot-prompt').value = 'Lucy turns';
+      at('#shot-seed').value = '7';
+      requests.length = 0;
+      fire('#shot-seed:change', {{}});
+      await flush();
+      const shots = JSON.parse(requests[requests.length - 1].body).shots;
+      console.log(JSON.stringify({{
+        plain: {{ h3: shots[1].h3_prompt, seed: shots[1].seed, prompt: shots[1].prompt }},
+        expanded: shots[0].h3_prompt,
+      }}));
+    """)
+
+    assert written["plain"]["h3"] == ""
+    assert written["plain"]["seed"] == 7
+    assert written["plain"]["prompt"] == "Lucy turns"
+    # ...and the shot that really does have one still has it: the whole-list save carries it
+    # round-trip untouched, which is the other half of the same guarantee.
+    assert written["expanded"] == H3_EXPANSION
+    # And what the server would make of that body is a valid Shot rather than a validation error.
+    assert Shot.model_validate(
+        {"start": 0, "duration": 5, "h3_prompt": written["plain"]["h3"]}
+    ).h3_prompt == ""
+
+
+def test_the_sweep_control_is_wired_to_its_own_route_and_says_what_it_costs():
+    source = APP_JS.read_text(encoding="utf-8")
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    handler = app_js_block("async function expandPlanPrompts")
+
+    button = re.search(r'<button[^>]*id="expand-h3-prompts"[^>]*>([^<]*)</button>', markup)
+    assert button, "the plan-wide H3 sweep has no control in the markup"
+    # It ships disabled: only `syncExpansionControls` enables it, off the pure control function, so
+    # a plan with no shots never offers a live button.
+    assert "disabled" in button.group(0), button.group(0)
+    assert '$(EXPAND_ALL_PROMPTS_CONTROL).addEventListener("click", expandPlanPrompts);' in source
+    # One route, and only that one. A handler that also called the shots write would reassert the
+    # whole plan under a request meaning "expand it".
+    assert re.findall(r"api\.(\w+)\(", handler) == ["expandPlanPrompts"], handler
+    # The same two protections the pass-one expansion has, and in the same order: this call is N
+    # model calls rather than one, so every window it leaves open is open N times as long.
+    assert handler.index('shotWriteInFlight = "expansion";') < handler.index("await shotSaveChain")
+    assert handler.index("await shotSaveChain") < handler.index("api.expandPlanPrompts(")
+    assert 'finally { shotWriteInFlight = "";' in handler
+    # The reply is adopted only if the Director is still looking at the project it answers.
+    assert handler.index("api.expandPlanPrompts(") < handler.index("state.project?.id !== projectId")
+    assert handler.index("state.project?.id !== projectId") < handler.index("state.project = expanded")
+
+
+def test_the_sweep_control_carries_the_api_js_label_and_help_and_the_servers_refusal():
+    """The markup cannot import them, so the two halves are asserted equal here -- and the empty
+    plan refusal is the server's own sentence rather than a second wording of one rule."""
+    from music_video_producer.app import EXPAND_PROMPTS_WITHOUT_SHOTS
+
+    strings = run_module("""
+      import { EXPAND_ALL_PROMPTS_LABEL, EXPAND_ALL_PROMPTS_HELP, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS,
+               SHOT_EXPANSION_NO_RENDER, expandAllPromptsControl }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        label: EXPAND_ALL_PROMPTS_LABEL,
+        help: EXPAND_ALL_PROMPTS_HELP,
+        refusal: EXPAND_ALL_PROMPTS_WITHOUT_SHOTS,
+        noRender: SHOT_EXPANSION_NO_RENDER,
+        empty: expandAllPromptsControl({ shots: [] }),
+        missing: expandAllPromptsControl(null),
+        planned: expandAllPromptsControl({ shots: [{ id: 's', locked: true }] }),
+      }));
+    """)
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert strings["refusal"] == EXPAND_PROMPTS_WITHOUT_SHOTS
+    button = re.search(r'<button[^>]*id="expand-h3-prompts"[^>]*>([^<]*)</button>', markup)
+    assert button.group(1) == strings["label"]
+    # What pressing it costs is stated before the click, in the one spelling every other control
+    # here uses for it.
+    assert strings["noRender"] in strings["help"]
+    assert "one call per shot" in strings["help"]
+    # Off only when there is nothing to sweep. A plan whose shots are merely locked is *not*
+    # filtered here: this route sends no selection, so filtering would be the client deciding what
+    # the report says about shots it never mentioned.
+    assert strings["empty"] == {"disabled": True, "title": strings["refusal"]}
+    assert strings["missing"]["disabled"] is True
+    assert strings["planned"] == {"disabled": False, "title": strings["help"]}
+
+
+def test_the_sweep_toast_reads_its_count_out_of_the_servers_own_notice():
+    """Read from the reply, never diffed off the shots: `h3_prompt` is not drawn on the timeline at
+    all, so a diff would have nothing on screen to be checked against."""
+    from music_video_producer.app import EXPAND_PROMPTS_WRITTEN_NOTICE
+
+    notice = EXPAND_PROMPTS_WRITTEN_NOTICE.format(count=3, shots="SHOT 01 (a), SHOT 02 (b), SHOT 03 (c)")
+    project = Project(name="Swept")
+    project.messages = [
+        MessageNotice and TreatmentMessage(role="assistant", content=f"Ran the specialist.\n\n{notice}")
+    ]
+    unchanged = Project(name="Nothing")
+    unchanged.messages = [TreatmentMessage(role="assistant", content="Ran the specialist.")]
+
+    toasts = run_module(f"""
+      import {{ expandAllPromptsToast, expandAllPromptsWritten }}
+        from './src/music_video_producer/web/assets/api.js';
+      const swept = {json.dumps(json.loads(project.model_dump_json()))};
+      const untouched = {json.dumps(json.loads(unchanged.model_dump_json()))};
+      console.log(JSON.stringify({{
+        count: expandAllPromptsWritten(swept),
+        toast: expandAllPromptsToast(swept),
+        unchanged: expandAllPromptsToast(untouched),
+      }}));
+    """)
+
+    assert toasts["count"] == 3
+    assert toasts["toast"].startswith("3 H3 prompts written")
+    assert "reply says per shot" in toasts["toast"]
+    assert "No H3 prompt was written" in toasts["unchanged"]
+
+
+def test_the_two_expansion_toasts_do_not_read_each_others_markers():
+    """Pass one writes "Prompts written for N shot(s):" and pass two "H3 prompts written for N".
+
+    One is a substring of the other in every sense that matters to a reader, so this asserts each
+    extractor ignores the other's notice -- otherwise a sweep would toast a pass-one count, or a
+    pass-one expansion would claim H3 prompts nobody wrote.
+    """
+    from music_video_producer.app import EXPAND_PROMPTS_WRITTEN_NOTICE, EXPANSION_WRITTEN_NOTICE
+
+    def project_with(notice: str) -> dict:
+        held = Project(name="Marker")
+        held.messages = [TreatmentMessage(role="assistant", content=notice)]
+        return json.loads(held.model_dump_json())
+
+    counts = run_module(f"""
+      import {{ expandAllPromptsWritten, shotExpansionWritten }}
+        from './src/music_video_producer/web/assets/api.js';
+      const passOne = {json.dumps(project_with(EXPANSION_WRITTEN_NOTICE.format(count=4, shots="a")))};
+      const passTwo = {json.dumps(project_with(EXPAND_PROMPTS_WRITTEN_NOTICE.format(count=2, shots="a")))};
+      console.log(JSON.stringify({{
+        oneReadsOne: shotExpansionWritten(passOne),
+        oneReadsTwo: shotExpansionWritten(passTwo),
+        twoReadsTwo: expandAllPromptsWritten(passTwo),
+        twoReadsOne: expandAllPromptsWritten(passOne),
+      }}));
+    """)
+
+    assert counts == {"oneReadsOne": 4, "oneReadsTwo": 0, "twoReadsTwo": 2, "twoReadsOne": 0}

@@ -230,7 +230,13 @@
                    expandShotPrompts. Its "Nothing is rendered" claim is api.js's
                    SHOT_EXPANSION_NO_RENDER, the same spelling the toast carries after the call;
                    the markup cannot import it, so tests/test_frontend_contract.py asserts both. -->
-              <button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="expand-shot-prompts" title="Write a prompt for every unlocked shot from the Treatment, Style bible and shot windows. Nothing is rendered and no shot window is changed.">Expand shots into prompts</button>
+              <!-- Pass two, beside pass one and after it, because that is the order they run in.
+                   It ships disabled: `syncExpansionControls` is the only thing that enables it, off
+                   `expandAllPromptsControl`, so a plan with no shots offers no live button and a
+                   markup-only reading of this line cannot claim otherwise. Its label and its help
+                   are api.js's EXPAND_ALL_PROMPTS_LABEL and EXPAND_ALL_PROMPTS_HELP; the markup
+                   cannot import them, so tests/test_frontend_contract.py asserts both. -->
+              <button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="expand-shot-prompts" title="Write a prompt for every unlocked shot from the Treatment, Style bible and shot windows. Nothing is rendered and no shot window is changed.">Expand shots into prompts</button><button class="quiet-button" id="expand-h3-prompts" disabled>Expand into H3 prompts</button>
             </div>
           </div>
         </div>

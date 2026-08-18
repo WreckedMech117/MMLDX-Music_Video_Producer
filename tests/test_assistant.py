@@ -41,14 +41,20 @@ from music_video_producer.app import (
     shot_render_provenance,
     shot_write_refusal,
 )
-from music_video_producer.assistant_prompt import ASSISTANT_SYSTEM_PROMPT, PROMPT_CRAFT
+from music_video_producer.assistant_prompt import (
+    ASSISTANT_SYSTEM_PROMPT,
+    EXPAND_PROMPTS_DESCRIPTION,
+    PROMPT_CRAFT,
+)
 from music_video_producer.batch import PLACEHOLDER_PROMPT, shot_label
 from music_video_producer.director import (
+    EXPAND_PROMPTS_TOOL,
     FILL_SHOTS_TOOL,
     AssistantTurn,
     DirectorClient,
     DirectorError,
     DirectorUnavailable,
+    ShotExpansionRequest,
     ShotFill,
     assistant_tools,
     parse_assistant_reply,
@@ -150,7 +156,7 @@ def test_the_tool_schema_is_generated_from_the_shot_taxonomy_and_not_hand_writte
     `models.py` — derived, never transcribed — and this asserts it for all three.
     """
     tools = assistant_tools()
-    assert [tool["function"]["name"] for tool in tools] == [FILL_SHOTS_TOOL]
+    assert [tool["function"]["name"] for tool in tools] == [FILL_SHOTS_TOOL, EXPAND_PROMPTS_TOOL]
     parameters = tools[0]["function"]["parameters"]
     shot = parameters["$defs"]["ShotFill"]["properties"]
     citation = parameters["$defs"]["ShotCitationFill"]["properties"]
@@ -1557,3 +1563,286 @@ def test_the_assistant_route_is_reachable_from_exactly_one_place_in_the_client()
     assert source.count("assistant/fill") == 1
     app_source = Path("src/music_video_producer/web/assets/app.js").read_text(encoding="utf-8")
     assert app_source.count("api.assistantFill(") == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# The expansion tool: a conversational request reaching the specialist
+# ---------------------------------------------------------------------------------------------
+
+GOOD_H3 = (
+    "integrated_multimodal_description: [Shot 1] A grey wolf crosses the clearing under low "
+    "amber light; the camera drifts with it, handheld.\n"
+    "overall_soundscape: Dry needles compress underfoot. Wind moves through the branches.\n"
+    "non_diegetic_music: A low cello figure at a slow tempo, swelling once and receding."
+)
+
+
+def expanding_turn(*shot_ids: str, message: str = "Expanding those.", **kwargs) -> AssistantTurn:
+    """One assistant answer that calls `expand_prompts` for the named shots."""
+    return AssistantTurn(
+        message=message,
+        expansions=[ShotExpansionRequest(shot_id=shot_id) for shot_id in shot_ids],
+        **kwargs,
+    )
+
+
+class ExpandingProducerDirector(FillingDirector):
+    """`FillingDirector` that can also answer the specialist's call, recording every one."""
+
+    def __init__(self, answer=None, *, answers: dict | None = None, error=None):
+        super().__init__(answer, error=error)
+        self.answers = answers or {}
+        self.expansions: list[dict] = []
+
+    async def expand_shot(self, *, shot_input, system_prompt, **_):
+        self.expansions.append(shot_input)
+        return self.answers.get(shot_input["shot"]["id"], GOOD_H3)
+
+
+def test_the_expansion_tool_is_typed_and_offered_beside_the_fill_tool():
+    """Two tools, both generated rather than hand-written, and the second one refusing to carry
+    anything it has no business setting.
+
+    `ShotFill` is typed to the shot vocabulary because a mode and a role are things a model can get
+    wrong in words. An expansion has no vocabulary at all -- everything it needs is on the shot --
+    so the only thing there is to validate is that a shot was named, and the schema says exactly
+    that and nothing more. A tool that also took, say, a mode would be a second way to write a
+    field the fill tool already owns, through a route that never validates it as a whole Shot.
+    """
+    tools = {tool["function"]["name"]: tool["function"] for tool in assistant_tools()}
+
+    assert set(tools) == {FILL_SHOTS_TOOL, EXPAND_PROMPTS_TOOL}
+    parameters = tools[EXPAND_PROMPTS_TOOL]["parameters"]
+    entry = parameters["$defs"]["ShotExpansionRequest"]
+    assert list(entry["properties"]) == ["shot_id"]
+    assert entry["required"] == ["shot_id"]
+    assert list(parameters["properties"]) == ["shots"]
+    # The maintainer-facing docstrings are stripped here too, for `_model_facing_schema`'s reason.
+    assert "description" not in parameters
+    assert "description" not in entry
+    # And the wire description is the one beside the persona, so the two agree about what calling
+    # it means.
+    assert tools[EXPAND_PROMPTS_TOOL]["description"] == EXPAND_PROMPTS_DESCRIPTION
+
+
+def test_an_expansion_call_that_does_not_fit_the_vocabulary_is_a_refusal_not_a_guess():
+    """The typed surface's whole purpose, applied to the second tool: a bad entry is discarded and
+    reported, and the good entries beside it survive."""
+    parsed = parse_assistant_reply({
+        "content": "Expanding.",
+        "tool_calls": [
+            {"function": {"name": EXPAND_PROMPTS_TOOL, "arguments": json.dumps({"shots": [
+                {"shot_id": "shot_one"},
+                {"shot_id": ""},
+                {"nothing": "useful"},
+                {"shot_id": "shot_two"},
+            ]})}},
+        ],
+    })
+
+    assert [item.shot_id for item in parsed.expansions] == ["shot_one", "shot_two"]
+    assert len(parsed.malformed) == 2
+    assert parsed.fills == []
+
+
+def test_both_tools_can_be_called_in_one_turn_and_land_in_their_own_lists():
+    parsed = parse_assistant_reply({
+        "content": "Written and expanded.",
+        "tool_calls": [
+            {"function": {"name": FILL_SHOTS_TOOL, "arguments": json.dumps(
+                {"shots": [{"shot_id": "shot_one", "prompt": "A wolf crosses the clearing."}]}
+            )}},
+            {"function": {"name": EXPAND_PROMPTS_TOOL, "arguments": json.dumps(
+                {"shots": [{"shot_id": "shot_one"}]}
+            )}},
+        ],
+    })
+
+    assert [fill.shot_id for fill in parsed.fills] == ["shot_one"]
+    assert [item.shot_id for item in parsed.expansions] == ["shot_one"]
+    assert parsed.malformed == []
+
+
+def test_the_tool_reaches_the_specialist_once_per_shot_and_writes_only_h3_prompt(tmp_path: Path):
+    """ProducerBot is the surface and the specialist is in its box.
+
+    One call per shot on the server, the intent untouched, and the expansion in its own field.
+    """
+    director = ExpandingProducerDirector(expanding_turn("shot_one", "shot_two"))
+    client, store, _ = make_client(tmp_path, director=director)
+    project = producer_project(store)
+    project.shots[0].prompt = "A wolf crosses the clearing."
+    project.shots[1].prompt = "Lucy turns to camera."
+    store.save(project)
+
+    response = client.post(
+        FILL.format(project=project.id),
+        json={"message": "Expand those two into H3 prompts", "shot_ids": ["shot_one", "shot_two"]},
+    )
+
+    assert response.status_code == 200
+    assert [held["shot"]["id"] for held in director.expansions] == ["shot_one", "shot_two"]
+    stored = store.get(project.id)
+    assert [shot.h3_prompt for shot in stored.shots] == [GOOD_H3, GOOD_H3]
+    assert [shot.prompt for shot in stored.shots] == [
+        "A wolf crosses the clearing.", "Lucy turns to camera."
+    ]
+    assert "H3 prompts written for 2 shot(s)" in reply_text(stored)
+
+
+def test_the_tool_expands_from_the_intent_the_same_turn_just_wrote(tmp_path: Path):
+    """Order is the point: fills first, then expansions, so a shot filled in and expanded in one
+    turn is expanded from the intent this turn wrote rather than from the one it replaced."""
+    answer = turn({"shot_id": "shot_one", "prompt": "A grey wolf crosses the clearing at dusk."})
+    answer.expansions = [ShotExpansionRequest(shot_id="shot_one")]
+    director = ExpandingProducerDirector(answer)
+    client, store, _ = make_client(tmp_path, director=director)
+    project = producer_project(store)
+
+    client.post(
+        FILL.format(project=project.id),
+        json={"message": "Write shot one and expand it", "shot_ids": ["shot_one"]},
+    )
+
+    assert director.expansions[0]["shot"]["intent"] == "A grey wolf crosses the clearing at dusk."
+    stored = store.get(project.id)
+    assert stored.shots[0].prompt == "A grey wolf crosses the clearing at dusk."
+    assert stored.shots[0].h3_prompt == GOOD_H3
+
+
+def test_the_tool_cannot_expand_a_shot_the_turn_did_not_select(tmp_path: Path):
+    """The guard that stops a tool widening what the assistant can act *on*.
+
+    `shot_two` is real, unlocked and perfectly writable. It is not in this turn's selection, so it
+    is out of reach -- and no model call is spent on it either.
+    """
+    director = ExpandingProducerDirector(expanding_turn("shot_one", "shot_two"))
+    client, store, _ = make_client(tmp_path, director=director)
+    project = producer_project(store)
+    project.shots[0].prompt = "A wolf crosses the clearing."
+    project.shots[1].prompt = "Lucy turns to camera."
+    store.save(project)
+
+    client.post(
+        FILL.format(project=project.id),
+        json={"message": "Expand shot one", "shot_ids": ["shot_one"]},
+    )
+
+    assert [held["shot"]["id"] for held in director.expansions] == ["shot_one"]
+    stored = store.get(project.id)
+    assert stored.shots[0].h3_prompt == GOOD_H3
+    assert stored.shots[1].h3_prompt == ""
+    assert "not among the shots this request selected" in reply_text(stored)
+
+
+def test_the_tool_meets_every_refusal_a_directors_own_click_meets(tmp_path: Path):
+    """A tool that cannot be refused is a guard hole.
+
+    A locked shot, a rendered one and one with no intent, all selected, all refused -- by
+    `shot_write_refusal` and the prompt gate the inspector's own button goes through, in the order
+    phase one pinned.
+    """
+    director = ExpandingProducerDirector(
+        expanding_turn("shot_locked", "shot_rendered", "shot_blank", "shot_open")
+    )
+    client, store, _ = make_client(tmp_path, director=director)
+    project = producer_project(store)
+    project.shots = [
+        Shot(id="shot_locked", start=0, duration=5, prompt="Do not touch", locked=True),
+        Shot(id="shot_rendered", start=5, duration=5, prompt="Already shot",
+             prompt_id="abc", status="complete"),
+        Shot(id="shot_blank", start=10, duration=5, prompt=PLACEHOLDER_PROMPT),
+        Shot(id="shot_open", start=15, duration=5, prompt="A wolf crosses the clearing."),
+    ]
+    store.save(project)
+
+    client.post(
+        FILL.format(project=project.id),
+        json={
+            "message": "Expand all four",
+            "shot_ids": ["shot_locked", "shot_rendered", "shot_blank", "shot_open"],
+        },
+    )
+
+    # Only the open one was ever sent to the specialist.
+    assert [held["shot"]["id"] for held in director.expansions] == ["shot_open"]
+    stored = store.get(project.id)
+    assert [shot.h3_prompt for shot in stored.shots] == ["", "", "", GOOD_H3]
+    text = reply_text(stored)
+    assert "they are locked" in text
+    assert "already depends on the prompt" in text
+    assert "no intent to expand from" in text
+
+
+def test_a_malformed_expansion_from_the_tool_is_reported_and_never_stored(tmp_path: Path):
+    director = ExpandingProducerDirector(
+        expanding_turn("shot_one"), answers={"shot_one": "A wolf. 35mm, grainy."}
+    )
+    client, store, _ = make_client(tmp_path, director=director)
+    project = producer_project(store)
+    project.shots[0].prompt = "A wolf crosses the clearing."
+    store.save(project)
+
+    client.post(
+        FILL.format(project=project.id),
+        json={"message": "Expand shot one", "shot_ids": ["shot_one"]},
+    )
+
+    stored = store.get(project.id)
+    assert stored.shots[0].h3_prompt == ""
+    assert "not a well-formed H3 prompt" in reply_text(stored)
+    # The refused text is inspectable and is not in the sentence the next call reads.
+    assert "A wolf. 35mm, grainy." not in reply_text(stored)
+    assert any(notice.raw == "A wolf. 35mm, grainy." for notice in reply_notices(stored))
+
+
+def test_a_turn_that_only_expands_is_not_reported_as_prose_with_no_tool_call(tmp_path: Path):
+    """It did call a tool. Telling the Director it answered in prose would be false, and would send
+    them to ask again for something that already happened."""
+    director = ExpandingProducerDirector(expanding_turn("shot_one"))
+    client, store, _ = make_client(tmp_path, director=director)
+    project = producer_project(store)
+    project.shots[0].prompt = "A wolf crosses the clearing."
+    store.save(project)
+
+    client.post(
+        FILL.format(project=project.id),
+        json={"message": "Expand shot one", "shot_ids": ["shot_one"]},
+    )
+
+    assert ASSISTANT_WITHOUT_TOOL_CALL_NOTICE not in reply_text(store.get(project.id))
+
+
+def test_the_assistant_is_told_which_shots_are_expanded_and_never_the_expansion(tmp_path: Path):
+    """A boolean, because the tool is useless without it and the text is what degrades the model.
+
+    MiniMax's own worked examples run past a thousand characters each; a plan of them in every turn
+    is the largest context regression available here, and it is what `SHOT_DIRECTOR_WITHHELD`
+    exists to prevent. This payload is not the exception to that rule.
+    """
+    project = Project(name="Expanded")
+    project.shots = [
+        Shot(id="shot_one", start=0, duration=5, prompt="A wolf crosses the clearing.",
+             h3_prompt=GOOD_H3),
+        Shot(id="shot_two", start=5, duration=5, prompt="Lucy turns to camera."),
+    ]
+
+    built = assistant_input(project, shot_ids=["shot_one", "shot_two"])
+
+    assert [entry["expanded"] for entry in built["shots"]] == [True, False]
+    serialised = json.dumps(built, ensure_ascii=False)
+    assert GOOD_H3 not in serialised
+    assert "integrated_multimodal_description" not in serialised
+    # The intent is still there, which is what makes withholding the expansion defensible at all.
+    assert "A wolf crosses the clearing." in serialised
+
+
+def test_a_whitespace_only_expansion_does_not_count_as_expanded():
+    """`reference_prompt` treats whitespace as absent, so the flag must agree -- otherwise the
+    assistant is told a shot is expanded while the render submits its intent."""
+    project = Project(name="Blank")
+    project.shots = [Shot(id="shot_one", start=0, duration=5, prompt="A wolf.", h3_prompt="  \n ")]
+
+    built = assistant_input(project, shot_ids=["shot_one"])
+
+    assert built["shots"][0]["expanded"] is False
