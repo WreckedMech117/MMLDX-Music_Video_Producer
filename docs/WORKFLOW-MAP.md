@@ -238,6 +238,10 @@ The Director's saved editor workflow was repaired in place on 2026-08-17: node `
 
 **Frame count is measured, never asserted.** A guard test greps the adapter, the route, the pre-flight and the test files for any assertion that output frames equal input frames, and fails if one appears.
 
+**Verified live 2026-08-18, and the measurement carries a warning.** One 3.75 s H3 take was enhanced: 640×384 / 90 frames → **1920×1152 / 89 frames**, 3.750 s → 3.708 s, audio surviving as aac, 549 KB → 2.98 MB. Aspect is preserved exactly (1.6667 both sides) and the longest side lands on 1920 as configured. **89 = 8 × 11 + 1**, which confirms the predicted mechanism: the VHS loader's `format: "LTXV"` puts the clip on the 8k+1 grid at load, and the input's 90 is H3's own 17k+5 grid (17 × 5 + 5). The two generator families genuinely disagree about frame counts and the conversion is real. `Shot.latest_output` still pointed at the H3 take afterwards — the enhancement is a sibling file, not a replacement.
+
+> **It is not an upscale, and it will break lip-sync.** The enhanced clip is markedly sharper — corset lacing, arm-guard studs, individual hair strands, roof trusses and light fixtures all resolve — but it is also a **different performance**. Sampled at frames 20, 44 and 70, the source is mid-vowel with teeth visible while the enhanced clip has the mouth closed, consistently rather than as a one-off. The cause is visible in the graph rather than inferred: `ManualSigmas` begins at **0.909375**, a high starting noise level, so this is substantial re-generation and not a light detail pass. For a music video whose entire premise is H3's audio-driven lip-sync, that is disqualifying on any shot where the performer is singing. Treat it as usable on B-roll, objects, scenery and non-vocal shots, and as unproven-to-harmful on vocal ones. Lowering the starting sigma is the obvious lever and is explicitly an Ask First tuning decision, not something to change quietly.
+
 ## Readiness matrix
 
 | Workflow | Catalog discovery | API payload | Unit tests | Live prior model validation | App submission |
