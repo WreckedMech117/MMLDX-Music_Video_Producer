@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import re
 import subprocess
 import wave
 from io import BytesIO
@@ -13,6 +14,8 @@ from pydantic import ValidationError
 
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
+    APPROVE_IN_FLIGHT_REFUSAL,
+    APPROVE_NO_TAKE_REFUSAL,
     CHAT_EMPTY_MESSAGE,
     DIRECTOR_CONTEXT_EXCLUDE,
     DOCUMENT_LABELS,
@@ -55,6 +58,9 @@ from music_video_producer.app import (
     SONG_DIRECTOR_VISIBLE,
     SONG_DIRECTOR_WITHHELD,
     SONG_LYRICS_LIMIT,
+    TAKE_MISSING_FILE_REFUSAL,
+    TAKE_NOT_RENDERED_REFUSAL,
+    UNAPPROVE_NOT_APPROVED_REFUSAL,
     DirectorRequest,
     DocumentName,
     SongContextField,
@@ -9664,3 +9670,432 @@ def test_the_singing_refusal_is_heard_before_the_missing_take_one(tmp_path: Path
 
     assert "moves lip position" in detail
     assert "has not produced a take" not in detail
+
+
+# ---------------------------------------------------------------------------------------------
+# Watching and approving a take (FR-21)
+# ---------------------------------------------------------------------------------------------
+
+
+def get_take(client, project_id: str, shot_id: str, **kwargs):
+    """The take stream. Ids only — the URL carries no path, by the route's own design."""
+    return client.get(f"/api/projects/{project_id}/shots/{shot_id}/take", **kwargs)
+
+
+def approve(client, project_id: str, shot_id: str, **kwargs):
+    """Approve one Shot's latest take. No body, by design — see `approve_take` in app.py."""
+    return client.post(f"/api/projects/{project_id}/shots/{shot_id}/approve", **kwargs)
+
+
+def unapprove(client, project_id: str, shot_id: str, **kwargs):
+    """Clear one Shot's approval. No body, for the same reason."""
+    return client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove", **kwargs)
+
+
+def write_take_file(
+    tmp_path: Path,
+    project_id: str,
+    filename: str = "shot_take-h3_00001.mp4",
+    payload: bytes | None = None,
+) -> bytes:
+    """Put real bytes where `rendered_shot`'s `latest_output` resolves to.
+
+    `make_client` pins `comfy_root` to `tmp_path / "comfy"`, and `land_take` records outputs
+    under `music-video-producer/{project_id}/shots/`, so this is the one place on disk the take
+    route may serve from. The payload is distinctive enough that a range assertion comparing
+    slices cannot pass by accident on repeated content.
+    """
+    content = payload if payload is not None else bytes(range(256)) * 8
+    target = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots" / filename
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return content
+
+
+def test_the_take_route_streams_the_latest_take_and_honours_range_requests(tmp_path: Path):
+    """The scrub bar's whole contract, held to a real 206 rather than to a response class.
+
+    Verified against Starlette 1.6.0 before this was written: `FileResponse` answers `Range`
+    itself. The assertions are on the wire — status, `Content-Range`, the exact bytes — so a
+    later change that swapped in a response type without range support fails here rather than
+    shipping a player whose scrub bar silently rewinds to zero.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Watchable")
+    payload = write_take_file(tmp_path, project_id)
+
+    whole = get_take(client, project_id, shot_id)
+    assert whole.status_code == 200, whole.text
+    assert whole.content == payload
+    assert whole.headers["content-type"] == "video/mp4"
+    # Advertised on the plain 200, which is what tells the browser seeking is worth asking for.
+    assert whole.headers["accept-ranges"] == "bytes"
+
+    middle = get_take(client, project_id, shot_id, headers={"Range": "bytes=100-299"})
+    assert middle.status_code == 206, middle.text
+    assert middle.headers["content-range"] == f"bytes 100-299/{len(payload)}"
+    assert middle.content == payload[100:300]
+
+    # A suffix range and an open-ended one, because a scrub to the end asks in exactly these
+    # shapes — and an unsatisfiable one is refused with the size rather than served empty.
+    tail = get_take(client, project_id, shot_id, headers={"Range": "bytes=-64"})
+    assert tail.status_code == 206
+    assert tail.content == payload[-64:]
+    open_ended = get_take(client, project_id, shot_id, headers={"Range": f"bytes={len(payload) - 32}-"})
+    assert open_ended.status_code == 206
+    assert open_ended.content == payload[-32:]
+    beyond = get_take(client, project_id, shot_id, headers={"Range": f"bytes={len(payload) * 2}-"})
+    assert beyond.status_code == 416
+
+    # Watching spends nothing and writes nothing: the one render is still the only submission,
+    # and the manifest did not move.
+    assert len(comfy.prompts) == 1
+    assert ProjectStore(tmp_path).get(project_id).shots[0].approved_output == ""
+
+
+def test_the_take_route_refuses_by_name_when_there_is_nothing_to_play(tmp_path: Path):
+    """Both 404 rows of the matrix, each with its own sentence rather than a broken player.
+
+    The never-rendered case must not name a path — there is none — and the missing-file case
+    must, because a manifest pointing at a file that is gone is usually a moved or cleared
+    ComfyUI output directory and the path is how the Director tells which.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = drafted_shot(store, "Never rendered")
+
+    unrendered = get_take(client, project.id, "shot_first")
+    assert unrendered.status_code == 404
+    assert unrendered.json()["detail"] == TAKE_NOT_RENDERED_REFUSAL.format(
+        shot="SHOT 01 (shot_first)"
+    )
+
+    # A take the manifest names and the disk does not hold.
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "File gone")
+    gone = get_take(client, project_id, shot_id)
+    assert gone.status_code == 404
+    recorded = ProjectStore(tmp_path).get(project_id).shots[0].latest_output
+    assert gone.json()["detail"] == TAKE_MISSING_FILE_REFUSAL.format(
+        shot=f"SHOT 01 ({shot_id})", path=recorded
+    )
+    assert recorded in gone.json()["detail"]
+
+    assert get_take(client, project_id, "shot_absent").status_code == 404
+    assert get_take(client, "proj_absent", shot_id).status_code == 404
+
+
+def test_the_take_route_resolves_the_manifest_and_stays_inside_the_output_root(tmp_path: Path):
+    """The confinement half of serve-by-ids.
+
+    The URL cannot carry a path, so the one injection surface left is the manifest itself —
+    `latest_output` is client-writable through the generic shots write. A value that walks out
+    of ComfyUI's output directory must resolve to the same named 404 as a missing file, not to
+    the file it walked to.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Escape attempt")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not a take", encoding="utf-8")
+
+    stored = store.get(project_id)
+    stored.shots[0].latest_output = "../../secret.txt"
+    store.save(stored)
+
+    response = get_take(client, project_id, shot_id)
+
+    assert response.status_code == 404
+    assert "secret.txt" in response.json()["detail"]
+    assert "not a take" not in response.text
+
+
+def test_approving_writes_the_watched_take_and_the_status_together_from_the_manifest(
+    tmp_path: Path,
+):
+    """FR-21's write, and the evidence-not-claim rule in one test.
+
+    What lands in `approved_output` is the server's own record of what rendered — byte-equal to
+    `latest_output` — and nothing on the wire can substitute for it: the request carries a body
+    and a query parameter that both name a different file, and both must be ignored, because the
+    route binds no body at all. `approved_output` is about to become assembly's input, so a value
+    a client could choose here would be a claim standing where evidence is required.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Approved")
+
+    response = approve(
+        client,
+        project_id,
+        shot_id,
+        params={"approved_output": "takes/forged.mp4"},
+        json={"approved_output": "takes/forged.mp4", "latest_output": "takes/forged.mp4"},
+    )
+
+    assert response.status_code == 200, response.text
+    saved = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert saved.approved_output == saved.latest_output
+    assert saved.latest_output.endswith("shot_take-h3_00001.mp4")
+    assert saved.status == "approved"
+    assert "forged" not in saved.approved_output
+    # The response is the whole project, so the inspector redraws from one reply.
+    assert response.json()["shots"][0]["approved_output"] == saved.approved_output
+    # Approving spends nothing: the one render is still the only submission.
+    assert len(comfy.prompts) == 1
+
+
+def test_approving_twice_is_an_idempotent_no_op_that_rewrites_nothing(tmp_path: Path):
+    """The matrix's own words: nothing rewritten.
+
+    Byte-identical manifest, not merely equal fields — a second approve that re-saved the same
+    values would move `updated_at`, and an unchanged manifest with a fresh timestamp collides
+    with the next optimistic-concurrency check for no reason.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Twice")
+    assert approve(client, project_id, shot_id).status_code == 200
+    manifest = store.manifest_path(project_id)
+    before = manifest.read_text(encoding="utf-8")
+
+    again = approve(client, project_id, shot_id)
+
+    assert again.status_code == 200
+    assert manifest.read_text(encoding="utf-8") == before
+    assert again.json()["shots"][0]["status"] == "approved"
+
+
+def test_approving_refuses_a_shot_with_no_take(tmp_path: Path):
+    """An approval is a decision about a specific piece of media, so no media, no decision.
+
+    Twice: the ordinary draft Shot, and a `complete` status whose `latest_output` was emptied by
+    hand — the status is not the evidence, the pointer is.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(store, "Nothing rendered")
+
+    response = approve(client, project.id, "shot_first")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == APPROVE_NO_TAKE_REFUSAL.format(
+        shot="SHOT 01 (shot_first)"
+    )
+    assert ProjectStore(tmp_path).get(project.id).shots[0].approved_output == ""
+
+    hollow = drafted_shot(store, "Hollow complete", status="complete", latest_output="")
+    assert approve(client, hollow.id, "shot_first").status_code == 422
+    assert ProjectStore(tmp_path).get(hollow.id).shots[0].status == "complete"
+
+
+def test_approving_refuses_a_live_render_from_the_job_records_not_the_status(tmp_path: Path):
+    """The 409, and the half of it a status-only check misses.
+
+    The take on screen is about to be displaced, so approving now would attach the decision to
+    whichever file lands next. The second case is the dangerous one: the status walked back to
+    `complete` by hand through the generic shots write while the job record still says the render
+    is out. The job records are the durable truth, and this must read them. Once the render
+    lands, the identical request succeeds — which is what makes 409 the right class.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = drafted_shot(store, "In flight", status="ready")
+    submitted = submit_h3(client, project.id, "shot_first")
+    assert submitted.status_code == 202
+
+    # The ordinary case: the Shot itself says a render is out.
+    queued = approve(client, project.id, "shot_first")
+    assert queued.status_code == 409
+    assert queued.json()["detail"] == APPROVE_IN_FLIGHT_REFUSAL.format(
+        shot="SHOT 01 (shot_first)"
+    )
+
+    # ...and the same live render hidden behind a hand-walked status and a hand-set pointer.
+    stored = store.get(project.id)
+    stored.shots[0].status = "complete"
+    stored.shots[0].latest_output = "takes/one.mp4"
+    store.save(stored)
+
+    hidden = approve(client, project.id, "shot_first")
+    assert hidden.status_code == 409, "a hand-edited status hid a live render from the guard"
+    assert hidden.json()["detail"] == APPROVE_IN_FLIGHT_REFUSAL.format(
+        shot="SHOT 01 (shot_first)"
+    )
+    assert ProjectStore(tmp_path).get(project.id).shots[0].approved_output == ""
+
+    # The conflict clears when the render lands, and the identical request then succeeds.
+    job_id = submitted.json()["id"]
+    land_take(client, comfy, project.id, job_id, "shot_first-h3_00001.mp4")
+    assert approve(client, project.id, "shot_first").status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "approved"
+
+
+def test_unapproving_clears_both_halves_and_returns_the_shot_to_complete(tmp_path: Path):
+    """FR-21's reversal: `approved_output` cleared, status back to `complete`, nothing deleted."""
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Reversed")
+    assert approve(client, project_id, shot_id).status_code == 200
+
+    response = unapprove(client, project_id, shot_id)
+
+    assert response.status_code == 200, response.text
+    saved = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert saved.approved_output == ""
+    assert saved.status == "complete"
+    # The record of what rendered is not the decision, and withdrawing one keeps the other.
+    assert saved.latest_output.endswith("shot_take-h3_00001.mp4")
+    assert len(comfy.prompts) == 1
+
+
+def test_unapproving_a_shot_that_is_not_approved_names_what_it_actually_is(tmp_path: Path):
+    """The matrix's 422, with the Shot's real state in the sentence rather than a bare no."""
+    client, store, comfy = make_client(tmp_path)
+    project = drafted_shot(store, "Not approved")
+
+    response = unapprove(client, project.id, "shot_first")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == UNAPPROVE_NOT_APPROVED_REFUSAL.format(
+        shot="SHOT 01 (shot_first)", status="draft"
+    )
+    assert "draft" in response.json()["detail"]
+
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Complete, never approved")
+    settled = unapprove(client, project_id, shot_id)
+    assert settled.status_code == 422
+    assert "complete" in settled.json()["detail"]
+    assert ProjectStore(tmp_path).get(project_id).shots[0].status == "complete"
+
+
+def test_unapproving_rescues_a_status_only_approval(tmp_path: Path):
+    """The one way out of a state only hand-edits can make.
+
+    A Shot with the `approved` status and no `approved_output` is refused by mark-ready (not its
+    status class), by render-again (the approval refusal reads either signal) and by everything
+    downstream — so un-approve must recognise the same either-signal definition render-again
+    refuses by, or the Shot is stuck.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = drafted_shot(
+        store, "Status only", status="approved", latest_output="takes/one.mp4"
+    )
+    assert render_again(client, project.id, "shot_first").status_code == 422
+
+    response = unapprove(client, project.id, "shot_first")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id).shots[0]
+    assert saved.status == "complete"
+    assert saved.approved_output == ""
+
+
+def test_the_approve_route_is_the_one_writer_of_approval(tmp_path: Path):
+    """AGENTS.md's rule and the spec's single-writer clause, asserted both ways.
+
+    Behaviorally: a completion that lands a take — the likeliest place a second writer would
+    creep in, because `apply_job_history` is already writing the Shot — moves `latest_output`
+    and stops there. And in the source: exactly two assignments to `approved_output` exist in
+    the whole package, both in `app.py`'s approve/unapprove pair, and exactly one write of the
+    `approved` status. The scan is what fails when a well-meaning writer is added somewhere the
+    behavioral half does not exercise.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, _, _ = rendered_shot(client, store, comfy, "Completed, not approved")
+    landed = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert landed.latest_output.endswith("shot_take-h3_00001.mp4")
+    assert landed.status == "complete"
+    assert landed.approved_output == ""
+
+    package = Path("src/music_video_producer")
+    assignments: dict[str, int] = {}
+    status_writes: dict[str, int] = {}
+    for source in package.rglob("*.py"):
+        text = source.read_text(encoding="utf-8")
+        wrote = len(re.findall(r"\.approved_output\s*=[^=]", text))
+        if wrote:
+            assignments[source.name] = wrote
+        wrote_status = len(re.findall(r"\.status\s*=\s*['\"]approved['\"]", text))
+        if wrote_status:
+            status_writes[source.name] = wrote_status
+    assert assignments == {"app.py": 2}, assignments
+    assert status_writes == {"app.py": 1}, status_writes
+    # And the frontend never writes it either: the one assignment in the workspace is the empty
+    # default a brand-new Shot is born with.
+    workspace = (package / "web" / "assets" / "app.js").read_text(encoding="utf-8")
+    contract = (package / "web" / "assets" / "api.js").read_text(encoding="utf-8")
+    for name, text in (("app.js", workspace), ("api.js", contract)):
+        writes = re.findall(r"approved_output\s*[:=]\s*(?!\s*['\"]['\"])", text)
+        assert writes == [], (name, writes)
+
+
+def test_while_approved_the_take_cannot_move_and_unapproval_is_the_way_back(tmp_path: Path):
+    """The invariant, pinned end to end: `approved_output == latest_output` for the life of an
+    approval — because everything that could move the pointer refuses an approved Shot — and
+    un-approve is the one gate back to an ordinary re-renderable complete Shot.
+
+    The round trip renders again after un-approving and lands a second take, which also proves
+    the other single-writer half in motion: the completion moves `latest_output` and leaves the
+    cleared approval cleared.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Invariant")
+    assert approve(client, project_id, shot_id).status_code == 200
+    approved = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert approved.approved_output == approved.latest_output
+
+    # Every route that could displace the take refuses, and the refusal names the approval.
+    reopen = render_again(client, project_id, shot_id)
+    assert reopen.status_code == 422
+    assert reopen.json()["detail"] == RENDER_AGAIN_APPROVED_REFUSAL.format(
+        shot=f"SHOT 01 ({shot_id})"
+    )
+    assert mark_ready(client, project_id, shot_id).status_code == 422
+    assert mark_draft(client, project_id, shot_id).status_code == 422
+    assert submit_h3(client, project_id, shot_id).status_code == 422
+    still = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert still.approved_output == still.latest_output
+    assert still.status == "approved"
+    assert len(comfy.prompts) == 1
+
+    # Un-approve, and the same Shot is an ordinary complete Shot again: re-openable,
+    # submittable, and its second take lands without resurrecting the withdrawn approval.
+    assert unapprove(client, project_id, shot_id).status_code == 200
+    assert render_again(client, project_id, shot_id).status_code == 200
+    resubmitted = submit_h3(client, project_id, shot_id)
+    assert resubmitted.status_code == 202
+    assert len(comfy.prompts) == 2
+    land_take(client, comfy, project_id, resubmitted.json()["id"], "shot_take-h3_00002.mp4")
+    second = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert second.latest_output.endswith("shot_take-h3_00002.mp4")
+    assert second.approved_output == ""
+    assert second.status == "complete"
+
+    # Approving now names the second take: what is approved is always the take that was watched.
+    assert approve(client, project_id, shot_id).status_code == 200
+    reapproved = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert reapproved.approved_output == second.latest_output
+
+
+def test_expansion_refuses_a_route_approved_shot(tmp_path: Path):
+    """The downstream refusal, wired end to end rather than hand-built.
+
+    Every existing expansion-refusal test constructs its approval by writing fields onto a Shot,
+    which proves the guard reads the fields and nothing about whether the approve route writes
+    the ones the guard reads. This one approves through the route and watches the same refusal
+    fire on what the route wrote.
+    """
+    client, store, comfy = make_client(tmp_path, ExpandingDirector())
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Approved, then expanded")
+    stored = store.get(project_id)
+    stored.shots.append(Shot(id="shot_second", start=10, duration=6, prompt="", status="draft"))
+    store.save(stored)
+    assert approve(client, project_id, shot_id).status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/director/expand")
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project_id)
+    assert saved.shots[0].prompt == "A singer turns toward camera"
+    assert saved.shots[0].approved_output == saved.shots[0].latest_output
+    # The draft Shot beside it still moves, so the approval is per Shot and not a plan veto.
+    assert saved.shots[1].prompt == "Prompt for shot_second at index 1"
+    notice = saved.messages[-1].content
+    assert "a render or a take already depends on the prompt" in notice
+    assert shot_id in notice.split("already depends on the prompt")[1]
+    assert len(comfy.prompts) == 1

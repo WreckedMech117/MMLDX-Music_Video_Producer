@@ -980,7 +980,7 @@ def render_again_refusal(project: Project, shot: Shot) -> tuple[int, str] | None
     """
     if shot.locked:
         return 422, RENDER_AGAIN_LOCKED_REFUSAL.format(shot=shot_label(project, shot))
-    if shot.approved_output or shot.status == "approved":
+    if shot_is_approved(shot):
         return 422, RENDER_AGAIN_APPROVED_REFUSAL.format(shot=shot_label(project, shot))
     if prompt_is_missing(shot):
         return 422, readiness_refusal([shot_label(project, shot)])
@@ -1282,6 +1282,75 @@ RESTORE_AUDIO_LENGTH_TOLERANCE = 0.5 / 24
 # Deliberately ASCII, exactly as `batch.READINESS_REFUSAL` and the render-again refusals are, and
 # for the same reason: the frontend halves are read back through node, whose stdout the contract
 # test decodes with the platform encoding on Windows.
+
+
+def shot_is_approved(shot: Shot) -> bool:
+    """Whether somebody has made the editorial decision this Shot's refusals key on.
+
+    Both signals, because they are settable independently through the generic shots write and a
+    Shot carrying either is a Shot somebody has decided about: `approved_output` is the decision
+    AGENTS.md names, and the `approved` status is reachable by hand and must not be a state
+    nothing can clear. One definition, read by `render_again_refusal`'s approval arm and by the
+    un-approve route, so the set of Shots render-again refuses as approved and the set un-approve
+    can rescue are the same set by construction rather than by two lists agreeing.
+    """
+    return bool(shot.approved_output) or shot.status == "approved"
+
+
+# Why one Shot's take cannot be played. Each names the Shot as the timeline names it, for
+# `render_again`'s reason: a bare `shot_a1b2c3d4e5f6` appears nowhere in the interface.
+#
+# Both are 404s rather than 422s, unlike the enhancer's take refusals, because the request is a
+# GET for a resource: what the client asked for does not exist, and the sentence in `detail` is
+# for the Director while the code is for the `<video>` element, which treats any error the same
+# way. The second names the path, per the matrix's own row: a manifest pointing at a file that is
+# gone is usually a moved or cleared ComfyUI output directory, and the only way the Director can
+# tell which is to see where this looked.
+TAKE_NOT_RENDERED_REFUSAL = (
+    "{shot} has not produced a take, so there is nothing to play. Render the shot first."
+)
+TAKE_MISSING_FILE_REFUSAL = (
+    "{shot}'s take is recorded as {path} and there is no file there. The take may have been "
+    "moved or the ComfyUI output directory cleared."
+)
+# Why one Shot's take may not be approved. FR-21's rule is that approval is explicit and
+# reversible, so both refusals say what would make the request approvable rather than only that
+# it was refused.
+APPROVE_NO_TAKE_REFUSAL = (
+    "{shot} has not produced a take, and an approval is an editorial decision about one "
+    "specific take. Render the shot first, then approve the take you watched."
+)
+# Concurrency, stated as the concrete harm rather than as a busy signal, with the same staleness
+# escape every in-flight refusal names: job status only moves when the queue is refreshed, so a
+# job that finished while nobody was polling still reads as in flight here.
+APPROVE_IN_FLIGHT_REFUSAL = (
+    "A render for {shot} has not finished, so the take on screen is about to be displaced. "
+    "Approving it now would leave the decision attached to whichever file lands next. Wait for "
+    "it, or refresh the render queue if it has already finished and this project has not been "
+    "told yet."
+)
+# The un-approve refusal names what the Shot actually is, per the matrix: a Director asking to
+# clear an approval that does not exist is holding a stale picture of this Shot, and the status
+# is the correction.
+UNAPPROVE_NOT_APPROVED_REFUSAL = (
+    "{shot} carries no approval to clear: no approved take is recorded and its status is "
+    "{status}. Nothing was changed."
+)
+# What each direction did, said rather than implied, on `MARK_READY_NOTICE`'s argument: the
+# approve toast has to carry the consequence -- the shot stops being re-renderable -- and the
+# un-approve toast has to say what was *not* lost, or a Director unsure of the cost will leave a
+# wrong approval standing rather than risk the take.
+APPROVE_NOTICE = (
+    "{shot}'s latest take is approved. The approval names that exact file, so the shot cannot "
+    "be re-rendered or re-queued while it stands. Un-approve it if the decision changes."
+)
+UNAPPROVE_NOTICE = (
+    "{shot}'s approval is cleared and the shot is back to complete, so it can be re-opened and "
+    "rendered again. Nothing was deleted: the take is still this shot's latest output."
+)
+# Deliberately ASCII, exactly as the render-again and mark-ready refusals are and for the same
+# reason: the frontend halves are read back through node, whose stdout the contract test decodes
+# with the platform encoding on Windows.
 
 
 def prose_claims_shots(message: str) -> bool:
@@ -3801,6 +3870,136 @@ def create_app(
         Shot whose prompt was emptied would trap it armed, which is exactly backwards.
         """
         return _set_shot_commitment(project_id, shot_id, "draft")
+
+    @app.get("/api/projects/{project_id}/shots/{shot_id}/take")
+    def read_shot_take(project_id: str, shot_id: str) -> FileResponse:
+        """Stream one Shot's latest take to the browser, by ids and by nothing else.
+
+        The URL carries a project id and a shot id and **no path**. The file served is resolved
+        here from the Shot's own `latest_output` through `analyze_latest_take`'s resolution,
+        containment check included, so there is no path-injection surface to defend: a client
+        cannot ask this route for anything except what the manifest says the Shot produced. That
+        is the same discipline `read_project_media` applies to the media tree, pointed at
+        ComfyUI's output root, where takes actually land.
+
+        Starlette's `FileResponse` answers `Range` itself — verified on this installation, 1.6.0:
+        a `bytes=` request gets a 206 with the right `Content-Range`, a suffix or open-ended
+        range is served, an unsatisfiable one gets a 416, and the plain 200 advertises
+        `Accept-Ranges: bytes`. That is what makes the `<video>` element's scrub bar work, and a
+        route test holds it to a real 206 so a change of response class cannot silently turn
+        seeking off.
+
+        Both failure rows are 404s with a sentence, per the matrix: the code is for the `<video>`
+        element, which treats every error alike, and the sentence is for the Director. The
+        missing-file row names the path this looked for, because a manifest pointing at a file
+        that is gone is usually a moved or cleared ComfyUI output directory and the path is the
+        only way to tell which.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if not shot.latest_output:
+            raise HTTPException(
+                status_code=404,
+                detail=TAKE_NOT_RENDERED_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        output_root = (settings.comfy_root / "output").resolve()
+        target = (output_root / Path(shot.latest_output)).resolve()
+        if output_root not in target.parents or not target.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=TAKE_MISSING_FILE_REFUSAL.format(
+                    shot=shot_label(project, shot), path=shot.latest_output
+                ),
+            )
+        return FileResponse(target)
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/approve", response_model=Project)
+    def approve_take(project_id: str, shot_id: str) -> Project:
+        """Approve one Shot's latest take. FR-21: explicit, reversible, never automatic. No body.
+
+        **This is the one writer of approval.** Nothing else in this application assigns
+        `approved_output` or the `approved` status — not job completion (`apply_job_history`
+        deliberately stops at `complete`), not the assistant, not expansion — and a test scans
+        the whole package to keep it that way. What is written is what the server resolved from
+        its own manifest: `approved_output := latest_output`, never a value from the wire.
+        `approved_output` is about to become assembly's input, and a path the server copied from
+        its own record of what rendered is evidence; a path accepted from a client would be a
+        claim. This route binds no body at all, so there is nothing on the wire to trust.
+
+        Both fields move together, and the pairing is what makes the un-approve path honest:
+        while the approval stands, render-again and mark-ready refuse this Shot, so
+        `latest_output` cannot move and `approved_output == latest_output` holds for the life of
+        the approval. A test pins that invariant end to end rather than trusting it.
+
+        The refusal order is the house order. In flight first, from the job records as well as
+        the status — `shot_render_in_flight` — because a status walked back by hand through the
+        generic shots write is exactly what hides a live render, and approving a take that is
+        about to be displaced attaches the decision to whichever file lands next; 409, because a
+        live render is a state conflict the same request survives. Then idempotence: an approved
+        Shot answers 200 and nothing is rewritten, not even `updated_at`. Then the take gate:
+        approval is a decision about a specific piece of media, so a Shot that never produced
+        one has nothing to approve, and that is a 422 fact no waiting changes.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if shot_render_in_flight(project, shot):
+            raise HTTPException(
+                status_code=409,
+                detail=APPROVE_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # Idempotent, and genuinely a no-op: nothing is saved, so an unchanged manifest does not
+        # get a fresh `updated_at` to collide with the next optimistic-concurrency check.
+        if shot.approved_output:
+            return project
+        if not shot.latest_output:
+            raise HTTPException(
+                status_code=422,
+                detail=APPROVE_NO_TAKE_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # The whole write, both halves together. The value is the server's own resolution of
+        # what this Shot's take is; nothing from the request is on the right-hand side.
+        shot.approved_output = shot.latest_output
+        shot.status = "approved"
+        return store.save(project)
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/unapprove", response_model=Project)
+    def unapprove_take(project_id: str, shot_id: str) -> Project:
+        """Clear one Shot's approval. The reversal FR-21 promises, and the one way back. No body.
+
+        Un-approval is what re-enables everything that keys on approval — render-again,
+        mark-ready, expansion and the assistant all refuse an approved Shot, and none of them
+        may be weakened instead — so this route accepts *either* approval signal through
+        `shot_is_approved`, the same definition render-again refuses by. A Shot with the
+        `approved` status and no `approved_output`, reachable only by hand through the generic
+        shots write, would otherwise be a Shot nothing can move: mark-ready disowns the status,
+        render-again says to clear the approval, and a route that only recognised
+        `approved_output` would refuse to.
+
+        Both fields are cleared together, `status` back to `complete` per the matrix — the Shot
+        had a take when it was approved, and a complete Shot is exactly what it goes back to
+        being, re-renderable through render-again like any other. Nothing else is touched:
+        `latest_output` stays, the take stays on disk, and the refusal for a Shot that is not
+        approved names what the Shot actually is rather than only refusing.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if not shot_is_approved(shot):
+            raise HTTPException(
+                status_code=422,
+                detail=UNAPPROVE_NOT_APPROVED_REFUSAL.format(
+                    shot=shot_label(project, shot), status=shot.status
+                ),
+            )
+        # The whole write: the decision is withdrawn, the record of what rendered is not.
+        shot.approved_output = ""
+        shot.status = "complete"
+        return store.save(project)
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)
     async def director_chat(project_id: str, request: DirectorRequest) -> Project:

@@ -4128,6 +4128,227 @@ def test_the_shot_inspector_draws_and_binds_the_mark_ready_control_it_was_given(
     assert "SHOT 01 (shot_a)" in rendered["readyNotice"]
 
 
+def test_the_approval_control_is_decided_by_executing_it_for_every_state():
+    """Every state the approve/un-approve pair can be in, run rather than read.
+
+    Four outcomes have to be told apart and none is inferable from the others: nothing to decide
+    about (no take, no control), approve, un-approve, and shown-but-refused with the in-flight
+    reason. The approved arm reads *either* approval signal — the server's `shot_is_approved`
+    definition — and wins over everything, because un-approve is the one way back and must be
+    offered even on a Shot whose other fields have been hand-mangled.
+    """
+    states = run_module("""
+      import { APPROVE_HELP, APPROVE_IN_FLIGHT, APPROVE_LABEL, UNAPPROVE_HELP, UNAPPROVE_LABEL,
+        approvalControl } from './src/music_video_producer/web/assets/api.js';
+      const shot = (fields) => ({ id: 'shot_a', prompt: 'A singer turns toward camera', locked: false,
+        latest_output: '', approved_output: '', ...fields });
+      const bare = {};
+      const taken = {};
+      for (const status of ['draft', 'ready', 'queued', 'running', 'complete', 'error', 'approved']) {
+        bare[status] = approvalControl(shot({ status }));
+        taken[status] = approvalControl(shot({ status, latest_output: 'takes/one.mp4' }));
+      }
+      console.log(JSON.stringify({
+        approveLabel: APPROVE_LABEL, approveHelp: APPROVE_HELP, inFlight: APPROVE_IN_FLIGHT,
+        unapproveLabel: UNAPPROVE_LABEL, unapproveHelp: UNAPPROVE_HELP,
+        bare, taken,
+        approved: approvalControl(shot({ status: 'approved', latest_output: 'takes/one.mp4', approved_output: 'takes/one.mp4' })),
+        fieldOnly: approvalControl(shot({ status: 'complete', latest_output: 'takes/one.mp4', approved_output: 'takes/one.mp4' })),
+        // A hand-mangled approval with no take at all still offers the one way back.
+        mangled: approvalControl(shot({ status: 'draft', approved_output: 'takes/one.mp4' })),
+        lockedApproved: approvalControl(shot({ status: 'approved', locked: true, approved_output: 'takes/one.mp4' })),
+        nothing: approvalControl(undefined),
+      }));
+    """)
+
+    # No take, no decision to make — for every status, including the in-flight pair. The one
+    # exception is the `approved` status itself, whose bare form still offers the way back.
+    for status in ("draft", "ready", "queued", "running", "complete", "error"):
+        assert states["bare"][status]["shown"] is False, status
+        assert states["bare"][status]["title"] == "", status
+    assert states["bare"]["approved"]["action"] == "unapprove"
+
+    # A settled take offers the approval, an errored shot's previous take included.
+    for status in ("draft", "ready", "complete", "error"):
+        assert states["taken"][status] == {
+            "shown": True, "disabled": False, "action": "approve",
+            "label": states["approveLabel"], "title": states["approveHelp"], "reason": "",
+        }, status
+    # In flight: shown and refused with the reason — the take on screen is about to be displaced.
+    for status in ("queued", "running"):
+        assert states["taken"][status]["shown"] is True, status
+        assert states["taken"][status]["disabled"] is True, status
+        assert states["taken"][status]["reason"] == states["inFlight"], status
+
+    # Approved, by both signals or by either alone, reads as the un-approve direction — and a
+    # lock does not take the way back away: approval is the Director's own decision to reverse.
+    for case in ("approved", "fieldOnly", "mangled", "lockedApproved"):
+        assert states[case] == {
+            "shown": True, "disabled": False, "action": "unapprove",
+            "label": states["unapproveLabel"], "title": states["unapproveHelp"], "reason": "",
+        }, case
+    assert states["taken"]["approved"]["action"] == "unapprove"
+
+    assert states["nothing"]["shown"] is False
+
+
+def test_the_shot_inspector_draws_the_player_and_approval_pair_from_the_shot_fields():
+    """The player and the pair, rendered and clicked against the workspace's own code.
+
+    The player's presence is decided from `shot.latest_output` and from nothing else — the same
+    rule `updateShotFromInspector` records for the expansion box, and the mutation that matters:
+    a stub DOM cannot tell an absent element from an empty one, so the assertion is on the markup
+    itself, which must contain no `<video` at all for a shot with no take. Its `src` must carry
+    ids only; a `latest_output` that travelled into the URL would be the client choosing the
+    path, which is exactly what the serve-by-ids route exists to prevent (the pointer may appear
+    in the query string only, as a cache key the server never reads).
+
+    The clicks prove the pair reaches the two bodyless routes — never the generic shots write —
+    in the direction the decision that drew the button carried.
+    """
+    rendered = run_workspace("""
+      const project = (fields) => ({
+        id: 'p1', assets: [], jobs: [], song: null,
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+                  mode: 'text', asset_ids: [], reference_labels: {}, use_song_audio: false,
+                  seed: 0, status: 'complete', prompt_id: 'p-1', latest_output: 'takes/one.mp4',
+                  approved_output: '', locked: false, ...fields }],
+      });
+      const draw = (fields) => {
+        state.project = project(fields);
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+        const html = at('#shot-inspector').innerHTML;
+        return {
+          video: html.includes('<video'),
+          player: html.includes('id="take-player"'),
+          src: (html.match(/src="([^"]*)"/) || [])[1] || '',
+          button: html.includes('id="approve-take"'),
+          disabled: /id="approve-take"[^>]*\\sdisabled/.test(html),
+          html,
+        };
+      };
+      const complete = draw({});
+      const unrendered = draw({ status: 'draft', prompt_id: '', latest_output: '' });
+      const approved = draw({ status: 'approved', approved_output: 'takes/one.mp4' });
+      const inFlight = draw({ status: 'queued' });
+
+      const clicked = async (fields, reply) => {
+        draw(fields);
+        globalThis.fetch = (path, options = {}) => {
+          requests.push({ path, method: options.method || 'GET', body: options.body || null });
+          return Promise.resolve({
+            ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => reply,
+          });
+        };
+        requests.length = 0;
+        toasts.length = 0;
+        await fire('#approve-take:click', {});
+        return {
+          requests: [...requests],
+          status: state.project.shots[0].status,
+          approvedOutput: state.project.shots[0].approved_output,
+          toasts: toasts.map((item) => item.textContent),
+        };
+      };
+      const toasts = [];
+      globalThis.document.createElement = () => { const item = make('<toast>'); toasts.push(item); return item; };
+      const approving = await clicked({}, project({ status: 'approved', approved_output: 'takes/one.mp4' }));
+      const unapproving = await clicked(
+        { status: 'approved', approved_output: 'takes/one.mp4' }, project({}));
+
+      console.log(JSON.stringify({
+        complete: { video: complete.video, player: complete.player, src: complete.src,
+                    button: complete.button, disabled: complete.disabled,
+                    label: complete.html.includes(contract.APPROVE_LABEL) },
+        unrendered: { video: unrendered.video, player: unrendered.player, button: unrendered.button },
+        approved: { video: approved.video, label: approved.html.includes(contract.UNAPPROVE_LABEL) },
+        inFlight: { button: inFlight.button, disabled: inFlight.disabled,
+                    reason: inFlight.html.includes(contract.APPROVE_IN_FLIGHT) },
+        approving, unapproving,
+        approveNotice: contract.approvalNotice(project({}), 'shot_a', 'approve'),
+        unapproveNotice: contract.approvalNotice(project({}), 'shot_a', 'unapprove'),
+      }));
+    """)
+
+    # The player, from the field: drawn with a take, absent — not empty, absent — without one.
+    assert rendered["complete"]["video"] is True
+    assert rendered["complete"]["player"] is True
+    assert rendered["unrendered"]["video"] is False
+    assert rendered["unrendered"]["player"] is False
+    assert rendered["unrendered"]["button"] is False
+    # Ids only in the path; the pointer rides in the query string as a cache key and the path
+    # itself names nothing a client chose.
+    src = rendered["complete"]["src"]
+    assert src.split("?")[0] == "/api/projects/p1/shots/shot_a/take"
+    assert "takes/one.mp4" not in src.split("?")[0]
+    # The approved shot still shows its player: un-approve is decided while watching too.
+    assert rendered["approved"]["video"] is True
+
+    # The pair: approve on a settled take, un-approve on an approved one, refused in flight.
+    assert rendered["complete"]["button"] is True
+    assert rendered["complete"]["disabled"] is False
+    assert rendered["complete"]["label"] is True
+    assert rendered["approved"]["label"] is True
+    assert rendered["inFlight"] == {"button": True, "disabled": True, "reason": True}
+
+    # Each direction is one bodyless request to its own route, never the generic shots write.
+    assert rendered["approving"]["requests"] == [
+        {"path": "/api/projects/p1/shots/shot_a/approve", "method": "POST", "body": None}
+    ]
+    assert rendered["unapproving"]["requests"] == [
+        {"path": "/api/projects/p1/shots/shot_a/unapprove", "method": "POST", "body": None}
+    ]
+    for direction in ("approving", "unapproving"):
+        assert not any(
+            sent["path"].endswith("/shots") for sent in rendered[direction]["requests"]
+        ), direction
+
+    # The reply is adopted and the Director is told the consequence in the server's sentence.
+    assert rendered["approving"]["status"] == "approved"
+    assert rendered["approving"]["approvedOutput"] == "takes/one.mp4"
+    assert rendered["unapproving"]["status"] == "complete"
+    assert rendered["unapproving"]["approvedOutput"] == ""
+    assert rendered["approving"]["toasts"] == [rendered["approveNotice"]]
+    assert rendered["unapproving"]["toasts"] == [rendered["unapproveNotice"]]
+    assert "cannot be re-rendered" in rendered["approveNotice"]
+    assert "Nothing was deleted" in rendered["unapproveNotice"]
+    assert "SHOT 01 (shot_a)" in rendered["approveNotice"]
+
+
+def test_approval_wordings_are_the_servers_own():
+    """One rule, one sentence, whichever side the Director meets it on — the render-again
+    convention applied to the approval pair: the in-flight refusal is previewed by the panel in
+    the server's words, and both toasts are the server's own account of what each direction did.
+    """
+    from music_video_producer.app import (
+        APPROVE_IN_FLIGHT_REFUSAL,
+        APPROVE_NOTICE,
+        UNAPPROVE_NOTICE,
+    )
+
+    shared = run_module("""
+      import { APPROVE_IN_FLIGHT, APPROVE_NOTICE, UNAPPROVE_NOTICE, approvalNotice }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { shots: [{ id: 'shot_a' }, { id: 'shot_b' }] };
+      console.log(JSON.stringify({
+        inFlight: APPROVE_IN_FLIGHT,
+        approve: APPROVE_NOTICE,
+        unapprove: UNAPPROVE_NOTICE,
+        approveNotice: approvalNotice(project, 'shot_b', 'approve'),
+        unapproveNotice: approvalNotice(project, 'shot_b', 'unapprove'),
+      }));
+    """)
+
+    # "this shot" stands in for the label the server prefixes, mid-sentence and so lower-case;
+    # every other word has to be the same or the two sides describe different rules.
+    assert shared["inFlight"] == APPROVE_IN_FLIGHT_REFUSAL.format(shot="this shot")
+    assert shared["approve"] == APPROVE_NOTICE
+    assert shared["unapprove"] == UNAPPROVE_NOTICE
+    assert shared["approveNotice"] == APPROVE_NOTICE.format(shot="SHOT 02 (shot_b)")
+    assert shared["unapproveNotice"] == UNAPPROVE_NOTICE.format(shot="SHOT 02 (shot_b)")
+
+
 def test_neither_refusal_is_decided_by_its_status_code_in_the_browser():
     """Both codes moved to 409 on 2026-08-18. This is the test that says nothing broke by it.
 

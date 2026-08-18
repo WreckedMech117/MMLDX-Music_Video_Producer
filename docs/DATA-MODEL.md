@@ -65,7 +65,7 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - `prompt_id`
 - `latest_output`: most recent completed render; never implies approval
 - optional `latest_review`: vision continuity review of the latest output; never implies approval
-- `approved_output`: only an explicitly approved take
+- `approved_output`: only an explicitly approved take — and it finally has a writer: the approve route alone assigns it (`:= latest_output` at the moment of approval, never a client-supplied path), `status: "approved"` moves with it as one write, and un-approve is the sole reversal. While approved, `latest_output` cannot move (render-again refuses approved Shots), so `approved_output == latest_output` is an invariant, pinned by test
 - `locked`
 
 Shot timing is measured in seconds against the master song. Director compilation converts it to frames only at the workflow boundary.

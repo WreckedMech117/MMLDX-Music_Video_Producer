@@ -90,6 +90,16 @@ Going back to `draft` has **no prompt gate**: un-committing a shot whose prompt 
 
 **Nothing auto-marks.** Not the Director applying a shot plan, not expansion writing prompts. Running expansion to see what the model suggests must never silently arm a whole plan for rendering. That is enforced by a test, not just by absence.
 
+## Watch and approve a take
+
+The finishing lane begins here. `GET /api/projects/{id}/shots/{shot_id}/take` streams a Shot's latest take **by id** — the server resolves its own `latest_output` through the same confined resolution the media route uses, so there is no path parameter to inject — and honours HTTP Range (Starlette's `FileResponse` serves real 206s; Edge was observed scrubbing on them in the browser gate). The player sits in the shot inspector beside the render controls.
+
+`POST .../approve` and `POST .../unapprove` are bodyless. Approve writes `approved_output := latest_output` and `status := "approved"` together — nothing from the wire on the right-hand side — refusing 409 while a render is in flight (read from the job records, since a hand-edited status hides a live render) and 422 with no take. Approving twice is a byte-identical no-op. Un-approve clears both and returns the Shot to `complete`, which is the one way back: an approved Shot is refused by mark-ready, render-again (which names the approval), expansion and the assistant alike.
+
+Approval is **explicit and reversible, never automatic** — FR-21's words. No render completion, poll tick or assistant tool can approve anything.
+
+Browser QA note: `tests/e2e_shot_controls.py` now synthesizes a playable take with ffmpeg (must be on PATH) under an isolated `MVP_COMFY_ROOT`, so it never touches the real ComfyUI output tree.
+
 ## Render a shot again
 
 `POST /api/projects/{id}/shots/{shot_id}/render-again`, and a control in the shot inspector, re-open a settled shot for one more submission by writing exactly one field — `status` back to `ready`. Before this existed, comparing two takes meant hand-editing status through the generic shots route with an API client, which is what had to be done on 2026-08-18 to compare the two sampling profiles.

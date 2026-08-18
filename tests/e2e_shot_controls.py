@@ -25,21 +25,36 @@ raised it, that neither inspector is hidden by a media query at any width this s
 that choosing which shot to look at does not write the whole shot list back or rebuild the panel
 under the Director's hands. The toast overlap used to be recorded here as an observation.
 
-Every fixture is built through shipped routes. Nothing is hand-written into a manifest.
+Since 2026-08-18 it also gates the take player and the approval pair (FR-21): a real, playable
+take is synthesized with ffmpeg -- a two-second color-and-tone source, no GPU, nothing to
+`/prompt` -- and placed where the server's confined `latest_output` resolution will find it, under
+an isolated `MVP_COMFY_ROOT` this script owns. The browser then proves what no offline harness
+can: `loadedmetadata` fires with a nonzero duration read from bytes the take route actually
+streamed, a `currentTime` seek lands, approving flips the pair and disables render-again with the
+approval named in place, and un-approving restores it.
+
+Every fixture is built through shipped routes. Nothing is hand-written into a manifest; the one
+file written to disk directly is the synthesized take, which is ComfyUI's half of the contract
+and has no route to arrive by without a GPU.
 
 Run from the repo root -- it starts and proves its own server, and takes no base URL::
 
     uv run --with selenium python tests/e2e_shot_controls.py [--port 8767]
 
 Assumes: nothing listening on the port (it refuses to reuse a bound one), Microsoft Edge and its
-WebDriver installed, and `music_video_producer` importable from this checkout's `src/`. ComfyUI
-does not need to be running: the ComfyUI status dot goes red and nothing here reads it.
+WebDriver installed, ffmpeg on PATH, and `music_video_producer` importable from this checkout's
+`src/`. ComfyUI does not need to be running: the ComfyUI status dot goes red and nothing here
+reads it.
 """
 
 from __future__ import annotations
 
 import base64
+import os
+import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 from e2e_support import (
     ManagedServer,
@@ -88,14 +103,59 @@ SHOTS = [
     # state where a second submission does concrete harm.
     {"id": "shot_queued", "start": 16, "duration": 4, "prompt": "Already on the card.",
      "mode": "text", "status": "queued"},
+    # A completed shot with a real, playable take on disk -- the subject of the FR-21 section.
+    # `latest_output` is filled in by `seed`, which knows the project id the path must carry, and
+    # the ffmpeg synthesis writes the file where the server's confined resolution will find it.
+    {"id": "shot_take", "start": 20, "duration": 4, "prompt": "The corridor, held on the turn.",
+     "mode": "text", "status": "complete", "latest_output": ""},
 ]
 
 
-def seed(base_url: str) -> dict:
-    """Build the project through shipped routes only."""
+def synthesize_take(target: Path) -> None:
+    """A real two-second video with a tone, made locally by ffmpeg.
+
+    No GPU and nothing to `/prompt`: this is the file a render would have left behind, produced
+    the only way a test may produce one. Color plus a 440 Hz sine, H.264 in an MP4, because the
+    assertion downstream is the browser's own `loadedmetadata` and a container Edge cannot open
+    would fail the right test for the wrong reason.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=orange:size=320x240:duration=2:rate=24",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+        str(target),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError as error:
+        raise StaleServer(
+            "ffmpeg is not on PATH, and the take-playback section needs it to synthesize a "
+            "playable take without a GPU."
+        ) from error
+    except subprocess.CalledProcessError as error:
+        raise StaleServer(f"ffmpeg could not synthesize the take:\n{error.stderr}") from error
+    if not target.is_file() or target.stat().st_size == 0:
+        raise StaleServer(f"ffmpeg reported success and wrote nothing at {target}")
+
+
+def seed(base_url: str, comfy_root: Path) -> dict:
+    """Build the project through shipped routes only.
+
+    The one exception is the take file itself, which is ComfyUI's half of the contract: it is
+    synthesized onto disk under `comfy_root/output` at exactly the path the manifest names, so
+    the take route's confined resolution -- ids in, manifest out -- is what the browser exercises.
+    """
     project = post_json(f"{base_url}/api/projects", {"name": "Shot controls browser QA"})
     project_id = project["id"]
-    project = put_json(f"{base_url}/api/projects/{project_id}/shots", {"shots": SHOTS})
+    latest_output = f"music-video-producer/{project_id}/shots/shot_take-h3_00001.mp4"
+    synthesize_take(comfy_root / "output" / latest_output)
+    shots = [
+        {**shot, "latest_output": latest_output} if shot["id"] == "shot_take" else shot
+        for shot in SHOTS
+    ]
+    project = put_json(f"{base_url}/api/projects/{project_id}/shots", {"shots": shots})
 
     picture = artifact_dir() / "shot-controls-source.png"
     picture.write_bytes(PNG)
@@ -183,9 +243,14 @@ def main() -> None:
         port = int(sys.argv[sys.argv.index("--port") + 1])
 
     result: dict[str, object] = {}
+    # An isolated ComfyUI root this run owns, told to the server through the environment the
+    # ManagedServer copies. The user's real ComfyUI installation is never read or written, and
+    # the synthesized take is the only thing that will ever exist under this one.
+    comfy_root = Path(tempfile.mkdtemp(prefix="mvp-shot-controls-comfy-"))
+    os.environ["MVP_COMFY_ROOT"] = str(comfy_root)
     with ManagedServer(port, label=NAME) as server:
         result["server_identity"] = server.evidence
-        fixture = seed(server.base_url)
+        fixture = seed(server.base_url, comfy_root)
         project_id = fixture["id"]
         assets = fixture["assets"]
 
@@ -372,6 +437,108 @@ def main() -> None:
             assert status_chip(driver) == "queued", status_chip(driver)
             visible_and_clickable(driver, control(driver, "#compile-shot"), "the compile button")
             result["in_flight_shot_offers_neither_control"] = True
+
+            # --- A take can be watched, scrubbed, approved and un-approved (FR-21) -------------
+            # The player's metadata is the browser's own reading of bytes the take route
+            # streamed, so a nonzero duration is proof of the whole serving path -- not of any
+            # markup. The seek is the scrub bar working end to end against that route.
+            select_clip(driver, wait, "shot_take")
+            player = control(driver, "#take-player")
+            assert player is not None, "a shot with a take on disk draws no player"
+            assert player.is_displayed(), "the take player is rendered but not visible"
+            media = WebDriverWait(driver, 20).until(
+                lambda browser: browser.execute_script(
+                    "const video = document.querySelector('#take-player');"
+                    "return video && video.readyState >= 1 && video.duration > 0"
+                    " ? {duration: video.duration, src: video.currentSrc} : null;"
+                )
+            )
+            assert 1.5 <= media["duration"] <= 2.6, media
+            assert f"/api/projects/{project_id}/shots/shot_take/take" in media["src"], media
+            seeked = WebDriverWait(driver, 20).until(
+                lambda browser: browser.execute_script(
+                    "const video = document.querySelector('#take-player');"
+                    "if (video.dataset.seekAsked !== '1') {"
+                    "  video.dataset.seekAsked = '1'; video.currentTime = 1.2; return null; }"
+                    "return video.seekable.length > 0 && video.currentTime >= 1.0"
+                    " ? {currentTime: video.currentTime, seekableEnd: video.seekable.end(0)}"
+                    " : null;"
+                )
+            )
+            assert seeked["currentTime"] >= 1.0, seeked
+            result["take_playback"] = {"duration": media["duration"], **seeked}
+
+            # Approve: the pair flips, the manifest holds the watched take in both fields, and
+            # render-again shuts with the approval named where the Director is refused.
+            approve_button = control(driver, "#approve-take")
+            facts = visible_and_clickable(driver, approve_button, "the approve button on a take")
+            assert approve_button.is_enabled(), "a settled take offers a dead approve button"
+            assert approve_button.text.strip() == "Approve take", approve_button.text
+            clear_toasts(driver)
+            approve_button.click()
+            approved_toast = wait_for_toast(driver, wait, "latest take is approved")
+            assert "cannot be re-rendered" in approved_toast, approved_toast
+            wait.until(lambda browser: status_chip(browser) == "approved")
+            settle(driver, "#shot-inspector")
+            stored_take = next(
+                shot for shot in get_json(f"{server.base_url}/api/projects/{project_id}")["shots"]
+                if shot["id"] == "shot_take"
+            )
+            assert stored_take["status"] == "approved", stored_take["status"]
+            assert stored_take["approved_output"] == stored_take["latest_output"], stored_take
+            assert stored_take["approved_output"].endswith("shot_take-h3_00001.mp4")
+            flipped = control(driver, "#approve-take")
+            assert flipped.text.strip() == "Un-approve take", flipped.text
+            refused = control(driver, "#render-again")
+            assert refused is not None, "an approved shot draws no render-again control at all"
+            assert not refused.is_enabled(), "an approved shot offers a live render-again button"
+            approval_reason = control(driver, "#render-again + .control-reason")
+            assert approval_reason is not None and approval_reason.is_displayed(), (
+                "the approval refusal is not rendered where the Director is refused"
+            )
+            assert "approved take" in approval_reason.text, approval_reason.text
+            # A disabled attribute the browser actually honours, rather than a grey button that
+            # still fires. Nothing offline can tell those apart.
+            refused.click()
+            assert stored_status(server.base_url, project_id, "shot_take") == "approved", (
+                "a disabled render-again button still re-opened an approved shot"
+            )
+            result["take_approved"] = {
+                "toast": " ".join(approved_toast.split())[:160],
+                "refusal_in_place": " ".join(approval_reason.text.split())[:160],
+                "geometry": facts,
+            }
+
+            # Un-approve: the one way back, and it re-enables render-again in the same panel.
+            clear_toasts(driver)
+            flipped = control(driver, "#approve-take")
+            visible_and_clickable(driver, flipped, "the un-approve button on an approved shot")
+            flipped.click()
+            cleared_toast = wait_for_toast(driver, wait, "approval is cleared")
+            assert "Nothing was deleted" in cleared_toast, cleared_toast
+            wait.until(lambda browser: status_chip(browser) == "complete")
+            settle(driver, "#shot-inspector")
+            stored_take = next(
+                shot for shot in get_json(f"{server.base_url}/api/projects/{project_id}")["shots"]
+                if shot["id"] == "shot_take"
+            )
+            assert stored_take["status"] == "complete", stored_take["status"]
+            assert stored_take["approved_output"] == "", stored_take["approved_output"]
+            assert stored_take["latest_output"].endswith("shot_take-h3_00001.mp4"), (
+                "un-approving touched the take pointer"
+            )
+            again_back = control(driver, "#render-again")
+            assert again_back is not None and again_back.is_enabled(), (
+                "un-approving did not re-enable render-again"
+            )
+            # The whole lane queued nothing: watching, approving and un-approving are free.
+            assert not get_json(f"{server.base_url}/api/projects/{project_id}")["jobs"], (
+                "the approval lane queued a render; it must never reach /prompt"
+            )
+            result["take_approval_round_trip"] = {
+                "unapprove_toast": " ".join(cleared_toast.split())[:160],
+                "render_again_reenabled": True,
+            }
 
             # --- Choosing which shot to look at is not an edit ---------------------------------
             # Selecting a clip used to write the whole shot list back on pointerup whether or not

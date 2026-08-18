@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -893,6 +893,24 @@ export function renderShotInspector() {
   const markHtml = mark.shown
     ? `<button class="quiet-button full" id="mark-ready" ${mark.disabled ? "disabled" : ""} title="${escapeHtml(mark.title)}">${escapeHtml(mark.label)}</button>${mark.reason ? `<p class="control-reason">${escapeHtml(mark.reason)}</p>` : ""}`
     : "";
+  // The take player. Drawn from the Shot's own `latest_output` and from nothing else -- never
+  // from whether some element exists -- for `updateShotFromInspector`'s recorded reason: the
+  // template decided from the shot, so everything about the take decides from the shot, and the
+  // two cannot disagree. The URL carries ids only; the server resolves the file from its own
+  // manifest, which is what makes the approval below a decision about evidence rather than about
+  // a path this client claimed. Range requests make the scrub bar work, and the server side of
+  // that is pinned by its own test.
+  const takeHtml = shot.latest_output
+    ? `<video id="take-player" class="take-player" controls preload="metadata" src="${escapeHtml(shotTakeUrl(state.project.id, shot.id, shot.latest_output))}"></video>`
+    : "";
+  // Whether this shot's take may be approved or the approval cleared, decided by
+  // `approvalControl`, which the contract tests execute for every state. Nothing about that
+  // decision is re-made in the template below: it applies `shown`, `disabled` and `title` and
+  // nothing else, exactly as the render-again control does.
+  const approval = approvalControl(shot);
+  const approvalHtml = approval.shown
+    ? `<button class="quiet-button full" id="approve-take" ${approval.disabled ? "disabled" : ""} title="${escapeHtml(approval.title)}">${escapeHtml(approval.label)}</button>${approval.reason ? `<p class="control-reason">${escapeHtml(approval.reason)}</p>` : ""}`
+    : "";
   // The H3 expansion, drawn under the creative intent it was written from. Decided by
   // `expandPromptControl`, which the contract tests execute for every state and every refusal;
   // nothing about that decision is re-made here.
@@ -911,7 +929,7 @@ export function renderShotInspector() {
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
@@ -1030,6 +1048,30 @@ export function renderShotInspector() {
       renderTimeline();
       renderJobs();
       toast(renderAgainNotice(project, shot.id));
+    } catch (error) { toast(error.message, "error"); }
+  });
+  // FR-21's two directions, through their own bodyless routes -- emphatically not the generic
+  // shots write, which would let a stale client reassert every prompt, window and lock in the
+  // plan under a click that meant "I approve this take". The direction comes off the decision
+  // that drew the button rather than from the shot read again here, for `mark-ready`'s reason: a
+  // re-derivation is a second copy of the rule, and the copy that decided the label is the one
+  // the Director actually pressed.
+  //
+  // The reply is the whole project, so the status chip, the timeline and both refusable controls
+  // beside this one redraw from it -- approving is exactly what flips render-again to its
+  // disabled arm. The toast is the server's own sentence about the consequence, because the
+  // belief a silent chip change leaves in place is that nothing else moved.
+  $("#approve-take")?.addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const projectId = state.project.id;
+    try {
+      const project = approval.action === "unapprove"
+        ? await api.unapproveTake(projectId, shot.id)
+        : await api.approveTake(projectId, shot.id);
+      if (state.project?.id !== projectId) return;
+      state.project = project;
+      renderTimeline();
+      toast(approvalNotice(project, shot.id, approval.action));
     } catch (error) { toast(error.message, "error"); }
   });
 }

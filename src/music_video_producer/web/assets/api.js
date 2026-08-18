@@ -1272,6 +1272,64 @@ export function markReadyControl(shot) {
   };
 }
 
+export const APPROVE_LABEL = "Approve take";
+export const UNAPPROVE_LABEL = "Un-approve take";
+// Both help strings lead with what the click does *not* do, on the mark-ready controls'
+// argument: approval is the one editorial decision in this panel, and a Director deciding
+// whether to press it must know it renders nothing and that it is reversible -- FR-21's own two
+// promises.
+export const APPROVE_HELP =
+  "Approve this shot's latest take. Nothing is rendered by this and nothing is deleted; while " +
+  "the approval stands the shot cannot be re-rendered, and un-approving reverses it.";
+export const UNAPPROVE_HELP =
+  "Clear this shot's approval. Nothing is deleted: the take stays this shot's latest output, " +
+  "and the shot becomes re-renderable again.";
+// The refusal the browser can see coming, in the server's words -- app.py's
+// APPROVE_IN_FLIGHT_REFUSAL with the label the panel already shows standing in for the name.
+// Drawn as a disabled control carrying the reason rather than as no control at all, for the
+// render-again control's reason: the take on screen is real and "why can I not approve it" is a
+// question the panel should answer where it is asked.
+export const APPROVE_IN_FLIGHT =
+  "A render for this shot has not finished, so the take on screen is about to be displaced. " +
+  "Approving it now would leave the decision attached to whichever file lands next. Wait for " +
+  "it, or refresh the render queue if it has already finished and this project has not been " +
+  "told yet.";
+
+// Everything the inspector draws for the approve/un-approve pair, decided here rather than in
+// the template -- `renderAgainControl`'s reason exactly. The states to tell apart are "nothing
+// to decide about", "approve", "un-approve" and "shown but refused, here is why", and a template
+// holding those ternaries can have its arms swapped while every string the suite greps for
+// survives. Executed by tests/test_frontend_contract.py for every state.
+//
+// The approved arm is decided from the Shot's two approval fields -- either signal, matching the
+// server's `shot_is_approved` -- and comes first, ahead of the take check, because un-approve is
+// the one way back and must be offered even on a hand-edited Shot whose `latest_output` is gone.
+//
+// `action` is carried out rather than re-derived at the click site, for `markReadyControl`'s
+// reason: a handler that recomputed the direction from the Shot would be a second copy of the
+// decision that could disagree with the button the Director actually pressed.
+//
+// `disabled` is never inferred from `shown` and never the other way round: a shot with a take
+// and a render in flight is shown *and* disabled, which is the case carrying the reason worth
+// reading.
+export function approvalControl(shot) {
+  const status = String(shot?.status ?? "");
+  const approved = Boolean(shot?.approved_output) || status === "approved";
+  if (approved) {
+    return { shown: true, disabled: false, action: "unapprove", label: UNAPPROVE_LABEL, title: UNAPPROVE_HELP, reason: "" };
+  }
+  // No take, no decision to make: an approval is about a specific piece of media, and a control
+  // drawn here could only refuse. The absent state is decided from the Shot's own field, never
+  // from what the template happened to draw.
+  if (!shot?.latest_output) {
+    return { shown: false, disabled: true, action: "", label: APPROVE_LABEL, title: "", reason: "" };
+  }
+  if (RENDER_IN_FLIGHT_SHOT_STATUSES.includes(status)) {
+    return { shown: true, disabled: true, action: "approve", label: APPROVE_LABEL, title: APPROVE_IN_FLIGHT, reason: APPROVE_IN_FLIGHT };
+  }
+  return { shown: true, disabled: false, action: "approve", label: APPROVE_LABEL, title: APPROVE_HELP, reason: "" };
+}
+
 // The shot-mode taxonomy, mirroring `models.SHOT_MODE_SPECS` field for field. A contract test
 // executes both and asserts the two tables are identical, because two hand-written copies of what a
 // mode requires is how the inspector starts drawing a shot as complete that the route then refuses.
@@ -1707,6 +1765,33 @@ export function markReadyNotice(project, shotId, action) {
   return template.replace("{shot}", shotLabel(project, shotId));
 }
 
+// What each approval direction did, mirroring app.py's APPROVE_NOTICE and UNAPPROVE_NOTICE so
+// the sentence the Director reads is the one the server implements. A contract test asserts they
+// are identical.
+//
+// Said on every success rather than left to the status chip, because each direction carries a
+// consequence the chip does not show: approving takes re-rendering away, and un-approving has to
+// say nothing was deleted or a Director unsure of the cost will leave a wrong approval standing.
+export const APPROVE_NOTICE =
+  "{shot}'s latest take is approved. The approval names that exact file, so the shot cannot " +
+  "be re-rendered or re-queued while it stands. Un-approve it if the decision changes.";
+export const UNAPPROVE_NOTICE =
+  "{shot}'s approval is cleared and the shot is back to complete, so it can be re-opened and " +
+  "rendered again. Nothing was deleted: the take is still this shot's latest output.";
+
+export function approvalNotice(project, shotId, action) {
+  const template = action === "unapprove" ? UNAPPROVE_NOTICE : APPROVE_NOTICE;
+  return template.replace("{shot}", shotLabel(project, shotId));
+}
+
+// Where one Shot's latest take streams from: ids only, per the route's own contract -- the
+// server resolves the file from its manifest, so no path travels in this URL. The take pointer
+// rides along as a cache key: the URL would otherwise be identical before and after a re-render,
+// and the browser would keep playing the take the approval no longer describes.
+export function shotTakeUrl(projectId, shotId, latestOutput) {
+  return `/api/projects/${projectId}/shots/${shotId}/take?v=${encodeURIComponent(latestOutput || "")}`;
+}
+
 // What a batch that failed partway has to say beyond the failure itself. The Shots already
 // accepted are burning GPU minutes right now, and a bare refusal reads as "nothing happened" --
 // so the Director edits and resubmits a plan half of which is already in flight.
@@ -2073,6 +2158,11 @@ export const api = {
   // again" is how a stale client silently reverts every other shot in the plan. Nothing is
   // rendered by this and no GPU time is spent -- the re-opened shot is queued like any other.
   renderAgain: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/render-again`, { method: "POST" }),
+  // Both bodyless on purpose, like every purpose-built shot action: approval is the one field
+  // the route writes, and it writes it from its own manifest rather than from anything a client
+  // could put on the wire.
+  approveTake: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/approve`, { method: "POST" }),
+  unapproveTake: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/unapprove`, { method: "POST" }),
   // The two sides of a shot's first render, and neither carries a body. The shots write would have
   // done this too -- it is the only thing that could, which is why no shot could reach a render
   // through the interface at all -- but it takes the whole shot list, so a request meaning "I have

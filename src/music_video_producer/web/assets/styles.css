@@ -302,6 +302,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    conveys only that something is wrong, which is state by appearance alone. This is the sentence.
    It is also the button's tooltip, for the pointer. */
 .control-reason { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+/* The take player. Full width of the inspector column with its own black stage, because a video
+   sized by its intrinsic pixels would either overflow the panel or sit in it at thumbnail size,
+   and the scrub bar is the point of drawing it at all. */
+.take-player { display: block; width: 100%; margin-top: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: #000; }
 /* The whole readiness report, above the batch button. Blocking and sameness lines are told apart
    by the words app.js writes into them as well as by the marker colour, because a list where the
    only difference is red versus amber conveys state by colour alone. */

@@ -616,6 +616,55 @@ def test_a_shot_carrying_render_provenance_is_refused_consistently_with_expansio
     assert comfy.prompts == []
 
 
+def test_the_assistant_refuses_a_shot_approved_through_the_approve_route(tmp_path: Path):
+    """The provenance refusal against a *route-made* approval, not a hand-built one.
+
+    The parametrised provenance test above writes `approved_output` onto a Shot directly, which
+    proves the guard reads the field and nothing about whether the approve route writes the field
+    the guard reads. This drives the whole chain through shipped routes — mark-ready, submit,
+    completion, approve — and then watches the assistant refuse what the route wrote; un-approve
+    is the one way the Shot comes back into reach, and that is driven too.
+    """
+    from test_api import approve, land_take, mark_ready, submit_h3, unapprove
+
+    director = FillingDirector(
+        turn({"shot_id": "shot_one", "prompt": "Should never be written over an approval"})
+    )
+    client, store, comfy = make_client(tmp_path, director)
+    project = producer_project(store)
+    project.shots[0].prompt = "A grey wolf crosses a wet pine forest"
+    store.save(project)
+    assert mark_ready(client, project.id, "shot_one").status_code == 200
+    submitted = submit_h3(client, project.id, "shot_one")
+    assert submitted.status_code == 202
+    land_take(client, comfy, project.id, submitted.json()["id"], "shot_one-h3_00001.mp4")
+    assert approve(client, project.id, "shot_one").status_code == 200
+    approved = store.get(project.id).shots[0].model_dump()
+
+    response = client.post(
+        FILL.format(project=project.id),
+        json={"message": "rewrite the wolf shot", "shot_ids": ["shot_one"]},
+    )
+
+    # Every selected Shot is refusable, so the refusal lands before the model is spent — and it
+    # names the provenance rule, exactly as a hand-built approval is refused.
+    assert response.status_code == 422
+    assert EXPANSION_RENDERED_NOTICE.format(shots="SHOT 01 (shot_one)") in response.json()["detail"]
+    assert store.get(project.id).shots[0].model_dump() == approved
+    assert len(comfy.prompts) == 1
+
+    # Un-approve is the one way back into the assistant's reach... except that a Shot with a
+    # take keeps its render provenance, so it stays refused — the approval is not the only
+    # marker, and clearing it must not quietly hand a rendered Shot to an automated writer.
+    assert unapprove(client, project.id, "shot_one").status_code == 200
+    still = client.post(
+        FILL.format(project=project.id),
+        json={"message": "rewrite the wolf shot", "shot_ids": ["shot_one"]},
+    )
+    assert still.status_code == 422
+    assert EXPANSION_RENDERED_NOTICE.format(shots="SHOT 01 (shot_one)") in still.json()["detail"]
+
+
 def test_the_selection_is_the_scope_and_the_model_cannot_widen_it(tmp_path: Path):
     """The guard that stops tool-calling widening what the assistant can act *on*.
 
