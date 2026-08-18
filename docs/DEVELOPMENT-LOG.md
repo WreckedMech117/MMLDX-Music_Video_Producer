@@ -18,6 +18,20 @@ Closed under `spec-shot-mode-foundation.md` — the keystone the whole shot-mode
 - **Two shared test facilities were repaired**, both latent holes rather than new breakage. The stub DOM answered every *scoped* `querySelectorAll` with `[]`, so anything bound via `$$(sel, scope)` was bound to nothing and unreachable by any test — an entire class of frontend guarantee was untestable. And `run_module` decoded node's stdout with the Windows code page, mangling every typographic character the workspace draws.
 - **16 mutations, 16 caught**, all files restored under SHA-256. 637 passing, ruff clean, `node --check` clean, and `tests/e2e_shot_controls.py` green in a real browser with nothing submitted.
 
+## 2026-08-18 — The real song goes back over the picture, verified by correlation
+
+The audio-restore stage ran live on a take conditioned at 12–15.75 s. **Correlation +0.9945 at exactly lag 0.000 s** against the master's own 12–15.75 s, extracted independently of the application — against the ≈ 0.01-at-every-lag the take itself measures. The restored file is the master's seconds, not a regeneration.
+
+Three departures from the export were each validated by the same run:
+
+- **90 frames preserved.** The export's loader carries `format: "LTXV"`, which declares `frames: [8, 1]`. An H3 take sits on the **17k+5** grid — 90 frames for 3.75 s — and `8n+1` does not contain 90, so the picture would have been silently cut to 89 under audio that was not. Every restoration would have been a frame out of sync, in the same direction, forever. Uses `"None"`, and the pre-flight asserts **both** halves — that `"None"` conforms nothing *and* that `"LTXV"` still conforms something — so the check cannot pass vacuously.
+- **24 fps preserved.** The export's saver hardcodes `frame_rate: 25` against an H3 take's 24, a 4% speed-up over an unmodified soundtrack. Read from `VHS_VideoInfo` instead.
+- **The window landed at zero lag**, which is the shared `song_audio_window` doing its job. The builder takes no window parameter at all — only `start`, `duration` and `song_duration`, the three numbers `generate_h3` already passes — so there is no seam for a second computation to drift through.
+
+The take was untouched: `latest_output` still points at the H3 render, and the restored file is a sibling. Both the generated audio and the restored audio now exist side by side, which is the point — hearing "voices but no phonetics" is what found a real conditioning bug, and a pipeline that discards H3's own output discards its best diagnostic.
+
+One honest narrowing carried from the implementation: "the picture is copied through" is a **re-encode**, not a stream copy. ComfyUI has no stream-copy mux, so the take is decoded to tensors and re-encoded at the crf it was written with. No generative model, sampler, VAE or model file appears anywhere in the payload — the graph names **zero** model files — so the frozen "never re-encoded through a generative model" holds exactly, but bit-for-bit frames do not. A truly bit-identical video stream needs `ffmpeg -c:v copy`, which is not a thing a ComfyUI graph can express.
+
 ## 2026-08-18 — The first render with all three inputs correct
 
 Three variables were wrong at once, and a three-way comparison separates them. All three frames are the same shot, same seed, same turbo bundle, frame 45.
