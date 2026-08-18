@@ -209,3 +209,27 @@ def test_a_repeated_field_is_reported_rather_than_silently_overwritten() -> None
     assert not result.well_formed
     assert any("more than once" in problem.message for problem in result.fatal)
     assert result.fields[CORE_FIELDS[1]] == "Traffic hums."
+
+
+def test_fields_run_together_on_one_line_are_diagnosed_as_that() -> None:
+    """The first live run produced exactly this, and "missing" was the wrong word.
+
+    A local model asked for three fields each on its own line put all three on one.
+    They were present; the parser could not read them. Reporting that as *missing*
+    sends a reader hunting for something already in front of them, and the fix is a
+    line break rather than a rewrite — so the message has to say which it is.
+
+    The misleading half is also suppressed: a field diagnosed as inline is not then
+    also reported as missing by the sound-field check, because two contradictory
+    sentences about one field is worse than one accurate one.
+    """
+    one_line = (
+        f"{CORE_FIELDS[0]}: [Shot 1] A wolf walks. "
+        f"{CORE_FIELDS[1]}: Leaves crunch underfoot. "
+        f"{CORE_FIELDS[2]}: Cello in a minor key, swelling then receding."
+    )
+    result = check(one_line, duration=3.75)
+    assert not result.well_formed
+    messages = [problem.message for problem in result.problems]
+    assert all("appears mid-line" in message for message in messages), messages
+    assert not any("is missing" in message for message in messages), messages

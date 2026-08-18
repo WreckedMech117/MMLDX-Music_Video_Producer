@@ -120,12 +120,30 @@ def parse(prompt: str) -> ParsedPrompt:
     whether an instruction is *required* depends on the mode the caller asked for.
     """
     parsed = ParsedPrompt()
+    names = "|".join(CORE_FIELDS)
     labels = [(match.start(), match.group(1)) for match in
-              re.finditer(rf"^({'|'.join(CORE_FIELDS)})\s*:", prompt, re.MULTILINE)]
+              re.finditer(rf"^({names})\s*:", prompt, re.MULTILINE)]
+
+    # A label appearing mid-line is *present but unparseable*, and calling it "missing"
+    # would send a reader hunting for something already in front of them. A local model
+    # asked for three fields each on its own line will run them together on one — seen
+    # on the first live run — and the fix is a line break rather than a rewrite, so the
+    # message should say which it is.
+    inline = sorted(
+        {match.group(1) for match in re.finditer(rf"(?<!^)\b({names})\s*:", prompt,
+                                                 re.MULTILINE)}
+        - {name for _, name in labels}
+    )
+    for name in inline:
+        parsed.problems.append(Problem(
+            name, f"{name} appears mid-line; each field must start its own line."))
+
     if not labels:
         parsed.problems.append(
             Problem("prompt", "No core fields found; expected "
-                    f"{CORE_FIELDS[0]}, {CORE_FIELDS[1]} and {CORE_FIELDS[2]}.")
+                    f"{CORE_FIELDS[0]}, {CORE_FIELDS[1]} and {CORE_FIELDS[2]}."
+                    + (" They are present but run together on one line."
+                       if inline else ""))
         )
         parsed.instruction = prompt.strip()
         return parsed
@@ -215,10 +233,20 @@ def check_dialogue(description: str) -> list[Problem]:
     return problems
 
 
-def check_sound_fields(fields: dict[str, str]) -> list[Problem]:
-    """Sentence bounds on the two sound fields, with `N/A` exempt."""
+def check_sound_fields(
+    fields: dict[str, str], *, already_reported: frozenset[str] = frozenset()
+) -> list[Problem]:
+    """Sentence bounds on the two sound fields, with `N/A` exempt.
+
+    ``already_reported`` names fields whose absence from ``fields`` has a better
+    explanation elsewhere — currently one found mid-line. Reporting such a field as
+    *missing* on top of that would hand the reader two contradictory sentences about
+    the same field, and the wrong one is the more alarming.
+    """
     problems: list[Problem] = []
     for name, (low, high) in SENTENCE_BOUNDS.items():
+        if name not in fields and name in already_reported:
+            continue
         value = fields.get(name)
         if value is None:
             problems.append(Problem(name, f"{name} is missing."))
@@ -290,6 +318,9 @@ def check(prompt: str, *, duration: float | None = None,
     else:
         parsed.problems.extend(check_shots(description, duration=duration))
         parsed.problems.extend(check_dialogue(description))
-    parsed.problems.extend(check_sound_fields(parsed.fields))
+    reported = frozenset(problem.field for problem in parsed.problems)
+    parsed.problems.extend(
+        check_sound_fields(parsed.fields, already_reported=reported)
+    )
     parsed.problems.extend(check_retention(prompt))
     return parsed
