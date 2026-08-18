@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songImportDuration, songRefusalMessage, threadHtml } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, shotExpansionToast, shotInspectorReadiness, shotPromptCell, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -116,6 +116,16 @@ async function loadProject(id) {
   // name would name Shots that are not on screen and count a plan nobody is looking at.
   readinessReport = null;
   readinessLoadRevision += 1;
+  // Ahead of the no-project branch too, and for the same reason: the Song context editors are
+  // seeded from the project on screen, so a sheet left dirty from the project being left would
+  // otherwise stay in the boxes under the next project's name -- or under no project at all.
+  //
+  // Gated on the project actually changing, like the consent above it. Clearing the flag lets the
+  // renderAll below re-seed both boxes from the stored Song, and most callers here are refreshes of
+  // the project already on screen -- the queue refresh, both generate paths, multiview, the
+  // queue-ready loop -- where that silently deletes a sheet the Director is part-way through
+  // pasting. A real switch asks first, through unsavedWorkPending on the selector.
+  if (songContextSeedClearedOnLoad(state.project?.id, id)) state.songContextDirty = false;
   if (!id) {
     state.project = null;
     state.audioBuffer = null;
@@ -166,7 +176,12 @@ function renderAll() {
   renderReadiness();
 }
 
-function renderSong() {
+// Exported for the executed frontend contract: tests/test_frontend_contract.py boots this module
+// against a stub DOM and calls this, to prove the render path really seeds and enables the Song
+// context editors. `renderSongContext` is reached from here and from nowhere else, so a grep for
+// the call passes just as happily on a function nothing ever runs; the export lets a test run the
+// render and read what came out of it.
+export function renderSong() {
   const song = state.project?.song;
   const audio = $("#master-audio");
   const source = songAudioUrl(song);
@@ -191,12 +206,74 @@ function renderSong() {
   $("#remove-song").disabled = !song;
   $("#send-treatment").disabled = !song;
   $("#waveform-empty").style.display = state.audioBuffer ? "none" : "grid";
+  renderSongContext();
   const duration = song?.duration || 0;
   $("#quarter-time").textContent = duration ? formatTime(duration * .25).slice(0, 5) : "—";
   $("#half-time").textContent = duration ? formatTime(duration * .5).slice(0, 5) : "—";
   $("#three-quarter-time").textContent = duration ? formatTime(duration * .75).slice(0, 5) : "—";
   $("#end-time").textContent = duration ? formatTime(duration).slice(0, 5) : "—";
   if (state.audioBuffer) drawWaveform($("#waveform"), state.audioBuffer, "#d4f75e");
+}
+
+// The loaded song's lyric sheet and style description, seeded from the stored Song.
+//
+// Not seeded while the Director is typing into them. renderSong runs on far more than a project
+// load -- the audio element's `loadedmetadata` alone fires it -- and re-seeding then would silently
+// delete a lyric sheet mid-paste. The dirty flag is cleared by a project load and by a successful
+// save, which are exactly the two moments the stored text is the truth again.
+//
+// The controls follow the Song rather than the project: with no song loaded there is nothing to
+// describe and the route would 404, so the whole block is disabled instead of offering a save that
+// cannot land.
+function renderSongContext() {
+  const song = state.project?.song;
+  const editable = songContextEditable(state.project);
+  const lyrics = $("#song-lyrics");
+  const style = $("#song-style");
+  if (!state.songContextDirty) {
+    lyrics.value = song?.lyrics || "";
+    style.value = song?.caption || "";
+  }
+  lyrics.disabled = !editable;
+  style.disabled = !editable;
+  $("#save-song-context").disabled = !editable;
+  renderSongContextCounts();
+}
+
+// How much of its bound the text in each of the four song-context boxes uses, written where the
+// Director can read it before spending a click. The boxes carry no `maxlength` -- it truncated a
+// paste silently, so an oversized sheet was quietly shortened in the browser while the identical
+// text sent to the route came back as a 422 naming its length -- so this count and the route's
+// refusal are now the only two things that say anything about the bound, and they say the same
+// thing. Every decision is in `songContextCount`, which is executed without a browser.
+function renderSongContextCounts() {
+  for (const control of SONG_CONTEXT_COUNTS) {
+    const counted = songContextCount($(control.field).value, control.limit);
+    const element = $(control.count);
+    element.textContent = counted.label;
+    element.classList.toggle("over", counted.over);
+  }
+}
+
+async function saveSongContext() {
+  if (!requireProject()) return;
+  if (!state.project.song) return toast("This project has no song to describe yet.", "error");
+  // The same pure mapping the import uses, so the style box lands on `caption` in both places and
+  // one crossed assignment cannot exist on only one of the two paths.
+  const context = songContextFields($("#song-lyrics").value, $("#song-style").value);
+  // The route assigns both fields from the body, so a save with an empty box deletes what is
+  // stored -- and a Song, unlike the two creative documents, keeps no previous version to restore.
+  // Asked only for that: replacing existing text with nothing. Replacing it with different text is
+  // typing, and a question on every save teaches the Director to click through this one.
+  const cleared = songContextClearing(state.project.song, context);
+  if (cleared.length && !window.confirm(songContextClearingQuestion(cleared))) return;
+  try {
+    state.project = await api.saveSongContext(state.project.id, context);
+    // Cleared only after the server has answered: until then the text on screen is the only copy.
+    state.songContextDirty = false;
+    renderSong();
+    toast("Song context saved; the audio, its length and its provenance were not touched");
+  } catch (error) { toast(error.message, "error"); }
 }
 
 function songAudioUrl(song = state.project?.song) {
@@ -757,7 +834,10 @@ function bindEvents() {
   }));
   $("#project-select").addEventListener("change", async (event) => {
     const previousId = state.project?.id || "";
-    if (state.dirty && !window.confirm("Discard unsaved changes and switch projects?")) {
+    // Every kind of unsaved work, not only what the project save covers: the switch re-seeds the
+    // Song context editors from the project being loaded, so an unsaved lyric sheet is discarded
+    // here exactly as an unsaved document edit is, and it used to go without a question.
+    if (unsavedWorkPending(state) && !window.confirm(unsavedWorkQuestion("Discard unsaved changes and switch projects?", state))) {
       event.target.value = previousId;
       return;
     }
@@ -832,13 +912,34 @@ function bindEvents() {
     if (!change.proceed) return;
     const form = new FormData();
     form.append("file", file); form.append("title", $("#import-title").value || file.name);
+    // The import block's own two fields, never the Music 3 form's lyrics textarea: that one is
+    // generation input for a song being written, these describe a song that already exists.
+    const context = songContextFields($("#import-lyrics").value, $("#import-style").value);
+    form.append("lyrics", context.lyrics); form.append("caption", context.caption);
     // Only this file's own measurement counts. Anything decoded for another file --
     // or for the project's stored song -- is not this import's length.
     form.append("duration", songImportDuration(state.pendingImport?.file === file ? state.pendingImport : null));
     form.append("confirm_song_replacement", String(change.confirmed));
-    try { state.project = await api.uploadSong(state.project.id, form); state.pendingImport = null; renderAll(); toast("Song imported"); }
+    try {
+      state.project = await api.uploadSong(state.project.id, form);
+      state.pendingImport = null;
+      // The stored Song is now the truth about its own context, so the editors below re-seed from
+      // it, and the import boxes are emptied: a sheet left sitting in them would be sent again by
+      // the next import of a different track.
+      state.songContextDirty = false;
+      $("#import-lyrics").value = ""; $("#import-style").value = "";
+      renderAll();
+      toast("Song imported");
+    }
     catch (error) { await recoverFromSongRefusal(error); }
   });
+  $("#save-song-context").addEventListener("click", saveSongContext);
+  // Typing marks the editors dirty so no incidental re-render overwrites them; a landed save, an
+  // import, a removal and a load that actually changes project are the only things that clear it.
+  ["song-lyrics", "song-style"].forEach((id) => $("#" + id).addEventListener("input", () => { state.songContextDirty = true; }));
+  // Every bounded box keeps its own counter current, the import block's included: those two are not
+  // seeded from anything, so a render is not what puts a number under them.
+  SONG_CONTEXT_COUNTS.forEach((control) => $(control.field).addEventListener("input", renderSongContextCounts));
   $("#remove-song").addEventListener("click", async () => {
     if (!requireProject()) return;
     if (!state.project.song) return toast("This project has no song to remove.", "error");
@@ -850,6 +951,9 @@ function bindEvents() {
       // cannot reappear and be read as current.
       waveformLoadRevision += 1;
       state.audioBuffer = null;
+      // The song those two editors described is gone, so what is in them describes nothing; left
+      // dirty they would sit there disabled, showing context for a song this project no longer has.
+      state.songContextDirty = false;
       renderAll();
       toast("Song removed from the project; the audio file was left on disk");
     }
@@ -1060,7 +1164,9 @@ function bindEvents() {
     finally { renderJobs(); }
   });
   window.addEventListener("resize", () => { if (state.audioBuffer) { renderSong(); renderTimeline(); } });
-  window.addEventListener("beforeunload", (event) => { if (state.dirty) event.preventDefault(); });
+  // The same predicate the project switch asks: a tab closed on an unsaved lyric sheet loses it as
+  // completely as a project switch does, and the browser's own dialog is the only warning left.
+  window.addEventListener("beforeunload", (event) => { if (unsavedWorkPending(state)) event.preventDefault(); });
 }
 
 async function refreshJobs() {

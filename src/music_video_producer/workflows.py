@@ -193,6 +193,15 @@ H3_FRAME_RATE = 24
 H3_DIRECTOR_MAX_FRAMES = 10000
 H3_DIRECTOR_MAX_SECONDS = 1000.0
 
+#: The step count the text-only Director path uses when the request names none. This was
+#: ``H3Request.steps``'s own default until the reference path grew sampling profiles and
+#: that default had to become "unset" so an omitted count could fall through to the
+#: profile's. The number is unchanged, and this path is deliberately *not* offered a turbo
+#: profile: it loads a different checkpoint pair through ``MiniMaxH3DirectorCS``, the
+#: installed generic H3 turbo LoRAs are not the ``ref2v`` one, and nothing has been
+#: rendered live that way.
+H3_DIRECTOR_DEFAULT_STEPS = 20
+
 
 def _finite(name: str, value: float) -> float:
     """A window value ComfyUI could act on. ``inf`` and ``nan`` are neither.
@@ -214,11 +223,17 @@ def build_h3_director_payload(
     seed: int,
     width: int,
     height: int,
-    steps: int,
     prefix: str,
+    steps: int | None = None,
     start: float = 0,
 ) -> dict[str, dict[str, Any]]:
-    """Build the selected text-only H3 Director path with explicit loaders."""
+    """Build the selected text-only H3 Director path with explicit loaders.
+
+    ``steps`` left as ``None`` takes ``H3_DIRECTOR_DEFAULT_STEPS``, which is the number
+    ``H3Request`` defaulted to before the reference path grew sampling profiles. This
+    path is offered no profile: see that constant.
+    """
+    steps = H3_DIRECTOR_DEFAULT_STEPS if steps is None else steps
     _finite("Shot duration", duration)
     _finite("Shot start", start)
     # Every window literal this payload sends, against the maximum its node declares for it.
@@ -314,6 +329,120 @@ H3_SPLIT_OFFSETS = {
     "audio": H3_REFERENCE_LIMITS["picture"] + 2 * H3_REFERENCE_LIMITS["video"],
 }
 
+
+#: The range ``LoraLoaderModelOnly.strength_model`` declares. Outside it ComfyUI rejects
+#: the whole prompt at ``/prompt`` validation, which reaches the Director as an opaque 502
+#: after the submission round-trip — the same failure ``H3_REFERENCE_MAX_FRAMES`` exists to
+#: prevent, so it is named here for the same reason and compared against the live schema by
+#: ``tests/preflight_h3_ultra.py`` rather than being trusted as a literal.
+H3_LORA_STRENGTH_LIMITS = (-100.0, 100.0)
+
+
+@dataclass(frozen=True, slots=True)
+class H3SamplingProfile:
+    """One *whole* evidenced way to sample the H3 reference graph.
+
+    A profile is a bundle, not a set of independent knobs: the LoRA, the strength it
+    was applied at, the scheduler, the sampler and the step count were tuned together
+    by whoever rendered them, and each field here is copied from one source of
+    evidence. Mixing halves of two profiles produces a combination nobody has
+    rendered while looking exactly as trustworthy as one that has been, which is why
+    the adapter takes a profile name and never the individual values.
+
+    ``lora`` and ``lora_strength`` are both ``None`` on a profile that applies no
+    LoRA, and both set on one that does. A strength without a LoRA would read as
+    "applied at 0.0" — a third state that means nothing — so it is rejected here
+    rather than left to whoever adds the next profile.
+
+    Every field is checked here, where it is declared, rather than at the point a
+    payload is built. A profile with zero steps, an unnamed sampler or a strength
+    outside the node's range produces a graph ComfyUI refuses at ``/prompt``
+    validation — which the Director sees as an opaque 502 after the submission
+    round-trip, at the end of the one path where the profile is *supposed* to be the
+    trustworthy part. Failing at import, on the line that got it wrong, costs nothing.
+    """
+
+    lora: str | None
+    lora_strength: float | None
+    scheduler: str
+    sampler: str
+    steps: int
+
+    def __post_init__(self) -> None:
+        if (self.lora is None) != (self.lora_strength is None):
+            raise ValueError(
+                "An H3 sampling profile must name a LoRA and its strength together, "
+                f"not {self.lora!r} at {self.lora_strength!r}"
+            )
+        # `bool` is an `int` in Python and `steps=True` would sample once, silently.
+        if not isinstance(self.steps, int) or isinstance(self.steps, bool) or self.steps < 1:
+            raise ValueError(
+                f"An H3 sampling profile must sample at least one step, not {self.steps!r}"
+            )
+        for name, value in (("scheduler", self.scheduler), ("sampler", self.sampler)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"An H3 sampling profile's {name} must be named, not {value!r}"
+                )
+        if self.lora is None:
+            return
+        if not isinstance(self.lora, str) or not self.lora.strip():
+            raise ValueError(
+                f"An H3 sampling profile's LoRA must be a filename, not {self.lora!r}"
+            )
+        minimum, maximum = H3_LORA_STRENGTH_LIMITS
+        if (
+            not isinstance(self.lora_strength, (int, float))
+            or isinstance(self.lora_strength, bool)
+            or not math.isfinite(self.lora_strength)
+            or not minimum <= self.lora_strength <= maximum
+        ):
+            raise ValueError(
+                f"An H3 sampling profile's LoRA strength must be between {minimum:g} and "
+                f"{maximum:g}, not {self.lora_strength!r}"
+            )
+
+
+#: The two configurations that have evidence behind them, each reproduced in full.
+#:
+#: ``default`` is the audited export
+#: ``workflow_templates/reference_exports/h3-ultra-references-user-export.json``: node
+#: ``2382`` schedules ``simple`` at 20 steps, node ``2388`` selects ``res_multistep``,
+#: and its ``Power Lora Loader (rgthree)`` (node ``2383``) holds a turbo LoRA with
+#: ``"on": false``. That off-switch is deliberate and is the whole reason this profile
+#: applies no LoRA — the export is a 20-step graph that was rendered without one.
+#:
+#: ``turbo`` is the Director's own H3 stage in
+#: ``…/user/default/workflows/Video/Music Video Advanced/04 - H3 Music Video - LTX 2.5
+#: READY.json``: node ``5959`` (``LoraLoaderModelOnly``) applies
+#: ``minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors`` at 0.7 between the
+#: ``ref2va`` UNET loader (node ``127``) and the sigma shift (node ``5960``), node
+#: ``124`` schedules ``beta`` at 4 steps and node ``123`` selects ``euler``. That LoRA
+#: is trained for the ``ref2v`` checkpoint this adapter already loads.
+#:
+#: Only the bundles are proven. Neither the LoRA on its own nor either scheduler paired
+#: with the other profile's sampler has been rendered by anyone here.
+H3_REFERENCE_PROFILES: dict[str, H3SamplingProfile] = {
+    "default": H3SamplingProfile(
+        lora=None,
+        lora_strength=None,
+        scheduler="simple",
+        sampler="res_multistep",
+        steps=20,
+    ),
+    "turbo": H3SamplingProfile(
+        lora="minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        lora_strength=0.7,
+        scheduler="beta",
+        sampler="euler",
+        steps=4,
+    ),
+}
+
+#: The profile a caller that names none gets: today's graph, unchanged.
+H3_DEFAULT_PROFILE = "default"
+
+
 #: The frame ceiling ``MiniMaxH3ReferenceToVideo.length`` declares (about 150 s at 24 fps).
 #: Above it ComfyUI rejects the whole prompt at ``/prompt`` validation with
 #: ``value_bigger_than_max``, which reaches the Director as an opaque 502 after the submission
@@ -328,12 +457,37 @@ def build_h3_reference_payload(
     duration: float,
     width: int,
     height: int,
-    steps: int,
     seed: int,
     prefix: str,
+    steps: int | None = None,
     ref_image_size: str = "match",
+    profile: str = H3_DEFAULT_PROFILE,
 ) -> dict[str, dict[str, Any]]:
-    """Build the audited H3 Ultra references-to-video path."""
+    """Build the H3 Ultra references-to-video path in one of its evidenced profiles.
+
+    ``profile`` selects a whole configuration from ``H3_REFERENCE_PROFILES`` — LoRA,
+    strength, scheduler, sampler and step default together. The default profile emits
+    exactly the graph this builder emitted before profiles existed; the turbo profile
+    inserts the Director's ``LoraLoaderModelOnly`` between ``mvp:model`` and
+    ``mvp:shift`` so everything downstream draws from the LoRA rather than the loader.
+
+    ``steps`` left as ``None`` takes the profile's own count — the number its evidence
+    was rendered at. A count supplied here overrides it: the profile chooses the graph,
+    the Director chooses the effort.
+    """
+    # Before anything else in this function, so an unknown profile is refused before a
+    # payload is built rather than after the references validate. The type is checked as
+    # well as the membership: a caller that is not the route — a script, a test, a future
+    # batch path — can pass an unhashable value, and `profile in {...}` would raise
+    # `TypeError`, which the route's `except ValueError` does not translate. That escapes
+    # as a 500 instead of the 422 every other bad input here gets.
+    if not isinstance(profile, str) or profile not in H3_REFERENCE_PROFILES:
+        raise ValueError(
+            f"Unknown H3 sampling profile: {profile!r}; the profiles are "
+            f"{', '.join(sorted(H3_REFERENCE_PROFILES))}"
+        )
+    sampling = H3_REFERENCE_PROFILES[profile]
+    sampled_steps = sampling.steps if steps is None else steps
     counts = {
         kind: sum(1 for item in references if item.get("kind") == kind)
         for kind in H3_REFERENCE_LIMITS
@@ -398,9 +552,29 @@ def build_h3_reference_payload(
             audio_index += 1
         else:
             raise ValueError(f"Unsupported H3 reference kind: {kind}")
+    # Every node downstream of the loader reads this one name, so a profile that inserts
+    # a LoRA moves the whole graph onto it rather than leaving a node behind on the
+    # unpatched model — which would silently sample half-adapted.
+    model_source = ["mvp:model", 0] if sampling.lora is None else ["mvp:lora", 0]
     return {
         "mvp:model": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
-        "mvp:shift": {"class_type": "MiniMaxH3SigmaShift", "inputs": {"model": ["mvp:model", 0], "shift_video": 12, "shift_audio": 3}},
+        # Absent entirely on a profile with no LoRA: an unpacked empty mapping adds no
+        # key, so the default profile's payload is what it always was, byte for byte.
+        **(
+            {}
+            if sampling.lora is None
+            else {
+                "mvp:lora": {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {
+                        "model": ["mvp:model", 0],
+                        "lora_name": sampling.lora,
+                        "strength_model": sampling.lora_strength,
+                    },
+                }
+            }
+        ),
+        "mvp:shift": {"class_type": "MiniMaxH3SigmaShift", "inputs": {"model": model_source, "shift_video": 12, "shift_audio": 3}},
         "mvp:attention": {"class_type": "PathchSageAttentionKJ", "inputs": {"model": ["mvp:shift", 0], "sage_attention": "disabled", "allow_compile": False}},
         "mvp:preview": {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": ["mvp:attention", 0], "max_resolution": 1024, "jpeg_quality": 80, "suppress_default_preview": True, "preview_frames": 12, "preview_fps": 12}},
         "mvp:clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
@@ -409,8 +583,8 @@ def build_h3_reference_payload(
         "mvp:references": {"class_type": "MiniMaxH3MediaLoader", "inputs": {"media_state": media_state}},
         "mvp:split": {"class_type": "MiniMaxH3ReferenceSplitter", "inputs": {"references": ["mvp:references", 0]}},
         "mvp:condition": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": condition_inputs},
-        "mvp:sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
-        "mvp:scheduler": {"class_type": "BasicScheduler", "inputs": {"model": ["mvp:preview", 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
+        "mvp:sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampling.sampler}},
+        "mvp:scheduler": {"class_type": "BasicScheduler", "inputs": {"model": ["mvp:preview", 0], "scheduler": sampling.scheduler, "steps": sampled_steps, "denoise": 1.0}},
         "mvp:noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
         "mvp:guider": {"class_type": "BasicGuider", "inputs": {"model": ["mvp:preview", 0], "conditioning": ["mvp:condition", 0]}},
         "mvp:sample": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["mvp:noise", 0], "guider": ["mvp:guider", 0], "sampler": ["mvp:sampler", 0], "sigmas": ["mvp:scheduler", 0], "latent_image": ["mvp:condition", 1]}},

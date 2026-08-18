@@ -22,8 +22,12 @@ from music_video_producer.app import (
     SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
     SHOT_PLAN_EMPTY_NOTICE,
     SHOT_WINDOW_NOTICE,
+    SONG_CAPTION_LIMIT,
+    SONG_CONTEXT_WITHOUT_SONG,
+    SONG_LYRICS_LIMIT,
     DirectorRequest,
     DocumentName,
+    SongContextRequest,
     create_app,
     document_change_notice,
     document_first_draft_notice,
@@ -247,6 +251,343 @@ def test_song_upload_stores_zero_when_ffprobe_cannot_run(tmp_path: Path, monkeyp
     assert response.status_code == 200
     assert response.json()["song"]["duration"] == 0
     assert ProjectStore(tmp_path).get(project.id).song.duration == 0
+
+
+# A lyric sheet with the three things a real one has and nothing here may touch: section tags,
+# interior blank lines, and indentation. Written for this suite rather than taken from a real
+# song — a copyrighted sheet is not test data, and nothing here depends on the words.
+IMPORTED_LYRIC_SHEET = (
+    "[Verse 1]\n"
+    "Cold rail, the platform hums\n"
+    "\n"
+    "    a paper cup goes over the edge\n"
+    "\n"
+    "[Chorus]\n"
+    "Hold the line, hold the line\n"
+    "\n"
+    "[Bridge]\n"
+    "    counting sodium lights"
+)
+IMPORTED_SONG_STYLE = "Downtempo industrial pop, close female vocal, tape saturation, no live drums."
+
+
+def import_song(
+    client: TestClient,
+    project_id: str,
+    *,
+    title: str = "Imported master",
+    filename: str = "master.wav",
+    **context: str,
+):
+    """One import, carrying whatever song context the caller passes and nothing it does not.
+
+    `context` is spread into the form rather than defaulted to `""`, so a test asking for "an
+    import that carries neither field" really sends no such field — which is the only way to
+    prove an import written before these fields existed behaves exactly as it did.
+    """
+    return client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": title, "duration": "12.5", **context},
+        files={"file": (filename, wav_bytes(0.5), "audio/wav")},
+    )
+
+
+def test_an_import_carries_its_lyric_sheet_and_style_onto_the_song(tmp_path: Path):
+    """The gap itself: an imported Song can finally say what it is.
+
+    Re-read through a fresh ProjectStore, because the response body is the in-memory object the
+    handler just built and the claim is that the manifest carries it.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Context on import"))
+
+    response = import_song(
+        client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE
+    )
+
+    assert response.status_code == 200
+    song = response.json()["song"]
+    assert song["lyrics"] == IMPORTED_LYRIC_SHEET
+    assert song["caption"] == IMPORTED_SONG_STYLE
+    restarted = ProjectStore(tmp_path).get(project.id).song
+    assert restarted.lyrics == IMPORTED_LYRIC_SHEET
+    assert restarted.caption == IMPORTED_SONG_STYLE
+    # The import is otherwise exactly the import it always was.
+    assert restarted.source == "imported"
+    assert restarted.duration == 12.5
+    assert restarted.path.endswith("master.wav")
+    assert restarted.prompt_id == ""
+
+
+def test_an_import_carrying_neither_field_behaves_exactly_as_it_did(tmp_path: Path):
+    """Both fields are optional, and "optional" means the form key is absent, not empty."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="No context"))
+
+    response = import_song(client, project.id)
+
+    assert response.status_code == 200
+    assert response.json()["song"]["lyrics"] == ""
+    assert response.json()["song"]["caption"] == ""
+    stored = ProjectStore(tmp_path).get(project.id).song
+    assert stored.lyrics == ""
+    assert stored.caption == ""
+    assert stored.duration == 12.5
+
+
+@pytest.mark.parametrize("field", ["lyrics", "caption"])
+def test_one_song_context_field_alone_leaves_the_other_empty(tmp_path: Path, field: str):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name=f"Only {field}"))
+    other = "caption" if field == "lyrics" else "lyrics"
+
+    response = import_song(client, project.id, **{field: "Supplied on its own."})
+
+    assert response.status_code == 200
+    assert response.json()["song"][field] == "Supplied on its own."
+    assert response.json()["song"][other] == ""
+
+
+def test_interior_lyric_structure_survives_the_import_exactly(tmp_path: Path):
+    """Only leading and trailing whitespace goes.
+
+    The section tags, the blank lines between verses and the indentation are the structure of the
+    sheet, and this is the same contract the known-lyrics generation path already keeps. Asserted
+    as equality against the original string rather than by substring, because "the tags are still
+    in there somewhere" is exactly what a reflow would also satisfy.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Interior structure"))
+
+    response = import_song(
+        client,
+        project.id,
+        lyrics=f"\n\n  {IMPORTED_LYRIC_SHEET}  \n\t\n",
+        caption=f"  {IMPORTED_SONG_STYLE}\n",
+    )
+
+    assert response.status_code == 200
+    stored = ProjectStore(tmp_path).get(project.id).song
+    assert stored.lyrics == IMPORTED_LYRIC_SHEET
+    assert stored.caption == IMPORTED_SONG_STYLE
+    # Said again as the thing that actually matters, so a future "tidy the sheet" cannot pass by
+    # trimming every line and still matching some looser assertion.
+    assert "\n\n" in stored.lyrics
+    assert "\n    counting sodium lights" in stored.lyrics
+
+
+def test_whitespace_only_song_context_is_stored_as_absent(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Blank context"))
+
+    response = import_song(client, project.id, lyrics="   \n\t\n  ", caption="\n\n")
+
+    assert response.status_code == 200
+    assert response.json()["song"]["lyrics"] == ""
+    assert response.json()["song"]["caption"] == ""
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"), [("lyrics", SONG_LYRICS_LIMIT), ("caption", SONG_CAPTION_LIMIT)]
+)
+def test_an_oversized_field_is_refused_before_any_audio_is_written(
+    tmp_path: Path, field: str, limit: int
+):
+    """422 with a plain message, and a refusal that wrote nothing.
+
+    The check sits ahead of the copy for the same reason the replacement gate does: a refusal that
+    has already written a file and left the project's Song half-replaced is not a refusal. The
+    ceiling itself is asserted from the constant, so the bound is one number rather than two.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = Project(name="Oversized")
+    project.song = Song(
+        title="Previous song", source="imported", path="media/songs/previous.wav", duration=187.5
+    )
+    store.create(project)
+
+    response = import_song(client, project.id, **{field: "x" * (limit + 1)})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert str(limit) in detail
+    assert str(limit + 1) in detail
+    # A plain sentence, not a validation-error blob.
+    assert isinstance(detail, str)
+    stored = ProjectStore(tmp_path).get(project.id)
+    assert stored.song.title == "Previous song"
+    assert stored.song.duration == 187.5
+    assert not list((store.media_dir(project.id) / "songs").glob("*"))
+
+    # Exactly the limit is accepted, so the bound is a bound rather than an off-by-one.
+    accepted = import_song(client, project.id, **{field: "x" * limit})
+    assert accepted.status_code == 200
+    assert accepted.json()["song"][field] == "x" * limit
+
+
+def test_song_context_can_be_corrected_after_the_import(tmp_path: Path):
+    """A Director who imported yesterday is not made to re-import to say what the song is.
+
+    The audio, its measured length and its provenance are the things this must not touch, so they
+    are compared field by field against what the import wrote — and the file itself is still on
+    disk afterwards.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Corrected later"))
+    import_song(client, project.id)
+    imported = ProjectStore(tmp_path).get(project.id).song
+    audio = store.project_dir(project.id) / imported.path
+
+    response = client.put(
+        f"/api/projects/{project.id}/song/context",
+        json={"lyrics": f"\n{IMPORTED_LYRIC_SHEET}\n ", "caption": IMPORTED_SONG_STYLE},
+    )
+
+    assert response.status_code == 200
+    corrected = ProjectStore(tmp_path).get(project.id).song
+    assert corrected.lyrics == IMPORTED_LYRIC_SHEET
+    assert corrected.caption == IMPORTED_SONG_STYLE
+    assert corrected.path == imported.path
+    assert corrected.duration == imported.duration
+    assert corrected.source == imported.source
+    assert corrected.prompt_id == imported.prompt_id
+    assert corrected.title == imported.title
+    assert audio.is_file()
+
+
+def test_song_context_can_be_cleared_and_is_bounded_on_the_edit_too(tmp_path: Path):
+    """Clearing a wrong sheet has to be possible, and the edit's ceiling is the import's.
+
+    The oversized case also proves the two assignments are not half-applied: `lyrics` is valid and
+    `caption` is not, and neither reaches the stored Song.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Cleared"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+
+    refused = client.put(
+        f"/api/projects/{project.id}/song/context",
+        json={"lyrics": "A replacement sheet.", "caption": "y" * (SONG_CAPTION_LIMIT + 1)},
+    )
+    assert refused.status_code == 422
+    unchanged = ProjectStore(tmp_path).get(project.id).song
+    assert unchanged.lyrics == IMPORTED_LYRIC_SHEET
+    assert unchanged.caption == IMPORTED_SONG_STYLE
+
+    cleared = client.put(f"/api/projects/{project.id}/song/context", json={"lyrics": "  "})
+    assert cleared.status_code == 200
+    emptied = ProjectStore(tmp_path).get(project.id).song
+    assert emptied.lyrics == ""
+    assert emptied.caption == ""
+    assert emptied.duration == 12.5
+
+
+def test_song_context_edit_without_a_song_is_refused_and_says_what_to_do(tmp_path: Path):
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Songless"))
+
+    response = client.put(
+        f"/api/projects/{project.id}/song/context", json={"lyrics": IMPORTED_LYRIC_SHEET}
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == SONG_CONTEXT_WITHOUT_SONG
+    assert ProjectStore(tmp_path).get(project.id).song is None
+
+
+def test_the_edit_route_cannot_carry_audio_duration_or_provenance(tmp_path: Path):
+    """The audio is not editable text, so nothing that could overwrite it is on the wire.
+
+    A body inventing a path or a duration is ignored rather than honoured — the route binds a model
+    with exactly two fields, and the Song it writes to is the stored one rather than a rebuilt one.
+    """
+    assert set(SongContextRequest.model_fields) == {"lyrics", "caption"}
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="No smuggling"))
+    import_song(client, project.id)
+
+    response = client.put(
+        f"/api/projects/{project.id}/song/context",
+        json={
+            "lyrics": "The words.",
+            "caption": "The sound.",
+            "path": "media/songs/somewhere-else.wav",
+            "duration": 999,
+            "source": "generated",
+            "prompt_id": "p-forged",
+            "title": "Renamed",
+        },
+    )
+
+    assert response.status_code == 200
+    stored = ProjectStore(tmp_path).get(project.id).song
+    assert stored.lyrics == "The words."
+    assert stored.path.endswith("master.wav")
+    assert stored.duration == 12.5
+    assert stored.source == "imported"
+    assert stored.prompt_id == ""
+    assert stored.title == "Imported master"
+
+
+def test_a_generated_song_still_writes_its_own_context(tmp_path: Path):
+    """Neither generation path is touched by this change: they already set both fields."""
+    client, store, _ = make_client(tmp_path)
+    music = store.create(Project(name="Direct Music 3"))
+    planner = store.create(Project(name="SongPlanner"))
+
+    client.post(
+        f"/api/projects/{music.id}/generate/music",
+        json={
+            "title": "Night Wire",
+            "caption": "industrial synth rock",
+            "lyrics": IMPORTED_LYRIC_SHEET,
+            "duration": 8,
+            "seed": 9,
+        },
+    )
+    client.post(
+        f"/api/projects/{planner.id}/generate/songplanner",
+        json={
+            "title": "Night Wire (Cover)",
+            "idea": "faithful synthwave cover",
+            "lyrics": IMPORTED_LYRIC_SHEET,
+            "duration": 90,
+            "seed": 3,
+        },
+    )
+
+    generated = store.get(music.id).song
+    assert generated.source == "generated"
+    assert generated.lyrics == IMPORTED_LYRIC_SHEET
+    assert generated.caption == "industrial synth rock"
+    assert generated.prompt_id == "p-101"
+    covered = store.get(planner.id).song
+    assert covered.lyrics == IMPORTED_LYRIC_SHEET
+    assert covered.caption == "faithful synthwave cover"
+
+
+def test_a_song_saved_before_this_change_loads_with_both_fields_empty(tmp_path: Path):
+    """A manifest whose Song predates these fields carrying any value at all.
+
+    Written by removing the keys from a real manifest rather than by constructing a `Song`, because
+    the claim is about JSON on disk: `Song` would supply the defaults itself and prove nothing.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Older manifest"))
+    import_song(client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE)
+    manifest = store.manifest_path(project.id)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    del payload["song"]["lyrics"]
+    del payload["song"]["caption"]
+    manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    response = client.get(f"/api/projects/{project.id}")
+
+    assert response.status_code == 200
+    assert response.json()["song"]["lyrics"] == ""
+    assert response.json()["song"]["caption"] == ""
+    assert response.json()["song"]["duration"] == 12.5
+    assert ProjectStore(tmp_path).get(project.id).song.lyrics == ""
 
 
 def test_uploads_enforce_size_and_asset_type_limits(tmp_path: Path):
@@ -2108,6 +2449,48 @@ def test_director_context_excludes_every_recovery_slot(tmp_path: Path):
         # text, and a boolean saying a document is off-limits is useful direction.
         assert context[field] == getattr(project, field), field
         assert context[f"{field}_locked"] is False, field
+
+
+def test_an_imported_songs_lyrics_and_style_reach_the_directors_context(tmp_path: Path):
+    """The entire reason for storing them, asserted against what the model was actually handed.
+
+    Not against the stored project: that a field is on the Song proves only that it was saved, and
+    the claim is that it reaches the prompt. `DIRECTOR_CONTEXT_EXCLUDE` strips whole keys, so a
+    later exclusion added for the song — or for a field beside it — would silently take this away
+    with every Song assertion in the suite still green. The recording double is the only witness.
+
+    Both are read out of the dump *and* out of its serialisation, because the dump is what is
+    encoded into the prompt: a lyric sheet present as a key but empty would satisfy the first check
+    alone.
+    """
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="Song context reaches the model"))
+    import_song(
+        client, project.id, lyrics=IMPORTED_LYRIC_SHEET, caption=IMPORTED_SONG_STYLE
+    )
+
+    client.post(
+        f"/api/projects/{project.id}/director/chat", json={"message": "What is this song about?"}
+    )
+
+    context = director.contexts[0]
+    assert context["song"]["lyrics"] == IMPORTED_LYRIC_SHEET
+    assert context["song"]["caption"] == IMPORTED_SONG_STYLE
+    serialised = json.dumps(context)
+    assert "counting sodium lights" in serialised
+    assert "tape saturation" in serialised
+    # Nothing about the song is excluded from the dump, and that is what makes the two fields above
+    # arrive without any further work. Asserted as the rule rather than only as its consequence.
+    assert "song" not in DIRECTOR_CONTEXT_EXCLUDE
+    # The same holds after a correction: the edit route is the other door into the same fields.
+    client.put(
+        f"/api/projects/{project.id}/song/context",
+        json={"lyrics": "Corrected words only.", "caption": "Corrected sound only."},
+    )
+    client.post(f"/api/projects/{project.id}/director/chat", json={"message": "And now?"})
+    assert director.contexts[1]["song"]["lyrics"] == "Corrected words only."
+    assert director.contexts[1]["song"]["caption"] == "Corrected sound only."
 
 
 def test_document_mapping_field_names_and_context_exclusion_cannot_drift():
@@ -4498,3 +4881,221 @@ def test_h3_payload_uses_grid_aligned_frame_count(tmp_path: Path):
     inputs = comfy.prompts[-1]["2343"]["inputs"]
     assert inputs["duration_frames"] == 107
     assert (inputs["duration_frames"] - 5) % 17 == 0
+
+
+# --- H3 sampling profiles at the route -------------------------------------------------
+#
+# The builder owns which graph each profile emits (`tests/test_workflows.py`); these own
+# the half between the Director and the builder: the profile reaches it, an unknown one
+# never gets that far, and an explicit step count still wins.
+#
+# `H3Request` and the profile table are imported here rather than at the top of the file
+# to keep this block self-contained.
+
+
+def h3_reference_project(client, store, tmp_path: Path) -> tuple[str, str]:
+    """A project with one ready reference Shot, returned as `(project id, shot id)`."""
+    project = store.create(Project(name="Profiles"))
+    lead = upload_asset(client, project.id, "Lead vocalist", "character", "lead.png")
+    return project.id, reference_shot(store, project.id, asset_ids=[lead["id"]])
+
+
+def rearm_shot(store, project_id: str, shot_id: str) -> None:
+    """Put a submitted Shot back to `ready` so the same one can be submitted again.
+
+    A successful submission sets `queued`, and the route refuses anything but `ready`.
+    These tests deliberately submit *one* Shot under several profiles: two graphs built
+    from the same Shot are comparable, two built from two Shots differ by their ids.
+    """
+    project = store.get(project_id)
+    shot = next(item for item in project.shots if item.id == shot_id)
+    shot.status = "ready"
+    shot.prompt_id = ""
+    store.save(project)
+
+
+def test_the_h3_profile_reaches_the_builder(tmp_path: Path):
+    """The turbo profile submitted is the turbo graph, LoRA and all.
+
+    Asserting the submitted payload rather than a mocked call, because the route's job is
+    to put the Director's choice into the graph that ComfyUI receives — a profile that
+    reached the builder and was then dropped would satisfy anything weaker.
+    """
+    from music_video_producer.workflows import H3_REFERENCE_PROFILES
+
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+    profile = H3_REFERENCE_PROFILES["turbo"]
+
+    assert submit_h3(client, project_id, shot_id, profile="turbo").status_code == 202
+
+    payload = comfy.prompts[-1]
+    assert payload["mvp:lora"]["inputs"]["lora_name"] == profile.lora
+    assert payload["mvp:lora"]["inputs"]["strength_model"] == profile.lora_strength
+    assert payload["mvp:shift"]["inputs"]["model"] == ["mvp:lora", 0]
+    assert payload["mvp:scheduler"]["inputs"]["scheduler"] == profile.scheduler
+    assert payload["mvp:scheduler"]["inputs"]["steps"] == profile.steps
+    assert payload["mvp:sampler"]["inputs"]["sampler_name"] == profile.sampler
+
+
+def test_an_omitted_h3_profile_submits_the_default_graph(tmp_path: Path):
+    """The existing caller's payload, unchanged: no LoRA, `simple`/`res_multistep`, 20 steps.
+
+    This is the route half of the story's central promise. A body of `{}` is what every
+    shipped client sends today.
+    """
+    from music_video_producer.workflows import H3_REFERENCE_PROFILES
+
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+    profile = H3_REFERENCE_PROFILES["default"]
+
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+
+    payload = comfy.prompts[-1]
+    assert all(node["class_type"] != "LoraLoaderModelOnly" for node in payload.values())
+    assert payload["mvp:shift"]["inputs"]["model"] == ["mvp:model", 0]
+    assert payload["mvp:scheduler"]["inputs"]["scheduler"] == profile.scheduler
+    assert payload["mvp:scheduler"]["inputs"]["steps"] == profile.steps == 20
+    assert payload["mvp:sampler"]["inputs"]["sampler_name"] == profile.sampler
+    # Naming the default explicitly submits the same graph as omitting it.
+    rearm_shot(store, project_id, shot_id)
+    assert submit_h3(client, project_id, shot_id, profile="default").status_code == 202
+    assert comfy.prompts[-1] == payload
+
+
+def test_an_unknown_h3_profile_is_refused_before_any_submission(tmp_path: Path):
+    """422 from validation, and nothing queued.
+
+    "Nothing queued" is the assertion that matters: a profile rejected after the payload
+    reached ComfyUI would still have cost GPU minutes for a render nobody asked for.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+
+    for unknown in ("fast", "TURBO", "turbo ", "", None, 4):
+        response = submit_h3(client, project_id, shot_id, profile=unknown)
+        assert response.status_code == 422, (unknown, response.text)
+        # A *list* detail is FastAPI's request-validation shape; the builder's own refusal
+        # arrives as a string. Asserting the list is what pins "refused before a payload is
+        # built" rather than "refused somewhere on the way to ComfyUI" — widening the field
+        # to a plain `str` would still 422 through the builder and satisfy anything weaker.
+        assert isinstance(response.json()["detail"], list), (unknown, response.text)
+    assert comfy.prompts == []
+
+
+def test_an_explicit_step_count_overrides_the_h3_profile_default(tmp_path: Path):
+    """The profile chooses the graph; the Director chooses the effort.
+
+    Both profiles, because "explicit steps win" is only interesting where the profile has
+    an opinion — and a route that honoured the override on one profile and not the other
+    would be the harder bug to see.
+    """
+    from music_video_producer.workflows import H3_REFERENCE_PROFILES
+
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+
+    for name, profile in H3_REFERENCE_PROFILES.items():
+        rearm_shot(store, project_id, shot_id)
+        assert submit_h3(client, project_id, shot_id, profile=name, steps=12).status_code == 202
+        assert comfy.prompts[-1]["mvp:scheduler"]["inputs"]["steps"] == 12, name
+        # The override changes the effort and nothing else the profile decided.
+        assert comfy.prompts[-1]["mvp:scheduler"]["inputs"]["scheduler"] == profile.scheduler
+        assert ("mvp:lora" in comfy.prompts[-1]) is (profile.lora is not None), name
+
+        rearm_shot(store, project_id, shot_id)
+        assert submit_h3(client, project_id, shot_id, profile=name).status_code == 202
+        assert comfy.prompts[-1]["mvp:scheduler"]["inputs"]["steps"] == profile.steps, name
+
+
+def test_the_text_only_h3_path_keeps_its_step_default_without_a_profile(tmp_path: Path):
+    """`H3Request.steps` became optional; the Director graph must not have lost its 20.
+
+    That path takes no profile — different checkpoint pair, no live evidence for a turbo
+    bundle — so an omitted count has to keep meaning what it meant before profiles
+    existed, rather than falling through to `None` or to a reference profile's number.
+    """
+    from music_video_producer.workflows import H3_DIRECTOR_DEFAULT_STEPS
+
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Text only"))
+    project.shots = [Shot(start=0, duration=5, prompt="A singer", mode="text", status="ready")]
+    store.save(project)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    payload = comfy.prompts[-1]
+    assert payload["2346"]["inputs"]["steps"] == H3_DIRECTOR_DEFAULT_STEPS == 20
+    assert all(node["class_type"] != "LoraLoaderModelOnly" for node in payload.values())
+    # An explicit count still reaches it.
+    rearm_shot(store, project.id, project.shots[0].id)
+    assert submit_h3(client, project.id, project.shots[0].id, steps=7).status_code == 202
+    assert comfy.prompts[-1]["2346"]["inputs"]["steps"] == 7
+
+
+def test_the_route_offers_every_profile_the_builder_defines(tmp_path: Path):
+    """The `Literal` and the profile table must not drift apart.
+
+    A profile added to `H3_REFERENCE_PROFILES` and not offered here is unreachable per
+    render — the story's whole point — and a name offered here that the builder does not
+    know would be a 500 on submission instead of a 422 on validation.
+    """
+    from music_video_producer.app import H3Request
+    from music_video_producer.workflows import H3_DEFAULT_PROFILE, H3_REFERENCE_PROFILES
+
+    offered = set(get_args(H3Request.model_fields["profile"].annotation))
+
+    assert offered == set(H3_REFERENCE_PROFILES)
+    assert H3Request().profile == H3_DEFAULT_PROFILE
+    assert H3Request().steps is None
+
+
+def test_a_profile_on_a_text_only_shot_is_refused_rather_than_ignored(tmp_path: Path):
+    """The field is on the request model *both* branches bind, and only one honours it.
+
+    Before this refusal, `{"profile": "turbo"}` on a Shot with no references returned 202
+    and rendered the 20-step no-LoRA Director graph — a full-price GPU job, logged under a
+    configuration that was never applied and indistinguishable afterwards from a default
+    render. Nothing recorded that the request was not honoured, which is the part that
+    makes it worse than a refusal: only the refusal is visible.
+
+    Refused rather than accepted-and-proven-inert, because the Director asking for turbo
+    on a text-only Shot is asking for something this project has no evidence for — a
+    different checkpoint pair through `MiniMaxH3DirectorCS` and a LoRA that is not the
+    `ref2v` one. Saying so costs nothing; rendering the wrong thing costs GPU minutes.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Text only profile"))
+    project.shots = [Shot(start=0, duration=5, prompt="A singer", mode="text", status="ready")]
+    store.save(project)
+    shot_id = project.shots[0].id
+
+    response = submit_h3(client, project.id, shot_id, profile="turbo")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    # The builder's/route's own refusal, not a validation error: `turbo` is a real profile,
+    # so the message has to explain *why it does not apply here* rather than list options.
+    assert isinstance(detail, str), detail
+    assert "reference shots only" in detail and "turbo" in detail
+    # Named as the timeline names it, like every other refusal on this route.
+    from music_video_producer.batch import shot_label
+
+    saved = store.get(project.id)
+    assert shot_label(saved, saved.shots[0]) in detail
+    assert comfy.prompts == []
+    # The same Shot still renders when the profile is dropped or explicitly default, so
+    # the refusal is about the profile and not about the Shot.
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    rearm_shot(store, project.id, shot_id)
+    assert submit_h3(client, project.id, shot_id, profile="default").status_code == 202
+    assert len(comfy.prompts) == 2
+    assert all("2343" in payload for payload in comfy.prompts)
+
+    # And attaching a reference makes the very same profile submittable, which is the line
+    # the refusal is actually drawn on.
+    lead = upload_asset(client, project.id, "Lead vocalist", "character", "lead.png")
+    reference_id = reference_shot(store, project.id, asset_ids=[lead["id"]])
+    assert submit_h3(client, project.id, reference_id, profile="turbo").status_code == 202
+    assert "mvp:lora" in comfy.prompts[-1]

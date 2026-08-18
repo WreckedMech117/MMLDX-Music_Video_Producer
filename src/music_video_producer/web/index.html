@@ -56,6 +56,21 @@
                 <span>or choose an audio file</span>
               </label>
               <label>Title<input id="import-title" autocomplete="off" placeholder="Track title"></label>
+              <!-- The import's own context fields, and deliberately NOT the Music 3 form's lyrics
+                   textarea below: these carry what a finished track already *is*, that one is
+                   generation input. They are ids on controls outside every form, that one is a
+                   named field inside #music-form, and app.js reads each from its own side — a
+                   crossed pair would send generation input to an import, or a finished master's
+                   lyric sheet into a song being written. tests/test_frontend_contract.py asserts
+                   the two are separate controls and that neither handler reaches for the other's.
+                   Both optional: an import that carries neither behaves exactly as it always did.
+                   No maxlength: it truncated a paste silently, so an oversized sheet was quietly
+                   shortened here while the same text sent to the route was refused with a 422
+                   naming its length. The bound belongs to the route alone; the counter beside each
+                   box reports where the text stands against it, from api.js's SONG_CONTEXT_COUNTS
+                   which the tests hold equal to app.py's SONG_LYRICS_LIMIT / SONG_CAPTION_LIMIT. -->
+              <label>Lyrics <span>optional</span><span class="field-count" id="import-lyrics-count"></span><textarea id="import-lyrics" rows="5" placeholder="Paste the lyric sheet as it is — section tags, blank lines and indentation are kept exactly"></textarea></label>
+              <label>Style <span>optional</span><span class="field-count" id="import-style-count"></span><textarea id="import-style" rows="3" placeholder="Genre, mood, vocal character, instrumentation…"></textarea></label>
               <button class="primary-button full" id="import-song">Import song</button>
             </article>
 
@@ -99,6 +114,18 @@
               <div><span>BPM</span><strong id="bpm-value">Not analyzed</strong></div>
               <div><span>Sections</span><strong id="sections-value">Not analyzed</strong></div>
               <div><span>Timeline</span><strong id="timeline-value">Waiting for song</strong></div>
+            </div>
+            <!-- The loaded song's own context, editable after the fact so a song imported before
+                 anyone typed its words is not stuck without them and does not have to be
+                 re-imported to gain them. It belongs to the song on screen, which is why it lives
+                 in the stage beside the waveform rather than in the import block. Saving it sends
+                 only these two fields: the audio, the duration and the provenance are not editable
+                 text. Nothing here parses or sections the lyrics — no analyser exists. -->
+            <div class="song-context">
+              <div class="block-heading"><h2>Song context</h2><span>Reaches the Director</span></div>
+              <label>Lyrics<span class="field-count" id="song-lyrics-count"></span><textarea id="song-lyrics" rows="6" placeholder="The words of the loaded song, stored as supplied"></textarea></label>
+              <label>Style<span class="field-count" id="song-style-count"></span><textarea id="song-style" rows="3" placeholder="Genre, mood, vocal character, instrumentation…"></textarea></label>
+              <button class="quiet-button full" id="save-song-context" disabled>Save song context</button>
             </div>
             <div class="production-note"><span>PRODUCTION NOTE</span><p>Imported songs and Music 3 outputs are equal first-class sources. Generation is never required to begin a video.</p></div>
           </div>

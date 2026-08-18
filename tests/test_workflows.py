@@ -12,13 +12,18 @@ import pytest
 from music_video_producer.app import SongPlannerRequest
 from music_video_producer.timeline import align_h3_frames
 from music_video_producer.workflows import (
+    H3_DEFAULT_PROFILE,
+    H3_DIRECTOR_DEFAULT_STEPS,
     H3_DIRECTOR_MAX_FRAMES,
     H3_DIRECTOR_MAX_SECONDS,
     H3_FRAME_RATE,
+    H3_LORA_STRENGTH_LIMITS,
     H3_REFERENCE_LIMITS,
     H3_REFERENCE_MAX_FRAMES,
+    H3_REFERENCE_PROFILES,
     H3_SPLIT_OFFSETS,
     LTX25_DIVISOR,
+    H3SamplingProfile,
     WorkflowCatalog,
     build_flux_payload,
     build_h3_director_payload,
@@ -80,6 +85,22 @@ def every_builder_payload() -> list[tuple[str, dict]]:
                 prefix="p",
             ),
         ),
+        (
+            # The turbo profile is a different graph — one node more, drawing the whole
+            # model chain through a LoRA — so it earns its own row here rather than
+            # being assumed equivalent to the default one above.
+            "h3-reference-turbo",
+            build_h3_reference_payload(
+                prompt="<Picture 1>",
+                references=[{"kind": "picture", "file": "a.png"}],
+                duration=8,
+                width=1280,
+                height=720,
+                seed=0,
+                prefix="p",
+                profile="turbo",
+            ),
+        ),
         ("ltx25-patched", patch_ltx25_dimension_boundary(template)),
     ]
 
@@ -94,13 +115,18 @@ def every_builder_payload() -> list[tuple[str, dict]]:
 # payload builds, plus the sampler, guider, decode and save classes it shares with
 # the Director and LTX graphs. Recording merges, so the SongPlanner classes those
 # thirteen joined are still there.
+#
+# `LoraLoaderModelOnly` left the list when the turbo sampling profile put it in an
+# audited payload. It was uncovered while only the Krea multiview and LTX graphs used
+# it, and nothing audited those; now the H3 audit records it, so the Krea LoRAs are
+# range-checked offline as a side effect.
 UNRECORDED_CLASSES = frozenset({
     "CFGGuider", "CLIPTextEncode", "ComfyMathExpression",
     "DualCLIPLoader", "EmptySD3LatentImage", "FluxGuidance", "FrameInterpolate",
     "FrameInterpolationModelLoader", "GetImageSize", "ImageResizeKJv2",
     "Krea2EditGroundedEncode", "Krea2EditModelPatch", "LTXVAudioVAEDecode", "LTXVAudioVAEEncode",
     "LTXVConcatAVLatent", "LTXVConditioning", "LTXVImgToVideoInplace", "LTXVLatentUpsampler",
-    "LTXVSeparateAVLatent", "LatentUpscaleModelLoader", "LoadImage", "LoraLoaderModelOnly",
+    "LTXVSeparateAVLatent", "LatentUpscaleModelLoader", "LoadImage",
     "ManualSigmas", "MathExpression|pysssss",
     "ModelSamplingFlux", "PrimitiveFloat",
     "PrimitiveStringMultiline", "RTXVideoSuperResolution", "ResolutionSelector",
@@ -493,14 +519,20 @@ def test_h3_reference_payload_maps_multiple_subjects_environment_and_shared_audi
 
 
 def h3_reference_payload(references: list[dict], **overrides) -> dict:
-    """One reference payload with the boring arguments filled in."""
+    """One reference payload with the boring arguments filled in.
+
+    `steps` is left unset rather than pinned at 20, which is what it used to be: a helper
+    that always sent 20 would hand the turbo profile the default profile's step count and
+    quietly make every profile test below check the wrong graph. For the default profile
+    the resolved value is still 20, so nothing that used this before has moved.
+    """
     arguments = {
         "prompt": "p",
         "references": references,
         "duration": 8,
         "width": 1280,
         "height": 720,
-        "steps": 20,
+        "steps": None,
         "seed": 0,
         "prefix": "p",
     }
@@ -579,6 +611,360 @@ def test_h3_reference_payload_carries_the_reference_size_to_the_conditioner():
     for size in ("match", "max"):
         payload = h3_reference_payload(h3_references("picture", 1), ref_image_size=size)
         assert payload["mvp:condition"]["inputs"]["ref_image_size"] == size
+
+
+# --- Sampling profiles -----------------------------------------------------------------
+#
+# Two evidenced bundles, each reproduced whole. The tests below pin the two directions
+# that matter: the default profile emits *exactly* what the adapter emitted before
+# profiles existed, and the turbo profile reproduces the Director's own H3 stage rather
+# than borrowing half of it.
+
+#: The default profile's payload for one fixed set of arguments, hashed at the commit
+#: before sampling profiles existed (`7e25ad0`, the story's baseline) by running that
+#: revision's `build_h3_reference_payload` and hashing
+#: `json.dumps(payload, separators=(",", ":"))` — key order included, so a node inserted
+#: anywhere in the graph changes it.
+#:
+#: A digest rather than a copied dict because the claim is *sameness with what shipped*,
+#: and a literal expected payload written today would only prove the adapter agrees with
+#: whatever it currently does. If this fails, the default profile's payload changed: that
+#: is the thing the story promised would not happen, so re-deriving the digest is the
+#: wrong fix unless the Director has renegotiated the promise.
+H3_DEFAULT_PROFILE_DIGEST = "57beec67787e9f744770b58d4c52532840634c8ea2333112e31b8711823c00db"
+
+
+def default_profile_payload(**overrides) -> dict:
+    """The exact arguments `H3_DEFAULT_PROFILE_DIGEST` was taken over."""
+    arguments = {
+        "prompt": "<Picture 1> and <Video 1> in <Audio 1>",
+        "references": [
+            {"kind": "picture", "file": "F:/refs/lead.png", "label": "lead"},
+            {"kind": "video", "file": "F:/refs/pan.mp4", "has_audio": True},
+            {"kind": "audio", "file": "F:/refs/song.flac", "label": "song"},
+        ],
+        "duration": 8,
+        "width": 1280,
+        "height": 720,
+        "steps": 20,
+        "seed": 42,
+        "prefix": "mvp/default-profile",
+    }
+    return build_h3_reference_payload(**{**arguments, **overrides})
+
+
+def test_the_default_profile_emits_the_graph_the_adapter_shipped_before_profiles():
+    """AC-1: a request that omits the profile builds today's payload, unchanged.
+
+    Named and omitted must also agree, or "the default" would mean two things — the
+    Director who never touches the field and the one who types `default` have to get the
+    same graph.
+    """
+    payload = default_profile_payload()
+    serialized = json.dumps(payload, separators=(",", ":"))
+
+    assert hashlib.sha256(serialized.encode("utf-8")).hexdigest() == H3_DEFAULT_PROFILE_DIGEST
+    assert default_profile_payload(profile="default") == payload
+    assert default_profile_payload(profile=H3_DEFAULT_PROFILE) == payload
+    # And the reason it is unchanged, said out loud: no LoRA node, and the shift node
+    # still drawing straight from the loader.
+    assert all(node["class_type"] != "LoraLoaderModelOnly" for node in payload.values())
+    assert payload["mvp:shift"]["inputs"]["model"] == ["mvp:model", 0]
+
+
+def test_the_default_profile_matches_the_audited_export_it_reproduces():
+    """The evidence, read rather than restated: the export is why the default is the default.
+
+    The export's `Power Lora Loader (rgthree)` holds a turbo LoRA switched **off**, and
+    that deliberate off-switch is the whole justification for a 20-step profile with no
+    LoRA. If someone ever switches it on in the file, this stops agreeing — which is the
+    moment the default profile's evidence changed and the constant should be revisited.
+    """
+    export = json.loads(
+        (REFERENCE_EXPORTS / "h3-ultra-references-user-export.json").read_text(encoding="utf-8")
+    )
+    scheduler = next(
+        node for node in export.values() if node["class_type"] == "BasicScheduler"
+    )["inputs"]
+    sampler = next(
+        node for node in export.values() if node["class_type"] == "KSamplerSelect"
+    )["inputs"]
+    power_lora = next(
+        node for node in export.values() if node["class_type"] == "Power Lora Loader (rgthree)"
+    )["inputs"]
+    profile = H3_REFERENCE_PROFILES["default"]
+
+    assert (profile.scheduler, profile.steps) == (scheduler["scheduler"], scheduler["steps"])
+    assert profile.sampler == sampler["sampler_name"]
+    assert profile.lora is None and profile.lora_strength is None
+    lora_entries = [value for key, value in power_lora.items() if key.startswith("lora_")]
+    assert lora_entries, power_lora
+    assert all(entry["on"] is False for entry in lora_entries), lora_entries
+
+
+def test_the_turbo_profile_matches_the_export_it_reproduces():
+    """The turbo bundle read out of the audited export, exactly as the default one is.
+
+    The Director's H3 stage is *in this repo*: `h3-ltx25-user-export.json` is the audited
+    copy of the same saved workflow, and it carries the whole chain — node `127` loading
+    `ref2va`, node `5959` `LoraLoaderModelOnly` at 0.7 taking that loader's output, and
+    `BasicScheduler`/`KSamplerSelect` downstream of the shift.
+
+    This exists because the first version of this test asserted the turbo values against
+    literals typed into it while the default profile was checked against its export. That
+    is the standard held for the profile carrying no LoRA and dropped for the one carrying
+    a LoRA into a GPU job — the wrong way round. Nothing here is restated: the LoRA is
+    located by *following the wiring* from the loader this adapter uses, so a second LoRA
+    elsewhere in that 65-node graph cannot be mistaken for it.
+    """
+    export = json.loads(
+        (REFERENCE_EXPORTS / "h3-ltx25-user-export.json").read_text(encoding="utf-8")
+    )
+    def only(candidates: list[str], what: str) -> str:
+        """One node id, or a failure naming what was ambiguous rather than picking."""
+        assert len(candidates) == 1, f"{what}: {candidates}"
+        return candidates[0]
+
+    def fed_by(node_id: str, socket: str = "model") -> list[str]:
+        return [
+            other_id
+            for other_id, other in export.items()
+            if other["inputs"].get(socket) == [node_id, 0]
+        ]
+
+    loader = only(
+        [
+            node_id
+            for node_id, node in export.items()
+            if node["class_type"] == "UNETLoader"
+            and node["inputs"].get("unet_name")
+            == "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+        ],
+        "ref2va loaders",
+    )
+    lora = only(
+        [node_id for node_id in fed_by(loader) if export[node_id]["class_type"] == "LoraLoaderModelOnly"],
+        "LoRAs on the ref2va loader",
+    )
+    # Walk the model chain forward from the LoRA, so the scheduler and sampler come from
+    # the branch this LoRA actually feeds. The export holds several of each — its LTX
+    # stages sample too, and they are `euler` as well — so picking one by class alone
+    # would be a coincidence dressed as evidence.
+    reached: set[str] = set()
+    frontier = fed_by(lora)
+    while frontier:
+        node_id = frontier.pop()
+        if node_id in reached:
+            continue
+        reached.add(node_id)
+        frontier += fed_by(node_id)
+    scheduler = only(
+        [node_id for node_id in reached if export[node_id]["class_type"] == "BasicScheduler"],
+        "schedulers downstream of the LoRA",
+    )
+    sampler = only(
+        [
+            export[node_id]["inputs"]["sampler"][0]
+            for node_id in fed_by(scheduler, socket="sigmas")
+            if export[node_id]["class_type"] == "SamplerCustomAdvanced"
+        ],
+        "samplers on that scheduler's sigmas",
+    )
+    profile = H3_REFERENCE_PROFILES["turbo"]
+
+    assert profile.lora == export[lora]["inputs"]["lora_name"]
+    assert profile.lora_strength == export[lora]["inputs"]["strength_model"]
+    assert profile.scheduler == export[scheduler]["inputs"]["scheduler"]
+    assert profile.steps == export[scheduler]["inputs"]["steps"]
+    assert profile.sampler == export[sampler]["inputs"]["sampler_name"]
+
+
+def test_the_turbo_profile_reproduces_the_directors_stage_and_rewires_everything_after_it():
+    """AC-2, and the wiring half of it.
+
+    The values themselves are checked against the audited export by the test above; this
+    one is about what the *builder* emits from them.
+
+    The downstream assertion is written as "nothing but the LoRA reads the loader" rather
+    than as "the shift node reads the LoRA", because a node added later that quietly kept
+    reading `mvp:model` would satisfy the second and defeat the point: half the graph
+    would sample the unpatched checkpoint.
+    """
+    payload = h3_reference_payload(h3_references("picture", 1), profile="turbo")
+
+    lora = payload["mvp:lora"]
+    assert lora["class_type"] == "LoraLoaderModelOnly"
+    assert lora["inputs"]["lora_name"] == "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+    assert lora["inputs"]["strength_model"] == 0.7
+    assert lora["inputs"]["model"] == ["mvp:model", 0]
+    assert payload["mvp:shift"]["inputs"]["model"] == ["mvp:lora", 0]
+    assert payload["mvp:scheduler"]["inputs"]["scheduler"] == "beta"
+    assert payload["mvp:scheduler"]["inputs"]["steps"] == 4
+    assert payload["mvp:sampler"]["inputs"]["sampler_name"] == "euler"
+
+    readers = {
+        node_id
+        for node_id, node in payload.items()
+        for value in node["inputs"].values()
+        if value == ["mvp:model", 0]
+    }
+    assert readers == {"mvp:lora"}, readers
+    # The turbo graph is the default graph plus exactly one node; nothing else moved.
+    assert set(payload) - set(h3_reference_payload(h3_references("picture", 1))) == {"mvp:lora"}
+
+
+@pytest.mark.parametrize("name", sorted(H3_REFERENCE_PROFILES))
+def test_each_profile_emits_its_own_lora_scheduler_sampler_and_step_default(name: str):
+    """Every field of every profile reaches the payload, for whatever profiles exist.
+
+    Parametrized over the mapping rather than over the two names known today: a third
+    profile added as data would otherwise be data nothing checks, which is exactly how a
+    configuration ends up looking evidenced while emitting something else.
+    """
+    profile = H3_REFERENCE_PROFILES[name]
+    payload = h3_reference_payload(h3_references("picture", 1), profile=name)
+    scheduler = payload["mvp:scheduler"]["inputs"]
+
+    assert scheduler["scheduler"] == profile.scheduler
+    assert scheduler["steps"] == profile.steps
+    assert payload["mvp:sampler"]["inputs"]["sampler_name"] == profile.sampler
+    if profile.lora is None:
+        assert "mvp:lora" not in payload
+        assert payload["mvp:shift"]["inputs"]["model"] == ["mvp:model", 0]
+    else:
+        assert payload["mvp:lora"]["inputs"]["lora_name"] == profile.lora
+        assert payload["mvp:lora"]["inputs"]["strength_model"] == profile.lora_strength
+        assert payload["mvp:shift"]["inputs"]["model"] == ["mvp:lora", 0]
+
+
+@pytest.mark.parametrize("name", sorted(H3_REFERENCE_PROFILES))
+def test_an_explicit_step_count_overrides_the_profiles_own(name: str):
+    """The profile chooses the graph; the Director chooses the effort.
+
+    Both directions matter: an explicit count must win over the profile's, and it must
+    not change anything else the profile decided — a step count is not a licence to drop
+    the LoRA or swap the sampler.
+    """
+    profile = H3_REFERENCE_PROFILES[name]
+    explicit = h3_reference_payload(h3_references("picture", 1), profile=name, steps=37)
+    implicit = h3_reference_payload(h3_references("picture", 1), profile=name)
+
+    assert explicit["mvp:scheduler"]["inputs"]["steps"] == 37
+    assert implicit["mvp:scheduler"]["inputs"]["steps"] == profile.steps
+    # `steps=None` is what the route sends for an omitted count, and it must mean the
+    # same thing as omitting the argument altogether.
+    assert h3_reference_payload(h3_references("picture", 1), profile=name, steps=None) == implicit
+    explicit["mvp:scheduler"]["inputs"]["steps"] = profile.steps
+    assert explicit == implicit
+
+
+def test_the_builder_refuses_a_profile_it_has_no_evidence_for():
+    """An unknown profile is refused before a payload exists, not silently defaulted.
+
+    Falling back to `default` would be the worst outcome available: a Director asking for
+    turbo would get a 20-step no-LoRA render and a bill for it, with nothing saying so.
+    """
+    for unknown in ("turbo ", "TURBO", "fast", "", None, 4, 0.7):
+        with pytest.raises(ValueError, match="Unknown H3 sampling profile"):
+            h3_reference_payload(h3_references("picture", 1), profile=unknown)
+    # Unhashable values are the ones that used to escape: `profile in {...}` raises
+    # `TypeError`, which the route's `except ValueError` does not translate, so a caller
+    # that is not the route got a 500 where every other bad input here gets a 422.
+    for unhashable in (["turbo"], {"profile": "turbo"}, {"turbo"}):
+        with pytest.raises(ValueError, match="Unknown H3 sampling profile"):
+            h3_reference_payload(h3_references("picture", 1), profile=unhashable)
+    # Refused *before* the payload is built: an unknown profile on an otherwise invalid
+    # request still reports the profile, because nothing downstream ran.
+    with pytest.raises(ValueError, match="Unknown H3 sampling profile"):
+        h3_reference_payload([], profile="fast")
+
+
+def test_a_profile_validates_its_own_fields_where_they_are_declared():
+    """A profile that cannot produce a submittable graph fails on the line that wrote it.
+
+    Every value below builds a payload ComfyUI rejects at `/prompt` validation, which the
+    Director sees as an opaque 502 after the submission round-trip — at the end of the one
+    path where the profile is meant to be the part nobody has to check. The whole point of
+    profiles is that the configuration is trustworthy; a profile that can be nonsense is
+    not one.
+    """
+    def profile(**overrides) -> H3SamplingProfile:
+        fields = {
+            "lora": "some.safetensors",
+            "lora_strength": 0.7,
+            "scheduler": "beta",
+            "sampler": "euler",
+            "steps": 4,
+        }
+        return H3SamplingProfile(**{**fields, **overrides})
+
+    assert profile()  # the shape everything below breaks one field of
+
+    for lora, strength in ((None, 0.7), ("some.safetensors", None)):
+        with pytest.raises(ValueError, match="name a LoRA and its strength together"):
+            profile(lora=lora, lora_strength=strength)
+    # `True` is an `int` in Python and would sample exactly once, silently.
+    for steps in (0, -1, 1.5, True, None, "4"):
+        with pytest.raises(ValueError, match="at least one step"):
+            profile(steps=steps)
+    for blank in ("", "   ", None, 4):
+        with pytest.raises(ValueError, match="scheduler must be named"):
+            profile(scheduler=blank)
+        with pytest.raises(ValueError, match="sampler must be named"):
+            profile(sampler=blank)
+    for empty in ("", "   ", 4):
+        with pytest.raises(ValueError, match="LoRA must be a filename"):
+            profile(lora=empty)
+    minimum, maximum = H3_LORA_STRENGTH_LIMITS
+    for strength in (minimum - 0.1, maximum + 0.1, float("inf"), float("nan"), True, "0.7"):
+        with pytest.raises(ValueError, match="LoRA strength must be between"):
+            profile(lora_strength=strength)
+    # The bounds themselves are inclusive, and 0 is a real value — a LoRA loaded at no
+    # strength is odd but it is the node's own range, not this adapter's opinion.
+    for strength in (minimum, maximum, 0, 1):
+        assert profile(lora_strength=strength).lora_strength == strength
+
+
+def test_the_shipped_profiles_satisfy_their_own_validation():
+    """Constructing them at import already proves it; saying so keeps it a guarantee.
+
+    `H3_REFERENCE_PROFILES` is built at module scope, so a profile that violated the rules
+    above would fail every import of `workflows.py` rather than one test — but nothing
+    would then say *which* rule, and a future profile added with the validation weakened
+    would slip past silently.
+    """
+    for name, profile in H3_REFERENCE_PROFILES.items():
+        assert profile.steps >= 1, name
+        assert profile.scheduler.strip() and profile.sampler.strip(), name
+        if profile.lora is not None:
+            minimum, maximum = H3_LORA_STRENGTH_LIMITS
+            assert profile.lora.strip(), name
+            assert minimum <= profile.lora_strength <= maximum, name
+
+
+def test_the_text_only_director_path_is_offered_no_profile_and_keeps_its_step_default():
+    """The Ask-First boundary, pinned.
+
+    `MiniMaxH3DirectorCS` loads a different checkpoint pair, the installed generic H3
+    turbo LoRAs are not the `ref2v` one, and nothing has been rendered live that way — so
+    the Director graph gains no LoRA, and an omitted step count still means the 20 it
+    always meant rather than any profile's number.
+    """
+    payload = build_h3_director_payload(
+        timeline_data='{"segments":[{"id":"s","start":0,"length":120,"prompt":"p"}]}',
+        duration=5.0,
+        requested_frames=120,
+        seed=0,
+        width=1344,
+        height=768,
+        prefix="p",
+    )
+
+    assert H3_DIRECTOR_DEFAULT_STEPS == 20
+    assert payload["2346"]["inputs"]["steps"] == H3_DIRECTOR_DEFAULT_STEPS
+    assert payload["2346"]["inputs"]["scheduler"] == "simple"
+    assert payload["2345"]["inputs"]["sampler_name"] == "res_multistep"
+    assert all(node["class_type"] != "LoraLoaderModelOnly" for node in payload.values())
 
 
 def test_h3_reference_slots_are_numbered_per_kind_in_attachment_order():
@@ -1154,10 +1540,11 @@ def test_the_h3_audit_wires_every_check_it_defines():
         preflight_h3_ultra.check_reference_limits,
         preflight_h3_ultra.check_split_offsets,
         preflight_h3_ultra.check_frame_ceilings,
+        preflight_h3_ultra.check_lora_strength_range,
         preflight_h3_ultra.check_model_files,
         preflight_h3_ultra.check_request_bounds,
     }
-    assert len(preflight_h3_ultra.CHECKS) == 5
+    assert len(preflight_h3_ultra.CHECKS) == 6
 
 
 def test_each_h3_check_passes_the_real_schema_and_names_a_moved_one():
@@ -1197,6 +1584,13 @@ def test_each_h3_check_passes_the_real_schema_and_names_a_moved_one():
     assert any(
         "MiniMaxH3DirectorCS.end_frame declares a maximum of 5000" in problem
         for problem in preflight_h3_ultra.check_frame_ceilings(ceiling)
+    )
+
+    strength = copy.deepcopy(schema)
+    strength["LoraLoaderModelOnly"]["input"]["required"]["strength_model"][1]["max"] = 2.0
+    assert any(
+        "strength_model declares (-100.0, 2.0)" in problem
+        for problem in preflight_h3_ultra.check_lora_strength_range(strength)
     )
 
     models = copy.deepcopy(schema)
@@ -1251,8 +1645,127 @@ def test_the_h3_audit_reads_its_model_files_out_of_the_payloads():
         "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         "minimax_h3_video_vae_fp16.safetensors",
         "minimax_h3_audio_vae_fp32.safetensors",
+        # The turbo profile's LoRA is in this set because a payload *loads* it, not
+        # because it is named here — which is what makes the live audit's "installed"
+        # claim about the file the app would actually submit.
+        "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
     }
-    assert {class_type for class_type, _, _ in files} == {"UNETLoader", "CLIPLoader", "VAELoader"}
+    assert {class_type for class_type, _, _ in files} == {
+        "UNETLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly",
+    }
+
+
+def test_the_reference_smoke_names_a_profile_and_sends_no_step_count():
+    """The first live render's mistake, made unrepeatable.
+
+    `tests/smoke_h3_reference_app.py` hardcoded `steps: 4` against the default profile —
+    a 20-step graph with no LoRA to compensate — and the frame it produced said nothing
+    about the path's picture quality. The body it sends is a module constant precisely so
+    this can be checked without a socket, a running app, or a GPU.
+    """
+    import smoke_h3_reference_app as smoke
+
+    assert "steps" not in smoke.RENDER_REQUEST, smoke.RENDER_REQUEST
+    assert smoke.RENDER_REQUEST["profile"] == smoke.RENDER_PROFILE
+    assert smoke.RENDER_PROFILE in H3_REFERENCE_PROFILES
+    # What the printed record calls the effort is the profile's own number, so the record
+    # and the render cannot disagree about what was sampled.
+    assert smoke.RENDER_STEPS == H3_REFERENCE_PROFILES[smoke.RENDER_PROFILE].steps
+
+
+def test_the_reference_smoke_reads_what_was_sampled_out_of_comfyuis_own_record():
+    """The record has to say what the *server* built, not what the constants mean.
+
+    A profile accepted and then silently dropped produces a run that completes, measures
+    correctly, and prints `turbo` over a render that used none — the record would be a
+    confident lie about a GPU job. The smoke reads the submitted graph back from
+    `/history` and compares it with the profile, so the two pure functions that do the
+    reading are driven here against the real shape ComfyUI 0.33.1 returns.
+    """
+    import smoke_h3_reference_app as smoke
+
+    payload = h3_reference_payload(h3_references("picture", 1), profile="turbo")
+    entry = {"prompt": [13, "abc", payload, {"create_time": 0}, ["mvp:save"]], "outputs": {}}
+
+    graph, why = smoke.graph_from_history(entry)
+
+    assert (graph, why) == (payload, "")
+    assert smoke.submitted_sampling(graph) == smoke.profile_declares("turbo")
+    # The default profile carries no LoRA, and its two empty fields are what say so —
+    # rather than the summary quietly reporting the turbo LoRA it never loaded.
+    default = h3_reference_payload(h3_references("picture", 1))
+    assert smoke.submitted_sampling(default) == smoke.profile_declares("default")
+    assert smoke.submitted_sampling(default)["lora"] == ""
+
+    # A shape it cannot read is a named gap, never a wrong answer. The index is not
+    # trusted either: the graph is found by shape, so a reordered tuple still resolves.
+    for unreadable, expected in (
+        (None, "not an object"),
+        ({}, "carries no prompt list"),
+        ({"prompt": [13, "abc", {"create_time": 0}]}, "carries no node graph"),
+    ):
+        found, reason = smoke.graph_from_history(unreadable)
+        assert found == {} and expected in reason, (unreadable, reason)
+    reordered = {"prompt": [payload, 13, "abc"]}
+    assert smoke.graph_from_history(reordered) == (payload, "")
+    # Two schedulers is a graph this summary does not understand, and it must say nothing
+    # rather than pick one: reporting the first would be a guess printed as a measurement.
+    doubled = {**payload, "extra:scheduler": copy.deepcopy(payload["mvp:scheduler"])}
+    assert smoke.submitted_sampling(doubled)["steps"] is None
+
+
+def test_the_h3_audit_variants_take_their_steps_from_the_profiles():
+    """Each profile's own step default is a number the audit actually sends.
+
+    The audit's shared arguments used to carry a literal `steps=20`. That is the default
+    profile's count *today*, so it looked equivalent — but it is a copy, and a copy stops
+    describing what the application submits the moment the profile moves. The variants now
+    name no count at all, so this holds by construction; it is asserted because "by
+    construction" is precisely the kind of claim that stops being true quietly.
+    """
+    audited = {
+        node["inputs"]["steps"]
+        for _, payload in preflight_h3_ultra.audit_payloads()
+        for node in payload.values()
+        if node["class_type"] == "BasicScheduler"
+    }
+
+    for name, profile in H3_REFERENCE_PROFILES.items():
+        assert profile.steps in audited, (name, sorted(audited))
+
+
+def test_the_h3_audit_covers_both_sampling_profiles():
+    """AC-3: both profiles reach the live schema, and only one of them carries the LoRA.
+
+    Asserting "some variant has a LoRA" alone would pass on an audit that dropped every
+    default-profile variant, and vice versa. Both halves are named, because the audit's
+    whole claim is that each shipped configuration was validated — not that one of them
+    was, twice.
+    """
+    variants = preflight_h3_ultra.audit_payloads()
+    with_lora = {
+        label
+        for label, payload in variants
+        if any(node["class_type"] == "LoraLoaderModelOnly" for node in payload.values())
+    }
+    reference = {
+        label
+        for label, payload in variants
+        if any(node["class_type"] == "MiniMaxH3ReferenceToVideo" for node in payload.values())
+    }
+
+    # Exactly one, not merely at least one: `next(iter(...))` over a set of two would pick
+    # an arbitrary variant, and the assertions below would then pass while saying nothing
+    # about the other. Which one is checked has to be determined, not incidental.
+    assert len(with_lora) == 1, sorted(with_lora)
+    assert reference - with_lora, [label for label, _ in variants]
+    turbo = dict(variants)[with_lora.pop()]
+    profile = H3_REFERENCE_PROFILES["turbo"]
+    assert turbo["mvp:lora"]["inputs"]["lora_name"] == profile.lora
+    assert turbo["mvp:lora"]["inputs"]["strength_model"] == profile.lora_strength
+    # Its step count comes from the profile rather than from a number restated in the
+    # audit, so a moved profile default moves what is audited.
+    assert turbo["mvp:scheduler"]["inputs"]["steps"] == profile.steps
 
 
 def test_the_h3_audit_variants_reach_both_ends_of_every_request_bound():

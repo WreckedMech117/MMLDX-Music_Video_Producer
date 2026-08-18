@@ -8,17 +8,20 @@ with a live, user-managed ComfyUI (never started or stopped here):
 
     uv run python tests/preflight_h3_ultra.py [base_url] [--record]
 
-Seven payload variants are audited separately, chosen to reach every input either
+Nine payload variants are audited separately, chosen to reach every input either
 adapter can emit: one picture; the full 9 pictures + 3 videos + 3 audios, which
 fills every autogrow slot the graph offers; a video carrying its paired
 soundtrack; ``ref_image_size="max"``; the longest window that still fits the
 node's frame ceiling; and **both ends of every range the H3 request model
 allows**, because a variant that only ever sends one safe midpoint would pass the
-range check no matter where the bound moved. The text-only Director graph is
-audited here too: it is the one H3 path with live render evidence, and it was
-covered by nothing.
+range check no matter where the bound moved. **Both sampling profiles** are here:
+the eight default-profile variants and one turbo variant, which is the only one
+carrying a ``LoraLoaderModelOnly`` — so the LoRA's class being registered and its
+file being installed are confirmed before any GPU time, rather than discovered by
+a submission that fails. The text-only Director graph is audited here too: it is
+the one H3 path with live render evidence, and it was covered by nothing.
 
-Beyond the shared per-node validation, five claims about the *adapters* are
+Beyond the shared per-node validation, six claims about the *adapters* are
 checked against the live schema:
 
 * the reference adapter's hardcoded per-kind limits equal the autogrow ``max`` of
@@ -27,8 +30,12 @@ checked against the live schema:
 * every ``mvp:split`` output index it wires lands on the splitter output the
   schema names for that kind, so a picture cannot be fed where an audio belongs;
 * both adapters' frame ceilings equal the maxima their nodes declare;
+* the strength range a sampling profile may declare equals the one
+  ``LoraLoaderModelOnly.strength_model`` declares, so the refusal a profile gets
+  at definition time is the node's rule rather than a number this project invented;
 * the model files the payloads actually name — read out of the payloads, never
-  restated here — are present in their loaders' combo options;
+  restated here, so the turbo profile's LoRA joins the list by being *loaded*
+  rather than by being mentioned — are present in their loaders' combo options;
 * every bound ``H3Request`` enforces sits inside the bound the node enforces, so
   a request the route accepts can never be refused by ComfyUI.
 
@@ -53,6 +60,7 @@ from music_video_producer.workflows import (
     H3_DIRECTOR_MAX_FRAMES,
     H3_DIRECTOR_MAX_SECONDS,
     H3_FRAME_RATE,
+    H3_LORA_STRENGTH_LIMITS,
     H3_REFERENCE_LIMITS,
     H3_REFERENCE_MAX_FRAMES,
     H3_SPLIT_OFFSETS,
@@ -110,7 +118,13 @@ def audit_payloads() -> list[tuple[str, dict]]:
     paired = [
         {"kind": "video", "file": "F:/refs/paired.mp4", "has_audio": True, "audio_mode": "paired"}
     ]
-    shared = {"width": 1280, "height": 720, "steps": 20, "seed": 0, "prefix": "preflight"}
+    # No `steps`, on purpose. Every reference variant below takes its step count from the
+    # profile it names, which is what the application submits when the Director does not
+    # override it. A literal 20 here — the number this used to carry — would keep passing
+    # if either profile's count moved, and the audit would quietly stop describing what is
+    # actually sent. The two request-bound variants below *do* name a count, because their
+    # subject is the bound rather than the profile.
+    shared = {"width": 1280, "height": 720, "seed": 0, "prefix": "preflight"}
     # Both ends of every range the route can send. A single midpoint would satisfy the
     # schema's min/max whichever way either bound moved, which is a check in name only.
     smallest = {
@@ -161,6 +175,20 @@ def audit_payloads() -> list[tuple[str, dict]]:
                 references=pictures[:1],
                 duration=8,
                 ref_image_size="max",
+                **shared,
+            ),
+        ),
+        (
+            # The turbo bundle exactly as the Director renders it: the LoRA at its
+            # strength, `beta`/`euler`, and no step count, so the profile supplies its
+            # own 4. This is the only variant carrying a `LoraLoaderModelOnly`, and it is
+            # what puts the LoRA's class and filename in front of the live schema.
+            "turbo-profile",
+            build_h3_reference_payload(
+                prompt="<Picture 1>",
+                references=pictures[:1],
+                duration=8,
+                profile="turbo",
                 **shared,
             ),
         ),
@@ -296,6 +324,32 @@ def model_files(variants: list[tuple[str, dict]]) -> set[tuple[str, str, str]]:
     }
 
 
+def check_lora_strength_range(object_info: dict) -> list[str]:
+    """The strength range a profile may declare against the range the node declares.
+
+    ``H3SamplingProfile`` refuses a strength outside ``H3_LORA_STRENGTH_LIMITS`` when the
+    profile is *defined*, which is only worth anything while those limits are the node's
+    own. Written as equality rather than containment because the adapter is not choosing a
+    narrower policy here — it is restating the node's range, and a restated number that
+    stops matching is exactly what this audit exists to catch.
+    """
+    spec = (
+        object_info.get("LoraLoaderModelOnly", {})
+        .get("input", {})
+        .get("required", {})
+        .get("strength_model")
+    )
+    declared = numeric_bounds(spec)
+    if declared != H3_LORA_STRENGTH_LIMITS:
+        return [
+            (
+                f"lora strength: a profile may declare {H3_LORA_STRENGTH_LIMITS} but "
+                f"LoraLoaderModelOnly.strength_model declares {declared}"
+            )
+        ]
+    return []
+
+
 def check_model_files(object_info: dict) -> list[str]:
     """Each loaded model file against its loader's combo options.
 
@@ -355,6 +409,7 @@ CHECKS = (
     check_reference_limits,
     check_split_offsets,
     check_frame_ceilings,
+    check_lora_strength_range,
     check_model_files,
     check_request_bounds,
 )

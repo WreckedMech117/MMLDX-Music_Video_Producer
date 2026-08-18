@@ -10,6 +10,12 @@ data/projects/
 Thumbs.db
 test-artifacts/
 # Planning artifacts (briefs, PRDs) are deliverables and stay versioned;
-# anything else BMAD writes under _bmad-output is transient.
+# anything else BMAD writes under _bmad-output is transient -- except the
+# deferred-work ledger, which is the standing record of known-unfixed issues.
+# A per-story spec is spent once its story lands; that ledger only accumulates,
+# and leaving it untracked meant every deferral was lost on a fresh clone.
 _bmad-output/*
 !_bmad-output/planning-artifacts/
+!_bmad-output/implementation-artifacts/
+_bmad-output/implementation-artifacts/*
+!_bmad-output/implementation-artifacts/deferred-work.md

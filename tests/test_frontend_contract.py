@@ -13,6 +13,8 @@ from music_video_producer.app import (
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_RESTORE_REFUSAL,
+    SONG_CAPTION_LIMIT,
+    SONG_LYRICS_LIMIT,
     SONG_REPLACEMENT_CONSEQUENCE,
     MusicRequest,
     SongPlannerRequest,
@@ -77,6 +79,88 @@ def run_module(script: str):
         text=True,
     )
     return json.loads(result.stdout)
+
+
+# A stub DOM barely complete enough to boot `app.js` under node, so the workspace's own code can be
+# *run* rather than read.
+#
+# Everything else in this file that concerns app.js reads its source, because a browser is not
+# available -- and source reading has one hole this closes: a function can be perfectly correct, and
+# asserted about in detail, while nothing ever calls it. `renderSongContext` is the case that
+# matters. It is the only thing that seeds `#song-lyrics`/`#song-style` from the stored Song and the
+# only thing that clears the `disabled` state the markup ships on both boxes and the save button; it
+# is reached from exactly one line inside `renderSong`. Delete that line and the entire
+# edit-after-import path is dead in every project, with every string assertion in this file still
+# passing. So the render is executed here and the boxes are read afterwards.
+#
+# The stub creates an element for any selector asked for, records every listener bound to it, and
+# records every request `fetch` is handed before rejecting it -- which is what makes "the guard
+# stopped the switch" and "the save was never sent" observable. `window.confirm` throws until a test
+# answers it, so an unexpected question is a failure rather than a silently accepted one.
+WORKSPACE_HARNESS = """
+const registry = new Map();
+const listeners = new Map();
+const requests = [];
+const make = (selector) => ({
+  selector, value: "", disabled: false, checked: false, textContent: "", innerHTML: "",
+  className: "", title: "", src: "", min: "", max: "", required: false,
+  dataset: {}, style: {}, files: [],
+  elements: new Proxy({}, { get: (bag, name) => (bag[name] ||= make(selector + "[" + String(name) + "]")) }),
+  classList: {
+    flags: new Set(),
+    add(name) { this.flags.add(name); },
+    remove(name) { this.flags.delete(name); },
+    toggle(name, on) { if (on) this.flags.add(name); else this.flags.delete(name); },
+    contains(name) { return this.flags.has(name); },
+  },
+  addEventListener(type, handler) { listeners.set(selector + ":" + type, handler); },
+  append() {}, remove() {}, pause() {}, load() {}, click() {},
+  setAttribute() {}, removeAttribute() {}, getAttribute() { return null; },
+  querySelector: () => null, querySelectorAll: () => [],
+  getBoundingClientRect: () => ({ left: 0, top: 0, width: 1000, height: 300 }),
+  closest() { return this; },
+});
+const at = (selector) => {
+  if (!registry.has(selector)) registry.set(selector, make(selector));
+  return registry.get(selector);
+};
+// The generation form is read at bind time by syncMusicVariant, which needs a real preset.
+at("#music-form").elements.preset.value = "balanced";
+globalThis.document = { querySelector: at, querySelectorAll: () => [], createElement: () => make("<created>") };
+globalThis.window = {
+  addEventListener(type, handler) { listeners.set("window:" + type, handler); },
+  confirm: (question) => { throw new Error("unanswered confirm: " + question); },
+  prompt: () => null,
+};
+globalThis.fetch = (path, options = {}) => {
+  requests.push({ path, method: options.method || "GET", body: options.body || null });
+  return Promise.reject(new Error("the contract harness makes no requests"));
+};
+// The workspace boots on import: it binds every handler, then fires its startup requests, which
+// reject. Timers are stubbed out so a pending toast cannot hold the process open for its 4.2 s.
+globalThis.setTimeout = () => 0;
+globalThis.setInterval = () => 0;
+globalThis.requestAnimationFrame = () => 0;
+const app = await import('./src/music_video_producer/web/assets/app.js');
+const contract = await import('./src/music_video_producer/web/assets/api.js');
+const { state } = await import('./src/music_video_producer/web/assets/state.js');
+const fire = (key, event = {}) => {
+  const handler = listeners.get(key);
+  if (!handler) throw new Error("nothing is bound to " + key);
+  return handler(event);
+};
+let asked = [];
+const answer = (reply) => {
+  asked = [];
+  requests.length = 0;
+  globalThis.window.confirm = (question) => { asked.push(question); return reply; };
+};
+"""
+
+
+def run_workspace(body: str):
+    """Boot `app.js` against the stub DOM and run `body` against the workspace it produced."""
+    return run_module(WORKSPACE_HARNESS + body)
 
 
 def document_controls() -> dict:
@@ -443,6 +527,467 @@ def test_song_import_handlers_drop_a_failed_decode_and_delegate_the_duration():
     assert "state.pendingImport?.file === file" in importer
     assert "songImportDuration(" in importer
     assert "state.audioBuffer" not in importer
+
+
+def import_block() -> str:
+    """The markup of the Song workspace's import block, from its heading to its own end."""
+    block = re.search(
+        r'<article class="tool-block">\s*<div class="block-heading"><h2>Import master</h2>.*?</article>',
+        INDEX_HTML.read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert block, "the Song workspace no longer has an import block"
+    return block.group(0)
+
+
+def music_form_markup() -> str:
+    """The markup of the generation form, whose lyrics textarea is generation input."""
+    form = re.search(
+        r'<form id="music-form">.*?</form>', INDEX_HTML.read_text(encoding="utf-8"), re.DOTALL
+    )
+    assert form, "the Song workspace no longer has a generation form"
+    return form.group(0)
+
+
+def app_js_handler(anchor: str) -> str:
+    """One DOM event handler's source, by the selector it is bound to."""
+    source = APP_JS.read_text(encoding="utf-8")
+    assert anchor in source, anchor
+    return source.split(anchor, 1)[1].split("  });", 1)[0]
+
+
+def test_song_context_fields_map_the_style_box_to_caption_and_trim_only_edges():
+    """The one mapping both song-context paths use, executed rather than grepped.
+
+    Which box lands on which field is invisible on screen and invisible in a diff: a lyric sheet
+    stored as `caption` reaches the Director as a description of how the song sounds, and a style
+    line stored as `lyrics` is read as the words being sung. Both are plausible strings in the
+    wrong slot, so nothing downstream would fail — which is why the arguments' order and their
+    destinations are asserted directly, with two values that cannot be confused for one another.
+    """
+    script = """
+      import { songContextFields } from './src/music_video_producer/web/assets/api.js';
+      const interior = '[Verse 1]\\n\\n    indented line\\n\\n[Chorus]\\nHold the line';
+      console.log(JSON.stringify({
+        interior,
+        crossed: songContextFields('THE-LYRIC-SHEET', 'THE-STYLE-LINE'),
+        trimmed: songContextFields('\\n\\n  ' + interior + '  \\n\\t', '  synthwave, close vocal  '),
+        blank: songContextFields('   \\n\\t ', '\\n\\n'),
+        absent: songContextFields(),
+        nulls: songContextFields(null, undefined),
+      }));
+    """
+
+    result = run_module(script)
+    # The lyric box is the lyric sheet and the style box is the caption -- never the other way.
+    assert result["crossed"] == {"lyrics": "THE-LYRIC-SHEET", "caption": "THE-STYLE-LINE"}
+    # Edges only: every interior blank line, indent and section tag survives byte for byte, which
+    # is the server's contract in `_song_context` and the known-lyrics path's before it.
+    assert result["trimmed"]["lyrics"] == result["interior"]
+    assert result["trimmed"]["caption"] == "synthwave, close vocal"
+    # Whitespace-only is absent, and so is a control that was never typed into.
+    for empty in ("blank", "absent", "nulls"):
+        assert result[empty] == {"lyrics": "", "caption": ""}, empty
+
+
+def test_the_song_context_editor_follows_the_song_rather_than_the_project():
+    script = """
+      import { songContextEditable } from './src/music_video_producer/web/assets/api.js';
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/a.wav', duration: 180 };
+      console.log(JSON.stringify({
+        withSong: songContextEditable({ song }),
+        withoutSong: songContextEditable({ song: null }),
+        noProject: songContextEditable(null),
+        absent: songContextEditable(),
+      }));
+    """
+
+    editable = run_module(script)
+
+    assert editable["withSong"] is True
+    for disabled in ("withoutSong", "noProject", "absent"):
+        assert editable[disabled] is False, disabled
+
+
+def test_the_import_context_controls_are_not_the_generation_forms_lyrics_field():
+    """The two lyrics controls are different controls, and neither handler reaches for the other.
+
+    Sending generation input to an import -- or a finished master's lyric sheet into a song being
+    written -- is worse than the gap this closes: both are plausible text arriving at a route that
+    accepts it, so nothing fails and the Director is never told. The separation is structural
+    (distinct ids, on controls outside every form) and it is asserted on both halves: the markup,
+    so one control cannot become the other, and the handlers, so neither reads the other's.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    imports = import_block()
+    generation = music_form_markup()
+
+    # The import's fields live in the import block, and nowhere else in the document.
+    for control in ('id="import-lyrics"', 'id="import-style"'):
+        assert control in imports, control
+        assert markup.count(control) == 1, control
+        assert control not in generation, control
+    # The generation form keeps its own, reached by name from the form's own FormData.
+    assert 'name="lyrics"' in generation
+    assert 'name="lyrics"' not in imports
+    # And the loaded-song editors are a third, separate pair -- in the stage, not in either.
+    for editor in ('id="song-lyrics"', 'id="song-style"', 'id="save-song-context"'):
+        assert markup.count(editor) == 1, editor
+        assert editor not in imports, editor
+        assert editor not in generation, editor
+
+    importer = app_js_handler('$("#import-song").addEventListener("click"')
+    generator = app_js_handler('musicForm.addEventListener("submit"')
+
+    # The import reads the import block's controls and nothing else: not the generation form's
+    # element collection, and not the loaded song's editors.
+    assert '$("#import-lyrics").value' in importer
+    assert '$("#import-style").value' in importer
+    for foreign in ("musicForm", "elements.lyrics", "#song-lyrics", "#song-style", "data.lyrics"):
+        assert foreign not in importer, foreign
+    # And the generation form never reaches for the import's fields or the import route.
+    for foreign in ("import-lyrics", "import-style", "songContextFields", "uploadSong"):
+        assert foreign not in generator, foreign
+
+
+def test_the_import_sends_the_song_context_the_director_typed():
+    """What the Director typed reaches the multipart body, under the server's own field names.
+
+    The route reads `lyrics` and `caption` off the form; a body that spelled either differently
+    would be accepted as an import carrying neither, which is silence rather than a failure.
+    """
+    importer = app_js_handler('$("#import-song").addEventListener("click"')
+
+    assert 'songContextFields($("#import-lyrics").value, $("#import-style").value)' in importer
+    assert 'form.append("lyrics", context.lyrics)' in importer
+    assert 'form.append("caption", context.caption)' in importer
+    # Both appends are before the upload, or they are not in the request at all.
+    assert importer.index('form.append("caption"') < importer.index("api.uploadSong(")
+
+
+def test_the_song_context_editor_saves_only_the_two_context_fields():
+    """The edit is context and nothing else, and it does not overwrite the Director mid-paste.
+
+    `renderSong` runs on far more than a project load -- the audio element's `loadedmetadata` fires
+    one -- so re-seeding the editors unconditionally would delete a lyric sheet while it was being
+    pasted. The dirty flag is the guard, and only a project load or a landed save clears it.
+    """
+    # Comments dropped: the assertions below are about what the handler *does*, and the sentence
+    # explaining why it does it legitimately contains words like "path".
+    save = without_comments(app_js_block("async function saveSongContext()"))
+    render = without_comments(app_js_block("function renderSongContext()"))
+
+    assert 'songContextFields($("#song-lyrics").value, $("#song-style").value)' in save
+    assert "api.saveSongContext(state.project.id, context)" in save
+    # Nothing about the audio, its length or its provenance is sent, and the import's fields are
+    # not read here either.
+    for foreign in ("path", "duration", "source", "prompt_id", "import-lyrics", "import-style"):
+        assert foreign not in save, foreign
+    # The flag is cleared only after the server has answered; until then the screen is the only copy.
+    assert save.index("api.saveSongContext(") < save.index("state.songContextDirty = false")
+
+    assert "if (!state.songContextDirty) {" in render
+    assert 'lyrics.value = song?.lyrics || "";' in render
+    assert 'style.value = song?.caption || "";' in render
+    # A project load re-seeds them, or a switch leaves the previous project's sheet on screen.
+    load = app_js_block("async function loadProject(id)")
+    assert "state.songContextDirty = false;" in load
+    assert load.index("state.songContextDirty = false;") < load.index("renderAll();")
+
+
+def test_rendering_the_song_seeds_and_enables_the_context_editors():
+    """The one call that makes the whole edit-after-import path exist, executed rather than read.
+
+    `renderSongContext` is reached from a single line inside `renderSong`, and it is the only thing
+    that seeds the two boxes from the stored Song and the only thing that clears the `disabled`
+    state `index.html` ships on both boxes and on the save button. Delete that line and the editors
+    are never filled and never enabled -- in every project, for the entire feature -- while a test
+    that reads the function's source out of the file still passes, because the function is still
+    there. So the render is run here, against a stub DOM, and the boxes are read afterwards.
+    """
+    rendered = run_workspace("""
+      const sheet = '[Verse 1]\\n\\n    counting sodium lights\\n\\n[Chorus]\\nHold the line';
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/000-master.wav', duration: 180, lyrics: sheet, caption: 'synthwave, close vocal' };
+      const read = () => ({
+        lyrics: at('#song-lyrics').value,
+        style: at('#song-style').value,
+        lyricsDisabled: at('#song-lyrics').disabled,
+        styleDisabled: at('#song-style').disabled,
+        saveDisabled: at('#save-song-context').disabled,
+        count: at('#song-lyrics-count').textContent,
+        over: at('#song-lyrics-count').classList.contains('over'),
+      });
+      state.project = { id: 'p1', shots: [], jobs: [], song };
+      state.songContextDirty = false;
+      app.renderSong();
+      const seeded = read();
+      // An incidental render -- the audio element's `loadedmetadata` fires one -- must not delete
+      // what the Director is part-way through typing.
+      state.songContextDirty = true;
+      at('#song-lyrics').value = 'MID-PASTE';
+      app.renderSong();
+      const midPaste = read();
+      // With no song there is nothing to describe and the route would 404, so the block is shut.
+      state.songContextDirty = false;
+      state.project = { id: 'p2', shots: [], jobs: [], song: null };
+      app.renderSong();
+      const songless = read();
+      // An oversized stored sheet reports itself as unsaveable rather than being silently cut.
+      state.project = { id: 'p3', shots: [], jobs: [], song: { ...song, lyrics: 'x'.repeat(8001) } };
+      app.renderSong();
+      const oversized = read();
+      console.log(JSON.stringify({ sheet, seeded, midPaste, songless, oversized }));
+    """)
+
+    # Seeded from the stored Song, interior structure and all, and the style box from `caption`.
+    assert rendered["seeded"]["lyrics"] == rendered["sheet"]
+    assert rendered["seeded"]["style"] == "synthwave, close vocal"
+    # And enabled: the markup ships all three disabled, so this is the only thing that opens them.
+    assert rendered["seeded"]["lyricsDisabled"] is False
+    assert rendered["seeded"]["styleDisabled"] is False
+    assert rendered["seeded"]["saveDisabled"] is False
+    assert rendered["seeded"]["count"] == "61 / 8,000"
+    assert rendered["seeded"]["over"] is False
+
+    # Unsaved typing survives a render it did not ask for.
+    assert rendered["midPaste"]["lyrics"] == "MID-PASTE"
+    assert rendered["midPaste"]["style"] == "synthwave, close vocal"
+
+    # A song-less project: cleared and shut, so no blank context can be PUT at a 404.
+    assert rendered["songless"]["lyrics"] == ""
+    assert rendered["songless"]["style"] == ""
+    assert rendered["songless"]["lyricsDisabled"] is True
+    assert rendered["songless"]["styleDisabled"] is True
+    assert rendered["songless"]["saveDisabled"] is True
+
+    assert rendered["oversized"]["over"] is True
+    assert "too long to save" in rendered["oversized"]["count"]
+
+
+def test_unsaved_song_context_asks_before_a_switch_and_before_a_tab_close():
+    """A lyric sheet is unsaved work, and both navigation guards now say so.
+
+    `songContextDirty` is deliberately not part of `state.dirty` -- it also decides whether an
+    incidental render may re-seed the boxes, which `state.dirty` must never do -- and `state.dirty`
+    was what gated the project-switch question and the `beforeunload` guard. So 8000 characters of
+    pasted lyrics were discarded without a word on a switch or a tab close, while three characters
+    typed into a document textarea produced a question. Both guards are fired here rather than read.
+    """
+    guards = run_workspace("""
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/000-master.wav', duration: 180, lyrics: 'stored words', caption: 'stored style' };
+      const attempt = async (flags) => {
+        state.project = { id: 'p1', shots: [], jobs: [], song };
+        Object.assign(state, { dirty: false, documentsDirty: false, shotsDirty: false, songContextDirty: false }, flags);
+        answer(false);
+        const target = { value: 'p2' };
+        await fire('#project-select:change', { target });
+        let prevented = 0;
+        fire('window:beforeunload', { preventDefault: () => { prevented += 1; } });
+        return { asked: [...asked], stayed: target.value, prevented, requested: requests.length };
+      };
+      console.log(JSON.stringify({
+        consequence: contract.UNSAVED_SONG_CONTEXT_CONSEQUENCE,
+        clean: await attempt({}),
+        songContextOnly: await attempt({ songContextDirty: true }),
+        projectOnly: await attempt({ dirty: true }),
+        both: await attempt({ dirty: true, songContextDirty: true }),
+      }));
+    """)
+
+    # Nothing unsaved: no question, and the switch is actually attempted.
+    assert guards["clean"]["asked"] == []
+    assert guards["clean"]["prevented"] == 0
+    assert guards["clean"]["requested"] >= 1
+
+    # An unsaved lyric sheet alone is enough for both guards, which is the whole finding.
+    song_context = guards["songContextOnly"]
+    assert len(song_context["asked"]) == 1
+    assert song_context["prevented"] == 1
+    assert song_context["requested"] == 0, "the switch went ahead despite the refusal"
+    assert song_context["stayed"] == "p1"
+    # And the question says why the Song workspace is involved, since "unsaved changes" reads as
+    # the project and a Director who pasted lyrics into another panel would not connect the two.
+    assert guards["consequence"] in song_context["asked"][0]
+    assert "lyric sheet" in guards["consequence"]
+
+    # An unsaved project still asks its own question, and is not told about song context it has not
+    # touched -- a consequence stated for something that did not happen teaches the Director to
+    # click through it.
+    assert len(guards["projectOnly"]["asked"]) == 1
+    assert guards["consequence"] not in guards["projectOnly"]["asked"][0]
+    assert guards["projectOnly"]["prevented"] == 1
+    assert guards["projectOnly"]["requested"] == 0
+    assert guards["consequence"] in guards["both"]["asked"][0]
+
+
+def test_a_refresh_of_the_project_on_screen_leaves_the_song_context_editors_alone():
+    """`loadProject` is the refresh path as well as the switch path.
+
+    The queue refresh, both generate paths, multiview and the batch loop all reload the project
+    already on screen. Clearing the dirty flag there lets the very next render re-seed both boxes
+    from the stored Song, so a sheet being pasted vanishes with nothing on screen to explain it --
+    and unlike a switch, none of those actions is a decision to discard anything. A real switch does
+    clear it: the Director was asked first, and the boxes belong to the project being loaded.
+    """
+    loads = run_workspace("""
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/000-master.wav', duration: 180, lyrics: 'stored words', caption: 'stored style' };
+      const typing = (id) => {
+        state.project = { id, shots: [], jobs: [], song };
+        state.songContextDirty = true;
+        at('#song-lyrics').value = 'MID-PASTE';
+      };
+      typing('p1');
+      answer(true);
+      await fire('#refresh-jobs:click', {});
+      // The render an incidental reload would have run anyway.
+      app.renderSong();
+      const refreshed = { dirty: state.songContextDirty, lyrics: at('#song-lyrics').value, asked: [...asked] };
+      typing('p1');
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      const switched = { dirty: state.songContextDirty, asked: [...asked] };
+      console.log(JSON.stringify({
+        refreshed,
+        switched,
+        sameProject: contract.songContextSeedClearedOnLoad('p1', 'p1'),
+        otherProject: contract.songContextSeedClearedOnLoad('p1', 'p2'),
+        toNoProject: contract.songContextSeedClearedOnLoad('p1', ''),
+        fromNoProject: contract.songContextSeedClearedOnLoad('', 'p2'),
+      }));
+    """)
+
+    # A refresh of the same project: nothing asked, nothing cleared, nothing overwritten.
+    assert loads["refreshed"]["asked"] == []
+    assert loads["refreshed"]["dirty"] is True
+    assert loads["refreshed"]["lyrics"] == "MID-PASTE"
+
+    # A real switch asks, and then does clear: the boxes belong to the project being loaded.
+    assert len(loads["switched"]["asked"]) == 1
+    assert loads["switched"]["dirty"] is False
+
+    assert loads["sameProject"] is False
+    for changed in ("otherProject", "toNoProject", "fromNoProject"):
+        assert loads[changed] is True, changed
+
+
+def test_saving_an_emptied_song_context_asks_before_it_deletes():
+    """The route assigns both fields from the body, and a Song keeps no previous version.
+
+    Story 2.1 gave the treatment and the style bible a `*_previous` slot each; song lyrics are the
+    largest hand-authored text this application accepts and have no way back, so the one save that
+    cannot be undone -- replacing stored text with nothing -- is the one that asks. Replacing it
+    with different text is typing, and a question on every save is a question nobody reads.
+    """
+    saves = run_workspace("""
+      const sheet = '[Verse 1]\\n\\n    counting sodium lights\\n\\n[Chorus]\\nHold the line';
+      const song = { title: 'Spine', source: 'imported', path: 'media/songs/000-master.wav', duration: 180, lyrics: sheet, caption: 'synthwave, close vocal' };
+      const context = () => requests.filter((sent) => sent.path.includes('/song/context'));
+      state.project = { id: 'p1', shots: [], jobs: [], song };
+      state.songContextDirty = false;
+      app.renderSong();
+      // The Director empties the lyric box and saves.
+      at('#song-lyrics').value = '';
+      state.songContextDirty = true;
+      answer(false);
+      await fire('#save-song-context:click', {});
+      const refused = { asked: [...asked], sent: context().length, dirty: state.songContextDirty };
+      answer(true);
+      await fire('#save-song-context:click', {});
+      const accepted = { asked: [...asked], sent: context() };
+      // Replacing a sheet with a different sheet is ordinary typing.
+      at('#song-lyrics').value = 'A replacement sheet.';
+      answer(false);
+      await fire('#save-song-context:click', {});
+      const replacing = { asked: [...asked], sent: context().length };
+      console.log(JSON.stringify({
+        refused, accepted, replacing,
+        consequence: contract.SONG_CONTEXT_CLEARING_CONSEQUENCE,
+        bothFields: contract.songContextClearing(song, { lyrics: '', caption: '   ' }),
+        neither: contract.songContextClearing(song, { lyrics: sheet, caption: 'other words' }),
+        nothingStored: contract.songContextClearing({ lyrics: '', caption: '' }, { lyrics: '', caption: '' }),
+      }));
+    """)
+
+    # Refused: the question was asked, and nothing was sent.
+    assert len(saves["refused"]["asked"]) == 1
+    assert "lyric sheet" in saves["refused"]["asked"][0]
+    assert saves["consequence"] in saves["refused"]["asked"][0]
+    assert "no previous version" in saves["consequence"]
+    assert saves["refused"]["sent"] == 0
+    # The text on screen is still the only copy, so the dirty flag must survive the refusal.
+    assert saves["refused"]["dirty"] is True
+
+    # Accepted: asked once, and then sent -- carrying the emptied field and the untouched one.
+    assert len(saves["accepted"]["asked"]) == 1
+    assert len(saves["accepted"]["sent"]) == 1
+    sent = saves["accepted"]["sent"][0]
+    assert sent["method"] == "PUT"
+    assert json.loads(sent["body"]) == {"lyrics": "", "caption": "synthwave, close vocal"}
+
+    # A replacement is not a deletion: no question, and it goes.
+    assert saves["replacing"]["asked"] == []
+    assert saves["replacing"]["sent"] == 1
+
+    assert saves["bothFields"] == ["lyric sheet", "style description"]
+    assert saves["neither"] == []
+    assert saves["nothingStored"] == []
+
+
+def test_the_song_context_boxes_count_against_the_bound_instead_of_truncating_at_it():
+    """One bound, one enforcer, and four boxes that report where the text stands against it.
+
+    These four carried `maxlength` equal to the route's limit, which is not the same behaviour as
+    the route's: `maxlength` drops the tail of an oversized paste in the browser and says nothing,
+    so a Director pasting a long sheet saved one ending mid-line while an API client sending the
+    identical text got a 422 naming its length. The bound now belongs to the route alone -- which is
+    what makes the two consistent -- and the counters are what stop the refusal being a surprise.
+    """
+    numbers = run_module("""
+      import { SONG_CONTEXT_COUNTS, SONG_CONTEXT_LIMITS, songContextCount }
+        from './src/music_video_producer/web/assets/api.js';
+      const sheet = (n) => 'x'.repeat(n);
+      console.log(JSON.stringify({
+        counts: SONG_CONTEXT_COUNTS,
+        limits: SONG_CONTEXT_LIMITS,
+        under: songContextCount(sheet(SONG_CONTEXT_LIMITS.lyrics - 1), SONG_CONTEXT_LIMITS.lyrics),
+        exact: songContextCount(sheet(SONG_CONTEXT_LIMITS.lyrics), SONG_CONTEXT_LIMITS.lyrics),
+        over: songContextCount(sheet(SONG_CONTEXT_LIMITS.lyrics + 1), SONG_CONTEXT_LIMITS.lyrics),
+        padded: songContextCount('\\n\\n  ' + sheet(SONG_CONTEXT_LIMITS.lyrics) + '  \\n\\t', SONG_CONTEXT_LIMITS.lyrics),
+        empty: songContextCount(undefined, SONG_CONTEXT_LIMITS.caption),
+      }));
+    """)
+
+    # The numbers the counters use are the route's own, or they report a bound nothing enforces.
+    assert numbers["limits"] == {"lyrics": SONG_LYRICS_LIMIT, "caption": SONG_CAPTION_LIMIT}
+    # The boundary is exactly the route's: `len(text) > limit` refuses, so `limit` itself is fine.
+    assert numbers["under"]["over"] is False
+    assert numbers["exact"]["over"] is False
+    assert numbers["over"]["over"] is True
+    # Measured after the trim, exactly as `_song_context` bounds after `.strip()` -- otherwise a
+    # sheet pasted with a trailing page of newlines is reported oversized and then accepted.
+    assert numbers["padded"]["over"] is False
+    assert numbers["padded"]["length"] == SONG_LYRICS_LIMIT
+    assert numbers["empty"]["length"] == 0
+    # The verdict is in the text, not only in a colour a Director may not be looking at.
+    assert "too long to save" in numbers["over"]["label"]
+    assert "too long to save" not in numbers["exact"]["label"]
+
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    limits = {
+        "#import-lyrics": SONG_LYRICS_LIMIT,
+        "#song-lyrics": SONG_LYRICS_LIMIT,
+        "#import-style": SONG_CAPTION_LIMIT,
+        "#song-style": SONG_CAPTION_LIMIT,
+    }
+    assert {control["field"]: control["limit"] for control in numbers["counts"]} == limits
+
+    for control in numbers["counts"]:
+        field = re.search(rf'<textarea id="{control["field"][1:]}"[^>]*>', markup)
+        assert field, control["field"]
+        # Nothing may truncate a paste in the browser: the tail it drops is gone with no message.
+        assert "maxlength" not in field.group(0), control["field"]
+        # And every box has somewhere to write its count, or the count is written into nothing.
+        assert f'id="{control["count"][1:]}"' in markup, control["count"]
 
 
 def test_song_change_consequence_names_shot_windows_and_assembly_sync():

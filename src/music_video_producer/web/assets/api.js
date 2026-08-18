@@ -126,6 +126,125 @@ export function songImportDuration(pending = {}) {
   return Number.isFinite(duration) && duration > 0 ? duration : 0;
 }
 
+// Pure decision: what a Song's context fields carry, from whatever the Director typed into them.
+//
+// Two arguments in a fixed order, and the *style* description lands on `caption` — the field both
+// generation paths already use for the sonic and stylistic direction of a song. Crossing the two
+// is the failure this function exists to make testable: a lyric sheet stored as the style summary
+// would reach the Director as a description of how the song sounds, and the style description
+// stored as lyrics would be read as the words being sung. Nothing about that is visible on screen,
+// so it is executed as a test rather than grepped for.
+//
+// Edges only, exactly as `musicGenerationPlan` trims a supplied lyric sheet and as the server's
+// `_song_context` does: interior blank lines, indentation and section tags are the structure of a
+// sheet, and a whitespace-only field is an absent one rather than a stored blank line.
+export function songContextFields(lyrics, style) {
+  return { lyrics: String(lyrics ?? "").trim(), caption: String(style ?? "").trim() };
+}
+
+// True when this project's Song context can be edited at all. The controls read a Song that is
+// not there as "" and would then PUT a blank context at a route that 404s, so the answer is the
+// enabled state of the whole block rather than a check inside the save handler.
+export function songContextEditable(project) {
+  return Boolean(project?.song);
+}
+
+// The bounds `_song_context` enforces, mirrored from app.py's SONG_LYRICS_LIMIT and
+// SONG_CAPTION_LIMIT and asserted equal to them by tests/test_frontend_contract.py.
+//
+// Held here rather than as a `maxlength` on the four textareas, which is what they carried before.
+// `maxlength` truncates a paste at the client and says nothing: a Director pasting an oversized
+// lyric sheet lost the tail silently and saved a sheet ending mid-line, while an API client sending
+// the identical text got a 422 naming the length. One bound, enforced in one place — the route —
+// and these numbers exist only to tell the Director where they stand against it before the click.
+export const SONG_CONTEXT_LIMITS = { lyrics: 8_000, caption: 4_000 };
+
+// Every bounded song-context control: the box, the element its count is written into, and which
+// bound applies to it. One table because there are four boxes across two blocks, and a counter
+// wired to the wrong bound would report a lyric sheet safe at 6000 characters or a style line
+// oversized at 5000.
+export const SONG_CONTEXT_COUNTS = [
+  { field: "#import-lyrics", count: "#import-lyrics-count", limit: SONG_CONTEXT_LIMITS.lyrics },
+  { field: "#import-style", count: "#import-style-count", limit: SONG_CONTEXT_LIMITS.caption },
+  { field: "#song-lyrics", count: "#song-lyrics-count", limit: SONG_CONTEXT_LIMITS.lyrics },
+  { field: "#song-style", count: "#song-style-count", limit: SONG_CONTEXT_LIMITS.caption },
+];
+
+// What one bounded box's counter says, and whether what is in it can be saved at all.
+//
+// Measured on the *trimmed* text because that is what the route measures — `_song_context` bounds
+// after `.strip()` — so a sheet pasted with a trailing page of newlines is neither reported as
+// oversized here nor refused there. The verdict is in the text rather than only in a colour: a
+// count that merely turns red is not a message to a Director who is not looking at it.
+export function songContextCount(value, limit) {
+  const length = String(value ?? "").trim().length;
+  const counted = `${length.toLocaleString("en-US")} / ${limit.toLocaleString("en-US")}`;
+  return { length, limit, over: length > limit, label: length > limit ? `${counted} — too long to save` : counted };
+}
+
+// Every kind of unsaved work the two navigation guards must answer for, in one predicate.
+//
+// `state.dirty` covers what the project save writes. The Song context is saved by its own button
+// through its own route, so it was invisible to both guards: an 8000-character lyric sheet typed
+// and not saved was discarded without a question on a project switch and on a tab close, while
+// three characters typed into a document textarea produced one.
+//
+// `songContextDirty` stays a separate flag rather than folding into `state.dirty`, because it
+// answers a second question no other flag answers — whether an incidental `renderSong`, such as the
+// audio element's `loadedmetadata`, may re-seed the editors from the stored Song. Folded in, it
+// would also make `saveProject` clear it and re-seed a sheet mid-paste.
+export function unsavedWorkPending(state) {
+  return Boolean(state?.dirty || state?.songContextDirty);
+}
+
+// Why a discard question has anything to do with the Song workspace. Named separately from the
+// project save because "unsaved changes" reads as the project, and a Director who has just pasted
+// a lyric sheet into a different panel has no reason to connect the two.
+export const UNSAVED_SONG_CONTEXT_CONSEQUENCE =
+  "The lyric sheet and style description in the Song workspace are saved by their own button. " +
+  "Anything typed into them and not saved is discarded.";
+
+// The discard question, stated for what is actually unsaved.
+export function unsavedWorkQuestion(question, state) {
+  return state?.songContextDirty ? `${question}\n\n${UNSAVED_SONG_CONTEXT_CONSEQUENCE}` : question;
+}
+
+// Which project loads may re-seed the Song context editors from the loaded project — which means
+// discarding whatever is in them. True only when the project actually changes, for the same reason
+// `documentConsentClearedOnLoad` exists: most of `loadProject`'s callers are refreshes of the
+// project already on screen — the queue refresh, both generate paths, multiview, the queue-ready
+// loop — and clearing the dirty flag there lets the very next render overwrite a sheet the Director
+// is part-way through pasting, with nothing on screen to explain where it went. A real switch is
+// guarded by the discard question, so re-seeding there is the Director's own answer.
+export function songContextSeedClearedOnLoad(currentProjectId, nextProjectId) {
+  return (currentProjectId || null) !== (nextProjectId || null);
+}
+
+// Which stored song-context fields a save would delete outright.
+//
+// The route assigns both fields from the body, so saving with an empty box deletes what is stored —
+// and unlike the two creative documents, which Story 2.1 gave `treatment_previous` and
+// `style_bible_previous`, a Song keeps no earlier copy. Nothing can bring a deleted lyric sheet
+// back, and it is the largest hand-authored text this application accepts.
+//
+// Asked only for that unrecoverable case: text that exists being replaced with nothing. Editing a
+// sheet down to *different* text is typing, and a question about every save would train the
+// Director to click through the one question that protects real work.
+export function songContextClearing(song, context) {
+  const cleared = [];
+  if (song?.lyrics?.trim() && !context?.lyrics?.trim()) cleared.push("lyric sheet");
+  if (song?.caption?.trim() && !context?.caption?.trim()) cleared.push("style description");
+  return cleared;
+}
+
+export const SONG_CONTEXT_CLEARING_CONSEQUENCE =
+  "A song keeps no previous version of its context, so this cannot be restored the way a replaced " +
+  "treatment or style bible can. Nothing else about the song changes: not the audio, its length or its provenance.";
+
+export function songContextClearingQuestion(cleared) {
+  return `Save this? It deletes the stored ${cleared.join(" and ")} for this song.\n\n${SONG_CONTEXT_CLEARING_CONSEQUENCE}`;
+}
+
 // True when a rejection is the Song gate refusing an unacknowledged change, which the
 // client can recover from by refreshing and asking again -- as opposed to any other
 // error, where a refresh would tell the Director nothing new. Keyed on the server's
@@ -900,6 +1019,9 @@ export const api = {
   restoreDocument: (id, document) => request(`/api/projects/${id}/documents/${document}/restore`, { method: "POST" }),
   saveShots: (id, shots) => request(`/api/projects/${id}/shots`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ shots }) }),
   uploadSong: (id, data) => request(`/api/projects/${id}/songs/upload`, { method: "POST", body: data }),
+  // Its own route, and it carries only the two context fields: the audio, the duration and the
+  // provenance are not editable text, so nothing that could overwrite them is on the wire.
+  saveSongContext: (id, context) => request(`/api/projects/${id}/song/context`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(context) }),
   // The flag is the Director's acknowledgement, so it is passed through rather than
   // hardcoded: a caller that never showed SONG_CHANGE_CONSEQUENCE must not claim it did.
   removeSong: (id, confirmed = false) => request(`/api/projects/${id}/song?confirm_song_replacement=${confirmed ? "true" : "false"}`, { method: "DELETE" }),

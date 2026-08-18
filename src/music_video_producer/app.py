@@ -41,6 +41,7 @@ from .timeline import (
     ordered_shots,
 )
 from .workflows import (
+    H3_DEFAULT_PROFILE,
     WorkflowCatalog,
     build_flux_payload,
     build_h3_director_payload,
@@ -567,6 +568,22 @@ class SongPlannerRequest(BaseModel):
     confirm_song_replacement: bool = False
 
 
+class SongContextRequest(BaseModel):
+    """What a Song is, as opposed to where its audio lives.
+
+    Deliberately only these two fields. A body that could carry `path`, `duration`, `source` or
+    `prompt_id` would be a Song replacement wearing an edit's name, and the route that binds it
+    could not tell the difference — the audio and the provenance are not editable text, so they
+    are not on the wire at all. Both are plain defaults rather than tri-state: an omitted field
+    blanks its half, which is what makes clearing a wrong lyric sheet possible. The bounds are
+    enforced in the route by `_song_context`, shared with the import, so one sheet cannot be
+    accepted by one door and refused by the other.
+    """
+
+    lyrics: str = ""
+    caption: str = ""
+
+
 class FluxRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     kind: Literal["character", "setting", "prop", "style", "image"] = "image"
@@ -610,8 +627,20 @@ class TimelineCompileResponse(BaseModel):
 class H3Request(BaseModel):
     width: int = Field(default=1344, ge=256, le=2048, multiple_of=32)
     height: int = Field(default=768, ge=256, le=2048, multiple_of=32)
-    steps: int = Field(default=20, ge=1, le=100)
+    # `None` rather than 20 so an omitted count is distinguishable from one the Director
+    # typed. The reference profiles carry different step counts — 20 for the audited
+    # export's graph, 4 for the turbo bundle — and a literal default here would silently
+    # send 20 steps into a 4-step LoRA bundle for every caller who never touched the field.
+    # An omitted count falls through to the profile's own; the text-only Director path,
+    # which takes no profile, falls through to `H3_DIRECTOR_DEFAULT_STEPS` — the same 20
+    # it defaulted to here before.
+    steps: int | None = Field(default=None, ge=1, le=100)
     ref_image_size: Literal["match", "max"] = "match"
+    # The literal is spelled out rather than derived from `H3_REFERENCE_PROFILES`, because
+    # a `Literal` is what puts the choices in `/openapi.json` and turns an unknown value
+    # into a 422 before any payload is built. `tests/test_api.py` asserts the two lists
+    # agree, so a profile added to the builder and not offered here fails loudly.
+    profile: Literal["default", "turbo"] = "default"
 
 
 # A flag a client omits and a flag a client sends as `null` mean the same thing — "I am not
@@ -715,6 +744,61 @@ def _browser_reported_duration(duration: float) -> float:
     if not math.isfinite(duration) or duration <= 0 or duration > MAX_IMPORTED_SONG_SECONDS:
         return 0.0
     return duration
+
+
+# What a Song's two context fields are called when a refusal has to name one, and the longest
+# either may be.
+#
+# Both ceilings are the ones the generation routes already impose on the very same two fields —
+# `SongPlannerRequest.lyrics` caps a supplied lyric sheet at 8000 characters and its `idea`, which
+# lands on `Song.caption`, at 4000. An imported Song and a generated one are the same record, read
+# by the same Director context, so a second pair of numbers here would mean a sheet that can be
+# generated but not imported, or the reverse. They exist to reject nonsense — a pasted novel, a
+# whole album — not to legislate lyric length.
+SONG_LYRICS_FIELD = "The lyric sheet"
+SONG_LYRICS_LIMIT = 8_000
+SONG_CAPTION_FIELD = "The style description"
+SONG_CAPTION_LIMIT = 4_000
+
+# The one wording for an oversized field, shared by the import and the edit. It says what was *not*
+# done, because both callers reach this before anything is written: an import that refuses here has
+# copied no audio and left the previous Song exactly as it was, and an edit has changed nothing.
+SONG_CONTEXT_TOO_LONG = (
+    "{field} is {length} characters, past the {limit} this application stores for it. Nothing was "
+    "saved: no audio was written and the song was not changed. Shorten it and try again."
+)
+
+# Why the edit route has nothing to edit. Its own sentence rather than a bare 404, because the
+# remedy differs from every other missing-thing here: import or generate a song first.
+SONG_CONTEXT_WITHOUT_SONG = (
+    "This project has no song, so there is no song context to change. Import or generate a song "
+    "first; an import can carry its lyric sheet and style description with it."
+)
+
+
+def _song_context(value: str, limit: int, field: str) -> str:
+    """One field of a Song's context: trimmed at the edges only, and bounded.
+
+    Leading and trailing whitespace goes and nothing else does. Interior blank lines, indentation
+    and section tags are the *structure* of a lyric sheet, and the known-lyrics generation path
+    already treats them that way (`SongPlannerRequest.lyrics` is `strip_whitespace=True` and
+    nothing more) — a second, tidier contract here would mean the same sheet stored two different
+    ways depending on which door it came through.
+
+    Nothing is parsed. A section tag in a supplied sheet looks like timing information and is not;
+    reading structure out of it here would create a second, worse source of truth for something a
+    song analyser should own.
+
+    The bound is measured after the trim, so a sheet that only *looks* oversized because it was
+    pasted with a trailing page of newlines is accepted rather than refused for whitespace.
+    """
+    text = value.strip()
+    if len(text) > limit:
+        raise HTTPException(
+            status_code=422,
+            detail=SONG_CONTEXT_TOO_LONG.format(field=field, length=len(text), limit=limit),
+        )
+    return text
 
 
 def _vision_media(path: Path) -> tuple[bytes, str]:
@@ -942,6 +1026,14 @@ def create_app(
         title: Annotated[str, Form()],
         duration: Annotated[float, Form()] = 0,
         confirm_song_replacement: Annotated[bool, Form()] = False,
+        # The two things the Director already has about a finished track, carried into the fields
+        # that exist for them. Both optional: an import that sends neither behaves exactly as every
+        # import did before they existed. `caption` rather than a new "style" field because both
+        # generation paths already use `caption` for precisely this — the sonic and stylistic
+        # direction of the song — and a second field meaning the same thing would need its own
+        # answer to which one the Director's context should believe.
+        lyrics: Annotated[str, Form()] = "",
+        caption: Annotated[str, Form()] = "",
     ) -> Project:
         project = get_project(project_id)
         # Before `_copy_upload`: a refusal must not have written anything, or it is not a
@@ -950,6 +1042,10 @@ def create_app(
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in {".wav", ".mp3", ".flac"}:
             raise HTTPException(status_code=415, detail="Song must be WAV, MP3, or FLAC")
+        # Ahead of the copy for the same reason the confirmation gate is: an oversized lyric sheet
+        # must not leave a written file and a half-done import behind it.
+        song_lyrics = _song_context(lyrics, SONG_LYRICS_LIMIT, SONG_LYRICS_FIELD)
+        song_caption = _song_context(caption, SONG_CAPTION_LIMIT, SONG_CAPTION_FIELD)
         songs_dir = store.media_dir(project_id) / "songs"
         songs_dir.mkdir(parents=True, exist_ok=True)
         filename = _safe_filename(file.filename or f"song{suffix}")
@@ -972,7 +1068,37 @@ def create_app(
             source="imported",
             path=target.relative_to(store.project_dir(project_id)).as_posix(),
             duration=resolved_duration,
+            lyrics=song_lyrics,
+            caption=song_caption,
         )
+        return store.save(project)
+
+    @app.put("/api/projects/{project_id}/song/context", response_model=Project)
+    def replace_song_context(project_id: str, request: SongContextRequest) -> Project:
+        """Set the lyric sheet and style description of the Song this project already has.
+
+        Correcting after the fact, so a Director who imported yesterday is not made to re-import a
+        finished master to say what it is. The Song's audio is the one thing this must not touch:
+        `path`, `duration`, `source` and `prompt_id` are never assigned here, and the two fields
+        are written onto the *stored* Song rather than a rebuilt one, so there is no construction
+        site where a provenance field could be defaulted away.
+
+        Both fields are assigned from the body, exactly as `PUT /documents` assigns its text: an
+        omitted field is a blank one. That is what makes clearing a wrong lyric sheet possible at
+        all, and the client sends both every time. It is also why nothing here is a Song
+        *replacement* — the timing spine is untouched, so `_require_song_replacement_confirmation`
+        has nothing to protect and asking for an acknowledgement would be theatre.
+
+        Both values are computed before either is assigned, so a refusal over the second field
+        cannot leave the first one applied.
+        """
+        project = get_project(project_id)
+        if project.song is None:
+            raise HTTPException(status_code=404, detail=SONG_CONTEXT_WITHOUT_SONG)
+        song_lyrics = _song_context(request.lyrics, SONG_LYRICS_LIMIT, SONG_LYRICS_FIELD)
+        song_caption = _song_context(request.caption, SONG_CAPTION_LIMIT, SONG_CAPTION_FIELD)
+        project.song.lyrics = song_lyrics
+        project.song.caption = song_caption
         return store.save(project)
 
     @app.delete("/api/projects/{project_id}/song", response_model=Project)
@@ -1417,13 +1543,38 @@ def create_app(
                     seed=shot.seed,
                     width=request.width,
                     height=request.height,
+                    # `None` when the request omitted it, which the builder reads as
+                    # "use the profile's own count" — see `H3Request.steps`.
                     steps=request.steps,
                     ref_image_size=request.ref_image_size,
+                    profile=request.profile,
                     prefix=f"music-video-producer/{project_id}/shots/{shot.id}-h3-reference",
                 )
             except ValueError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
         else:
+            # A sampling profile names a *reference*-graph configuration, and this branch
+            # builds the text-only Director graph, which has no evidenced profile: it loads
+            # a different checkpoint pair through `MiniMaxH3DirectorCS`, and the installed
+            # generic H3 turbo LoRAs are not the `ref2v` one the turbo profile applies.
+            #
+            # Refused rather than ignored, which is the whole reason this is here. The
+            # profile field is on the request model *both* branches bind, so a Director who
+            # ticked turbo on a Shot with no references would otherwise get a 202 and a
+            # full-price 20-step no-LoRA render — indistinguishable afterwards from a
+            # default one, with nothing anywhere recording that the request was not
+            # honoured. A GPU job logged under a configuration that was never applied is
+            # worse than a refusal, because only the refusal is visible.
+            if request.profile != H3_DEFAULT_PROFILE:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"The {request.profile!r} sampling profile applies to reference "
+                        f"shots only. {shot_label(project, shot)} has no references, so it "
+                        f"renders through the text-only Director graph, which has no "
+                        f"evidenced profile. Attach a reference or drop the profile."
+                    ),
+                )
             try:
                 timeline = build_director_timeline(
                     [shot], window_start=shot.start, window_duration=shot.duration, fps=24

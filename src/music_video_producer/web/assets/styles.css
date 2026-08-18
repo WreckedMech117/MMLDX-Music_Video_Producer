@@ -81,6 +81,11 @@ h2 { margin-bottom: 10px; font-size: 16px; font-weight: 620; }
 .block-heading span { color: var(--dim); font-size: 11px; }
 label { display: grid; gap: 6px; margin-bottom: 12px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .03em; }
 label > span { color: var(--dim); }
+/* How much of a bounded field's limit the text in it uses. The song-context boxes carry no
+   `maxlength` -- it truncated a paste silently -- so this is where a Director sees an oversized
+   sheet before the route refuses it. `.over` is the same amber the production note uses. */
+.field-count { justify-self: end; color: var(--dim); font: 10px Consolas, monospace; letter-spacing: .04em; }
+.field-count.over { color: var(--amber); }
 input, textarea, select { width: 100%; border: 1px solid var(--line); border-radius: 5px; background: #101212; padding: 9px 10px; color: var(--ink); font-size: 13px; }
 input, select { height: 38px; }
 textarea { resize: vertical; line-height: 1.45; }
@@ -110,6 +115,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .analysis-strip > div:last-child { border-right: 0; }
 .analysis-strip span { display: block; margin-bottom: 5px; color: var(--dim); font-size: 10px; text-transform: uppercase; }
 .analysis-strip strong { font-size: 13px; font-weight: 550; }
+.song-context { padding: 15px 18px; border-bottom: 1px solid var(--line); }
+.song-context .block-heading { margin-bottom: 11px; }
 .production-note { display: grid; grid-template-columns: 120px 1fr; gap: 20px; padding: 14px 18px; }
 .production-note span { color: var(--amber); font: 10px Consolas, monospace; letter-spacing: .09em; }
 .production-note p { margin: 0; color: var(--muted); font-size: 12px; }

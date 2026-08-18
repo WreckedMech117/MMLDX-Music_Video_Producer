@@ -27,8 +27,24 @@ considered; a failed promotion spends the second job on nothing, so it does not 
 
 ``duration=3.75`` rather than a round 4 s: the reference builder pads to the 17k+5 grid, so
 4.0 s becomes 107 frames and 4.458 s while 3.75 s is exactly 90 frames and a measured 3.750 s
-the assertion needs no allowance for. The requested geometry is 640x384 at 4 steps -- the
-cheapest window that still proves the path.
+the assertion needs no allowance for. The requested geometry is 640x384.
+
+The **step count is taken from the sampling profile, not chosen here.** The first run of this
+script hardcoded a 4-step override against the default profile -- a 20-step graph with no
+LoRA -- and produced a badly undersampled frame that said nothing about the path's picture
+quality. Four steps is what the *turbo* profile's LoRA bundle was trained for, so this run
+names ``turbo`` and lets the profile supply its own count. Anyone wanting the audited
+20-step graph should switch ``RENDER_PROFILE`` rather than the number: the two travel
+together, and a step count typed in here is exactly the mistake that is not worth repeating.
+
+**What was sampled is read back from ComfyUI, not asserted from the constants.** After the
+job settles this reads ``/history/{prompt_id}`` and reports the LoRA, strength, scheduler,
+sampler and step count out of the graph the server recorded, beside what the profile
+declares. A profile that was accepted and then silently dropped would otherwise produce a
+run that completes, measures correctly, and prints ``turbo`` over a render that used none.
+The read is best-effort -- the render has already been measured by then, so a failed
+supplementary read is recorded as a gap rather than treated as a failed run -- but a
+mismatch it *can* see is fatal.
 
 The staged media is the project's real asset library under ComfyUI's ``input/music-video/``
 rather than anything this script invents: the character image from ``characters/`` and the
@@ -92,7 +108,7 @@ from smoke_songplanner_app import (
 
 from music_video_producer.config import Settings
 from music_video_producer.timeline import align_h3_frames
-from music_video_producer.workflows import H3_FRAME_RATE
+from music_video_producer.workflows import H3_FRAME_RATE, H3_REFERENCE_PROFILES
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8766"
 PROJECT_NAME = "H3 Reference Smoke QA"
@@ -129,7 +145,16 @@ EXPECTED_FRAMES = 90
 SHOT_SEED = 20260819
 RENDER_WIDTH = 640
 RENDER_HEIGHT = 384
-RENDER_STEPS = 4
+#: Which evidenced sampling bundle this run submits. The route takes the name; the step
+#: count below is read back from the same table only so the printed record can say what was
+#: requested. Nothing here sends a step count, so the server's answer and this number cannot
+#: disagree -- and changing the profile changes both together, which is the whole point.
+RENDER_PROFILE = "turbo"
+RENDER_STEPS = H3_REFERENCE_PROFILES[RENDER_PROFILE].steps
+#: The body the render submission sends, named rather than inlined so a test can assert it
+#: carries a profile and **no** step count without opening a socket. A `steps` key here is
+#: the defect this story removed.
+RENDER_REQUEST = {"width": RENDER_WIDTH, "height": RENDER_HEIGHT, "profile": RENDER_PROFILE}
 
 #: The master song: the real track from the asset library, imported through the shipped route.
 #: `use_song_audio` on the Shot is what appends it as a further audio reference, so this is the
@@ -208,6 +233,76 @@ def run_preflight(comfy_url: str) -> None:
             abort("pre-flight reported a problem; nothing was submitted")
     finally:
         sys.argv = saved
+
+
+def graph_from_history(entry: Any) -> tuple[dict, str]:
+    """The graph ComfyUI recorded for one prompt, or ``({}, reason)``.
+
+    ComfyUI stores ``entry["prompt"]`` as ``[number, prompt_id, graph, extra_data,
+    outputs_to_execute]``. The graph is found by *shape* -- the one member that is a
+    mapping of nodes carrying ``class_type`` -- rather than by index, so a changed tuple
+    layout degrades to a reported reason instead of raising, or worse, silently reading
+    the wrong dict as a graph.
+    """
+    if not isinstance(entry, dict):
+        return {}, f"history entry is {type(entry).__name__}, not an object"
+    parts = entry.get("prompt")
+    if not isinstance(parts, list):
+        return {}, "history entry carries no prompt list"
+    for part in parts:
+        if isinstance(part, dict) and any(
+            isinstance(node, dict) and "class_type" in node for node in part.values()
+        ):
+            return part, ""
+    return {}, "the history entry's prompt carries no node graph"
+
+
+def submitted_sampling(graph: dict) -> dict[str, Any]:
+    """What was *actually* sampled, read out of the graph ComfyUI recorded.
+
+    The point of reading it back rather than printing `H3_REFERENCE_PROFILES[...]` is that
+    the constants describe what the profile *means*, not what the server built. A profile
+    that never reached the builder -- silently dropped, or applied to a graph that has no
+    profile -- would leave the constants saying `turbo` over a render that used none, and
+    the record would be a confident lie about a GPU job. These values come from the
+    submission itself, so they cannot disagree with it.
+
+    A class appearing more than once makes its entry empty rather than picking the first:
+    this graph has exactly one scheduler, one sampler and at most one LoRA, so two is a
+    graph this function does not understand and must not summarise.
+    """
+    def only(class_type: str) -> dict:
+        found = [
+            node.get("inputs", {})
+            for node in graph.values()
+            if isinstance(node, dict) and node.get("class_type") == class_type
+        ]
+        return found[0] if len(found) == 1 and isinstance(found[0], dict) else {}
+
+    lora, scheduler, sampler = only("LoraLoaderModelOnly"), only("BasicScheduler"), only("KSamplerSelect")
+    return {
+        "lora": lora.get("lora_name", ""),
+        "lora_strength": lora.get("strength_model"),
+        "scheduler": scheduler.get("scheduler", ""),
+        "sampler": sampler.get("sampler_name", ""),
+        "steps": scheduler.get("steps"),
+    }
+
+
+def profile_declares(name: str) -> dict[str, Any]:
+    """The same five fields as ``submitted_sampling``, from the adapter's own constants.
+
+    Printed next to the submitted ones so the record shows both and the comparison is
+    visible rather than asserted out of view.
+    """
+    profile = H3_REFERENCE_PROFILES[name]
+    return {
+        "lora": profile.lora or "",
+        "lora_strength": profile.lora_strength,
+        "scheduler": profile.scheduler,
+        "sampler": profile.sampler,
+        "steps": profile.steps,
+    }
 
 
 def choose_probe_target(output_files: list[str]) -> tuple[str, str]:
@@ -384,8 +479,8 @@ def write_shot(base_url: str, project_id: str, child_asset_id: str) -> dict[str,
 def submit_reference(base_url: str, project_id: str, shot_id: str) -> dict[str, Any]:
     """Submit the reference render. **This is the second of the two authorised GPU jobs.**"""
     note(
-        f"submitting the reference render at {RENDER_WIDTH}x{RENDER_HEIGHT} and "
-        f"{RENDER_STEPS} steps -- GPU spend (job 2 of 2)"
+        f"submitting the reference render at {RENDER_WIDTH}x{RENDER_HEIGHT} on the "
+        f"{RENDER_PROFILE!r} profile ({RENDER_STEPS} steps) -- GPU spend (job 2 of 2)"
     )
     path = f"/api/projects/{project_id}/shots/{shot_id}/generate/h3"
     return expect_object(
@@ -393,7 +488,9 @@ def submit_reference(base_url: str, project_id: str, shot_id: str) -> dict[str, 
             base_url,
             path,
             method="POST",
-            payload={"width": RENDER_WIDTH, "height": RENDER_HEIGHT, "steps": RENDER_STEPS},
+            # No `steps`: the profile carries its own, and an override here is what
+            # undersampled the first run. See the module docstring.
+            payload=RENDER_REQUEST,
         ),
         where=f"POST {path}",
         keys=("id", "prompt_id", "status"),
@@ -482,13 +579,14 @@ def run(base_url: str, ffprobe: str, output_root: Path, record: dict[str, Any]) 
         "job_id": job["id"],
         "prompt_id": job.get("prompt_id", ""),
         "seed": job.get("seed"),
+        # Exactly the body that was POSTed, and nothing inferred. What the profile *means*
+        # is reported separately below, next to what the server actually built.
         "requested": {
-            "width": RENDER_WIDTH,
-            "height": RENDER_HEIGHT,
-            "steps": RENDER_STEPS,
+            **RENDER_REQUEST,
             "duration_seconds": SHOT_DURATION_SECONDS,
             "frames": EXPECTED_FRAMES,
         },
+        "profile_declares": profile_declares(RENDER_PROFILE),
     }
     record["reference_render"] = render
     note(f"  render job {job['id']} prompt {job.get('prompt_id')}")
@@ -502,6 +600,28 @@ def run(base_url: str, ffprobe: str, output_root: Path, record: dict[str, Any]) 
         probe_target=target,
         probe_target_reason=reason,
     )
+
+    # What the server actually built for this prompt, read back out of ComfyUI's own
+    # record. `tolerant=True` because the render has already happened and been measured: a
+    # supplementary read that fails is a gap in the record, not a reason to discard the
+    # run -- and the reason it failed travels into the JSON block either way. Read before
+    # the completion check so a *failed* render still says what was submitted, which is
+    # exactly when that is worth knowing.
+    comfy_url = str(record.get("comfy_url", "")).rstrip("/")
+    prompt_id = str(job.get("prompt_id") or "")
+    history = (
+        request(comfy_url, f"/history/{prompt_id}", tolerant=True)
+        if comfy_url and prompt_id
+        else None
+    )
+    graph, why = graph_from_history(
+        history.get(prompt_id) if isinstance(history, dict) else history
+    )
+    render["submitted_sampling"] = submitted_sampling(graph) if graph else {}
+    render["submitted_sampling_source"] = (
+        f"ComfyUI /history/{prompt_id}" if graph else f"unavailable: {why}"
+    )
+
     if job["status"] != "complete":
         fail(
             record,
@@ -555,6 +675,19 @@ def run(base_url: str, ffprobe: str, output_root: Path, record: dict[str, Any]) 
     }
     emit(record)
 
+    # The profile reached the graph, or it did not. Nothing else in this run would notice:
+    # a profile that was accepted and silently dropped produces a render that completes,
+    # measures correctly, and is indistinguishable from the default one afterwards.
+    submitted = render["submitted_sampling"]
+    if not submitted:
+        note(f"  sampling not confirmed: {render['submitted_sampling_source']}")
+    elif submitted != render["profile_declares"]:
+        abort(
+            f"the {RENDER_PROFILE!r} profile was requested but ComfyUI recorded "
+            f"{json.dumps(submitted)} where the profile declares "
+            f"{json.dumps(render['profile_declares'])}, so the render is not the "
+            f"configuration this run claims to have measured"
+        )
     if not video.get("present"):
         abort("the completed output carries no video stream")
     if not measured.get("decodable"):

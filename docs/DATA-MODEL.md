@@ -20,10 +20,18 @@ The recoverable source of truth is `data/projects/<project-id>/project.json`.
 - `source`: `imported` or `generated`
 - `path`: project-relative upload or Comfy output-relative media path
 - `duration`
-- `lyrics`, `caption`
+- `lyrics`, `caption` — the song's own words and a short description of how it sounds. Both are optional, both reach the Director's context, and both are now reachable from either source: a generation path writes them from the request, and an import can carry them on the upload form or have them set afterwards through `PUT /api/projects/{id}/song/context`
 - `prompt_id` for generated songs
 
 Imported and generated songs have equal project status.
+
+`lyrics` and `caption` are stored exactly as supplied apart from leading and trailing whitespace: interior blank lines, indentation and section tags are the structure of a lyric sheet and are kept byte for byte. **Nothing parses, sections or interprets them.** A section tag in a supplied sheet looks like timing information and is not — it carries no timestamps — so no verse boundary, no BPM and no `song_section` is derived from it. That remains the song-analysis work that does not exist yet (`docs/ROADMAP.md`).
+
+The context edit route touches those two fields and nothing else: `path`, `duration`, `source` and `prompt_id` are not on its request model at all, so an edit can never move a project's timing spine or rewrite its provenance.
+
+Bounds are `SONG_LYRICS_LIMIT` 8,000 and `SONG_CAPTION_LIMIT` 4,000 characters, measured **after** trimming, and the route is the only place they are enforced. The textareas deliberately carry no `maxlength`: it truncated an oversized paste at the client and dropped the tail with no message, while an API client sending the same text got a documented 422. The boxes show a live count measured the same way the server measures it, and refuse to save rather than silently shorten.
+
+Unlike `treatment` and `style_bible`, song context has **no `*_previous` recovery slot** — see `docs/DEVELOPMENT-LOG.md` for why it was declined rather than overlooked. The one unrecoverable accident, a save that replaces stored text with nothing, is guarded by a confirmation; replacing text with different text is not.
 
 ## Asset
 
