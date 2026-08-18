@@ -1,0 +1,6 @@
+# The reference exports are immutable audited evidence and their SHA-256 digests are
+# asserted by tests. `core.autocrlf` is true on the authoring machine, so without this
+# a fresh clone would receive CRLF and every one of those digest tests would fail --
+# the repository would be broken for anyone but its author. `-text` tells git to store
+# and check these out byte for byte, which is what "immutable evidence" has to mean.
+workflow_templates/reference_exports/*.json -text

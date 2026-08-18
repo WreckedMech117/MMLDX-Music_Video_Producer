@@ -1,6 +1,7 @@
 import ast
 import copy
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -10,14 +11,25 @@ import tokenize
 from pathlib import Path
 
 import preflight
+import preflight_audio_replace
 import preflight_h3_ultra
 import preflight_ltx25_enhance
 import preflight_songplanner
 import pytest
 
+# The module object as well as the names, because one test below has to replace
+# `song_audio_window` *where the builder looks it up* — see
+# `test_the_restore_window_comes_from_song_audio_window_and_not_a_second_computation`.
+from music_video_producer import workflows as workflows_module
 from music_video_producer.app import SongPlannerRequest
 from music_video_producer.timeline import align_h3_frames
 from music_video_producer.workflows import (
+    AUDIO_REPLACE_AUDIO_EXTENSIONS,
+    AUDIO_REPLACE_CRF,
+    AUDIO_REPLACE_FORMAT,
+    AUDIO_REPLACE_PIX_FMT,
+    AUDIO_REPLACE_SOURCE_FORMAT,
+    AUDIO_REPLACE_VIDEO_EXTENSIONS,
     H3_ASPECT_RATIOS,
     H3_DEFAULT_ASPECT_RATIO,
     H3_DEFAULT_MEGAPIXELS,
@@ -55,6 +67,8 @@ from music_video_producer.workflows import (
     SONGPLANNER_MAX_DURATION_HEADROOM,
     H3SamplingProfile,
     WorkflowCatalog,
+    audio_replace_lengths,
+    build_audio_replace_payload,
     build_flux_payload,
     build_h3_director_payload,
     build_h3_reference_payload,
@@ -159,6 +173,18 @@ def every_builder_payload() -> list[tuple[str, dict]]:
             "ltx25-enhance",
             build_ltx25_enhance_payload(source_video="J:/comfy/output/take_00001.mp4", prefix="p"),
         ),
+        (
+            # Also one shape: this builder has no sampling to vary and no model to swap.
+            "audio-replace",
+            build_audio_replace_payload(
+                source_video="J:/comfy/output/take_00001.mp4",
+                source_audio="F:/data/master.mp3",
+                start=12.0,
+                duration=3.75,
+                song_duration=154.644898,
+                prefix="p",
+            ),
+        ),
     ]
 
 
@@ -193,6 +219,13 @@ def every_builder_payload() -> list[tuple[str, dict]]:
 # exactly what that reproduction has to keep matching. Recording it is what lets the
 # offline half of the suite check the reproduction against the schema rather than only
 # against itself.
+#
+# `preflight_audio_replace.py --record` removed `VHS_LoadAudio`, which the restoration adapter
+# submits, and recorded `LoadAudio` and `VHS_LoadVideo` through `extra_classes` — neither is in
+# any payload, and both are here because the *shape* of their inputs is the whole justification
+# for substituting them. `LatentUpscaleModelLoader` stays on this list for a second reason now:
+# it is an orphan in the AudioReplacer export as well, so nothing audited puts it in front of
+# the live schema from either graph.
 UNRECORDED_CLASSES = frozenset({
     "ComfyMathExpression",
     "DualCLIPLoader", "EmptySD3LatentImage", "FluxGuidance", "FrameInterpolate",
@@ -205,15 +238,15 @@ UNRECORDED_CLASSES = frozenset({
     "PrimitiveStringMultiline", "RTXVideoSuperResolution",
     "SaveImage", "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
     "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask", "VAEDecodeTiled",
-    "VAEEncode", "VHS_LoadAudio", "VHS_LoadImagePath", "easy cleanGpuUsed",
+    "VAEEncode", "VHS_LoadImagePath", "easy cleanGpuUsed",
     "easy clearCacheAll",
 })
 
 SONGPLANNER_EXPORTS = {
     REFERENCE_EXPORTS
-    / "songplanner-invented-user-export.json": "8c313fda7665ccb79a9aeb02734f3d5c04f7f92821af3d0dbff764bc718ec28a",
+    / "songplanner-invented-user-export.json": "fb26b3720c47918e14b15b7d55583454b338fa24d31b54414a8b1ab9fbef1420",
     REFERENCE_EXPORTS
-    / "songplanner-known-lyrics-user-export.json": "24485cf273bf1be1be798c50be65081f5737264f8c0dc6ffb1004389682523b2",
+    / "songplanner-known-lyrics-user-export.json": "2df49d8ce9a72f4532e26f645af04e4706cc03c5cfeba3d62aa41447524a6659",
 }
 
 
@@ -3405,3 +3438,482 @@ def test_nothing_in_the_enhancement_path_claims_the_frame_count_is_preserved():
     assert payload["mvp:source"]["inputs"]["frame_load_cap"] == 0
     assert payload["mvp:source"]["inputs"]["select_every_nth"] == 1
     assert payload["mvp:source"]["inputs"]["force_rate"] == 0
+
+
+# --- Song-audio restoration ----------------------------------------------------------------
+#
+# The audited evidence for the restoration adapter, its single output node, and the digest that
+# says the file has not moved under the tests that read it.
+AUDIOREPLACER_EXPORT = REFERENCE_EXPORTS / "ltx25-audioreplacer-user-export.json"
+AUDIOREPLACER_EXPORT_SHA256 = (
+    "9cf755fe83588b6f15fc8c363bf363150fb1f6f5051df2adb482e22e4d4ebb5d"
+)
+AUDIOREPLACER_OUTPUT_NODE = "4"
+
+# The two node classes the adapter substitutes and the one it adds, declared as data so the
+# comparison below can hold every other class to equality: a fourth node arriving quietly would
+# otherwise disappear into a looser assertion. Each is justified in
+# `build_audio_replace_payload`. Both substitutes keep the same outputs in the same order as the
+# loaders they replace, which is why the wiring comparison further down is a like-for-like one.
+AUDIO_REPLACE_SUBSTITUTIONS = {
+    "VHS_LoadVideo": "VHS_LoadVideoPath",
+    "LoadAudio": "VHS_LoadAudio",
+}
+# Not a substitution: an addition, and the only one. The export hardcodes `frame_rate: 25` on
+# its saver; this reads the take's own rate instead. Declared here so the class comparison can
+# allow exactly this one extra node and no other.
+AUDIO_REPLACE_ADDITIONS = ("VHS_VideoInfo",)
+
+
+def audioreplacer_export() -> dict:
+    return json.loads(AUDIOREPLACER_EXPORT.read_text(encoding="utf-8"))
+
+
+def audio_replace_payload(**overrides) -> dict:
+    arguments = {
+        "source_video": "J:/comfy/output/music-video-producer/p/shots/s-h3-reference_00001.mp4",
+        "source_audio": "F:/MusicVideoProducer/data/projects/p/media/songs/master.mp3",
+        "start": 12.0,
+        "duration": 3.75,
+        "song_duration": 154.644898,
+        "prefix": "music-video-producer/p/shots/s-song-audio",
+    }
+    return build_audio_replace_payload(**{**arguments, **overrides})
+
+
+def test_the_audioreplacer_export_is_not_mutated():
+    """The evidence every test below reads, pinned. It is immutable per AGENTS.md."""
+    digest = hashlib.sha256(AUDIOREPLACER_EXPORT.read_bytes()).hexdigest()
+
+    assert digest == AUDIOREPLACER_EXPORT_SHA256
+
+
+def test_the_audioreplacer_export_carries_five_orphaned_loaders_and_reaches_three_nodes():
+    """The trap, measured off the file rather than restated from the spec.
+
+    8 nodes, 3 reachable from the single `VHS_VideoCombine`. The five that are not are a
+    `UNETLoader`, two `VAELoaderKJ`, a `CLIPLoader` and a `LatentUpscaleModelLoader`, inherited
+    from the parent LTX graph this export was cut out of. All five name a real model file, and
+    all five files would end up in a dependency list built from `export.values()` — which for
+    this graph is not a near miss but the whole list, because **the reachable subgraph loads
+    nothing at all**. Asserted here before anything asserts the adapter avoids it.
+    """
+    export = audioreplacer_export()
+
+    reachable = reachable_node_ids(export, [AUDIOREPLACER_OUTPUT_NODE])
+    orphaned = set(export) - reachable
+
+    assert len(export) == 8
+    assert len(reachable) == 3
+    assert {export[node_id]["class_type"] for node_id in reachable} == {
+        "LoadAudio",
+        "VHS_LoadVideo",
+        "VHS_VideoCombine",
+    }
+    assert {export[node_id]["class_type"] for node_id in orphaned} == {
+        "UNETLoader",
+        "VAELoaderKJ",
+        "CLIPLoader",
+        "LatentUpscaleModelLoader",
+    }
+    # The five files a node-list dependency scan would demand. Named rather than counted,
+    # because "some files" and "a 22B transformer plus two VAEs plus a Gemma text encoder plus
+    # a spatial upscaler" are different sentences to a Director whose machine was just refused.
+    assert preflight_audio_replace.export_model_files(orphaned) == {
+        "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+        "ltx-2.5-video-vae-conv-bf16.safetensors",
+        "ltx-2.5-audio-vae-bf16.safetensors",
+        "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+        "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    }
+    # And the executed path loads none of them, which is the fact the adapter is built on.
+    assert preflight_audio_replace.export_model_files(reachable) == set()
+
+
+def test_the_audio_replace_payload_is_the_reachable_subgraph_and_one_declared_addition():
+    """AC: the adapter is built from the 3, not from the 8.
+
+    Compared as a class multiset against the export's own reachable nodes, with the two
+    substitutions and the single declared addition applied from the constants above — so a node
+    quietly added or dropped fails here, and so does a third substitution nobody declared.
+    """
+    export = audioreplacer_export()
+    reachable = reachable_node_ids(export, [AUDIOREPLACER_OUTPUT_NODE])
+    expected = sorted(
+        [
+            AUDIO_REPLACE_SUBSTITUTIONS.get(
+                export[node_id]["class_type"], export[node_id]["class_type"]
+            )
+            for node_id in reachable
+        ]
+        + list(AUDIO_REPLACE_ADDITIONS)
+    )
+
+    payload = audio_replace_payload()
+
+    assert sorted(node["class_type"] for node in payload.values()) == expected
+    # And the payload is itself fully reachable from its own output: a node built here that
+    # nothing downstream reads would be dead weight submitted to ComfyUI.
+    assert reachable_node_ids(payload, ["mvp:save"]) == set(payload)
+
+
+def test_the_audio_replace_payload_names_no_model_file_at_all():
+    """The specific harm the orphans would do, stated as the absence that is the whole point.
+
+    Derived on both sides: the expectation is read out of the export's reachable nodes and the
+    payload's list is read out of the payload. Neither is a list typed into this test. This
+    graph decodes a video, slices an audio file and muxes them; it has no UNET, no VAE, no CLIP
+    and no LoRA, so a pre-flight that demanded any model here would refuse a machine that needs
+    none of them.
+    """
+    export = audioreplacer_export()
+    reachable = reachable_node_ids(export, [AUDIOREPLACER_OUTPUT_NODE])
+    orphaned = set(export) - reachable
+
+    loaded = preflight_audio_replace.payload_model_files([("t", audio_replace_payload())])
+
+    assert loaded == preflight_audio_replace.export_model_files(reachable) == set()
+    # Named, because "equal to the reachable set" alone would still pass if the reachable set
+    # had somehow acquired them.
+    assert len(preflight_audio_replace.export_model_files(orphaned)) == 5
+    # No sampler, no guider, no conditioning: nothing that could regenerate a frame.
+    classes = {node["class_type"] for node in audio_replace_payload().values()}
+    assert not any(
+        marker in name
+        for name in classes
+        for marker in ("Sampler", "Guider", "VAE", "CLIP", "UNET", "Lora", "MiniMax", "LTXV")
+    ), classes
+
+
+def test_the_restore_window_comes_from_song_audio_window_and_not_a_second_computation(
+    monkeypatch,
+):
+    """The single correctness argument of this whole stage, driven as a mutation.
+
+    `song_audio_window` is replaced with one that returns a window nothing else could produce.
+    If the builder computed the window itself — even with arithmetic that agrees today — the
+    payload would carry 12 to 15.75 and this would fail. It carries the replacement's numbers
+    instead, which is only possible if the shared function is the single source of the window.
+
+    That is the failure this guards: two independent computations of "which seconds is this
+    shot" drift, and the symptom is a subtle desync rather than an error.
+    """
+    calls: list[dict] = []
+
+    def only_this_function_could_have_produced_it(*, start, duration, song_duration):
+        calls.append({"start": start, "duration": duration, "song_duration": song_duration})
+        return {"start": 101.5, "end": 108.25}
+
+    monkeypatch.setattr(
+        workflows_module, "song_audio_window", only_this_function_could_have_produced_it
+    )
+
+    payload = audio_replace_payload(start=12.0, duration=3.75, song_duration=154.644898)
+
+    # Called with the render's own three numbers, unmodified on the way.
+    assert calls == [{"start": 12.0, "duration": 3.75, "song_duration": 154.644898}]
+    # And the payload is that function's answer, not the builder's own arithmetic.
+    window = payload["mvp:song"]["inputs"]
+    assert window["seek_seconds"] == 101.5
+    assert window["duration"] == pytest.approx(6.75)
+
+
+def test_the_restore_builder_offers_no_window_parameter_for_a_caller_to_disagree_through():
+    """The structural half of the argument above: there is nothing to pass a window as.
+
+    The mutation test proves the builder *uses* the shared function. This proves a caller
+    cannot route around it — the signature takes the three numbers the render was given and
+    accepts no window, no start second, no end second and no trim. A parameter added here
+    would be the seam a second computation arrives through, so the signature is pinned.
+    """
+    parameters = inspect.signature(build_audio_replace_payload).parameters
+
+    assert set(parameters) == {
+        "source_video",
+        "source_audio",
+        "start",
+        "duration",
+        "song_duration",
+        "prefix",
+    }
+    # Keyword-only throughout, so no positional call can transpose start and duration.
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters.values()
+    )
+
+
+def test_a_shot_running_past_the_end_of_the_song_is_refused_in_the_renders_own_words():
+    """The matrix's window-past-the-end row: inherited, never restated.
+
+    Compared against `song_audio_window`'s own message rather than against a string typed here,
+    because a second refusal written in this file would be exactly the duplicated rule the spec
+    forbids — and would drift from the render's wording the first time either changed.
+    """
+    with pytest.raises(ValueError) as shared:
+        song_audio_window(start=152.0, duration=5.0, song_duration=154.644898)
+    with pytest.raises(ValueError) as inherited:
+        audio_replace_payload(start=152.0, duration=5.0, song_duration=154.644898)
+
+    assert str(inherited.value) == str(shared.value)
+    # A song whose length was never recorded compares against an unknown, so it is not refused —
+    # the shared function's rule, inherited whole rather than tightened here.
+    assert audio_replace_payload(start=152.0, duration=5.0, song_duration=0)
+
+
+def test_the_restored_file_carries_the_master_and_never_the_takes_generated_audio():
+    """The wiring that is the entire feature, and the diagnostic it deliberately leaves behind.
+
+    The saver's audio is the song loader's first output. The take's *generated* audio is the
+    source loader's third output, and it is wired nowhere: replacing it is the point. It stays
+    in the take, which this graph only ever reads — hearing what H3 actually produced is what
+    found a real conditioning bug on 2026-08-18.
+    """
+    payload = audio_replace_payload()
+
+    assert payload["mvp:save"]["inputs"]["audio"] == ["mvp:song", 0]
+    assert payload["mvp:save"]["inputs"]["images"] == ["mvp:source", 0]
+    assert payload["mvp:song"]["class_type"] == "VHS_LoadAudio"
+    # The take's own audio output goes nowhere at all.
+    links = [
+        value
+        for node in payload.values()
+        for value in node["inputs"].values()
+        if isinstance(value, list)
+    ]
+    assert ["mvp:source", 2] not in links
+    # And nothing in this graph can synthesise a track: there is no audio decode of any kind.
+    assert not any("Decode" in node["class_type"] for node in payload.values())
+
+
+def test_the_restore_payload_does_not_conform_the_takes_frames_the_way_the_export_would():
+    """The adapter's one substantive departure from the export, and why it is not optional.
+
+    The export loads its video with `format: "LTXV"`, which live `/object_info` defines as a
+    24 fps target, a 32-pixel dimension floor and an `8n+1` frame rule. An H3 take lands on the
+    17k+5 grid — 90 frames for a 3.75 s shot — so inheriting that would cut the picture to 89
+    and leave the restored song running one frame long against it. `"None"` conforms nothing.
+    """
+    export = audioreplacer_export()
+    loader = next(node for node in export.values() if node["class_type"] == "VHS_LoadVideo")
+
+    assert loader["inputs"]["format"] == "LTXV"
+    assert AUDIO_REPLACE_SOURCE_FORMAT == "None"
+
+    source = audio_replace_payload()["mvp:source"]["inputs"]
+
+    assert source["format"] == AUDIO_REPLACE_SOURCE_FORMAT
+    # Nothing else resamples, caps or skips either.
+    assert source["force_rate"] == 0
+    assert source["frame_load_cap"] == 0
+    assert source["skip_first_frames"] == 0
+    assert source["select_every_nth"] == 1
+    assert source["custom_width"] == 0
+    assert source["custom_height"] == 0
+    # 90 frames is what a 3.75 s H3 shot is, and 8n+1 does not contain it — the arithmetic the
+    # paragraph above rests on, computed rather than asserted from memory.
+    frames = align_h3_frames(max(5, round(3.75 * H3_FRAME_RATE)))
+    assert frames == 90
+    assert (frames - 1) % 8 != 0
+
+
+def test_the_restore_payload_takes_its_frame_rate_from_the_take_rather_than_the_exports_25():
+    """A number this adapter invented would silently retime the picture.
+
+    The export's saver hardcodes 25 fps, which is the creator's own footage. An H3 take is 24,
+    and writing its frames out at 25 plays the picture 4% fast under a soundtrack that is not
+    sped up at all — a desync produced by the one stage whose purpose is to remove one.
+    """
+    export = audioreplacer_export()
+    saver = next(node for node in export.values() if node["class_type"] == "VHS_VideoCombine")
+
+    assert saver["inputs"]["frame_rate"] == 25
+
+    payload = audio_replace_payload()
+
+    assert payload["mvp:save"]["inputs"]["frame_rate"] == ["mvp:source_info", 0]
+    assert payload["mvp:source_info"]["inputs"]["video_info"] == ["mvp:source", 3]
+    # And no literal frame rate survives anywhere in the payload.
+    assert not any(
+        isinstance(node["inputs"].get("frame_rate"), (int, float)) for node in payload.values()
+    )
+
+
+def test_the_restore_payload_never_pads_or_cuts_the_picture_to_the_audio():
+    """The matrix's length-mismatch row, as the saver setting that makes the report honest."""
+    payload = audio_replace_payload()
+
+    assert payload["mvp:save"]["inputs"]["trim_to_audio"] is False
+    assert payload["mvp:save"]["inputs"]["pingpong"] is False
+    assert payload["mvp:save"]["inputs"]["loop_count"] == 0
+    # The container the export writes, reproduced.
+    assert payload["mvp:save"]["inputs"]["format"] == AUDIO_REPLACE_FORMAT == "video/h264-mp4"
+    assert payload["mvp:save"]["inputs"]["pix_fmt"] == AUDIO_REPLACE_PIX_FMT
+    assert payload["mvp:save"]["inputs"]["crf"] == AUDIO_REPLACE_CRF
+
+
+def test_restore_lengths_report_the_grid_rounding_rather_than_asserting_agreement():
+    """The two numbers, and the case where they differ.
+
+    A 3.75 s shot is 90 frames, which is 3.75 s exactly. A 5 s shot is 124, which is 5.1667 s —
+    a sixth of a second of picture past the end of its own audio window. That mismatch is real,
+    computable before anything is submitted, and reported rather than corrected.
+    """
+    exact = audio_replace_lengths(duration=3.75)
+
+    assert exact["audio_seconds"] == 3.75
+    assert exact["requested_picture_seconds"] == 3.75
+    assert exact["requested_frames"] == 90
+
+    rounded = audio_replace_lengths(duration=5.0)
+
+    assert rounded["audio_seconds"] == 5.0
+    assert rounded["requested_frames"] == 124
+    assert rounded["requested_picture_seconds"] == pytest.approx(124 / 24)
+    assert rounded["requested_picture_seconds"] > rounded["audio_seconds"]
+    # Read off `align_h3_frames` rather than a copy of the grid, so a shot that rendered
+    # through that function is measured against that function.
+    for duration in (0.1, 3.75, 5.0, 8.0, 12.5, 15.0):
+        assert audio_replace_lengths(duration=duration)["requested_frames"] == align_h3_frames(
+            max(5, round(duration * H3_FRAME_RATE))
+        )
+
+
+def test_the_restore_builder_refuses_paths_the_loaders_could_not_open():
+    """Both extension lists and both VHS path-rewriting refusals, per loader."""
+    for extension in AUDIO_REPLACE_VIDEO_EXTENSIONS:
+        assert audio_replace_payload(source_video=f"J:/o/take_00001.{extension}")
+    for extension in AUDIO_REPLACE_AUDIO_EXTENSIONS:
+        assert audio_replace_payload(source_audio=f"F:/d/master.{extension}")
+    # Case is the caller's, not a reason to refuse.
+    assert audio_replace_payload(source_video="J:/o/TAKE.MP4", source_audio="F:/d/M.FLAC")
+
+    with pytest.raises(ValueError, match="webm, mp4, mkv, gif, mov"):
+        audio_replace_payload(source_video="J:/o/take_00001.wav")
+    with pytest.raises(ValueError, match="wav, mp3, ogg, m4a, flac"):
+        audio_replace_payload(source_audio="F:/d/master.mp4")
+    # VHS strips whitespace and one surrounding quote before opening, on both loaders, so a
+    # path it would rewrite is refused rather than silently repointed.
+    for arguments in (
+        {"source_video": ' "J:/o/take_00001.mp4" '},
+        {"source_audio": ' "F:/d/master.mp3" '},
+    ):
+        with pytest.raises(ValueError, match="quoted or padded"):
+            audio_replace_payload(**arguments)
+    for arguments in ({"source_video": "  "}, {"source_audio": ""}, {"prefix": " "}):
+        with pytest.raises(ValueError):
+            audio_replace_payload(**arguments)
+
+
+def test_the_audio_replace_payload_validates_against_the_recorded_object_info():
+    """The offline half of the pre-flight, so a schema drift fails in CI rather than live."""
+    object_info = recorded_object_info()
+    label, payload = preflight_audio_replace.audit_payloads()[0]
+
+    assert preflight.validate(label, payload, object_info) == []
+    assert preflight.unbounded_numeric_inputs(label, payload, object_info) == []
+
+
+def test_the_audio_replace_audit_wires_every_check_it_defines():
+    """A check dropped from `CHECKS` still passes its own test while the audit stops running it."""
+    defined = {
+        name
+        for name in dir(preflight_audio_replace)
+        if name.startswith("check_") and callable(getattr(preflight_audio_replace, name))
+    }
+
+    assert {check.__name__ for check in preflight_audio_replace.CHECKS} == defined
+
+
+def test_each_audio_replace_check_passes_the_recorded_schema_and_names_a_moved_one():
+    """Every check is exercised in both directions: clean, and against a schema that moved."""
+    object_info = recorded_object_info()
+
+    for check in preflight_audio_replace.CHECKS:
+        assert check(object_info) == [], check.__name__
+
+    moved = copy.deepcopy(object_info)
+    moved["VHS_LoadAudio"]["input"]["required"]["audio_file"][1]["vhs_path_extensions"] = ["mp3"]
+    assert preflight_audio_replace.check_path_extensions(moved) != []
+
+    # The window inputs disappearing is the failure that would otherwise be silent: ComfyUI
+    # drops an input it does not know, so the whole song would play over the shot.
+    moved = copy.deepcopy(object_info)
+    del moved["VHS_LoadAudio"]["input"]["optional"]["seek_seconds"]
+    assert any(
+        "seek_seconds" in problem
+        for problem in preflight_audio_replace.check_the_window_inputs_are_the_nodes_own(moved)
+    )
+
+    # A substitution that stopped being possible.
+    moved = copy.deepcopy(object_info)
+    moved["VHS_LoadAudio"]["input"]["required"]["audio_file"][0] = "COMBO"
+    assert (
+        preflight_audio_replace.check_the_substituted_loaders_are_the_only_reachable_ones(moved)
+        != []
+    )
+
+    # And the format departure losing its justification in either direction.
+    moved = copy.deepcopy(object_info)
+    moved["VHS_LoadVideoPath"]["input"]["optional"]["format"][1]["formats"]["None"] = {
+        "frames": [8, 1]
+    }
+    assert preflight_audio_replace.check_the_source_format_conforms_nothing(moved) != []
+
+    moved = copy.deepcopy(object_info)
+    moved["VHS_LoadVideoPath"]["input"]["optional"]["format"][1]["formats"]["LTXV"] = {}
+    assert preflight_audio_replace.check_the_source_format_conforms_nothing(moved) != []
+
+
+def test_the_audio_replace_audit_refuses_a_dependency_list_built_from_the_node_list(monkeypatch):
+    """The mutation this whole design exists to survive, driven through the audit itself.
+
+    A payload that also built the export's five orphaned loaders — the shape a node-list scan
+    produces — must fail the reachability check, and must name every one of the five files.
+    """
+    honest = preflight_audio_replace.audit_payloads()
+    export = audioreplacer_export()
+    orphaned = set(export) - reachable_node_ids(export, [AUDIOREPLACER_OUTPUT_NODE])
+
+    def from_the_node_list() -> list[tuple[str, dict]]:
+        label, payload = honest[0]
+        inherited = {
+            f"mvp:orphan_{node_id}": copy.deepcopy(export[node_id]) for node_id in orphaned
+        }
+        return [(label, {**copy.deepcopy(payload), **inherited})]
+
+    monkeypatch.setattr(preflight_audio_replace, "audit_payloads", from_the_node_list)
+
+    problems = preflight_audio_replace.check_dependencies_come_from_the_reachable_subgraph(
+        recorded_object_info()
+    )
+
+    assert problems
+    for filename in preflight_audio_replace.export_model_files(orphaned):
+        assert any(filename in problem for problem in problems), problems
+
+
+def test_nothing_on_the_restore_path_claims_the_frame_count_is_preserved():
+    """The matrix's frame-count row, enforced against the source rather than trusted.
+
+    What the restored file contains is an `ffprobe` reading of two files. No builder, route,
+    pre-flight or test on this path may assert that an output frame count equals an input's —
+    including this file. The check is a read of the source text because the failure mode is a
+    line of code nobody wrote yet.
+    """
+    sources = [
+        REPO_ROOT / "src/music_video_producer/workflows.py",
+        REPO_ROOT / "src/music_video_producer/app.py",
+        REPO_ROOT / "tests/preflight_audio_replace.py",
+        REPO_ROOT / "tests/test_api.py",
+        Path(__file__),
+    ]
+    # Spliced from two pieces for the reason the enhancement guard states: written whole, the
+    # guard's only finding would be the guard.
+    pattern = re.compile(r"assert[^\n]*" + "frame" + "_count")
+
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        assert not pattern.search(text), source
+    # And what the route reports is named as a *request*, never as a measurement.
+    assert "requested_picture_seconds" in audio_replace_lengths(duration=3.75)
+    assert "picture_seconds" not in audio_replace_lengths(duration=3.75)

@@ -1,4 +1,5 @@
-"""Browser QA for the song-context editor and the VRAM eject toggle.
+"""Browser QA for the song-context editor, the SongPlanner headroom control, and the VRAM eject
+toggle.
 
 Neither had ever been driven in a browser. Both are proven offline by *executing* their deciding
 logic against a stub DOM under node -- `songContextCount`, `songContextRestoreAvailable`,
@@ -11,6 +12,16 @@ dialog actually appears in front of a destructive save. Those are the assertions
 Since 2026-08-18 it also gates two of the defects the first browser run found: that the save
 confirmation does not stand in front of the button that raised it, and that the eject box and the
 note reporting what an eject did are on screen together at every width or at neither.
+
+The SongPlanner headroom section is here for the same division of labour. `musicFormFieldUpdate`,
+`musicPresetFieldState` and `songEncoderCeiling` are executed offline against the request model's
+own bounds, and `app.js` is booted against the stub DOM to prove the field is sent and an
+out-of-range product is refused -- so none of that is re-proved here. What the stub cannot reach
+is whether the box and the ceiling it produces are on screen and reachable at all, whether the
+browser honours the `disabled` that takes a `required` control out of the direct Music 3 submit,
+whether a real `input` event redraws the readout, and whether the note naming the two node inputs
+is legible beside them. Nothing in that section submits: the one click it spends is on a product
+the client refuses locally, and the assertion is that no request and no confirmation followed it.
 
 The eject toggle is driven for real, which is safe and does not need a GPU: the control writes a
 machine preference through its own route, and the setting reaches ComfyUI only through the
@@ -63,7 +74,7 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
 NAME = "song-context"
 
@@ -340,6 +351,143 @@ def main() -> None:
             settled = stored_song(server.base_url, project_id)
             assert (settled["lyrics"], settled["caption"]) == (LYRICS, STYLE), settled
             result["style_box_lands_on_caption"] = True
+
+            # --- The SongPlanner headroom, and the ceiling it multiplies out to ----------------
+            # Two inputs that take the same kind of number and mean different things: how long a
+            # song `M3SongPlanner` is told to write, against the latent ceiling
+            # `MiniMaxMusic3TextEncode.max_duration` gives it to finish inside. Until this control
+            # existed the form sent only the first and the route defaulted the second to 1.5x, so a
+            # duration above 240 s took a 422 from a box whose own `max` still said 300.
+            preset = Select(driver.find_element(By.CSS_SELECTOR, '#music-form [name="preset"]'))
+            headroom_block = driver.find_element(By.ID, "music-headroom-field")
+            headroom = driver.find_element(By.CSS_SELECTOR, '#music-form [name="duration_headroom"]')
+            duration = driver.find_element(By.CSS_SELECTOR, '#music-form [name="duration"]')
+            ceiling = driver.find_element(By.ID, "music-ceiling")
+            # Filled first so the form-level validity checks below are about the headroom box and
+            # nothing else: `title` and `caption` are `required` too, and an empty one of those
+            # would make every `checkValidity()` here false for a reason that is not the subject.
+            driver.find_element(By.CSS_SELECTOR, '#music-form [name="title"]').send_keys("Headroom probe")
+            driver.find_element(By.CSS_SELECTOR, '#music-form [name="caption"]').send_keys(
+                "long lyric-dense synthwave, sung through"
+            )
+
+            # Direct Music 3 is the shipped preset and has no planner between the Director and the
+            # encoder, so the whole block is gone -- and the box is disabled with it, or a
+            # `required` control nobody can see would refuse that form's submit with a validation
+            # bubble pointing at nothing. The browser is asked, not the attribute.
+            assert not headroom_block.is_displayed(), (
+                "the SongPlanner headroom block is on screen for direct Music 3, which has no "
+                "planner and no such field"
+            )
+            assert not headroom.is_enabled(), "the hidden headroom box is still live"
+            assert driver.execute_script(
+                "return document.getElementById('music-form').checkValidity();"
+            ), "a hidden required headroom box is blocking the direct Music 3 submit"
+            # `willValidate` is the browser's own word for "barred from constraint validation",
+            # which is what `disabled` buys and what `display: none` alone would not.
+            assert driver.execute_script(
+                "return document.querySelector('#music-form [name=duration_headroom]').willValidate;"
+            ) is False, "the hidden headroom box is still part of the direct Music 3 form's validity"
+
+            preset.select_by_value("songplanner-invented")
+            wait.until(lambda browser: browser.find_element(By.ID, "music-headroom-field").is_displayed())
+            result["headroom_geometry"] = visible_and_clickable(
+                driver, headroom, "the encoder headroom box"
+            )
+            visible_and_clickable(driver, ceiling, "the encoder ceiling readout")
+            # Seeded, bounded and on screen without the Director touching anything: the multiplier
+            # in force is never invisible again. Every one of these comes from
+            # `SongPlannerRequest.duration_headroom` by way of `musicFormFieldUpdate`.
+            assert headroom.get_attribute("value") == "1.5", headroom.get_attribute("value")
+            assert headroom.get_attribute("min") == "1", headroom.get_attribute("min")
+            assert headroom.get_attribute("max") == "12", headroom.get_attribute("max")
+            assert "180 s" in ceiling.text, ceiling.text
+            assert "360 s" in ceiling.text, ceiling.text
+
+            # The note that names the two node inputs, which is the larger half of why the control
+            # exists -- and it has to be readable, not a tooltip nobody hovers.
+            note_text = headroom_block.find_element(By.CSS_SELECTOR, ".field-help")
+            visible_and_clickable(driver, note_text, "the note naming the two duration inputs")
+            for phrase in ("M3SongPlanner", "MiniMaxMusic3TextEncode.max_duration"):
+                assert phrase in note_text.text, (phrase, note_text.text)
+
+            # 300 s is the top of the form's own duration range and, at the shipped default, past
+            # the encoder's 360 s ceiling. A real `input` event has to redraw the readout.
+            duration.clear()
+            duration.send_keys("300")
+            wait.until(
+                lambda browser: "over the encoder"
+                in browser.find_element(By.ID, "music-ceiling").text
+            )
+            ceiling = driver.find_element(By.ID, "music-ceiling")
+            assert "450 s" in ceiling.text, ceiling.text
+            assert "over" in (ceiling.get_attribute("class") or ""), ceiling.get_attribute("class")
+            over_colour = ceiling.value_of_css_property("color")
+            assert over_colour != note_text.value_of_css_property("color"), (
+                "a product past the encoder's ceiling is not distinguished from ordinary help text"
+            )
+            result["headroom_over_ceiling"] = {"readout": ceiling.text.strip(), "colour": over_colour}
+
+            # And the submit is refused before it costs anything. The invented-lyrics preset is used
+            # so the lyric-sheet guard is not what answers, and the browser's own validation has
+            # nothing left to catch -- every required box is filled and both numbers are in range
+            # individually. Only their product is not.
+            assert driver.execute_script(
+                "return document.getElementById('music-form').checkValidity();"
+            ), "the browser refused this before the client's own guard could, so nothing is proved"
+            clear_toasts(driver)
+            driver.find_element(By.CSS_SELECTOR, '#music-form button[type="submit"]').click()
+            refused = wait_for_toast(driver, wait, "over the encoder")
+            # No question was asked, which is the point: a Director learns this from arithmetic the
+            # browser already had every number for, not after two confirmations and a round trip.
+            # If the guard were gone the GPU-cost confirm would be standing here instead -- and
+            # would still be holding, unanswered, in front of anything reaching ComfyUI.
+            asked_anyway = None
+            with contextlib.suppress(NoAlertPresentException, WebDriverException):
+                alert = driver.switch_to.alert
+                asked_anyway = alert.text
+                alert.dismiss()
+            assert asked_anyway is None, (
+                f"the ceiling refusal let the submit through to a confirmation: {asked_anyway}"
+            )
+            assert stored_song(server.base_url, project_id)["title"] == "Corridor (master)", (
+                "a product the client refuses replaced the project's song anyway"
+            )
+            result["headroom_refusal"] = " ".join(refused.split())[:200]
+
+            # A headroom of 1.0 is the pre-headroom behaviour byte for byte and one of the two
+            # candidate answers nothing has settled; it must stay typeable, and it is what makes the
+            # form's own 300 s maximum submittable again. Not submitted -- that would be a render.
+            headroom.clear()
+            headroom.send_keys("1")
+            wait.until(
+                lambda browser: "over the encoder"
+                not in browser.find_element(By.ID, "music-ceiling").text
+            )
+            ceiling = driver.find_element(By.ID, "music-ceiling")
+            assert "300 s" in ceiling.text and "360 s" in ceiling.text, ceiling.text
+            assert "over" not in (ceiling.get_attribute("class") or "")
+            result["headroom_of_one_clears_it"] = ceiling.text.strip()
+
+            # Cleared and sent back through the preset that has no such field: the box must be
+            # disabled rather than merely hidden, or an empty `required` control blocks a submit
+            # the Director cannot see a reason for. Then back, where an empty box seeds the
+            # default again rather than sending nothing.
+            headroom.clear()
+            preset.select_by_value("balanced")
+            wait.until(
+                lambda browser: not browser.find_element(By.ID, "music-headroom-field").is_displayed()
+            )
+            assert driver.execute_script(
+                "return document.getElementById('music-form').checkValidity();"
+            ), "an emptied headroom box left the direct Music 3 submit invalid while hidden"
+            preset.select_by_value("songplanner-known")
+            wait.until(
+                lambda browser: browser.find_element(
+                    By.CSS_SELECTOR, '#music-form [name="duration_headroom"]'
+                ).get_attribute("value") == "1.5"
+            )
+            result["headroom_reseeds_from_empty"] = True
 
             # --- The VRAM eject toggle, in the topbar -----------------------------------------
             toggle = driver.find_element(By.ID, "vram-eject")

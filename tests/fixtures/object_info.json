@@ -1275,6 +1275,59 @@
     "python_module": "custom_nodes.ComfyUI-LTXVideo",
     "search_aliases": []
   },
+  "LoadAudio": {
+    "api_node": false,
+    "category": "audio",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "Load Audio",
+    "essentials_category": "Audio",
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "audio": [
+          "COMBO",
+          {
+            "audio_upload": true,
+            "multiselect": false,
+            "options": [
+              "W.A.S.P. - Harder Faster.mp3"
+            ]
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "audio"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LoadAudio",
+    "output": [
+      "AUDIO"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "AUDIO"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_audio",
+    "search_aliases": [
+      "import audio",
+      "open audio",
+      "audio file"
+    ]
+  },
   "LoraLoader": {
     "category": "model/loaders",
     "description": "This LoRA loader is used to modify both diffusion and CLIP models, altering the way in which latents are denoised such as applying styles. Multiple LoRA nodes can be linked together.",
@@ -3500,6 +3553,290 @@
     ],
     "output_node": false,
     "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": []
+  },
+  "VHS_LoadAudio": {
+    "category": "Video Helper Suite \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62/audio",
+    "description": "Load Audio (Path) \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62<div style=\"font-size: 0.8em\"><div id=VHS_shortdesc>Loads an audio file from an arbitrary path</div></div><div style=\"font-size: 0.8em\"><div vhs_title=\"Outputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Outputs: <div vhs_title=\"audio\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">audio: The loaded audio</div></div></div></div><div vhs_title=\"Widgets\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Widgets: <div vhs_title=\"audio_file\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">audio_file: The audio file to be loaded.<div style=\"font-size: 1em\">This is a VHS_PATH input. When edited, it provides a list of possible valid files or directories</div><div style=\"font-size: 1em\"><video preload=\"none\" src=https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite/assets/4284322/729b7185-1fca-41d8-bc8d-a770bb2a5ce6 muted loop controls controlslist=\"nodownload noremoteplayback noplaybackrate\" style=\"width: 0px; min-width: 100%\" class=\"VHS_loopedvideo\"></div><div style=\"font-size: 1em\">The current top-most completion may be selected with Tab</div><div style=\"font-size: 1em\">You can navigate up a directory by pressing Ctrl+B (or Ctrl+W if supported by browser)</div><div style=\"font-size: 1em\">The filter on suggested file types can be disabled by pressing Ctrl+G.</div><div style=\"font-size: 1em\">If converted to an input, this functions as a string</div></div></div><div vhs_title=\"seek_seconds\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">seek_seconds: An offset from the start of the sound file that the audio should start from</div></div></div></div></div>",
+    "display_name": "Load Audio (Path)\ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "duration": [
+          "FLOAT",
+          {
+            "default": 0,
+            "max": 10000000,
+            "min": 0,
+            "step": 0.01,
+            "widgetType": "VHSTIMESTAMP"
+          }
+        ],
+        "seek_seconds": [
+          "FLOAT",
+          {
+            "default": 0,
+            "min": 0,
+            "widgetType": "VHSTIMESTAMP"
+          }
+        ]
+      },
+      "required": {
+        "audio_file": [
+          "STRING",
+          {
+            "default": "input/",
+            "vhs_path_extensions": [
+              "wav",
+              "mp3",
+              "ogg",
+              "m4a",
+              "flac"
+            ]
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "seek_seconds",
+        "duration"
+      ],
+      "required": [
+        "audio_file"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VHS_LoadAudio",
+    "output": [
+      "AUDIO",
+      "FLOAT"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_name": [
+      "audio",
+      "duration"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-VideoHelperSuite",
+    "search_aliases": []
+  },
+  "VHS_LoadVideo": {
+    "category": "Video Helper Suite \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "description": "Load Video \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62<div style=\"font-size: 0.8em\"><div id=VHS_shortdesc>Loads a video from the input folder</div></div><div style=\"font-size: 0.8em\"><div vhs_title=\"Inputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Inputs: <div vhs_title=\"meta_batch\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">meta_batch: (optional) Connect to a Meta Batch manager to divide extremely long sequences into sub batches. See the documentation for Meta Batch Manager</div></div><div vhs_title=\"vae\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">vae: (optional) If provided the node will output latents instead of images. This drastically reduces the required RAM (not VRAM) when working with long (100+ frames) sequences<div style=\"font-size: 1em\">Using this is strongly encouraged unless connecting to a node that requires a blue image connection such as Apply Controllnet</div></div></div></div></div><div vhs_title=\"Outputs\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Outputs: <div vhs_title=\"IMAGE\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">IMAGE: The loaded images</div></div><div vhs_title=\"frame_count\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">frame_count: The length of images just returned</div></div><div vhs_title=\"audio\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">audio: The audio from the loaded video</div></div><div vhs_title=\"video_info\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">video_info: Exposes additional info about the video such as the source frame rate, or the total length</div></div><div vhs_title=\"LATENT\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">LATENT: The loaded images pre-converted to latents. Only available when a vae is connected</div></div></div></div><div vhs_title=\"Widgets\" style=\"display: flex; font-size: 0.8em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">Widgets: <div vhs_title=\"video\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">video: The video file to be loaded. Lists all files with a video extension in the ComfyUI/Input folder</div></div><div vhs_title=\"force_rate\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">force_rate: Drops or duplicates frames so that the produced output has the target frame rate. Many motion models are trained on videos of a specific frame rate and will give better results if input matches that frame rate. If set to 0, all frames are returned. May give unusual results with inputs that have a variable frame rate like animated gifs. Reducing this value can also greatly reduce the execution time and memory requirements.</div></div><div vhs_title=\"force_size\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">force_size: Previously was used to provide suggested resolutions. Instead, custom_width and custom_height can be disabled by setting to 0.</div></div><div vhs_title=\"custom_width\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">custom_width: Allows for an arbitrary width to be entered, cropping to maintain aspect ratio if both are set</div></div><div vhs_title=\"custom_height\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">custom_height: Allows for an arbitrary height to be entered, cropping to maintain aspect ratio if both are set</div></div><div vhs_title=\"frame_load_cap\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">frame_load_cap: The maximum number of frames to load. If 0, all frames are loaded.</div></div><div vhs_title=\"skip_first_frames\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">skip_first_frames: A number of frames which are discarded before producing output.</div></div><div vhs_title=\"select_every_nth\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">select_every_nth: Similar to frame rate. Keeps only the first of every n frames and discard the rest. Has better compatibility with variable frame rate inputs such as gifs. When combined with force_rate, select_every_nth_applies after force_rate so the resulting output has a frame rate equivalent to force_rate/select_every_nth. select_every_nth does not apply to skip_first_frames</div></div><div vhs_title=\"format\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">format: Updates other widgets so that only values supported by the given format can be entered and provides recommended defaults.</div></div><div vhs_title=\"choose video to upload\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">choose video to upload: An upload button is provided to upload local files to the input folder</div></div><div vhs_title=\"videopreview\" style=\"display: flex; font-size: 1em\" class=\"VHS_collapse\"><div style=\"color: #AAA; height: 1.5em;\">[<span style=\"font-family: monospace\">-</span>]</div><div style=\"width: 100%\">videopreview: Displays a preview for the selected video input. If advanced previews is enabled, this preview will reflect the frame_load_cap, force_rate, skip_first_frames, and select_every_nth values chosen. If the video has audio, it will also be previewed when moused over. Additional preview options can be accessed with right click.</div></div></div></div></div>",
+    "display_name": "Load Video (Upload) \ud83c\udfa5\ud83c\udd65\ud83c\udd57\ud83c\udd62",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "force_size": "STRING",
+        "unique_id": "UNIQUE_ID"
+      },
+      "optional": {
+        "format": [
+          [
+            "None",
+            "AnimateDiff",
+            "Mochi",
+            "LTXV",
+            "Hunyuan",
+            "Cosmos",
+            "Wan"
+          ],
+          {
+            "default": "AnimateDiff",
+            "formats": {
+              "AnimateDiff": {
+                "dim": [
+                  8,
+                  0,
+                  512,
+                  512
+                ],
+                "target_rate": 8
+              },
+              "Cosmos": {
+                "dim": [
+                  16,
+                  0,
+                  1280,
+                  704
+                ],
+                "frames": [
+                  8,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "Hunyuan": {
+                "dim": [
+                  16,
+                  0,
+                  848,
+                  480
+                ],
+                "frames": [
+                  4,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "LTXV": {
+                "dim": [
+                  32,
+                  0,
+                  768,
+                  512
+                ],
+                "frames": [
+                  8,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "Mochi": {
+                "dim": [
+                  16,
+                  0,
+                  848,
+                  480
+                ],
+                "frames": [
+                  6,
+                  1
+                ],
+                "target_rate": 24
+              },
+              "None": {},
+              "Wan": {
+                "dim": [
+                  8,
+                  0,
+                  832,
+                  480
+                ],
+                "frames": [
+                  4,
+                  1
+                ],
+                "target_rate": 16
+              }
+            }
+          }
+        ],
+        "meta_batch": [
+          "VHS_BatchManager"
+        ],
+        "vae": [
+          "VAE"
+        ]
+      },
+      "required": {
+        "custom_height": [
+          "INT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 8192,
+            "min": 0
+          }
+        ],
+        "custom_width": [
+          "INT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 8192,
+            "min": 0
+          }
+        ],
+        "force_rate": [
+          "FLOAT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 60,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "frame_load_cap": [
+          "INT",
+          {
+            "default": 0,
+            "disable": 0,
+            "max": 9007199254740991,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "select_every_nth": [
+          "INT",
+          {
+            "default": 1,
+            "max": 9007199254740991,
+            "min": 1,
+            "step": 1
+          }
+        ],
+        "skip_first_frames": [
+          "INT",
+          {
+            "default": 0,
+            "max": 9007199254740991,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "video": [
+          []
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "force_size",
+        "unique_id"
+      ],
+      "optional": [
+        "meta_batch",
+        "vae",
+        "format"
+      ],
+      "required": [
+        "video",
+        "force_rate",
+        "custom_width",
+        "custom_height",
+        "frame_load_cap",
+        "skip_first_frames",
+        "select_every_nth"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VHS_LoadVideo",
+    "output": [
+      "IMAGE",
+      "INT",
+      "AUDIO",
+      "VHS_VIDEOINFO"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "IMAGE",
+      "frame_count",
+      "audio",
+      "video_info"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-VideoHelperSuite",
     "search_aliases": []
   },
   "VHS_LoadVideoPath": {

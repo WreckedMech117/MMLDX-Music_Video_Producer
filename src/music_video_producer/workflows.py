@@ -7,6 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# The 17k+5 grid, imported rather than re-derived. `build_h3_reference_payload` computes the
+# same rounding inline and `tests/test_workflows.py` pins the two against each other over the
+# whole window range; `audio_replace_lengths` is new code and has no such history to preserve,
+# so it calls the function. `timeline` imports only `models`, which imports nothing local, so
+# this direction cannot cycle.
+from .timeline import align_h3_frames
+
 
 @dataclass(frozen=True, slots=True)
 class WorkflowEntry:
@@ -1571,4 +1578,233 @@ def build_ltx25_enhance_payload(*, source_video: str, prefix: str) -> dict[str, 
                 "audio": ["mvp:source", 2],
             },
         },
+    }
+
+
+#: The container extensions each loader on the audio-replacement path accepts, published by
+#: live ``/object_info`` as ``video[1]["vhs_path_extensions"]`` and
+#: ``audio_file[1]["vhs_path_extensions"]``. Restated locally only so a take or a song in a
+#: container the node cannot open is named here instead of arriving as an opaque ``/prompt``
+#: rejection; ``tests/preflight_audio_replace.py`` checks both tuples against the live schema
+#: rather than trusting them. The video list is the same one
+#: ``LTX25_ENHANCE_SOURCE_EXTENSIONS`` carries, and is deliberately *not* an alias of it: the
+#: two adapters restate the same node's list for their own reasons, and aliasing would make a
+#: divergence in one of them invisible in the other's audit.
+AUDIO_REPLACE_VIDEO_EXTENSIONS = ("webm", "mp4", "mkv", "gif", "mov")
+AUDIO_REPLACE_AUDIO_EXTENSIONS = ("wav", "mp3", "ogg", "m4a", "flac")
+
+#: What ``VHS_LoadVideoPath.format`` is set to, and the single most consequential departure
+#: from the audited export.
+#:
+#: The export loads its video with ``format: "LTXV"``, inherited from the LTX graph it was cut
+#: out of. Live ``/object_info`` publishes what that string means: ``{"target_rate": 24,
+#: "dim": [32, 0, 768, 512], "frames": [8, 1]}`` — force the rate to 24, floor both axes to a
+#: multiple of 32 with a 768x512 minimum, and conform the frame count to ``8n+1``. Every one
+#: of those would change the picture this stage exists to copy through, and the frame rule is
+#: the dangerous one: an H3 take lands on the **17k+5** grid, so a 90-frame take would be cut
+#: to 89 and the restored song would run one frame long against a picture one frame short.
+#: That is precisely the silent desync this whole stage is shaped to avoid.
+#:
+#: ``"None"`` publishes an empty spec — no target rate, no dimension floor, no frame rule — so
+#: the frames reach the saver as the take decoded them.
+AUDIO_REPLACE_SOURCE_FORMAT = "None"
+
+#: The output container, reproduced from the export's ``VHS_VideoCombine``.
+#:
+#: **Stated plainly because the word "copy" would overclaim it:** this is a re-encode. ComfyUI
+#: has no stream-copy mux; ``VHS_LoadVideoPath`` decodes the take to IMAGE tensors and
+#: ``VHS_VideoCombine`` encodes them again at h264 crf 19. What the frozen spec's "the picture
+#: is copied through, never re-encoded through a generative model" rules out is a *generative*
+#: pass, and there is none here — no UNET, no VAE, no sampler, no model file of any kind in
+#: this payload. What the Director gets is the take's own frames through one more h264
+#: generation at the same crf the take itself was written at. If a bit-identical video stream
+#: is ever required, that is an ffmpeg ``-c:v copy`` mux and not a ComfyUI graph at all.
+AUDIO_REPLACE_FORMAT = "video/h264-mp4"
+AUDIO_REPLACE_PIX_FMT = "yuv420p"
+AUDIO_REPLACE_CRF = 19
+
+
+def build_audio_replace_payload(
+    *,
+    source_video: str,
+    source_audio: str,
+    start: float,
+    duration: float,
+    song_duration: float,
+    prefix: str,
+) -> dict[str, dict[str, Any]]:
+    """Put the master song's own seconds back over a finished take.
+
+    Derived from ``workflow_templates/reference_exports/ltx25-audioreplacer-user-export.json``
+    — 8 nodes of which **only 3 are reachable** from its single ``VHS_VideoCombine``:
+    ``LoadAudio``, ``VHS_LoadVideo`` and the saver. The other five are a ``UNETLoader``, two
+    ``VAELoaderKJ``, a ``CLIPLoader`` and a ``LatentUpscaleModelLoader``, inherited from the
+    parent LTX graph the export was cut out of. This builder builds the three and no others,
+    and the arithmetic that matters is what falls out of that: **this payload names zero model
+    files.** Nothing here loads a checkpoint, a VAE, a CLIP or a LoRA, because nothing here
+    generates anything. ``reachable_node_ids`` is the rule and ``tests/test_workflows.py``
+    checks this payload against the export through it rather than against a list retyped here.
+
+    **The window is not computed here and cannot be.** ``start``, ``duration`` and
+    ``song_duration`` are the three numbers the *render* was given, and they are handed
+    straight to ``song_audio_window`` — the same function ``generate_h3`` calls to decide which
+    seconds of the master conditioned this shot. There is deliberately no window parameter: a
+    caller cannot pass a window this builder would then trust, so there is no second
+    computation of "which seconds is this shot" anywhere on this path and no way for the two to
+    drift. The refusal for a window past the end of the song is inherited from that function
+    rather than restated, so the two stages refuse the same shot for the same reason in the
+    same words.
+
+    The window reaches ComfyUI as ``VHS_LoadAudio``'s ``seek_seconds`` and ``duration``, which
+    is the node slicing the file as it reads it. Nothing downstream trims: ``trim_to_audio`` is
+    ``False``, so a picture longer than its audio is left long rather than cut, and a picture
+    shorter is left short rather than padded. Neither is silently corrected — the two lengths
+    are reported to the caller instead.
+
+    Three node classes are involved and two of them are substitutions, both stated because an
+    unstated substitution is the part that would mislead:
+
+    * ``VHS_LoadVideo`` -> ``VHS_LoadVideoPath``, for exactly the reason
+      ``build_ltx25_enhance_payload`` records and re-verified against live ``/object_info`` on
+      2026-08-18: that node's ``video`` combo enumerates ComfyUI's *input* directory, which
+      this installation publishes **empty**, while a take lives under *output*. Same outputs in
+      the same order (``IMAGE``, ``frame_count``, ``audio``, ``video_info``), so the wiring is
+      unchanged.
+    * ``LoadAudio`` -> ``VHS_LoadAudio``. The mirror of the same trap, and it is real here
+      rather than assumed: live ``/object_info`` publishes ``LoadAudio.audio`` as a COMBO whose
+      only option is the one file sitting in ComfyUI's input directory. The master song lives
+      under this application's data root — a different drive — so there is no value that node
+      could be given. ``VHS_LoadAudio`` ("Load Audio (Path)") takes a ``STRING`` path, and it
+      is not merely a workaround: it is the only one of the two that can express a window at
+      all, through the optional ``seek_seconds`` and ``duration`` this stage exists to set.
+      Its first output is ``AUDIO``, which is what the saver reads.
+
+    One node is *added* rather than substituted, and it is the fourth in the payload:
+    ``VHS_VideoInfo``. The export hardcodes ``frame_rate: 25`` on its saver, which is the
+    creator's own footage and not this application's — an H3 take is 24 fps, and writing its
+    frames out at 25 would play the picture 4% fast against a soundtrack that is not. Reading
+    the rate off the source is ``build_ltx25_enhance_payload``'s existing answer to the same
+    problem, and it keeps this adapter from inventing a number about a file it can measure.
+
+    **The take is not an input to anything that writes.** ``prefix`` is the caller's, and the
+    only guarantee this builder can make about it is that it refuses an empty one; keeping the
+    restored file out of the take's numbered series is the route's job and is checked there.
+    """
+    if not isinstance(source_video, str) or not source_video.strip():
+        raise ValueError("Restoring a shot's song audio needs a source video path")
+    if not isinstance(source_audio, str) or not source_audio.strip():
+        raise ValueError("Restoring a shot's song audio needs the master song's path")
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise ValueError("Restoring a shot's song audio needs an output filename prefix")
+    # VHS strips surrounding whitespace and one leading/trailing quote off a path before
+    # opening it (``utils.strip_path``), on both loaders. The file a caller checked on disk and
+    # the file the node then opens must be the same one, so a value that would be rewritten is
+    # refused rather than silently repointed. Both paths, because both go through it.
+    for label, value in (("source video", source_video), ("song", source_audio)):
+        if value != value.strip().strip('"'):
+            raise ValueError(
+                f"The {label} path must not be quoted or padded: VHS would rewrite "
+                f"{value!r} before opening it"
+            )
+    for label, value, accepted in (
+        ("A take", source_video, AUDIO_REPLACE_VIDEO_EXTENSIONS),
+        ("A master song", source_audio, AUDIO_REPLACE_AUDIO_EXTENSIONS),
+    ):
+        extension = value.rsplit(".", 1)[-1].lower() if "." in value else ""
+        if extension not in accepted:
+            raise ValueError(
+                f"{label} must be one of {', '.join(accepted)}; {value} is not one of those"
+            )
+    # The whole correctness argument of this stage, in one call. See the docstring: there is no
+    # window parameter for a caller to disagree with, and the past-the-end refusal is this
+    # function's, not a second one written here.
+    window = song_audio_window(start=start, duration=duration, song_duration=song_duration)
+    return {
+        "mvp:source": {
+            "class_type": "VHS_LoadVideoPath",
+            "inputs": {
+                "video": source_video,
+                "force_rate": 0,
+                "custom_width": 0,
+                "custom_height": 0,
+                "frame_load_cap": 0,
+                "skip_first_frames": 0,
+                "select_every_nth": 1,
+                # Not the export's "LTXV". See `AUDIO_REPLACE_SOURCE_FORMAT`.
+                "format": AUDIO_REPLACE_SOURCE_FORMAT,
+            },
+        },
+        # The take's own frame rate, read back off the loader rather than hardcoded as the
+        # export hardcodes 25.
+        "mvp:source_info": {
+            "class_type": "VHS_VideoInfo",
+            "inputs": {"video_info": ["mvp:source", 3]},
+        },
+        # The master, sliced as it is read. `seek_seconds` and `duration` are the node's own
+        # optional inputs and are the only place this window is expressed.
+        "mvp:song": {
+            "class_type": "VHS_LoadAudio",
+            "inputs": {
+                "audio_file": source_audio,
+                "seek_seconds": window["start"],
+                "duration": window["end"] - window["start"],
+            },
+        },
+        "mvp:save": {
+            "class_type": "VHS_VideoCombine",
+            "inputs": {
+                "frame_rate": ["mvp:source_info", 0],
+                "loop_count": 0,
+                "filename_prefix": prefix,
+                "format": AUDIO_REPLACE_FORMAT,
+                "pix_fmt": AUDIO_REPLACE_PIX_FMT,
+                "crf": AUDIO_REPLACE_CRF,
+                "save_metadata": True,
+                # Never silently cut the picture to the audio's length. A mismatch is reported
+                # to the caller with both numbers instead; see `audio_replace_lengths`.
+                "trim_to_audio": False,
+                "pingpong": False,
+                "save_output": True,
+                # The take's frames, untouched by anything generative.
+                "images": ["mvp:source", 0],
+                # The master's own seconds. The take's *generated* audio — `mvp:source`
+                # output 2 — is deliberately not wired anywhere: replacing it is the point,
+                # and it stays recoverable in the take itself, which this graph only reads.
+                "audio": ["mvp:song", 0],
+            },
+        },
+    }
+
+
+def audio_replace_lengths(*, duration: float) -> dict[str, float]:
+    """How many seconds of picture a shot's take holds against the seconds of song it gets.
+
+    The matrix's length-mismatch row, answered with the two numbers that are actually known
+    before anything is submitted, and named so neither is mistaken for the other:
+
+    * ``audio_seconds`` is the window's own length — ``duration``, exactly, because
+      ``song_audio_window`` returns ``start`` to ``start + duration``;
+    * ``requested_picture_seconds`` is the H3 **request**, not a measurement: the render asked
+      for ``align_h3_frames(max(5, round(duration * 24)))`` frames at 24 fps, and the 17k+5
+      grid rounds *up*. A 3.75 s shot asks for 90 frames, which is 3.75 s exactly; a 5 s shot
+      asks for 124, which is 5.1667 s. That 0.1667 s is a real mismatch, computable here, and
+      it is the reason this function exists rather than a line saying the two agree.
+
+    The distinction is load-bearing and is the matrix's "frame count is measured, never
+    asserted equal to the input": what the render *asked for* is knowable from the shot; what
+    the take *contains* is an ``ffprobe`` reading of a file. This returns the first and never
+    claims the second. The saver is told ``trim_to_audio: False``, so whichever is longer stays
+    longer.
+
+    Computed from `timeline.align_h3_frames` rather than from a copy of the grid, so a shot
+    that rendered through that function is measured against that function.
+    """
+    _finite("Shot duration", duration)
+    if duration <= 0:
+        raise ValueError(f"A shot must last longer than zero seconds, not {duration:g}s")
+    frames = align_h3_frames(max(5, round(duration * H3_FRAME_RATE)))
+    return {
+        "audio_seconds": float(duration),
+        "requested_picture_seconds": frames / H3_FRAME_RATE,
+        "requested_frames": float(frames),
     }

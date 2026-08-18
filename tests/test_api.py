@@ -32,6 +32,13 @@ from music_video_producer.app import (
     RENDER_AGAIN_IN_FLIGHT_REFUSAL,
     RENDER_AGAIN_LOCKED_REFUSAL,
     RENDER_AGAIN_STATUSES,
+    RESTORE_AUDIO_IN_FLIGHT_REFUSAL,
+    RESTORE_AUDIO_MISSING_SONG_REFUSAL,
+    RESTORE_AUDIO_MISSING_TAKE_REFUSAL,
+    RESTORE_AUDIO_NO_SONG_REFUSAL,
+    RESTORE_AUDIO_NO_TAKE_REFUSAL,
+    RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL,
+    RESTORE_AUDIO_PREFIX_SUFFIX,
     SHOT_CLAIM_MISMATCH_NOTICE,
     SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
     SHOT_DIRECTOR_VISIBLE,
@@ -57,7 +64,7 @@ from music_video_producer.app import (
     multiview_refusal,
     prose_claims_shots,
 )
-from music_video_producer.batch import PLACEHOLDER_PROMPT, readiness_refusal
+from music_video_producer.batch import PLACEHOLDER_PROMPT, readiness_refusal, shot_label
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.director import (
@@ -104,6 +111,7 @@ from music_video_producer.workflows import (
     LTX25_ENHANCE_SEED,
     LTX25_ENHANCE_SIGMAS,
     build_h3_reference_payload,
+    song_audio_window,
 )
 
 
@@ -8223,3 +8231,363 @@ def test_declaring_references_on_an_empty_shot_routes_to_the_reference_graph(tmp
     assert refused.status_code == 422
     assert refused.json()["detail"] == "At least one H3 reference is required"
     assert comfy.prompts == []
+
+
+# --- Song-audio restoration ----------------------------------------------------------------
+#
+# The route's own tests. Every row of the spec's I/O matrix that a route can answer is here; the
+# ones it cannot are elsewhere by design — the model-dependency row is the pre-flight's
+# (`tests/preflight_audio_replace.py`), the window row's arithmetic is
+# `tests/test_workflows.py`, and "frame count is measured, never asserted equal to the input" is
+# a live `ffprobe` reading of the two files.
+
+#: The 12–15.75 s window of a 154 s master, which is the worked example the spec states.
+RESTORE_SONG_DURATION = 154.644898
+RESTORE_SHOT_START = 12.0
+RESTORE_SHOT_DURATION = 3.75
+
+
+def restorable_project(
+    store,
+    tmp_path: Path,
+    *,
+    take: str = "takes/shot-h3-reference_00001-audio.mp4",
+    song: str | None = "master.mp3",
+    song_duration: float = RESTORE_SONG_DURATION,
+    **shot,
+):
+    """A project whose one Shot rode the master song and has a take on disk.
+
+    `song=None` leaves the project songless; a `song` naming a file that is never written
+    leaves the manifest pointing at nothing, which is the other half of the song refusals.
+    """
+    project = store.create(Project(name="Restore"))
+    if take:
+        output = tmp_path / "comfy" / "output" / Path(take)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"rendered-take-with-generated-audio")
+    if song:
+        media = tmp_path / "projects" / project.id / "media" / "songs"
+        media.mkdir(parents=True, exist_ok=True)
+        if song != "missing.mp3":
+            (media / song).write_bytes(b"master-song")
+        project.song = Song(
+            title="Master",
+            source="imported",
+            path=f"media/songs/{song}",
+            duration=song_duration,
+        )
+    fields = {
+        "start": RESTORE_SHOT_START,
+        "duration": RESTORE_SHOT_DURATION,
+        "prompt": "Lantern light across the corridor",
+        "latest_output": take,
+        "status": "complete",
+        "use_song_audio": True,
+        **shot,
+    }
+    project.shots = [Shot(**fields)]
+    store.save(project)
+    return project
+
+
+def restore_audio(client, project, shot=None):
+    shot_id = (shot or project.shots[0]).id
+    return client.post(f"/api/projects/{project.id}/shots/{shot_id}/restore-song-audio")
+
+
+def test_restoring_a_take_takes_the_masters_own_window_and_leaves_the_take_alone(
+    tmp_path: Path,
+):
+    """The matrix's first row, the frozen "Always", and the frozen "Never", in one call.
+
+    The submitted graph reads the take and the master, slices the master at the shot's own
+    seconds, and writes a sibling. Nothing in the payload generates, and nothing in the
+    manifest moves.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path)
+    take_path = tmp_path / "comfy" / "output" / "takes/shot-h3-reference_00001-audio.mp4"
+    before = hashlib.sha256(take_path.read_bytes()).hexdigest()
+    shot_before = store.get(project.id).shots[0].model_dump(mode="json")
+
+    response = restore_audio(client, project)
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job"]["kind"] == "post"
+    assert body["job"]["target_id"] == project.shots[0].id
+    assert len(comfy.prompts) == 1
+    payload = comfy.prompts[0]
+    # The take is the picture.
+    assert payload["mvp:source"]["inputs"]["video"].endswith(
+        "takes/shot-h3-reference_00001-audio.mp4"
+    )
+    assert Path(payload["mvp:source"]["inputs"]["video"]).is_file()
+    # The master is the sound, sliced at 12–15.75 s.
+    assert payload["mvp:song"]["inputs"]["audio_file"].endswith("media/songs/master.mp3")
+    assert Path(payload["mvp:song"]["inputs"]["audio_file"]).is_file()
+    assert payload["mvp:song"]["inputs"]["seek_seconds"] == RESTORE_SHOT_START
+    assert payload["mvp:song"]["inputs"]["duration"] == RESTORE_SHOT_DURATION
+    # Nothing on this path regenerates anything: no model file anywhere in the payload.
+    assert not any(
+        isinstance(value, str) and value.endswith(".safetensors")
+        for node in payload.values()
+        for value in node["inputs"].values()
+    )
+    # A prefix of its own, which is what makes the output a sibling of the take rather than the
+    # next entry in the take's numbered series.
+    prefix = payload["mvp:save"]["inputs"]["filename_prefix"]
+    assert prefix.endswith(RESTORE_AUDIO_PREFIX_SUFFIX)
+    assert prefix != project.shots[0].latest_output
+    # The take is byte-identical, and the whole Shot is untouched.
+    assert hashlib.sha256(take_path.read_bytes()).hexdigest() == before
+    assert store.get(project.id).shots[0].model_dump(mode="json") == shot_before
+
+
+def test_a_restoration_writes_nothing_to_the_shot_even_after_it_completes(tmp_path: Path):
+    """The frozen "Never", carried past completion.
+
+    `read_job` has no branch for `kind="post"`, so the shot goes on naming the take that was
+    processed and the restored file is reachable on the job that produced it. That is what keeps
+    the take's *generated* audio recoverable — the diagnostic the spec insists on.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path)
+    shot_before = store.get(project.id).shots[0].model_dump(mode="json")
+
+    take = tmp_path / "comfy" / "output" / project.shots[0].latest_output
+
+    job = restore_audio(client, project).json()["job"]
+    restored = f"music-video-producer/{project.id}/shots/{project.shots[0].id}-song-audio"
+    comfy.history = completed_history_for(
+        [{"subfolder": restored.rsplit("/", 1)[0], "filename": "s-song-audio_00001-audio.mp4"}]
+    )
+
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "complete"
+    saved = ProjectStore(tmp_path).get(project.id)
+    # The shot is byte-identical to what it was before the restoration was ever submitted, so
+    # `latest_output` still names the take, and the take is still on disk holding H3's own audio.
+    assert saved.shots[0].model_dump(mode="json") == shot_before
+    assert saved.shots[0].latest_output == "takes/shot-h3-reference_00001-audio.mp4"
+    assert take.is_file()
+    # And the restored file is reachable, on the job rather than on the shot.
+    assert saved.jobs[-1].output_files == [
+        f"{restored.rsplit('/', 1)[0]}/s-song-audio_00001-audio.mp4"
+    ]
+
+
+def test_running_a_restoration_twice_produces_a_further_sibling_and_never_an_edit_in_place(
+    tmp_path: Path,
+):
+    """The matrix's run-twice row.
+
+    Both submissions carry the same filename prefix, which is what makes ComfyUI number the
+    second `_00002` beside the first rather than write over it — and neither prefix is the
+    take's, so neither can land on the file being read.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path)
+    take_path = tmp_path / "comfy" / "output" / "takes/shot-h3-reference_00001-audio.mp4"
+    before = hashlib.sha256(take_path.read_bytes()).hexdigest()
+
+    assert restore_audio(client, project).status_code == 202
+    # The first job has to land before a second is allowed; concurrency is refused separately.
+    project = store.get(project.id)
+    project.jobs[0].status = "complete"
+    store.save(project)
+    assert restore_audio(client, project).status_code == 202
+
+    prefixes = [prompt["mvp:save"]["inputs"]["filename_prefix"] for prompt in comfy.prompts]
+    assert prefixes[0] == prefixes[1]
+    assert all(not prefix.endswith(".mp4") for prefix in prefixes)
+    assert hashlib.sha256(take_path.read_bytes()).hexdigest() == before
+
+
+def test_a_shot_that_never_rode_the_song_is_refused_rather_than_given_a_guessed_window(
+    tmp_path: Path,
+):
+    """The matrix's `use_song_audio` false row, and the reason it is a refusal.
+
+    Such a shot was never conditioned on any part of the master, so there is no window to take.
+    Any window this route picked would put the picture out of sync with the sound that produced
+    it — which the frozen spec calls worse than leaving the generated audio in place.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path, use_song_audio=False)
+
+    response = restore_audio(client, project)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL.format(
+        shot=shot_label(store.get(project.id), store.get(project.id).shots[0])
+    )
+    # No GPU time, and no submission of any kind.
+    assert comfy.prompts == []
+
+
+def test_a_project_with_no_song_is_refused_naming_what_is_missing(tmp_path: Path):
+    """The matrix's no-song row, in both shapes: no Song at all, and a Song whose file is gone."""
+    client, store, comfy = make_client(tmp_path)
+    songless = restorable_project(store, tmp_path, song=None)
+
+    response = restore_audio(client, songless)
+
+    assert response.status_code == 422
+    assert "no song" in response.json()["detail"]
+    assert response.json()["detail"] == RESTORE_AUDIO_NO_SONG_REFUSAL.format(
+        shot=shot_label(store.get(songless.id), store.get(songless.id).shots[0])
+    )
+
+    gone = restorable_project(store, tmp_path, song="missing.mp3")
+
+    missing = restore_audio(client, gone)
+
+    assert missing.status_code == 422
+    assert missing.json()["detail"] == RESTORE_AUDIO_MISSING_SONG_REFUSAL.format(
+        shot=shot_label(store.get(gone.id), store.get(gone.id).shots[0]),
+        path="media/songs/missing.mp3",
+    )
+    # Named, so a moved file is distinguishable from a cleared directory.
+    assert "media/songs/missing.mp3" in missing.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_a_shot_with_no_take_and_a_take_whose_file_is_gone_are_different_refusals(
+    tmp_path: Path,
+):
+    """The two take rows, which are different situations and get different sentences."""
+    client, store, comfy = make_client(tmp_path)
+    unrendered = restorable_project(store, tmp_path, take="")
+
+    response = restore_audio(client, unrendered)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == RESTORE_AUDIO_NO_TAKE_REFUSAL.format(
+        shot=shot_label(store.get(unrendered.id), store.get(unrendered.id).shots[0])
+    )
+
+    project = restorable_project(store, tmp_path)
+    (tmp_path / "comfy" / "output" / "takes/shot-h3-reference_00001-audio.mp4").unlink()
+
+    missing = restore_audio(client, project)
+
+    assert missing.status_code == 422
+    assert missing.json()["detail"] == RESTORE_AUDIO_MISSING_TAKE_REFUSAL.format(
+        shot=shot_label(store.get(project.id), store.get(project.id).shots[0]),
+        path="takes/shot-h3-reference_00001-audio.mp4",
+    )
+    assert comfy.prompts == []
+
+
+def test_a_take_pointer_escaping_the_output_directory_is_refused(tmp_path: Path):
+    """A `latest_output` carrying `..` may not hand an arbitrary file to the node."""
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path, take="../../escaped.mp4")
+
+    response = restore_audio(client, project)
+
+    assert response.status_code == 422
+    assert comfy.prompts == []
+
+
+def test_a_shot_running_past_the_end_of_the_song_is_refused_by_the_renders_own_rule(
+    tmp_path: Path,
+):
+    """The matrix's past-the-end row, and that it is inherited rather than a second rule.
+
+    The refusal a restoration gives is byte-identical to the one an H3 submission gives for the
+    same shot, because both come from `song_audio_window`. A second rule written on this path
+    would drift from that one the first time either changed.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path, start=152.0, duration=5.0)
+
+    response = restore_audio(client, project)
+
+    assert response.status_code == 422
+    assert "runs past the end of the master song" in response.json()["detail"]
+    assert comfy.prompts == []
+    # The same sentence the shared function produces, so the two stages refuse alike.
+    with pytest.raises(ValueError) as shared:
+        song_audio_window(start=152.0, duration=5.0, song_duration=RESTORE_SONG_DURATION)
+    assert response.json()["detail"] == str(shared.value)
+
+
+def test_a_restoration_reports_both_lengths_and_never_pads_or_cuts(tmp_path: Path):
+    """The matrix's length-mismatch row, in both the agreeing and the differing case.
+
+    A 3.75 s shot is 90 frames, which is 3.75 s exactly. A 5 s shot is 124, which is 5.1667 s —
+    a real mismatch, computable before submission, reported with both numbers rather than
+    silently corrected. `trim_to_audio` is off in both.
+    """
+    client, store, comfy = make_client(tmp_path)
+    exact = restore_audio(client, restorable_project(store, tmp_path)).json()
+
+    assert exact["audio_seconds"] == 3.75
+    assert exact["requested_picture_seconds"] == 3.75
+    assert exact["requested_frames"] == 90
+    assert exact["lengths_match"] is True
+
+    project = restorable_project(store, tmp_path, start=0.0, duration=5.0)
+    rounded = restore_audio(client, project).json()
+
+    assert rounded["audio_seconds"] == 5.0
+    assert rounded["requested_frames"] == 124
+    assert rounded["requested_picture_seconds"] == pytest.approx(124 / 24)
+    assert rounded["lengths_match"] is False
+    # Both numbers in the sentence, and the sentence is present either way.
+    for body in (exact, rounded):
+        assert "5" in body["length_note"] or "3.75" in body["length_note"]
+        assert "trim_to_audio is off" in body["length_note"]
+        assert "ffprobe" in body["length_note"]
+    assert "124 frames" in rounded["length_note"]
+    assert all(
+        prompt["mvp:save"]["inputs"]["trim_to_audio"] is False for prompt in comfy.prompts
+    )
+
+
+def test_a_restoration_in_flight_refuses_a_second_one_and_so_does_a_live_render(
+    tmp_path: Path,
+):
+    """Concurrency, read off the job records alone.
+
+    A restoration writes nothing to the Shot, so `Shot.status` is not evidence about it — the
+    jobs are. Covers a live render and a live enhancement too: both can move the take this reads
+    or the file it writes beside.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path)
+    assert restore_audio(client, project).status_code == 202
+    assert store.get(project.id).shots[0].status == "complete"
+
+    second = restore_audio(client, store.get(project.id))
+
+    assert second.status_code == 409
+    assert second.json()["detail"] == RESTORE_AUDIO_IN_FLIGHT_REFUSAL.format(
+        shot=shot_label(store.get(project.id), store.get(project.id).shots[0])
+    )
+    assert len(comfy.prompts) == 1
+
+    rendering = restorable_project(store, tmp_path)
+    rendering.shots[0].status = "queued"
+    store.save(rendering)
+
+    assert restore_audio(client, rendering).status_code == 409
+    assert len(comfy.prompts) == 1
+
+
+def test_a_restoration_never_asks_the_readiness_questions_a_render_asks(tmp_path: Path):
+    """No prompt gate and no `ready` status gate: this graph has neither a prompt nor a sampler.
+
+    Borrowing `generate_h3`'s gates here would refuse a real take for fields the work does not
+    read. What must exist is a take and a window, which the refusals above check.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path, prompt="", status="draft")
+
+    assert restore_audio(client, project).status_code == 202
+    assert len(comfy.prompts) == 1

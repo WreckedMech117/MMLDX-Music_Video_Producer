@@ -61,6 +61,8 @@ from .workflows import (
     SONGPLANNER_DEFAULT_DURATION_HEADROOM,
     SONGPLANNER_MAX_DURATION_HEADROOM,
     WorkflowCatalog,
+    audio_replace_lengths,
+    build_audio_replace_payload,
     build_flux_payload,
     build_h3_director_payload,
     build_h3_reference_payload,
@@ -983,6 +985,76 @@ ENHANCE_IN_FLIGHT_REFUSAL = (
 #: sequence and become indistinguishable from a take. A separate prefix is what puts the enhanced
 #: file beside the take rather than in the middle of the series.
 ENHANCE_PREFIX_SUFFIX = "-ltx25-enhance"
+
+
+def shot_audio_restore_in_flight(project: Project, shot: Shot) -> bool:
+    """True when a song-audio restoration for this Shot has been accepted and has not landed.
+
+    Its own function for `shot_enhancement_in_flight`'s reason and by the same rule: this path
+    writes nothing to the Shot, so `Shot.status` is not evidence about it and reading it here
+    would make an H3 render indistinguishable from a restoration in the sentence the Director
+    reads. The job records are the only evidence, keyed by `kind="post"`.
+    """
+    return any(
+        job.kind == "post" and job.target_id == shot.id and job.status in RENDER_IN_FLIGHT_STATUSES
+        for job in project.jobs
+    )
+
+
+# Why one Shot's take may not have the master song put back over it. Each names the Shot as the
+# timeline names it, for `render_again`'s reason.
+#
+# There is deliberately no readiness gate and no prompt check here, for the enhancer's reason and
+# more strongly: this graph has no prompt input at all, no model of any kind, and does not
+# generate. What must exist is a take and a window.
+RESTORE_AUDIO_NO_TAKE_REFUSAL = (
+    "{shot} has not produced a take, and restoring the song puts audio over a picture that "
+    "already exists. Render the shot first, then restore the audio on the take you want to hear."
+)
+# Names the path, per the matrix, for `ENHANCE_MISSING_TAKE_REFUSAL`'s reason.
+RESTORE_AUDIO_MISSING_TAKE_REFUSAL = (
+    "{shot}'s take is recorded as {path} and there is no file there. Nothing was submitted. "
+    "The take may have been moved or the ComfyUI output directory cleared."
+)
+# The matrix's "shot without song audio" row, stated as the reason rather than as a flag being
+# off. A shot rendered without the master song was never conditioned on any part of it, so there
+# is no window this stage could take, and picking one would put the picture out of sync with the
+# sound that produced it -- which the frozen spec calls worse than leaving the generated audio in
+# place. That is why this is a refusal and not a default.
+RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL = (
+    "{shot} was not rendered with the master song attached, so there is no window of the song "
+    "it was conditioned on. Guessing one would put the picture out of sync with the sound that "
+    "produced it, which is worse than leaving the take's own audio in place. Nothing was "
+    "submitted."
+)
+# Named per the matrix: what is missing, not that something is.
+RESTORE_AUDIO_NO_SONG_REFUSAL = (
+    "This project has no song, and restoring {shot}'s audio takes its seconds from the master "
+    "track. Add or generate the project song first. Nothing was submitted."
+)
+RESTORE_AUDIO_MISSING_SONG_REFUSAL = (
+    "This project's song is recorded as {path} and there is no file there, so {shot} has "
+    "nothing to take its seconds from. Nothing was submitted."
+)
+# Concurrency, as the concrete harm. Covers a live render, a live enhancement and a second
+# restoration: all three can move or race the file this one reads or the prefix it writes under.
+RESTORE_AUDIO_IN_FLIGHT_REFUSAL = (
+    "Work on {shot} has not finished. Restoring the song over a take while a render, an "
+    "enhancement or another restoration is still running would work from a take that may be "
+    "about to change, so nothing was submitted. Wait for it, or refresh the render queue if it "
+    "has already finished and this project has not been told yet."
+)
+#: The filename prefix a restoration writes under, appended to the shot's own, for
+#: `ENHANCE_PREFIX_SUFFIX`'s reason and carrying one more guarantee. ComfyUI numbers its outputs
+#: per prefix, so this is what makes the restored file a **sibling** of the take rather than the
+#: next entry in its numbered series — and it is the mechanism behind the frozen "Never
+#: overwriting the take being processed". Run twice, the second restoration takes `_00002` under
+#: this same prefix: a further sibling, never an edit in place, which is the matrix's own wording.
+RESTORE_AUDIO_PREFIX_SUFFIX = "-song-audio"
+#: Half a frame at 24 fps, the tolerance `lengths_match` uses. Both numbers it compares are
+#: floats and one of them is a division, so an exact `==` would report a mismatch on arithmetic
+#: rather than on a real difference in length.
+RESTORE_AUDIO_LENGTH_TOLERANCE = 0.5 / 24
 # Deliberately ASCII, exactly as `batch.READINESS_REFUSAL` and the render-again refusals are, and
 # for the same reason: the frontend halves are read back through node, whose stdout the contract
 # test decodes with the platform encoding on Windows.
@@ -1217,6 +1289,37 @@ class TimelineCompileResponse(BaseModel):
     aligned_frames: int
     warnings: list[str]
     readiness: ReadinessReport
+
+
+class AudioRestoreResponse(BaseModel):
+    """What restoring a shot's song audio returns: the job, and the two lengths involved.
+
+    A richer reply than the enhancer's bare `RenderJob`, and the extra fields are the spec's
+    length-mismatch row rather than decoration. That row asks for a mismatch to be "reported
+    with both numbers; never silently padded or cut" — the saver's `trim_to_audio: False` is
+    the second half, and this is the first. A number reported in a log line nobody reads is not
+    a report.
+
+    `requested_picture_seconds` is deliberately not called "picture_seconds": it is what the
+    render *asked H3 for*, on the same 17k+5 grid, and not a measurement of the file. The
+    matrix's frame-count row says the count is measured and never asserted equal to the input,
+    and this application does not open video files — `ffprobe` does, on the two files, after the
+    run. See `workflows.audio_replace_lengths`.
+    """
+
+    job: RenderJob
+    #: The window's own length, in seconds. Equal to the Shot's duration, exactly.
+    audio_seconds: float
+    #: Seconds of picture the render was asked to produce. May exceed `audio_seconds` because
+    #: the H3 grid rounds up: a 5 s shot is 124 frames, which is 5.1667 s.
+    requested_picture_seconds: float
+    requested_frames: int
+    #: False when the two above differ by more than half a frame at 24 fps. Half a frame rather
+    #: than an exact comparison because both are floats and one is a division.
+    lengths_match: bool
+    #: Both numbers in one sentence, always populated — a report that only appears on mismatch
+    #: is a report the Director cannot tell from a report that failed to run.
+    length_note: str
 
 
 class H3Request(BaseModel):
@@ -2736,6 +2839,190 @@ def create_app(
         project.jobs.append(job)
         store.save(project)
         return job
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/restore-song-audio",
+        response_model=AudioRestoreResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def restore_song_audio(project_id: str, shot_id: str) -> AudioRestoreResponse:
+        """Put the master song's own seconds back over one Shot's rendered take. No body.
+
+        The gap this closes, measured on 2026-08-18: **H3 generates its output audio.**
+        `VHS_VideoCombine.audio` is fed by a `VAEDecodeAudio` on the sampler's own latent — in
+        `build_h3_reference_payload` and in both canonical exports alike — so a song attached
+        with `use_song_audio` conditions the lip movement as `ref_audios` and is deliberately
+        never the soundtrack. A rendered take correlates with the master at about 0.01 at every
+        lag within a second and is 3.4x louder. That is correct, nothing on this path changes
+        it, and this route is the stage that was missing: the one that puts the real track back
+        over the finished picture.
+
+        **The window is not computed here.** This route hands `build_audio_replace_payload` the
+        same three numbers `generate_h3` hands `song_audio_window` — `shot.start`,
+        `shot.duration`, `project.song.duration` — and that builder calls that function. There
+        is no window parameter anywhere on this path for the two stages to disagree through. A
+        shot conditioned on 12–15.75 s therefore gets the master's 12–15.75 s by construction
+        rather than by two computations agreeing, and the failure a second computation would
+        produce — a subtle desync rather than an error — has nowhere to come from.
+
+        The refusal for a window past the end of the song is that function's, raised inside the
+        builder and translated here, so this stage refuses exactly the shots the render refuses
+        and in the same words. It is not a second rule.
+
+        **Nothing here writes to the Shot.** Not `status`, not `latest_output`, not
+        `latest_review`, not `prompt_id`. Only a `RenderJob` of `kind="post"` is appended, and
+        `read_job` has no branch for that kind, so a *completed* restoration moves no pointer
+        either. Three consequences, and the third is the point of the other two:
+
+        * the restored video is written under `RESTORE_AUDIO_PREFIX_SUFFIX`, so ComfyUI numbers
+          it in its own series and it lands *beside* the take;
+        * the take is opened read-only by `VHS_LoadVideoPath` and is byte-identical afterwards.
+          **Its generated audio stays recoverable**, which is not tidiness: hearing "voices but
+          no phonetics" in a take is what let the Director find a real conditioning bug on
+          2026-08-18, and a pipeline that discards H3's own output discards its best
+          diagnostic;
+        * deciding which of the two files is *the* take is take comparison, and stitching many
+          takes to a master is assembly (FR-22). Both remain unbuilt and neither is presumed
+          here.
+
+        This is deliberately a separate act and not something a render does. Applying it
+        automatically at render time is marked Ask First in the spec and has not been asked —
+        it would remove the ability to hear what H3 actually produced.
+
+        No body, for the enhancer's reason: this route has no controls at all. The window comes
+        from the shot, the paths come from the manifest, and the sampling does not exist because
+        nothing here samples.
+
+        **No GPU time is spent on any refusal**: every branch below sits ahead of the
+        submission. There is very little to spend either way — this payload names zero model
+        files and loads no network at all. See `build_audio_replace_payload`.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        # First, for `enhance_with_ltx25`'s reason: an in-flight Shot is the one state where
+        # getting this wrong does concrete harm, and 409 rather than 422 because a live job is a
+        # state conflict — the same request succeeds once it lands.
+        if (
+            shot_render_in_flight(project, shot)
+            or shot_enhancement_in_flight(project, shot)
+            or shot_audio_restore_in_flight(project, shot)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=RESTORE_AUDIO_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # Then the take, because a take is what this route's subject *is*: the picture the song
+        # goes over. A Shot that never rendered has no take to name, and that is a different
+        # sentence from a take whose file is gone.
+        if not shot.latest_output:
+            raise HTTPException(
+                status_code=422,
+                detail=RESTORE_AUDIO_NO_TAKE_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # `enhance_with_ltx25`'s resolution, containment check included, so a `latest_output`
+        # carrying `..` cannot reach outside ComfyUI's output directory and hand an arbitrary
+        # file to the node.
+        output_root = (settings.comfy_root / "output").resolve()
+        source = (output_root / Path(shot.latest_output)).resolve()
+        if output_root not in source.parents or not source.is_file():
+            raise HTTPException(
+                status_code=422,
+                detail=RESTORE_AUDIO_MISSING_TAKE_REFUSAL.format(
+                    shot=shot_label(project, shot), path=shot.latest_output
+                ),
+            )
+        # Then whether this shot has a window at all. Before the song is resolved, because a
+        # shot that never rode the master is refused for that whether or not a song exists —
+        # telling such a Director to add a song would send them to fix the wrong thing.
+        if not shot.use_song_audio:
+            raise HTTPException(
+                status_code=422,
+                detail=RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL.format(
+                    shot=shot_label(project, shot)
+                ),
+            )
+        if not project.song or not project.song.path:
+            raise HTTPException(
+                status_code=422,
+                detail=RESTORE_AUDIO_NO_SONG_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        try:
+            song = resolve_song_path(project_id, project.song)
+        except HTTPException as error:
+            # `resolve_song_path` answers 404 for "the media is not there", which is right for
+            # a media route and wrong here: the request names a project and a Shot that both
+            # exist, and what cannot be processed is the state the manifest describes. Re-raised
+            # as the matrix's 422, naming the recorded path so a moved file is distinguishable
+            # from a cleared directory.
+            raise HTTPException(
+                status_code=422,
+                detail=RESTORE_AUDIO_MISSING_SONG_REFUSAL.format(
+                    shot=shot_label(project, shot), path=project.song.path
+                ),
+            ) from error
+        try:
+            payload = build_audio_replace_payload(
+                # Forward slashes on Windows too, for `enhance_with_ltx25`'s reason: the value
+                # is a plain string to VHS, and a backslash path survives the JSON round-trip
+                # doubled and unreadable in every log and error message on the way.
+                source_video=source.as_posix(),
+                source_audio=song.as_posix(),
+                # The three numbers, unmodified. Everything correct about this stage follows
+                # from these going to `song_audio_window` rather than to a window computed here.
+                start=shot.start,
+                duration=shot.duration,
+                song_duration=project.song.duration,
+                prefix=(
+                    f"music-video-producer/{project_id}/shots/"
+                    f"{shot.id}{RESTORE_AUDIO_PREFIX_SUFFIX}"
+                ),
+            )
+        except ValueError as error:
+            # Covers the window-past-the-end refusal, raised by `song_audio_window` inside the
+            # builder, and every path-shape refusal beside it. Before `comfy.submit`, so none of
+            # them costs anything.
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        lengths = audio_replace_lengths(duration=shot.duration)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        # The whole write. The Shot itself is untouched: see this route's docstring.
+        job = RenderJob(
+            kind="post",
+            prompt_id=submission.prompt_id,
+            target_id=shot.id,
+            # No sampling happens here, so there is no seed. Left at the model's 0 rather than
+            # borrowed from the shot, which would record a number nothing used.
+        )
+        project.jobs.append(job)
+        store.save(project)
+        matched = (
+            abs(lengths["requested_picture_seconds"] - lengths["audio_seconds"])
+            <= RESTORE_AUDIO_LENGTH_TOLERANCE
+        )
+        return AudioRestoreResponse(
+            job=job,
+            audio_seconds=lengths["audio_seconds"],
+            requested_picture_seconds=lengths["requested_picture_seconds"],
+            requested_frames=int(lengths["requested_frames"]),
+            lengths_match=matched,
+            length_note=(
+                f"{lengths['audio_seconds']:g}s of the master song, from "
+                f"{shot.start:g}s to {shot.start + shot.duration:g}s, over a picture the render "
+                f"asked H3 for as {int(lengths['requested_frames'])} frames "
+                f"({lengths['requested_picture_seconds']:.4g}s at 24 fps). "
+                + (
+                    "The two agree. "
+                    if matched
+                    else "They differ because the 17k+5 frame grid rounds up. "
+                )
+                + "Neither is padded or cut: trim_to_audio is off. The frames the file "
+                "actually holds are an ffprobe reading, not a number this application claims."
+            ),
+        )
 
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/render-again", response_model=Project

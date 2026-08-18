@@ -31,13 +31,13 @@ export function musicGenerationPlan(data) {
   if (data.preset === "songplanner-invented") {
     return {
       endpoint: "songplanner",
-      body: { title: data.title, idea: data.caption, duration: Number(data.duration), seed: Number(data.seed) },
+      body: { title: data.title, idea: data.caption, duration: Number(data.duration), duration_headroom: plannedHeadroom(data), seed: Number(data.seed) },
     };
   }
   if (data.preset === "songplanner-known") {
     return {
       endpoint: "songplanner",
-      body: { title: data.title, idea: data.caption, lyrics: (data.lyrics || "").trim(), duration: Number(data.duration), seed: Number(data.seed) },
+      body: { title: data.title, idea: data.caption, lyrics: (data.lyrics || "").trim(), duration: Number(data.duration), duration_headroom: plannedHeadroom(data), seed: Number(data.seed) },
     };
   }
   return {
@@ -46,7 +46,22 @@ export function musicGenerationPlan(data) {
   };
 }
 
-// Pure preset → lyrics/duration/seed field state for the Song workspace form, kept
+// The multiplier a SongPlanner request carries. Sent on every SongPlanner submission rather than
+// omitted, so the number on screen is the number the route uses — an omitted field silently took
+// the route's own default, which is how a duration above 240 s started taking a 422 from a form
+// whose `max` still said 300. Direct Music 3 never gets one: `MusicRequest` has no planner, so no
+// lyrics that can overrun and no such field to send.
+//
+// A missing or cleared value falls back to the same default the route has, which is the only
+// answer that does not invent a number: the form's own box is `required`, so this is reachable
+// only from a caller that never had a box.
+function plannedHeadroom(data) {
+  const raw = data.duration_headroom;
+  if (raw === "" || raw === null || raw === undefined) return SONGPLANNER_HEADROOM.default;
+  return Number(raw);
+}
+
+// Pure preset → lyrics/headroom/duration/seed field state for the Song workspace form, kept
 // here beside musicGenerationPlan so the routing and the form shape cannot drift
 // apart. Both SongPlanner variants carry the M3SongPlanner node's real bounds —
 // 30–300 s duration and a 32-bit seed — while direct Music 3 keeps its own 4–360 s
@@ -62,12 +77,36 @@ export function musicPresetFieldState(preset) {
   return {
     lyricsVisible: preset !== "songplanner-invented",
     lyricsRequired: preset === "songplanner-known",
+    // The headroom belongs to the planner path alone. Direct Music 3 has no `M3SongPlanner`
+    // between the Director and the encoder, so its `max_duration` *is* the requested duration and
+    // there is nothing to multiply. Its bounds are `null` rather than Music 3's own numbers: a
+    // control that does not exist must not be handed a plausible-looking range.
+    headroomVisible: songplanner,
+    headroomMin: songplanner ? SONGPLANNER_HEADROOM.min : null,
+    headroomMax: songplanner ? SONGPLANNER_HEADROOM.max : null,
+    headroomDefault: songplanner ? SONGPLANNER_HEADROOM.default : null,
     durationMin: songplanner ? 30 : 4,
     durationMax: songplanner ? 300 : 360,
     seedMin: 0,
     seedMax: songplanner ? "4294967295" : "18446744073709551615",
   };
 }
+
+// `SongPlannerRequest.duration_headroom`'s floor, ceiling and default, carried once here because
+// JavaScript cannot import a Pydantic model — tests/test_frontend_contract.py reads `ge`, `le` and
+// `default` off the model and asserts each equals its entry, which is what makes these one number
+// rather than two, exactly as it already does for the duration and seed bounds.
+//
+// The floor is 1.0 and stays reachable: it hands the encoder exactly the song's length, which is
+// the pre-headroom payload byte for byte and one of the two candidate answers to a question the
+// evidence has not settled. Nothing here may round it away.
+const SONGPLANNER_HEADROOM = { min: 1, max: 12, default: 1.5 };
+
+// `MiniMaxMusic3TextEncode.max_duration`'s own schema ceiling, equal to
+// `workflows.MUSIC3_MAX_DURATION_SECONDS` and asserted so by the same test. It bounds the
+// *product* of the duration and the headroom, not either field, which is the whole reason the
+// form shows the product instead of pretending one input describes the limit.
+export const MUSIC3_MAX_DURATION_SECONDS = 360;
 
 // Clamp a raw form value into [minimum, maximum], leaving anything that is not a
 // finite number exactly as the Director typed it. `Number("")` is 0, so a cleared
@@ -90,23 +129,108 @@ export function clampToBounds(raw, minimum, maximum) {
 // the clamp direction and the bound assignment are testable without a browser.
 export function musicFormFieldUpdate(preset, current = {}) {
   const fields = musicPresetFieldState(preset);
+  const numeric = {
+    duration: {
+      min: fields.durationMin,
+      max: fields.durationMax,
+      value: clampToBounds(current.duration, fields.durationMin, fields.durationMax),
+    },
+    seed: {
+      min: fields.seedMin,
+      max: fields.seedMax,
+      value: clampToBounds(current.seed, fields.seedMin, fields.seedMax),
+    },
+  };
+  // Only for the presets that have the field. Leaving it out of `numeric` for direct Music 3 is
+  // what stops the DOM applier from writing bounds onto a control that route knows nothing about,
+  // and it also leaves the Director's chosen multiplier untouched by a trip through Balanced.
+  if (fields.headroomVisible) {
+    numeric.duration_headroom = {
+      min: fields.headroomMin,
+      max: fields.headroomMax,
+      // An empty box seeds the default instead of staying cleared, which is the one place this
+      // field parts company with `duration`. A cleared duration is a Director mid-edit and theirs
+      // to leave blank; an absent multiplier is not a request at all, and the entire point of the
+      // control is that whatever multiplier is in force is legible on screen rather than applied
+      // by a default nobody saw. Anything actually typed is clamped to this field's own bounds
+      // and to nothing else — see `songEncoderCeiling` for why the duration is not one of them.
+      value: emptyValue(current.duration_headroom)
+        ? fields.headroomDefault
+        : clampToBounds(current.duration_headroom, fields.headroomMin, fields.headroomMax),
+    };
+  }
   return {
     lyricsVisible: fields.lyricsVisible,
     lyricsRequired: fields.lyricsRequired,
-    numeric: {
-      duration: {
-        min: fields.durationMin,
-        max: fields.durationMax,
-        value: clampToBounds(current.duration, fields.durationMin, fields.durationMax),
-      },
-      seed: {
-        min: fields.seedMin,
-        max: fields.seedMax,
-        value: clampToBounds(current.seed, fields.seedMin, fields.seedMax),
-      },
-    },
+    headroomVisible: fields.headroomVisible,
+    numeric,
   };
 }
+
+function emptyValue(raw) {
+  return raw === "" || raw === null || raw === undefined;
+}
+
+// A number the way a Director reads one: at most two decimals, and no trailing zeros on a value
+// that did not need them. 240 x 1.5 is 360, not 360.00, and 360 / 300 is 1.2, not 1.2000000001.
+function readable(value) {
+  return String(Number(value.toFixed(2)));
+}
+
+// Pure decision: what the encoder's latent ceiling works out to for a duration and a headroom, and
+// whether that product is submittable at all.
+//
+// This is the form's answer to the one question the two fields raise together: 300 s at the
+// default 1.5 is 450 s, which the route refuses, so the form must not sit there promising it. Four
+// answers were available and this is the one taken, with the three rejected ones and why:
+//
+//   * Bound the duration against the current headroom, or the headroom against the current
+//     duration. Both were rejected for the same reason: whichever field is made to follow becomes
+//     a trap. Raise the headroom and the duration's `max` slides under the number already in the
+//     box, so either the Director's typed duration is silently rewritten — the one thing this
+//     feature exists to prevent, since a quietly shortened ceiling is exactly the truncation it
+//     guards — or the box holds a value its own `max` now forbids. Neither field is subordinate to
+//     the other; they are two independent inputs whose *product* is what the schema bounds.
+//   * Leave both free and let the 422 explain. Honest, and worse: the Director spends a submit,
+//     a replacement confirmation and a GPU-cost confirmation to learn something arithmetic the
+//     browser already had every number for.
+//
+// So the product is shown, continuously, beside the two fields that make it, and a product outside
+// the schema is refused locally in the same words the readout is already showing. Nothing is
+// clamped, both fields keep their own model bounds whatever the other holds, and the sentence
+// names both alternatives — a lower headroom or a shorter song — so the Director chooses which of
+// their two numbers gives way rather than having the form choose for them.
+//
+// `refusal` is the readout's own text rather than a second sentence: the line on screen and the
+// toast that blocks the submit say exactly the same thing, so there is no wording to drift.
+export function songEncoderCeiling(duration, headroom) {
+  const target = Number(duration);
+  const multiplier = Number(headroom);
+  // A half-filled pair states nothing. The browser's own `required`/`min` validation and the
+  // route's 422 both report an empty or non-numeric box; inventing a product from one would put a
+  // number on screen that no field holds.
+  if (emptyValue(duration) || emptyValue(headroom) || !Number.isFinite(target) || !Number.isFinite(multiplier)) {
+    return { ceiling: null, exceeds: false, text: CEILING_UNSET, refusal: null };
+  }
+  const ceiling = target * multiplier;
+  const shown = `Song written to ${readable(target)} s · encoder ceiling ${readable(ceiling)} s`;
+  if (ceiling <= MUSIC3_MAX_DURATION_SECONDS) {
+    return { ceiling, exceeds: false, text: `${shown} of ${readable(MUSIC3_MAX_DURATION_SECONDS)} s allowed.`, refusal: null };
+  }
+  // Both ways out, computed rather than described, and both rounded *down* so a suggestion the
+  // Director types back in cannot land a hair over the ceiling it was offered to clear.
+  const headroomFits = Math.floor((MUSIC3_MAX_DURATION_SECONDS / target) * 100) / 100;
+  const durationFits = Math.floor((MUSIC3_MAX_DURATION_SECONDS / multiplier) * 100) / 100;
+  const ways = headroomFits >= SONGPLANNER_HEADROOM.min
+    ? `Lower the headroom to ${readable(headroomFits)}, or the duration to ${readable(durationFits)} s.`
+    : `Lower the duration to ${readable(durationFits)} s.`;
+  const text = `${shown} — over the encoder's ${readable(MUSIC3_MAX_DURATION_SECONDS)} s maximum. ${ways}`;
+  return { ceiling, exceeds: true, text, refusal: text };
+}
+
+// What the readout says when the two boxes do not yet make a product. Not a blank: the line has to
+// hold its place in the form, or the layout jumps as a Director types.
+export const CEILING_UNSET = "Encoder ceiling — fill in both the duration and the headroom.";
 
 // Pure decision: the `duration` value a pending song import sends to the server.
 //

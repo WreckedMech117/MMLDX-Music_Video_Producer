@@ -48,6 +48,7 @@ from music_video_producer.models import (
     mode_specification_problems,
     resolve_shot_mode,
 )
+from music_video_producer.workflows import MUSIC3_MAX_DURATION_SECONDS
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
 API_JS = Path("src/music_video_producer/web/assets/api.js")
@@ -382,9 +383,16 @@ def test_preset_field_state_drives_lyrics_visibility_and_duration_cap():
     # M3SongPlanner node's real 30-300 s range and 32-bit seed, matching
     # SongPlannerRequest so the form can never offer a value the route refuses.
     # Seed bounds are strings because 2**64-1 is not representable as a JS number.
+    # Direct Music 3 has no planner, so it has no headroom field either: its bounds are None
+    # rather than Music 3's own numbers, so a control that route knows nothing about can never be
+    # handed a plausible-looking range.
     assert states["balanced"] == {
         "lyricsVisible": True,
         "lyricsRequired": False,
+        "headroomVisible": False,
+        "headroomMin": None,
+        "headroomMax": None,
+        "headroomDefault": None,
         "durationMin": 4,
         "durationMax": 360,
         "seedMin": 0,
@@ -393,6 +401,10 @@ def test_preset_field_state_drives_lyrics_visibility_and_duration_cap():
     assert states["songplanner-invented"] == {
         "lyricsVisible": False,
         "lyricsRequired": False,
+        "headroomVisible": True,
+        "headroomMin": 1,
+        "headroomMax": 12,
+        "headroomDefault": 1.5,
         "durationMin": 30,
         "durationMax": 300,
         "seedMin": 0,
@@ -401,6 +413,10 @@ def test_preset_field_state_drives_lyrics_visibility_and_duration_cap():
     assert states["songplanner-known"] == {
         "lyricsVisible": True,
         "lyricsRequired": True,
+        "headroomVisible": True,
+        "headroomMin": 1,
+        "headroomMax": 12,
+        "headroomDefault": 1.5,
         "durationMin": 30,
         "durationMax": 300,
         "seedMin": 0,
@@ -470,6 +486,183 @@ def test_form_numeric_bounds_match_the_route_models():
     assert int(states["music"]["seedMax"]) == 0xFFFFFFFFFFFFFFFF
 
 
+def test_the_headroom_control_carries_the_request_models_bounds_and_its_default():
+    """The form's multiplier bounds are `SongPlannerRequest.duration_headroom`'s, read off it.
+
+    The same drift guard the duration and seed bounds get, for the same reason and one more: the
+    *default* is on the form too, because the form now sends the field on every submission rather
+    than letting it be defaulted invisibly. A hand-typed 1.5 in the markup or in `api.js` that the
+    model later moved away from would put a number on screen, send it, and be right about neither.
+
+    1.0 has to survive all of this. It reproduces the pre-headroom payload byte for byte and is one
+    of the two candidate answers to a question no live render has settled, so a floor that rounded
+    it away would remove the comparison the Director needs to make.
+    """
+    script = """
+      import { musicPresetFieldState } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        invented: musicPresetFieldState('songplanner-invented'),
+        known: musicPresetFieldState('songplanner-known'),
+        music: musicPresetFieldState('balanced'),
+      }));
+    """
+    states = run_module(script)
+    field = SongPlannerRequest.model_fields["duration_headroom"]
+
+    for preset in ("invented", "known"):
+        assert states[preset]["headroomVisible"] is True, preset
+        assert states[preset]["headroomMin"] == model_bound(
+            SongPlannerRequest, "duration_headroom", "Ge"
+        ), preset
+        assert states[preset]["headroomMax"] == model_bound(
+            SongPlannerRequest, "duration_headroom", "Le"
+        ), preset
+        assert states[preset]["headroomDefault"] == field.default, preset
+        # Stated outright as well as derived: the floor is the setting's whole comparison.
+        assert states[preset]["headroomMin"] == 1.0, preset
+
+    # Direct Music 3 has no planner and `MusicRequest` has no such field, so the control is absent
+    # rather than bounded — offering it there would send a key the route would reject.
+    assert states["music"]["headroomVisible"] is False
+    assert "duration_headroom" not in MusicRequest.model_fields
+    for bound in ("headroomMin", "headroomMax", "headroomDefault"):
+        assert states["music"][bound] is None, bound
+
+
+def test_every_preset_that_has_a_headroom_control_sends_its_value():
+    """Every SongPlanner variant, not just the one the workspace test happens to drive.
+
+    Found by mutation: dropping `duration_headroom` from the invented-lyrics body alone left the
+    whole suite green, because the booted-workspace test drives the known-lyrics preset. Half a fix
+    is the same regression wearing the other preset's name — the form would show a multiplier, the
+    Director would set it, and the route would default it to 1.5 behind their back on exactly the
+    long invented-lyrics song this setting exists to be judged on. So the presets are enumerated
+    from the markup and each one's plan is checked against whether it has the control at all.
+    """
+    presets = markup_preset_values()
+    script = f"""
+      import {{ musicGenerationPlan, musicPresetFieldState }}
+        from './src/music_video_producer/web/assets/api.js';
+      const planned = {{}};
+      for (const preset of {json.dumps(presets)}) {{
+        const plan = musicGenerationPlan({{
+          preset, title: 'T', caption: 'an idea', lyrics: '[verse]\\nWords',
+          duration: '90', duration_headroom: '2.5', seed: '1',
+        }});
+        planned[preset] = {{
+          hasControl: musicPresetFieldState(preset).headroomVisible,
+          sent: Object.hasOwn(plan.body, 'duration_headroom') ? plan.body.duration_headroom : null,
+        }};
+      }}
+      console.log(JSON.stringify(planned));
+    """
+    planned = run_module(script)
+
+    assert set(planned) == set(PRESET_ENDPOINTS), planned
+    for preset, outcome in planned.items():
+        # The control and the key on the wire are the same fact seen twice: a preset that shows the
+        # box must send it, and one that does not must not send a field its route has never heard
+        # of. Either mismatch is a form saying one thing and a request doing another.
+        assert outcome["hasControl"] is (PRESET_ENDPOINTS[preset] == "songplanner"), preset
+        assert outcome["sent"] == (2.5 if outcome["hasControl"] else None), (preset, outcome)
+
+
+def test_the_form_shows_the_product_rather_than_bounding_either_duration_field():
+    """The chosen answer to the two fields' interaction, executed.
+
+    `duration` x `duration_headroom` has to stay inside the encoder's 360 s schema ceiling, so at
+    the default 1.5 a 300 s song is refused — the regression this change exists to close, where the
+    form's own `max` of 300 promised a duration the route would 422.
+
+    Bounding either field against the other was rejected: whichever follows becomes a trap, because
+    raising one slides the other's `max` under a number already in its box, and the only ways out of
+    that are silently rewriting what the Director typed — the truncation this whole feature guards
+    against — or leaving a box holding a value its own `max` forbids. So neither `max` moves, and
+    the *product*, which is what the schema actually bounds, is shown instead and refused locally
+    when it leaves the range. This test pins both halves: the bounds that must not move, and the
+    product that must be reported.
+    """
+    script = """
+      import { musicFormFieldUpdate, songEncoderCeiling, MUSIC3_MAX_DURATION_SECONDS, CEILING_UNSET }
+        from './src/music_video_producer/web/assets/api.js';
+      const at = (duration, headroom) => songEncoderCeiling(duration, headroom);
+      console.log(JSON.stringify({
+        ceiling: MUSIC3_MAX_DURATION_SECONDS,
+        unset: CEILING_UNSET,
+        // The bounds each field reports while the other one moves across its whole range.
+        bounds: [1, 1.5, 12].map((headroom) => {
+          const update = musicFormFieldUpdate('songplanner-known', { duration: '300', headroom, duration_headroom: String(headroom) });
+          return {
+            headroom,
+            durationMax: update.numeric.duration.max,
+            durationValue: update.numeric.duration.value,
+            headroomMax: update.numeric.duration_headroom.max,
+            headroomValue: update.numeric.duration_headroom.value,
+          };
+        }),
+        inRange: at('120', '1.5'),
+        exactlyAtTheCeiling: at('240', '1.5'),
+        overByTheDefault: at('300', '1.5'),
+        noHeadroomAtAll: at('300', '1'),
+        widest: at('30', '12'),
+        overAtTheWidest: at('31', '12'),
+        emptyDuration: at('', '1.5'),
+        emptyHeadroom: at('120', ''),
+        notANumber: at('abc', '1.5'),
+      }));
+    """
+    result = run_module(script)
+
+    # The encoder's ceiling is the builder's own constant, not a number retyped in the browser.
+    assert result["ceiling"] == MUSIC3_MAX_DURATION_SECONDS
+
+    # Neither field's bound follows the other, and neither value is rewritten, at any headroom.
+    for row in result["bounds"]:
+        assert row["durationMax"] == model_bound(SongPlannerRequest, "duration", "Le"), row
+        assert row["durationValue"] == "300", row
+        assert row["headroomMax"] == model_bound(SongPlannerRequest, "duration_headroom", "Le"), row
+        assert float(row["headroomValue"]) == row["headroom"], row
+
+    # The product, in the words the Director reads, naming both node inputs' roles.
+    assert result["inRange"]["ceiling"] == 180
+    assert result["inRange"]["exceeds"] is False
+    assert result["inRange"]["refusal"] is None
+    assert "120 s" in result["inRange"]["text"] and "180 s" in result["inRange"]["text"]
+    assert "360 s" in result["inRange"]["text"]
+
+    # 240 x 1.5 is exactly 360: the largest submittable request at the shipped default, and the
+    # boundary the whole regression is about. Inside, not over.
+    assert result["exactlyAtTheCeiling"]["ceiling"] == MUSIC3_MAX_DURATION_SECONDS
+    assert result["exactlyAtTheCeiling"]["exceeds"] is False
+
+    # And one second of song past it is refused, in a sentence that names both ways out and
+    # neither of the Director's numbers as the one that has to give.
+    refused = result["overByTheDefault"]
+    assert refused["exceeds"] is True
+    assert refused["refusal"] == refused["text"], "the readout and the refusal are two wordings"
+    assert "450 s" in refused["text"], refused["text"]
+    assert "360 s" in refused["text"], refused["text"]
+    # 360 / 300 and 360 / 1.5 — both alternatives computed, so neither is a number to type back in
+    # and be refused again.
+    assert "1.2" in refused["text"], refused["text"]
+    assert "240 s" in refused["text"], refused["text"]
+
+    # A headroom of 1.0 is the pre-headroom behaviour, and it is exactly what makes the form's own
+    # 300 s maximum submittable again.
+    assert result["noHeadroomAtAll"]["ceiling"] == 300
+    assert result["noHeadroomAtAll"]["exceeds"] is False
+    assert result["noHeadroomAtAll"]["refusal"] is None
+    # 30 x 12 is the widest legal product the two fields can make; a second more is not.
+    assert result["widest"]["exceeds"] is False
+    assert result["overAtTheWidest"]["exceeds"] is True
+
+    # A half-filled pair states nothing rather than inventing a product from one box.
+    for absent in ("emptyDuration", "emptyHeadroom", "notANumber"):
+        assert result[absent]["ceiling"] is None, absent
+        assert result[absent]["exceeds"] is False, absent
+        assert result[absent]["text"] == result["unset"], absent
+
+
 def test_form_field_update_applies_bounds_and_clamps_per_preset():
     """Executable coverage for the logic syncMusicVariant applies to the DOM.
 
@@ -511,6 +704,223 @@ def test_form_field_update_applies_bounds_and_clamps_per_preset():
     assert cases["belowFloor"]["lyricsVisible"] is False
     assert cases["aboveCeiling"]["lyricsRequired"] is True
     assert cases["backToBalanced"]["lyricsRequired"] is False
+
+
+def test_form_field_update_seeds_the_headroom_and_leaves_it_where_the_director_put_it():
+    """The multiplier's own lifecycle, separate from the product it takes part in.
+
+    An empty box seeds the model's default instead of staying cleared, which is where this field
+    parts company with `duration`: a cleared duration is a Director mid-edit, but an absent
+    multiplier is not a request at all, and the whole point of the control is that the number in
+    force is on screen rather than applied by a default nobody saw. Everything else about it is the
+    duration's rules — clamped to its own bounds, fractional values kept exactly as typed.
+    """
+    script = """
+      import { musicFormFieldUpdate } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        empty: musicFormFieldUpdate('songplanner-known', { duration: '120', duration_headroom: '' }),
+        absent: musicFormFieldUpdate('songplanner-invented', { duration: '120' }),
+        one: musicFormFieldUpdate('songplanner-known', { duration: '120', duration_headroom: '1' }),
+        fractional: musicFormFieldUpdate('songplanner-known', { duration: '120', duration_headroom: '2.25' }),
+        belowFloor: musicFormFieldUpdate('songplanner-known', { duration: '120', duration_headroom: '0.5' }),
+        aboveCeiling: musicFormFieldUpdate('songplanner-known', { duration: '120', duration_headroom: '99' }),
+        notANumber: musicFormFieldUpdate('songplanner-known', { duration: '120', duration_headroom: 'abc' }),
+        balanced: musicFormFieldUpdate('balanced', { duration: '120', duration_headroom: '2.25' }),
+      }));
+    """
+    cases = run_module(script)
+    default = SongPlannerRequest.model_fields["duration_headroom"].default
+
+    # Nothing in the box, and something on screen: the multiplier in force is never invisible.
+    assert cases["empty"]["numeric"]["duration_headroom"]["value"] == default
+    assert cases["absent"]["numeric"]["duration_headroom"]["value"] == default
+    # 1.0 is a value the Director can hold, not a floor that rounds up to the default.
+    assert cases["one"]["numeric"]["duration_headroom"]["value"] == "1"
+    assert cases["fractional"]["numeric"]["duration_headroom"]["value"] == "2.25"
+    # Clamped to this field's own model bounds, and to nothing else.
+    assert cases["belowFloor"]["numeric"]["duration_headroom"]["value"] == 1
+    assert cases["aboveCeiling"]["numeric"]["duration_headroom"]["value"] == 12
+    assert cases["notANumber"]["numeric"]["duration_headroom"]["value"] == "abc"
+    # Direct Music 3 has no such control, so the update carries no entry to write onto one — which
+    # is also what leaves a chosen multiplier untouched by a trip through the Balanced preset.
+    assert "duration_headroom" not in cases["balanced"]["numeric"]
+    assert cases["balanced"]["headroomVisible"] is False
+
+
+def test_the_song_form_sends_the_headroom_it_shows_and_refuses_what_the_route_would():
+    """The regression, closed, in the workspace's own code rather than in a function beside it.
+
+    Three things a pure-function test cannot reach, so `app.js` is booted and driven: that the
+    handler puts the ceiling on screen at all, that the submission carries `duration_headroom`
+    instead of letting the route default it invisibly, and that a product past the encoder's
+    schema ceiling is stopped before it costs the Director a confirmation — the harness's
+    `window.confirm` throws until a test answers it, so a question asked here would fail loudly.
+    """
+    driven = run_workspace("""
+      // A FormData the stub DOM can produce: the real one takes an HTMLFormElement, which does not
+      // exist here. It reproduces the two behaviours the submit handler leans on -- values come
+      // from the controls themselves, and a `disabled` control is not submitted at all -- over the
+      // form's own field names, which is what makes the direct Music 3 case below mean anything.
+      const NAMES = ['title', 'caption', 'lyrics', 'duration', 'duration_headroom', 'seed', 'preset'];
+      globalThis.FormData = class {
+        constructor(form) {
+          this.pairs = NAMES
+            .filter((name) => !form.elements[name].disabled)
+            .map((name) => [name, form.elements[name].value]);
+        }
+        [Symbol.iterator]() { return this.pairs[Symbol.iterator](); }
+      };
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      const form = at('#music-form');
+      form.elements.title.value = 'Night Signal';
+      form.elements.caption.value = 'sunset synthwave';
+      form.elements.lyrics.value = '[Verse]\\nKnown words';
+      // The stub creates every control blank, so the duration the markup ships with is put back
+      // here; the headroom's is deliberately not, because seeding that one is the code's job.
+      form.elements.duration.value = '120';
+      form.elements.seed.value = '0';
+      state.project = { id: 'p1', shots: [], jobs: [], song: null };
+      const readout = () => ({
+        text: at('#music-ceiling').textContent,
+        over: at('#music-ceiling').classList.contains('over'),
+        shown: at('#music-headroom-field').style.display,
+        disabled: form.elements.duration_headroom.disabled,
+        value: form.elements.duration_headroom.value,
+      });
+      const type = (name, value) => { form.elements[name].value = value; fire('#music-form[' + name + ']:input'); };
+      const submit = () => fire('#music-form:submit', { preventDefault() {}, currentTarget: form });
+
+      // The workspace fires its own startup requests on import and they all reject; let them
+      // settle and clear the record, so what is counted below is this form's doing alone.
+      await flush();
+      requests.length = 0;
+      toasts.length = 0;
+
+      // Boots on Balanced: no planner, so no control and nothing on the wire to carry.
+      const balanced = readout();
+
+      form.elements.preset.value = 'songplanner-known';
+      fire('#music-form[preset]:change');
+      const seeded = readout();
+
+      // The duration the form's own `max` has always offered, at the shipped default.
+      type('duration', '300');
+      const overCeiling = readout();
+
+      // Refused here, with no reply canned and `window.confirm` still throwing: a request or a
+      // question at this point is a failure, not a pass.
+      await submit();
+      const refusal = { toasts: [...toasts], requests: requests.length };
+
+      // The Director takes one of the two ways out the sentence named.
+      toasts.length = 0;
+      type('duration_headroom', '1');
+      const relieved = readout();
+      answer(true);
+      await submit();
+      await flush();
+      const sentPlanner = requests.map((entry) => ({ path: entry.path, body: JSON.parse(entry.body) }));
+
+      // And back to the route that has no such field.
+      answer(true);
+      form.elements.preset.value = 'balanced';
+      fire('#music-form[preset]:change');
+      const backToBalanced = readout();
+      await submit();
+      await flush();
+      const sentMusic = requests.map((entry) => ({ path: entry.path, body: JSON.parse(entry.body) }));
+
+      console.log(JSON.stringify({ balanced, seeded, overCeiling, refusal, relieved, sentPlanner, backToBalanced, sentMusic }));
+    """)
+    default = SongPlannerRequest.model_fields["duration_headroom"].default
+
+    # Direct Music 3: the control, its readout and the note naming the two node inputs are all gone
+    # together, and the box is disabled so a `required` field nobody can see cannot block a submit.
+    assert driven["balanced"]["shown"] == "none"
+    assert driven["balanced"]["disabled"] is True
+
+    # SongPlanner: the box appears carrying the model's default, and the ceiling it produces is on
+    # screen without the Director touching anything.
+    assert driven["seeded"]["shown"] == ""
+    assert driven["seeded"]["disabled"] is False
+    assert driven["seeded"]["value"] == default
+    assert "180 s" in driven["seeded"]["text"], driven["seeded"]["text"]
+    assert driven["seeded"]["over"] is False
+
+    # 300 s at 1.5 is the regression itself: a duration the form's `max` offers and the route
+    # refuses. The form now says so before the submit rather than after it.
+    assert driven["overCeiling"]["over"] is True
+    assert "450 s" in driven["overCeiling"]["text"], driven["overCeiling"]["text"]
+
+    # And stops it, in the same words, having spent nothing.
+    assert driven["refusal"]["requests"] == 0, "the submit reached the network anyway"
+    assert driven["refusal"]["toasts"] == [driven["overCeiling"]["text"]], driven["refusal"]
+
+    # A headroom of 1.0 is reachable, and it is what makes the form's own 300 s maximum submittable
+    # again — the pre-headroom payload, byte for byte, from the UI.
+    assert driven["relieved"]["over"] is False
+    assert driven["sentPlanner"] == [
+        {
+            "path": "/api/projects/p1/generate/songplanner",
+            "body": {
+                "title": "Night Signal",
+                "idea": "sunset synthwave",
+                "lyrics": "[Verse]\nKnown words",
+                "duration": 300,
+                "duration_headroom": 1,
+                "seed": 0,
+                "confirm_song_replacement": False,
+            },
+        }
+    ]
+
+    # The direct route has no planner and no such field, so it must not acquire the key on the way
+    # past — and the multiplier the Director chose survives the round trip through Balanced.
+    assert driven["backToBalanced"]["value"] == "1"
+    assert len(driven["sentMusic"]) == 1
+    assert driven["sentMusic"][0]["path"] == "/api/projects/p1/generate/music"
+    assert "duration_headroom" not in driven["sentMusic"][0]["body"]
+
+
+def test_the_headroom_field_names_the_two_inputs_it_separates_and_does_not_vouch_for_1_5():
+    """The copy is the larger half of this change, so its removal has to fail something.
+
+    The two inputs take the same kind of number and mean different things; a form that shows a
+    multiplier without saying what it multiplies into is the conflation this feature exists to
+    undo. And the 1.5 it ships at is a documented claim contradicted by the same creator's own
+    exported graphs, with no live render long enough to tell them apart — so the copy reports the
+    disagreement rather than presenting the number as verified.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    block = re.search(r'<div id="music-headroom-field">.*?\n                </div>', markup, re.DOTALL)
+    assert block, "the Song workspace form no longer has a headroom block"
+    # The comments are the implementer's; the Director reads only what is outside a tag.
+    help_text = re.search(r'<p class="field-help">(.*?)</p>', block.group(0), re.DOTALL)
+    assert help_text, "the headroom block no longer explains what it multiplies"
+    prose = re.sub(r"<[^>]+>", "", help_text.group(1))
+
+    # Both node inputs, named, where the Director reads them rather than in a tooltip.
+    assert "M3SongPlanner" in prose, prose
+    assert "MiniMaxMusic3TextEncode.max_duration" in prose, prose
+    # What each one governs: a length to write, against a ceiling that may be finished before.
+    assert "how long a song" in prose, prose
+    assert "ceiling" in prose, prose
+    # 1.0's meaning, since it is one of the two candidate answers and the reproducible one.
+    assert "1.0" in prose, prose
+    # And the contradiction, in the same breath as the number.
+    assert "1.5" in prose, prose
+    assert "set both inputs equal" in prose, prose
+
+    field = re.search(r'<input name="duration_headroom"[^>]*>', block.group(0))
+    assert field, "the headroom input is gone"
+    # The route takes a float; the browser's default step=1 would refuse the 1.5 it ships at.
+    assert 'step="any"' in field.group(0), field.group(0)
+    # No bound and no default in the markup: every one of them comes from musicFormFieldUpdate,
+    # which is held equal to the request model. A number here is exactly the drift that guards
+    # against, so its absence is asserted rather than assumed.
+    for retyped in ("min=", "max=", "value="):
+        assert retyped not in field.group(0), field.group(0)
 
 
 def test_duration_input_accepts_fractional_values():
@@ -2719,6 +3129,7 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
         "generate_multiview",
         "generate_h3",
         "enhance_with_ltx25",
+        "restore_song_audio",
     }, "a new route submits to ComfyUI; decide whether it is Shot-sourced and guard it"
 
     shot_sourced = {
@@ -2728,18 +3139,30 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
     }
     assert shot_sourced, "no route builds a payload from a Shot any more; this test is stale"
 
-    # The one Shot-sourced route the readiness gate does not apply to, and the decision is
+    # The two Shot-sourced routes the readiness gate does not apply to, and the decision is
     # recorded here rather than made by omission. The gate refuses a Shot whose prompt would
-    # spend a GPU pass returning noise; `enhance_with_ltx25` submits a graph whose prompt is
-    # **empty** — the export fixes it that way — and reads only the take on disk. A Shot with
-    # no prompt enhances exactly as well as one with a prompt, so borrowing the gate here would
-    # refuse a real take for a field the work never reads.
+    # spend a GPU pass returning noise; both of these take a *take* as their input and neither
+    # graph has a prompt the Shot supplies — `enhance_with_ltx25`'s is fixed **empty** by its
+    # export, and `restore_song_audio`'s graph has no text input at all and no model either.
+    # A Shot with no prompt is processed exactly as well as one with a prompt on both, so
+    # borrowing the gate would refuse a real take for a field the work never reads.
     #
-    # Exempt from that gate, not from *a* gate: this route's precondition is that a take
-    # exists, and it is asserted below with the same "before the submission" ordering the
-    # others get. A route with neither would fail this test.
-    ungated = {"enhance_with_ltx25"}
-    for name in sorted(ungated):
+    # Exempt from that gate, not from *a* gate: each route's precondition is that a take exists,
+    # and each is asserted below with the same "before the submission" ordering the others get,
+    # against its own refusal constants. A route with neither would fail this test.
+    ungated = {
+        "enhance_with_ltx25": ("ENHANCE_NO_TAKE_REFUSAL", "ENHANCE_MISSING_TAKE_REFUSAL"),
+        # Plus the two that make this route's window the render's own: a shot that never rode
+        # the master has no window to take, and a project with no song has nothing to take it
+        # from. Both refuse before the submission for the same reason the take checks do.
+        "restore_song_audio": (
+            "RESTORE_AUDIO_NO_TAKE_REFUSAL",
+            "RESTORE_AUDIO_MISSING_TAKE_REFUSAL",
+            "RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL",
+            "RESTORE_AUDIO_NO_SONG_REFUSAL",
+        ),
+    }
+    for name, refusals in sorted(ungated.items()):
         assert name in shot_sourced, f"{name} no longer takes a shot_id; this exemption is stale"
         code = "\n".join(
             line
@@ -2750,8 +3173,9 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
         # The take is the input, so its absence is what this route refuses, before submitting.
         assert "latest_output" in code, name
         assert code.index("latest_output") < code.index("comfy.submit"), name
-        assert "ENHANCE_NO_TAKE_REFUSAL" in code, name
-        assert "ENHANCE_MISSING_TAKE_REFUSAL" in code, name
+        for refusal in refusals:
+            assert refusal in code, (name, refusal)
+            assert code.index(refusal) < code.index("comfy.submit"), (name, refusal)
 
     for name, source in {
         name: source for name, source in shot_sourced.items() if name not in ungated

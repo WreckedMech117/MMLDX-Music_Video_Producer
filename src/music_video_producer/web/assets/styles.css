@@ -103,6 +103,16 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .or-rule::before, .or-rule::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .form-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
 .form-row.thirds { grid-template-columns: 1fr 1fr 1.25fr; }
+/* The headroom box and the encoder ceiling it produces, on one line: the number typed and the
+   number it works out to have to be read together or the product is no more visible than the
+   default it replaced. The readout keeps its height when it has nothing to say, so the form does
+   not jump as the boxes are filled. `.over` is the same amber `.field-count` uses for text a route
+   will refuse -- here it marks a product past the encoder's 360 s schema ceiling. */
+.form-row.headroom { grid-template-columns: 1fr 2.1fr; align-items: start; }
+.field-note { min-height: 38px; margin: 0 0 12px; display: flex; align-items: center; color: var(--dim); font-size: 11px; line-height: 1.35; }
+.field-note.over { color: var(--amber); }
+.field-help { margin: -4px 0 12px; color: var(--dim); font-size: 11px; line-height: 1.5; }
+.field-help b { color: var(--muted); font-weight: 600; }
 .waveform-header { display: flex; justify-content: space-between; align-items: center; min-height: 70px; padding: 0 18px; border-bottom: 1px solid var(--line); }
 .waveform-header > div:first-child { display: flex; align-items: center; gap: 10px; }
 .source-badge { padding: 4px 6px; border: 1px solid var(--line-strong); color: var(--muted); font: 9px Consolas, monospace; letter-spacing: .1em; }

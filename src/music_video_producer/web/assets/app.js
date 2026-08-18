@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, CITATION_MISSING_LABEL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, CITATION_MISSING_LABEL, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, resolveShotMode, shotCitations, shotExpansionToast, shotInspectorReadiness, shotPromptCell, shotSpecificationProblems, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -1269,32 +1269,64 @@ function bindEvents() {
     catch (error) { await recoverFromSongRefusal(error); }
   });
   const musicForm = $("#music-form");
-  // Thin DOM applier: every decision (which bounds, which way to clamp) lives in
-  // musicFormFieldUpdate, which is unit-tested without a browser.
+  // The encoder ceiling the two duration fields multiply out to, redrawn from `songEncoderCeiling`
+  // on every keystroke in either box. Neither field bounds the other -- the schema bounds their
+  // product, so the product is what is shown -- and this line is the only thing that makes that
+  // product visible before the submit that would otherwise learn it from a 422.
+  const syncMusicCeiling = () => {
+    const ceiling = songEncoderCeiling(
+      musicForm.elements.duration.value,
+      musicForm.elements.duration_headroom.value,
+    );
+    const note = $("#music-ceiling");
+    note.textContent = ceiling.text;
+    note.classList.toggle("over", ceiling.exceeds);
+  };
+  // Thin DOM applier: every decision (which bounds, which way to clamp, which controls a preset
+  // even has) lives in musicFormFieldUpdate, which is unit-tested without a browser.
   const syncMusicVariant = () => {
     const update = musicFormFieldUpdate(musicForm.elements.preset.value, {
       duration: musicForm.elements.duration.value,
+      duration_headroom: musicForm.elements.duration_headroom.value,
       seed: musicForm.elements.seed.value,
     });
     const lyricsField = musicForm.elements.lyrics;
     lyricsField.closest("label").style.display = update.lyricsVisible ? "" : "none";
     lyricsField.disabled = !update.lyricsVisible;
     lyricsField.required = update.lyricsRequired;
+    // The whole block -- box, ceiling readout and the note naming the two node inputs -- goes
+    // together, and the box is disabled with it: `required` on a hidden field would block the
+    // direct Music 3 submit with a validation message pointing at a control nobody can see.
+    $("#music-headroom-field").style.display = update.headroomVisible ? "" : "none";
+    musicForm.elements.duration_headroom.disabled = !update.headroomVisible;
     for (const [name, bounds] of Object.entries(update.numeric)) {
       const field = musicForm.elements[name];
       field.min = bounds.min;
       field.max = bounds.max;
       field.value = bounds.value;
     }
+    syncMusicCeiling();
   };
   syncMusicVariant();
   musicForm.elements.preset.addEventListener("change", syncMusicVariant);
+  musicForm.elements.duration.addEventListener("input", syncMusicCeiling);
+  musicForm.elements.duration_headroom.addEventListener("input", syncMusicCeiling);
   musicForm.addEventListener("submit", async (event) => {
     event.preventDefault(); if (!requireProject()) return;
     const data = Object.fromEntries(new FormData(event.currentTarget));
     const plan = musicGenerationPlan(data);
     if (data.preset === "songplanner-known" && !plan.body.lyrics) {
       return toast("Paste the lyric sheet, or switch to the invented-lyrics preset.", "error");
+    }
+    // Refused here, before the replacement question and before the GPU-cost question, for the same
+    // reason the server refuses before `comfy.submit`: the product of the duration and the headroom
+    // leaving the encoder's schema range is arithmetic the browser already has every number for,
+    // and spending two confirmations to be told it by a 422 is a worse way to find out. Same
+    // sentence the readout beside the fields is already showing, and the same numbers the route
+    // would name. Nothing is clamped -- the Director is told which of their two numbers to move.
+    if (plan.endpoint === "songplanner") {
+      const ceiling = songEncoderCeiling(plan.body.duration, plan.body.duration_headroom);
+      if (ceiling.refusal) return toast(ceiling.refusal, "error");
     }
     // Both generate routes assign the new Song at submit time, before any audio exists,
     // so the consequence is asked here rather than when the job completes. This is a

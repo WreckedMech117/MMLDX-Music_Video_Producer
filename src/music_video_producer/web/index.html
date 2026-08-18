@@ -103,9 +103,32 @@
                        SongPlanner presets' 30-300 s node range is never duplicated here. step="any" because
                        the routes take a float and enforce only min/max — the default step=1 would make the
                        browser refuse fractional durations ComfyUI accepts. -->
-                  <label>Duration <span>s</span><input name="duration" type="number" step="any" min="4" max="360" value="120"></label>
+                  <label>Duration <span>s</span><input name="duration" type="number" step="any" min="4" max="360" value="120" title="How long a song the planner is told to write. Not a ceiling — the encoder's ceiling is this multiplied by the headroom below."></label>
                   <label>Seed<input name="seed" type="number" min="0" value="0"></label>
                   <label>Preset<select name="preset" title="Generation variant"><option value="balanced">Balanced (direct)</option><option value="songplanner-invented">SongPlanner — invented lyrics</option><option value="songplanner-known">SongPlanner — known lyrics</option></select></label>
+                </div>
+                <!-- SongPlanner only, hidden and disabled for direct Music 3 by syncMusicVariant:
+                     `MusicRequest` has no planner between the Director and the encoder, so it has
+                     no headroom field and a `required` box left live here would block its submit.
+                     No min/max/value in the markup on purpose — every one of them, the default
+                     included, comes from musicFormFieldUpdate, which carries SongPlannerRequest's
+                     own ge/le/default and is held equal to them by tests/test_frontend_contract.py.
+                     A number typed here would be the drift that whole test exists to catch.
+                     step="any" for the same reason the duration has it: the route takes a float and
+                     the browser's default step=1 would refuse the 1.5 this field ships at. -->
+                <div id="music-headroom-field">
+                  <div class="form-row headroom">
+                    <label>Encoder headroom <span>×</span><input name="duration_headroom" type="number" step="any" required title="Multiplier from the song's length to MiniMaxMusic3TextEncode.max_duration. The planner is still asked for a song of exactly the duration above."></label>
+                    <p class="field-note" id="music-ceiling"></p>
+                  </div>
+                  <!-- The two inputs this field separates, named where the Director reads them,
+                       which is the larger half of why the control exists at all. The claim about
+                       1.5 is reported with its contradiction rather than as a fact: the creator's
+                       write-up states the 50% rule four times, their own audited exports set both
+                       inputs equal, and no render on record has been long enough to tell them
+                       apart. Inside this block, so it goes when the field does — it describes a
+                       planner the direct Music 3 preset does not use. -->
+                  <p class="field-help"><b>Duration</b> is how long a song <b>M3SongPlanner</b> is told to write. <b>Headroom</b> multiplies it into <b>MiniMaxMusic3TextEncode.max_duration</b> — the encoder's latent ceiling, which the song may finish before, not a second target length. 1.0 gives the encoder exactly the song's length and no room to overrun, reproducing what this form sent before the setting existed. 1.5 is the creator's documented rule; their own exported workflows set both inputs equal, and no render yet has been long enough to settle which is right.</p>
                 </div>
                 <button class="primary-button full" type="submit">Queue song generation</button>
               </form>
