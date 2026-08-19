@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import hashlib
 import json
@@ -9828,6 +9829,110 @@ def test_an_expansion_of_only_whitespace_is_treated_as_absent():
     blank = "   " + "\n" + "  "
     shot = Shot(start=0.0, duration=3.75, prompt="Wide on Lucy.", h3_prompt=blank)
     assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")
+
+
+def test_a_singing_song_audio_shot_gains_the_measured_sings_clause():
+    """The lipsync half of the 2026-08-19 measurements: the takes the Director praised
+    both said the character sings to camera, and a prompt with no singing language
+    rendered a closed mouth. The clause is appended only when the intent does not
+    already say so, only for song-audio shots, and only when the shot sings."""
+    from music_video_producer.app import (
+        SONG_AUDIO_SINGS_CLAUSE,
+        SONG_AUDIO_SINGS_CLAUSE_BARE,
+    )
+
+    tags = ["<Picture 1> is Lucy", "<Audio 1> is the master song for synchronization"]
+    base = {"start": 0.0, "duration": 3.75, "prompt": "Close on her face at the mic.",
+            "use_song_audio": True}
+    cited = [AssetCitation(asset_id="asset_1", role="reference", order=0)]
+
+    singing = Shot(**base, singing="singing", citations=cited)
+    assert reference_prompt(singing, tags).endswith(SONG_AUDIO_SINGS_CLAUSE)
+    # Without a reference sheet the wording cannot claim one.
+    uncited = Shot(**base, singing="singing")
+    assert reference_prompt(uncited, tags).endswith(SONG_AUDIO_SINGS_CLAUSE_BARE)
+    # An intent that already sings gets no doubled clause.
+    already = Shot(start=0.0, duration=3.75, prompt="She sings to camera, leaning in.",
+                   use_song_audio=True, singing="singing", citations=cited)
+    assert "sings to camera." not in reference_prompt(already, tags).removeprefix(
+        f"Reference map: {'; '.join(tags)}. {already.prompt}"
+    )
+    # Not singing, or not riding the song: the string this route always built.
+    silent = Shot(**base, singing="not_singing", citations=cited)
+    assert reference_prompt(silent, tags) == (
+        f"Reference map: {'; '.join(tags)}. {silent.prompt}"
+    )
+    # The section look still lands after the clause.
+    sectioned = reference_prompt(singing, tags, section_prompt="on the canopy bed")
+    assert sectioned.endswith(f"{SONG_AUDIO_SINGS_CLAUSE} Section look: on the canopy bed")
+
+
+def test_song_audio_prose_is_the_submit_walks_own_string(tmp_path: Path):
+    """The prose expansion and the render must name the same slots: `song_audio_prose`
+    stores what `generate_h3`'s reference branch will submit, byte for byte — same
+    citation walk, same numbering, same master-song line — even while a stale document
+    expansion is still on the Shot."""
+    from music_video_producer.app import (
+        reference_map_tag_lines,
+        song_audio_prose,
+    )
+
+    project = Project(
+        name="Prose",
+        song=Song(title="Harder Faster", source="imported", duration=154.6),
+        assets=[
+            Asset(id="asset_sheet", name="HarderFaster · multiview", kind="character",
+                  path="a.png", source="upload"),
+        ],
+        shots=[
+            Shot(id="shot_p", start=19.33, duration=4.0, prompt="Over-the-shoulder lean-in.",
+                 singing="singing", use_song_audio=True,
+                 h3_prompt="integrated_multimodal_description: stale document",
+                 citations=[AssetCitation(asset_id="asset_sheet", role="reference", order=0)]),
+        ],
+        sections=[SongSection(label="Verse", start=10.0, duration=20.0,
+                              prompt="moonlit warehouse")],
+    )
+    shot = project.shots[0]
+    tags = reference_map_tag_lines(project, shot)
+    assert tags == [
+        "<Picture 1> is HarderFaster · multiview",
+        "<Audio 1> is the master song for synchronization",
+    ]
+    prose = song_audio_prose(project, shot)
+    assert prose == (
+        "Reference map: <Picture 1> is HarderFaster · multiview; "
+        "<Audio 1> is the master song for synchronization. "
+        "Over-the-shoulder lean-in. "
+        "The character from the reference sheet sings to camera. "
+        "Section look: moonlit warehouse"
+    )
+    assert "integrated_multimodal_description" not in prose
+
+
+def test_a_song_audio_reference_shots_expansion_is_deterministic_and_calls_no_model():
+    """The night's decisive measurement (2026-08-19, eight renders, one A/B shot): every
+    H3-document prompt made the sampler synthesize its own score over the referenced
+    track (≤0.43 envelope correlation), every plain-prose reference-map prompt followed
+    it (≥0.77; 0.94 with the sings clause). So a song-audio reference shot's expansion
+    is `song_audio_prose`, and the director is never called for it."""
+    from music_video_producer.app import attempt_expansion, song_audio_prose
+
+    class ExplodingDirector:
+        async def expand_shot(self, **_):
+            raise AssertionError("the model must not be called for song-audio prose")
+
+    project = Project(
+        name="Prose",
+        song=Song(title="Harder Faster", source="imported", duration=154.6),
+        shots=[Shot(id="shot_p", start=19.33, duration=4.0, prompt="Lean-in at the mic.",
+                    singing="singing", use_song_audio=True)],
+    )
+    outcome = asyncio.run(
+        attempt_expansion(project, project.shots[0], director=ExplodingDirector())
+    )
+    assert outcome.kind == "expanded"
+    assert outcome.text == song_audio_prose(project, project.shots[0])
 
 
 GOOD_EXPANSION = (

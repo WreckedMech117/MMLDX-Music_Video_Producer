@@ -123,9 +123,11 @@ SINGING_RULES = """About singing, which this model gets wrong in both directions
   performance as visible action AND name the audio tag from the references list as its
   source, like this: "she sings straight into the microphone, mouth moving precisely
   with the words, breath and effort visible; the vocal in <Audio 1> drives her lip
-  movements." Use the audio tag exactly as the references list numbers it. Never quote,
-  paraphrase or invent the words being sung — not in a dialogue tag, not in prose, not
-  anywhere. The audio reference carries the words; text that names them fights it.
+  movements." Use the audio tag exactly as the references list numbers it. That sentence
+  is plain prose inside the description — a singing shot has no dialogue, so no <d> tag
+  appears anywhere in it. Never quote, paraphrase or invent the words being sung — not
+  in a dialogue tag, not in prose, not anywhere. The audio reference carries the words;
+  text that names them fights it.
 - If the shot is marked as not singing, no one in it performs the song: do not write
   lip movement matching the music, and write no sung words. The music still moves the
   shot — cue physical action to the track's beat by its tag, like "she strides in time

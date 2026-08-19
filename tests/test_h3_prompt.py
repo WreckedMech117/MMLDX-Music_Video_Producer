@@ -303,3 +303,22 @@ def test_normalize_audio_fields_rewrites_both_to_the_reuse_declaration() -> None
         for p in check(overlong, duration=4.0, require_sound_fields=False).problems
     )
     assert normalize_audio_fields("free text, no fields") == "free text, no fields"
+
+
+def test_forbid_dialogue_flags_any_d_block_on_a_song_audio_prompt() -> None:
+    """The prohibition that failed as a rule (2026-08-19): the model invented fully
+    well-formed lyrics — words in no lyric sheet — inside <d>[English] on a not-singing
+    shot, and every other check passed them. On a shot conditioned on the master song any
+    <d> block is a second vocal source, so its presence is the mechanical defect."""
+    invented = (
+        "integrated_multimodal_description: [Shot 1] She stands at the mic. "
+        '<d>[English] "Words from nowhere"</d>\n\n'
+        "overall_soundscape: N/A\n\n"
+        "non_diegetic_music: <Audio 1> is directly reused as the complete "
+        "audience-only score."
+    )
+    assert check(invented, duration=4.0).problems == []  # well-formed by every old rule
+    flagged = check(invented, duration=4.0, forbid_dialogue=True).problems
+    assert any("no <d> dialogue block" in p.message for p in flagged)
+    clean = invented.replace('<d>[English] "Words from nowhere"</d>', "She sings.")
+    assert check(clean, duration=4.0, forbid_dialogue=True).problems == []

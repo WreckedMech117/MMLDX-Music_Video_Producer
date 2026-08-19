@@ -437,24 +437,36 @@ REFERENCE_KEYFRAME_NOT_IMAGE = (
 )
 
 
+#: The measured lipsync clause (2026-08-19, the night's decisive experiment): the two
+#: takes the Director's own ear rated "really good" both carried this exact sentence
+#: shape, and re-rendered on the A/B shot it measured 0.94 envelope correlation with
+#: visible articulation — while every H3-document variant measured ≤0.43. The wording is
+#: lifted from the praised take verbatim, not composed.
+SONG_AUDIO_SINGS_CLAUSE = "The character from the reference sheet sings to camera."
+SONG_AUDIO_SINGS_CLAUSE_BARE = "The performer sings to camera."
+
+
 def reference_prompt(shot: Shot, tags: list[str], section_prompt: str = "") -> str:
     """What the reference render actually submits for this Shot.
 
     Without an expansion this is byte-for-byte the string this route has always built:
-    the reference map, then the Shot's intent. That equality is the whole safety
-    argument for the change — a Shot nobody has expanded renders exactly as it did.
+    the reference map, then the Shot's intent — plus, for a singing song-audio shot whose
+    intent never says so, the measured sings-to-camera clause (see the constant above).
 
-    With one, the expansion is submitted **alone**, and dropping the preamble is the
-    point rather than an omission. An H3-format prompt is a document with a required
-    shape: an optional instruction line first, then the three named fields. Prefixing
-    "Reference map: ..." would put prose in front of that instruction line and break the
-    format the expansion exists to produce. The tags are not lost — the specialist was
-    handed them and wrote them into the description as `<Picture 1>`, which is where the
-    guide puts them and is a better place than a preamble the model has to parse back out.
+    With an expansion, it is submitted **alone**: for song-audio shots the stored text is
+    already the whole preamble-prose string (`song_audio_prose` built it), and for the
+    document modes prefixing prose would break the required format.
     """
     if shot.h3_prompt.strip():
         return shot.h3_prompt
     base = f"Reference map: {'; '.join(tags)}. {shot.prompt}"
+    if (
+        shot.use_song_audio
+        and shot.singing == "singing"
+        and "sing" not in shot.prompt.lower()
+    ):
+        clause = SONG_AUDIO_SINGS_CLAUSE if shot.citations else SONG_AUDIO_SINGS_CLAUSE_BARE
+        base = f"{base} {clause}"
     # The fallback's insurance (run-2 audit item 7): the section's shared look reaches H3
     # only through the expansion, so a shot whose every expansion attempt failed would
     # render from one bare intent sentence with no section character. Appended, never
@@ -464,6 +476,74 @@ def reference_prompt(shot: Shot, tags: list[str], section_prompt: str = "") -> s
     if section_prompt:
         return f"{base} Section look: {section_prompt}"
     return base
+
+
+def reference_map_tag_lines(project: Project, shot: Shot) -> list[str]:
+    """The submit walk's tag sentences, computed outside the submit route.
+
+    Byte-for-byte the lines `generate_h3`'s reference branch builds — same
+    `citations_in_prompt_order` walk, same per-kind numbering, same role wording, same
+    master-song line last — so a prompt stored ahead of submission names exactly the
+    slots the payload will fill. A citation whose asset is missing is skipped here where
+    the route 422s: this function writes text, and the render is where a dangling
+    citation must stop the world.
+    """
+    tags: list[str] = []
+    numbers = {"picture": 0, "video": 0, "audio": 0}
+    for citation in citations_in_prompt_order(shot):
+        asset = next((item for item in project.assets if item.id == citation.asset_id), None)
+        if asset is None:
+            continue
+        label = shot.reference_labels.get(asset.id, asset.name)
+        if citation.role in REFERENCE_MAP_ROLE_TAGS:
+            numbers["picture"] += 1
+            tags.append(
+                REFERENCE_MAP_ROLE_TAGS[citation.role].format(
+                    number=numbers["picture"], label=label
+                )
+            )
+            continue
+        kind = (
+            "video"
+            if asset.kind == "video"
+            else "audio"
+            if asset.kind == "audio"
+            else "picture"
+        )
+        numbers[kind] += 1
+        tag_name = {"picture": "Picture", "video": "Video", "audio": "Audio"}[kind]
+        tags.append(f"<{tag_name} {numbers[kind]}> is {label}")
+    if shot.use_song_audio:
+        numbers["audio"] += 1
+        tags.append(f"<Audio {numbers['audio']}> is the master song for synchronization")
+    return tags
+
+
+def song_audio_prose(project: Project, shot: Shot) -> str:
+    """The whole submitted prompt for a song-audio reference Shot, as prose.
+
+    The night of measurements this encodes (2026-08-19, one A/B shot, same trim, turbo):
+    every prompt in the H3 document format made the sampler *synthesize* its own score
+    over the reference — fields present 0.36/0.27, guide-official citation fields -0.04,
+    fields absent with vocal language -0.03, fields absent with plain "singing" 0.43,
+    fields absent with a sync declaration 0.06 — while the plain-prose reference-map form
+    measured 0.82 (no singing language), 0.77 (the run-1 take the Director praised) and
+    **0.94 with the sings-to-camera clause**, with visible lip articulation and the set
+    intact. The document header itself is the trigger; no wording inside it recovered.
+
+    So a song-audio shot's "expansion" is this deterministic string: the same reference
+    map the submit route numbers, the Shot's intent, the measured sings clause when the
+    shot sings and the intent does not already say so, and the section look. It is the
+    submit fallback's own construction, stored — record and submission stay one text.
+    """
+    section = song_section(project, shot)
+    return reference_prompt(
+        # A copy with the stored expansion blanked, so the fallback construction runs
+        # even while a previous document expansion is still on the Shot.
+        shot.model_copy(update={"h3_prompt": ""}),
+        reference_map_tag_lines(project, shot),
+        section_prompt=section.prompt if section is not None else "",
+    )
 
 
 
@@ -2226,6 +2306,17 @@ async def attempt_expansion(
     attempt, and both callers already map it to their own 503.
     """
     mode = resolve_shot_mode(shot)
+    # A song-audio reference shot's expansion is deterministic prose, no model call: the
+    # H3 document format itself was measured (2026-08-19, eight renders) to make the
+    # sampler synthesize its own score over the referenced track — every document
+    # variant ≤0.43 envelope correlation against the master window, every plain-prose
+    # reference-map prompt ≥0.77, the sings-clause form 0.94 with visible lipsync. See
+    # `song_audio_prose` for the full table. The keyframe modes keep the document path:
+    # they carry no evidence either way and their graphs differ.
+    if shot.use_song_audio and mode == "references":
+        return ShotExpansionOutcome(
+            shot.id, "expanded", text=song_audio_prose(project, shot)
+        )
     expect_instruction = mode in H3_KEYFRAME_MODES
     payload = shot_expansion_input(project, shot)
     system = h3_system_prompt(
@@ -2260,7 +2351,14 @@ async def attempt_expansion(
                 shot.id, "failed", detail=str(error), attempts=attempt
             )
         checked = h3_check(
-            text, duration=shot.duration, expect_instruction=expect_instruction
+            text,
+            duration=shot.duration,
+            expect_instruction=expect_instruction,
+            # A song-audio shot may carry no <d> block, and this is enforced here rather
+            # than in the rules because the rules failed: the model invented well-formed
+            # lyrics that no lyric-sheet comparison could catch (2026-08-19). Flagging it
+            # makes the retry loop feed the removal back as a corrective turn.
+            forbid_dialogue=shot.use_song_audio,
         )
         if checked.well_formed:
             return ShotExpansionOutcome(shot.id, "expanded", text=text, attempts=attempt)
@@ -5824,11 +5922,19 @@ def create_app(
 
         # Re-checked pure so the advisory problems ride along with an applied answer, exactly
         # as they always have: `attempt_expansion` only reports problems for a refusal.
-        checked = h3_check(
-            outcome.text,
-            duration=shot.duration,
-            expect_instruction=mode in H3_KEYFRAME_MODES,
-        )
+        # A song-audio reference shot's outcome is deterministic prose, not a document —
+        # the H3 checker would only report the fields it deliberately does not have.
+        advisory: list[str] = []
+        if not (shot.use_song_audio and mode == "references"):
+            advisory = [
+                problem.message
+                for problem in h3_check(
+                    outcome.text,
+                    duration=shot.duration,
+                    expect_instruction=mode in H3_KEYFRAME_MODES,
+                    forbid_dialogue=shot.use_song_audio,
+                ).problems
+            ]
 
         # Re-read after the await for the reason `director_chat` documents: the Shot may have
         # been locked, rendered or deleted while the model was thinking, and the answer was
@@ -5857,7 +5963,7 @@ def create_app(
         return ShotExpansionResult(
             project=project,
             applied=True,
-            problems=[problem.message for problem in checked.problems],
+            problems=advisory,
             prompt=outcome.text,
             attempts=outcome.attempts,
         )

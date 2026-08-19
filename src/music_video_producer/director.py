@@ -527,7 +527,12 @@ class DirectorClient:
         base_url: str,
         model: str,
         api_key: str = "",
-        timeout: float = 90,
+        # 300 rather than 90 since 2026-08-19: the loaded model began reasoning
+        # unconditionally (`enable_thinking: false` stopped taking effect after an LM
+        # Studio-side change), and a full H3 expansion's reasoning phase alone can run
+        # past 90 s. The reasoning now *terminates* — measured the same day — so waiting
+        # is correct where truncating the budget is not.
+        timeout: float = 300,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -849,10 +854,14 @@ class DirectorClient:
             response = await self._completion(body=body, headers=headers)
             message = self._reply(response)
         except (httpx.HTTPError, KeyError, IndexError, TypeError) as error:
+            # `str(error)` alone is not enough: httpx.ReadTimeout stringifies to "",
+            # which once produced the message "invalid response: ." about what was
+            # actually a timeout. The class name is the part that always says something.
             raise DirectorError(
                 "LLM director returned an invalid response: "
-                f"{error}. If the provider rejected the request body, note that "
-                "chat_template_kwargs is an LM Studio / vLLM extension and may need removing."
+                f"{type(error).__name__}: {error}. If the provider rejected the request "
+                "body, note that chat_template_kwargs is an LM Studio / vLLM extension "
+                "and may need removing."
             ) from error
 
         text = (message.get("content") or "").strip()

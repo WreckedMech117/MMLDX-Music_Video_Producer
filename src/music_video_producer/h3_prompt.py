@@ -321,7 +321,8 @@ def check_retention(prompt: str) -> list[Problem]:
 
 def check(prompt: str, *, duration: float | None = None,
           expect_instruction: bool = False,
-          require_sound_fields: bool = True) -> ParsedPrompt:
+          require_sound_fields: bool = True,
+          forbid_dialogue: bool = False) -> ParsedPrompt:
     """Check the mechanical rules and report what is wrong.
 
     ``duration`` bounds the cut times when the caller knows the shot's length;
@@ -329,10 +330,17 @@ def check(prompt: str, *, duration: float | None = None,
     line as the first line. T2VA requires its absence, and that is checked too —
     an instruction on a T2VA prompt is a mode confusion worth catching.
 
-    ``require_sound_fields=False`` is for song-audio shots, whose stored prompts have
-    their two audio fields stripped (`strip_audio_fields` — measured 2026-08-19: any
-    text in those fields fights the referenced track). Fields *present* on such a
-    prompt are still bounds-checked; only their absence stops being a problem.
+    ``require_sound_fields=False`` is for prompts whose two audio fields were removed
+    rather than normalized. Fields *present* on such a prompt are still bounds-checked;
+    only their absence stops being a problem.
+
+    ``forbid_dialogue=True`` is for song-audio shots, and it exists because the rule it
+    enforces failed as a prohibition: told never to invent sung words, the model on this
+    machine wrote a fully well-formed `<d>[English] "I'm howling at the moon..."` — words
+    that exist nowhere in the song — onto a not-singing shot, and every other check
+    passed it (2026-08-19). On a shot conditioned on the master song, ANY `<d>` block is
+    a second vocal source fighting the reference, so its presence is the defect, and
+    flagging it here is what routes the sentence into the expansion retry loop.
 
     A clean result means well-formed. It does not mean good; see the module
     docstring for what deliberately is not checked here.
@@ -359,6 +367,14 @@ def check(prompt: str, *, duration: float | None = None,
         parsed.problems.extend(check_shots(description, duration=duration))
         parsed.problems.extend(check_orphan_cuts(description))
         parsed.problems.extend(check_dialogue(description))
+        if forbid_dialogue and _DIALOGUE_OPEN.search(description):
+            parsed.problems.append(Problem(
+                CORE_FIELDS[0],
+                "This shot rides the master song, so the description may contain no "
+                "<d> dialogue block at all: the referenced audio carries every word, "
+                "and written speech or lyrics would fight it. Remove the <d> block and "
+                "its contents; describe the performance as visible action instead.",
+            ))
     reported = frozenset(problem.field for problem in parsed.problems)
     parsed.problems.extend(
         check_sound_fields(
