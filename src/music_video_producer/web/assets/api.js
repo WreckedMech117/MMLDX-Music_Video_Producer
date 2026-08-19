@@ -2042,6 +2042,66 @@ export function assemblyControl(project) {
   return { disabled: false, label: ASSEMBLE_LABEL, title: ASSEMBLE_HELP, reason: "" };
 }
 
+// ------------------------------------------------------------------------------------------
+// The over-render offset and the Monitor's decisions (spec-monitor-and-over-render). Takes
+// are rendered ~half a second longer than their windows; these decide which slice of the
+// take the timeline's window shows. `effectiveOffset` is the client's one copy of the rule
+// the server's assembly route resolves from the same two fields -- a contract test holds
+// the two together, because a Monitor previewing one slice while assembly cuts another
+// would make the fine-tune a lie.
+// ------------------------------------------------------------------------------------------
+
+export function effectiveOffset(shot) {
+  return (Number(shot?.latest_take_lead) || 0) + (Number(shot?.trim_nudge) || 0);
+}
+
+// The nudge control's whole decision: shown only when there is a take to tune, stepped in
+// frames by the workspace, floored so the cut can never reach before the take begins. The
+// upper bound is the take's own length, which only the server measures -- assembly refuses
+// an overrun with the numbers, and the Monitor simply shows the last frame.
+export function trimNudgeControl(shot) {
+  const lead = Number(shot?.latest_take_lead) || 0;
+  const nudge = Number(shot?.trim_nudge) || 0;
+  return {
+    shown: Boolean(shot?.latest_output),
+    lead,
+    nudge,
+    offset: lead + nudge,
+    minNudge: -lead,
+  };
+}
+
+// The shot whose window holds this moment of the song, or null over a gap. Later starts
+// win a boundary tie, matching assembly's cumulative grid where a boundary frame belongs
+// to the clip it opens.
+export function monitorShotAt(project, seconds) {
+  let found = null;
+  for (const shot of project?.shots || []) {
+    if (seconds >= shot.start && seconds < shot.start + shot.duration) {
+      if (!found || shot.start > found.start) found = shot;
+    }
+  }
+  return found;
+}
+
+// What the Monitor shows at one moment: a take (and where inside it), or an honest
+// placeholder -- never a stale frame from another shot. `takeTime` folds the effective
+// offset in, so a fresh song-audio take previews the exact song seconds it was
+// conditioned on and a nudged one previews the nudged slice assembly will cut.
+export function monitorState(project, seconds) {
+  const shot = monitorShotAt(project, seconds);
+  if (!shot) return { kind: "gap", shot: null, takeTime: 0, label: "No shot under the playhead" };
+  if (!shot.latest_output) {
+    return { kind: "no-take", shot, takeTime: 0, label: "This shot has no rendered take yet" };
+  }
+  return {
+    kind: "take",
+    shot,
+    takeTime: Math.max(0, seconds - shot.start + effectiveOffset(shot)),
+    label: "",
+  };
+}
+
 // The newest finished export, read from the job records rather than a field of its own: an
 // export *is* a completed local job's output, jobs append in submission order, and a second
 // copy of "the latest" is a copy that can lie. The URL is the existing project-media route,

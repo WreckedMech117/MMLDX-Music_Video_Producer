@@ -22,9 +22,9 @@ from .assembly import (
     assembly_refusals,
     concat_args,
     concat_manifest,
-    probe_dimensions_args,
     probe_duration_args,
     probe_streams_args,
+    probe_take_args,
     trim_args,
     verification_problems,
 )
@@ -4445,44 +4445,56 @@ def create_app(
                 status_code=422,
                 detail=ASSEMBLY_SONG_UNREADABLE_REFUSAL.format(path=project.song.path),
             )
-        # Re-read after the await, then judge the plan from the fresh manifest.
+        # Re-read after the await, then judge the plan from the fresh manifest. Sourced
+        # takes are probed *before* the refusal report so the offset checks — the
+        # over-render lead plus the Director's nudge, judged against the take's measured
+        # length — land in the same comprehensive answer as everything else.
         project = get_project(project_id)
         output_root = (settings.comfy_root / "output").resolve()
         clips: list[ClipWindow] = []
+        dimensions: dict[str, tuple[int, int]] = {}
         for shot in project.shots:
             source: Path | None = None
+            take_seconds: float | None = None
+            label = shot_label(project, shot)
             if shot.approved_output:
                 candidate = (output_root / Path(shot.approved_output)).resolve()
                 if output_root in candidate.parents and candidate.is_file():
                     source = candidate
+            if source is not None:
+                rc, out, _err = await run_tool(probe_take_args(source))
+                lines = out.splitlines() if rc == 0 else []
+                try:
+                    width, height = (int(part) for part in lines[0].split(","))
+                    take_seconds = float(lines[1])
+                except (ValueError, IndexError):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=ASSEMBLY_TAKE_UNREADABLE_REFUSAL.format(
+                            shot=label, path=shot.approved_output
+                        ),
+                    ) from None
+                dimensions[shot.id] = (width, height)
             clips.append(
                 ClipWindow(
                     shot_id=shot.id,
-                    label=shot_label(project, shot),
+                    label=label,
                     start=shot.start,
                     duration=shot.duration,
                     approved_output=shot.approved_output,
                     approved_start=shot.approved_start,
                     approved_duration=shot.approved_duration,
                     source=source,
+                    # One offset rule, resolved here from the Shot's own fields; the
+                    # client's `effectiveOffset` mirrors it and a contract test holds
+                    # the two together.
+                    offset=shot.latest_take_lead + shot.trim_nudge,
+                    take_seconds=take_seconds,
                 )
             )
         refusals = assembly_refusals(clips, song_seconds)
         if refusals:
             raise HTTPException(status_code=422, detail="\n".join(refusals))
-        dimensions: dict[str, tuple[int, int]] = {}
-        for clip in clips:
-            rc, out, _err = await run_tool(probe_dimensions_args(clip.source))
-            try:
-                first = out.splitlines()[0].split(",") if rc == 0 and out else []
-                dimensions[clip.shot_id] = (int(first[0]), int(first[1]))
-            except (ValueError, IndexError):
-                raise HTTPException(
-                    status_code=422,
-                    detail=ASSEMBLY_TAKE_UNREADABLE_REFUSAL.format(
-                        shot=clip.label, path=clip.approved_output
-                    ),
-                ) from None
         plan = assembly_plan(clips, song_seconds, dimensions)
 
         exports_root = store.media_dir(project_id) / "exports"
@@ -4539,7 +4551,14 @@ def create_app(
             ):
                 dest = workdir / f"clip_{index:03d}.mp4"
                 rc, _out, err = await run_tool(
-                    trim_args(clip.source, dest, frames, plan.width, plan.height)
+                    trim_args(
+                        clip.source,
+                        dest,
+                        frames,
+                        plan.width,
+                        plan.height,
+                        offset=clip.offset,
+                    )
                 )
                 if rc != 0 or not dest.is_file():
                     raise failed(f"trim ({clip.label})", err)

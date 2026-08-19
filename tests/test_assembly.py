@@ -13,6 +13,8 @@ from music_video_producer.assembly import (
     ASSEMBLY_GAP_REFUSAL,
     ASSEMBLY_LEGACY_APPROVAL_REFUSAL,
     ASSEMBLY_NO_SHOTS_REFUSAL,
+    ASSEMBLY_OFFSET_NEGATIVE_REFUSAL,
+    ASSEMBLY_OFFSET_OVERRUN_REFUSAL,
     ASSEMBLY_OVERLAP_REFUSAL,
     ASSEMBLY_OVERRUN_REFUSAL,
     ASSEMBLY_STALE_REFUSAL,
@@ -29,9 +31,9 @@ from music_video_producer.assembly import (
     clip_frames_on_grid,
     concat_args,
     concat_manifest,
-    probe_dimensions_args,
     probe_duration_args,
     probe_streams_args,
+    probe_take_args,
     trim_args,
     verification_problems,
 )
@@ -273,8 +275,60 @@ def test_the_concat_manifest_quotes_the_demuxers_way():
 def test_probe_argv_shapes():
     assert probe_duration_args(Path("x.mp4"))[-3:] == ["-of", "csv=p=0", "x.mp4"]
     assert "format=duration" in probe_duration_args(Path("x.mp4"))
-    assert "stream=width,height" in probe_dimensions_args(Path("x.mp4"))
+    assert "stream=width,height:format=duration" in probe_take_args(Path("x.mp4"))
     assert "stream=codec_type" in probe_streams_args(Path("x.mp4"))
+
+
+def test_the_trim_offset_is_a_frame_exact_start_frame_never_a_seek():
+    """The cut point is `trim=start_frame=K` inside the filter chain — decoded, counted,
+    exact — not an input `-ss`, whose seek heuristics decide differently per codec. Zero
+    offset builds the identical argv it always did (legacy takes, byte-for-byte)."""
+    with_offset = trim_args(
+        Path("in.mp4"), Path("out.mp4"), frames=90, width=1056, height=608, offset=0.25
+    )
+    assert "-ss" not in with_offset
+    filters = with_offset[with_offset.index("-vf") + 1]
+    assert filters.startswith("trim=start_frame=6,setpts=PTS-STARTPTS,scale=")
+
+    plain = trim_args(Path("in.mp4"), Path("out.mp4"), frames=90, width=1056, height=608)
+    assert plain == trim_args(
+        Path("in.mp4"), Path("out.mp4"), frames=90, width=1056, height=608, offset=0.0
+    )
+    assert "trim=" not in plain[plain.index("-vf") + 1]
+
+
+def test_an_offset_that_runs_off_either_end_of_the_take_is_refused_with_numbers():
+    """The nudge is clamped in the client, but the manifest is writable by clients that do
+    not clamp — so the report decides, against the take's measured length."""
+    behind = clip("a", 0, 10.0)
+    behind.offset = -0.1
+    report = assembly_refusals([behind], song_seconds=10.0)
+    assert report == [
+        ASSEMBLY_OFFSET_NEGATIVE_REFUSAL.format(shot="SHOT (a)", behind=0.1)
+    ]
+
+    over = clip("a", 0, 10.0)
+    over.offset = 0.5
+    over.take_seconds = 10.25
+    report = assembly_refusals([over], song_seconds=10.0)
+    assert report == [
+        ASSEMBLY_OFFSET_OVERRUN_REFUSAL.format(
+            shot="SHOT (a)", take=10.25, offset=0.5, duration=10.0, needed=10.5
+        )
+    ]
+
+    # Fits — the boundary tolerance keeps a half-frame rounding edge from refusing.
+    fits = clip("a", 0, 10.0)
+    fits.offset = 0.25
+    fits.take_seconds = 10.25
+    assert assembly_refusals([fits], song_seconds=10.0) == []
+
+    # Unknown take length (file missing reports separately): the overflow is undecidable
+    # and must not fabricate a refusal.
+    unknown = clip("a", 0, 10.0)
+    unknown.offset = 5.0
+    assert unknown.take_seconds is None
+    assert assembly_refusals([unknown], song_seconds=10.0) == []
 
 
 def test_verification_reports_duration_drift_and_stream_shape_with_numbers():

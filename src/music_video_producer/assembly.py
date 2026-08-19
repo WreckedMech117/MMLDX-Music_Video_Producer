@@ -72,6 +72,15 @@ ASSEMBLY_OVERRUN_REFUSAL = (
 ASSEMBLY_TOO_SHORT_REFUSAL = (
     "{shot}'s window is shorter than one frame at {fps} fps and would contribute nothing."
 )
+ASSEMBLY_OFFSET_NEGATIVE_REFUSAL = (
+    "{shot}'s cut sits {behind:.3f}s before its take begins — the trim nudge reaches "
+    "further back than the take's recorded lead. Ease the nudge forward."
+)
+ASSEMBLY_OFFSET_OVERRUN_REFUSAL = (
+    "{shot}'s cut runs off the end of its take: the take holds {take:.3f}s, but "
+    "{offset:.3f}s of trim offset plus the {duration:.3f}s window needs {needed:.3f}s. "
+    "Ease the trim nudge back, or re-render for a longer take."
+)
 
 #: The two ends of the timeline, named as what they are in gap sentences.
 SONG_START_LABEL = "the start of the song"
@@ -106,6 +115,13 @@ class ClipWindow:
     #: inside ComfyUI's output root, ``None`` when it is missing or escapes. Resolution is
     #: the route's job; this module only judges the result.
     source: Path | None
+    #: Where in the take the window's first frame sits: the recorded sync lead plus the
+    #: Director's trim nudge, resolved by the route from the Shot's own fields. 0 for
+    #: every take rendered before the over-render margin existed.
+    offset: float = 0.0
+    #: The take's measured duration in seconds (ffprobe's reading), or ``None`` when the
+    #: file is missing — the overflow refusal below is decidable only when it is known.
+    take_seconds: float | None = None
 
     @property
     def end(self) -> float:
@@ -153,6 +169,31 @@ def assembly_refusals(clips: list[ClipWindow], song_seconds: float) -> list[str]
         if clip_frames_on_grid(clip.start, clip.end) < 1:
             refusals.append(
                 ASSEMBLY_TOO_SHORT_REFUSAL.format(shot=clip.label, fps=ASSEMBLY_FPS)
+            )
+        # The over-render offset, judged against the take the manifest actually holds. A
+        # negative offset is a nudge pulled past the recorded lead; an overrun is a cut
+        # that needs more take than the file measures. Both name every number the fix
+        # needs, and both are decidable only here — the client clamps, but the manifest
+        # is writable by clients that do not.
+        if clip.offset < 0:
+            refusals.append(
+                ASSEMBLY_OFFSET_NEGATIVE_REFUSAL.format(
+                    shot=clip.label, behind=-clip.offset
+                )
+            )
+        elif (
+            clip.take_seconds is not None
+            and clip.offset + clip.duration
+            > clip.take_seconds + BOUNDARY_TOLERANCE_SECONDS
+        ):
+            refusals.append(
+                ASSEMBLY_OFFSET_OVERRUN_REFUSAL.format(
+                    shot=clip.label,
+                    take=clip.take_seconds,
+                    offset=clip.offset,
+                    duration=clip.duration,
+                    needed=clip.offset + clip.duration,
+                )
             )
     refusals.extend(tiling_refusals(ordered, song_seconds))
     return refusals
@@ -253,24 +294,31 @@ def assembly_plan(
 # ------------------------------------------------------------------------------------------
 
 
-def trim_args(source: Path, dest: Path, frames: int, width: int, height: int) -> list[str]:
+def trim_args(
+    source: Path, dest: Path, frames: int, width: int, height: int, offset: float = 0.0
+) -> list[str]:
     """One take → one normalized intermediate: exact frame count, target geometry, no audio.
 
     Re-encode, deliberately: stream-copy trims cut on keyframes only, and frame-accurate
-    cuts are the whole point (see the module docstring's drift numbers). `-frames:v` does
-    the trim — takes run *longer* than their windows by grid alignment, so the first
-    `frames` frames are the window. The filter chain scales aspect-preserved, pads to
-    center, conforms the rate and pins yuv420p so every intermediate is concat-identical.
+    cuts are the whole point (see the module docstring's drift numbers). The cut starts
+    `offset` seconds into the take — the over-render lead plus the Director's nudge,
+    expressed as a frame-exact `trim=start_frame=` so no seek heuristic decides which
+    frame is first — and `-frames:v` closes it: takes run *longer* than their windows by
+    the margin, and the window is the slice from the offset. The filter chain scales
+    aspect-preserved, pads to center, conforms the rate and pins yuv420p so every
+    intermediate is concat-identical.
     """
-    filters = ",".join(
-        [
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
-            f"fps={ASSEMBLY_FPS}",
-            "setsar=1",
-            "format=yuv420p",
-        ]
-    )
+    skip = round(offset * ASSEMBLY_FPS)
+    stages = (
+        [f"trim=start_frame={skip}", "setpts=PTS-STARTPTS"] if skip > 0 else []
+    ) + [
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+        f"fps={ASSEMBLY_FPS}",
+        "setsar=1",
+        "format=yuv420p",
+    ]
+    filters = ",".join(stages)
     return [
         "ffmpeg",
         "-y",
@@ -355,7 +403,10 @@ def probe_duration_args(path: Path) -> list[str]:
     ]
 
 
-def probe_dimensions_args(path: Path) -> list[str]:
+def probe_take_args(path: Path) -> list[str]:
+    """One probe per take: geometry and length together, because both gate the plan —
+    dimensions pick the normalization target and the duration decides whether the offset
+    cut fits. csv output: one `width,height` line, then one `duration` line."""
     return [
         "ffprobe",
         "-v",
@@ -363,7 +414,7 @@ def probe_dimensions_args(path: Path) -> list[str]:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height",
+        "stream=width,height:format=duration",
         "-of",
         "csv=p=0",
         path.as_posix(),

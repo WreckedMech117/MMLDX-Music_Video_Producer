@@ -239,7 +239,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .timeline-panel { padding-bottom: 14px; overflow: hidden; }
 .timeline-tools .divider { height: 22px; border-left: 1px solid var(--line); margin: 0 4px; }
 .timeline-layout { display: grid; grid-template-columns: minmax(620px, 1fr) 280px; gap: 12px; height: calc(100% - 65px); min-height: 500px; }
-.timeline-main { display: grid; grid-template-rows: 42px 1fr; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+.timeline-main { display: grid; grid-template-rows: minmax(200px, 34vh) 42px 1fr; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+.timeline-monitor { position: relative; background: #000; border-bottom: 1px solid var(--line); display: grid; place-items: center; overflow: hidden; }
+.timeline-monitor video { width: 100%; height: 100%; object-fit: contain; }
+.monitor-overlay { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font: 12px Consolas, monospace; letter-spacing: .08em; background: rgba(0,0,0,.72); pointer-events: none; }
+.timeline-monitor.showing-take .monitor-overlay { display: none; }
+.timeline-monitor.showing-take video { display: block; }
+.timeline-monitor:not(.showing-take) video { display: none; }
 .timeline-transport { display: flex; align-items: center; gap: 9px; padding: 0 10px; border-bottom: 1px solid var(--line); color: var(--muted); font: 11px Consolas, monospace; }
 .timeline-transport button { border: 0; background: transparent; color: var(--ink); min-width: 28px; height: 30px; }
 .timeline-spacer { flex: 1; }
@@ -315,6 +321,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .plan-readiness ul { display: grid; gap: 6px; margin: 9px 0 0; padding-left: 18px; }
 .plan-readiness li.blocking { color: var(--red); }
 .plan-readiness li.warning { color: var(--amber); }
+.trim-nudge { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; padding: 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-1); }
+.trim-nudge .control-label { font: 10px/1.2 Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; color: var(--acid); }
+.trim-nudge #nudge-value { font: 12px Consolas, monospace; min-width: 58px; text-align: center; }
+.trim-nudge .control-reason { flex-basis: 100%; color: var(--muted); font-size: 11px; }
 .assembly-bar { margin-top: 12px; display: grid; gap: 10px; }
 .assembly-controls { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
 .assembly-reason { color: var(--muted); font-size: 12px; }

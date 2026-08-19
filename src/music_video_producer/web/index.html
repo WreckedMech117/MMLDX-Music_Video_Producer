@@ -286,6 +286,15 @@
         </div>
         <div class="timeline-layout">
           <div class="timeline-main">
+            <!-- The Monitor: the timeline's program viewer. The master audio element is the
+                 clock; this video is a muted view of it, switched and seeked per shot by
+                 monitorState in api.js. Takes play muted by design — the master song is the
+                 sound of the timeline; a take's own sampler audio stays audible in the
+                 inspector player, where its diagnostic value lives. -->
+            <div class="timeline-monitor" id="timeline-monitor">
+              <video id="monitor-video" muted playsinline preload="auto"></video>
+              <div class="monitor-overlay" id="monitor-overlay">No shot under the playhead</div>
+            </div>
             <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
             <div class="timeline-scroll" id="timeline-scroll">
               <div class="timeline-canvas" id="timeline-canvas">

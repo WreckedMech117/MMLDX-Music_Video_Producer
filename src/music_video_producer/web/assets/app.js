@@ -1,5 +1,5 @@
 import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
-import { ASSEMBLE_RUNNING, assemblyControl, latestAssemblyExport } from "./api.js";
+import { ASSEMBLE_RUNNING, assemblyControl, effectiveOffset, latestAssemblyExport, monitorState, trimNudgeControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -436,6 +436,9 @@ function syncTransportState() {
   const icon = audio.paused ? "▶" : "❚❚";
   $("#global-play").textContent = icon;
   $("#timeline-play").textContent = icon;
+  // The Monitor follows the clock's transport, not only its position: pausing the master
+  // must freeze the picture in the same event, or the video free-runs past the playhead.
+  syncMonitor();
 }
 
 function renderTreatment() {
@@ -954,6 +957,14 @@ export function renderShotInspector() {
   const takeHtml = shot.latest_output
     ? `<video id="take-player" class="take-player" controls preload="metadata" src="${escapeHtml(shotTakeUrl(state.project.id, shot.id, shot.latest_output))}"></video>`
     : "";
+  // The trim nudge: which slice of the over-rendered take fills the window. Decided by
+  // `trimNudgeControl` (contract-tested); frame-stepped here because a frame is the unit
+  // the cut actually moves in. Editable on an approved shot by design -- it selects a
+  // slice of the approved file; the file itself stays immovable.
+  const nudgeState = trimNudgeControl(shot);
+  const nudgeHtml = nudgeState.shown
+    ? `<div class="trim-nudge" id="trim-nudge"><span class="control-label" title="The take is rendered longer than the shot's window. The offset is where in the take the window starts: the recorded sync lead plus your nudge. The Monitor previews the same slice assembly will cut.">Trim nudge</span><button class="quiet-button" id="nudge-back" title="One frame earlier">−1f</button><span id="nudge-value">${escapeHtml(nudgeState.nudge.toFixed(3))}s</span><button class="quiet-button" id="nudge-forward" title="One frame later">+1f</button><button class="quiet-button" id="nudge-reset" title="Back to the recorded sync lead" ${nudgeState.nudge === 0 ? "disabled" : ""}>Reset</button><span class="control-reason">cut at ${escapeHtml(nudgeState.offset.toFixed(3))}s into the take (lead ${escapeHtml(nudgeState.lead.toFixed(3))}s)</span></div>`
+    : "";
   // Whether this shot's take may be approved or the approval cleared, decided by
   // `approvalControl`, which the contract tests execute for every state. Nothing about that
   // decision is re-made in the template below: it applies `shown`, `disabled` and `title` and
@@ -980,7 +991,7 @@ export function renderShotInspector() {
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
@@ -1112,6 +1123,18 @@ export function renderShotInspector() {
   // beside this one redraw from it -- approving is exactly what flips render-again to its
   // disabled arm. The toast is the server's own sentence about the consequence, because the
   // belief a silent chip change leaves in place is that nothing else moved.
+  // The nudge moves in frames and is floored at the recorded lead — the cut can never
+  // reach before the take begins; the far end is the server's refusal, with the numbers,
+  // because only it measures the take. Saved through the ordinary silent shot save and
+  // redrawn, so the Monitor shows the new slice in the same gesture that chose it.
+  const applyNudge = (nudge) => {
+    shot.trim_nudge = Math.max(nudgeState.minNudge, Math.round(nudge * 24) / 24);
+    saveShotsSilently();
+    renderTimeline();
+  };
+  $("#nudge-back")?.addEventListener("click", () => applyNudge(nudgeState.nudge - 1 / 24));
+  $("#nudge-forward")?.addEventListener("click", () => applyNudge(nudgeState.nudge + 1 / 24));
+  $("#nudge-reset")?.addEventListener("click", () => applyNudge(0));
   $("#approve-take")?.addEventListener("click", async () => {
     if (!requireProject()) return;
     const projectId = state.project.id;
@@ -1511,6 +1534,49 @@ function updateTimelinePlayhead() {
     ? $("#master-audio").duration
     : projectDuration();
   $("#song-playhead").style.left = `${duration ? (state.playhead / duration) * 100 : 0}%`;
+  syncMonitor();
+}
+
+// How far the Monitor's video may drift from the master clock before it is snapped back.
+// Two frames: below the boundary-switch granularity, above the cost of re-seeking a video
+// element every timeupdate for jitter nobody can see.
+const MONITOR_DRIFT_SECONDS = 2 / 24;
+
+// The take URL currently loaded in the Monitor's video element, so a playhead move inside
+// one shot seeks instead of reloading, and a move across shots swaps the source once.
+let monitorLoadedUrl = "";
+
+function syncMonitor() {
+  const video = $("#monitor-video");
+  if (!video || !state.project) return;
+  const frame = $("#timeline-monitor");
+  const audio = $("#master-audio");
+  // One decision function owns what this moment shows -- the same offset rule assembly
+  // cuts by, so the preview and the export cannot disagree about which slice plays.
+  const view = monitorState(state.project, state.playhead);
+  if (view.kind !== "take") {
+    frame.classList.remove("showing-take");
+    $("#monitor-overlay").textContent = view.label;
+    if (!video.paused) video.pause();
+    return;
+  }
+  frame.classList.add("showing-take");
+  const url = shotTakeUrl(state.project.id, view.shot.id, view.shot.latest_output);
+  if (url !== monitorLoadedUrl) {
+    monitorLoadedUrl = url;
+    video.src = url;
+  }
+  if (Math.abs(video.currentTime - view.takeTime) > MONITOR_DRIFT_SECONDS) {
+    video.currentTime = view.takeTime;
+  }
+  // The master audio element is the clock; the video is a view of it. Muted playback of a
+  // muted element is allowed to autoplay everywhere, so play() here cannot be refused for
+  // the reason unmuted media is.
+  if (audio.paused) {
+    if (!video.paused) video.pause();
+  } else if (video.paused) {
+    video.play().catch(() => {});
+  }
 }
 
 function attachSelectedAsset() {

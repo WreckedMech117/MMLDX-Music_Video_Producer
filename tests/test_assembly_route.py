@@ -8,6 +8,7 @@ measures it within one frame of the song, the takes are byte-identical afterward
 `comfy.prompts` stayed empty the whole way.
 """
 
+import json
 import subprocess
 import wave
 from io import BytesIO
@@ -323,11 +324,98 @@ def test_the_song_gates_refuse_before_any_work(tmp_path: Path):
     assert gone.json()["detail"] == ASSEMBLY_SONG_FILE_REFUSAL.format(path=recorded)
 
 
-def test_a_failed_verification_is_reported_with_numbers_and_leaves_no_export(tmp_path: Path):
-    """FR-22's honesty row, forced with a real defect: one take physically shorter than
-    its window, so the joined video runs short of the song. The 502 carries the measured
-    numbers, the job records the same sentence, and nothing lands under exports/."""
-    client, store, _comfy, app = make_client(tmp_path)
+def synthesize_two_part_take(path: Path, first: str, first_seconds: float, second: str,
+                             second_seconds: float, size: str = "128x72"):
+    """A take whose opening and body are different solid colours — what makes 'which slice
+    did assembly cut' a measurable question rather than a trusted one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"color=c={first}:size={size}:rate=24",
+            "-f", "lavfi", "-i", f"color=c={second}:size={size}:rate=24",
+            "-filter_complex",
+            (
+                f"[0:v]trim=duration={first_seconds}[a];"
+                f"[1:v]trim=duration={second_seconds}[b];"
+                f"[a][b]concat=n=2:v=1[v]"
+            ),
+            "-map", "[v]", "-pix_fmt", "yuv420p", path.as_posix(),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def first_pixel(path: Path, at_seconds: float) -> tuple[int, int, int]:
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-ss", f"{at_seconds}", "-i", path.as_posix(),
+            "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return tuple(result.stdout[:3])
+
+
+def test_the_offset_selects_which_slice_of_the_take_fills_the_window(tmp_path: Path):
+    """The margin's whole point, measured in pixels: a take that opens with a one-second
+    green lead before its blue body. With the recorded lead as the offset, the window is
+    the blue body; nudged back to zero, the green lead is what plays. Same file, same
+    approval — the cut moved, exactly as the ruling asks."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Offset"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(4.0), "audio/wav")},
+    )
+    assert upload.status_code == 200
+    shots_dir = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    )
+    synthesize_two_part_take(
+        shots_dir / "shot_a-h3_00001-audio.mp4", "green", 1.0, "blue", 5.0
+    )
+    prefix = f"music-video-producer/{project_id}/shots"
+    shots = [{
+        "id": "shot_a", "start": 0, "duration": 4.0, "prompt": "Lead then body",
+        "status": "complete",
+        "latest_output": f"{prefix}/shot_a-h3_00001-audio.mp4",
+        "latest_take_lead": 1.0,
+    }]
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+    assert client.post(f"/api/projects/{project_id}/shots/shot_a/approve").status_code == 200
+
+    synced = client.post(f"/api/projects/{project_id}/assemble")
+    assert synced.status_code == 200, synced.text
+    export = tmp_path / "projects" / project_id / "media" / synced.json()["export"]
+    red, green, blue = first_pixel(export, 0.5)
+    assert blue > 180 and green < 100, (red, green, blue)  # the body, not the lead
+
+    # The nudge is editable after approval by design — it selects a slice of the approved
+    # file, the file itself immovable. Pull the cut back to the take's very start.
+    stored = json.loads(store.get(project_id).model_dump_json())["shots"]
+    stored[0]["trim_nudge"] = -1.0
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": stored}
+    ).status_code == 200
+
+    nudged = client.post(f"/api/projects/{project_id}/assemble")
+    assert nudged.status_code == 200, nudged.text
+    export2 = tmp_path / "projects" / project_id / "media" / nudged.json()["export"]
+    red, green, blue = first_pixel(export2, 0.5)
+    assert green > 100 and blue < 100, (red, green, blue)  # the green lead now plays
+
+
+def test_a_take_too_short_for_its_window_is_refused_before_any_work(tmp_path: Path):
+    """A take physically shorter than its window used to surface as a mid-pipeline
+    verification failure; the probe-fed offset check turns it into a plan refusal —
+    422, every number named, no job written, nothing spent."""
+    client, store, _comfy, _app = make_client(tmp_path)
     project_id, shots_dir = project_with_two_approved_takes(client, store, tmp_path)
     # Replace shot_b's approved take with one that cannot fill its 4 s window. The
     # manifest still names the same path, so approval and staleness both hold.
@@ -335,10 +423,39 @@ def test_a_failed_verification_is_reported_with_numbers_and_leaves_no_export(tmp
 
     response = client.post(f"/api/projects/{project_id}/assemble")
 
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "runs off the end of its take" in detail
+    assert "2.000" in detail and "4.000" in detail  # the take and the window, named
+    assert store.get(project_id).jobs == []
+    assert not (tmp_path / "projects" / project_id / "media" / "exports").exists()
+
+
+def test_a_failed_verification_is_reported_with_numbers_and_leaves_no_export(
+    tmp_path: Path, monkeypatch
+):
+    """FR-22's honesty row: the wiring from a failed verification to the 502, the job's
+    error, and an empty exports/. The verdict itself is unit-tested in
+    `verification_problems`; here it is forced, because a take that passes the up-front
+    probes yet writes a bad export takes a genuinely corrupt encoder to produce."""
+    client, store, _comfy, app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    import music_video_producer.app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "verification_problems",
+        lambda song, measured, streams: [
+            f"The export runs {measured:.3f}s but the song runs {song:.3f}s — forced."
+        ],
+    )
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+
     assert response.status_code == 502
     detail = response.json()["detail"]
     assert "verification" in detail
-    assert "6.0" in detail and "8.0" in detail  # measured vs song, in the sentence
+    assert "8.000" in detail  # the song's measured seconds reach the sentence
     jobs = store.get(project_id).jobs
     assert [job.status for job in jobs] == ["error"]
     assert jobs[0].error == detail

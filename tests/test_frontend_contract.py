@@ -4273,6 +4273,87 @@ def test_the_assembly_client_calls_a_route_the_server_exposes_and_the_bar_is_wir
     assert 'id="assembly-bar"' in INDEX_HTML.read_text(encoding="utf-8")
 
 
+def test_the_monitor_and_the_offset_rule_are_executed_for_every_state():
+    """The over-render pair's client half, run rather than read.
+
+    `effectiveOffset` is the client's one copy of the rule the assembly route resolves
+    from the same two fields (`latest_take_lead + trim_nudge`); a Monitor previewing one
+    slice while assembly cuts another would make the fine-tune a lie, so the formula is
+    asserted against the same samples on both sides, and the route's source is scanned
+    for the exact expression so a drift is a named failure rather than a silent split.
+    """
+    samples = [
+        {"latest_take_lead": 0.25, "trim_nudge": 0.0},
+        {"latest_take_lead": 0.25, "trim_nudge": -0.25},
+        {"latest_take_lead": 0.0, "trim_nudge": 0.125},
+        {"latest_take_lead": 0.7083333, "trim_nudge": -0.5},
+        {},  # a legacy shot: both fields absent read as 0
+    ]
+    states = run_module(f"""
+      import {{ effectiveOffset, monitorShotAt, monitorState, trimNudgeControl }}
+        from './src/music_video_producer/web/assets/api.js';
+      const samples = {json.dumps(samples)};
+      const shots = [
+        {{ id: 'a', start: 0, duration: 4, latest_output: 'shots/a.mp4',
+           latest_take_lead: 0.25, trim_nudge: 0.125 }},
+        {{ id: 'b', start: 4, duration: 4 }},
+      ];
+      const project = {{ shots }};
+      console.log(JSON.stringify({{
+        offsets: samples.map(effectiveOffset),
+        control: trimNudgeControl(shots[0]),
+        controlBare: trimNudgeControl(shots[1]),
+        inA: monitorState(project, 1.0),
+        boundary: monitorState(project, 4.0),
+        noTake: monitorState(project, 5.0),
+        gap: monitorState(project, 9.5),
+        nothing: monitorState(undefined, 0),
+        atShotEnd: monitorShotAt(project, 8.0),
+      }}));
+    """)
+
+    for sample, offset in zip(samples, states["offsets"]):
+        expected = sample.get("latest_take_lead", 0) + sample.get("trim_nudge", 0)
+        assert offset == pytest.approx(expected), sample
+
+    # The take view folds the offset in: playhead 1.0 in a shot starting at 0 with
+    # offset 0.375 previews 1.375 s into the take — the slice assembly will cut.
+    assert states["inA"]["kind"] == "take"
+    assert states["inA"]["takeTime"] == pytest.approx(1.375)
+    # A boundary belongs to the shot it opens, matching the cumulative grid.
+    assert states["boundary"]["kind"] == "no-take"
+    assert states["boundary"]["shot"]["id"] == "b"
+    assert states["noTake"]["label"]
+    assert states["gap"]["kind"] == "gap"
+    assert states["nothing"]["kind"] == "gap"
+    assert states["atShotEnd"] is None
+
+    # The nudge control shows only with a take, and floors at the recorded lead.
+    assert states["control"] == {
+        "shown": True, "lead": 0.25, "nudge": 0.125, "offset": 0.375, "minNudge": -0.25,
+    }
+    assert states["controlBare"]["shown"] is False
+
+    # The server's half of the contract: the route resolves the identical expression.
+    route_source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
+    assert "offset=shot.latest_take_lead + shot.trim_nudge" in route_source
+
+    # And the Monitor is wired where every playhead move already passes: position changes
+    # and transport changes both reach it, and the markup exists to receive it.
+    workspace = APP_JS.read_text(encoding="utf-8")
+    playhead_fn = workspace.split("function updateTimelinePlayhead()", 1)[1].split("\nfunction", 1)[0]
+    assert "syncMonitor();" in playhead_fn
+    transport_fn = workspace.split("function syncTransportState()", 1)[1].split("\nfunction", 1)[0]
+    assert "syncMonitor();" in transport_fn
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    assert 'id="monitor-overlay"' in markup
+    monitor_tag = re.search(r'<video[^>]*id="monitor-video"[^>]*>', markup)
+    assert monitor_tag, "the Monitor's video element left the markup"
+    # Muted by design: the master song is the timeline's sound, and muted playback is
+    # what browsers allow to start programmatically.
+    assert "muted" in monitor_tag.group(0)
+
+
 def test_the_shot_inspector_draws_the_player_and_approval_pair_from_the_shot_fields():
     """The player and the pair, rendered and clicked against the workspace's own code.
 
