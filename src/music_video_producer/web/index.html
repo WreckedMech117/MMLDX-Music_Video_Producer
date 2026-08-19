@@ -295,7 +295,9 @@
               <video id="monitor-video" muted playsinline preload="auto"></video>
               <div class="monitor-overlay" id="monitor-overlay">No shot under the playhead</div>
             </div>
-            <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
+            <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><!-- The two line mutes from the Director's workflow: audition controls, session-only,
+              never persisted. Muting the song silences the master element without stopping it,
+              so the playhead keeps running. --><button id="mute-song" title="Mute the audio line — the master song. The playhead keeps running.">♪ song</button><button id="mute-video" title="Mute the video line — the Monitor blanks; audio is untouched.">▣ video</button><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
             <div class="timeline-scroll" id="timeline-scroll">
               <div class="timeline-canvas" id="timeline-canvas">
                 <div class="timeline-ruler" id="timeline-ruler"></div>

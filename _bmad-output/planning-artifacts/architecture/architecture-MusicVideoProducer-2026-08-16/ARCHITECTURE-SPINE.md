@@ -106,9 +106,11 @@ Dependency rule: arrows only point downward/rightward as drawn. `comfy.py`, `dir
 - **Prevents:** each builder inventing its own LM Studio probe or assuming unload succeeded
 - **Rule:** `DirectorClient` gains `loaded_models()` and `unload_all()` using LM Studio's native REST API — `GET /api/v1/models`, `POST /api/v1/models/unload` (`instance_id`) — derived from the configured `llm_base_url` host:port (API documented 2026-08-16, and `GET /api/v1/models` **probed live against the installed instance the same day** — the endpoint responds with the expected `loaded_instances` shape, so the version assumption is closed). Success is never assumed: after unloading, free VRAM is re-read from ComfyUI `/system_stats` and *reported*. Unload failure or absent configuration never blocks rendering — the risk is stated at the pre-flight modal. VRAM is context, never a gate.
 
-### AD-9 — Assembly is local ffmpeg, job kind `post`, trim-then-concat `[BUILT 2026-08-18]`
+### AD-9 — Assembly is local ffmpeg, job kind `post`, trim-then-concat `[BUILT 2026-08-18]` `[AUDIO CLAUSE AMENDED 2026-08-19]`
 
 > **Built as ratified**, with the deferred details resolved: "reconciled locally" is an empty `prompt_id` (which `reconcilable_jobs` already skips, so no polling machinery grew) plus an in-process registry that heals restart-orphaned `running` jobs to `error`; "non-blocking" is awaited `asyncio` subprocesses with a synchronous response; inputs ride a new defaulted `RenderJob.inputs` field. Frame counts come from one cumulative 24 fps grid; mixed-resolution takes normalize to the largest-area take, aspect preserved, padded. Live-proven on real singing takes the same day.
+>
+> **Audio clause amended 2026-08-19, by the Director's own renegotiation** (UserWorkflow.txt: "only the main music track and accepted audio from videos would come through"): the master song is the mix's *foundation*, no longer its sole track — a per-shot `mix_take_audio` acceptance (default off, nothing infers it) mixes that take's window-slice under the song via `amix normalize=0`, the song's level never ducked. An untouched project still builds the byte-identical song-only command, so the 2026-08-16 default is preserved exactly; this is the "per-shot opt-in mixing" that ruling parked as v2, arrived.
 
 - **Binds:** FR-22, FR-24 (Epic 5)
 - **Prevents:** assembly drifting onto ComfyUI, or untrimmed joins accumulating ~11 % grid drift (4.0 s Shot renders 4.458 s)

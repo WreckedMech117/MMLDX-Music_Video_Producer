@@ -12,6 +12,7 @@ from music_video_producer.assembly import (
     ASSEMBLY_FPS,
     ASSEMBLY_GAP_REFUSAL,
     ASSEMBLY_LEGACY_APPROVAL_REFUSAL,
+    ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL,
     ASSEMBLY_NO_SHOTS_REFUSAL,
     ASSEMBLY_OFFSET_NEGATIVE_REFUSAL,
     ASSEMBLY_OFFSET_OVERRUN_REFUSAL,
@@ -25,6 +26,7 @@ from music_video_producer.assembly import (
     EXPORT_STREAMS_PROBLEM,
     SONG_END_LABEL,
     SONG_START_LABEL,
+    AudioOverlay,
     ClipWindow,
     assembly_plan,
     assembly_refusals,
@@ -254,7 +256,10 @@ def test_trim_args_pin_the_normalization_and_the_exact_frame_count():
 
 
 def test_concat_args_copy_video_and_carry_the_song_as_the_sole_audio():
-    """AD-9: shot audio dropped, master song muxed, no second generation loss on video."""
+    """The default: shot audio dropped, master song muxed, no second generation loss on
+    video. Pinned byte-for-byte, because "an untouched project sounds exactly as the
+    song-only ruling shipped" is a claim about this argv — and the empty-overlay call
+    must be the identical bytes, not merely equivalent ones."""
     args = concat_args(Path("list.txt"), Path("song.mp3"), Path("export.mp4"))
     assert args == [
         "ffmpeg", "-y", "-v", "error",
@@ -265,6 +270,58 @@ def test_concat_args_copy_video_and_carry_the_song_as_the_sole_audio():
         "-shortest", "-movflags", "+faststart",
         "export.mp4",
     ]
+    assert concat_args(Path("list.txt"), Path("song.mp3"), Path("export.mp4"), []) == args
+
+
+def test_accepted_take_audio_becomes_one_trimmed_delayed_input_per_clip():
+    """The mix graph, pinned: each accepted take is an extra input, cut to the same slice
+    as its picture (offset in, window long), delayed to its cumulative timeline position,
+    and mixed with the song FIRST and `normalize=0` — mixing under the song must never
+    duck the song."""
+    overlays = [
+        AudioOverlay(
+            source=Path("takes/a.mp4"),
+            offset_seconds=0.25,
+            window_seconds=3.75,
+            delay_seconds=0.0,
+        ),
+        AudioOverlay(
+            source=Path("takes/b.mp4"),
+            offset_seconds=0.0,
+            window_seconds=4.25,
+            delay_seconds=3.75,
+        ),
+    ]
+    args = concat_args(Path("list.txt"), Path("song.mp3"), Path("export.mp4"), overlays)
+    assert args[args.index("-filter_complex") + 1] == (
+        "[2:a]atrim=start=0.25:end=4.0,asetpts=PTS-STARTPTS,adelay=0:all=1[take0];"
+        "[3:a]atrim=start=0.0:end=4.25,asetpts=PTS-STARTPTS,adelay=3750:all=1[take1];"
+        "[1:a][take0][take1]amix=inputs=3:duration=first:normalize=0[mix]"
+    )
+    assert args[args.index("-map", args.index("-map") + 1) + 1] == "[mix]"
+    assert args.count("-i") == 4
+    assert "takes/a.mp4" in args and "takes/b.mp4" in args
+    # Video is still the untouched concat copy.
+    assert args[args.index("-c:v") + 1] == "copy"
+
+
+def test_an_acceptance_with_no_audio_stream_is_refused_by_name():
+    accepted = clip("a", 0, 10.0)
+    accepted.mix_audio = True
+    accepted.has_audio = False
+    report = assembly_refusals([accepted], song_seconds=10.0)
+    assert report == [ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL.format(shot="SHOT (a)")]
+
+    # With audio present — or unprobed (missing file already reports separately) — the
+    # acceptance itself is never a refusal.
+    fine = clip("a", 0, 10.0)
+    fine.mix_audio = True
+    fine.has_audio = True
+    assert assembly_refusals([fine], song_seconds=10.0) == []
+    unknown = clip("a", 0, 10.0)
+    unknown.mix_audio = True
+    assert unknown.has_audio is None
+    assert assembly_refusals([unknown], song_seconds=10.0) == []
 
 
 def test_the_concat_manifest_quotes_the_demuxers_way():

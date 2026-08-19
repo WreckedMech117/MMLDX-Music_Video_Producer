@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
 from .assembly import (
+    ASSEMBLY_FPS,
+    AudioOverlay,
     ClipWindow,
     assembly_plan,
     assembly_refusals,
@@ -379,8 +381,17 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 #: render bookkeeping written at submission, and `trim_nudge` is the human's own editorial
 #: fine-tune on a rendered file — neither is a plan fact a chat turn writes or reads, and
 #: nothing the conversational model could do with them is anything but noise.
+#: `mix_take_audio` is the same class again: the human's acceptance of a rendered file's
+#: audio into the mix, decided by ear, never by the chat model.
 SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
-    {"h3_prompt", "approved_start", "approved_duration", "latest_take_lead", "trim_nudge"}
+    {
+        "h3_prompt",
+        "approved_start",
+        "approved_duration",
+        "latest_take_lead",
+        "trim_nudge",
+        "mix_take_audio",
+    }
 )
 
 #: How the reference map declares a keyframe-role picture, per MiniMax's guide §2.2.2 — read
@@ -4461,6 +4472,7 @@ def create_app(
                 candidate = (output_root / Path(shot.approved_output)).resolve()
                 if output_root in candidate.parents and candidate.is_file():
                     source = candidate
+            has_audio: bool | None = None
             if source is not None:
                 rc, out, _err = await run_tool(probe_take_args(source))
                 lines = out.splitlines() if rc == 0 else []
@@ -4475,6 +4487,11 @@ def create_app(
                         ),
                     ) from None
                 dimensions[shot.id] = (width, height)
+                if shot.mix_take_audio:
+                    # An acceptance needs something to accept: the no-audio-stream case
+                    # joins the comprehensive report rather than failing mid-mix.
+                    rc, out, _err = await run_tool(probe_streams_args(source))
+                    has_audio = "audio" in out.splitlines() if rc == 0 else None
             clips.append(
                 ClipWindow(
                     shot_id=shot.id,
@@ -4490,6 +4507,8 @@ def create_app(
                     # the two together.
                     offset=shot.latest_take_lead + shot.trim_nudge,
                     take_seconds=take_seconds,
+                    mix_audio=shot.mix_take_audio,
+                    has_audio=has_audio,
                 )
             )
         refusals = assembly_refusals(clips, song_seconds)
@@ -4566,7 +4585,26 @@ def create_app(
             list_file = workdir / "clips.txt"
             list_file.write_text(concat_manifest(intermediates), encoding="utf-8")
             candidate = workdir / export_name
-            rc, _out, err = await run_tool(concat_args(list_file, song_path, candidate))
+            # The accepted-audio overlays: same slice as the picture (the clip's offset
+            # and grid frames), placed at the clip's cumulative timeline position. Empty
+            # for an untouched project, which keeps the command byte-identical to the
+            # song-only ruling's.
+            overlays: list[AudioOverlay] = []
+            elapsed_frames = 0
+            for clip, frames in zip(plan.clips, plan.frames, strict=True):
+                if clip.mix_audio:
+                    overlays.append(
+                        AudioOverlay(
+                            source=clip.source,
+                            offset_seconds=clip.offset,
+                            window_seconds=frames / ASSEMBLY_FPS,
+                            delay_seconds=elapsed_frames / ASSEMBLY_FPS,
+                        )
+                    )
+                elapsed_frames += frames
+            rc, _out, err = await run_tool(
+                concat_args(list_file, song_path, candidate, overlays)
+            )
             if rc != 0 or not candidate.is_file():
                 raise failed("concat", err)
             # FR-22's last consequence: verified after writing, and the export reaches its

@@ -4290,13 +4290,15 @@ def test_the_monitor_and_the_offset_rule_are_executed_for_every_state():
         {},  # a legacy shot: both fields absent read as 0
     ]
     states = run_module(f"""
-      import {{ effectiveOffset, monitorShotAt, monitorState, trimNudgeControl }}
-        from './src/music_video_producer/web/assets/api.js';
+      import {{ effectiveOffset, monitorShotAt, monitorState, takeAudioControl,
+        trimNudgeControl }} from './src/music_video_producer/web/assets/api.js';
       const samples = {json.dumps(samples)};
       const shots = [
         {{ id: 'a', start: 0, duration: 4, latest_output: 'shots/a.mp4',
            latest_take_lead: 0.25, trim_nudge: 0.125 }},
         {{ id: 'b', start: 4, duration: 4 }},
+        {{ id: 'c', start: 8, duration: 2, latest_output: 'shots/c.mp4',
+           mix_take_audio: true }},
       ];
       const project = {{ shots }};
       console.log(JSON.stringify({{
@@ -4306,9 +4308,13 @@ def test_the_monitor_and_the_offset_rule_are_executed_for_every_state():
         inA: monitorState(project, 1.0),
         boundary: monitorState(project, 4.0),
         noTake: monitorState(project, 5.0),
-        gap: monitorState(project, 9.5),
+        accepted: monitorState(project, 8.5),
+        gap: monitorState(project, 11.5),
         nothing: monitorState(undefined, 0),
-        atShotEnd: monitorShotAt(project, 8.0),
+        atShotEnd: monitorShotAt(project, 11.0),
+        audioControl: takeAudioControl(shots[2]),
+        audioControlOff: takeAudioControl(shots[0]),
+        audioControlBare: takeAudioControl(shots[1]),
       }}));
     """)
 
@@ -4327,6 +4333,15 @@ def test_the_monitor_and_the_offset_rule_are_executed_for_every_state():
     assert states["gap"]["kind"] == "gap"
     assert states["nothing"]["kind"] == "gap"
     assert states["atShotEnd"] is None
+
+    # The acceptance flag reaches the preview: an unaccepted take is muted, an accepted
+    # one is not — the same field assembly mixes by, so preview and export agree.
+    assert states["inA"]["muted"] is True
+    assert states["accepted"]["kind"] == "take"
+    assert states["accepted"]["muted"] is False
+    assert states["audioControl"] == {"shown": True, "checked": True}
+    assert states["audioControlOff"] == {"shown": True, "checked": False}
+    assert states["audioControlBare"]["shown"] is False
 
     # The nudge control shows only with a take, and floors at the recorded lead.
     assert states["control"] == {
@@ -4349,9 +4364,23 @@ def test_the_monitor_and_the_offset_rule_are_executed_for_every_state():
     assert 'id="monitor-overlay"' in markup
     monitor_tag = re.search(r'<video[^>]*id="monitor-video"[^>]*>', markup)
     assert monitor_tag, "the Monitor's video element left the markup"
-    # Muted by design: the master song is the timeline's sound, and muted playback is
-    # what browsers allow to start programmatically.
+    # Muted by default: the master song is the timeline's sound, and muted playback is
+    # what browsers allow to start programmatically. `syncMonitor` un-mutes per shot from
+    # the acceptance flag — the same field assembly mixes by.
     assert "muted" in monitor_tag.group(0)
+    assert "video.muted = view.muted;" in workspace
+
+    # The two line mutes exist, are wired, and are session-only: no field name for them
+    # may appear anywhere in the persisted model.
+    assert 'id="mute-song"' in markup and 'id="mute-video"' in markup
+    assert '$("#mute-song").addEventListener' in workspace
+    assert '$("#mute-video").addEventListener' in workspace
+    models_source = Path("src/music_video_producer/models.py").read_text(encoding="utf-8")
+    assert "line_muted" not in models_source and "songLineMuted" not in models_source
+
+    # The acceptance checkbox writes the one persisted field through the ordinary save.
+    assert 'id="mix-take-audio"' in workspace
+    assert "shot.mix_take_audio = event.target.checked;" in workspace
 
 
 def test_the_shot_inspector_draws_the_player_and_approval_pair_from_the_shot_fields():

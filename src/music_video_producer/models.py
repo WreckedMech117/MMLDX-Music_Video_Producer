@@ -357,6 +357,12 @@ class Shot(BaseModel):
     # for — while the file itself stays immovable.
     latest_take_lead: float = Field(default=0, ge=0)
     trim_nudge: float = 0
+    # Whether this shot's take audio is *accepted* into the mix (spec-take-audio-mix):
+    # the Monitor plays it over the master and assembly mixes its window-slice under the
+    # song. Default muted — the Director's rule is "only the main music track and
+    # accepted audio from videos would come through" — so an untouched project sounds
+    # exactly as the 2026-08-16 song-only ruling shipped. Nothing infers it.
+    mix_take_audio: bool = False
     locked: bool = False
 
     @field_validator("mode", mode="before")

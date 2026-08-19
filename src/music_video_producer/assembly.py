@@ -81,6 +81,10 @@ ASSEMBLY_OFFSET_OVERRUN_REFUSAL = (
     "{offset:.3f}s of trim offset plus the {duration:.3f}s window needs {needed:.3f}s. "
     "Ease the trim nudge back, or re-render for a longer take."
 )
+ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL = (
+    "{shot}'s take audio is accepted into the mix, but its take carries no audio stream. "
+    "Un-accept it, or re-render the shot."
+)
 
 #: The two ends of the timeline, named as what they are in gap sentences.
 SONG_START_LABEL = "the start of the song"
@@ -122,6 +126,11 @@ class ClipWindow:
     #: The take's measured duration in seconds (ffprobe's reading), or ``None`` when the
     #: file is missing — the overflow refusal below is decidable only when it is known.
     take_seconds: float | None = None
+    #: Whether this shot's take audio is accepted into the mix (`Shot.mix_take_audio`),
+    #: and whether the take actually carries an audio stream — ``None`` when unprobed or
+    #: missing. An acceptance with nothing to accept is a refusal, not a silent skip.
+    mix_audio: bool = False
+    has_audio: bool | None = None
 
     @property
     def end(self) -> float:
@@ -195,6 +204,8 @@ def assembly_refusals(clips: list[ClipWindow], song_seconds: float) -> list[str]
                     needed=clip.offset + clip.duration,
                 )
             )
+        if clip.mix_audio and clip.has_audio is False:
+            refusals.append(ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL.format(shot=clip.label))
     refusals.extend(tiling_refusals(ordered, song_seconds))
     return refusals
 
@@ -351,15 +362,92 @@ def concat_manifest(intermediates: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def concat_args(list_file: Path, song: Path, dest: Path) -> list[str]:
-    """All intermediates → the export, with the master song as the sole audio track.
+@dataclass(slots=True)
+class AudioOverlay:
+    """One accepted take's contribution to the mix: which file, which slice, and where.
+
+    The slice is the *same* one the picture was cut to — the effective offset in, the
+    window's grid seconds long — and `delay_seconds` is the clip's cumulative timeline
+    position, so the accepted sound sits exactly under its own picture.
+    """
+
+    source: Path
+    offset_seconds: float
+    window_seconds: float
+    delay_seconds: float
+
+
+def concat_args(
+    list_file: Path,
+    song: Path,
+    dest: Path,
+    overlays: list[AudioOverlay] | None = None,
+) -> list[str]:
+    """All intermediates → the export, master song plus any *accepted* take audio.
 
     `-c:v copy` because every intermediate came out of `trim_args` with identical encode
     parameters — the join costs no second generation loss. The song is re-encoded to AAC
     (sources are mp3 or flac depending on origin; mp4 wants neither). `-shortest` guards
     the rounding edge: the video is the verified length, and a song file a hair longer
     than its stored duration must not stretch the container past it.
+
+    With no overlays this builds the identical argv it always has — the Director's
+    default is "only the main music track comes through", and a pinned test holds the
+    bytes. Each overlay becomes one extra input plus `atrim → adelay` into a single
+    `amix` whose **first** input is the song and whose `normalize=0` keeps the master's
+    level untouched — mixing under the song must never duck the song
+    (spec-take-audio-mix, the Director's own wording). `duration=first` ends the mix at
+    the song, exactly as `-shortest` already ends the container.
     """
+    if not overlays:
+        return [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_file.as_posix(),
+            "-i",
+            song.as_posix(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            dest.as_posix(),
+        ]
+    inputs: list[str] = []
+    chains: list[str] = []
+    labels: list[str] = []
+    for index, overlay in enumerate(overlays):
+        inputs.extend(["-i", overlay.source.as_posix()])
+        delay_ms = round(overlay.delay_seconds * 1000)
+        chains.append(
+            f"[{2 + index}:a]"
+            f"atrim=start={overlay.offset_seconds}"
+            f":end={overlay.offset_seconds + overlay.window_seconds},"
+            f"asetpts=PTS-STARTPTS,"
+            f"adelay={delay_ms}:all=1"
+            f"[take{index}]"
+        )
+        labels.append(f"[take{index}]")
+    graph = (
+        ";".join(chains)
+        + f";[1:a]{''.join(labels)}amix=inputs={len(overlays) + 1}"
+        + ":duration=first:normalize=0[mix]"
+    )
     return [
         "ffmpeg",
         "-y",
@@ -373,10 +461,13 @@ def concat_args(list_file: Path, song: Path, dest: Path) -> list[str]:
         list_file.as_posix(),
         "-i",
         song.as_posix(),
+        *inputs,
+        "-filter_complex",
+        graph,
         "-map",
         "0:v:0",
         "-map",
-        "1:a:0",
+        "[mix]",
         "-c:v",
         "copy",
         "-c:a",

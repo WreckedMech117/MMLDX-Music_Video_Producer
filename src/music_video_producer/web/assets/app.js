@@ -1,5 +1,5 @@
 import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
-import { ASSEMBLE_RUNNING, assemblyControl, effectiveOffset, latestAssemblyExport, monitorState, trimNudgeControl } from "./api.js";
+import { ASSEMBLE_RUNNING, assemblyControl, effectiveOffset, latestAssemblyExport, monitorState, takeAudioControl, trimNudgeControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -961,6 +961,12 @@ export function renderShotInspector() {
   // `trimNudgeControl` (contract-tested); frame-stepped here because a frame is the unit
   // the cut actually moves in. Editable on an approved shot by design -- it selects a
   // slice of the approved file; the file itself stays immovable.
+  // The acceptance flag: whether this take's own audio joins the mix -- previewed by the
+  // Monitor and mixed by assembly through the same field. Decided by `takeAudioControl`.
+  const takeAudio = takeAudioControl(shot);
+  const takeAudioHtml = takeAudio.shown
+    ? `<label class="mix-take-audio-line" title="Accept this take's own audio into the video: the Monitor plays it over the master song and assembly mixes the same slice under the song. Off means only the master song comes through for this clip."><input type="checkbox" id="mix-take-audio" ${takeAudio.checked ? "checked" : ""}> Mix this take's audio under the song</label>`
+    : "";
   const nudgeState = trimNudgeControl(shot);
   const nudgeHtml = nudgeState.shown
     ? `<div class="trim-nudge" id="trim-nudge"><span class="control-label" title="The take is rendered longer than the shot's window. The offset is where in the take the window starts: the recorded sync lead plus your nudge. The Monitor previews the same slice assembly will cut.">Trim nudge</span><button class="quiet-button" id="nudge-back" title="One frame earlier">−1f</button><span id="nudge-value">${escapeHtml(nudgeState.nudge.toFixed(3))}s</span><button class="quiet-button" id="nudge-forward" title="One frame later">+1f</button><button class="quiet-button" id="nudge-reset" title="Back to the recorded sync lead" ${nudgeState.nudge === 0 ? "disabled" : ""}>Reset</button><span class="control-reason">cut at ${escapeHtml(nudgeState.offset.toFixed(3))}s into the take (lead ${escapeHtml(nudgeState.lead.toFixed(3))}s)</span></div>`
@@ -991,7 +997,7 @@ export function renderShotInspector() {
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
@@ -1132,6 +1138,11 @@ export function renderShotInspector() {
     saveShotsSilently();
     renderTimeline();
   };
+  $("#mix-take-audio")?.addEventListener("change", (event) => {
+    shot.mix_take_audio = event.target.checked;
+    saveShotsSilently();
+    renderTimeline();
+  });
   $("#nudge-back")?.addEventListener("click", () => applyNudge(nudgeState.nudge - 1 / 24));
   $("#nudge-forward")?.addEventListener("click", () => applyNudge(nudgeState.nudge + 1 / 24));
   $("#nudge-reset")?.addEventListener("click", () => applyNudge(0));
@@ -1545,15 +1556,27 @@ const MONITOR_DRIFT_SECONDS = 2 / 24;
 // The take URL currently loaded in the Monitor's video element, so a playhead move inside
 // one shot seeks instead of reloading, and a move across shots swaps the source once.
 let monitorLoadedUrl = "";
+// The two line mutes from the Director's workflow: audition controls, session-only by
+// design -- never persisted, never touching the manifest. Muting the song never stops
+// the clock; the element keeps driving the playhead with its output silenced.
+let songLineMuted = false;
+let videoLineMuted = false;
 
 function syncMonitor() {
   const video = $("#monitor-video");
   if (!video || !state.project) return;
   const frame = $("#timeline-monitor");
   const audio = $("#master-audio");
+  audio.muted = songLineMuted;
   // One decision function owns what this moment shows -- the same offset rule assembly
   // cuts by, so the preview and the export cannot disagree about which slice plays.
   const view = monitorState(state.project, state.playhead);
+  if (videoLineMuted) {
+    frame.classList.remove("showing-take");
+    $("#monitor-overlay").textContent = "Video line muted";
+    if (!video.paused) video.pause();
+    return;
+  }
   if (view.kind !== "take") {
     frame.classList.remove("showing-take");
     $("#monitor-overlay").textContent = view.label;
@@ -1561,6 +1584,9 @@ function syncMonitor() {
     return;
   }
   frame.classList.add("showing-take");
+  // The acceptance flag, previewed: an accepted clip's own audio plays over the master,
+  // exactly the mix assembly writes.
+  video.muted = view.muted;
   const url = shotTakeUrl(state.project.id, view.shot.id, view.shot.latest_output);
   if (url !== monitorLoadedUrl) {
     monitorLoadedUrl = url;
@@ -1965,6 +1991,16 @@ function bindEvents() {
   });
   $("#global-play").addEventListener("click", toggleMasterAudio);
   $("#timeline-play").addEventListener("click", toggleMasterAudio);
+  $("#mute-song").addEventListener("click", () => {
+    songLineMuted = !songLineMuted;
+    $("#mute-song").classList.toggle("muted-line", songLineMuted);
+    syncMonitor();
+  });
+  $("#mute-video").addEventListener("click", () => {
+    videoLineMuted = !videoLineMuted;
+    $("#mute-video").classList.toggle("muted-line", videoLineMuted);
+    syncMonitor();
+  });
   $("#jump-start").addEventListener("click", () => seekMasterAudio(0));
   $("#timeline-start").addEventListener("click", () => seekMasterAudio(0));
   const masterAudio = $("#master-audio");

@@ -2087,18 +2087,31 @@ export function monitorShotAt(project, seconds) {
 // What the Monitor shows at one moment: a take (and where inside it), or an honest
 // placeholder -- never a stale frame from another shot. `takeTime` folds the effective
 // offset in, so a fresh song-audio take previews the exact song seconds it was
-// conditioned on and a nudged one previews the nudged slice assembly will cut.
+// conditioned on and a nudged one previews the nudged slice assembly will cut. `muted`
+// is the acceptance flag inverted: an accepted clip's own audio plays over the master in
+// preview, exactly as assembly will mix it -- one decision on both sides.
 export function monitorState(project, seconds) {
   const shot = monitorShotAt(project, seconds);
-  if (!shot) return { kind: "gap", shot: null, takeTime: 0, label: "No shot under the playhead" };
+  if (!shot) return { kind: "gap", shot: null, takeTime: 0, label: "No shot under the playhead", muted: true };
   if (!shot.latest_output) {
-    return { kind: "no-take", shot, takeTime: 0, label: "This shot has no rendered take yet" };
+    return { kind: "no-take", shot, takeTime: 0, label: "This shot has no rendered take yet", muted: true };
   }
   return {
     kind: "take",
     shot,
     takeTime: Math.max(0, seconds - shot.start + effectiveOffset(shot)),
     label: "",
+    muted: !shot.mix_take_audio,
+  };
+}
+
+// The take-audio acceptance control: shown only with a take to accept, checked from the
+// persisted flag. Default unchecked -- "only the main music track and accepted audio
+// from videos would come through" is the Director's rule, and nothing infers acceptance.
+export function takeAudioControl(shot) {
+  return {
+    shown: Boolean(shot?.latest_output),
+    checked: Boolean(shot?.mix_take_audio),
   };
 }
 

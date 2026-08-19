@@ -411,6 +411,89 @@ def test_the_offset_selects_which_slice_of_the_take_fills_the_window(tmp_path: P
     assert green > 100 and blue < 100, (red, green, blue)  # the green lead now plays
 
 
+def synthesize_toned_take(path: Path, seconds: float, size: str = "128x72"):
+    """A take carrying a loud sine on its audio track — the thing acceptance lets through."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"color=c=red:size={size}:rate=24",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+            "-t", f"{seconds}", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest",
+            path.as_posix(),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def mean_volume_db(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "info", "-i", path.as_posix(),
+            "-af", "volumedetect", "-f", "null", "-",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    import re as _re
+
+    match = _re.search(r"mean_volume:\s*(-?[\d.]+) dB", result.stderr)
+    assert match, result.stderr[-500:]
+    return float(match.group(1))
+
+
+def test_accepted_take_audio_reaches_the_export_and_unaccepted_audio_never_does(
+    tmp_path: Path,
+):
+    """The Director's rule, measured in decibels: a silent song over a take with a loud
+    sine. Untouched (default muted), the export is silence — byte-for-byte the song-only
+    behaviour. Accepted, the sine is in the export. Same take, same approval; only the
+    acceptance moved."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Mix"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Silence", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(4.0), "audio/wav")},
+    )
+    assert upload.status_code == 200
+    shots_dir = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    )
+    synthesize_toned_take(shots_dir / "shot_a-h3_00001-audio.mp4", 4.6)
+    prefix = f"music-video-producer/{project_id}/shots"
+    shots = [{
+        "id": "shot_a", "start": 0, "duration": 4.0, "prompt": "Toned",
+        "status": "complete",
+        "latest_output": f"{prefix}/shot_a-h3_00001-audio.mp4",
+    }]
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+    assert client.post(f"/api/projects/{project_id}/shots/shot_a/approve").status_code == 200
+
+    muted = client.post(f"/api/projects/{project_id}/assemble")
+    assert muted.status_code == 200, muted.text
+    silent_export = tmp_path / "projects" / project_id / "media" / muted.json()["export"]
+    assert mean_volume_db(silent_export) < -70  # digital silence, song-only
+
+    stored = json.loads(store.get(project_id).model_dump_json())["shots"]
+    stored[0]["mix_take_audio"] = True
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": stored}
+    ).status_code == 200
+
+    mixed = client.post(f"/api/projects/{project_id}/assemble")
+    assert mixed.status_code == 200, mixed.text
+    loud_export = tmp_path / "projects" / project_id / "media" / mixed.json()["export"]
+    assert mean_volume_db(loud_export) > -30  # the sine came through
+    # Verification still holds: one video, one audio, song-length.
+    assert probe(loud_export, "stream=codec_type").splitlines() == ["video", "audio"]
+
+
 def test_a_take_too_short_for_its_window_is_refused_before_any_work(tmp_path: Path):
     """A take physically shorter than its window used to surface as a mid-pipeline
     verification failure; the probe-fed offset check turns it into a plan refusal —

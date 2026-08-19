@@ -8435,7 +8435,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     Director's prompt the moment it was declared, with nobody deciding that it should. This change
     added three at once, which is exactly the situation the guard exists for.
 
-    Five fields are withheld, none of them a removal — each was classified withheld at the
+    Six fields are withheld, none of them a removal — each was classified withheld at the
     moment it was declared, so withholding adds nothing to the prompt rather than subtracting
     something from it. The over-render pair (`latest_take_lead`/`trim_nudge`) is render
     bookkeeping and the human's own editorial fine-tune, neither a plan fact a chat turn
@@ -8472,7 +8472,14 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     # at all — and every field is on exactly one side.
     assert _withheld_fields(
         Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
-    ) == {"h3_prompt", "approved_start", "approved_duration", "latest_take_lead", "trim_nudge"}
+    ) == {
+        "h3_prompt",
+        "approved_start",
+        "approved_duration",
+        "latest_take_lead",
+        "trim_nudge",
+        "mix_take_audio",
+    }
     assert not SHOT_DIRECTOR_VISIBLE & SHOT_DIRECTOR_WITHHELD
     assert {"mode", "citations", "singing", "prompt"} <= SHOT_DIRECTOR_VISIBLE
 
@@ -8486,6 +8493,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         "approved_duration",
         "latest_take_lead",
         "trim_nudge",
+        "mix_take_audio",
     }
     assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {
         "__all__": {
@@ -8494,6 +8502,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
             "approved_duration",
             "latest_take_lead",
             "trim_nudge",
+            "mix_take_audio",
         }
     }
 
