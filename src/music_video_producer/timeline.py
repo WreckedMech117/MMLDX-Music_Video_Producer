@@ -124,9 +124,16 @@ def populate_windows(
         end = song_duration if index == len(durations) - 1 else cursor + duration
         windows.append((round(cursor, 3), round(end - cursor, 3)))
         cursor = end
-    # The rounding above must not reopen a gap at the very end: the last window absorbs it.
+    # The rounding above must not reopen a gap at the very end — the last window absorbs
+    # it — and must not overshoot the song either: a last window rounded 0.1 ms past the
+    # end is a shot `song_audio_window` refuses whole (found live on the first-video run,
+    # song 154.644898 s → last end rounded to 154.645). Floor the last duration to the
+    # millisecond below the true remainder instead of rounding to the nearest.
     last_start, _ = windows[-1]
-    windows[-1] = (last_start, round(song_duration - last_start, 3))
+    remainder = song_duration - last_start
+    # The +1e-6 absorbs binary-float noise just below a millisecond boundary; it can
+    # overshoot the true remainder by at most a nanosecond, which nothing measures.
+    windows[-1] = (last_start, math.floor(remainder * 1000 + 1e-6) / 1000)
     return windows
 
 

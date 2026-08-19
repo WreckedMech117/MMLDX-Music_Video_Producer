@@ -612,16 +612,21 @@ def test_an_unknown_song_length_never_shifts_the_lead():
 
 def test_populate_windows_tiles_the_whole_song_inside_h3s_range():
     """The model's layout is shape, not arithmetic: whatever it proposed, the result is
-    contiguous from exactly 0 to exactly the song's end, every window in 4-15 s."""
+    contiguous from 0 to the song's end (within the millisecond the end-floor may shave),
+    every window in 4-15 s — and the last window **never ends past the song**, because a
+    window 0.1 ms over is a shot `song_audio_window` refuses whole. Found live: song
+    154.644898 s, last window rounded to end at 154.645."""
     proposals = [(0.0, 2.0), (2.0, 30.0), (40.0, 7.0)]  # sloppy: gaps, out-of-range
-    windows = populate_windows(proposals, 60.0)
-    assert windows[0][0] == 0.0
-    cursor = 0.0
-    for start, duration in windows:
-        assert start == pytest.approx(cursor, abs=1e-6)
-        assert 4.0 - 1e-9 <= duration <= 15.0 + 1e-9
-        cursor = start + duration
-    assert cursor == pytest.approx(60.0, abs=1e-6)
+    for song in (60.0, 154.644898, 33.333333):
+        windows = populate_windows(proposals, song)
+        assert windows[0][0] == 0.0
+        cursor = 0.0
+        for start, duration in windows:
+            assert start == pytest.approx(cursor, abs=1e-6)
+            assert 4.0 - 1e-9 <= duration <= 15.0 + 1e-9
+            cursor = start + duration
+        assert cursor == pytest.approx(song, abs=2e-3)
+        assert cursor <= song + 1e-9, f"last window ends past the song at {song}"
 
 
 def test_populate_windows_clamps_the_count_to_the_feasible_band():
