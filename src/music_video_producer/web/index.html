@@ -302,6 +302,11 @@
             <span class="eyebrow">Shot inspector</span><h2>No shot selected</h2><p>Add a shot to begin. Shots are rendered independently in H3's reliable 4–15 second range.</p>
           </aside>
         </div>
+        <!-- Assembly (FR-22): the finishing lane's main act, at the foot of the timeline it
+             assembles. The cheap readiness facts (approvals, song, open renders) come from
+             api.js's assemblyControl; the plan-shaped refusals — gaps, stale windows — are the
+             server's own multi-line 422 report, rendered verbatim rather than re-derived. -->
+        <div class="assembly-bar" id="assembly-bar" aria-live="polite"></div>
       </section>
 
       <section class="panel" id="panel-queue" aria-labelledby="queue-heading">

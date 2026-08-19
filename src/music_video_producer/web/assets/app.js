@@ -1,4 +1,5 @@
 import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { ASSEMBLE_RUNNING, assemblyControl, latestAssemblyExport } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -695,7 +696,57 @@ function renderTimeline() {
   // only question is whether this plan has any shots -- which is a thing this function owns.
   syncExpansionControls();
   if (state.audioBuffer) drawWaveform($("#timeline-waveform"), state.audioBuffer, "#6f7d3d");
+  renderAssembly();
   updateTimelinePlayhead();
+}
+
+// Whether an assemble request is currently open, and the last multi-line refusal the server
+// answered one with. Both module state for `readinessReport`'s reason -- derived, never saved,
+// never sent back -- and the report is cleared by the next attempt or a successful export,
+// because the plan it described stops being the plan on screen.
+let assemblyInFlight = false;
+let assemblyRefusalReport = "";
+
+function renderAssembly() {
+  const bar = $("#assembly-bar");
+  if (!bar) return;
+  if (!state.project) { bar.innerHTML = ""; return; }
+  const control = assemblyControl(state.project);
+  const disabled = control.disabled || assemblyInFlight;
+  const label = assemblyInFlight ? ASSEMBLE_RUNNING : control.label;
+  const exported = latestAssemblyExport(state.project);
+  // The refusal report is the server's own words, one reason per line -- rendered whole
+  // because rationing it is exactly what the comprehensive 422 exists to prevent.
+  const report = assemblyRefusalReport
+    ? `<div class="assembly-report">${assemblyRefusalReport.split("\n").map((line) => `<div>${escapeHtml(line)}</div>`).join("")}</div>`
+    : "";
+  const player = exported
+    ? `<div class="assembly-export"><span class="eyebrow">Latest export</span><video controls preload="metadata" src="${exported.url}"></video><a href="${exported.url}" target="_blank" rel="noopener">${escapeHtml(exported.path)}</a></div>`
+    : "";
+  bar.innerHTML = `<div class="assembly-controls"><span class="eyebrow">Assembly</span><button class="primary-button" id="assemble-button" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button><span class="assembly-reason">${escapeHtml(control.reason)}</span></div>${report}${player}`;
+  const button = $("#assemble-button", bar);
+  if (button) {
+    button.addEventListener("click", async () => {
+      if (assemblyInFlight) return;
+      assemblyInFlight = true;
+      assemblyRefusalReport = "";
+      renderAssembly();
+      try {
+        const result = await api.assemble(state.project.id);
+        // The reply is the settled job plus measurements, not the project -- re-fetch so the
+        // job list, the export reader and every other panel redraw from one server truth.
+        state.project = await api.project(state.project.id);
+        toast(`Assembled ${result.clip_count} shots into ${result.export} (${result.duration_seconds.toFixed(2)}s)`);
+      } catch (error) {
+        assemblyRefusalReport = String(error?.message || error);
+        toast("Assembly refused — see the report under the button", "error");
+      } finally {
+        assemblyInFlight = false;
+        renderJobs();
+        renderTimeline();
+      }
+    });
+  }
 }
 
 function renderRuler(duration, width) {

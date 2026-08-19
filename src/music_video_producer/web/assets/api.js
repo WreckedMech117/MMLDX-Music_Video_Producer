@@ -2003,6 +2003,67 @@ export function hasActiveRenderJobs(project) {
   );
 }
 
+// ------------------------------------------------------------------------------------------
+// Assembly (FR-22). One decision function for the bar's button, one reader for the newest
+// export. An assembly job is the local kind: `post` with an empty prompt_id -- AD-9's own
+// marker, and the same emptiness `hasActiveRenderJobs` keys on to keep local work out of the
+// ComfyUI poll. Only the *cheap* readiness facts are decided here (shots, song, approvals,
+// open renders); the plan-shaped refusals -- gaps, overlaps, stale windows -- are the
+// server's comprehensive 422 report, rendered verbatim, never re-derived in a second
+// implementation that could disagree with the one that matters.
+// ------------------------------------------------------------------------------------------
+
+export const ASSEMBLE_LABEL = "Assemble video";
+export const ASSEMBLE_HELP =
+  "Trim every approved take to its shot's window, join them in shot order and lay the master " +
+  "song under the whole video. Runs locally in seconds; no render is queued and no take is " +
+  "modified. The export lands under this project's media.";
+export const ASSEMBLE_NO_SHOTS = "No shots to assemble yet.";
+export const ASSEMBLE_NO_SONG = "Assembly needs a master song to synchronize to.";
+export const ASSEMBLE_UNAPPROVED = "{count} of {total} shots still need an approved take.";
+export const ASSEMBLE_RENDERS_OPEN =
+  "Renders are still in flight; assemble when the queue settles.";
+export const ASSEMBLE_RUNNING = "Assembling…";
+
+export function assemblyControl(project) {
+  const shots = project?.shots || [];
+  const refuse = (reason) => ({ disabled: true, label: ASSEMBLE_LABEL, title: reason, reason });
+  if (!shots.length) return refuse(ASSEMBLE_NO_SHOTS);
+  if (!project?.song?.path) return refuse(ASSEMBLE_NO_SONG);
+  const unapproved = shots.filter((shot) => !shot.approved_output).length;
+  if (unapproved) {
+    return refuse(
+      ASSEMBLE_UNAPPROVED
+        .replace("{count}", String(unapproved))
+        .replace("{total}", String(shots.length)),
+    );
+  }
+  if (hasActiveRenderJobs(project)) return refuse(ASSEMBLE_RENDERS_OPEN);
+  return { disabled: false, label: ASSEMBLE_LABEL, title: ASSEMBLE_HELP, reason: "" };
+}
+
+// The newest finished export, read from the job records rather than a field of its own: an
+// export *is* a completed local job's output, jobs append in submission order, and a second
+// copy of "the latest" is a copy that can lie. The URL is the existing project-media route,
+// which serves Range requests, so the player this feeds can scrub.
+export function latestAssemblyExport(project) {
+  const jobs = project?.jobs || [];
+  for (let index = jobs.length - 1; index >= 0; index -= 1) {
+    const job = jobs[index];
+    if (
+      job.kind === "post" && !job.prompt_id && job.status === "complete"
+      && (job.output_files || []).length
+    ) {
+      return {
+        path: job.output_files[0],
+        url: `/api/projects/${project.id}/media/${job.output_files[0]}`,
+        jobId: job.id,
+      };
+    }
+  }
+  return null;
+}
+
 // The shot statuses a reconciliation tick is allowed to move, and the only ones. The report is a
 // snapshot that can be a request older than a click the Director just made, and the whole-list
 // shots save writes every field it holds -- so a stale `draft` patched over a fresh `ready` here
@@ -2207,6 +2268,10 @@ export const api = {
   // once per tick) and /history (only for jobs the queue no longer holds), and answers with the
   // fixed jobs+states shape `applyRenderStatus` patches in. Never a per-job fan-out from here.
   renderStatus: (id) => request(`/api/projects/${id}/render-status`),
+  // Assembly. No body: every input is the manifest's own -- approved takes, snapshotted
+  // windows, the master song. Synchronous by design; the reply carries the settled job and
+  // the measured export. Nothing is queued on ComfyUI and no GPU time is spent.
+  assemble: (id) => request(`/api/projects/${id}/assemble`, { method: "POST" }),
   workflows: () => request("/api/workflows"),
   // Machine-scoped, so neither call carries a project id. The GET is what refreshes the
   // after-the-fact report; the PUT is the only thing that changes the setting, and the server

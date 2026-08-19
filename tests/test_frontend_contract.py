@@ -4192,6 +4192,87 @@ def test_the_approval_control_is_decided_by_executing_it_for_every_state():
     assert states["nothing"]["shown"] is False
 
 
+def test_the_assembly_control_is_decided_by_executing_it_for_every_state():
+    """Every cheap readiness state the assembly bar can be in, run rather than read — plus the
+    export reader's one job: the newest complete *local* job, told apart from ComfyUI post jobs
+    by the empty prompt_id, exactly AD-9's marker.
+
+    Deliberately only the cheap facts live in the client: gaps, overlaps and stale windows are
+    the server's comprehensive 422, rendered verbatim. A second client-side implementation of
+    the tiling rules is a second place for them to be wrong.
+    """
+    states = run_module("""
+      import { ASSEMBLE_HELP, ASSEMBLE_LABEL, ASSEMBLE_NO_SHOTS, ASSEMBLE_NO_SONG,
+        ASSEMBLE_RENDERS_OPEN, assemblyControl, latestAssemblyExport }
+        from './src/music_video_producer/web/assets/api.js';
+      const song = { path: 'media/song.wav' };
+      const approved = (id) => ({ id, approved_output: `shots/${id}.mp4` });
+      console.log(JSON.stringify({
+        label: ASSEMBLE_LABEL, help: ASSEMBLE_HELP, noShots: ASSEMBLE_NO_SHOTS,
+        noSong: ASSEMBLE_NO_SONG, rendersOpen: ASSEMBLE_RENDERS_OPEN,
+        empty: assemblyControl({ shots: [], song }),
+        songless: assemblyControl({ shots: [approved('a')], song: null }),
+        unapproved: assemblyControl({ shots: [approved('a'), { id: 'b' }, { id: 'c' }], song }),
+        open: assemblyControl({ shots: [approved('a')], song,
+          jobs: [{ prompt_id: 'p-1', status: 'running' }] }),
+        localOpen: assemblyControl({ shots: [approved('a')], song,
+          jobs: [{ kind: 'post', prompt_id: '', status: 'running' }] }),
+        ready: assemblyControl({ shots: [approved('a')], song,
+          jobs: [{ prompt_id: 'p-1', status: 'complete' }] }),
+        exportNone: latestAssemblyExport({ id: 'proj', jobs: [] }),
+        exportNewest: latestAssemblyExport({ id: 'proj', jobs: [
+          { id: 'job_old', kind: 'post', prompt_id: '', status: 'complete',
+            output_files: ['exports/assembly_00001.mp4'] },
+          { id: 'job_new', kind: 'post', prompt_id: '', status: 'complete',
+            output_files: ['exports/assembly_00002.mp4'] },
+          { id: 'job_comfy', kind: 'post', prompt_id: 'p-2', status: 'complete',
+            output_files: ['shots/restored.mp4'] },
+          { id: 'job_failed', kind: 'post', prompt_id: '', status: 'error', output_files: [] },
+        ] }),
+      }));
+    """)
+
+    for case, reason in (("empty", "noShots"), ("songless", "noSong"), ("open", "rendersOpen")):
+        assert states[case]["disabled"] is True, case
+        assert states[case]["reason"] == states[reason], case
+    # The count is real: two of three shots lack an approval.
+    assert states["unapproved"]["disabled"] is True
+    assert "2 of 3" in states["unapproved"]["reason"]
+    # A *local* open job does not read as "renders open" — the server's own 409 owns that
+    # conflict, in its own words, and `hasActiveRenderJobs` rightly ignores empty prompt_ids.
+    assert states["localOpen"]["disabled"] is False
+    assert states["ready"] == {
+        "disabled": False, "label": states["label"], "title": states["help"], "reason": "",
+    }
+
+    assert states["exportNone"] is None
+    # Newest local export wins; the ComfyUI post job (a restore) and the failed run are not
+    # exports and must not shadow it, whatever order they landed in.
+    assert states["exportNewest"] == {
+        "path": "exports/assembly_00002.mp4",
+        "url": "/api/projects/proj/media/exports/assembly_00002.mp4",
+        "jobId": "job_new",
+    }
+
+
+def test_the_assembly_client_calls_a_route_the_server_exposes_and_the_bar_is_wired():
+    """The `removeSong` lesson applied to assembly: the hand-written URL is compared to the
+    server's route table, and the bar's render is reachable from the timeline render every
+    project load already goes through."""
+    source = API_JS.read_text(encoding="utf-8")
+    call = source.split("assemble:", 1)[1].split("\n", 1)[0]
+    url = re.search(r"`([^`]+)`", call)
+    assert url, "api.assemble no longer builds its URL from a template literal"
+    client_path = url.group(1).replace("${id}", "{project_id}")
+    assert client_path in {route.path for route in create_app().routes}
+
+    workspace = APP_JS.read_text(encoding="utf-8")
+    assert "renderAssembly();" in workspace.split("function renderTimeline()", 1)[1].split("\nfunction ", 1)[0], (
+        "renderAssembly is no longer reached from renderTimeline — the bar would draw once and go stale"
+    )
+    assert 'id="assembly-bar"' in INDEX_HTML.read_text(encoding="utf-8")
+
+
 def test_the_shot_inspector_draws_the_player_and_approval_pair_from_the_shot_fields():
     """The player and the pair, rendered and clicked against the workspace's own code.
 

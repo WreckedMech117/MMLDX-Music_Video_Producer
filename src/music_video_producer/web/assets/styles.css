@@ -315,6 +315,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .plan-readiness ul { display: grid; gap: 6px; margin: 9px 0 0; padding-left: 18px; }
 .plan-readiness li.blocking { color: var(--red); }
 .plan-readiness li.warning { color: var(--amber); }
+.assembly-bar { margin-top: 12px; display: grid; gap: 10px; }
+.assembly-controls { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
+.assembly-reason { color: var(--muted); font-size: 12px; }
+.assembly-report { padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--red-edge); border-radius: var(--radius); background: var(--surface-0); color: var(--red); font-size: 12px; line-height: 1.6; }
+.assembly-export { padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--acid); border-radius: var(--radius); background: var(--surface-0); display: grid; gap: 8px; }
+.assembly-export video { width: 100%; max-width: 640px; max-height: 380px; border-radius: 6px; background: #000; }
+.assembly-export a { color: var(--muted); font: 11px Consolas, monospace; }
 .queue-layout { display: grid; grid-template-columns: 1fr 300px; gap: 12px; }
 .queue-table, .finish-stack { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
 .queue-header, .job-row { display: grid; grid-template-columns: 1.4fr 1fr .7fr .6fr 1.2fr; gap: 10px; align-items: center; min-height: 48px; padding: 0 14px; border-bottom: 1px solid var(--line); }
