@@ -126,6 +126,12 @@ The export lands under `data/projects/{id}/media/exports/`, numbered and never o
 
 The dedicated keyframe modes (`image_to_video`, `first_last`) are the cheaper graphs and have **no song lip-sync** - the node has no audio input. To pin a frame on a shot that sings: use **references mode**, cite the picture in the `first` (or `last`) role alongside any identity references, and keep `use_song_audio` on. The picture rides as an ordinary reference slot and the structured prompt declares it the shot's first frame (`fully_preserved`), per MiniMax's guide 2.2.2 - the reference map writes that line for un-expanded shots, and the expansion specialist writes it for expanded ones. A keyframe picture counts against the node's 9-picture ceiling.
 
+## Sections: the song's structure layer
+
+The **SECTIONS track** holds the Director's structure marks — Intro/Verse/Chorus/Bridge/Outro — as real boxes: drag to move, drag an edge to resize, **edges snap to the shot boundaries below** (tolerance scales with zoom), **double-click empty track space to create**, click to select. A selected section owns the inspector panel: label, window, covered-shot count, and the **shared prompt** carried into every shot inside it. `PUT /api/projects/{id}/sections` replaces the list whole; overlaps are refused by name, gaps are legal and mean unknown.
+
+Sections are the fix for the wrong-lyric lipsync found on the first full render run (a chorus-position shot expanded with the song's opening verse line — the submitted audio trim was exactly right; the *words* were guessed). The section's label pairs with the lyric sheet's own `[Tag]` blocks **by order of appearance within a label family** ("Verse 2" takes the second `[Verse]` block), and the expansion specialist may sing only from that block — `clip_position` picks the line(s) within it, and an empty block means *no words*, never a guess. Populate proposes sections when none are marked (repaired, then dropped on the track for dragging); marked sections are never replaced.
+
 ## Populate Timeline
 
 `POST /api/projects/{id}/timeline/populate` — the **Populate Timeline** button in the Assets panel — lays out the whole plan from the Song, Treatment and Assets in one act (the Director's user workflow, stage 4). Destructive by design and doubly guarded: the button shows the warning (replaces every shot; first run or a deliberate redo) and the server refuses without `confirm_replace` in the same words. Locked or approved shots refuse populate entirely, by name, before the model is ever asked.

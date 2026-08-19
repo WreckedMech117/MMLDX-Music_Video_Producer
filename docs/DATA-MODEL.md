@@ -88,6 +88,13 @@ Shot timing is measured in seconds against the master song. Director compilation
 
 **Four modes are plannable and not yet renderable.** A mode with no adapter is refused at render with a clear reason rather than hidden, because laying out a first/middle/last section before its adapter exists is useful planning work. Three rows from the planning table are deliberately *not* modes: image editing is a `length: 5` reference render and so a parameter of `references`; enhancement is an operation on a take with its own route; and slicing and audio replacement are file utilities.
 
+## SongSection
+
+- stable `id`, free-text `label` (max 60), `start`, `duration`, computed `end`
+- `prompt` — the section's shared characteristics, layered under every shot inside it
+
+Held on `Project.sections` (defaulted, so every manifest loads unchanged; empty means unmarked and every reader treats absence as unknown). A shot belongs to the section holding its **midpoint**; the label pairs with the lyric sheet's `[Tag]` blocks by order of appearance within a label family, which is how sections carry the timing the sheet's tags lack. Nothing infers sections: the Director marks them (or accepts populate's repaired proposal, which never overwrites marks).
+
 ## TreatmentMessage
 
 - stable `id`, `role` (user, assistant, system), `content`, `created_at`
