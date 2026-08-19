@@ -126,6 +126,14 @@ The export lands under `data/projects/{id}/media/exports/`, numbered and never o
 
 The dedicated keyframe modes (`image_to_video`, `first_last`) are the cheaper graphs and have **no song lip-sync** - the node has no audio input. To pin a frame on a shot that sings: use **references mode**, cite the picture in the `first` (or `last`) role alongside any identity references, and keep `use_song_audio` on. The picture rides as an ordinary reference slot and the structured prompt declares it the shot's first frame (`fully_preserved`), per MiniMax's guide 2.2.2 - the reference map writes that line for un-expanded shots, and the expansion specialist writes it for expanded ones. A keyframe picture counts against the node's 9-picture ceiling.
 
+## Populate Timeline
+
+`POST /api/projects/{id}/timeline/populate` — the **Populate Timeline** button in the Assets panel — lays out the whole plan from the Song, Treatment and Assets in one act (the Director's user workflow, stage 4). Destructive by design and doubly guarded: the button shows the warning (replaces every shot; first run or a deliberate redo) and the server refuses without `confirm_replace` in the same words. Locked or approved shots refuse populate entirely, by name, before the model is ever asked.
+
+The model's layout is treated as **shape, never arithmetic**: its prompts and relative durations survive, but `populate_windows` repairs the geometry into what assembly later demands — contiguous from exactly 0 to exactly the song's end, every window inside H3's reliable 4–15 s range, the shot count clamped to the feasible band. Each tiled window draws its prompt from the proposal whose proportional span of the song contains it. Shots land as plain drafts; assistant fill (modes/citations/singing) and expansion remain the next acts.
+
+Operational note from the first live run (2026-08-19): the local model happily proposes out-of-range windows (a 44.8 s shot, a whole-song shot) — the chat route 502s on those (`PlannedShot` caps duration at 30) while populate's repair absorbs anything; a retry or two on the chat lane is normal, and populate itself landed a 16-shot, exactly-tiling plan on its first attempt.
+
 ## Generate All
 
 `POST /api/projects/{id}/generate/batch` — the queue panel's **Generate All** button — submits every ready shot as one batch (FR-4): one confirmation naming the count (server-enforced through `confirm_gpu`, so no client can spend hours of GPU by omission), each shot its own job and prompt id, all sharing one freshly minted `batch_id`. A shot whose submission refuses is **skipped by name with the route's own sentence and blocks nothing else** — the report lists both halves, and the toast relays it whole. Every submission rides the identical single-shot handlers, so no gate or payload rule exists twice.
