@@ -42,6 +42,60 @@ def align_h3_frames(frame_count: int) -> int:
     return frame_count if remainder == 0 else (quotient + 1) * 17 + 5
 
 
+#: The over-render margin, ruled by the Director 2026-08-19: "do not generate a clip to
+#: exact or lesser length than the time it was given, going over is acceptible as it can
+#: give a bit of editable room at either end … Doesnt have to be more than a half second."
+#: Before this, margin was a grid accident — a 3.75 s shot rendered exactly 90 frames and
+#: left nothing to fine-tune with.
+OVER_RENDER_SECONDS = 0.5
+
+#: How much of the margin sits *before* the shot's window when the song allows it. A
+#: quarter second each way is the "either end" of the ruling; the grid's own snap-up
+#: usually adds more tail on top.
+OVER_RENDER_LEAD_SECONDS = 0.25
+
+#: The one frame rate every adapter in this application renders at.
+H3_FPS = 24
+
+
+def over_render_frames(duration: float) -> int:
+    """The frames a shot of ``duration`` seconds is actually rendered for.
+
+    ``duration + OVER_RENDER_SECONDS``, snapped up to the 17k+5 grid — so the take is
+    always at least half a second longer than the window that will consume it, and never
+    exactly its length again. Every consumer of the extra length (the Monitor, the trim
+    nudge, assembly's offset) exists because this margin does.
+    """
+    return align_h3_frames(max(5, round((duration + OVER_RENDER_SECONDS) * H3_FPS)))
+
+
+def over_render_lead(
+    *, start: float, duration: float, picture_seconds: float, song_duration: float
+) -> float:
+    """How far before the shot's window the conditioning audio (and thus the take) begins.
+
+    The lead is what keeps an over-rendered singing take *sync-correct by construction*:
+    frame ``round(lead·24)`` of the take is the shot's window start, and playing or
+    assembling from that offset reproduces exactly the song seconds the model performed.
+    It is recorded on the Shot at submission (``latest_take_lead``) because it cannot be
+    derived later — a pre-margin take and a post-margin one are indistinguishable by
+    arithmetic on their lengths.
+
+    The shape of the rule, per the spec's matrix: ideally ``OVER_RENDER_LEAD_SECONDS``,
+    never more than the margin itself, never before the song starts — and if the *tail*
+    would run past the song's end, the lead grows to shift the whole window earlier
+    rather than truncating the picture. A whole-song shot with no room either side gets
+    lead 0 and renders with the mismatch, which is the pre-margin behaviour for that edge.
+    """
+    extra = max(0.0, picture_seconds - duration)
+    lead = min(OVER_RENDER_LEAD_SECONDS, extra, start)
+    if song_duration > 0:
+        overflow = (start - lead + picture_seconds) - song_duration
+        if overflow > 0:
+            lead = min(lead + overflow, extra, start)
+    return lead
+
+
 def build_director_timeline(
     shots: list[Shot],
     *,

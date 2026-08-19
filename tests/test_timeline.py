@@ -11,11 +11,16 @@ from music_video_producer.models import (
     citations_in_prompt_order,
 )
 from music_video_producer.timeline import (
+    H3_FPS,
+    OVER_RENDER_LEAD_SECONDS,
+    OVER_RENDER_SECONDS,
     TimelineError,
     align_h3_frames,
     build_director_timeline,
     expansion_input,
     ordered_shots,
+    over_render_frames,
+    over_render_lead,
     shot_expansion_input,
     song_section,
 )
@@ -516,3 +521,85 @@ def test_the_per_shot_input_refuses_a_shot_from_another_project():
     project = _expansion_project()
     with pytest.raises(TimelineError):
         shot_expansion_input(project, Shot(id="elsewhere", start=0.0, duration=4.0))
+
+
+# --- The over-render margin (spec-monitor-and-over-render) --------------------------------
+
+
+def test_over_render_frames_is_never_exact_or_lesser_than_the_window():
+    """The Director's ruling, in frames: a 3.75 s window renders 107 frames (4.458 s), a
+    4 s window 124, an 8 s window 209 — and across the whole plannable range the take is
+    always longer than the window by at least the margin, less the half frame rounding
+    can shave, and still on the 17k+5 grid."""
+    assert over_render_frames(3.75) == 107
+    assert over_render_frames(4.0) == 124
+    assert over_render_frames(5.0) == 141
+    assert over_render_frames(8.0) == 209
+    for eighths in range(1, 15 * 8 + 1):
+        duration = eighths / 8
+        frames = over_render_frames(duration)
+        assert (frames - 5) % 17 == 0, duration
+        assert frames / H3_FPS > duration, duration
+        assert frames >= (duration + OVER_RENDER_SECONDS) * H3_FPS - 0.5, duration
+
+
+def test_the_lead_is_a_quarter_second_when_the_song_has_room():
+    picture = over_render_frames(3.75) / H3_FPS
+    lead = over_render_lead(
+        start=12.0, duration=3.75, picture_seconds=picture, song_duration=154.6
+    )
+    assert lead == OVER_RENDER_LEAD_SECONDS == 0.25
+
+
+def test_the_lead_never_reaches_before_the_song_starts():
+    picture = over_render_frames(3.75) / H3_FPS
+    assert over_render_lead(
+        start=0.0, duration=3.75, picture_seconds=picture, song_duration=154.6
+    ) == 0.0
+    assert over_render_lead(
+        start=0.1, duration=3.75, picture_seconds=picture, song_duration=154.6
+    ) == 0.1
+
+
+def test_the_lead_grows_to_keep_the_tail_inside_the_song():
+    """A shot ending at the song's last second cannot extend its tail, so the whole margin
+    shifts ahead of the window instead — the picture never shortens."""
+    picture = over_render_frames(3.75) / H3_FPS  # 4.4583 s, extra 0.7083 s
+    song = 100.0
+    lead = over_render_lead(
+        start=96.25, duration=3.75, picture_seconds=picture, song_duration=song
+    )
+    # The window ends exactly at the song's end: every bit of margin must lead.
+    assert lead == pytest.approx(picture - 3.75)
+    assert 96.25 - lead + picture == pytest.approx(song)
+    # Part-way: the ideal quarter second plus exactly the overflow, no more. At 96.0 the
+    # quarter-second lead leaves the tail 0.208 s past the song, so the lead grows to
+    # 0.458 s and the window lands flush on the song's end.
+    partial = over_render_lead(
+        start=96.0, duration=3.75, picture_seconds=picture, song_duration=song
+    )
+    assert 96.0 - partial + picture == pytest.approx(song)
+    assert OVER_RENDER_LEAD_SECONDS < partial < picture - 3.75
+    # And a shot whose tail already fits keeps the ideal lead untouched.
+    assert over_render_lead(
+        start=95.0, duration=3.75, picture_seconds=picture, song_duration=song
+    ) == OVER_RENDER_LEAD_SECONDS
+
+
+def test_a_whole_song_shot_gets_no_lead_and_keeps_its_picture():
+    """No room either side: the lead stays clamped to the start (0) and the caller clamps
+    the trim's end at the song — the mismatch renders, exactly as pre-margin edge shots
+    did, rather than being silently truncated or refused."""
+    picture = over_render_frames(100.0) / H3_FPS
+    assert over_render_lead(
+        start=0.0, duration=100.0, picture_seconds=picture, song_duration=100.0
+    ) == 0.0
+
+
+def test_an_unknown_song_length_never_shifts_the_lead():
+    """`song_duration == 0` means the length was never recorded; nothing can overflow an
+    unknown, so the lead stays the ideal quarter second."""
+    picture = over_render_frames(3.75) / H3_FPS
+    assert over_render_lead(
+        start=50.0, duration=3.75, picture_seconds=picture, song_duration=0.0
+    ) == OVER_RENDER_LEAD_SECONDS

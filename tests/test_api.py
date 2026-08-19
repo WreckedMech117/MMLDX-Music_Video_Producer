@@ -2247,10 +2247,11 @@ def test_h3_refuses_a_text_only_window_past_the_director_nodes_maxima(tmp_path: 
     ]
 
     assert all(f"maximum of {H3_DIRECTOR_MAX_FRAMES}" in detail for detail in refusals), refusals
-    # Each names the literal that would have gone out, which is what tells a Director
-    # whether the window is too long or merely too far down the song.
-    assert "duration_frames=12007" in refusals[0]
-    assert "end_frame=10080" in refusals[1]
+    # Each names the literal that would have gone out — over-render margin included, since
+    # that is what would actually be sent — which is what tells a Director whether the
+    # window is too long or merely too far down the song.
+    assert "duration_frames=12024" in refusals[0]
+    assert "end_frame=10098" in refusals[1]
     assert "start_frame=12000" in refusals[2]
     assert comfy.prompts == []
 
@@ -6842,7 +6843,8 @@ def test_an_unusable_reported_duration_falls_through_to_probing(tmp_path: Path):
 
 
 def test_h3_payload_uses_grid_aligned_frame_count(tmp_path: Path):
-    """A 4s window is 96 frames, which is off H3's 17k+5 grid and must round to 107."""
+    """A 4s window plus the over-render margin is 4.5s = 108 frames, off H3's 17k+5 grid,
+    and must round up to 124 — the take always runs longer than the window that asked."""
     client, store, comfy = make_client(tmp_path)
     project = store.create(Project(name="Grid"))
     project.shots = [Shot(start=0, duration=4, prompt="Off-grid", mode="text", status="ready")]
@@ -6851,8 +6853,10 @@ def test_h3_payload_uses_grid_aligned_frame_count(tmp_path: Path):
     client.post(f"/api/projects/{project.id}/shots/{project.shots[0].id}/generate/h3", json={})
 
     inputs = comfy.prompts[-1]["2343"]["inputs"]
-    assert inputs["duration_frames"] == 107
+    assert inputs["duration_frames"] == 124
     assert (inputs["duration_frames"] - 5) % 17 == 0
+    # The ruling itself: never exact or lesser than the window.
+    assert inputs["duration_frames"] / 24 >= 4 + 0.5
 
 
 # --- H3 sampling profiles at the route -------------------------------------------------
@@ -7421,10 +7425,39 @@ def test_a_reference_shot_hears_its_own_part_of_the_song(tmp_path: Path):
     assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
 
     song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
-    assert song["trim"] == {"start": 12.0, "end": 15.75}
-    # The visual window and the audio window are the same window: `length` is the frame
-    # count for the same 3.75 s, so nothing lets the two diverge silently.
-    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["length"] == 90
+    # The shot's own 12.0-15.75 window, extended by the over-render margin: a 0.25 s lead
+    # ahead of the window and the grid's tail behind it, so the whole 107-frame picture is
+    # performed against real song seconds and editable room exists at either end.
+    assert song["trim"] == {"start": 11.75, "end": 11.75 + 107 / 24}
+    # The visual span and the audio span are still the same span: `length` is the frame
+    # count for exactly the trimmed seconds, so nothing lets the two diverge silently.
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["length"] == 107
+
+
+def test_submission_records_the_takes_lead_on_the_shot(tmp_path: Path):
+    """`latest_take_lead` is written at the moment of truth, with `prompt_id`.
+
+    The lead cannot be derived later — a pre-margin take and a post-margin one are
+    indistinguishable by arithmetic on their lengths — so the submission write is the one
+    record of where the sync-correct cut sits. A song-audio shot mid-song records the
+    quarter-second lead its trim actually carried; a text-only shot records 0, because its
+    take starts at the window and all margin is tail.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=12.0, duration=3.75)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+    recorded = ProjectStore(tmp_path).get(project.id).shots[0]
+    assert recorded.latest_take_lead == 0.25
+    # The recorded lead and the submitted trim agree — one is the record of the other.
+    song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
+    assert song["trim"]["start"] == 12.0 - recorded.latest_take_lead
+
+    text = store.create(Project(name="Text lead"))
+    text.shots = [Shot(start=12.0, duration=3.75, prompt="A wide shot.", status="ready")]
+    store.save(text)
+    assert submit_h3(client, text.id, text.shots[0].id).status_code == 202
+    assert ProjectStore(tmp_path).get(text.id).shots[0].latest_take_lead == 0.0
 
 
 def test_a_moved_shot_renders_its_new_window_with_no_stale_offset(tmp_path: Path):
@@ -7433,7 +7466,7 @@ def test_a_moved_shot_renders_its_new_window_with_no_stale_offset(tmp_path: Path
     project = windowed_project(store, client, start=12.0, duration=3.75)
     shot_id = project.shots[0].id
     assert submit_h3(client, project.id, shot_id).status_code == 202
-    assert submitted_media(comfy)[-1]["trim"] == {"start": 12.0, "end": 15.75}
+    assert submitted_media(comfy)[-1]["trim"] == {"start": 11.75, "end": 11.75 + 107 / 24}
 
     moved = store.get(project.id)
     moved.shots[0].start = 96.5
@@ -7441,7 +7474,7 @@ def test_a_moved_shot_renders_its_new_window_with_no_stale_offset(tmp_path: Path
     rearm_shot(store, project.id, shot_id)
 
     assert submit_h3(client, project.id, shot_id).status_code == 202
-    assert submitted_media(comfy)[-1]["trim"] == {"start": 96.5, "end": 100.25}
+    assert submitted_media(comfy)[-1]["trim"] == {"start": 96.25, "end": 96.25 + 107 / 24}
 
 
 def test_a_shot_at_zero_seconds_is_windowed_like_any_other(tmp_path: Path):
@@ -7470,7 +7503,9 @@ def test_a_shot_at_zero_seconds_is_windowed_like_any_other(tmp_path: Path):
 
     submitted = comfy.prompts[-1]
     song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
-    assert song["trim"] == {"start": 0.0, "end": 3.75}
+    # At 0 s the over-render lead has nowhere to go — the song starts here — so all the
+    # margin is tail: the trim covers the full 107-frame picture from 0.
+    assert song["trim"] == {"start": 0.0, "end": 107 / 24}
 
     # What the route used to send: the same graph with no window on the song at all.
     shipped = build_h3_reference_payload(
@@ -7552,7 +7587,10 @@ def test_the_text_only_director_path_keeps_its_own_window_untouched(tmp_path: Pa
     payload = comfy.prompts[-1]
     assert "mvp:references" not in payload
     director = payload["2343"]["inputs"]
-    assert (director["start_second"], director["end_second"]) == (12.0, 15.75)
+    # The window's end carries the over-render margin: 3.75 s renders 107 frames
+    # (4.4583 s), so the Director node's own second-markers run to 12 + 107/24. The text
+    # path has no audio to lead, so all margin is tail and the start is untouched.
+    assert (director["start_second"], director["end_second"]) == (12.0, 12.0 + 107 / 24)
     # The key, not the substring: `VHS_VideoCombine.trim_to_audio` contains "trim" and
     # always has.
     assert all("trim" not in node["inputs"] for node in payload.values())
@@ -7684,8 +7722,14 @@ def test_the_route_offers_every_aspect_ratio_the_selector_knows(tmp_path: Path):
 # audio a reference shot is conditioned on, so a Shot with `use_song_audio` is knowingly no longer
 # byte-identical to a commit before it. Baselining further back would have frozen the bug this
 # project had just fixed and reported the fix as the regression.
-H3_REFERENCE_PAYLOAD_DIGEST = "e523c516a524409ee6cf3c2c7017d047b254f3f4ef3a0008a751e6fac432e9e8"
-H3_TEXT_PAYLOAD_DIGEST = "3745c41171949a07e46009843ebe38bb14efaab3bd5056d20de0fa9b3eb9733a"
+#
+# Re-pinned 2026-08-19 for the over-render margin — a renegotiation, not a drift: the
+# Director ruled every take renders at least half a second longer than its window, which
+# moves `length`/`duration_frames` and (for song-audio shots) the audio trim in every H3
+# payload at once. The two shapes' *structure* is unchanged; only those literals moved,
+# verified by eye on the diff before re-pinning.
+H3_REFERENCE_PAYLOAD_DIGEST = "b59a93ddcc4f8cbf3e51504d47581a70fd3e95f2c758b34c1ff6c384e9fe7c60"
+H3_TEXT_PAYLOAD_DIGEST = "d7d657a7b20c6d85b3895e23a8bd65304ef3fe014d8376ccff8d03a8c56dac8d"
 
 DIGEST_PROJECT_ID = "project_deadbeef0001"
 DIGEST_SHOT_REFERENCE = "shot_deadbeef0002"
@@ -8391,9 +8435,11 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     Director's prompt the moment it was declared, with nobody deciding that it should. This change
     added three at once, which is exactly the situation the guard exists for.
 
-    Three fields are withheld, none of them a removal — each was classified withheld at the
+    Five fields are withheld, none of them a removal — each was classified withheld at the
     moment it was declared, so withholding adds nothing to the prompt rather than subtracting
-    something from it. `h3_prompt` on the numbers: a thirty-shot plan of H3-format expansions
+    something from it. The over-render pair (`latest_take_lead`/`trim_nudge`) is render
+    bookkeeping and the human's own editorial fine-tune, neither a plan fact a chat turn
+    writes or reads. `h3_prompt` on the numbers: a thirty-shot plan of H3-format expansions
     would add many thousands of tokens to *every* chat turn, and rich context is this project's
     recorded cause of Director degradation. The AD-13 window snapshot pair
     (`approved_start`/`approved_duration`) as staleness bookkeeping: copies of `start`/`duration`
@@ -8426,7 +8472,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     # at all — and every field is on exactly one side.
     assert _withheld_fields(
         Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
-    ) == {"h3_prompt", "approved_start", "approved_duration"}
+    ) == {"h3_prompt", "approved_start", "approved_duration", "latest_take_lead", "trim_nudge"}
     assert not SHOT_DIRECTOR_VISIBLE & SHOT_DIRECTOR_WITHHELD
     assert {"mode", "citations", "singing", "prompt"} <= SHOT_DIRECTOR_VISIBLE
 
@@ -8434,9 +8480,21 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     # withheld — it is derived from the classification rather than written by hand, so a field
     # classified withheld cannot fail to be excluded, and a field classified visible cannot be
     # excluded by a stale path someone forgot to update.
-    assert SHOT_DIRECTOR_WITHHELD == {"h3_prompt", "approved_start", "approved_duration"}
+    assert SHOT_DIRECTOR_WITHHELD == {
+        "h3_prompt",
+        "approved_start",
+        "approved_duration",
+        "latest_take_lead",
+        "trim_nudge",
+    }
     assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {
-        "__all__": {"h3_prompt", "approved_start", "approved_duration"}
+        "__all__": {
+            "h3_prompt",
+            "approved_start",
+            "approved_duration",
+            "latest_take_lead",
+            "trim_nudge",
+        }
     }
 
     # And the intent is still shown. Withholding the expansion is only defensible because the thing
@@ -8611,8 +8669,10 @@ def test_a_references_shot_declares_its_first_frame_in_the_guides_wording(tmp_pa
     assert [item["kind"] for item in media] == ["picture", "picture", "audio"]
     assert media[0]["file"].endswith("lead.png")
     assert media[1]["file"].endswith("stage.png")
-    # And the song is windowed to the shot exactly as a plain references shot's is.
-    assert media[2]["trim"] == {"start": 0.0, "end": 5.0}
+    # And the song is windowed to the shot exactly as a plain references shot's is — the
+    # over-rendered span: at 0 s the lead has nowhere to go, so the 141-frame picture
+    # (5 s + margin, grid-snapped) is all tail.
+    assert media[2]["trim"] == {"start": 0.0, "end": 141 / 24}
 
 
 def test_a_references_shot_declares_both_keyframes_and_ties_the_last_to_the_final_shot(

@@ -22,7 +22,11 @@ import pytest
 # `test_the_restore_window_comes_from_song_audio_window_and_not_a_second_computation`.
 from music_video_producer import workflows as workflows_module
 from music_video_producer.app import SongPlannerRequest
-from music_video_producer.timeline import align_h3_frames
+from music_video_producer.timeline import (
+    OVER_RENDER_SECONDS,
+    align_h3_frames,
+    over_render_frames,
+)
 from music_video_producer.workflows import (
     AUDIO_REPLACE_AUDIO_EXTENSIONS,
     AUDIO_REPLACE_CRF,
@@ -1048,7 +1052,8 @@ def test_h3_reference_payload_maps_multiple_subjects_environment_and_shared_audi
     assert conditioner["ref_images.ref_image_0"] == ["mvp:split", 0]
     assert conditioner["ref_images.ref_image_2"] == ["mvp:split", 2]
     assert conditioner["ref_audios.ref_audio_0"] == ["mvp:split", 15]
-    assert conditioner["length"] == 192
+    # 8 s plus the over-render margin: 8.5 s -> 204 frames -> 209 on the 17k+5 grid.
+    assert conditioner["length"] == 209
     assert payload["mvp:scheduler"]["inputs"]["steps"] == 20
     assert payload["mvp:save"]["inputs"]["filename_prefix"] == "mvp/duet-chorus"
 
@@ -1445,7 +1450,9 @@ def test_the_reference_payload_carries_a_window_and_refuses_a_broken_one():
 #: whatever it currently does. If this fails, the default profile's payload changed: that
 #: is the thing the story promised would not happen, so re-deriving the digest is the
 #: wrong fix unless the Director has renegotiated the promise.
-H3_DEFAULT_PROFILE_DIGEST = "57beec67787e9f744770b58d4c52532840634c8ea2333112e31b8711823c00db"
+#: Re-pinned 2026-08-19 for the over-render margin (see H3_TEXT_ONLY_PRE_KEYFRAME_DIGEST's
+#: note): duration 8 s now renders 209 frames instead of 192, and nothing else moved.
+H3_DEFAULT_PROFILE_DIGEST = "f87e6b97efa95e67dcbedcefef40b1cffb603b88958896193725b21f220bfe17"
 
 
 def default_profile_payload(**overrides) -> dict:
@@ -2175,15 +2182,20 @@ def test_the_keyframe_length_is_the_exports_own_expression_on_the_shared_grid():
     )
     expression = expression_node["inputs"]["expression"]
 
-    for duration in (5 / 24, 0.5, 3.75, 5, 5.1, 8, 12.34, 149.5):
+    for duration in (5 / 24, 0.5, 3.75, 5, 5.1, 8, 12.34, 149.0):
         # The audited export's own arithmetic, evaluated with no builtins and no inputs
         # but `a` — restating the formula locally is exactly what this test must not do.
+        # Evaluated at `duration + OVER_RENDER_SECONDS`: the builder deliberately feeds
+        # the grid the over-rendered length (the Director's margin ruling), and the
+        # export's snap arithmetic must agree with it *at that input*.
         expected = eval(
-            expression, {"__builtins__": {}}, {"a": duration, "max": max, "round": round}
+            expression,
+            {"__builtins__": {}},
+            {"a": duration + OVER_RENDER_SECONDS, "max": max, "round": round},
         )
         payload = keyframe_payload(duration=duration)
         assert payload["mvp:condition"]["inputs"]["length"] == expected, duration
-        assert align_h3_frames(max(5, round(duration * H3_FRAME_RATE))) == expected, duration
+        assert over_render_frames(duration) == expected, duration
 
 
 def test_the_keyframe_payload_is_the_reachable_subgraph_minus_the_stated_drops():
@@ -2300,8 +2312,9 @@ def test_the_keyframe_builder_refuses_a_window_past_its_own_nodes_ceiling():
     """The refusal quotes this node's ceiling, and the ceiling is the schema's."""
     with pytest.raises(ValueError, match="H3 keyframe node's 3600-frame maximum"):
         keyframe_payload(duration=151)
-    # 3592 frames is the last grid point at or below the ceiling; it must build.
-    assert keyframe_payload(duration=3592 / H3_FRAME_RATE)
+    # 3592 frames is the last grid point at or below the ceiling; the longest buildable
+    # window is that minus the over-render margin, which every take now carries.
+    assert keyframe_payload(duration=3592 / H3_FRAME_RATE - OVER_RENDER_SECONDS)
     schema = recorded_object_info()["MiniMaxH3ImageToVideo"]["input"]["required"]
     assert preflight.numeric_bounds(schema["length"])[1] == H3_KEYFRAME_MAX_FRAMES
 
@@ -2345,11 +2358,16 @@ def test_the_keyframe_graph_offers_no_audio_reference_and_generates_its_own_trac
 #: baseline and still asserted by its own test. If one of these fails, a pre-existing
 #: mode's payload changed; re-deriving the digest is the wrong fix unless the Director has
 #: renegotiated that promise.
+#: Re-pinned 2026-08-19 for the over-render margin — a renegotiation, not a drift: the
+#: Director ruled every take renders longer than its window ("do not generate a clip to
+#: exact or lesser length than the time it was given"), which changes `length` in every H3
+#: payload family at once. The text-only digest is unchanged (its builder takes frames
+#: from the caller); the reference digest moved 90 -> 107 frames and nothing else.
 H3_TEXT_ONLY_PRE_KEYFRAME_DIGEST = (
     "c454de1948ad7185112d1a9a492a129b7f3225f8218cc4f758640e0d792984c8"
 )
 H3_SONG_AUDIO_PRE_KEYFRAME_DIGEST = (
-    "b8921e81121ce10d2a880287d1448867b6bed23e799efed7696c2c5c311d7e68"
+    "fd3863312ce3c3c2e65cfd68791d0bad2a41b878b8f71719fa198db8a6b388b0"
 )
 
 
@@ -2435,7 +2453,9 @@ def test_h3_reference_payload_refuses_a_window_past_the_node_frame_ceiling():
     `length` is capped at 3600 in the live schema; over it, `/prompt` validation returns
     `value_bigger_than_max` and the route translates that into an opaque 502.
     """
-    longest = 3592 / 24  # 17 * 211 + 5, the last grid point at or below the ceiling
+    # 3592 = 17·211 + 5 is the last grid point at or below the ceiling; the longest
+    # buildable *window* is that minus the over-render margin every take now carries.
+    longest = 3592 / 24 - OVER_RENDER_SECONDS
     assert h3_reference_payload(h3_references("picture", 1), duration=longest)[
         "mvp:condition"
     ]["inputs"]["length"] == H3_REFERENCE_MAX_FRAMES - 8
@@ -2514,17 +2534,22 @@ def test_h3_reference_frame_alignment_agrees_with_the_timeline_helper():
     checked = 0
     for eighths in range(1, 1200):
         duration = eighths / 8  # 0.125 s to 149.875 s, every eighth of a second
-        requested = max(5, round(duration * H3_FRAME_RATE))
+        requested = max(5, round((duration + OVER_RENDER_SECONDS) * H3_FRAME_RATE))
         expected = align_h3_frames(requested)
         if expected > H3_REFERENCE_MAX_FRAMES:
             continue
         payload = h3_reference_payload(h3_references("picture", 1), duration=duration)
         length = payload["mvp:condition"]["inputs"]["length"]
         assert length == expected, duration
-        # Independent of both implementations: on the grid, never short of the window, and
-        # never more than one grid step longer than it needs to be.
+        assert length == over_render_frames(duration), duration
+        # Independent of both implementations: on the grid, never more than one grid step
+        # past what the margin needs — and the ruling itself, in frames: **never exact or
+        # lesser than the window**, always at least the margin longer (less the half-frame
+        # rounding can shave).
         assert length >= 5 and (length - 5) % 17 == 0, duration
         assert requested <= length < requested + 17, duration
+        assert length / H3_FRAME_RATE > duration, duration
+        assert length >= (duration + OVER_RENDER_SECONDS) * H3_FRAME_RATE - 0.5, duration
         checked += 1
     assert checked > 1100, checked
 
@@ -3265,7 +3290,8 @@ def test_the_reference_smoke_reads_what_was_sampled_out_of_comfyuis_own_record()
     assert smoke.submitted_geometry(windowed) == {
         "width": 1056,
         "height": 608,
-        "length": 90,
+        # 3.75 s plus the over-render margin: 4.25 s -> 102 frames -> 107 on the grid.
+        "length": 107,
     }
     assert smoke.submitted_song_window(windowed) == {
         "file": "F:/refs/master.mp3",

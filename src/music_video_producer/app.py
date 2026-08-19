@@ -74,6 +74,7 @@ from .models import (
 from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
 from .store import ProjectNotFound, ProjectStore
 from .timeline import (
+    H3_FPS,
     H3_MAX_SHOT_SECONDS,
     H3_MIN_SHOT_SECONDS,
     TimelineError,
@@ -81,6 +82,8 @@ from .timeline import (
     build_director_timeline,
     expansion_input,
     ordered_shots,
+    over_render_frames,
+    over_render_lead,
     shot_expansion_input,
 )
 from .vram import CliUnloader, LlmEjector
@@ -371,8 +374,13 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 #: assembly's refusal. The chat Director already sees the live window and `approved_output`;
 #: echoing near-duplicate numbers into every shot of every turn buys nothing, and no
 #: assistant tool writes them — approval is never the Director's act (AD-15).
+#:
+#: The over-render pair is withheld for the same class of reason: `latest_take_lead` is
+#: render bookkeeping written at submission, and `trim_nudge` is the human's own editorial
+#: fine-tune on a rendered file — neither is a plan fact a chat turn writes or reads, and
+#: nothing the conversational model could do with them is anything but noise.
 SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
-    {"h3_prompt", "approved_start", "approved_duration"}
+    {"h3_prompt", "approved_start", "approved_duration", "latest_take_lead", "trim_nudge"}
 )
 
 #: How the reference map declares a keyframe-role picture, per MiniMax's guide §2.2.2 — read
@@ -3377,6 +3385,10 @@ def create_app(
                     shot=shot_label(project, shot), problems=" ".join(problems)
                 ),
             )
+        # The sync-correct offset of the take the submission below will produce — nonzero
+        # only when the reference branch extends a song-audio window ahead of the shot.
+        # Written onto the Shot with `prompt_id` at submission; see `Shot.latest_take_lead`.
+        take_lead = 0.0
         if spec.adapter == "h3-reference":
             references: list[dict[str, Any]] = []
             tags: list[str] = []
@@ -3462,7 +3474,10 @@ def create_app(
                 # reference audio, so a 0 s shot with no window rides the whole track through
                 # every sampling step exactly like any other. See `song_audio_window`.
                 try:
-                    window = song_audio_window(
+                    # The *shot's own* window first, for its refusal: a window past the end
+                    # of the song is refused here in the same words as ever, before any GPU
+                    # time. The trim actually sent is then the over-rendered one below.
+                    song_audio_window(
                         start=shot.start,
                         duration=shot.duration,
                         song_duration=project.song.duration,
@@ -3473,12 +3488,33 @@ def create_app(
                     # end to the file length and renders a shorter window than asked for
                     # without saying so.
                     raise HTTPException(status_code=422, detail=str(error)) from error
+                # The over-render margin (spec-monitor-and-over-render): the picture runs
+                # ~half a second past the window, and the conditioning audio extends with
+                # it — up to a quarter second *before* the window when the song allows —
+                # so the whole take is performed against real song seconds and editable
+                # room exists at either end. `take_lead` is the sync-correct offset the
+                # submission write records on the Shot; the Monitor and assembly both cut
+                # there by default.
+                picture_seconds = over_render_frames(shot.duration) / H3_FPS
+                take_lead = over_render_lead(
+                    start=shot.start,
+                    duration=shot.duration,
+                    picture_seconds=picture_seconds,
+                    song_duration=project.song.duration,
+                )
+                trim_start = shot.start - take_lead
+                trim_end = trim_start + picture_seconds
+                if project.song.duration > 0:
+                    # The whole-song edge: no room either side, so the file simply ends
+                    # before the picture does — rendered with the mismatch, exactly as
+                    # every pre-margin render behaved, never silently shortened elsewhere.
+                    trim_end = min(trim_end, project.song.duration)
                 references.append(
                     {
                         "kind": "audio",
                         "file": str(resolve_song_path(project_id, project.song)),
                         "label": "master song",
-                        "trim": window,
+                        "trim": {"start": trim_start, "end": trim_end},
                     }
                 )
                 numbers["audio"] += 1
@@ -3669,16 +3705,24 @@ def create_app(
                         f"reference, or give this shot an explicit width and height."
                     ),
                 )
+            # The over-render margin: the take runs at least half a second past the
+            # window (spec-monitor-and-over-render). The timeline the Director node sees
+            # is widened to the whole picture — window *and* the shot's own segment — so
+            # the prompt governs the margin rather than leaving unprompted tail frames.
+            picture_seconds = over_render_frames(shot.duration) / H3_FPS
             try:
                 timeline = build_director_timeline(
-                    [shot], window_start=shot.start, window_duration=shot.duration, fps=24
+                    [shot.model_copy(update={"duration": picture_seconds})],
+                    window_start=shot.start,
+                    window_duration=picture_seconds,
+                    fps=24,
                 )
             except TimelineError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
             try:
                 payload = build_h3_director_payload(
                     timeline_data=timeline.timeline_data,
-                    duration=shot.duration,
+                    duration=picture_seconds,
                     requested_frames=timeline.aligned_frames,
                     seed=shot.seed,
                     # This path's own default, unchanged from the one `H3Request` carried
@@ -3704,6 +3748,10 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(error)) from error
         shot.status = "queued"
         shot.prompt_id = submission.prompt_id
+        # The take this job produces begins `take_lead` seconds before the shot's window
+        # (0 for every non-song path). Recorded at the moment of truth because it cannot
+        # be derived later; the Monitor, the nudge control and assembly all cut from it.
+        shot.latest_take_lead = take_lead
         job = RenderJob(
             kind="h3",
             prompt_id=submission.prompt_id,

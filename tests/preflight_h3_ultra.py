@@ -68,7 +68,7 @@ repo_src_on_path()
 # Imported after `repo_src_on_path()` on purpose: run as a script, `src` is not
 # importable until that call puts it on the path.
 from music_video_producer.app import H3Request
-from music_video_producer.timeline import align_h3_frames
+from music_video_producer.timeline import OVER_RENDER_SECONDS, align_h3_frames
 from music_video_producer.workflows import (
     H3_ASPECT_RATIOS,
     H3_DEFAULT_ASPECT_RATIO,
@@ -130,9 +130,11 @@ REQUEST_BOUNDS = (
     ("multiple", "ResolutionSelector", "multiple"),
 )
 
-#: The longest window whose aligned frame count still fits `H3_REFERENCE_MAX_FRAMES`:
-#: 3592 frames is 17 x 211 + 5, the last point on H3's grid at or below 3600.
-LONGEST_WINDOW_SECONDS = 3592 / H3_FRAME_RATE
+#: The longest window whose over-rendered frame count still fits
+#: `H3_REFERENCE_MAX_FRAMES`: 3592 frames is 17 x 211 + 5, the last point on H3's grid at
+#: or below 3600 — minus the over-render margin every shot take now carries
+#: (`timeline.OVER_RENDER_SECONDS`, the Director's 2026-08-19 ruling).
+LONGEST_WINDOW_SECONDS = 3592 / H3_FRAME_RATE - OVER_RENDER_SECONDS
 
 
 def request_bound(field: str, kind: str) -> float:

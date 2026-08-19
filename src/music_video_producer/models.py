@@ -338,6 +338,25 @@ class Shot(BaseModel):
     # stale wording). Defaults keep every existing manifest loading unchanged.
     approved_start: float = 0
     approved_duration: float = 0
+    # The over-render pair (spec-monitor-and-over-render). Takes are rendered ~half a
+    # second longer than their window; these two decide which slice of the take the
+    # timeline's window shows.
+    #
+    # `latest_take_lead` is how far before the window the take begins — the sync-correct
+    # offset for a song-audio take, written at submission by `generate_h3` alongside
+    # `prompt_id` (it describes the take the submitted job will produce) and by nothing
+    # else. Recorded rather than derived, because a pre-margin take and a post-margin one
+    # are indistinguishable by arithmetic on their lengths; every take rendered before the
+    # margin existed correctly reads 0.
+    #
+    # `trim_nudge` is the Director's fine-tune on top of the lead: seconds added to the
+    # cut point, negative allowed up to the lead. Effective offset = lead + nudge, one
+    # rule read by the Monitor, the inspector and assembly alike. Deliberately NOT
+    # snapshotted at approval and still editable on an approved shot: it selects a slice
+    # of the approved file — the "fine tune with the extra added length" the ruling asks
+    # for — while the file itself stays immovable.
+    latest_take_lead: float = Field(default=0, ge=0)
+    trim_nudge: float = 0
     locked: bool = False
 
     @field_validator("mode", mode="before")

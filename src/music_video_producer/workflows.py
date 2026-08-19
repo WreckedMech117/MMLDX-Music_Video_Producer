@@ -12,7 +12,7 @@ from typing import Any
 # whole window range; `audio_replace_lengths` is new code and has no such history to preserve,
 # so it calls the function. `timeline` imports only `models`, which imports nothing local, so
 # this direction cannot cycle.
-from .timeline import align_h3_frames
+from .timeline import align_h3_frames, over_render_frames
 
 
 @dataclass(frozen=True, slots=True)
@@ -905,14 +905,15 @@ def build_h3_reference_payload(
     if ref_image_size not in {"match", "max"}:
         raise ValueError("ref_image_size must be 'match' or 'max'")
     _finite("Shot duration", duration)
-    requested = max(5, round(duration * H3_FRAME_RATE))
-    # The same 17k+5 grid `timeline.align_h3_frames` rounds to, and asserted to agree with it
-    # over the whole window range in `tests/test_workflows.py`.
-    length = requested + (5 - requested % 17) % 17
+    # The over-render margin (spec-monitor-and-over-render): every take is rendered at
+    # least half a second longer than its window, grid-snapped, so editable room exists at
+    # either end. This deliberately changed every reference payload's `length` on
+    # 2026-08-19 — the digests in `tests/test_workflows.py` were re-pinned with it.
+    length = over_render_frames(duration)
     if length > H3_REFERENCE_MAX_FRAMES:
         raise ValueError(
-            f"A {duration:g}s shot needs {length} frames, above the H3 node's "
-            f"{H3_REFERENCE_MAX_FRAMES}-frame maximum "
+            f"A {duration:g}s shot needs {length} frames (over-render margin included), "
+            f"above the H3 node's {H3_REFERENCE_MAX_FRAMES}-frame maximum "
             f"({H3_REFERENCE_MAX_FRAMES / H3_FRAME_RATE:g}s at {H3_FRAME_RATE} fps)"
         )
     # Every `trim` that reaches `media_state`, checked here rather than trusted from the
@@ -1128,15 +1129,13 @@ def build_h3_keyframe_payload(
         multiple=multiple,
     )
     _finite("Shot duration", duration)
-    requested = max(5, round(duration * H3_FRAME_RATE))
-    # The export's own ComfyMathExpression, computed server-side: the same 17k+5 grid
-    # `timeline.align_h3_frames` rounds to, asserted to agree with the export's expression
-    # in `tests/test_workflows.py`.
-    length = requested + (5 - requested % 17) % 17
+    # The over-render margin, same rule and same date as the reference builder's — one
+    # policy across every shot adapter, computed by one function.
+    length = over_render_frames(duration)
     if length > H3_KEYFRAME_MAX_FRAMES:
         raise ValueError(
-            f"A {duration:g}s shot needs {length} frames, above the H3 keyframe node's "
-            f"{H3_KEYFRAME_MAX_FRAMES}-frame maximum "
+            f"A {duration:g}s shot needs {length} frames (over-render margin included), "
+            f"above the H3 keyframe node's {H3_KEYFRAME_MAX_FRAMES}-frame maximum "
             f"({H3_KEYFRAME_MAX_FRAMES / H3_FRAME_RATE:g}s at {H3_FRAME_RATE} fps)"
         )
     # The frames travel as `picture` entries of the same media loader the reference path
