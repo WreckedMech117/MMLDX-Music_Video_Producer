@@ -255,3 +255,18 @@ Several of these are exactly the errors a competent model writing from taste wou
 6. **One shared composer**, docked with the chat, prefill beside it.
 7. **Width floor 1440**, docks collapsing below it (bin/chat to icons first, inspector to a drawer); the e2e width matrix re-baselines against these points.
 8. **Song setup lives in a Song stage tab**, always one click away.
+
+
+---
+
+## Corrected 2026-08-18: reference mode subsumes keyframes — with audio
+
+The keyframe adapter's schema reading was accurate (`MiniMaxH3ImageToVideo` has no audio input of any kind) but the conclusion drawn from it — "a keyframe shot has nothing to sync to" — treated the simple path as a ceiling. The Director pushed back, and the Fantastic prompt builder plus MiniMax's own guide settle it:
+
+- Guide §2.2.2: *"Use a standalone `<Picture N>` when the reference image itself serves as a shot's first frame, keyframe, last frame, edited keyframe, or composition anchor"* — with the worked wording *"`<Picture 2>` is the first frame of `[Shot 1]`, showing …"*.
+- The builder's Reference-mode picture roles include **First frame** and **Last frame** (`fully_preserved`, task `keyframe completion`), alongside composition, look, setting, attribute-transfer and storyboard roles.
+- All of this rides `MiniMaxH3ReferenceToVideo` — the node with `ref_audios`, i.e. the windowed master song.
+
+**So keyframes and lip-sync combine in references mode.** The picture is an ordinary reference slot; its *meaning* travels in the structured prompt — which is H3's whole design, and why the prompt expansion machinery matters as much as the graphs. The dedicated keyframe modes remain the efficient audio-less path.
+
+One line blocks it in our taxonomy today: `SHOT_MODE_SPECS["references"]` accepts only the `reference` role. The unlock is that plus the prompt wording (reference map for un-expanded shots, the specialist for expanded ones).
