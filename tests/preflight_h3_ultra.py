@@ -8,7 +8,7 @@ with a live, user-managed ComfyUI (never started or stopped here):
 
     uv run python tests/preflight_h3_ultra.py [base_url] [--record]
 
-Thirteen payload variants are audited separately, chosen to reach every input any
+Fourteen payload variants are audited separately, chosen to reach every input any
 adapter can emit: one picture; the full 9 pictures + 3 videos + 3 audios, which
 fills every autogrow slot the graph offers; a video carrying its paired
 soundtrack; ``ref_image_size="max"``; the longest window that still fits the
@@ -256,6 +256,36 @@ def audit_payloads() -> list[tuple[str, dict]]:
                 # audit sees it at all.
                 references=[
                     *pictures[:1],
+                    {
+                        "kind": "audio",
+                        "file": "F:/refs/master.mp3",
+                        "label": "master song",
+                        "trim": {"start": 12.0, "end": 15.75},
+                    },
+                ],
+                duration=3.75,
+                seed=0,
+                prefix="preflight",
+            ),
+        ),
+        (
+            # The mixed-role references shape: a keyframe picture riding the reference graph
+            # beside a plain reference and the shot's windowed song. The graph is the same
+            # references graph — the role travels only in the prompt, which is the point — so
+            # what this variant audits is that the exact payload the route builds for a
+            # first-frame-plus-lip-sync shot validates: the keyframe picture in an ordinary
+            # picture slot, numbered first by `citations_in_prompt_order`'s walk, the map
+            # declaring it in the guide's §2.2.2 wording, and the trimmed master song beside it.
+            "references-with-first-frame",
+            build_h3_reference_payload(
+                prompt=(
+                    "Reference map: <Picture 1> is the first frame of [Shot 1] "
+                    "(fully_preserved), showing the opening pose; <Picture 2> is the lead "
+                    "vocalist; <Audio 1> is the master song for synchronization. "
+                    "She sings the chorus."
+                ),
+                references=[
+                    *pictures[:2],
                     {
                         "kind": "audio",
                         "file": "F:/refs/master.mp3",

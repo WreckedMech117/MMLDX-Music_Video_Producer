@@ -12,6 +12,7 @@ from .models import (
     Asset,
     Project,
     Shot,
+    citations_in_prompt_order,
     resolve_shot_mode,
     shot_label,
 )
@@ -455,8 +456,14 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
     # forbids inventing one, and a model told "you have two pictures" will still guess at their
     # numbers; naming each tag alongside its role removes the guess entirely. Pictures are the
     # only kind a Shot can cite today, so every role numbers into the Picture series.
+    #
+    # Numbered by `citations_in_prompt_order` — the same walk the reference render numbers its
+    # own tags and appends its media by. That sharing is load-bearing, not tidy: the specialist
+    # writes "<Picture 1>" into a prompt whose payload fills its anonymous slots in the render's
+    # walk, so a tag numbered here under any *other* order would declare a role for somebody
+    # else's picture, and the take would render plausibly and wrongly.
     if shot.citations:
-        ordered_citations = sorted(shot.citations, key=lambda c: (c.role, c.order))
+        ordered_citations = citations_in_prompt_order(shot)
         entry["references"] = [
             {
                 "tag": f"<Picture {position}>",

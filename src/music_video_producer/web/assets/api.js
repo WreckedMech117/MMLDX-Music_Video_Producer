@@ -1349,7 +1349,13 @@ export const SHOT_MODES = [
   { value: "image_to_video", label: "Image to video", roles: [{ role: "first", minimum: 1, maximum: 1 }], song_audio: false, adapter: "h3-keyframe", workflow: "MiniMax H3 I2V-FLframe (first frame only, no song lip-sync)" },
   { value: "first_last", label: "First / last frame", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "h3-keyframe", workflow: "MiniMax H3 I2V-FLframe (first and last frames, no song lip-sync)" },
   { value: "first_middle_last", label: "First / middle / last", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "middle", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
-  { value: "references", label: "References to video", roles: [{ role: "reference", minimum: 0, maximum: 15 }], song_audio: true, adapter: "h3-reference", workflow: "MiniMax H3 References-to-Video (with the sampling profiles)" },
+  // `first` and `last` ride the references mode too, per MiniMax's guide §2.2.2: the picture
+  // travels as an ordinary reference slot on the one graph that takes the windowed master song,
+  // and the structured prompt is what makes it the shot's first or last frame — which is how a
+  // pinned keyframe and song lip-sync combine at all. The workflow string says so, because the
+  // mode select is where a Director would otherwise learn from the audio-less keyframe modes
+  // that a singing shot cannot pin its opening frame.
+  { value: "references", label: "References to video", roles: [{ role: "reference", minimum: 0, maximum: 15 }, { role: "first", minimum: 0, maximum: 1 }, { role: "last", minimum: 0, maximum: 1 }], song_audio: true, adapter: "h3-reference", workflow: "MiniMax H3 References-to-Video (with the sampling profiles; a first or last keyframe may ride as a reference picture, with song lip-sync)" },
   { value: "extend", label: "Extend an existing video", roles: [{ role: "source_video", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
 ];
 

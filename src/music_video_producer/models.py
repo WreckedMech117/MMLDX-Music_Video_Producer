@@ -230,10 +230,24 @@ SHOT_MODE_SPECS: dict[ShotMode, ShotModeSpec] = {
         # is a ceiling on citations and nothing more: the *per-kind* limits are enforced where the
         # kinds are known, in `workflows.build_h3_reference_payload`, and are not restated here —
         # a second copy of a limit is a second thing to keep true.
-        roles=(RoleRequirement("reference", 0, 15),),
+        #
+        # `first` and `last` ride this mode too, per MiniMax's guide §2.2.2: a reference picture
+        # *is* a shot's first frame, keyframe or last frame when the structured prompt declares it
+        # so, on the very node that takes the windowed master song — which is how a keyframe and
+        # lip-sync combine at all. The picture travels as an ordinary reference slot and counts
+        # against the 9-picture ceiling; only the prompt knows its role, because H3's media slots
+        # are anonymous and the prompt is where a slot becomes "the first frame".
+        roles=(
+            RoleRequirement("reference", 0, 15),
+            RoleRequirement("first", 0, 1),
+            RoleRequirement("last", 0, 1),
+        ),
         song_audio=True,
         adapter="h3-reference",
-        workflow="MiniMax H3 References-to-Video (with the sampling profiles)",
+        workflow=(
+            "MiniMax H3 References-to-Video (with the sampling profiles; a first or last "
+            "keyframe may ride as a reference picture, with song lip-sync)"
+        ),
     ),
     "extend": ShotModeSpec(
         label="Extend an existing video",
@@ -370,6 +384,26 @@ def citations_in_role(shot: Shot, role: AssetRole) -> list[AssetCitation]:
         (citation for citation in shot.citations if citation.role == role),
         key=lambda citation: citation.order,
     )
+
+
+def citations_in_prompt_order(shot: Shot) -> list[AssetCitation]:
+    """Every citation this Shot holds, in the one order a prompt may number them.
+
+    **This is the single definition of that order**, and both prompt channels read it: the
+    reference render numbers its `<Picture N>` tags and appends its media in this walk, and
+    `timeline.shot_expansion_input` hands the expansion specialist the same tags from the same
+    walk. The two must agree byte for byte, because the tag a prompt declares as "the first
+    frame" points at whichever anonymous media slot holds the same number — a numbering that
+    drifted between the two would render, plausibly, with the wrong picture pinned.
+
+    Keyed on `(role, order)` — exactly the sort `shot_expansion_input` has always used — with a
+    **stable** sort, so a reference-only Shot's sequence is `citations_in_role(shot,
+    "reference")`'s sequence exactly: same key once every role compares equal, same tie-break.
+    That equality is what keeps every pre-keyframe references payload byte-identical. Roles sort
+    alphabetically, which puts `first` before `last` before `reference`; the order is arbitrary
+    but it is *this* one, everywhere, forever.
+    """
+    return sorted(shot.citations, key=lambda citation: (citation.role, citation.order))
 
 
 def resolve_shot_mode(shot: Shot) -> ShotMode:

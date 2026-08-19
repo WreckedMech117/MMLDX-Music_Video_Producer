@@ -100,6 +100,10 @@ Approval is **explicit and reversible, never automatic** — FR-21's words. No r
 
 Browser QA note: `tests/e2e_shot_controls.py` now synthesizes a playable take with ffmpeg (must be on PATH) under an isolated `MVP_COMFY_ROOT`, so it never touches the real ComfyUI output tree.
 
+## Pin a frame on a singing shot
+
+The dedicated keyframe modes (`image_to_video`, `first_last`) are the cheaper graphs and have **no song lip-sync** - the node has no audio input. To pin a frame on a shot that sings: use **references mode**, cite the picture in the `first` (or `last`) role alongside any identity references, and keep `use_song_audio` on. The picture rides as an ordinary reference slot and the structured prompt declares it the shot's first frame (`fully_preserved`), per MiniMax's guide 2.2.2 - the reference map writes that line for un-expanded shots, and the expansion specialist writes it for expanded ones. A keyframe picture counts against the node's 9-picture ceiling.
+
 ## Render a shot again
 
 `POST /api/projects/{id}/shots/{shot_id}/render-again`, and a control in the shot inspector, re-open a settled shot for one more submission by writing exactly one field — `status` back to `ready`. Before this existed, comparing two takes meant hand-editing status through the generic shots route with an API client, which is what had to be done on 2026-08-18 to compare the two sampling profiles.

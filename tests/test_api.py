@@ -85,6 +85,9 @@ from music_video_producer.director import (
     PlannedShot,
     ShotExpansion,
 )
+from music_video_producer.h3_expansion_prompt import (
+    system_prompt as h3_expansion_system_prompt,
+)
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
     LEGACY_SHOT_MODES,
@@ -104,13 +107,14 @@ from music_video_producer.models import (
     Song,
     TreatmentMessage,
     VisionInspectionRecord,
+    citations_in_prompt_order,
     citations_in_role,
     dangling_citations,
     mode_specification_problems,
     resolve_shot_mode,
 )
 from music_video_producer.store import ProjectStore
-from music_video_producer.timeline import expansion_input
+from music_video_producer.timeline import expansion_input, shot_expansion_input
 from music_video_producer.workflows import (
     H3_ASPECT_RATIOS,
     H3_DIRECTOR_DEFAULT_HEIGHT,
@@ -8548,6 +8552,280 @@ def test_declaring_references_on_an_empty_shot_routes_to_the_reference_graph(tmp
     assert comfy.prompts == []
 
 
+# --- Keyframes riding the references mode ---------------------------------------------------
+#
+# MiniMax's guide §2.2.2 uses a reference picture *as* a shot's first frame, keyframe or last
+# frame, declared in the structured prompt, on the very node that takes the windowed master song.
+# The picture rides as an ordinary reference slot; only the prompt knows its role. These are the
+# spec's matrix rows for that shape — the byte-identity rows live above, in the digest tests,
+# which is what makes every pre-existing shot's payload the same bytes it always was.
+
+
+def test_a_references_shot_declares_its_first_frame_in_the_guides_wording(tmp_path: Path):
+    """References + first frame + the master song: the combination that is the point.
+
+    The picture travels as a plain reference picture — same kind, same slot family, nothing new
+    in the graph — and the map's line for it is the guide's own sentence shape, with the
+    `fully_preserved` retention marker riding beside the shot anchor. The audio is windowed
+    exactly as today.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Pinned opening"))
+    portrait = upload_asset(client, project.id, "Lead portrait", "character", "lead.png")
+    stage = upload_asset(client, project.id, "Stage", "setting", "stage.png")
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Harder Faster", "duration": "30"},
+        files={"file": ("song.flac", b"fLaCfake", "audio/flac")},
+    )
+    shot_id = reference_shot(
+        store,
+        project.id,
+        mode="references",
+        citations=[
+            AssetCitation(asset_id=stage["id"], role="reference"),
+            AssetCitation(asset_id=portrait["id"], role="first"),
+        ],
+        reference_labels={portrait["id"]: "the singer mid-breath"},
+        use_song_audio=True,
+    )
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+
+    payload = comfy.prompts[-1]
+    prompt = payload["mvp:condition"]["inputs"]["prompt"]
+    # The first-frame picture numbers first — `citations_in_prompt_order` puts keyframe roles
+    # ahead of references — and its line is the guide's, not the plain label line.
+    assert prompt.startswith(
+        "Reference map: <Picture 1> is the first frame of [Shot 1] (fully_preserved), "
+        "showing the singer mid-breath; <Picture 2> is Stage; "
+        "<Audio 1> is the master song for synchronization."
+    )
+    # The payload's media order is the same walk, so <Picture 1> really is the portrait.
+    media = json.loads(payload["mvp:references"]["inputs"]["media_state"])
+    assert [item["kind"] for item in media] == ["picture", "picture", "audio"]
+    assert media[0]["file"].endswith("lead.png")
+    assert media[1]["file"].endswith("stage.png")
+    # And the song is windowed to the shot exactly as a plain references shot's is.
+    assert media[2]["trim"] == {"start": 0.0, "end": 5.0}
+
+
+def test_a_references_shot_declares_both_keyframes_and_ties_the_last_to_the_final_shot(
+    tmp_path: Path,
+):
+    """First and last both riding: `[Shot 1]` for the first, the final shot for the last.
+
+    An un-expanded intent declares no shot numbers, so the last frame is tied to "the final
+    shot" — the guide's own alignment language ("the last frame must be reached by the final
+    [Shot N]") — rather than to an index this route would have to invent.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Both ends"))
+    opening = upload_asset(client, project.id, "Opening pose", "character", "open.png")
+    closing = upload_asset(client, project.id, "Closing pose", "character", "close.png")
+    shot_id = reference_shot(
+        store,
+        project.id,
+        mode="references",
+        citations=[
+            AssetCitation(asset_id=closing["id"], role="last"),
+            AssetCitation(asset_id=opening["id"], role="first"),
+        ],
+    )
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+
+    prompt = comfy.prompts[-1]["mvp:condition"]["inputs"]["prompt"]
+    assert (
+        "<Picture 1> is the first frame of [Shot 1] (fully_preserved), "
+        "showing Opening pose" in prompt
+    )
+    assert (
+        "<Picture 2> is the last frame of the final shot (fully_preserved), "
+        "showing Closing pose" in prompt
+    )
+    media = json.loads(comfy.prompts[-1]["mvp:references"]["inputs"]["media_state"])
+    assert media[0]["file"].endswith("open.png")
+    assert media[1]["file"].endswith("close.png")
+
+
+def test_mixed_role_numbering_is_one_numbering_across_prompt_payload_and_expansion(
+    tmp_path: Path,
+):
+    """The off-by-one that would render plausibly and wrongly, pinned from three sides.
+
+    H3's media slots are anonymous: the prompt's `<Picture N>` *is* the Nth picture slot, so a
+    declaration numbered under any other walk than the payload's would pin somebody else's
+    picture as the first frame — and nothing downstream would report it. The citation list here
+    is adversarial on purpose: list order disagrees with role order, and an explicit `order`
+    disagrees with list position within the reference role, so a route that numbered by list
+    position, or an expansion input that sorted by a different key, each produce a different
+    (wrong) numbering and fail.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="One numbering"))
+    wolf = upload_asset(client, project.id, "Grey wolf", "character", "wolf.png")
+    stage = upload_asset(client, project.id, "Stage", "setting", "stage.png")
+    portrait = upload_asset(client, project.id, "Lead portrait", "character", "lead.png")
+    # The first-frame citation carries the *largest* order on purpose: under the shared
+    # `(role, order)` key it still numbers first, while a walk keyed `(order, role)`, or by
+    # list position, each put a reference picture into slot one — so either drift fails here
+    # instead of coinciding with the right answer.
+    citations = [
+        AssetCitation(asset_id=stage["id"], role="reference", order=1),
+        AssetCitation(asset_id=portrait["id"], role="first", order=7),
+        AssetCitation(asset_id=wolf["id"], role="reference", order=0),
+    ]
+    shot_id = reference_shot(
+        store, project.id, mode="references", citations=citations
+    )
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+
+    payload = comfy.prompts[-1]
+    prompt = payload["mvp:condition"]["inputs"]["prompt"]
+    media = json.loads(payload["mvp:references"]["inputs"]["media_state"])
+    # The one walk: first frame, then references by their own order. The payload's picture
+    # slots fill in list order, so slot N holds exactly the asset the map's <Picture N> names.
+    assert prompt.startswith(
+        "Reference map: <Picture 1> is the first frame of [Shot 1] (fully_preserved), "
+        "showing Lead portrait; <Picture 2> is Grey wolf; <Picture 3> is Stage."
+    )
+    # `strict=True` pins the count as well as the order; uploads carry a numbered prefix, so
+    # the name is matched by suffix.
+    for item, name in zip(media, ["lead.png", "wolf.png", "stage.png"], strict=True):
+        assert item["file"].endswith(name), (item["file"], name)
+
+    # And the expansion specialist is handed the same numbering from the same function: the
+    # tag it is told to declare a role for is the tag the payload's media order implies.
+    shot = store.get(project.id).shots[0]
+    handed = shot_expansion_input(store.get(project.id), shot)["shot"]["references"]
+    assert [(entry["tag"], entry["role"]) for entry in handed] == [
+        ("<Picture 1>", "first frame"),
+        ("<Picture 2>", "reference"),
+        ("<Picture 3>", "reference"),
+    ]
+    assert [entry["asset_id"] for entry in handed] == [
+        citation.asset_id for citation in citations_in_prompt_order(shot)
+    ]
+    assert [entry["asset_id"] for entry in handed] == [
+        portrait["id"], wolf["id"], stage["id"]
+    ]
+
+
+def test_a_references_shot_citing_only_a_first_frame_renders(tmp_path: Path):
+    """The matrix's "keyframe role, no reference role" row: the mode's minimums are all zero."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="First only"))
+    portrait = upload_asset(client, project.id, "Lead portrait", "character", "lead.png")
+    shot_id = reference_shot(
+        store,
+        project.id,
+        mode="references",
+        citations=[AssetCitation(asset_id=portrait["id"], role="first")],
+    )
+
+    assert mode_specification_problems(store.get(project.id).shots[0]) == []
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["prompt"].startswith(
+        "Reference map: <Picture 1> is the first frame of [Shot 1] (fully_preserved), "
+        "showing Lead portrait."
+    )
+
+
+def test_a_keyframe_role_on_a_references_shot_must_be_an_image(tmp_path: Path):
+    """A frame is a picture: the same refusal the dedicated keyframe branch makes.
+
+    The splitter routes media by kind, so an audio cited as the first frame would be fed to
+    the picture loader under a kind it is not — and nothing downstream reports that.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Not a frame"))
+    room = upload_asset(client, project.id, "Room tone", "audio", "room.flac")
+    shot_id = reference_shot(
+        store,
+        project.id,
+        mode="references",
+        citations=[AssetCitation(asset_id=room["id"], role="first")],
+    )
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == (
+        "A first frame must be an image, and Room tone is an audio."
+    )
+    assert comfy.prompts == []
+
+
+def test_a_keyframe_picture_counts_against_the_nine_picture_ceiling(tmp_path: Path):
+    """The node's arity is the node's arity: the keyframe picture is an ordinary slot.
+
+    Nine reference pictures plus a first frame is ten pictures, and the adapter's per-kind
+    limit — the autogrow maximum the pre-flight holds to the live schema — refuses it before
+    ComfyUI ever sees it.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Ceiling"))
+    uploads = [
+        upload_asset(client, project.id, f"Still {index}", "setting", f"still-{index}.png")
+        for index in range(9)
+    ]
+    portrait = upload_asset(client, project.id, "Lead portrait", "character", "lead.png")
+    shot_id = reference_shot(
+        store,
+        project.id,
+        mode="references",
+        citations=[
+            *[
+                AssetCitation(asset_id=item["id"], role="reference", order=index)
+                for index, item in enumerate(uploads)
+            ],
+            AssetCitation(asset_id=portrait["id"], role="first"),
+        ],
+    )
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    assert "picture" in refused.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_the_references_mode_fit_report_admits_keyframe_roles_and_bounds_them():
+    """The matrix's mode-fit row: first/last no longer flagged, still at most one of each."""
+    fitting = Shot(
+        start=0, duration=5, mode="references",
+        citations=[
+            AssetCitation(asset_id="a", role="reference"),
+            AssetCitation(asset_id="b", role="first"),
+            AssetCitation(asset_id="c", role="last"),
+        ],
+    )
+    assert mode_specification_problems(fitting) == []
+
+    two_firsts = Shot(
+        start=0, duration=5, mode="references",
+        citations=[
+            AssetCitation(asset_id="a", role="first"),
+            AssetCitation(asset_id="b", role="first"),
+        ],
+    )
+    assert mode_specification_problems(two_firsts) == [
+        "References to video takes at most 1 first frame, and this shot cites 2."
+    ]
+
+    # `middle` stays undeclared — the guide's keyframe vocabulary covers it, but no evidence
+    # graph demonstrates it on H3, and the spec marks it Ask First.
+    middled = Shot(
+        start=0, duration=5, mode="references",
+        citations=[AssetCitation(asset_id="a", role="middle")],
+    )
+    assert mode_specification_problems(middled) == [
+        "References to video has no middle frame role, and this shot cites 1."
+    ]
+
+
 # --- Song-audio restoration ----------------------------------------------------------------
 #
 # The route's own tests. Every row of the spec's I/O matrix that a route can answer is here; the
@@ -9113,6 +9391,44 @@ def test_a_keyframe_shot_is_told_to_write_one(tmp_path: Path):
     client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
 
     assert "must open with the instruction line" in director.prompts[0]
+
+
+def test_a_references_shot_with_a_keyframe_role_gets_the_anchor_rules(tmp_path: Path):
+    """The specialist is told the roles are frame anchors, only where the shape exists.
+
+    Three prompts from three shapes: a references shot citing a first-frame picture carries
+    the anchor rules; a references shot citing only plain references gets the byte-identical
+    prompt it always got; the dedicated keyframe modes keep their instruction-line sentence
+    and never this one — full-reference mode has no instruction line, and the two wordings
+    must not blend.
+    """
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project_id, shot_id = _expandable(
+        client,
+        store,
+        mode="references",
+        citations=[AssetCitation(asset_id="asset_a", role="first")],
+    )
+    client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+    with_keyframe = director.prompts[-1]
+
+    project_id, shot_id = _expandable(
+        client,
+        store,
+        mode="references",
+        citations=[AssetCitation(asset_id="asset_a", role="reference")],
+    )
+    client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+    plain = director.prompts[-1]
+
+    assert "the shot begins from <Picture N>" in with_keyframe
+    assert 'marked "first frame" is the clip\'s exact opening frame' in with_keyframe
+    assert "must open with the instruction line" not in with_keyframe
+    assert "opening frame" not in plain
+    # Byte-identical, not merely rule-free: the plain references prompt is exactly the prompt
+    # every shot without the shape has always been given.
+    assert plain == h3_expansion_system_prompt()
 
 
 # ---------------------------------------------------------------------------------------------

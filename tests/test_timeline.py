@@ -1,8 +1,15 @@
+import hashlib
 import json
 
 import pytest
 
-from music_video_producer.models import AssetCitation, Project, Shot, Song
+from music_video_producer.models import (
+    AssetCitation,
+    Project,
+    Shot,
+    Song,
+    citations_in_prompt_order,
+)
 from music_video_producer.timeline import (
     TimelineError,
     align_h3_frames,
@@ -405,6 +412,89 @@ def test_the_per_shot_input_numbers_the_reference_tags_the_model_may_use():
 
     assert [entry["tag"] for entry in references] == ["<Picture 1>", "<Picture 2>"]
     assert {entry["role"] for entry in references} == {"first frame", "last frame"}
+
+
+def test_the_per_shot_input_numbers_mixed_roles_in_the_renders_own_walk():
+    """Keyframe roles ahead of references, by `citations_in_prompt_order` — the render's walk.
+
+    The tag this input tells the specialist to declare a role for must be the tag the payload's
+    media order implies, because H3's slots are anonymous and `<Picture 1>` *is* slot one. The
+    list order here is adversarial — a reference cited before the first frame, and an explicit
+    `order` contradicting list position within the reference role — so an input numbered by
+    list position, or by any key other than the shared one, produces a different list and fails.
+    """
+    project = _expansion_project()
+    # The keyframe citation's order is the largest on purpose: under the shared `(role, order)`
+    # key it still numbers first, while `(order, role)` or list position each number a
+    # reference into <Picture 1> — so a drifted key fails rather than coinciding.
+    project.shots[1].citations = [
+        AssetCitation(asset_id="asset_stage", role="reference", order=1),
+        AssetCitation(asset_id="asset_portrait", role="first", order=7),
+        AssetCitation(asset_id="asset_wolf", role="reference", order=0),
+    ]
+
+    references = shot_expansion_input(project, project.shots[1])["shot"]["references"]
+
+    assert [(entry["tag"], entry["role"], entry["asset_id"]) for entry in references] == [
+        ("<Picture 1>", "first frame", "asset_portrait"),
+        ("<Picture 2>", "reference", "asset_wolf"),
+        ("<Picture 3>", "reference", "asset_stage"),
+    ]
+    # And the shared walk really is the one this numbering came from.
+    assert [entry["asset_id"] for entry in references] == [
+        citation.asset_id
+        for citation in citations_in_prompt_order(project.shots[1])
+    ]
+
+
+#: `shot_expansion_input`, digested at commit `a754794` — the keyframes-in-references baseline —
+#: over the two pre-existing shapes that story was forbidden to move: a reference-only shot and
+#: a dedicated first/last keyframe shot. The story rerouted this builder's numbering through
+#: `citations_in_prompt_order`, and for these shapes that function must be the identity of the
+#: old inline sort; a digest is the only assertion that cannot drift with the code it checks.
+EXPANSION_INPUT_REFERENCE_ONLY_DIGEST = (
+    "30fea20f3276e3fade1c567df8b469a6d36e859bf8e1f22efbb36848cc46f496"
+)
+EXPANSION_INPUT_FIRST_LAST_DIGEST = (
+    "a4a612e564402b8c114f63421af8fe04290b0fcc2bf32d9785a8a1b0c8e88354"
+)
+
+
+def test_pre_existing_expansion_inputs_are_byte_identical_across_the_keyframe_change():
+    """The spec's byte-identity rail, on the expansion channel.
+
+    Everything here is pinned — ids, times, the song — so the digest moves only if the payload
+    does. If one of these fails, a pre-existing shape's expansion input changed; re-deriving
+    the digest is the wrong fix unless the Director has renegotiated that promise.
+    """
+    project = Project(
+        id="project_pinned0001", name="Pinned",
+        creative_brief="brief", treatment="treatment", style_bible="style",
+        song=Song(title="Harder Faster", source="imported", duration=154.6,
+                  lyrics="[verse] there is a hunger", caption="mid-tempo metal"),
+        shots=[
+            Shot(id="shot_refonly", start=12.0, duration=3.75, prompt="Wolf B-roll",
+                 singing="not_singing",
+                 citations=[AssetCitation(asset_id="asset_b", role="reference", order=1),
+                            AssetCitation(asset_id="asset_a", role="reference", order=0)]),
+            Shot(id="shot_fl", start=20.0, duration=4.0, prompt="Close on her face",
+                 mode="first_last",
+                 citations=[AssetCitation(asset_id="asset_2", role="last", order=1),
+                            AssetCitation(asset_id="asset_1", role="first", order=0)]),
+        ],
+    )
+
+    digests = {
+        shot.id: hashlib.sha256(
+            json.dumps(
+                shot_expansion_input(project, shot), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        for shot in project.shots
+    }
+
+    assert digests["shot_refonly"] == EXPANSION_INPUT_REFERENCE_ONLY_DIGEST
+    assert digests["shot_fl"] == EXPANSION_INPUT_FIRST_LAST_DIGEST
 
 
 def test_the_per_shot_input_omits_what_a_shot_does_not_have():

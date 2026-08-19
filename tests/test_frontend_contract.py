@@ -6119,6 +6119,24 @@ SHOT_PARITY_CASES = {
         ],
     },
     "extend_without_source": {"mode": "extend"},
+    # Keyframes riding the references mode: fitting, and over the one-per-role ceiling. Both
+    # sides must agree that the first shape is now clean and the second is refused — the exact
+    # rows the role-gate change moved.
+    "references_with_keyframes": {
+        "mode": "references",
+        "citations": [
+            {"asset_id": "asset_a", "role": "reference", "order": 0},
+            {"asset_id": "asset_b", "role": "first", "order": 0},
+            {"asset_id": "asset_c", "role": "last", "order": 0},
+        ],
+    },
+    "references_two_first_frames": {
+        "mode": "references",
+        "citations": [
+            {"asset_id": "asset_a", "role": "first", "order": 0},
+            {"asset_id": "asset_b", "role": "first", "order": 1},
+        ],
+    },
     "image_to_video_with_two": {
         "mode": "image_to_video",
         "citations": [

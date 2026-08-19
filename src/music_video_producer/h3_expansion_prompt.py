@@ -135,6 +135,38 @@ LYRIC_RULES = """You may be given the song's lyrics. Read them carefully:
 - Do not put a lyric inside a dialogue tag unless the shot is marked as singing AND you have
   been told which words are sung over it. You have not been told that, so do not."""
 
+#: Keyframes riding a references shot — the guide's §2.2.2 picture role, restated for the one
+#: shape this specialist meets it in. Appended only when the caller says this shot actually
+#: carries a keyframe-role picture (`system_prompt`'s `keyframe_references`), so every other
+#: shot's system prompt is byte-identical to what it was before this block existed.
+#:
+#: The declaration is the guide's §2.5.3 anchor phrasing — *the shot begins from* / *ends on*
+#: the tag — stated as a positive template the model is meant to copy, because the three-field
+#: format this specialist writes has no subject_definitions or retention_analysis section to
+#: carry a marker; the natural anchor clause is the guide's own vocabulary for exactly this
+#: format. First frame belongs to [Shot 1] and last frame to the final shot, the guide's
+#: alignment rule. No retention marker is named: `fully_preserved` belongs to the six-section
+#: full-reference format this specialist does not write.
+#:
+#: Measured before shipping (2026-08-18, `measure.py`, references+first singing payload,
+#: temperature 0.6, `reasoning_effort: "none"`). Two candidates. An abstract instruction
+#: ("open the description with [Shot 1] beginning from that picture's tag") moved nothing:
+#: strict guide-form anchors 0/16 well-formed across three baseline runs, 0/6 with it. This
+#: template wording anchored 12/12 well-formed answers across two runs (4/4, then 8/8) — and
+#: 12/12 of *all* non-empty answers in the run that counted them, against the baseline's 0/12
+#: — with 0/24 answers copying the literal "<Picture N>" placeholder and 0/24 inventing a
+#: tag. Malformed rates did not worsen (4/12 and 8/12 with the rule against 2/6, 5/12 and
+#: 7/12 without; the failures are the pre-existing singing-shot <d> defect in every arm, which
+#: the production retry loop repairs). The template is deliberately a *prescription with an
+#: example*, not a prohibition — the measured failure this machine has already produced is a
+#: model copying a forbidden string out of a prohibition, and a template the model copies is
+#: here the desired behaviour.
+KEYFRAME_REFERENCE_RULES = """One or more of this shot's pictures is marked "first frame" or "last frame". Those are exact frames of this clip, not loose references:
+
+- A picture marked "first frame" is the clip's exact opening frame. Say so inside [Shot 1] with its own short clause: the shot begins from <Picture N> — writing that picture's actual tag in place of <Picture N> — then describe the action moving on from that exact image.
+- A picture marked "last frame" is the clip's exact closing frame. Say so in the final shot the same way: the shot ends on <Picture N>, with that picture's actual tag, and write the action converging onto that exact image.
+- Pictures marked "reference" stay ordinary references; give them no frame-anchor clause."""
+
 #: What not to do with the output, which is a real failure mode for local models.
 OUTPUT_RULES = f"""Return only the prompt. No preamble, no explanation, no code fence, no
 commentary after it. Do not repeat the intent back. Do not write anything before
@@ -142,15 +174,26 @@ commentary after it. Do not repeat the intent back. Do not write anything before
 case that line comes first, followed by one blank line."""
 
 
-def system_prompt(*, expect_instruction: bool = False) -> str:
+def system_prompt(
+    *, expect_instruction: bool = False, keyframe_references: bool = False
+) -> str:
     """Assemble the specialist's system prompt.
 
     ``expect_instruction`` is for the keyframe modes, whose prompts open with a fixed
     line stating how each picture aligns to a time in the target video. Passed rather
     than inferred from the mode so that the caller — which knows the mode — owns the
     decision, and so this module stays a prompt rather than becoming a mode table.
+
+    ``keyframe_references`` is for a references shot that cites a picture in the
+    `first` or `last` role — the keyframe-inside-references shape, and the only shape
+    that gets `KEYFRAME_REFERENCE_RULES`. Passed for the same reason, and defaulting
+    off so every shot without the shape gets the byte-identical prompt it always got.
     """
     parts = [ROLE, STRUCTURE, SEMANTIC_RULES, SINGING_RULES, LYRIC_RULES, OUTPUT_RULES]
+    if keyframe_references:
+        # Before OUTPUT_RULES would read more naturally, but appending keeps the shared
+        # prefix bytes untouched; the rules are order-independent statements either way.
+        parts.append(KEYFRAME_REFERENCE_RULES)
     if expect_instruction:
         parts.append(
             "This shot's mode uses keyframe references, so the prompt must open with "

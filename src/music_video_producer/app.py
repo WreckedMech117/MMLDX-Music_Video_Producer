@@ -50,6 +50,7 @@ from .models import (
     Song,
     TreatmentMessage,
     VisionInspectionRecord,
+    citations_in_prompt_order,
     citations_in_role,
     dangling_citations,
     mode_specification_problems,
@@ -351,6 +352,31 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 #: chat Director writes treatments and intents, and the expansion specialist gets its own
 #: purpose-built payload rather than this dump.
 SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset({"h3_prompt"})
+
+#: How the reference map declares a keyframe-role picture, per MiniMax's guide §2.2.2 — read
+#: from the bundled ``Video_Prompt_Writing_Guide.pdf``, never copied: the guide's own example is
+#: this sentence shape, and the retention marker is the guide's fixed English value for a frame
+#: anchor. `[Shot 1]` for the first frame because the guide has `[Shot 1]` mark the opening shot
+#: of every prompt; the last frame is tied to *the final shot* in the guide's own alignment
+#: language ("the last frame must be reached by the final [Shot N]"), and an un-expanded intent
+#: declares no shot numbers this map could name, so the final shot is named as what it is rather
+#: than guessed at as an index.
+#:
+#: A plain reference keeps the exact line this route has always built — `<Picture N> is
+#: {label}` — so a shot with no keyframe roles is byte-identical to before these existed.
+REFERENCE_MAP_ROLE_TAGS = {
+    "first": "<Picture {number}> is the first frame of [Shot 1] (fully_preserved), showing {label}",
+    "last": "<Picture {number}> is the last frame of the final shot (fully_preserved), showing {label}",
+}
+
+#: A keyframe role names a concrete frame, and a frame is a picture. Same refusal the keyframe
+#: branch makes for the same reason: the splitter routes media by kind, and an audio or video
+#: cited as a frame would be fed to a loader under a kind it is not, which nothing downstream
+#: reports.
+REFERENCE_KEYFRAME_NOT_IMAGE = (
+    "A {role} must be an image, and {name} is {article} {kind}."
+)
+
 
 def reference_prompt(shot: Shot, tags: list[str]) -> str:
     """What the reference render actually submits for this Shot.
@@ -1869,9 +1895,20 @@ async def attempt_expansion(
     `DirectorUnavailable` propagates untouched: it is a configuration fact, identical on every
     attempt, and both callers already map it to their own 503.
     """
-    expect_instruction = resolve_shot_mode(shot) in H3_KEYFRAME_MODES
+    mode = resolve_shot_mode(shot)
+    expect_instruction = mode in H3_KEYFRAME_MODES
     payload = shot_expansion_input(project, shot)
-    system = h3_system_prompt(expect_instruction=expect_instruction)
+    system = h3_system_prompt(
+        expect_instruction=expect_instruction,
+        # The keyframe-inside-references shape and nothing else: a references shot actually
+        # citing a picture in a keyframe role. The dedicated keyframe modes take the
+        # instruction line instead, and a references shot without the shape gets the
+        # byte-identical prompt it always got — the rule rides only where the roles do.
+        keyframe_references=(
+            mode == "references"
+            and any(citation.role in ("first", "last") for citation in shot.citations)
+        ),
+    )
     rejected = ""
     rejected_problems: tuple[str, ...] = ()
     last = ShotExpansionOutcome(shot.id, "failed", detail="no attempt was made")
@@ -3257,17 +3294,61 @@ def create_app(
             references: list[dict[str, Any]] = []
             tags: list[str] = []
             numbers = {"picture": 0, "video": 0, "audio": 0}
-            # The reference-role citations in order, which the model guarantees is `asset_ids` in
-            # order for every Shot that has ever been saved — see `Shot._reconcile_citations`.
-            # Read from the citations rather than from the flat list because the citations are the
-            # truth: a Shot whose wolf has been given the middle-frame role must stop sending it
-            # as reference picture three, and `asset_ids` is the projection that stops naming it.
-            for asset_id in [
-                citation.asset_id for citation in citations_in_role(shot, "reference")
-            ]:
-                asset = next((item for item in project.assets if item.id == asset_id), None)
+            # Every citation this mode declares, in `citations_in_prompt_order`'s walk — which for
+            # a reference-only Shot is the reference-role citations in order, which the model
+            # guarantees is `asset_ids` in order for every Shot that has ever been saved — see
+            # `Shot._reconcile_citations`. Read from the citations rather than from the flat list
+            # because the citations are the truth: a Shot whose wolf has been given the
+            # middle-frame role must stop sending it as reference picture three, and `asset_ids`
+            # is the projection that stops naming it.
+            #
+            # One walk numbers the tags *and* appends the media, deliberately: the payload fills
+            # its per-kind slots in list order, so `<Picture N>` in the map is the Nth picture
+            # appended here and nothing else. `shot_expansion_input` numbers the specialist's tags
+            # from the same function, which is what keeps the three numberings — map, expansion,
+            # slots — one numbering. The `mode_specification_problems` gate above has already
+            # refused any role this mode does not declare, so only `reference`, `first` and `last`
+            # can reach this loop.
+            for citation in citations_in_prompt_order(shot):
+                asset = next(
+                    (item for item in project.assets if item.id == citation.asset_id), None
+                )
                 if not asset:
-                    raise HTTPException(status_code=422, detail=f"Unknown reference asset: {asset_id}")
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Unknown reference asset: {citation.asset_id}",
+                    )
+                label = shot.reference_labels.get(asset.id, asset.name)
+                if citation.role in REFERENCE_MAP_ROLE_TAGS:
+                    # A keyframe riding the reference graph, per the guide's §2.2.2: the picture
+                    # travels as an ordinary reference slot — no new node input, no graph change —
+                    # and *only this tag line* makes it the shot's first or last frame. It counts
+                    # against the same 9-picture ceiling as any other picture, in
+                    # `build_h3_reference_payload`, which is where the per-kind limits live.
+                    if asset.kind in ("audio", "video"):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=REFERENCE_KEYFRAME_NOT_IMAGE.format(
+                                role=ASSET_ROLE_LABELS[citation.role],
+                                name=asset.name,
+                                article="an" if asset.kind == "audio" else "a",
+                                kind=asset.kind,
+                            ),
+                        )
+                    numbers["picture"] += 1
+                    references.append(
+                        {
+                            "kind": "picture",
+                            "file": str(resolve_asset_path(project_id, asset)),
+                            "label": label,
+                        }
+                    )
+                    tags.append(
+                        REFERENCE_MAP_ROLE_TAGS[citation.role].format(
+                            number=numbers["picture"], label=label
+                        )
+                    )
+                    continue
                 kind = (
                     "video"
                     if asset.kind == "video"
@@ -3275,7 +3356,6 @@ def create_app(
                     if asset.kind == "audio"
                     else "picture"
                 )
-                label = shot.reference_labels.get(asset.id, asset.name)
                 references.append(
                     {"kind": kind, "file": str(resolve_asset_path(project_id, asset)), "label": label}
                 )

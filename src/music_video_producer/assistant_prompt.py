@@ -116,8 +116,12 @@ Each entry in shots has:
 
 Choosing the mode is the first decision and everything else follows from it:
 - text_to_video for a shot with nothing that has to match — landscape, weather, texture, B-roll.
-- references when named characters, props or locations must stay consistent, and cite them.
-- image_to_video when one library image is the shot's opening frame.
+- references when named characters, props or locations must stay consistent, and cite them. A
+  references shot may also cite one picture in the first role and one in the last: that pins the
+  clip's exact opening or closing frame while the master song still drives the performance, and it
+  is the only mode where a pinned frame and song lip-sync combine.
+- image_to_video when one library image is the shot's opening frame and nothing in the shot
+  performs the song — this mode cannot take the master song.
 - first_last and first_middle_last when the Director has specific images that must land at
   specific points, cited in the first, middle and last roles.
 - extend to continue a video that already exists, cited as source_video.
