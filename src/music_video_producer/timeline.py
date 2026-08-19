@@ -69,6 +69,82 @@ def over_render_frames(duration: float) -> int:
     return align_h3_frames(max(5, round((duration + OVER_RENDER_SECONDS) * H3_FPS)))
 
 
+def populate_windows(
+    proposals: list[tuple[float, float]],
+    song_duration: float,
+    *,
+    minimum: float = H3_MIN_SHOT_SECONDS,
+    maximum: float = H3_MAX_SHOT_SECONDS,
+) -> list[tuple[float, float]]:
+    """Tile the whole song with shot windows shaped by the model's proposals.
+
+    Populate Timeline's repair pass (spec-populate-timeline): a local model's layout is
+    treated as *shape*, never as arithmetic — its relative durations survive, but the
+    result must satisfy what assembly will later demand (contiguous from 0 to the song's
+    end, no gaps, no overlaps) and what H3 renders reliably (windows in the 4–15 s range).
+
+    The count is clamped to the feasible band first — at least ``ceil(song/maximum)``
+    segments, at most ``floor(song/minimum)`` — then the proposal durations are scaled to
+    the song and water-filled into the per-window clamps until the total is exact. A song
+    shorter than one minimum window is a single whole-song shot. The output starts at
+    exactly 0 and ends at exactly ``song_duration``, by construction.
+    """
+    if not math.isfinite(song_duration) or song_duration <= 0:
+        raise TimelineError("A song must have a positive length to populate against")
+    if song_duration <= minimum:
+        return [(0.0, song_duration)]
+    lower = max(1, math.ceil(song_duration / maximum))
+    upper = max(1, math.floor(song_duration / minimum))
+    count = len(proposals) or round(song_duration / ((minimum + maximum) / 2))
+    count = max(lower, min(count, upper))
+    weights = [max(duration, 0.5) for _, duration in proposals[:count]]
+    weights += [song_duration / count] * (count - len(weights))
+    scale = song_duration / sum(weights)
+    durations = [weight * scale for weight in weights]
+    # Water-fill: clamp every window, then push the residual into whichever windows still
+    # have headroom. The count sits inside the feasible band, so this always converges.
+    for _ in range(64):
+        durations = [min(max(duration, minimum), maximum) for duration in durations]
+        residual = song_duration - sum(durations)
+        if abs(residual) < 1e-9:
+            break
+        adjustable = [
+            index
+            for index, duration in enumerate(durations)
+            if (residual > 0 and duration < maximum) or (residual < 0 and duration > minimum)
+        ]
+        if not adjustable:
+            break
+        share = residual / len(adjustable)
+        for index in adjustable:
+            durations[index] += share
+    windows: list[tuple[float, float]] = []
+    cursor = 0.0
+    for index, duration in enumerate(durations):
+        end = song_duration if index == len(durations) - 1 else cursor + duration
+        windows.append((round(cursor, 3), round(end - cursor, 3)))
+        cursor = end
+    # The rounding above must not reopen a gap at the very end: the last window absorbs it.
+    last_start, _ = windows[-1]
+    windows[-1] = (last_start, round(song_duration - last_start, 3))
+    return windows
+
+
+def proposal_for_position(
+    position: float, song_duration: float, proposal_count: int
+) -> int:
+    """Which proposal a tiled window draws its prompt from: the one whose *proportional*
+    span of the song contains this position. Repairing the count must not orphan a window
+    from the story — a segment in the song's second quarter takes the prompt the model
+    wrote for the second quarter, whether the repair split, merged, or kept its windows."""
+    if proposal_count <= 0:
+        raise TimelineError("No proposals to draw prompts from")
+    if song_duration <= 0:
+        return 0
+    index = int(position / song_duration * proposal_count)
+    return min(max(index, 0), proposal_count - 1)
+
+
 def over_render_lead(
     *, start: float, duration: float, picture_seconds: float, song_duration: float
 ) -> float:

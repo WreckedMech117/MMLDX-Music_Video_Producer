@@ -100,6 +100,7 @@ from music_video_producer.models import (
     MessageNotice,
     NoticeKind,
     Project,
+    RenderJob,
     Shot,
     ShotMode,
     ShotStatus,
@@ -3733,6 +3734,126 @@ def test_promotion_records_its_parent_and_leaves_the_source_asset_untouched(tmp_
     assert child["id"] != asset_id
     # The source is what was uploaded to ComfyUI, and it was read rather than moved.
     assert comfy.uploads == [source_bytes]
+
+
+class PlanningDirector:
+    """A director double whose plan is chosen by the test, with the request recorded."""
+
+    def __init__(self, shots=None, message="Laid out."):
+        self.shots = shots or []
+        self.message = message
+        self.requests = []
+
+    async def plan(self, *, message, project_context):
+        self.requests.append({"message": message, "context": project_context})
+        shot = lambda start, duration, prompt: type(
+            "PlannedShot", (), {"start": start, "duration": duration, "prompt": prompt}
+        )()
+        return type(
+            "DirectorResult",
+            (),
+            {
+                "message": self.message,
+                "treatment": "",
+                "style_bible": "",
+                "shots": [shot(*entry) for entry in self.shots],
+            },
+        )()
+
+
+def populate(client, project_id: str, confirm: bool = True):
+    return client.post(
+        f"/api/projects/{project_id}/timeline/populate",
+        json={"confirm_replace": confirm},
+    )
+
+
+def test_populate_timeline_lays_out_the_whole_song_from_the_models_shape(tmp_path: Path):
+    """Stage 4 end to end: the model's sloppy layout becomes a contiguous, H3-range plan
+    covering exactly the song, prompts drawn from the proposal whose span each window
+    falls in, old drafts replaced, and the instruction carrying the song length and the
+    asset roster by name."""
+    director = PlanningDirector(shots=[
+        (0, 3, "Open wide on the empty warehouse."),
+        (10, 30, "She sings at the standing microphone."),
+        (45, 10, "Glamour angles on the canopy bed."),
+    ])
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = store.create(Project(name="Populate"))
+    project.song = Song(title="Harder", source="imported", path="media/h.mp3", duration=60.0)
+    project.assets = [Asset(name="HarderFaster", kind="character", path="media/a.png")]
+    project.shots = [Shot(id="shot_old", start=0, duration=5, prompt="Old draft")]
+    store.save(project)
+
+    unconfirmed = populate(client, project.id, confirm=False)
+    assert unconfirmed.status_code == 422
+    assert "every existing shot is replaced" in unconfirmed.json()["detail"]
+    assert store.get(project.id).shots[0].id == "shot_old"
+
+    response = populate(client, project.id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["proposed"] == 3
+    assert body["created"] >= 4  # 60 s at <=15 s per shot
+    saved = store.get(project.id)
+    assert all(shot.id != "shot_old" for shot in saved.shots)
+    cursor = 0.0
+    for shot in sorted(saved.shots, key=lambda item: item.start):
+        assert shot.start == pytest.approx(cursor, abs=1e-6)
+        assert 4.0 - 1e-9 <= shot.duration <= 15.0 + 1e-9
+        assert shot.status == "draft"
+        assert shot.prompt
+        cursor = shot.start + shot.duration
+    assert cursor == pytest.approx(60.0, abs=1e-6)
+    # The last window sits in the last proposal's proportional span.
+    last = max(saved.shots, key=lambda item: item.start)
+    assert last.prompt == "Glamour angles on the canopy bed."
+    # The instruction told the model what only the server knows.
+    sent = director.requests[0]["message"]
+    assert "60.0 seconds" in sent
+    assert "HarderFaster (character)" in sent
+    assert comfy.prompts == []  # populate renders nothing
+
+
+def test_populate_timeline_refuses_what_it_must_not_replace(tmp_path: Path):
+    director = PlanningDirector(shots=[(0, 10, "A shot.")])
+    client, store, _comfy = make_client(tmp_path, director=director)
+
+    project = store.create(Project(name="No song"))
+    assert populate(client, project.id).status_code == 422
+
+    protected = store.create(Project(name="Protected"))
+    protected.song = Song(title="S", source="imported", path="m.mp3", duration=30.0)
+    protected.shots = [
+        Shot(id="shot_lock", start=0, duration=5, prompt="p", locked=True),
+        Shot(id="shot_appr", start=5, duration=5, prompt="p", status="approved",
+             approved_output="takes/a.mp4", approved_start=5, approved_duration=5),
+    ]
+    store.save(protected)
+    refusal = populate(client, protected.id)
+    assert refusal.status_code == 422
+    assert "shot_lock" in refusal.json()["detail"]
+    assert "shot_appr" in refusal.json()["detail"]
+    assert director.requests == []  # refused before the model was ever asked
+
+    busy = store.create(Project(name="Busy"))
+    busy.song = Song(title="S", source="imported", path="m.mp3", duration=30.0)
+    busy.jobs = [RenderJob(kind="h3", status="running", prompt_id="p-1")]
+    store.save(busy)
+    assert populate(client, busy.id).status_code == 409
+
+    empty_plan = store.create(Project(name="Empty plan"))
+    empty_plan.song = Song(title="S", source="imported", path="m.mp3", duration=30.0)
+    store.save(empty_plan)
+    hollow = PlanningDirector(shots=[], message="I could not decide.")
+    hollow_client, hollow_store, _ = make_client(tmp_path / "hollow", director=hollow)
+    hollow_project = hollow_store.create(Project(name="Hollow"))
+    hollow_project.song = Song(title="S", source="imported", path="m.mp3", duration=30.0)
+    hollow_store.save(hollow_project)
+    no_shots = populate(hollow_client, hollow_project.id)
+    assert no_shots.status_code == 502
+    assert "I could not decide." in no_shots.json()["detail"]
+    assert hollow_store.get(hollow_project.id).shots == []
 
 
 def batch_plan_project(store, shots: list[Shot], name: str = "Batch") -> str:

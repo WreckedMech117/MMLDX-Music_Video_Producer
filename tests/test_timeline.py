@@ -21,6 +21,8 @@ from music_video_producer.timeline import (
     ordered_shots,
     over_render_frames,
     over_render_lead,
+    populate_windows,
+    proposal_for_position,
     shot_expansion_input,
     song_section,
 )
@@ -603,3 +605,57 @@ def test_an_unknown_song_length_never_shifts_the_lead():
     assert over_render_lead(
         start=50.0, duration=3.75, picture_seconds=picture, song_duration=0.0
     ) == OVER_RENDER_LEAD_SECONDS
+
+
+# --- Populate Timeline's tiling repair (spec-populate-timeline) ---------------------------
+
+
+def test_populate_windows_tiles_the_whole_song_inside_h3s_range():
+    """The model's layout is shape, not arithmetic: whatever it proposed, the result is
+    contiguous from exactly 0 to exactly the song's end, every window in 4-15 s."""
+    proposals = [(0.0, 2.0), (2.0, 30.0), (40.0, 7.0)]  # sloppy: gaps, out-of-range
+    windows = populate_windows(proposals, 60.0)
+    assert windows[0][0] == 0.0
+    cursor = 0.0
+    for start, duration in windows:
+        assert start == pytest.approx(cursor, abs=1e-6)
+        assert 4.0 - 1e-9 <= duration <= 15.0 + 1e-9
+        cursor = start + duration
+    assert cursor == pytest.approx(60.0, abs=1e-6)
+
+
+def test_populate_windows_clamps_the_count_to_the_feasible_band():
+    # 154.6 s: at most 15 s per shot means at least 11 shots, however few were proposed.
+    few = populate_windows([(0, 50), (50, 50), (100, 54.6)], 154.6)
+    assert len(few) == 11
+    # 60 s: at least 4 s per shot means at most 15, however many were proposed.
+    many = populate_windows([(i * 1.5, 1.5) for i in range(40)], 60.0)
+    assert len(many) == 15
+    # And a comfortable proposal count survives as-is.
+    six = populate_windows([(i * 10, 10.0) for i in range(6)], 60.0)
+    assert len(six) == 6
+
+
+def test_populate_windows_preserves_the_proposals_relative_shape():
+    windows = populate_windows([(0.0, 5.0), (5.0, 10.0)], 24.0)
+    assert len(windows) == 2
+    assert windows[0][1] < windows[1][1]
+    assert windows[0][1] + windows[1][1] == pytest.approx(24.0)
+
+
+def test_populate_windows_handles_the_tiny_song_and_refuses_the_impossible_one():
+    assert populate_windows([], 3.0) == [(0.0, 3.0)]
+    with pytest.raises(TimelineError):
+        populate_windows([], 0.0)
+    # No proposals at all still tiles: the default count aims at ~9.5 s windows.
+    bare = populate_windows([], 60.0)
+    assert sum(duration for _, duration in bare) == pytest.approx(60.0)
+
+
+def test_proposal_for_position_maps_by_proportional_span():
+    assert proposal_for_position(5.0, 30.0, 3) == 0
+    assert proposal_for_position(15.0, 30.0, 3) == 1
+    assert proposal_for_position(29.9, 30.0, 3) == 2
+    assert proposal_for_position(30.0, 30.0, 3) == 2  # clamped at the end
+    with pytest.raises(TimelineError):
+        proposal_for_position(1.0, 30.0, 0)

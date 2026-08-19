@@ -1931,6 +1931,25 @@ function bindEvents() {
     catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; button.textContent = label; }
   });
+  $("#populate-timeline").addEventListener("click", async () => {
+    if (!requireProject()) return;
+    // The Director's own warning, word for word with the server's refusal: replaces every
+    // shot, first run or deliberate redo. The server enforces the same acknowledgement.
+    if (!window.confirm("Populate Timeline lays out the whole plan from the Song, Treatment and Assets. EVERY existing shot is replaced and unsaved timeline work is lost. Intended for a first run on an empty timeline, or for deliberately redoing the plan. Continue?")) return;
+    const projectId = state.project.id;
+    const button = $("#populate-timeline");
+    button.disabled = true;
+    try {
+      const report = await api.populateTimeline(projectId, true);
+      if (state.project?.id === projectId) {
+        state.project = report.project;
+        renderTimeline();
+        renderJobs();
+      }
+      toast(`Timeline populated: ${report.created} shots laid out (${report.proposed} proposed by the model)`);
+    } catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; }
+  });
   $("#upload-asset-button").addEventListener("click", () => $("#asset-file").click());
   $("#asset-file").addEventListener("change", async (event) => {
     if (!requireProject()) return;

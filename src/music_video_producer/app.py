@@ -88,6 +88,8 @@ from .timeline import (
     ordered_shots,
     over_render_frames,
     over_render_lead,
+    populate_windows,
+    proposal_for_position,
     shot_expansion_input,
 )
 from .vram import CliUnloader, LlmEjector
@@ -1673,6 +1675,61 @@ GENERATE_BATCH_EMPTY_READY = (
     "takes to re-render settled shots."
 )
 GENERATE_BATCH_EMPTY_FLAGGED = "No shots are flagged for re-render."
+
+
+# --------------------------------------------------------------------------------------------
+# Populate Timeline (the Director's user workflow, stage 4 — spec-populate-timeline).
+# --------------------------------------------------------------------------------------------
+
+#: The Director's own warning, server-enforced: the button's dialog shows this and the
+#: route refuses without the acknowledgement, so no client can replace a timeline by
+#: omission. The wording is the user workflow's: first run, or a deliberate redo.
+POPULATE_CONFIRM_REFUSAL = (
+    "Populate Timeline lays out the whole plan from the Song, Treatment and Assets — "
+    "every existing shot is replaced and unsaved timeline work is lost. It is intended "
+    "for a first run on an empty timeline, or for deliberately redoing the plan after "
+    "reworking the song, treatment or assets. Send confirm_replace=true to proceed."
+)
+POPULATE_NO_SONG_REFUSAL = (
+    "Populate Timeline lays shots across the song, so the project needs a song with a "
+    "known length first."
+)
+POPULATE_PROTECTED_REFUSAL = (
+    "Populate Timeline replaces every shot, and {shots} carry protections (approval or a "
+    "lock) that must not vanish silently. Un-approve or unlock them first — or delete "
+    "them if the plan is truly being redone."
+)
+POPULATE_NO_PLAN_REFUSAL = (
+    "The Director model returned no shots to lay out. Its message: {message}"
+)
+
+#: What the model is asked for. The count guidance and the asset roster matter: a local
+#: model told nothing about length writes five shots for a three-minute song, and one
+#: told nothing about the library invents characters the project does not hold.
+POPULATE_INSTRUCTION = (
+    "Lay out the complete shot plan for this music video. The song is {duration:.1f} "
+    "seconds long; cover it entirely from 0 to {duration:.1f} with contiguous shots — "
+    "no gaps, no overlaps — each between 4 and 15 seconds, about {count} shots in "
+    "total. Follow the treatment and style bible; use the song's lyrics to place "
+    "performance moments where the words are. The project's assets, by name, are: "
+    "{assets}. Refer to them by these exact names in shot prompts so each shot says "
+    "which character or location it uses. Every shot's prompt is a short readable "
+    "visual intent (one or two sentences): what is seen, who is in frame, how the "
+    "camera behaves. Alternate framings and locations per the treatment rather than "
+    "repeating one setup."
+)
+
+
+class PopulateTimelineRequest(BaseModel):
+    confirm_replace: bool = False
+
+
+class PopulateTimelineResponse(BaseModel):
+    """What populate did: the counts a Director sanity-checks first, then the project."""
+
+    proposed: int
+    created: int
+    project: Project
 
 
 class GenerateBatchRequest(BaseModel):
@@ -4900,6 +4957,111 @@ def create_app(
             height=plan.height,
             total_frames=plan.total_frames,
             clip_count=len(plan.clips),
+        )
+
+    @app.post(
+        "/api/projects/{project_id}/timeline/populate",
+        response_model=PopulateTimelineResponse,
+    )
+    async def populate_timeline(
+        project_id: str, request: PopulateTimelineRequest
+    ) -> PopulateTimelineResponse:
+        """Stage 4 of the Director's user workflow: one button lays out the whole plan.
+
+        The model's answer is treated as *shape*, never as arithmetic: its shots carry the
+        story (prompts, relative lengths, order), and `populate_windows` repairs the
+        geometry into what assembly will later demand — contiguous from 0 to the song's
+        end, every window inside H3's reliable 4–15 s range. Each tiled window draws its
+        prompt from the proposal whose proportional span of the song contains it
+        (`proposal_for_position`), so a count repair cannot orphan a window from the
+        story. The shots land as ordinary drafts — mode, citations, singing and
+        expansion remain the existing lanes' acts, exactly as the workflow describes
+        ("this is also when the prompts for each shot would be Expanded").
+
+        Destructive by design and doubly guarded: the browser shows the warning, and the
+        route refuses without `confirm_replace` in the same words — while shots carrying
+        protections (approval, a lock) refuse populate entirely by name, because a
+        protection that vanishes with the timeline it protected was never a protection.
+        """
+        project = get_project(project_id)
+        if not project.song or project.song.duration <= 0:
+            raise HTTPException(status_code=422, detail=POPULATE_NO_SONG_REFUSAL)
+        if reconcilable_jobs(project):
+            raise HTTPException(
+                status_code=409,
+                detail="Renders are in flight; populate would replace the shots they "
+                "are rendering for. Let the queue settle first.",
+            )
+        protected = [
+            shot_label(project, shot)
+            for shot in project.shots
+            if shot.locked or shot.approved_output or shot.status == "approved"
+        ]
+        if protected:
+            raise HTTPException(
+                status_code=422,
+                detail=POPULATE_PROTECTED_REFUSAL.format(shots=", ".join(protected)),
+            )
+        if not request.confirm_replace:
+            raise HTTPException(status_code=422, detail=POPULATE_CONFIRM_REFUSAL)
+        duration = project.song.duration
+        window_mean = (H3_MIN_SHOT_SECONDS + H3_MAX_SHOT_SECONDS) / 2
+        assets = (
+            "; ".join(f"{asset.name} ({asset.kind})" for asset in project.assets)
+            or "none yet"
+        )
+        instruction = POPULATE_INSTRUCTION.format(
+            duration=duration,
+            count=max(1, round(duration / window_mean)),
+            assets=assets,
+        )
+        context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+        try:
+            result = await director.plan(message=instruction, project_context=context)
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        proposals = sorted(
+            (shot for shot in result.shots if shot.prompt.strip()),
+            key=lambda shot: shot.start,
+        )
+        if not proposals:
+            raise HTTPException(
+                status_code=502,
+                detail=POPULATE_NO_PLAN_REFUSAL.format(
+                    message=(result.message or "").strip()[:300] or "(empty)"
+                ),
+            )
+        # Re-read after the await — the model can hold this open for minutes — and
+        # re-check what matters before the destructive write: a protection set or a
+        # render submitted while the model thought must still refuse.
+        project = get_project(project_id)
+        if reconcilable_jobs(project) or any(
+            shot.locked or shot.approved_output or shot.status == "approved"
+            for shot in project.shots
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The project changed while the model was planning (a render or a "
+                "protection appeared). Nothing was replaced; try again.",
+            )
+        windows = populate_windows(
+            [(shot.start, shot.duration) for shot in proposals], duration
+        )
+        project.shots = [
+            Shot(
+                start=start,
+                duration=length,
+                prompt=proposals[
+                    proposal_for_position(start + length / 2, duration, len(proposals))
+                ].prompt.strip(),
+            )
+            for start, length in windows
+        ]
+        saved = store.save(project)
+        return PopulateTimelineResponse(
+            proposed=len(proposals), created=len(saved.shots), project=saved
         )
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)

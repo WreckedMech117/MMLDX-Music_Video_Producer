@@ -2365,6 +2365,10 @@ export const api = {
   markShotReady: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-ready`, { method: "POST" }),
   markShotDraft: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-draft`, { method: "POST" }),
   directorChat: (id, body) => request(`/api/projects/${id}/director/chat`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // Populate Timeline (the Director's stage 4): destructive by design and doubly guarded —
+  // the button shows the warning, and the server refuses without confirm_replace in the
+  // same words. Nothing is rendered by it; the shots land as drafts.
+  populateTimeline: (id, confirmReplace) => request(`/api/projects/${id}/timeline/populate`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ confirm_replace: confirmReplace }) }),
   // Its own route, and it carries no body: expansion is not a chat turn. The whole input the
   // model sees is derived on the server from the project itself, so there is nothing here for a
   // message to travel in — and nothing that could queue a render.
