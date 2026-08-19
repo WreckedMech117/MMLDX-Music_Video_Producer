@@ -3153,6 +3153,7 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
         "generate_flux",
         "generate_multiview",
         "edit_asset",
+        "fill_assets",
         "generate_h3",
         "enhance_with_ltx25",
         "restore_song_audio",

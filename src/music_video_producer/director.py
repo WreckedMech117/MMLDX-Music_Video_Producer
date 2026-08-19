@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from base64 import b64encode
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -378,6 +378,48 @@ was rendered. Keep identities, wardrobe, setting, color, camera, and motion cont
 The message should briefly explain the creative changes you made."""
 
 
+# The Stage Manager (the Director's user workflow, stage 3): one pass over what the project
+# holds, proposing the supporting assets the video still needs. A job description like the
+# expansion specialist's — meant to be edited against real output. The example block is a
+# prescription, not decoration: this model family follows examples and ignores abstract
+# instructions (measured three-for-three on prompt rules, and again on tool booleans).
+STAGE_MANAGER_PROMPT = """You are the stage manager inside a local music-video production editor.
+You are handed the whole project: creative brief, treatment, style bible, the song's words,
+the asset library as it stands, and the shot plan. Your one job: propose the supporting
+image assets the video still needs — alternate character looks, extra camera-relevant
+angles, secondary locations, props the treatment implies — that the library does not hold.
+
+Return exactly one JSON object with keys: message, assets.
+- message: one or two sentences on what the library is missing and why these fill it.
+- assets: a list of proposals. Each has:
+  - name: a short library name, distinct from every existing asset's name.
+  - kind: one of "character", "setting", "prop", "style".
+  - prompt: a complete text-to-image prompt for a single still image. Write it like this
+    example, concrete and self-contained: "A tall female rock singer with wild curly blonde
+    hair, black leather corset and bright red leather boots, standing full-body in a dark
+    moonlit warehouse, cool slate-blue light, warm amber rim light on her face, 35mm film
+    grain, photorealistic." Name colors, wardrobe, lighting and framing explicitly; never
+    reference other images, assets, or shots — the image model sees only this text.
+
+Propose only what the treatment actually needs. Never duplicate an existing asset's
+subject; propose the missing angle, outfit, corner or prop instead. Fewer, better
+proposals beat filler."""
+
+
+class AssetProposal(BaseModel):
+    # A `Literal`, deliberately: the strict json_schema reaches LM Studio's constrained
+    # decoder, so an enum here *guides sampling* toward valid kinds rather than merely
+    # refusing invalid ones after the fact.
+    kind: Literal["character", "setting", "prop", "style"]
+    name: str = Field(min_length=1, max_length=160)
+    prompt: str = Field(min_length=1)
+
+
+class StageManagerResult(BaseModel):
+    message: str
+    assets: list[AssetProposal] = Field(default_factory=list)
+
+
 # One whole-plan pass, because per-Shot calls cannot see each other and cross-Shot variance is
 # the point: a plan of twelve shots that each independently "hold the identity" reads as twelve
 # takes of one shot. The constants to hold fixed and the axes to vary are named explicitly
@@ -597,6 +639,62 @@ class DirectorClient:
         try:
             response = await self._completion(body=body, headers=headers)
             return DirectorResult.model_validate(json.loads(self._content(response)))
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            raise DirectorError(f"LLM director returned an invalid response: {error}") from error
+
+    async def stage_manager(
+        self, *, project_context: dict[str, Any], count: int
+    ) -> StageManagerResult:
+        """One Stage Manager pass: what supporting assets does this video still need.
+
+        `plan`'s transport, `plan`'s error translation, a different job description and a
+        different strict schema. `count` rides in the request text rather than the schema
+        because it is guidance ("up to N"), not a shape — the route truncates the answer
+        to it either way, so an over-eager model costs nothing.
+        """
+        if not self.base_url or not self.model:
+            raise DirectorUnavailable(
+                "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
+            )
+        headers = self._headers()
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": STAGE_MANAGER_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "request": (
+                                f"Propose up to {count} supporting image assets this "
+                                "video still needs."
+                            ),
+                            "project": project_context,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0.7,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "stage_manager_result",
+                    "strict": True,
+                    "schema": StageManagerResult.model_json_schema(),
+                },
+            },
+        }
+        try:
+            response = await self._completion(body=body, headers=headers)
+            return StageManagerResult.model_validate(json.loads(self._content(response)))
         except (
             httpx.HTTPError,
             KeyError,

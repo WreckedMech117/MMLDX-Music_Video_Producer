@@ -1658,6 +1658,46 @@ class MultiviewRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------------------------
+# Asset Fill / the Stage Manager (the Director's user workflow, stage 3).
+# --------------------------------------------------------------------------------------------
+
+ASSET_FILL_CONFIRM_REFUSAL = (
+    "Asset Fill would queue up to {count} Flux image render(s) proposed by the Stage "
+    "Manager. Send confirm_gpu=true to proceed."
+)
+ASSET_FILL_RENDERS_OPEN_REFUSAL = (
+    "Renders are in flight. Filling assets now would interleave Flux renders into the "
+    "queue and evict the resident video model stack (~150 s per eviction, FR-9). Let "
+    "the queue settle first."
+)
+ASSET_FILL_NO_PROPOSALS_REFUSAL = (
+    "The Stage Manager proposed no assets. Its message: {message}"
+)
+
+
+class AssetFillRequest(BaseModel):
+    """One Stage Manager pass: how many proposals at most, and the GPU acknowledgement."""
+
+    count: int = Field(default=8, ge=1, le=16)
+    confirm_gpu: bool = False
+
+
+class AssetFillSubmission(BaseModel):
+    asset_id: str
+    name: str
+    kind: str
+    job_id: str
+
+
+class AssetFillResponse(BaseModel):
+    """The Stage Manager's own reasoning plus what actually queued — each proposal is an
+    ordinary generated asset (keep, delete, AI Mod) once its render lands."""
+
+    message: str
+    submitted: list[AssetFillSubmission]
+
+
+# --------------------------------------------------------------------------------------------
 # Generate All (FR-4, AD-5) — the route's own wordings; the per-shot skip sentences come
 # from the single-shot handlers verbatim, and the two protection sentences from batch.py.
 # --------------------------------------------------------------------------------------------
@@ -3453,6 +3493,98 @@ def create_app(
         project.jobs.append(job)
         store.save(project)
         return job
+
+    @app.post(
+        "/api/projects/{project_id}/assets/fill",
+        response_model=AssetFillResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def fill_assets(project_id: str, request: AssetFillRequest) -> AssetFillResponse:
+        """The Stage Manager (stage 3 of the Director's user workflow): assess and create.
+
+        One model pass over the whole project proposes the supporting image assets the
+        library still lacks; each proposal queues an ordinary Flux render through the
+        exact asset shape `generate_flux` creates, so a landed proposal is
+        indistinguishable from a hand-generated asset — keep it, delete it to reject,
+        AI Mod it onward. The count is guidance to the model and a hard truncation here.
+
+        Refused while renders are open, deliberately and with FR-9's number: Flux
+        interleaved into an H3 batch evicts the resident stack at ~150 s per eviction.
+        The GPU acknowledgement is server-enforced like every expensive path's.
+        """
+        project = get_project(project_id)
+        if reconcilable_jobs(project):
+            raise HTTPException(status_code=409, detail=ASSET_FILL_RENDERS_OPEN_REFUSAL)
+        if not request.confirm_gpu:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSET_FILL_CONFIRM_REFUSAL.format(count=request.count),
+            )
+        context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+        try:
+            result = await director.stage_manager(
+                project_context=context, count=request.count
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        proposals = [item for item in result.assets if item.prompt.strip()][: request.count]
+        if not proposals:
+            raise HTTPException(
+                status_code=502,
+                detail=ASSET_FILL_NO_PROPOSALS_REFUSAL.format(
+                    message=(result.message or "").strip()[:300] or "(empty)"
+                ),
+            )
+        # Re-read after the await, and re-check the eviction guard: an H3 batch submitted
+        # while the model thought must not get Flux interleaved into it.
+        project = get_project(project_id)
+        if reconcilable_jobs(project):
+            raise HTTPException(status_code=409, detail=ASSET_FILL_RENDERS_OPEN_REFUSAL)
+        submitted: list[AssetFillSubmission] = []
+        for index, proposal in enumerate(proposals):
+            asset = Asset(
+                name=proposal.name,
+                kind=proposal.kind,
+                path="",
+                source="stage-manager",
+                prompt=proposal.prompt,
+            )
+            payload = build_flux_payload(
+                prompt=proposal.prompt,
+                width=1024,
+                height=1024,
+                steps=20,
+                guidance=4.0,
+                # Distinct seeds so two similar proposals cannot land the identical image.
+                seed=index,
+                prefix=f"music-video-producer/{project_id}/assets/{asset.id}",
+            )
+            try:
+                submission = await comfy.submit(payload)
+            except ComfyError as error:
+                # Partial batches are reported honestly: what queued is queued, and the
+                # failure names itself; nothing already submitted is rolled back.
+                if submitted:
+                    store.save(project)
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            asset.prompt_id = submission.prompt_id
+            project.assets.append(asset)
+            job = RenderJob(
+                kind="flux",
+                prompt_id=submission.prompt_id,
+                target_id=asset.id,
+                seed=index,
+            )
+            project.jobs.append(job)
+            submitted.append(
+                AssetFillSubmission(
+                    asset_id=asset.id, name=asset.name, kind=asset.kind, job_id=job.id
+                )
+            )
+        store.save(project)
+        return AssetFillResponse(message=result.message, submitted=submitted)
 
     @app.post("/api/projects/{project_id}/assets/{asset_id}/analyze", response_model=Project)
     async def analyze_asset(project_id: str, asset_id: str) -> Project:

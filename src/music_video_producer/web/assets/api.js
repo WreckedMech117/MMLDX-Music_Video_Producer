@@ -2365,6 +2365,9 @@ export const api = {
   markShotReady: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-ready`, { method: "POST" }),
   markShotDraft: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-draft`, { method: "POST" }),
   directorChat: (id, body) => request(`/api/projects/${id}/director/chat`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // Asset Fill (the Director's stage 3): the Stage Manager assesses the library and queues
+  // one Flux render per proposal. confirm_gpu is the acknowledgement, server-enforced.
+  fillAssets: (id, count) => request(`/api/projects/${id}/assets/fill`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ count, confirm_gpu: true }) }),
   // Populate Timeline (the Director's stage 4): destructive by design and doubly guarded —
   // the button shows the warning, and the server refuses without confirm_replace in the
   // same words. Nothing is rendered by it; the shots land as drafts.

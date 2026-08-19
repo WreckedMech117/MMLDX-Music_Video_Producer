@@ -3997,6 +3997,102 @@ def test_generate_batch_flagged_scope_resubmits_and_clears_the_flag_only_on_succ
     assert none_left.json()["submitted"] == []
 
 
+class StageManagingDirector:
+    """A director double whose Stage Manager proposals are chosen by the test."""
+
+    def __init__(self, assets=None, message="Assessed."):
+        self.assets = assets or []
+        self.message = message
+        self.requests = []
+
+    async def stage_manager(self, *, project_context, count):
+        self.requests.append({"context": project_context, "count": count})
+        proposal = lambda kind, name, prompt: type(
+            "AssetProposal", (), {"kind": kind, "name": name, "prompt": prompt}
+        )()
+        return type(
+            "StageManagerResult",
+            (),
+            {"message": self.message, "assets": [proposal(*entry) for entry in self.assets]},
+        )()
+
+
+def fill_assets(client, project_id: str, count: int = 8, confirm: bool = True):
+    return client.post(
+        f"/api/projects/{project_id}/assets/fill",
+        json={"count": count, "confirm_gpu": confirm},
+    )
+
+
+def test_asset_fill_queues_one_flux_render_per_stage_manager_proposal(tmp_path: Path):
+    """Stage 3's last ask end to end: each proposal becomes an ordinary generated asset —
+    the exact shape generate_flux creates, so a landed one is keep/delete/AI Mod like any
+    other — with one flux job each, distinct seeds, and the model's message relayed."""
+    director = StageManagingDirector(assets=[
+        ("character", "HarderFaster · red boots full body",
+         "A tall female rock singer, red leather boots, full body, dark warehouse."),
+        ("setting", "Warehouse corner mezzanine",
+         "A dark warehouse mezzanine corner, moonlight shafts, 35mm grain."),
+        ("prop", "Standing microphone",
+         "A vintage chrome standing microphone on a dark stage, amber rim light."),
+    ])
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = store.create(Project(name="Fill"))
+    store.save(project)
+
+    unconfirmed = fill_assets(client, project.id, count=5, confirm=False)
+    assert unconfirmed.status_code == 422
+    assert "5 Flux image render(s)" in unconfirmed.json()["detail"]
+    assert director.requests == []
+
+    response = fill_assets(client, project.id, count=5)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["message"] == "Assessed."
+    assert [entry["kind"] for entry in body["submitted"]] == ["character", "setting", "prop"]
+    assert len(comfy.prompts) == 3
+    assert director.requests[0]["count"] == 5
+
+    saved = store.get(project.id)
+    assert [asset.source for asset in saved.assets] == ["stage-manager"] * 3
+    assert all(asset.path == "" and asset.prompt_id for asset in saved.assets)
+    assert [job.kind for job in saved.jobs] == ["flux"] * 3
+    assert [job.seed for job in saved.jobs] == [0, 1, 2]
+
+    # The eviction guard now correctly refuses a second fill over its own open flux jobs.
+    assert fill_assets(client, project.id, count=2).status_code == 409
+
+    # Truncation: the count is a hard cap however eager the model was.
+    fresh = store.create(Project(name="Trim"))
+    store.save(fresh)
+    trimmed = fill_assets(client, fresh.id, count=2)
+    assert trimmed.status_code == 202
+    assert len(trimmed.json()["submitted"]) == 2
+
+
+def test_asset_fill_refuses_while_renders_are_open_and_an_empty_assessment(tmp_path: Path):
+    """The FR-9 eviction guard fires before the model is ever asked — Flux interleaved
+    into an H3 batch costs ~150 s per eviction — and a proposal-less answer is a 502
+    carrying the model's own message rather than an empty success."""
+    director = StageManagingDirector(assets=[], message="The library is complete.")
+    client, store, _comfy = make_client(tmp_path, director=director)
+    busy = store.create(Project(name="Busy"))
+    busy.jobs = [RenderJob(kind="h3", status="running", prompt_id="p-1")]
+    store.save(busy)
+
+    blocked = fill_assets(client, busy.id)
+    assert blocked.status_code == 409
+    assert "evict the resident video model" in blocked.json()["detail"]
+    assert director.requests == []
+
+    idle = store.create(Project(name="Idle"))
+    store.save(idle)
+    hollow = fill_assets(client, idle.id)
+    assert hollow.status_code == 502
+    assert "The library is complete." in hollow.json()["detail"]
+    assert store.get(idle.id).assets == []
+
+
 def test_ai_mod_creates_a_child_asset_and_the_completion_adopts_the_edit(tmp_path: Path):
     """The Director's stage-3 ask end to end: instruction in, new asset beside the source,
     the landed file adopted by the one completion writer, the source untouched.

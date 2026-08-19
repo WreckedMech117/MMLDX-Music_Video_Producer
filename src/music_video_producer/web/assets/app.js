@@ -1931,6 +1931,20 @@ function bindEvents() {
     catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; button.textContent = label; }
   });
+  $("#asset-fill").addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const count = Math.max(1, Math.min(16, Number($("#asset-fill-count")?.value) || 8));
+    if (!window.confirm(`Ask the Stage Manager to assess the library and queue up to ${count} Flux asset render(s)? Each proposal becomes an ordinary asset you can keep, delete, or AI Mod.`)) return;
+    const projectId = state.project.id;
+    const button = $("#asset-fill");
+    button.disabled = true;
+    try {
+      const report = await api.fillAssets(projectId, count);
+      toast(`Stage Manager queued ${report.submitted.length} asset render(s). ${report.message}`.slice(0, 220));
+      if (state.project?.id === projectId) await loadProject(projectId);
+    } catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; }
+  });
   $("#populate-timeline").addEventListener("click", async () => {
     if (!requireProject()) return;
     // The Director's own warning, word for word with the server's refusal: replaces every
