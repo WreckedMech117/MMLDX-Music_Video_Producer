@@ -363,6 +363,11 @@ class Shot(BaseModel):
     # accepted audio from videos would come through" — so an untouched project sounds
     # exactly as the 2026-08-16 song-only ruling shipped. Nothing infers it.
     mix_take_audio: bool = False
+    # AD-5's re-render mark: the Director flags a shot whose take fell short, and the
+    # flagged set resubmits as its own batch scope. Independent of render state; cleared
+    # only by that shot's successful resubmission or by hand — never by the batch
+    # draining, and nothing infers it.
+    flagged: bool = False
     locked: bool = False
 
     @field_validator("mode", mode="before")
@@ -626,6 +631,10 @@ class RenderJob(BaseModel):
     # `edit` is the H3 image-edit (AI Mod) — an asset-producing GPU render like `flux`
     # and `multiview`, and adopted onto its target asset by the same completion writer.
     kind: Literal["music", "flux", "multiview", "edit", "h3", "ltx", "post"]
+    # AD-5: a batch is the set of jobs sharing this id, active iff any member is
+    # non-terminal — always derived, never stored as a status. Empty for every job
+    # submitted outside a batch.
+    batch_id: str = ""
     status: JobStatus = "queued"
     prompt_id: str = ""
     target_id: str = ""

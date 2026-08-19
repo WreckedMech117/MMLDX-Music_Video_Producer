@@ -323,7 +323,7 @@
       <section class="panel" id="panel-queue" aria-labelledby="queue-heading">
         <div class="workspace-heading">
           <div><span class="eyebrow">ComfyUI orchestration</span><h1 id="queue-heading">Render queue</h1></div>
-          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="primary-button" id="queue-ready" disabled title="Mark a shot ready to queue H3">Queue ready H3 shots</button></div>
+          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="quiet-button" id="queue-flagged" hidden title="Resubmit every flagged shot as one batch; each success clears that shot's flag">Re-queue flagged</button><label class="replace-existing-line" title="Also re-render settled shots (complete or error). Approved and locked shots are never touched — the batch report names them."><input type="checkbox" id="replace-existing"> Replace existing takes</label><button class="primary-button" id="queue-ready" disabled title="Mark a shot ready to queue H3">Generate All</button></div>
         </div>
         <!-- The plan's readiness, directly above the batch button that acts on it: how many shots
              carry a prompt, every shot that blocks submission, and every near-duplicate pair the

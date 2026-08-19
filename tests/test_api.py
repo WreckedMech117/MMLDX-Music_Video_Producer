@@ -3735,6 +3735,147 @@ def test_promotion_records_its_parent_and_leaves_the_source_asset_untouched(tmp_
     assert comfy.uploads == [source_bytes]
 
 
+def batch_plan_project(store, shots: list[Shot], name: str = "Batch") -> str:
+    project = store.create(Project(name=name))
+    project.shots = shots
+    store.save(project)
+    return project.id
+
+
+def generate_batch(client, project_id: str, **body):
+    return client.post(f"/api/projects/{project_id}/generate/batch", json=body)
+
+
+def test_generate_batch_submits_every_ready_shot_after_one_confirmation(tmp_path: Path):
+    """FR-4's happy path: one server-enforced confirmation naming the count, then every
+    ready shot in timeline order — each its own job, all sharing one freshly-minted
+    batch_id, the draft untouched because arming is not this route's act."""
+    client, store, comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_late", start=8, duration=4, prompt="A crane shot", status="ready"),
+        Shot(id="shot_early", start=0, duration=4, prompt="A wide open", status="ready"),
+        Shot(id="shot_draft", start=4, duration=4, prompt="Unarmed", status="draft"),
+    ])
+
+    unconfirmed = generate_batch(client, project_id)
+    assert unconfirmed.status_code == 422
+    assert "2 H3 render(s)" in unconfirmed.json()["detail"]
+    assert comfy.prompts == []
+
+    response = generate_batch(client, project_id, confirm_gpu=True)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert [entry["shot_id"] for entry in body["submitted"]] == ["shot_early", "shot_late"]
+    assert body["skipped"] == []
+    assert body["batch_id"].startswith("batch_")
+    assert len(comfy.prompts) == 2
+
+    saved = ProjectStore(tmp_path).get(project_id)
+    jobs = {job.target_id: job for job in saved.jobs}
+    assert set(jobs) == {"shot_early", "shot_late"}
+    assert all(job.kind == "h3" for job in jobs.values())
+    assert {job.batch_id for job in jobs.values()} == {body["batch_id"]}
+    assert {shot.id: shot.status for shot in saved.shots}["shot_draft"] == "draft"
+    assert {shot.id: shot.status for shot in saved.shots}["shot_early"] == "queued"
+
+
+def test_generate_batch_skips_a_blocked_shot_and_submits_the_rest(tmp_path: Path):
+    """FR-4's consequence, verbatim: 'A Shot that fails validation is reported and
+    skipped without blocking the rest of the batch.' The skip carries the single-shot
+    route's own sentence — no second wording exists to drift."""
+    client, store, comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_good", start=0, duration=4, prompt="A real prompt", status="ready"),
+        # Hand-walked to ready with no prompt — unreachable through the UI, exactly the
+        # state the per-shot gate exists to catch at submission.
+        Shot(id="shot_blank", start=4, duration=4, prompt="", status="ready"),
+    ])
+
+    response = generate_batch(client, project_id, confirm_gpu=True)
+
+    assert response.status_code == 202
+    body = response.json()
+    assert [entry["shot_id"] for entry in body["submitted"]] == ["shot_good"]
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["shot_id"] == "shot_blank"
+    assert "no prompt" in body["skipped"][0]["reason"]
+    assert len(comfy.prompts) == 1
+
+
+def test_generate_batch_replace_existing_reopens_settled_and_names_the_protected(
+    tmp_path: Path,
+):
+    client, store, _comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_ready", start=0, duration=4, prompt="p", status="ready"),
+        Shot(id="shot_done", start=4, duration=4, prompt="p2", status="complete",
+             latest_output="takes/a.mp4"),
+        Shot(id="shot_err", start=8, duration=4, prompt="p3", status="error"),
+        Shot(id="shot_appr", start=12, duration=4, prompt="p4", status="approved",
+             latest_output="takes/b.mp4", approved_output="takes/b.mp4",
+             approved_start=12, approved_duration=4),
+        Shot(id="shot_lock", start=16, duration=4, prompt="p5", status="complete",
+             latest_output="takes/c.mp4", locked=True),
+    ])
+
+    # Without the tick, settled shots are not the batch's business.
+    only_ready = generate_batch(client, project_id, confirm_gpu=True)
+    assert [e["shot_id"] for e in only_ready.json()["submitted"]] == ["shot_ready"]
+
+    replaced = generate_batch(
+        client, project_id, confirm_gpu=True, replace_existing=True
+    )
+    assert replaced.status_code == 202, replaced.text
+    body = replaced.json()
+    # shot_ready is queued from the first call — already rendering, so it is deliberately
+    # absent from both lists (the queue panel is its surface) — while the two settled
+    # unprotected shots re-open and go, and the two protections are named.
+    assert [e["shot_id"] for e in body["submitted"]] == ["shot_done", "shot_err"]
+    skipped = {e["shot_id"]: e["reason"] for e in body["skipped"]}
+    assert set(skipped) == {"shot_appr", "shot_lock"}
+    assert "approved take" in skipped["shot_appr"]
+    assert "locked" in skipped["shot_lock"]
+    saved = ProjectStore(tmp_path).get(project_id)
+    statuses = {shot.id: shot.status for shot in saved.shots}
+    assert statuses["shot_done"] == "queued" and statuses["shot_err"] == "queued"
+    assert statuses["shot_appr"] == "approved" and statuses["shot_lock"] == "complete"
+
+
+def test_generate_batch_flagged_scope_resubmits_and_clears_the_flag_only_on_success(
+    tmp_path: Path,
+):
+    """AD-5's words: the flag is cleared by successful resubmission of that shot or by
+    hand, never by the batch draining — so a flagged shot whose resubmission refuses
+    keeps its flag, and unflagged shots are not the flagged scope's business."""
+    client, store, comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_flag", start=0, duration=4, prompt="p", status="complete",
+             latest_output="takes/a.mp4", flagged=True),
+        Shot(id="shot_flag_blank", start=4, duration=4, prompt="", status="complete",
+             latest_output="takes/b.mp4", flagged=True),
+        Shot(id="shot_plain", start=8, duration=4, prompt="p3", status="ready"),
+    ])
+
+    empty = generate_batch(client, project_id, confirm_gpu=True, scope="flagged")
+    assert empty.status_code == 202
+    body = empty.json()
+    assert [e["shot_id"] for e in body["submitted"]] == ["shot_flag"]
+    assert body["skipped"][0]["shot_id"] == "shot_flag_blank"
+    assert len(comfy.prompts) == 1  # the ready-but-unflagged shot is untouched
+
+    saved = ProjectStore(tmp_path).get(project_id)
+    flags = {shot.id: shot.flagged for shot in saved.shots}
+    assert flags["shot_flag"] is False   # cleared by success
+    assert flags["shot_flag_blank"] is True  # kept by refusal
+    assert saved.jobs[-1].batch_id.startswith("batch_")
+
+    none_left = generate_batch(client, project_id, confirm_gpu=True, scope="flagged")
+    # The refused shot is still flagged, so the scope is not empty — it reports the same
+    # skip again rather than lying that nothing is flagged.
+    assert none_left.status_code == 202
+    assert none_left.json()["submitted"] == []
+
+
 def test_ai_mod_creates_a_child_asset_and_the_completion_adopts_the_edit(tmp_path: Path):
     """The Director's stage-3 ask end to end: instruction in, new asset beside the source,
     the landed file adopted by the one completion writer, the source untouched.
@@ -8578,7 +8719,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     Director's prompt the moment it was declared, with nobody deciding that it should. This change
     added three at once, which is exactly the situation the guard exists for.
 
-    Six fields are withheld, none of them a removal — each was classified withheld at the
+    Seven fields are withheld, none of them a removal — each was classified withheld at the
     moment it was declared, so withholding adds nothing to the prompt rather than subtracting
     something from it. The over-render pair (`latest_take_lead`/`trim_nudge`) is render
     bookkeeping and the human's own editorial fine-tune, neither a plan fact a chat turn
@@ -8622,6 +8763,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         "latest_take_lead",
         "trim_nudge",
         "mix_take_audio",
+        "flagged",
     }
     assert not SHOT_DIRECTOR_VISIBLE & SHOT_DIRECTOR_WITHHELD
     assert {"mode", "citations", "singing", "prompt"} <= SHOT_DIRECTOR_VISIBLE
@@ -8637,6 +8779,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         "latest_take_lead",
         "trim_nudge",
         "mix_take_audio",
+        "flagged",
     }
     assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {
         "__all__": {
@@ -8646,6 +8789,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
             "latest_take_lead",
             "trim_nudge",
             "mix_take_audio",
+            "flagged",
         }
     }
 

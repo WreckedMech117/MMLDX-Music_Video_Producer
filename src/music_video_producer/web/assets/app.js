@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, batchQueueProgress, batchReadinessBlock, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, prefillControl, queueButtonState, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, assemblyControl, effectiveOffset, latestAssemblyExport, monitorState, takeAudioControl, trimNudgeControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
@@ -971,6 +971,12 @@ export function renderShotInspector() {
   const againHtml = again.shown
     ? `<button class="quiet-button full" id="render-again" ${again.disabled ? "disabled" : ""} title="${escapeHtml(again.title)}">${escapeHtml(again.label)}</button>${again.reason ? `<p class="control-reason">${escapeHtml(again.reason)}</p>` : ""}`
     : "";
+  // AD-5's re-render mark, offered wherever render-again is: flag now, resubmit the whole
+  // flagged set later from the queue panel. The flag is the Director's own; nothing infers
+  // it, and only a successful resubmission (or this toggle) clears it.
+  const flagHtml = again.shown
+    ? `<button class="quiet-button full" id="flag-shot" title="${shot.flagged ? "Clear this shot's re-render flag." : "Mark this shot for re-rendering; Re-queue flagged in the render queue resubmits every flagged shot as one batch."}">${shot.flagged ? "Unflag re-render" : "Flag for re-render"}</button>`
+    : "";
   // Whether this shot may be committed to the queue or taken back out, decided by
   // `markReadyControl`, which the contract tests execute for every status and every refusal. This
   // is the control the primary journey was missing: `status` defaults to `draft`, the queue button
@@ -1033,7 +1039,7 @@ export function renderShotInspector() {
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}${flagHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
@@ -1141,6 +1147,12 @@ export function renderShotInspector() {
       toast(expandPromptToast(result, shotLabelText), result.applied ? "info" : "error");
     } catch (error) { toast(error.message, "error"); }
     finally { shotWriteInFlight = ""; button.disabled = false; button.textContent = label; }
+  });
+  $("#flag-shot")?.addEventListener("click", () => {
+    shot.flagged = !shot.flagged;
+    saveShotsSilently();
+    renderTimeline();
+    renderJobs();
   });
   $("#render-again")?.addEventListener("click", async () => {
     if (!requireProject()) return;
@@ -1315,15 +1327,21 @@ export async function pollRenderStatus() {
 function renderJobs() {
   const jobs = state.project?.jobs || [];
   const list = $("#job-list");
-  const queueable = (state.project?.shots || []).filter((shot) => shot.status === "ready");
   // The poll follows the job list, and this is the one place every version of that list passes.
   syncRenderPolling();
-  // Both reasons the button can be off, decided in one place: nothing to queue, and a batch the
-  // route will certainly refuse. The second was invisible until the click -- the button was
-  // enabled purely from the ready count -- so a Director spent the click to be told no.
-  const queue = queueButtonState(readinessReport, queueable);
-  $("#queue-ready").disabled = queue.disabled;
-  $("#queue-ready").title = queue.title;
+  // Generate All's whole state, decided by one contract-tested function: the count the
+  // confirmation will name (Replace Existing widening it to settled unprotected shots),
+  // and the readiness heads-up as a warning rather than a gate -- the server-side batch
+  // (FR-4) skips a blocked shot by name and submits the rest.
+  const plan = generateAllPlan(state.project, readinessReport, Boolean($("#replace-existing")?.checked));
+  $("#queue-ready").disabled = plan.disabled;
+  $("#queue-ready").title = plan.title;
+  const flagged = (state.project?.shots || []).filter((shot) => shot.flagged);
+  const flaggedButton = $("#queue-flagged");
+  if (flaggedButton) {
+    flaggedButton.hidden = !flagged.length;
+    flaggedButton.textContent = `Re-queue flagged (${flagged.length})`;
+  }
   if (!jobs.length) { list.innerHTML = `<div class="queue-empty">No render jobs for this project.</div>`; return; }
   list.innerHTML = [...jobs].reverse().map((job) => `<div class="job-row" data-job-id="${job.id}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(job.target_id || "—")}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span></div>`).join("");
 }
@@ -2058,50 +2076,41 @@ function bindEvents() {
   $("#cancel-project")?.addEventListener("click", () => $("#project-dialog").close());
   $("#queue-ready").addEventListener("click", async () => {
     if (!requireProject()) return;
-    const shots = state.project.shots.filter((shot) => shot.status === "ready");
-    if (!shots.length) return;
-    // The project this batch belongs to, captured before any await. The selector stays live while
-    // the readiness GET is in flight, so without this the Shot ids collected from project A would
-    // be submitted against project B -- renders queued for a plan nobody asked about, on a project
-    // whose readiness was never checked. Same guard the expansion handler carries.
+    const replace = Boolean($("#replace-existing")?.checked);
+    // Re-decided at the click from the same function that drew the button, so the count
+    // the Director confirms is the count the request means. The server enforces the
+    // confirmation too (confirm_gpu), so this dialog is the acknowledgement it names.
+    const plan = generateAllPlan(state.project, readinessReport, replace);
+    if (plan.disabled || !window.confirm(plan.confirm)) return;
     const projectId = state.project.id;
     const button = $("#queue-ready");
     button.disabled = true;
-    // How much of the batch the server has already accepted, so a failure partway can say so.
-    let queued = 0;
     try {
-      // Before the loop, never inside it. The route refuses a blocked Shot per submission, so a
-      // refusal discovered mid-loop would leave every earlier Shot already queued and burning GPU
-      // minutes on a plan that is about to be edited and resubmitted -- a half-submitted batch,
-      // which is the one outcome this check exists to make impossible. Either all of it goes or
-      // none of it does.
-      //
-      // Asked of the server rather than computed here: this client's copy of the project can be
-      // minutes old, and the readiness that matters is the one the route will apply.
-      const report = await api.readiness(projectId);
-      if (state.project?.id !== projectId) return;
-      readinessReport = report;
-      // Only the Shots actually being queued block it -- decided by `batchReadinessBlock`, which is
-      // executed by the contract tests. A blocked draft elsewhere in the plan is not this batch's
-      // problem, and refusing over one would make the button unusable for a plan the Director is
-      // still writing, which is every plan most of the time.
-      const block = batchReadinessBlock(report, shots.map((shot) => shot.id));
-      if (block.refused) { toast(block.message, "error"); return; }
-      // After the check, so the Director is never asked to accept a GPU cost for a batch that
-      // was never going to be sent.
-      if (!window.confirm(`Queue ${shots.length} reviewed H3 shot${shots.length === 1 ? "" : "s"}? Reference shots use MiniMax Ultra and can use significant GPU time.`)) return;
-      for (const shot of shots) { await api.generateH3(projectId, shot.id); queued += 1; }
-      toast(`${shots.length} H3 shot${shots.length === 1 ? "" : "s"} queued`);
+      const report = await api.generateBatch(projectId, {
+        confirm_gpu: true,
+        replace_existing: replace,
+      });
+      toast(batchReportToast(report), report.submitted.length ? "info" : "error");
       if (state.project?.id === projectId) await loadProject(projectId);
-    } catch (error) {
-      // What already queued is spending GPU minutes right now. The refusal on its own reads as
-      // "nothing happened", and a Director who believes that edits the plan and submits the whole
-      // batch again -- on top of the half that is already rendering.
-      toast(`${error.message} ${batchQueueProgress(queued, shots.length)}`, "error");
-      if (queued && state.project?.id === projectId) await loadProject(projectId);
-    }
+    } catch (error) { toast(error.message, "error"); }
     finally { renderJobs(); }
   });
+  $("#queue-flagged").addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const flagged = (state.project?.shots || []).filter((shot) => shot.flagged);
+    if (!flagged.length) return;
+    if (!window.confirm(`Resubmit ${flagged.length} flagged shot${flagged.length === 1 ? "" : "s"} as one batch? Each successful resubmission clears that shot's flag.`)) return;
+    const projectId = state.project.id;
+    try {
+      const report = await api.generateBatch(projectId, { confirm_gpu: true, scope: "flagged" });
+      toast(batchReportToast(report), report.submitted.length ? "info" : "error");
+      if (state.project?.id === projectId) await loadProject(projectId);
+    } catch (error) { toast(error.message, "error"); }
+    finally { renderJobs(); }
+  });
+  // The checkbox changes what the button would submit, so the button's own label and
+  // count redraw in the same gesture.
+  $("#replace-existing").addEventListener("change", renderJobs);
   // The whole of the control. It sends the box's own value -- never a hardcoded one, which would
   // make the control decorative in one direction and unusable in the other -- and repaints from
   // the server's reply, so a refused change reverts the box instead of leaving it showing a

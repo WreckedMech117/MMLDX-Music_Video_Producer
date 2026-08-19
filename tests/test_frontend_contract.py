@@ -3329,35 +3329,28 @@ def queue_handler_body() -> str:
     return without_comments(handler)
 
 
-def test_the_queue_handler_checks_readiness_once_before_its_loop():
-    """A per-Shot refusal discovered mid-loop is a half-submitted batch.
+def test_the_generate_all_handler_confirms_then_posts_one_server_batch():
+    """The client loop is gone: one confirm, one POST, the server's report relayed.
 
-    The route refuses per submission, so without a check ahead of the loop the earlier Shots are
-    already queued and burning GPU minutes when the blocked one is reached -- and the plan the
-    Director then fixes has takes for half of it already in flight. Position is the guarantee
-    here, not presence, so the check, the confirm and the loop are asserted in order.
+    Position still matters — the confirm precedes the request, and `confirm_gpu: true`
+    exists only inside the request the confirm guards, so a handler edit that sends the
+    flag unconditionally or before the dialog fails here. The plan is re-decided at the
+    click from the same function that drew the button, so the count the Director confirms
+    is the count the request means.
     """
     body = queue_handler_body()
 
-    assert "api.readiness(projectId)" in body
-    # The decision itself is `batchReadinessBlock`, executed by the test below; the handler only
-    # asks it and obeys. A filter written out here again is a second rule that can invert alone.
-    assert "batchReadinessBlock(report, shots.map((shot) => shot.id))" in body
-    for redecided in ("blockedShotIds", "queued.has", "readinessRefusal("):
-        assert redecided not in body, redecided
-
-    check = body.index("api.readiness(")
-    loop = body.index("for (const shot of shots)")
-    confirm = body.index("window.confirm")
-    assert check < loop, "readiness is checked inside the loop, so a batch can half-submit"
-    # The GPU-cost confirm comes after: nobody is asked to accept a cost for a batch that was
-    # never going to be sent.
-    assert check < confirm < loop
-
-    # And the refusal returns instead of falling through into the loop.
-    refusal = re.search(r"if \(block\.refused\)[^\n]*return;", body)
-    assert refusal, body
-    assert body.index("block.refused") < confirm
+    assert "generateAllPlan(state.project, readinessReport, replace)" in body
+    confirm = body.index("window.confirm(plan.confirm)")
+    post = body.index("api.generateBatch(")
+    assert confirm < post
+    assert "confirm_gpu: true" in body
+    assert body.index("confirm_gpu: true") > confirm
+    # No client loop remains anywhere: FR-4's skip-and-continue is the server's act.
+    assert "for (const shot" not in body
+    assert "api.generateH3(" not in body
+    # The server's report reaches the Director through the one relay.
+    assert "batchReportToast(report)" in body
 
 
 def test_only_a_blocked_shot_inside_the_batch_refuses_it():
@@ -3413,75 +3406,42 @@ def test_only_a_blocked_shot_inside_the_batch_refuses_it():
     assert decisions["insideBatch"]["labels"] == ["shot_b"]
 
 
-def test_a_project_switch_during_the_readiness_check_abandons_the_batch():
-    """The selector stays live while the readiness GET is in flight.
+def test_a_project_switch_during_the_batch_post_abandons_the_reload():
+    """The selector stays live while the POST is in flight.
 
-    Without capturing the id first, the Shot ids collected from project A are submitted against
-    whatever project is loaded when the answer lands -- renders queued for a plan nobody asked
-    about, against a readiness report that was never checked for it. The expansion handler already
-    carries this guard; the batch is the path that spends GPU minutes.
+    The id is captured before the await and the submission goes to it, so a switch cannot
+    redirect the batch; and the reload afterwards is guarded, so a batch that finished
+    after a switch does not pull the Director back to the project they left.
     """
     body = queue_handler_body()
 
     assert "const projectId = state.project.id;" in body
-    assert body.index("const projectId") < body.index("await "), body
-    assert "api.readiness(projectId)" in body
-    assert "if (state.project?.id !== projectId) return;" in body
-    # After the answer, before anything is submitted or accepted as this project's readiness.
-    assert body.index("api.readiness(") < body.index("state.project?.id !== projectId")
-    assert body.index("state.project?.id !== projectId") < body.index("api.generateH3(")
-    assert body.index("state.project?.id !== projectId") < body.index("readinessReport = report")
-    # Every submission goes to the captured id, never to whatever is loaded by then.
-    assert "api.generateH3(projectId, shot.id)" in body
-    assert "api.generateH3(state.project" not in body
-    # And the reloads are guarded too: a batch that finished after a switch must not pull the
-    # Director back to the project they left.
-    assert body.count("await loadProject(projectId)") == 2, body
+    assert body.index("const projectId") < body.index("await api.generateBatch")
+    assert "api.generateBatch(projectId," in body
+    assert "api.generateBatch(state.project" not in body
     for reload in re.findall(r"[^\n]*await loadProject\(projectId\)[^\n]*", body):
         assert "state.project?.id === projectId" in reload, reload
 
 
-def test_a_batch_that_fails_partway_reports_what_already_queued():
-    """The catch toasted the refusal alone, and `loadProject` sat after the loop.
-
-    So a failure on the third of five Shots told the Director "not submitted" while two renders
-    were already running, and the queue on screen did not show them either. A Director who reads
-    that edits the plan and submits the whole batch again, on top of the half already in flight.
-    """
-    progress = run_module("""
-      import { BATCH_QUEUE_NO_PROGRESS, batchQueueProgress }
-        from './src/music_video_producer/web/assets/api.js';
+def test_the_batch_report_toast_relays_every_skip_in_the_servers_words():
+    """FR-4's report, rendered: what queued, what was skipped, each skip in the sentence
+    the single-shot route refused it with — never a reworded copy, never a bare count."""
+    states = run_module("""
+      import { batchReportToast } from './src/music_video_producer/web/assets/api.js';
       console.log(JSON.stringify({
-        none: batchQueueProgress(0, 5),
-        one: batchQueueProgress(1, 5),
-        some: batchQueueProgress(3, 5),
-        nothingWording: BATCH_QUEUE_NO_PROGRESS,
-        absent: batchQueueProgress(),
+        clean: batchReportToast({ submitted: [{}, {}, {}], skipped: [] }),
+        mixed: batchReportToast({ submitted: [{}],
+          skipped: [{ label: 'SHOT 02 (shot_b)', reason: 'No prompt on it.' }] }),
+        nothing: batchReportToast({ submitted: [], skipped: [
+          { label: 'SHOT 01 (shot_a)', reason: 'locked.' }] }),
+        empty: batchReportToast(undefined),
       }));
     """)
-
-    # Nothing queued is its own sentence: "0 of 5" would still read as a partial batch.
-    assert progress["none"] == progress["nothingWording"]
-    assert progress["absent"] == progress["nothingWording"]
-    assert "no GPU time" in progress["none"]
-    for partial, count in (("one", "1"), ("some", "3")):
-        assert progress[partial].startswith(f"{count} of 5"), progress[partial]
-        # Both halves: what is already running, and what was not sent.
-        assert "already rendering" in progress[partial], progress[partial]
-        assert "not sent" in progress[partial], progress[partial]
-
-    body = queue_handler_body()
-    # Counted as the server accepts them, so the number is what really queued rather than an
-    # index the loop had reached.
-    assert "let queued = 0;" in body
-    assert "for (const shot of shots) { await api.generateH3(projectId, shot.id); queued += 1; }" in body
-    assert "batchQueueProgress(queued, shots.length)" in body
-    # Reported in the failure toast itself, not as a second toast that can be missed.
-    catch = body.split("} catch (error) {", 1)[1]
-    assert "batchQueueProgress(" in catch
-    assert catch.index("toast(") < catch.index("loadProject("), catch
-    # And what did queue is shown, or the queue table contradicts the toast beside it.
-    assert "if (queued && state.project?.id === projectId) await loadProject(projectId);" in catch
+    assert states["clean"] == "3 shots queued as one batch"
+    assert states["mixed"].startswith("1 shot queued as one batch — 1 skipped.")
+    assert "SHOT 02 (shot_b): No prompt on it." in states["mixed"]
+    assert states["nothing"].startswith("Nothing queued — 1 skipped.")
+    assert states["empty"] == "Nothing queued"
 
 
 def test_the_readiness_client_matches_a_route_the_server_actually_exposes():
@@ -4927,10 +4887,11 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
 
     report = server_readiness_report(tmp_path)
     script = f"""
-      import {{ batchReadinessBlock, blockedShotIds, blockedShotLabels, queueButtonState,
+      import {{ batchReadinessBlock, blockedShotIds, blockedShotLabels, generateAllPlan,
         readinessLines, readinessSummary }}
         from './src/music_video_producer/web/assets/api.js';
       const report = {json.dumps(report)};
+      const shots = [{{ id: 'shot_written', status: 'ready' }}, {{ id: 'shot_blank', status: 'ready' }}];
       console.log(JSON.stringify({{
         blocked: blockedShotIds(report),
         labels: blockedShotLabels(report),
@@ -4938,7 +4899,7 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
         summary: readinessSummary(report),
         insideBatch: batchReadinessBlock(report, ['shot_blank', 'shot_written']),
         outsideBatch: batchReadinessBlock(report, ['shot_written', 'shot_echo']),
-        button: queueButtonState(report, [{{ id: 'shot_written' }}, {{ id: 'shot_blank' }}]),
+        button: generateAllPlan({{ shots }}, report),
       }}));
     """
 
@@ -4954,8 +4915,11 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
     assert parsed["insideBatch"]["refused"] is True
     assert parsed["insideBatch"]["message"] == readiness_refusal(blocked_labels)
     assert parsed["outsideBatch"]["refused"] is False
-    assert parsed["button"]["disabled"] is True
-    assert parsed["button"]["title"] == readiness_refusal(blocked_labels)
+    # The button stays enabled — the server-side batch (FR-4) skips the blocked shot by
+    # name and submits the rest — but the heads-up is in the title before the click.
+    assert parsed["button"]["disabled"] is False
+    assert parsed["button"]["blocked"] == ["shot_blank"]
+    assert "1 will be skipped" in parsed["button"]["title"]
 
     # The sameness half, which nothing in the browser read at all before this.
     blocking = [line for line in parsed["lines"] if line["kind"] == "blocking"]
@@ -5052,13 +5016,13 @@ def test_an_empty_plans_note_names_no_shot_on_the_client_either(tmp_path: Path):
     report = TestClient(app).get(f"/api/projects/{project.id}/readiness").json()
 
     parsed = run_module(f"""
-      import {{ readinessLines, readinessSummary, queueButtonState }}
+      import {{ readinessLines, readinessSummary, generateAllPlan }}
         from './src/music_video_producer/web/assets/api.js';
       const report = {json.dumps(report)};
       console.log(JSON.stringify({{
         lines: readinessLines(report),
         summary: readinessSummary(report),
-        button: queueButtonState(report, []),
+        button: generateAllPlan({{ shots: [] }}, report),
       }}));
     """)
 
@@ -5068,51 +5032,75 @@ def test_an_empty_plans_note_names_no_shot_on_the_client_either(tmp_path: Path):
     assert parsed["button"]["disabled"] is True
 
 
-def test_the_batch_button_says_no_before_the_click_rather_than_after_it():
-    """`#queue-ready` was enabled purely from the ready-status count.
+def test_the_generate_all_plan_counts_warns_and_never_gates_what_the_server_would_skip():
+    """`generateAllPlan` is the button's whole decision, for every state.
 
-    So a batch the route would certainly refuse looked fully submittable, and the Director learned
-    otherwise by spending the click. Readiness is a cheap GET, fetched on project load, and the
-    button's whole state is decided from it here -- including the case that must *not* disable it,
-    a blocked draft elsewhere in the plan.
+    The FR-4 change of stance, recorded: a blocked shot inside the batch no longer
+    disables the button — the server-side batch skips it by name and submits the rest —
+    but the heads-up still lands *before* the click, in the title and the confirm.
+    Replace Existing widens the count to settled unprotected shots; approved and locked
+    settled shots are excluded from the count because the server will name them in the
+    report rather than re-render them.
     """
     script = """
-      import { QUEUE_WITHOUT_READY_SHOTS, queueButtonState }
+      import { QUEUE_REPLACE_WITHOUT_TARGETS, QUEUE_WITHOUT_READY_SHOTS, generateAllPlan }
         from './src/music_video_producer/web/assets/api.js';
       const blocking = (...ids) => ({ blocking: ids.map((id) => ({ shot_ids: [id], reason: 'x' })) });
-      const shot = (id) => ({ id, status: 'ready' });
+      const shot = (id, status = 'ready', extra = {}) => ({ id, status, ...extra });
+      const settledPlan = { shots: [
+        shot('shot_a'),
+        shot('shot_done', 'complete'),
+        shot('shot_err', 'error'),
+        shot('shot_appr', 'complete', { approved_output: 'takes/a.mp4' }),
+        shot('shot_lock', 'complete', { locked: true }),
+        shot('shot_draft', 'draft'),
+      ] };
       console.log(JSON.stringify({
         emptyWording: QUEUE_WITHOUT_READY_SHOTS,
-        nothingReady: queueButtonState(blocking(), []),
-        allWritten: queueButtonState(blocking(), [shot('shot_a'), shot('shot_b')]),
-        one: queueButtonState(blocking(), [shot('shot_a')]),
-        blockedInside: queueButtonState(blocking('shot_b'), [shot('shot_a'), shot('shot_b')]),
-        blockedElsewhere: queueButtonState(blocking('shot_c'), [shot('shot_a'), shot('shot_b')]),
-        // Nothing fetched yet must not disable a batch the server has not been asked about.
-        noReport: queueButtonState(null, [shot('shot_a')]),
+        replaceEmptyWording: QUEUE_REPLACE_WITHOUT_TARGETS,
+        nothingReady: generateAllPlan({ shots: [] }, blocking()),
+        nothingEvenReplacing: generateAllPlan({ shots: [shot('shot_draft', 'draft')] }, null, true),
+        two: generateAllPlan({ shots: [shot('shot_a'), shot('shot_b')] }, blocking()),
+        one: generateAllPlan({ shots: [shot('shot_a')] }, blocking()),
+        blockedInside: generateAllPlan({ shots: [shot('shot_a'), shot('shot_b')] }, blocking('shot_b')),
+        blockedElsewhere: generateAllPlan({ shots: [shot('shot_a'), shot('shot_b')] }, blocking('shot_c')),
+        noReport: generateAllPlan({ shots: [shot('shot_a')] }, null),
+        replacing: generateAllPlan(settledPlan, null, true),
+        notReplacing: generateAllPlan(settledPlan, null, false),
       }));
     """
 
     states = run_module(script)
     assert states["nothingReady"]["disabled"] is True
     assert states["nothingReady"]["title"] == states["emptyWording"]
-    assert states["allWritten"] == {"disabled": False, "blocked": [], "title": "Queue 2 reviewed H3 shots"}
-    assert states["one"]["title"] == "Queue 1 reviewed H3 shot"
-    # The refusal is stated before the click, in the words it would be refused with.
-    assert states["blockedInside"]["disabled"] is True
+    assert states["nothingEvenReplacing"]["disabled"] is True
+    assert states["nothingEvenReplacing"]["title"] == states["replaceEmptyWording"]
+    assert states["two"]["disabled"] is False
+    assert states["two"]["count"] == 2
+    assert states["two"]["title"] == "Generate 2 H3 shots"
+    assert "Queue 2 H3 shots as one batch?" in states["two"]["confirm"]
+    assert states["one"]["title"] == "Generate 1 H3 shot"
+    # The heads-up before the click, without gating what the server would not gate.
+    assert states["blockedInside"]["disabled"] is False
     assert states["blockedInside"]["blocked"] == ["shot_b"]
-    assert "Write a prompt in the shot inspector" in states["blockedInside"]["title"]
-    # And a blank draft elsewhere leaves the batch submittable.
-    assert states["blockedElsewhere"]["disabled"] is False
+    assert "1 will be skipped" in states["blockedInside"]["title"]
+    assert "1 will be skipped" in states["blockedInside"]["confirm"]
+    assert states["blockedElsewhere"]["blocked"] == []
     assert states["noReport"]["disabled"] is False
+    # Replace Existing: ready + settled unprotected; approved, locked and draft excluded.
+    assert states["replacing"]["count"] == 3
+    assert states["notReplacing"]["count"] == 1
 
     source = APP_JS.read_text(encoding="utf-8")
     jobs = without_comments(app_js_block("function renderJobs"))
-    assert "const queue = queueButtonState(readinessReport, queueable);" in jobs
-    assert '$("#queue-ready").disabled = queue.disabled;' in jobs
-    assert '$("#queue-ready").title = queue.title;' in jobs
-    # No second rule for the same button: the count alone is what could not see a refusal coming.
-    assert "queueable.length === 0" not in jobs, jobs
+    assert "generateAllPlan(state.project, readinessReport" in jobs
+    assert '$("#queue-ready").disabled = plan.disabled;' in jobs
+    assert '$("#queue-ready").title = plan.title;' in jobs
+    # The flagged set's own button redraws from the same pass.
+    assert '$("#queue-flagged")' in jobs
+    # The handler posts the one server batch and relays its report; no client loop remains.
+    assert "api.generateBatch(" in source
+    assert "for (const shot of shots) { await api.generateH3" not in source
 
     # The report is fetched on project load, so the state is known before the Queue panel is even
     # opened -- and abandoned if it lands for a project that is no longer on screen.

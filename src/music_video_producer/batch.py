@@ -608,3 +608,76 @@ def render_status_report(
         if project.song
         else None,
     )
+
+
+# --------------------------------------------------------------------------------------------
+# Generate All -- AD-5's batch selection (spec-generate-all). The submission itself rides the
+# single-shot routes; this half decides, purely, which shots a batch names and which it skips
+# with a sentence.
+# --------------------------------------------------------------------------------------------
+
+#: Why a settled shot is skipped rather than re-opened under Replace Existing (and why a
+#: flagged shot cannot resubmit). Named, never silent: a Director who ticked Replace and
+#: sees an old take again deserves the reason in the report, not a mystery.
+GENERATE_BATCH_APPROVED_SKIP = (
+    "{shot} carries an approved take. The approval pins that exact file; un-approve it "
+    "to re-render."
+)
+GENERATE_BATCH_LOCKED_SKIP = "{shot} is locked."
+
+
+def batch_targets(
+    project: Project, *, scope: str = "ready", replace_existing: bool = False
+) -> tuple[list[Shot], list[tuple[Shot, str]]]:
+    """The shots one batch will submit, in timeline order, and the named skips.
+
+    Two scopes, per the spec's matrix. ``ready`` is FR-4's own set -- every shot standing
+    at ``ready`` -- widened by ``replace_existing`` to settled (``complete``/``error``)
+    shots that nothing protects; approved and locked settled shots are skipped **by
+    name**. ``flagged`` is AD-5's resubmission set: exactly the flagged shots, with the
+    same two protections named.
+
+    Deliberately only the *meaning-level* protections are decided here (approval, lock --
+    the two states a submission could never be right about). Everything mechanical --
+    in-flight 409s, the readiness prompt gate, adapterless modes -- is left to the
+    single-shot routes the batch delegates to, so no second copy of any of those rules
+    exists to drift. Draft shots are not this route's act at all: arming is arm-a-plan's
+    lane, and a draft in the flagged scope surfaces through the single-shot path's own
+    "must be ready" refusal rather than a rule here.
+    """
+    targets: list[Shot] = []
+    skipped: list[tuple[Shot, str]] = []
+
+    def protected(shot: Shot) -> str | None:
+        if shot.approved_output or shot.status == "approved":
+            return GENERATE_BATCH_APPROVED_SKIP.format(shot=shot_label(project, shot))
+        if shot.locked:
+            return GENERATE_BATCH_LOCKED_SKIP.format(shot=shot_label(project, shot))
+        return None
+
+    for shot in ordered_shots(project):
+        if scope == "flagged":
+            if not shot.flagged:
+                continue
+            reason = protected(shot)
+            if reason:
+                skipped.append((shot, reason))
+            else:
+                targets.append(shot)
+        else:
+            if shot.status == "ready":
+                targets.append(shot)
+            elif replace_existing and (
+                shot.status in ("complete", "error", "approved") or shot.approved_output
+            ):
+                # `approved` joins the settled set so the protection is *named*: a
+                # Director who ticked Replace and sees an old take again deserves the
+                # reason, and an approved shot silently absent from both lists reads as
+                # a bug. In-flight (`queued`/`running`) shots are deliberately absent
+                # instead — they are already rendering, which the queue panel shows.
+                reason = protected(shot)
+                if reason:
+                    skipped.append((shot, reason))
+                else:
+                    targets.append(shot)
+    return targets, skipped

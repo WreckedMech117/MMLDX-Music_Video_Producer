@@ -35,6 +35,7 @@ from .batch import (
     ReadinessReport,
     RenderStatusReport,
     apply_job_history,
+    batch_targets,
     prompt_is_missing,
     prompt_rejection,
     readiness_refusal,
@@ -71,6 +72,7 @@ from .models import (
     citations_in_role,
     dangling_citations,
     mode_specification_problems,
+    new_id,
     resolve_shot_mode,
 )
 from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
@@ -384,7 +386,9 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 #: fine-tune on a rendered file — neither is a plan fact a chat turn writes or reads, and
 #: nothing the conversational model could do with them is anything but noise.
 #: `mix_take_audio` is the same class again: the human's acceptance of a rendered file's
-#: audio into the mix, decided by ear, never by the chat model.
+#: audio into the mix, decided by ear, never by the chat model. `flagged` likewise: the
+#: Director's own re-render mark (AD-5), decided by eye on a take, resubmitted by a
+#: button — nothing a chat turn writes or reads.
 SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
     {
         "h3_prompt",
@@ -393,6 +397,7 @@ SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
         "latest_take_lead",
         "trim_nudge",
         "mix_take_audio",
+        "flagged",
     }
 )
 
@@ -1648,6 +1653,60 @@ class MultiviewRequest(BaseModel):
     prompt: str = Field(min_length=1)
     # KSampler.seed is 64-bit; see MusicRequest.seed on why unbounded is wrong.
     seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
+
+
+# --------------------------------------------------------------------------------------------
+# Generate All (FR-4, AD-5) — the route's own wordings; the per-shot skip sentences come
+# from the single-shot handlers verbatim, and the two protection sentences from batch.py.
+# --------------------------------------------------------------------------------------------
+
+#: The server-enforced half of "Warning on time/GPU": a client that never showed the
+#: warning cannot spend hours of GPU by omission. Names the count, per FR-4's testable
+#: consequence, and the measured per-shot range so the Director can do the arithmetic.
+GENERATE_BATCH_CONFIRM_REFUSAL = (
+    "This batch would queue {count} H3 render(s). A reference shot measured 288-438 s on "
+    "the default profile (about 2 min on turbo), so this is a real GPU commitment. "
+    "Send confirm_gpu=true to proceed."
+)
+GENERATE_BATCH_EMPTY_READY = (
+    "No shots are ready to generate. Mark shots ready first — or tick Replace existing "
+    "takes to re-render settled shots."
+)
+GENERATE_BATCH_EMPTY_FLAGGED = "No shots are flagged for re-render."
+
+
+class GenerateBatchRequest(BaseModel):
+    """One batch, one confirmation. `scope` picks FR-4's ready set or AD-5's flagged set;
+    `replace_existing` widens the ready scope to settled, unprotected shots; `profile`
+    applies one evidenced sampling bundle to the whole batch (per-shot profiles are Ask
+    First). `confirm_gpu` is the acknowledgement itself — a client sends true only after
+    showing the warning, exactly like `confirm_song_replacement`."""
+
+    confirm_gpu: bool = False
+    scope: Literal["ready", "flagged"] = "ready"
+    replace_existing: bool = False
+    profile: Literal["default", "turbo", "turbo-references2v"] = "default"
+
+
+class BatchSubmittedShot(BaseModel):
+    shot_id: str
+    label: str
+    job_id: str
+
+
+class BatchSkippedShot(BaseModel):
+    shot_id: str
+    label: str
+    reason: str
+
+
+class BatchSubmissionResponse(BaseModel):
+    """FR-4's report: what queued and what was skipped, each by name with a sentence.
+    `batch_id` is empty when nothing submitted — a batch that never formed has no id."""
+
+    batch_id: str
+    submitted: list[BatchSubmittedShot]
+    skipped: list[BatchSkippedShot]
 
 
 class AssetEditRequest(BaseModel):
@@ -3875,6 +3934,102 @@ def create_app(
         project.jobs.append(job)
         store.save(project)
         return job
+
+    @app.post(
+        "/api/projects/{project_id}/generate/batch",
+        response_model=BatchSubmissionResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def generate_batch(
+        project_id: str, request: GenerateBatchRequest
+    ) -> BatchSubmissionResponse:
+        """FR-4: every eligible shot as one batch, one confirmation, per-shot skip-and-report.
+
+        Every submission rides the *identical* single-shot handlers — `render_again` to
+        re-open a settled shot, `generate_h3` to submit — called in-closure, so no gate,
+        payload rule, or refusal wording exists twice. A shot whose submission refuses
+        lands in `skipped` with that route's own sentence and blocks nothing else, which
+        is FR-4's testable consequence verbatim.
+
+        FR-9 by construction: every submission is kind `h3`, they go out consecutively in
+        timeline order, and nothing on this path issues a ComfyUI free, unload, or
+        interrupt (the LM-Studio eject before the first submit is AD-8's control, on the
+        other host). The measured fact FR-9 reduces to — ComfyUI keeps the stack resident
+        between same-kind prompts — is preserved exactly because nothing else is
+        interleaved.
+
+        The confirmation is server-enforced: `confirm_gpu` false answers 422 with the
+        exact count that would queue, so a client that never showed the warning cannot
+        spend hours of GPU by omission (AD-15: expensive renders require explicit
+        confirmation; one confirmation covers a batch).
+
+        AD-5's bookkeeping happens after the loop on a fresh read: the submitted jobs are
+        stamped with one freshly-minted `batch_id` (a batch is the set of jobs sharing
+        it, active iff any member is non-terminal — derived, never stored), and each
+        successfully resubmitted shot's `flagged` clears — success only; a skip keeps
+        the flag, and the batch draining never touches it.
+        """
+        project = get_project(project_id)
+        targets, protected = batch_targets(
+            project, scope=request.scope, replace_existing=request.replace_existing
+        )
+        if not targets:
+            raise HTTPException(
+                status_code=422,
+                detail=GENERATE_BATCH_EMPTY_FLAGGED
+                if request.scope == "flagged"
+                else GENERATE_BATCH_EMPTY_READY,
+            )
+        if not request.confirm_gpu:
+            raise HTTPException(
+                status_code=422,
+                detail=GENERATE_BATCH_CONFIRM_REFUSAL.format(count=len(targets)),
+            )
+        batch_id = new_id("batch")
+        submitted: list[BatchSubmittedShot] = []
+        skipped = [
+            BatchSkippedShot(shot_id=shot.id, label=shot_label(project, shot), reason=reason)
+            for shot, reason in protected
+        ]
+        for target in targets:
+            label = shot_label(project, target)
+            try:
+                # A settled shot re-opens through the same route a lone click uses; its
+                # refusals (in-flight, locked, approved, the prompt gate re-asked) are
+                # the batch's refusals, in the same words.
+                if target.status in ("complete", "error"):
+                    render_again(project_id, target.id)
+                job = await generate_h3(
+                    project_id, target.id, H3Request(profile=request.profile)
+                )
+            except HTTPException as refusal:
+                skipped.append(
+                    BatchSkippedShot(
+                        shot_id=target.id, label=label, reason=str(refusal.detail)
+                    )
+                )
+                continue
+            submitted.append(
+                BatchSubmittedShot(shot_id=target.id, label=label, job_id=job.id)
+            )
+        # One fresh read for the bookkeeping: the loop's handlers each saved, so this
+        # patch must land on the manifest as it now stands, not on the pre-loop copy.
+        if submitted:
+            fresh = get_project(project_id)
+            submitted_jobs = {entry.job_id for entry in submitted}
+            submitted_shots = {entry.shot_id for entry in submitted}
+            for job in fresh.jobs:
+                if job.id in submitted_jobs:
+                    job.batch_id = batch_id
+            for shot in fresh.shots:
+                if shot.id in submitted_shots and shot.flagged:
+                    shot.flagged = False
+            store.save(fresh)
+        return BatchSubmissionResponse(
+            batch_id=batch_id if submitted else "",
+            submitted=submitted,
+            skipped=skipped,
+        )
 
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/enhance/ltx25",

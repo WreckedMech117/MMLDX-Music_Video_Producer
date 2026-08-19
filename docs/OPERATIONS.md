@@ -126,6 +126,14 @@ The export lands under `data/projects/{id}/media/exports/`, numbered and never o
 
 The dedicated keyframe modes (`image_to_video`, `first_last`) are the cheaper graphs and have **no song lip-sync** - the node has no audio input. To pin a frame on a shot that sings: use **references mode**, cite the picture in the `first` (or `last`) role alongside any identity references, and keep `use_song_audio` on. The picture rides as an ordinary reference slot and the structured prompt declares it the shot's first frame (`fully_preserved`), per MiniMax's guide 2.2.2 - the reference map writes that line for un-expanded shots, and the expansion specialist writes it for expanded ones. A keyframe picture counts against the node's 9-picture ceiling.
 
+## Generate All
+
+`POST /api/projects/{id}/generate/batch` — the queue panel's **Generate All** button — submits every ready shot as one batch (FR-4): one confirmation naming the count (server-enforced through `confirm_gpu`, so no client can spend hours of GPU by omission), each shot its own job and prompt id, all sharing one freshly minted `batch_id`. A shot whose submission refuses is **skipped by name with the route's own sentence and blocks nothing else** — the report lists both halves, and the toast relays it whole. Every submission rides the identical single-shot handlers, so no gate or payload rule exists twice.
+
+**Replace existing takes** (the checkbox beside the button) widens the batch to settled shots (`complete`/`error`), re-opened through the render-again path; approved and locked shots are never touched and the report names them. **Flag for re-render** (in the shot inspector, AD-5) marks a shot whose take fell short; *Re-queue flagged (N)* resubmits exactly the flagged set, and each success clears that shot's flag — a refusal keeps it, and the batch draining never touches it.
+
+FR-9 by construction: all submissions are kind `h3`, consecutive, in timeline order — nothing interleaves, nothing frees or unloads on the ComfyUI side, so the resident model stack survives the whole batch (measured: the second consecutive H3 render saved 150 s).
+
 ## Render a shot again
 
 `POST /api/projects/{id}/shots/{shot_id}/render-again`, and a control in the shot inspector, re-open a settled shot for one more submission by writing exactly one field — `status` back to `ready`. Before this existed, comparing two takes meant hand-editing status through the generic shots route with an API client, which is what had to be done on 2026-08-18 to compare the two sampling profiles.

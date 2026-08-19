@@ -1038,21 +1038,68 @@ export function batchReadinessBlock(report, queuedIds = []) {
   return { refused: blocked.length > 0, blocked, labels, message: blocked.length ? readinessRefusal(labels) : "" };
 }
 
-// Why the batch button is off when it is off. Nothing to queue is one reason and a batch the route
-// will certainly refuse is another, and they need different sentences: "mark a shot ready" is
-// useless advice for a batch whose Shots are all ready and one of which has no prompt.
+// Why the batch button is off when it is off. Nothing to queue is the only remaining
+// reason: a blocked shot no longer disables the whole batch, because the server-side
+// batch (FR-4) skips it by name and submits the rest — the pre-click warning survives as
+// a warning in the title and the confirm, never as a refusal the route would not make.
 export const QUEUE_WITHOUT_READY_SHOTS = "Mark a shot ready to queue H3";
+export const QUEUE_REPLACE_WITHOUT_TARGETS =
+  "Mark a shot ready — or render something for Replace existing to re-render";
 
-export function queueButtonState(report, readyShots = []) {
-  const shots = (readyShots || []).filter(Boolean);
-  if (!shots.length) return { disabled: true, blocked: [], title: QUEUE_WITHOUT_READY_SHOTS };
-  const block = batchReadinessBlock(report, shots.map((shot) => shot?.id));
-  if (block.refused) return { disabled: true, blocked: block.blocked, title: block.message };
+// Generate All's whole decision (spec-generate-all): the count the confirmation names,
+// the settled shots Replace Existing would re-open (approved and locked excluded — the
+// server names those in its report), and the readiness advisory as a heads-up rather
+// than a gate. Executed by the contract tests for every state.
+export function generateAllPlan(project, report = null, replaceExisting = false) {
+  const shots = (project?.shots || []).filter(Boolean);
+  const ready = shots.filter((shot) => shot.status === "ready");
+  const replace = replaceExisting
+    ? shots.filter(
+        (shot) =>
+          ["complete", "error"].includes(shot.status)
+          && !shot.locked
+          && !shot.approved_output,
+      )
+    : [];
+  const targets = [...ready, ...replace];
+  if (!targets.length) {
+    return {
+      disabled: true, count: 0, blocked: [],
+      title: replaceExisting ? QUEUE_REPLACE_WITHOUT_TARGETS : QUEUE_WITHOUT_READY_SHOTS,
+      confirm: "",
+    };
+  }
+  const blockedIds = new Set(report ? blockedShotIds(report) : []);
+  const blocked = targets.filter((shot) => blockedIds.has(shot.id)).map((shot) => shot.id);
+  const noun = (n) => `${n} H3 shot${n === 1 ? "" : "s"}`;
+  const skipNote = blocked.length
+    ? ` — ${blocked.length} will be skipped (no prompt)`
+    : "";
   return {
     disabled: false,
-    blocked: [],
-    title: `Queue ${shots.length} reviewed H3 shot${shots.length === 1 ? "" : "s"}`,
+    count: targets.length,
+    blocked,
+    title: `Generate ${noun(targets.length)}${skipNote}`,
+    confirm:
+      `Queue ${noun(targets.length)} as one batch?${skipNote ? `${skipNote}.` : ""} `
+      + "A reference shot measured 288-438 s on the default profile. "
+      + "One confirmation covers the batch.",
   };
+}
+
+// The batch report, as one toast the Director actually reads: what queued, what was
+// skipped, each skip in the server's own sentence.
+export function batchReportToast(report) {
+  const queued = report?.submitted?.length || 0;
+  const skipped = report?.skipped || [];
+  let message = queued
+    ? `${queued} shot${queued === 1 ? "" : "s"} queued as one batch`
+    : "Nothing queued";
+  if (skipped.length) {
+    const reasons = skipped.map((entry) => `${entry.label}: ${entry.reason}`).join(" · ");
+    message += ` — ${skipped.length} skipped. ${reasons}`;
+  }
+  return message;
 }
 
 // Which half of the report a note came from, said in words. State is never carried by colour
@@ -1802,20 +1849,6 @@ export function shotTakeUrl(projectId, shotId, latestOutput) {
   return `/api/projects/${projectId}/shots/${shotId}/take?v=${encodeURIComponent(latestOutput || "")}`;
 }
 
-// What a batch that failed partway has to say beyond the failure itself. The Shots already
-// accepted are burning GPU minutes right now, and a bare refusal reads as "nothing happened" --
-// so the Director edits and resubmits a plan half of which is already in flight.
-export const BATCH_QUEUE_PROGRESS =
-  "{queued} of {total} shots had already been queued when this failed; what was accepted is " +
-  "already rendering, and the rest was not sent.";
-export const BATCH_QUEUE_NO_PROGRESS = "Nothing was queued, so no GPU time was spent.";
-
-export function batchQueueProgress(queued, total) {
-  const done = Number(queued) || 0;
-  if (!done) return BATCH_QUEUE_NO_PROGRESS;
-  return BATCH_QUEUE_PROGRESS.replace("{queued}", `${done}`).replace("{total}", `${Number(total) || 0}`);
-}
-
 // The consequence of letting the server's text overwrite the editors, stated before any path
 // does it. Recovery captures the *stored* text, so unsaved on-screen edits are the one thing
 // this feature cannot bring back — discarding them silently would reintroduce the exact loss
@@ -2310,6 +2343,10 @@ export const api = {
   // the only stale answer possible is one this client held on to.
   readiness: (id) => request(`/api/projects/${id}/readiness`),
   generateH3: (projectId, shotId, body = {}) => request(`/api/projects/${projectId}/shots/${shotId}/generate/h3`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // Generate All (FR-4): one POST, the server submits per shot through the identical
+  // single-shot gates and reports what queued and what was skipped, each by name.
+  // confirm_gpu is the acknowledgement itself — sent true only after the confirm dialog.
+  generateBatch: (projectId, body) => request(`/api/projects/${projectId}/generate/batch`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // Re-open one settled shot for another take. Its own route and no body at all: the shots write
   // is the generic full-project-shaped one, and sending a whole shot list to say "render this
   // again" is how a stale client silently reverts every other shot in the plan. Nothing is
