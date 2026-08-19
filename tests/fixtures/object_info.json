@@ -384,6 +384,64 @@
       "clear conditioning"
     ]
   },
+  "EmptyMiniMaxH3ImageLatentAV": {
+    "category": "model/latent/minimax",
+    "description": "Creates a true one-frame MiniMax H3 audiovisual latent for the experimental T=1 image VAE. Use this node for still images only.",
+    "display_name": "Empty MiniMax H3 Image AV Latent (T=1)",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "batch_size": [
+          "INT",
+          {
+            "default": 1,
+            "max": 64,
+            "min": 1,
+            "step": 1
+          }
+        ],
+        "height": [
+          "INT",
+          {
+            "default": 768,
+            "max": 16384,
+            "min": 32,
+            "step": 32
+          }
+        ],
+        "width": [
+          "INT",
+          {
+            "default": 1344,
+            "max": 16384,
+            "min": 32,
+            "step": 32
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "width",
+        "height",
+        "batch_size"
+      ]
+    },
+    "is_input_list": false,
+    "name": "EmptyMiniMaxH3ImageLatentAV",
+    "output": [
+      "LATENT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "latent"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-MiniMaxH3-T1-Latent",
+    "search_aliases": []
+  },
   "EmptyMiniMaxMusic3LatentAudio": {
     "api_node": false,
     "category": "model/latent/minimax music",
@@ -548,6 +606,112 @@
     "price_badge": null,
     "python_module": "comfy_extras.nodes_images",
     "search_aliases": null
+  },
+  "ImageScaleToTotalPixelsX": {
+    "category": "image/upscaling",
+    "description": "",
+    "display_name": "Scale Image to Total Pixels Adv",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "unique_id": "UNIQUE_ID"
+      },
+      "optional": {
+        "height": [
+          "INT",
+          {
+            "forceInput": true
+          }
+        ],
+        "width": [
+          "INT",
+          {
+            "forceInput": true
+          }
+        ]
+      },
+      "required": {
+        "image": [
+          "IMAGE"
+        ],
+        "megapixels": [
+          "FLOAT",
+          {
+            "default": 1.05,
+            "max": 16.0,
+            "min": 0.0,
+            "step": 0.01
+          }
+        ],
+        "multiple_of": [
+          "INT",
+          {
+            "default": 16,
+            "max": 128,
+            "min": 1,
+            "step": 1
+          }
+        ],
+        "resize_mode": [
+          [
+            "stretch",
+            "crop",
+            "pad"
+          ],
+          {
+            "default": "crop"
+          }
+        ],
+        "upscale_method": [
+          [
+            "nearest-exact",
+            "bilinear",
+            "area",
+            "bicubic",
+            "lanczos"
+          ],
+          {
+            "default": "lanczos"
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "unique_id"
+      ],
+      "optional": [
+        "width",
+        "height"
+      ],
+      "required": [
+        "image",
+        "megapixels",
+        "multiple_of",
+        "resize_mode",
+        "upscale_method"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ImageScaleToTotalPixelsX",
+    "output": [
+      "IMAGE",
+      "INT",
+      "INT"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "image",
+      "width",
+      "height"
+    ],
+    "output_node": true,
+    "python_module": "custom_nodes.ComfyUi-Scale-Image-to-Total-Pixels-Advanced",
+    "search_aliases": []
   },
   "KSampler": {
     "category": "model/sampling",
@@ -3297,6 +3461,65 @@
       "flac",
       "mp3",
       "opus"
+    ]
+  },
+  "SaveImage": {
+    "category": "image",
+    "description": "Saves the input images to your ComfyUI output directory.",
+    "display_name": "Save Image",
+    "essentials_category": "Basics",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "extra_pnginfo": "EXTRA_PNGINFO",
+        "prompt": "PROMPT"
+      },
+      "required": {
+        "filename_prefix": [
+          "STRING",
+          {
+            "default": "ComfyUI",
+            "tooltip": "The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes."
+          }
+        ],
+        "images": [
+          "IMAGE",
+          {
+            "tooltip": "The images to save."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "prompt",
+        "extra_pnginfo"
+      ],
+      "required": [
+        "images",
+        "filename_prefix"
+      ]
+    },
+    "is_input_list": false,
+    "name": "SaveImage",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "images"
+    ],
+    "output_node": true,
+    "python_module": "nodes",
+    "search_aliases": [
+      "save",
+      "save image",
+      "export image",
+      "output image",
+      "write image",
+      "download"
     ]
   },
   "UNETLoader": {

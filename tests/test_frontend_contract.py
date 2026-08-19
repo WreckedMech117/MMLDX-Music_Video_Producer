@@ -3143,13 +3143,16 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
     from music_video_producer.batch import readiness_refusal
 
     submitters = app_py_submitting_routes()
-    # Pinned, so a new submitting route cannot appear without this test being read. The four
-    # non-Shot routes render a Song, an image or an Asset and have no prompt of a Shot's to check.
+    # Pinned, so a new submitting route cannot appear without this test being read. The
+    # non-Shot routes render a Song, an image or an Asset and have no prompt of a Shot's to
+    # check — `edit_asset` (AI Mod, 2026-08-19) is asset-sourced like multiview: its input
+    # is an Asset's own image and instruction, gated by its own refusals, never a Shot.
     assert set(submitters) == {
         "generate_music",
         "generate_songplanner",
         "generate_flux",
         "generate_multiview",
+        "edit_asset",
         "generate_h3",
         "enhance_with_ltx25",
         "restore_song_audio",
@@ -4271,6 +4274,40 @@ def test_the_assembly_client_calls_a_route_the_server_exposes_and_the_bar_is_wir
         "renderAssembly is no longer reached from renderTimeline — the bar would draw once and go stale"
     )
     assert 'id="assembly-bar"' in INDEX_HTML.read_text(encoding="utf-8")
+
+
+def test_ai_mod_is_offered_to_image_assets_and_calls_a_real_route():
+    """`aiModPlan` executed for every asset shape, and the `removeSong` lesson applied to
+    the new call: the hand-written URL is compared against the server's route table."""
+    states = run_module("""
+      import { aiModPlan } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        character: aiModPlan({ kind: 'character', path: 'media/a.png' }),
+        setting: aiModPlan({ kind: 'setting', path: 'media/b.png' }),
+        editedChild: aiModPlan({ kind: 'character', path: 'assets/child.png' }),
+        pending: aiModPlan({ kind: 'character', path: '' }),
+        audio: aiModPlan({ kind: 'audio', path: 'media/song.mp3' }),
+        video: aiModPlan({ kind: 'video', path: 'media/clip.mp4' }),
+        nothing: aiModPlan(undefined),
+      }));
+    """)
+    for ready in ("character", "setting", "editedChild"):
+        assert states[ready] == {"ready": True}, ready
+    assert states["pending"] == {"ready": False}
+    for refused in ("audio", "video", "nothing"):
+        assert states[refused] is None, refused
+
+    source = API_JS.read_text(encoding="utf-8")
+    call = source.split("editAsset:", 1)[1].split("\n", 1)[0]
+    url = re.search(r"`([^`]+)`", call)
+    assert url, "api.editAsset no longer builds its URL from a template literal"
+    template = re.sub(r"\$\{projectId\}", "{project_id}", url.group(1))
+    template = re.sub(r"\$\{assetId\}", "{asset_id}", template)
+    assert template in {route.path for route in create_app().routes}
+
+    workspace = APP_JS.read_text(encoding="utf-8")
+    assert 'id="ai-mod-asset"' in workspace
+    assert "aiModAsset" in workspace
 
 
 def test_the_monitor_and_the_offset_rule_are_executed_for_every_state():

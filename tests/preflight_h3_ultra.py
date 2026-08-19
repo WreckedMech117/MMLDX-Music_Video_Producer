@@ -83,6 +83,7 @@ from music_video_producer.workflows import (
     H3_REFERENCE_MAX_FRAMES,
     H3_SPLIT_OFFSETS,
     build_h3_director_payload,
+    build_h3_image_edit_payload,
     build_h3_keyframe_payload,
     build_h3_reference_payload,
     select_resolution,
@@ -368,6 +369,35 @@ def audit_payloads() -> list[tuple[str, dict]]:
                 requested_frames=align_h3_frames(round(415 * H3_FRAME_RATE)),
                 start=0.0,
                 **{**smallest, **director},
+            ),
+        ),
+        (
+            # AI Mod, the plain export's bundle: the image VAE joins the model-file check
+            # by being loaded, `SaveImage`/`ImageScaleToTotalPixelsX`/
+            # `EmptyMiniMaxH3ImageLatentAV` join the class check by being emitted. Three
+            # pictures so the multi-picture wiring (`ref_image_1`+ off the raw splitter)
+            # is validated, not only the scaled base.
+            "image-edit-default",
+            build_h3_image_edit_payload(
+                prompt="subject_definitions:\n<Picture 1> is the base image being edited.",
+                pictures=[
+                    {"file": "F:/refs/base.png", "label": "base"},
+                    {"file": "F:/refs/outfit.png", "label": "outfit"},
+                    {"file": "F:/refs/scene.png", "label": "scene"},
+                ],
+                seed=0,
+                prefix="preflight",
+            ),
+        ),
+        (
+            # The turbo twin: its LoRA joins the model-file check by being loaded.
+            "image-edit-turbo",
+            build_h3_image_edit_payload(
+                prompt="subject_definitions:\n<Picture 1> is the base image being edited.",
+                pictures=[{"file": "F:/refs/base.png", "label": "base"}],
+                seed=0,
+                profile="turbo",
+                prefix="preflight",
             ),
         ),
     ]

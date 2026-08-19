@@ -43,6 +43,7 @@ from music_video_producer.workflows import (
     H3_DIRECTOR_MAX_FRAMES,
     H3_DIRECTOR_MAX_SECONDS,
     H3_FRAME_RATE,
+    H3_IMAGE_EDIT_PROFILES,
     H3_KEYFRAME_DEFAULT_STEPS,
     H3_KEYFRAME_MAX_FRAMES,
     H3_LORA_STRENGTH_LIMITS,
@@ -77,6 +78,7 @@ from music_video_producer.workflows import (
     build_audio_replace_payload,
     build_flux_payload,
     build_h3_director_payload,
+    build_h3_image_edit_payload,
     build_h3_keyframe_payload,
     build_h3_reference_payload,
     build_ltx25_enhance_payload,
@@ -218,6 +220,28 @@ def every_builder_payload() -> list[tuple[str, dict]]:
                 prefix="p",
             ),
         ),
+        (
+            # AI Mod's two evidenced bundles, each its own graph (the turbo one draws the
+            # chain through a LoRA), multi-picture on the default so the raw-splitter
+            # slots are range-checked too.
+            "h3-image-edit",
+            build_h3_image_edit_payload(
+                prompt="subject_definitions:\n<Picture 1> is the base image being edited.",
+                pictures=[{"file": "a.png"}, {"file": "b.png"}],
+                seed=0,
+                prefix="p",
+            ),
+        ),
+        (
+            "h3-image-edit-turbo",
+            build_h3_image_edit_payload(
+                prompt="subject_definitions:\n<Picture 1> is the base image being edited.",
+                pictures=[{"file": "a.png"}],
+                seed=0,
+                profile="turbo",
+                prefix="p",
+            ),
+        ),
     ]
 
 
@@ -269,7 +293,7 @@ UNRECORDED_CLASSES = frozenset({
     "MathExpression|pysssss",
     "ModelSamplingFlux", "PrimitiveFloat",
     "PrimitiveStringMultiline", "RTXVideoSuperResolution",
-    "SaveImage", "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
+    "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
     "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask", "VAEDecodeTiled",
     "VAEEncode", "VHS_LoadImagePath", "easy cleanGpuUsed",
     "easy clearCacheAll",
@@ -3188,6 +3212,9 @@ def test_the_h3_audit_reads_its_model_files_out_of_the_payloads():
         # because the two turbo bundles come from two different graphs.
         "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
         "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+        # The image-edit variants load the dedicated image VAE — AI Mod's distinctive
+        # model file, in the set because a payload loads it (2026-08-19).
+        "minimax_h3_t1_image_vae_step1597.safetensors",
     }
     assert {class_type for class_type, _, _ in files} == {
         "UNETLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly",
@@ -3417,7 +3444,11 @@ def test_the_h3_audit_samples_no_bundle_a_profile_does_not_declare():
     configuration. Only shipped bundles are audited, and every shipped LoRA is loaded by
     one of them.
     """
-    declared = {declared_bundle(profile) for profile in H3_REFERENCE_PROFILES.values()}
+    declared = {
+        declared_bundle(profile)
+        for table in (H3_REFERENCE_PROFILES, H3_IMAGE_EDIT_PROFILES)
+        for profile in table.values()
+    }
 
     for label, payload in audited_reference_variants():
         assert audited_bundle(payload) in declared, (label, audited_bundle(payload))
@@ -3429,7 +3460,10 @@ def test_the_h3_audit_samples_no_bundle_a_profile_does_not_declare():
         if node["class_type"] == "LoraLoaderModelOnly"
     }
     assert loaded == {
-        profile.lora for profile in H3_REFERENCE_PROFILES.values() if profile.lora is not None
+        profile.lora
+        for table in (H3_REFERENCE_PROFILES, H3_IMAGE_EDIT_PROFILES)
+        for profile in table.values()
+        if profile.lora is not None
     }
 
 

@@ -430,7 +430,7 @@ def apply_job_history(project: Project, job: RenderJob, history: HistoryResult) 
     ]
     job.error = history.error
     if job.status == "complete":
-        if job.kind in {"flux", "multiview"}:
+        if job.kind in {"flux", "multiview", "edit"}:
             asset = next((item for item in project.assets if item.id == job.target_id), None)
             if asset and job.output_files:
                 asset.path = job.output_files[0]

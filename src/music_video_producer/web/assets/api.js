@@ -1980,6 +1980,16 @@ export function multiviewPlan(asset) {
   return { prompt, ready: Boolean(asset.path) };
 }
 
+// AI Mod (the Director's stage-3 ask): whether this asset can take a prompted image edit.
+// Any image-kinded asset qualifies — a character, a setting, a prop, a style frame, an
+// already-edited child (edits chain) — and only audio/video media cannot. Same shown/ready
+// split as multiviewPlan and for its reason: an asset still rendering can be modded, once
+// it exists.
+export function aiModPlan(asset) {
+  if (!asset || ["audio", "video"].includes(asset.kind)) return null;
+  return { ready: Boolean(asset.path) };
+}
+
 // -------------------------------------------------------------------------------------------
 // Render polling -- the client half of AD-1's transport decision. Every decision here is pure
 // and executed under node by the contract tests; app.js only owns the timer and the repaints.
@@ -2290,6 +2300,9 @@ export const api = {
   generateSongPlanner: (id, body) => request(`/api/projects/${id}/generate/songplanner`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateFlux: (id, body) => request(`/api/projects/${id}/generate/flux`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateMultiview: (projectId, assetId, body) => request(`/api/projects/${projectId}/assets/${assetId}/multiview`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // AI Mod: one instruction, one new asset beside the source. The server wraps a plain
+  // sentence in the workflow's own prompting form; a full structured prompt travels verbatim.
+  editAsset: (projectId, assetId, body) => request(`/api/projects/${projectId}/assets/${assetId}/edit`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   analyzeAsset: (projectId, assetId) => request(`/api/projects/${projectId}/assets/${assetId}/analyze`, { method: "POST" }),
   analyzeLatestTake: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/analyze-latest`, { method: "POST" }),
   compileTimeline: (id, body) => request(`/api/projects/${id}/timeline/compile`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

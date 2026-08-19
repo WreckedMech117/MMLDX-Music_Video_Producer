@@ -623,7 +623,9 @@ class TreatmentMessage(BaseModel):
 
 class RenderJob(BaseModel):
     id: str = Field(default_factory=lambda: new_id("job"))
-    kind: Literal["music", "flux", "multiview", "h3", "ltx", "post"]
+    # `edit` is the H3 image-edit (AI Mod) — an asset-producing GPU render like `flux`
+    # and `multiview`, and adopted onto its target asset by the same completion writer.
+    kind: Literal["music", "flux", "multiview", "edit", "h3", "ltx", "post"]
     status: JobStatus = "queued"
     prompt_id: str = ""
     target_id: str = ""

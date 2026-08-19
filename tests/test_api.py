@@ -3735,6 +3735,149 @@ def test_promotion_records_its_parent_and_leaves_the_source_asset_untouched(tmp_
     assert comfy.uploads == [source_bytes]
 
 
+def test_ai_mod_creates_a_child_asset_and_the_completion_adopts_the_edit(tmp_path: Path):
+    """The Director's stage-3 ask end to end: instruction in, new asset beside the source,
+    the landed file adopted by the one completion writer, the source untouched.
+
+    The submitted graph is checked for the adapter's distinctive facts rather than trusted:
+    the image VAE conditioning seat, the wrapped prompt carrying the instruction, and the
+    resolved source path inside `media_state` — the reference path's way, no upload.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="AI Mod"))
+    uploaded = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "HarderFaster", "kind": "character"},
+        files={"file": ("harderfaster.png", b"png-data", "image/png")},
+    ).json()
+    asset_id = uploaded["assets"][0]["id"]
+    manifest = store.manifest_path(project.id)
+    before = json.dumps(json.loads(manifest.read_text(encoding="utf-8"))["assets"][0])
+
+    response = client.post(
+        f"/api/projects/{project.id}/assets/{asset_id}/edit",
+        json={"instruction": "Change her boots to bright red leather boots.", "profile": "turbo"},
+    )
+
+    assert response.status_code == 202, response.text
+    job = response.json()
+    assert job["kind"] == "edit"
+    payload = comfy.prompts[-1]
+    assert payload["mvp:condition"]["inputs"]["vae"] == ["mvp:image_vae", 0]
+    assert payload["mvp:save"]["class_type"] == "SaveImage"
+    prompt = payload["mvp:condition"]["inputs"]["prompt"]
+    assert prompt.startswith("subject_definitions:")
+    assert "Change her boots to bright red leather boots." in prompt
+    assert "(HarderFaster)" in prompt
+    media = json.loads(payload["mvp:references"]["inputs"]["media_state"])
+    assert media[0]["file"].endswith("harderfaster.png")
+    # Turbo is the turbo export's own bundle.
+    assert payload["mvp:scheduler"]["inputs"]["steps"] == 8
+    assert payload["mvp:lora"]["inputs"]["lora_name"].startswith("minimax_h3_turbo_v4_step600")
+
+    persisted = json.loads(manifest.read_text(encoding="utf-8"))["assets"]
+    assert len(persisted) == 2
+    assert json.dumps(persisted[0]) == before
+    child = persisted[1]
+    assert child["parent_id"] == asset_id
+    assert child["source"] == "h3-image-edit"
+    assert child["kind"] == "character"
+    assert child["path"] == ""
+
+    # The completion lands the edited image onto the child — `apply_job_history`, the one
+    # writer, through the ordinary per-job refresh.
+    async def completed_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "complete",
+                "outputs": [
+                    {
+                        "subfolder": f"music-video-producer/{project.id}/assets",
+                        "filename": f"{child['id']}-edit_00001_.png",
+                    }
+                ],
+                "error": "",
+            },
+        )()
+
+    comfy.history = completed_history
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+    assert refreshed.status_code == 200
+    landed = store.get(project.id).assets[-1]
+    assert landed.path.endswith(f"{child['id']}-edit_00001_.png")
+    # An edited child is an ordinary image asset: a second mod on it is accepted. Its
+    # file lives under the ComfyUI output root, where the route resolves rendered assets.
+    rendered = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project.id / "assets"
+        / f"{child['id']}-edit_00001_.png"
+    )
+    rendered.parent.mkdir(parents=True, exist_ok=True)
+    rendered.write_bytes(b"edited-png")
+    again = client.post(
+        f"/api/projects/{project.id}/assets/{landed.id}/edit",
+        json={"instruction": "Now make the jacket white."},
+    )
+    assert again.status_code == 202
+
+
+def test_ai_mod_refuses_what_it_cannot_edit(tmp_path: Path):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Refusals"))
+    uploaded = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "Master track", "kind": "audio"},
+        files={"file": ("song.mp3", b"mp3-data", "audio/mpeg")},
+    ).json()
+    audio_id = uploaded["assets"][0]["id"]
+
+    wrong_kind = client.post(
+        f"/api/projects/{project.id}/assets/{audio_id}/edit",
+        json={"instruction": "Make it red."},
+    )
+    assert wrong_kind.status_code == 422
+    assert "audio" in wrong_kind.json()["detail"]
+
+    stored = store.get(project.id)
+    stored.assets.append(Asset(id="asset_unrendered", name="Pending", kind="character", path=""))
+    store.save(stored)
+    unrendered = client.post(
+        f"/api/projects/{project.id}/assets/asset_unrendered/edit",
+        json={"instruction": "Make it red."},
+    )
+    assert unrendered.status_code == 422
+    assert "no image yet" in unrendered.json()["detail"]
+
+    blank = client.post(
+        f"/api/projects/{project.id}/assets/asset_unrendered/edit",
+        json={"instruction": "   "},
+    )
+    assert blank.status_code == 422
+
+    missing = client.post(
+        f"/api/projects/{project.id}/assets/asset_absent/edit",
+        json={"instruction": "Make it red."},
+    )
+    assert missing.status_code == 404
+    assert comfy.prompts == []
+
+    # A structured instruction travels verbatim — never double-wrapped.
+    imaged = client.post(
+        f"/api/projects/{project.id}/assets/upload",
+        data={"name": "Sheet", "kind": "character"},
+        files={"file": ("sheet.png", b"png-data", "image/png")},
+    ).json()["assets"][-1]
+    structured = "subject_definitions:\n<Picture 1> is x.\n\ndetailed_description:\nY."
+    verbatim = client.post(
+        f"/api/projects/{project.id}/assets/{imaged['id']}/edit",
+        json={"instruction": structured},
+    )
+    assert verbatim.status_code == 202
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["prompt"] == structured
+
+
 def test_multiview_rejects_asset_paths_outside_project_media(tmp_path: Path):
     client, store, comfy = make_client(tmp_path)
     project = store.create(Project(name="Contained"))

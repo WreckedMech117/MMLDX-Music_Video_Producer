@@ -101,6 +101,7 @@ from .workflows import (
     build_audio_replace_payload,
     build_flux_payload,
     build_h3_director_payload,
+    build_h3_image_edit_payload,
     build_h3_keyframe_payload,
     build_h3_reference_payload,
     build_ltx25_enhance_payload,
@@ -108,6 +109,7 @@ from .workflows import (
     build_music3_payload,
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
+    image_edit_prompt,
     song_audio_window,
 )
 
@@ -1645,6 +1647,21 @@ class FluxRequest(BaseModel):
 class MultiviewRequest(BaseModel):
     prompt: str = Field(min_length=1)
     # KSampler.seed is 64-bit; see MusicRequest.seed on why unbounded is wrong.
+    seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
+
+
+class AssetEditRequest(BaseModel):
+    """AI Mod's wire shape: the edit in the Director's words, and which evidenced bundle.
+
+    `instruction` is a plain sentence by default — the route wraps it in the workflow's
+    own prompting form — or the full structured prompt when it carries
+    `subject_definitions:`, which travels verbatim. The two profiles are the two imported
+    exports' bundles and nothing in between; a `Literal` so an unknown one is a 422
+    before any payload exists.
+    """
+
+    instruction: str = Field(min_length=1)
+    profile: Literal["default", "turbo"] = "default"
     seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
 
 
@@ -3227,6 +3244,92 @@ def create_app(
         project.assets.append(child)
         job = RenderJob(
             kind="multiview",
+            prompt_id=submission.prompt_id,
+            target_id=child.id,
+            seed=request.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
+        return job
+
+    @app.post(
+        "/api/projects/{project_id}/assets/{asset_id}/edit",
+        response_model=RenderJob,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def edit_asset(
+        project_id: str, asset_id: str, request: AssetEditRequest
+    ) -> RenderJob:
+        """AI Mod: one image asset plus one instruction becomes a *new* asset beside it.
+
+        The Director's stage-3 ask, verbatim shape: prompt an edit, get a new image asset
+        to keep, delete (rejection is ordinary deletion), or modify further — a child of
+        an edit is an ordinary image asset, so edits chain. The source is never touched.
+
+        The instruction travels in the workflow's own prompting form via
+        `image_edit_prompt` — identity preserved, the edit stated, everything else kept —
+        unless it already carries the structured marker, in which case the Director wrote
+        the full form and it goes verbatim. The media reaches ComfyUI the reference
+        path's way: a resolved absolute file path through the H3 media loader, no upload.
+
+        `generate_multiview` is the template for everything else here: the child is
+        created before submission with an empty path, the job (kind `edit`) targets it,
+        and `apply_job_history` — the one completion writer — adopts the landed file.
+        """
+        project = get_project(project_id)
+        source = next((item for item in project.assets if item.id == asset_id), None)
+        if not source:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        if source.kind in ("audio", "video"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"AI Mod edits images, and {source.name} is {source.kind} media.",
+            )
+        if not source.path:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{source.name} has no image yet — render or upload it first.",
+            )
+        if not request.instruction.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="Describe the edit: what should change, and what must stay.",
+            )
+        source_path = resolve_asset_path(project_id, source)
+        prompt = image_edit_prompt(
+            request.instruction,
+            source_kind=source.kind,
+            source_label=source.name,
+        )
+        child = Asset(
+            name=f"{source.name} · edit",
+            # An edited character is still a character; an edited setting is still a
+            # setting. The multiview promotion's rule, for the multiview promotion's
+            # reason.
+            kind=source.kind,
+            path="",
+            source="h3-image-edit",
+            parent_id=source.id,
+            prompt=prompt,
+        )
+        try:
+            payload = build_h3_image_edit_payload(
+                prompt=prompt,
+                pictures=[{"file": str(source_path), "label": source.name}],
+                seed=request.seed,
+                profile=request.profile,
+                prefix=f"music-video-producer/{project_id}/assets/{child.id}-edit",
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        child.prompt_id = submission.prompt_id
+        project.assets.append(child)
+        job = RenderJob(
+            kind="edit",
             prompt_id=submission.prompt_id,
             target_id=child.id,
             seed=request.seed,

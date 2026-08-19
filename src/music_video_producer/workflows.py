@@ -1181,6 +1181,239 @@ def build_h3_keyframe_payload(
     }
 
 
+# --------------------------------------------------------------------------------------------
+# The H3 image-edit adapter (AI Mod) — spec-ai-mod-image-edit, evidence
+# `h3-image-edit-user-export.json` / `h3-turbo-image-edit-user-export.json`.
+# --------------------------------------------------------------------------------------------
+
+#: The two evidenced image-edit bundles, one per export, whole. ``default`` is the plain
+#: export's own `simple`/20/`res_multistep` with an empty Power Lora. ``turbo`` is its twin's
+#: `minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors` at 1.0 with **`beta`**/8/
+#: `euler` — note the scheduler differs from `turbo-references2v`'s `simple` with the *same*
+#: LoRA. Same class, different graphs, different scheduler: bundles are evidenced per export
+#: and never borrowed across (the MANIFEST records both readings).
+H3_IMAGE_EDIT_PROFILES: dict[str, H3SamplingProfile] = {
+    "default": H3SamplingProfile(
+        lora=None,
+        lora_strength=None,
+        scheduler="simple",
+        sampler="res_multistep",
+        steps=20,
+    ),
+    "turbo": H3SamplingProfile(
+        lora="minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+        lora_strength=1.0,
+        scheduler="beta",
+        sampler="euler",
+        steps=8,
+    ),
+}
+
+#: The export's own canvas. Its two rgthree Any Switches offer an INTConstant against the
+#: scaled source's dimensions, and the switch returns its first non-null input at runtime —
+#: the constants — so 1920×1080 is what the export actually renders, resolved server-side
+#: rather than reproduced as plumbing. (1080 is not a multiple of 32; the latent node
+#: accepts it, and honesty to the evidence beats tidiness to a grid nothing here enforces.)
+H3_IMAGE_EDIT_DEFAULT_WIDTH = 1920
+H3_IMAGE_EDIT_DEFAULT_HEIGHT = 1080
+
+#: The conditioner's picture ceiling, same node and same nine slots as the reference path.
+H3_IMAGE_EDIT_MAX_PICTURES = 9
+
+#: How a hand-written full-form prompt announces itself. An instruction carrying this is
+#: sent verbatim — wrapping it again would nest one structured document inside another.
+IMAGE_EDIT_STRUCTURED_MARKER = "subject_definitions:"
+
+
+def image_edit_prompt(
+    instruction: str,
+    *,
+    source_kind: str,
+    source_label: str,
+    extra_labels: tuple[str, ...] = (),
+) -> str:
+    """The edit instruction in the workflow's own prompting form.
+
+    The shape is the guide bundled inside the Director's editor-format workflow (referenced,
+    never copied wholesale): subject definitions, a ``[reference generation]`` summary,
+    ``attribute_transfer`` on the base picture, ``fully_preserved`` identity, the edit as
+    the detailed description, and the two sound fields closed off (``Silence`` / ``N/A``)
+    because this graph saves an image. The order is the guide's own rule: *reference →
+    preserve identity → describe the edit → preserve everything else* — and the
+    always-preserve list deliberately **excludes clothing and pose**, because "change the
+    outfit" is the Director's own worked example and a preamble that pre-forbids the edit
+    would fight the instruction it wraps.
+
+    A character source gets the guide's subject form; any other kind gets the plain form —
+    a warehouse has no identity to preserve, only composition and style. An instruction
+    that already carries ``subject_definitions:`` is returned verbatim.
+    """
+    if IMAGE_EDIT_STRUCTURED_MARKER in instruction:
+        return instruction
+    edit = instruction.strip()
+    extras = "".join(
+        f"\n<Picture {index}> is {label}." for index, label in enumerate(extra_labels, start=2)
+    )
+    extra_retention = "".join(
+        f"\n<Picture {index}>: reference - additional visual reference."
+        for index in range(2, 2 + len(extra_labels))
+    )
+    if source_kind == "character":
+        return (
+            "subject_definitions:\n"
+            "<Picture 1> is the base image being edited.\n"
+            f"<Subject 1> is the character from <Picture 1> ({source_label}), preserving "
+            "the character's identity and important visual features."
+            f"{extras}\n\n"
+            "summary:\n"
+            "[reference generation] The target image is an edited version of <Picture 1>.\n\n"
+            "retention_analysis:\n"
+            "<Picture 1>: attribute_transfer - provides the original composition, visual "
+            "style, and subject reference.\n"
+            "<Subject 1>: fully_preserved - preserve the character's identity and important "
+            "design features."
+            f"{extra_retention}\n\n"
+            "detailed_description:\n"
+            f"Preserve <Subject 1>'s exact identity, face, and body proportions. {edit} "
+            "Keep everything not named above unchanged: composition, lighting, background, "
+            "and visual style.\n\n"
+            "overall_soundscape:\n"
+            "Silence\n\n"
+            "non_diegetic_music:\n"
+            "N/A"
+        )
+    return (
+        "subject_definitions:\n"
+        f"<Picture 1> is the base image being edited ({source_label})."
+        f"{extras}\n\n"
+        "summary:\n"
+        "[reference generation] The target image is an edited version of <Picture 1>.\n\n"
+        "retention_analysis:\n"
+        "<Picture 1>: attribute_transfer - provides the original composition, visual "
+        "style, and subject reference."
+        f"{extra_retention}\n\n"
+        "detailed_description:\n"
+        f"{edit} Keep everything not named above unchanged: composition, lighting, and "
+        "visual style.\n\n"
+        "overall_soundscape:\n"
+        "Silence\n\n"
+        "non_diegetic_music:\n"
+        "N/A"
+    )
+
+
+def build_h3_image_edit_payload(
+    *,
+    prompt: str,
+    pictures: list[dict[str, Any]],
+    seed: int,
+    width: int | None = None,
+    height: int | None = None,
+    steps: int | None = None,
+    profile: str = "default",
+    prefix: str,
+) -> dict[str, dict[str, Any]]:
+    """Build the H3 image-edit graph: a ``length: 5`` reference render that saves one image.
+
+    Reproduces the reachable 24 of `h3-image-edit-user-export.json`'s 27 nodes. What is
+    *not* reproduced is a named decision: the Image Comparer (editor UI), the video VAE
+    loader and the ``fl2va`` UNET (the export's orphans — the exact mirror of the keyframe
+    export, where ``ref2va`` was the orphan), Spectrum (both prior H3 adapters' recorded
+    omission, mirrored again), the empty Power Lora (a no-op; a profile's LoRA arrives
+    through ``LoraLoaderModelOnly`` as everywhere else), and the INTConstant/Any Switch
+    plumbing (resolved server-side; see ``H3_IMAGE_EDIT_DEFAULT_WIDTH``). **No sigma
+    shift and no preview node exist in this export** — this builder emits what the
+    evidence holds, not the video graphs' habit.
+
+    The distinctive wiring, each read from the export: the dedicated **image VAE**
+    (``t1_image_vae_step1597``) sits in the conditioner's ``vae`` seat *and* decodes the
+    sample; the first picture — the base image being edited — passes through
+    ``ImageScaleToTotalPixelsX`` (2 MP, ×32, crop, lanczos) into ``ref_image_0`` while
+    pictures 2–9 ride the splitter unscaled; and the sampler's latent is an
+    ``EmptyMiniMaxH3ImageLatentAV`` canvas, not the conditioner's output.
+    """
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("An image edit requires a prompt")
+    if profile not in H3_IMAGE_EDIT_PROFILES:
+        named = ", ".join(sorted(H3_IMAGE_EDIT_PROFILES))
+        raise ValueError(f"Unknown H3 image-edit profile {profile!r}; expected one of: {named}")
+    sampling = H3_IMAGE_EDIT_PROFILES[profile]
+    if steps is not None and (not isinstance(steps, int) or isinstance(steps, bool) or steps < 1):
+        raise ValueError(f"steps must be a positive integer, not {steps!r}")
+    if not pictures:
+        raise ValueError("An image edit requires at least the base picture")
+    if len(pictures) > H3_IMAGE_EDIT_MAX_PICTURES:
+        raise ValueError(
+            f"H3 accepts at most {H3_IMAGE_EDIT_MAX_PICTURES} pictures per edit and this "
+            f"one has {len(pictures)}"
+        )
+    for item in pictures:
+        if not isinstance(item.get("file"), str) or not item["file"].strip():
+            raise ValueError(f"An edit picture must name a file path, not {item.get('file')!r}")
+    width = H3_IMAGE_EDIT_DEFAULT_WIDTH if width is None else width
+    height = H3_IMAGE_EDIT_DEFAULT_HEIGHT if height is None else height
+    for name, value in (("width", width), ("height", height)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 16:
+            raise ValueError(f"An image edit {name} must be an integer of at least 16, not {value!r}")
+    media_state = json.dumps(
+        [
+            {"kind": "picture", **item, "enabled": item.get("enabled", True)}
+            for item in pictures
+        ],
+        separators=(",", ":"),
+    )
+    condition_inputs: dict[str, Any] = {
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "length": 5,
+        "ref_image_size": "max",
+        "clip": ["mvp:clip", 0],
+        "vae": ["mvp:image_vae", 0],
+        "audio_vae": ["mvp:audio_vae", 0],
+        # The base picture arrives scaled; every further picture rides the splitter raw.
+        "ref_images.ref_image_0": ["mvp:scale", 0],
+    }
+    for index in range(1, len(pictures)):
+        condition_inputs[f"ref_images.ref_image_{index}"] = [
+            "mvp:split", H3_SPLIT_OFFSETS["picture"] + index,
+        ]
+    model_source = ["mvp:model", 0] if sampling.lora is None else ["mvp:lora", 0]
+    return {
+        "mvp:model": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+        **(
+            {}
+            if sampling.lora is None
+            else {
+                "mvp:lora": {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {
+                        "model": ["mvp:model", 0],
+                        "lora_name": sampling.lora,
+                        "strength_model": sampling.lora_strength,
+                    },
+                }
+            }
+        ),
+        "mvp:attention": {"class_type": "PathchSageAttentionKJ", "inputs": {"model": model_source, "sage_attention": "disabled", "allow_compile": False}},
+        "mvp:clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
+        "mvp:image_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_t1_image_vae_step1597.safetensors"}},
+        "mvp:audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+        "mvp:references": {"class_type": "MiniMaxH3MediaLoader", "inputs": {"media_state": media_state}},
+        "mvp:split": {"class_type": "MiniMaxH3ReferenceSplitter", "inputs": {"references": ["mvp:references", 0]}},
+        "mvp:scale": {"class_type": "ImageScaleToTotalPixelsX", "inputs": {"image": ["mvp:split", H3_SPLIT_OFFSETS["picture"]], "megapixels": 2, "multiple_of": 32, "resize_mode": "crop", "upscale_method": "lanczos"}},
+        "mvp:condition": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": condition_inputs},
+        "mvp:latent": {"class_type": "EmptyMiniMaxH3ImageLatentAV", "inputs": {"width": width, "height": height, "batch_size": 1}},
+        "mvp:sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampling.sampler}},
+        "mvp:scheduler": {"class_type": "BasicScheduler", "inputs": {"model": ["mvp:attention", 0], "scheduler": sampling.scheduler, "steps": sampling.steps if steps is None else steps, "denoise": 1.0}},
+        "mvp:noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "mvp:guider": {"class_type": "BasicGuider", "inputs": {"model": ["mvp:attention", 0], "conditioning": ["mvp:condition", 0]}},
+        "mvp:sample": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["mvp:noise", 0], "guider": ["mvp:guider", 0], "sampler": ["mvp:sampler", 0], "sigmas": ["mvp:scheduler", 0], "latent_image": ["mvp:latent", 0]}},
+        "mvp:image": {"class_type": "VAEDecode", "inputs": {"samples": ["mvp:sample", 0], "vae": ["mvp:image_vae", 0]}},
+        "mvp:save": {"class_type": "SaveImage", "inputs": {"images": ["mvp:image", 0], "filename_prefix": prefix}},
+    }
+
+
 # The LTX 2.5 video VAE's total spatial compression; see the normalizer node below
 # for why 32 rather than 16. Kept as one constant so the floor applied here and the
 # divisor handed to ImageResizeKJv2 cannot drift apart.
