@@ -27,7 +27,7 @@ import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from e2e_support import (  # noqa: E402
+from e2e_support import (
     ManagedServer,
     StaleServer,
     artifact_dir,
@@ -38,9 +38,9 @@ from e2e_support import (  # noqa: E402
     put_json,
     report,
 )
-from selenium.webdriver.common.by import By  # noqa: E402
-from selenium.webdriver.support import expected_conditions as EC  # noqa: E402
-from selenium.webdriver.support.ui import WebDriverWait  # noqa: E402
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 NAME = "monitor"
 

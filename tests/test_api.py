@@ -3803,8 +3803,10 @@ def test_populate_timeline_lays_out_the_whole_song_from_the_models_shape(tmp_pat
         assert 4.0 - 1e-9 <= shot.duration <= 15.0 + 1e-9
         assert shot.status == "draft"
         assert shot.prompt
+        assert shot.seed > 0  # distinct seeds; a shared seed correlates NaN failures
         cursor = shot.start + shot.duration
     assert cursor == pytest.approx(60.0, abs=1e-6)
+    assert len({shot.seed for shot in saved.shots}) == len(saved.shots)
     # The last window sits in the last proposal's proportional span.
     last = max(saved.shots, key=lambda item: item.start)
     assert last.prompt == "Glamour angles on the canopy bed."

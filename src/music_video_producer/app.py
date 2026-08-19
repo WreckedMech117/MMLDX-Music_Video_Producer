@@ -5188,8 +5188,15 @@ def create_app(
                 prompt=proposals[
                     proposal_for_position(start + length / 2, duration, len(proposals))
                 ].prompt.strip(),
+                # Distinct per shot, derived from the window rather than random so a
+                # re-populate of the same plan is reproducible. Sixteen shots sharing
+                # seed 0 made one bad sampling trajectory a batch-wide risk: the first
+                # live batch lost 3 of its first 4 renders to a NaN'd audio latent that
+                # a fresh seed resolves, and a shared seed turns that coin flip into a
+                # correlated one (2026-08-19).
+                seed=1 + index,
             )
-            for start, length in windows
+            for index, (start, length) in enumerate(windows)
         ]
         saved = store.save(project)
         return PopulateTimelineResponse(
