@@ -257,3 +257,40 @@ def test_a_cut_time_with_no_shot_marker_is_prose_not_a_cut() -> None:
 def test_a_cut_time_belonging_to_a_shot_marker_is_not_flagged() -> None:
     """The guard must not fire on the correct form, or it would reject every real prompt."""
     assert not check_orphan_cuts("[Shot 1] She stands. [Shot 2] At 00:02.500 A wolf steps in.")
+
+
+def test_defer_audio_fields_replaces_only_the_two_audio_fields():
+    """The song-audio deferral, measured before it was written (2026-08-19): the
+    specialist's own audio fields drowned the referenced track (envelope correlation
+    0.36/0.27 with fields vs 0.84 bare, same shot, same seed), so a song-audio shot's
+    stored expansion defers both fields to the reference. The description — the picture —
+    is untouched byte for byte, the result stays checker-clean, and the rewrite is
+    idempotent."""
+    from music_video_producer.h3_prompt import (
+        SONG_AUDIO_MUSIC,
+        SONG_AUDIO_SOUNDSCAPE,
+        defer_audio_fields,
+    )
+
+    sample = (
+        "integrated_multimodal_description: [Shot 1] She sings at the mic, camera "
+        "pushing in slowly.\n\n"
+        "overall_soundscape: Warehouse echo hums; mic stand clicks softly.\n\n"
+        "non_diegetic_music: driving electric guitars swell beneath her vocal line."
+    )
+    out = defer_audio_fields(sample)
+    assert out.startswith(
+        "integrated_multimodal_description: [Shot 1] She sings at the mic, camera "
+        "pushing in slowly."
+    )
+    assert SONG_AUDIO_SOUNDSCAPE in out
+    assert SONG_AUDIO_MUSIC in out
+    assert "Warehouse echo" not in out
+    assert "electric guitars swell" not in out
+    assert check(out, duration=4.0).problems == []
+    assert defer_audio_fields(out) == out
+    # A malformed document is the checker's problem, not this normalizer's.
+    assert defer_audio_fields("integrated_multimodal_description: x") == (
+        "integrated_multimodal_description: x"
+    )
+    assert defer_audio_fields("free text, no fields") == "free text, no fields"

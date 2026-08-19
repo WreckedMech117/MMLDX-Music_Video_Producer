@@ -355,3 +355,53 @@ def check(prompt: str, *, duration: float | None = None,
     )
     parsed.problems.extend(check_retention(prompt))
     return parsed
+
+
+#: What a song-audio shot's two audio fields say instead of ordering a second soundtrack.
+#: Measured 2026-08-19 on one shot, same seed, three ways: with the specialist's written
+#: fields ("warehouse echo... driving electric guitars swell") the generated audio's
+#: envelope correlated with the referenced master window at 0.36 (turbo) / 0.27 (20-step);
+#: with no fields at all, 0.84 — the text was drowning the reference. These sentences keep
+#: the document well-formed (each inside its field's sentence bounds) while deferring the
+#: sound to the referenced track, which is the closest a required field can get to the
+#: measured-best absence.
+SONG_AUDIO_SOUNDSCAPE = (
+    "The referenced master song carries this clip's sound, exactly as provided."
+)
+SONG_AUDIO_MUSIC = "The referenced master song, exactly as provided."
+
+_FIELD_LINE = re.compile(
+    rf"^({'|'.join(CORE_FIELDS)}):", re.MULTILINE
+)
+
+
+def defer_audio_fields(prompt: str) -> str:
+    """Rewrite a well-formed prompt's two audio fields to defer to the referenced song.
+
+    Applied at expansion-write time for `use_song_audio` shots, so the stored prompt and
+    the submitted prompt stay one text. Everything outside the two field bodies —
+    instruction line, description, spacing style — is untouched byte for byte; a prompt
+    missing either field comes back unchanged, because this normalizes well-formed
+    documents and the checker owns malformed ones.
+    """
+    matches = list(_FIELD_LINE.finditer(prompt))
+    if not matches:
+        return prompt
+    spans: dict[str, tuple[int, int]] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(prompt)
+        spans[match.group(1)] = (match.end(), end)
+    if CORE_FIELDS[1] not in spans or CORE_FIELDS[2] not in spans:
+        return prompt
+    replacements = {
+        CORE_FIELDS[1]: SONG_AUDIO_SOUNDSCAPE,
+        CORE_FIELDS[2]: SONG_AUDIO_MUSIC,
+    }
+    # Rebuilt back-to-front so earlier spans stay valid.
+    rebuilt = prompt
+    for name in sorted(replacements, key=lambda n: spans[n][0], reverse=True):
+        start, end = spans[name]
+        body = rebuilt[start:end]
+        trailing = body[len(body.rstrip()):]
+        rebuilt = rebuilt[:start] + " " + replacements[name] + trailing + rebuilt[end:]
+    return rebuilt

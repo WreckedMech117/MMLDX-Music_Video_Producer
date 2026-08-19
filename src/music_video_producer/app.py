@@ -58,6 +58,7 @@ from .director import (
 from .dp_prompt import DP_SYSTEM_PROMPT, dp_input
 from .h3_expansion_prompt import system_prompt as h3_system_prompt
 from .h3_prompt import check as h3_check
+from .h3_prompt import defer_audio_fields
 from .models import (
     ASSET_ROLE_LABELS,
     SHOT_MODE_SPECS,
@@ -2349,7 +2350,13 @@ def apply_expansions(
         if reason := shot_write_refusal(shot):
             committed.append(replace(outcome, kind=reason))
             continue
-        shot.h3_prompt = outcome.text
+        # A song-audio shot's audio fields defer to the referenced track at write time —
+        # stored and submitted stay one text. Measured 2026-08-19: the specialist's own
+        # audio fields drowned the reference (envelope correlation 0.36 vs 0.84 bare);
+        # see `h3_prompt.defer_audio_fields`.
+        shot.h3_prompt = (
+            defer_audio_fields(outcome.text) if shot.use_song_audio else outcome.text
+        )
         committed.append(replace(outcome, kind="applied"))
     return committed
 
@@ -5832,7 +5839,10 @@ def create_app(
                 detail=wording.format(shot=shot_label(project, current)),
             )
 
-        current.h3_prompt = outcome.text
+        # The same song-audio deferral the sweep applies; see `defer_audio_fields`.
+        current.h3_prompt = (
+            defer_audio_fields(outcome.text) if current.use_song_audio else outcome.text
+        )
         store.save(project)
         return ShotExpansionResult(
             project=project,
