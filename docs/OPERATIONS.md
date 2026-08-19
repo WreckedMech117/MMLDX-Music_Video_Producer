@@ -100,6 +100,18 @@ Approval is **explicit and reversible, never automatic** — FR-21's words. No r
 
 Browser QA note: `tests/e2e_shot_controls.py` now synthesizes a playable take with ffmpeg (must be on PATH) under an isolated `MVP_COMFY_ROOT`, so it never touches the real ComfyUI output tree.
 
+Approval now **snapshots the window** (`approved_start`/`approved_duration`, AD-13): the decision is about this take *in this window*, and assembly refuses a shot whose window moved after approval — re-approve, or restore the window, and it assembles again.
+
+## Assemble the video
+
+`POST /api/projects/{id}/assemble` — and the **Assembly bar at the foot of the timeline** — is the finishing lane's main act (FR-22): every approved take, trimmed to its shot's window, joined in shot order, with the **master song as the sole audio track** (shot audio is dropped at assembly; the Director's 2026-08-16 ruling). It runs **locally in ffmpeg, never on ComfyUI** (AD-9) — no GPU time, no queue entry, an idle ComfyUI throughout — and answers synchronously in seconds. `ffmpeg`/`ffprobe` must be on PATH.
+
+The trim is not optional: grid alignment renders every clip longer than its window (a 4.0 s shot is 107 frames ≈ 4.458 s), and untrimmed joins drift ~11 % — twenty seconds over a three-minute song. Frame counts come from one cumulative 24 fps grid so per-clip rounding cannot accumulate; mixed-resolution takes are normalized to the largest-area take present, aspect preserved with centered padding, never stretched.
+
+Refusals come **all at once** in one 422 — every unapproved shot, every stale or legacy approval, every missing take file, and every gap/overlap against the song, each by shot ID — so a 15-shot plan is fixed in one reading, not rationed one refusal at a time. State conflicts are 409s: open renders, or an assembly already running. The song's duration is ffprobe's reading of the file, never the stored field.
+
+The export lands under `data/projects/{id}/media/exports/`, numbered and never overwritten, and **only after verification passes** — duration within one frame of the song, exactly one video and one audio stream — so a failed run leaves nothing that could be mistaken for a result. It is recorded as a `RenderJob` of kind `post` with an **empty `prompt_id`** (the local-work marker) carrying the consumed takes in `inputs`, and plays in the Assembly bar through the media route's Range service. Live-proven 2026-08-18 on `project_21e5a260c3a7` ("Assembly Live Proof"): the two real singing takes over a 7.5 s excerpt cut from exactly the windows they lip-synced to — 180 frames, 7.500 s vs a 7.500 s song, both takes byte-identical afterwards.
+
 ## Pin a frame on a singing shot
 
 The dedicated keyframe modes (`image_to_video`, `first_last`) are the cheaper graphs and have **no song lip-sync** - the node has no audio input. To pin a frame on a shot that sings: use **references mode**, cite the picture in the `first` (or `last`) role alongside any identity references, and keep `use_song_audio` on. The picture rides as an ordinary reference slot and the structured prompt declares it the shot's first frame (`fully_preserved`), per MiniMax's guide 2.2.2 - the reference map writes that line for un-expanded shots, and the expansion specialist writes it for expanded ones. A keyframe picture counts against the node's 9-picture ceiling.

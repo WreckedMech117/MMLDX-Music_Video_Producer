@@ -66,6 +66,7 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - `latest_output`: most recent completed render; never implies approval
 - optional `latest_review`: vision continuity review of the latest output; never implies approval
 - `approved_output`: only an explicitly approved take — and it finally has a writer: the approve route alone assigns it (`:= latest_output` at the moment of approval, never a client-supplied path), `status: "approved"` moves with it as one write, and un-approve is the sole reversal. While approved, `latest_output` cannot move (render-again refuses approved Shots), so `approved_output == latest_output` is an invariant, pinned by test
+- `approved_start`, `approved_duration`: AD-13's window snapshot — the window the shot had at the moment of approval, written and cleared with `approved_output` by the same two routes and nothing else (a one-writer scan pins all three). Assembly compares them to the live window and refuses a moved one by shot ID. `approved_duration == 0` means *never snapshotted* (`duration` itself is `gt=0`, so zero is unrepresentable as a real window) — a legacy approval refuses assembly with re-approve wording, distinct from the stale wording. Withheld from the Director's context alongside `h3_prompt`: staleness bookkeeping, near-duplicates of the live window the chat model already sees
 - `locked`
 
 Shot timing is measured in seconds against the master song. Director compilation converts it to frames only at the workflow boundary.
@@ -103,12 +104,15 @@ Messages saved before 2026-08-17 carry no `notices` and still have the old inlin
 - stable `id`
 - `kind`: music, Flux, multiview, H3, LTX, post
 - `status`: queued, running, complete, error, cancelled
-- Comfy `prompt_id`
-- `target_id`
-- `seed`
-- `output_files[]`
+- Comfy `prompt_id` — **empty means local work** (AD-9): an assembly runs in the app's own ffmpeg and never touches ComfyUI, and the empty id is the marker every consumer keys on — `reconcilable_jobs` skips it, the frontend poll ignores it, and the export reader selects by it
+- `target_id` — the constant `"assembly"` for assemblies
+- `seed` — 0 by design for local work; nothing sampled
+- `output_files[]` — an assembly records its export here, media-relative (`exports/assembly_00001.mp4`)
+- `inputs[]` — FR-24 adapted for local work: what the job consumed, as `"<shot_id>=<approved_output>"` pairs, so an export is rebuildable from its record. Empty for every ComfyUI job, whose inputs are the submitted graph `prompt_id` already names
 - exact `error`
 - timestamps
+
+A `running` local job whose process died with the application — a restart's leftover — is healed to `error` by the next assemble rather than blocking forever; the in-process registry of live assemblies is the one truth about "still running" for jobs no ComfyUI history can settle.
 
 ## Provenance rule
 
