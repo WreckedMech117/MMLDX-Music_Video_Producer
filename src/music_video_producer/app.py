@@ -1743,6 +1743,10 @@ POPULATE_NO_PLAN_REFUSAL = (
     "The Director model returned no shots to lay out. Its message: {message}"
 )
 
+#: See the populate route's window_mean comment: the creator's "fastest / safest" preset,
+#: measured on this card as the difference between minutes and hours per shot.
+POPULATE_TARGET_WINDOW_SECONDS = 5.2
+
 #: What the model is asked for. The count guidance and the asset roster matter: a local
 #: model told nothing about length writes five shots for a three-minute song, and one
 #: told nothing about the library invents characters the project does not hold.
@@ -5155,7 +5159,13 @@ def create_app(
         if not request.confirm_replace:
             raise HTTPException(status_code=422, detail=POPULATE_CONFIRM_REFUSAL)
         duration = project.song.duration
-        window_mean = (H3_MIN_SHOT_SECONDS + H3_MAX_SHOT_SECONDS) / 2
+        # The target window populate steers the model toward, and thereby the plan's
+        # typical shot length. NOT the midpoint of H3's 4–15 s training range: the
+        # creator's own preset table calls 5.17 s (124 frames) "fastest / safest", and
+        # the first live batch measured why — 124-frame renders take ~2–6 min while the
+        # 221-frame windows a 9.5 s mean produced took 2.2 HOURS each on this card
+        # (2026-08-19). ~5 s cuts also edit better for music video than 9 s holds.
+        window_mean = POPULATE_TARGET_WINDOW_SECONDS
         assets = (
             "; ".join(f"{asset.name} ({asset.kind})" for asset in project.assets)
             or "none yet"
