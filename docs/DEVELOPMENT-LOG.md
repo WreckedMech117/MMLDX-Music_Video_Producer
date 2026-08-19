@@ -4,6 +4,18 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-18 — The Director's own flow, rendered: first frame in, motion out
+
+The keyframe adapter's live check ran the flow the Director described when this direction was set: *"have an image generated so I could try to go for something specific or get a preview or first frame."* A Flux frame (a wolf at a birch treeline, sodium dusk), cited in the `first` role on an `image_to_video` Shot, marked ready, rendered — 344 s at 20 steps.
+
+Every prediction held, and each one traces to a specific piece of earlier work:
+- **1056×608** — the measured 0.6 MP selection the resolution story established.
+- **124 frames for a 5 s shot, 5.167 s** — 17×7+5, the grid the schema's own tooltip names.
+- **`fl2va` in the submitted graph, `ref2va` nowhere** — the orphan analysis at import time is what made loading the wrong 20-GB checkpoint a caught mutation instead of a live surprise.
+- **`last_frame` genuinely absent from the wire** — the schema-optionality reading, honoured rather than papered over with a null.
+- **Frame 0 of the take is visibly the cited image**, and frame 100 shows the prompt's motion (the wolf stepping from the treeline toward camera). That is the adapter's whole promise, seen rather than asserted.
+- Generated aac audio present — and no song audio, because `MiniMaxH3ImageToVideo` has **no audio input of any kind**: the fact was learned from the schema before design, so `use_song_audio` refuses in words instead of silently dropping, and the mode labels say "no song lip-sync" before the click. A singing shot belongs in `references` mode.
+
 ## 2026-08-18 — Completion reaches the screen, and a sweep stops needing luck
 
 Two streams landed together, both from the Director's live session.
