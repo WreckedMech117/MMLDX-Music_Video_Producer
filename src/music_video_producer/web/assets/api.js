@@ -1342,8 +1342,12 @@ export function approvalControl(shot) {
 // is the one place the mode→workflow mapping is decided.
 export const SHOT_MODES = [
   { value: "text_to_video", label: "Text to video", roles: [], song_audio: false, adapter: "h3-director", workflow: "the MiniMax H3 Director graph" },
-  { value: "image_to_video", label: "Image to video", roles: [{ role: "first", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
-  { value: "first_last", label: "First / last frame", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
+  // The two keyframe modes share one adapter over `MiniMaxH3ImageToVideo`, whose live schema
+  // declares both frames optional and offers no reference-audio input at all — `song_audio:
+  // false` is the node's fact, and the workflow strings say "no song lip-sync" so the Director
+  // reads it before the click rather than after the render.
+  { value: "image_to_video", label: "Image to video", roles: [{ role: "first", minimum: 1, maximum: 1 }], song_audio: false, adapter: "h3-keyframe", workflow: "MiniMax H3 I2V-FLframe (first frame only, no song lip-sync)" },
+  { value: "first_last", label: "First / last frame", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "h3-keyframe", workflow: "MiniMax H3 I2V-FLframe (first and last frames, no song lip-sync)" },
   { value: "first_middle_last", label: "First / middle / last", roles: [{ role: "first", minimum: 1, maximum: 1 }, { role: "middle", minimum: 1, maximum: 1 }, { role: "last", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },
   { value: "references", label: "References to video", roles: [{ role: "reference", minimum: 0, maximum: 15 }], song_audio: true, adapter: "h3-reference", workflow: "MiniMax H3 References-to-Video (with the sampling profiles)" },
   { value: "extend", label: "Extend an existing video", roles: [{ role: "source_video", minimum: 1, maximum: 1 }], song_audio: false, adapter: "", workflow: "" },

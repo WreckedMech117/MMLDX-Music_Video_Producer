@@ -80,6 +80,7 @@ from .workflows import (
     build_audio_replace_payload,
     build_flux_payload,
     build_h3_director_payload,
+    build_h3_keyframe_payload,
     build_h3_reference_payload,
     build_ltx25_enhance_payload,
     build_multiview_payload,
@@ -193,7 +194,7 @@ MODE_UNSPECIFIED_REFUSAL = (
 #: text-to-video, logged as though its own adapter had run. That is the one failure this story is
 #: forbidden to introduce, and it has no symptom at the point it happens. The application refusing
 #: to start does.
-H3_ADAPTERS = frozenset({"h3-director", "h3-reference"})
+H3_ADAPTERS = frozenset({"h3-director", "h3-reference", "h3-keyframe"})
 
 if _unbuildable := {
     mode: spec.adapter
@@ -3339,10 +3340,122 @@ def create_app(
                 )
             except ValueError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
+        elif spec.adapter == "h3-keyframe":
+            # A sampling profile names a *reference*-graph configuration, and this branch
+            # builds the first/last keyframe graph on the `fl2va` checkpoint, which has no
+            # evidenced profile: the turbo exports are T2V, Director and References2V graphs
+            # on other checkpoints, and blending one across is marked Ask First and not asked.
+            # Refused rather than ignored, for the text-only branch's exact reason: a GPU job
+            # logged under a configuration that was never applied is worse than a refusal,
+            # because only the refusal is visible.
+            if request.profile != H3_DEFAULT_PROFILE:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"The {request.profile!r} sampling profile applies to reference "
+                        f"shots only. {shot_label(project, shot)} renders through the "
+                        f"MiniMax H3 first/last keyframe graph, which has no evidenced "
+                        f"profile. Drop the profile."
+                    ),
+                )
+            # The same refusal one field over, and stricter than the reference branch needs
+            # to be: `ref_image_size` is a `MiniMaxH3ReferenceToVideo` input, and the
+            # keyframe conditioner has no such input at all — live `/object_info` declares
+            # only clip/vae/prompt/width/height/length plus the two optional frames — so a
+            # non-default value here could only be silently dropped, logged as though it
+            # had been applied.
+            if request.ref_image_size != "match":
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"ref_image_size sizes reference media for the references graph. "
+                        f"{shot_label(project, shot)} renders through the MiniMax H3 "
+                        f"first/last keyframe graph, whose conditioner has no such input, "
+                        f"so the value would not be sent. Drop the field."
+                    ),
+                )
+            # The shot's frames, resolved from its citations **by role** — the same
+            # citation-to-file resolution the reference branch does for its pictures, keyed
+            # by `first`/`last` rather than by position, so a citation list that happens to
+            # hold the last frame before the first one still renders the right way round.
+            # The roles come off the mode's own table row: `image_to_video` declares only
+            # `first`, `first_last` declares both, and the `mode_specification_problems`
+            # gate above has already refused a shot whose counts do not match — which is
+            # what makes the `[0]` below safe.
+            frames: dict[str, str] = {}
+            for requirement in spec.roles:
+                citation = citations_in_role(shot, requirement.role)[0]
+                role_label = ASSET_ROLE_LABELS[requirement.role]
+                asset = next(
+                    (item for item in project.assets if item.id == citation.asset_id), None
+                )
+                if not asset:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Unknown {role_label} asset: {citation.asset_id}",
+                    )
+                # The splitter routes media by the `kind` this branch writes into
+                # `media_state`, and a frame travels as a picture. An audio or video Asset
+                # cited as a frame would be fed to the loader under a kind it is not,
+                # which nothing downstream reports — so it is refused here by name.
+                if asset.kind in ("audio", "video"):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"A {role_label} must be an image, and {asset.name} is "
+                            f"{'an' if asset.kind == 'audio' else 'a'} {asset.kind}."
+                        ),
+                    )
+                # `resolve_asset_path`'s own resolution and containment, with its 404 for a
+                # vanished file translated to the 422 the keyframe matrix specifies — the
+                # request names a Shot that exists, and what cannot be processed is the
+                # state its manifest describes. The path is named so the refusal is
+                # actionable rather than only true.
+                try:
+                    frames[requirement.role] = str(resolve_asset_path(project_id, asset))
+                except HTTPException as error:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"{shot_label(project, shot)} cites {asset.name} as its "
+                            f"{role_label}, but its media was not found at {asset.path}."
+                        ),
+                    ) from error
+            try:
+                payload = build_h3_keyframe_payload(
+                    # `reference_prompt`'s rule without its reference map: an expansion is
+                    # submitted **alone** — an H3-format prompt opens with its own
+                    # instruction line (`H3_KEYFRAME_MODES` names both these modes for it)
+                    # and prose in front would break the format. Without one, the shot's
+                    # intent goes as written, exactly as the text-only path sends it.
+                    prompt=shot.h3_prompt if shot.h3_prompt.strip() else shot.prompt,
+                    first_frame=frames["first"],
+                    # Absent for `image_to_video`, whose table row declares no `last` role;
+                    # the builder then omits `last_frame` entirely, which the node's schema
+                    # declares optional.
+                    last_frame=frames.get("last"),
+                    duration=shot.duration,
+                    seed=shot.seed,
+                    # The same geometry contract as the reference branch, resolved by the
+                    # same `_resolve_frame`: an explicit width/height honoured exactly, the
+                    # selector triple through `select_resolution`, an omission taking the
+                    # measured 0.6 MP default, both kinds together refused.
+                    width=request.width,
+                    height=request.height,
+                    megapixels=request.megapixels,
+                    aspect_ratio=request.aspect_ratio,
+                    multiple=request.multiple,
+                    # `None` falls through to the export's own 20; see
+                    # `H3_KEYFRAME_DEFAULT_STEPS`.
+                    steps=request.steps,
+                    prefix=f"music-video-producer/{project_id}/shots/{shot.id}-h3-keyframe",
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
         else:
             # `h3-director`, and nothing else can reach here: the adapter gate above refuses `""`,
-            # and the import-time check beside `H3_ADAPTERS` refuses a table naming any third
-            # adapter this route has no branch for.
+            # the two named branches take theirs, and the import-time check beside `H3_ADAPTERS`
+            # refuses a table naming any fourth adapter this route has no branch for.
             #
             # A sampling profile names a *reference*-graph configuration, and this branch
             # builds the text-only Director graph, which has no evidenced profile: it loads

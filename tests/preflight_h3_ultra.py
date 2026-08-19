@@ -1,4 +1,4 @@
-"""Manual live audit of both MiniMax H3 adapters against ComfyUI ``/object_info``.
+"""Manual live audit of the three MiniMax H3 adapters against ComfyUI ``/object_info``.
 
 Not pytest-collected (like ``preflight_songplanner.py``, whose rules it shares
 through ``tests/preflight.py``). This is the gate the H3 paths never had: it has
@@ -8,7 +8,7 @@ with a live, user-managed ComfyUI (never started or stopped here):
 
     uv run python tests/preflight_h3_ultra.py [base_url] [--record]
 
-Ten payload variants are audited separately, chosen to reach every input either
+Thirteen payload variants are audited separately, chosen to reach every input any
 adapter can emit: one picture; the full 9 pictures + 3 videos + 3 audios, which
 fills every autogrow slot the graph offers; a video carrying its paired
 soundtrack; ``ref_image_size="max"``; the longest window that still fits the
@@ -21,9 +21,15 @@ eight default-profile variants and one variant per LoRA-carrying profile
 being installed, and the class being registered, are confirmed before any GPU
 time rather than discovered by a submission that fails. The text-only Director
 graph is audited here too: it is the one H3 path with live render evidence, and
-it was covered by nothing.
+it was covered by nothing. The keyframe adapter has **two** variants — first and
+last frames, and first-frame-only — because the second omits ``last_frame``
+entirely and an input the audit never omits is an optionality claim it never
+tests; the first-only variant also takes the default geometry, so the 0.6 MP
+selection is exercised through this adapter and not only the reference one. The
+``fl2va`` checkpoint joins the model-file check by being *loaded* by these
+variants, never by being mentioned.
 
-Beyond the shared per-node validation, six claims about the *adapters* are
+Beyond the shared per-node validation, seven claims about the *adapters* are
 checked against the live schema:
 
 * the reference adapter's hardcoded per-kind limits equal the autogrow ``max`` of
@@ -39,7 +45,12 @@ checked against the live schema:
   restated here, so each profile's LoRA joins the list by being *loaded* rather
   than by being mentioned — are present in their loaders' combo options;
 * every bound ``H3Request`` enforces sits inside the bound the node enforces, so
-  a request the route accepts can never be refused by ComfyUI.
+  a request the route accepts can never be refused by ComfyUI;
+* the two schema facts the keyframe mode table is built on still hold:
+  ``MiniMaxH3ImageToVideo`` declares ``first_frame`` and ``last_frame`` optional
+  (what lets ``image_to_video`` omit the last frame) and offers **no**
+  reference-audio input of any kind (what makes "keyframe shots cannot lip-sync
+  to the song" the node's fact rather than this project's claim).
 
 ``--record`` merges the audited classes into ``tests/fixtures/object_info.json``
 only when the audit found zero problems, keeping every class already recorded
@@ -66,11 +77,13 @@ from music_video_producer.workflows import (
     H3_DIRECTOR_MAX_FRAMES,
     H3_DIRECTOR_MAX_SECONDS,
     H3_FRAME_RATE,
+    H3_KEYFRAME_MAX_FRAMES,
     H3_LORA_STRENGTH_LIMITS,
     H3_REFERENCE_LIMITS,
     H3_REFERENCE_MAX_FRAMES,
     H3_SPLIT_OFFSETS,
     build_h3_director_payload,
+    build_h3_keyframe_payload,
     build_h3_reference_payload,
     select_resolution,
 )
@@ -88,6 +101,7 @@ SPLIT_OUTPUT_PREFIXES = {
 #: Each adapter's frame ceiling and the schema input that declares it.
 FRAME_CEILINGS = (
     ("MiniMaxH3ReferenceToVideo", "length", H3_REFERENCE_MAX_FRAMES),
+    ("MiniMaxH3ImageToVideo", "length", H3_KEYFRAME_MAX_FRAMES),
     ("MiniMaxH3DirectorCS", "duration_frames", H3_DIRECTOR_MAX_FRAMES),
     ("MiniMaxH3DirectorCS", "end_frame", H3_DIRECTOR_MAX_FRAMES),
     ("MiniMaxH3DirectorCS", "end_second", H3_DIRECTOR_MAX_SECONDS),
@@ -101,6 +115,11 @@ FRAME_CEILINGS = (
 REQUEST_BOUNDS = (
     ("width", "MiniMaxH3ReferenceToVideo", "width"),
     ("height", "MiniMaxH3ReferenceToVideo", "height"),
+    # The keyframe conditioner declares its own width/height range, and `H3Request` feeds
+    # it too, so the containment claim is made against both nodes rather than assumed to
+    # transfer from one to the other.
+    ("width", "MiniMaxH3ImageToVideo", "width"),
+    ("height", "MiniMaxH3ImageToVideo", "height"),
     ("steps", "BasicScheduler", "steps"),
     # The selector's own two numeric inputs. `H3Request` restates their ranges so an
     # out-of-range figure is a 422 rather than a ComfyUI validation failure seen as an opaque
@@ -265,6 +284,37 @@ def audit_payloads() -> list[tuple[str, dict]]:
                 references=pictures[:1],
                 duration=LONGEST_WINDOW_SECONDS,
                 **largest,
+            ),
+        ),
+        (
+            # Both frames, explicit geometry, no step count so the export's own 20 is what
+            # is audited. This is the variant that loads `fl2va`: the checkpoint joins the
+            # model-file check by being loaded here, never by being mentioned in a list.
+            "keyframe-first-last",
+            build_h3_keyframe_payload(
+                prompt="The wolf turns from the window to the door.",
+                first_frame="F:/refs/first.png",
+                last_frame="F:/refs/last.png",
+                duration=5,
+                seed=0,
+                prefix="preflight",
+                width=1280,
+                height=720,
+            ),
+        ),
+        (
+            # The `image_to_video` shape: `last_frame` omitted entirely, which is the
+            # optionality claim the mode table depends on — an input the audit always sends
+            # is an optionality nothing tests. Default geometry, so the 0.6 MP selection is
+            # exercised through this adapter and not only the reference one.
+            "keyframe-first-only",
+            build_h3_keyframe_payload(
+                prompt="The wolf turns from the window.",
+                first_frame="F:/refs/first.png",
+                last_frame=None,
+                duration=3.75,
+                seed=0,
+                prefix="preflight",
             ),
         ),
         (
@@ -542,6 +592,45 @@ def check_default_geometry(object_info: dict) -> list[str]:
     return problems
 
 
+def check_keyframe_schema_claims(object_info: dict) -> list[str]:
+    """The two schema facts the keyframe mode table is built on, re-read live.
+
+    Settled from live ``/object_info`` on 2026-08-18 and load-bearing ever since:
+
+    * ``first_frame`` and ``last_frame`` are **optional** — which is what lets
+      ``image_to_video`` route through the same graph with ``last_frame`` simply absent.
+      A frame promoted to ``required`` upstream would turn the first-only payload into a
+      validation failure this audit should name before a render does.
+    * The node offers **no reference-audio input of any kind** — no ``ref_audios``
+      autogrow, nothing audio-shaped in either half of its input map. That absence is the
+      entire basis for ``SHOT_MODE_SPECS`` declaring ``song_audio=False`` on both keyframe
+      modes and for the mode select saying "no song lip-sync": if an audio input ever
+      appears here, the honest answer changes and the table must change with it, so its
+      appearance is a named failure rather than a quiet capability.
+    """
+    schema = object_info.get("MiniMaxH3ImageToVideo", {}).get("input", {})
+    if not schema:
+        return ["keyframe schema: MiniMaxH3ImageToVideo publishes no input map at all"]
+    problems: list[str] = []
+    required = schema.get("required", {})
+    optional = schema.get("optional", {})
+    for name in ("first_frame", "last_frame"):
+        if name not in optional:
+            where = "required" if name in required else "nowhere"
+            problems.append(
+                f"keyframe schema: MiniMaxH3ImageToVideo.{name} is {where}, not optional — "
+                f"the adapter omits last_frame for image_to_video on the strength of this"
+            )
+    audio_like = sorted(name for name in {**required, **optional} if "audio" in name.lower())
+    if audio_like:
+        problems.append(
+            f"keyframe schema: MiniMaxH3ImageToVideo now declares audio-shaped inputs "
+            f"{audio_like} — the mode table says keyframe shots cannot take the master "
+            f"song, and that claim just stopped being the node's fact"
+        )
+    return problems
+
+
 #: Every check this audit runs. Named as one tuple so a test can assert the audit wires all
 #: of them: a check deleted from here is a check that still passes its own unit test while
 #: the live audit stops performing it.
@@ -554,6 +643,7 @@ CHECKS = (
     check_request_bounds,
     check_aspect_ratios,
     check_default_geometry,
+    check_keyframe_schema_claims,
 )
 
 

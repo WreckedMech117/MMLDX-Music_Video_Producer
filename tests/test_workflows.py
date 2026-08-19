@@ -39,6 +39,8 @@ from music_video_producer.workflows import (
     H3_DIRECTOR_MAX_FRAMES,
     H3_DIRECTOR_MAX_SECONDS,
     H3_FRAME_RATE,
+    H3_KEYFRAME_DEFAULT_STEPS,
+    H3_KEYFRAME_MAX_FRAMES,
     H3_LORA_STRENGTH_LIMITS,
     H3_MEGAPIXEL_LIMITS,
     H3_MULTIPLE_LIMITS,
@@ -71,6 +73,7 @@ from music_video_producer.workflows import (
     build_audio_replace_payload,
     build_flux_payload,
     build_h3_director_payload,
+    build_h3_keyframe_payload,
     build_h3_reference_payload,
     build_ltx25_enhance_payload,
     build_multiview_payload,
@@ -164,6 +167,32 @@ def every_builder_payload() -> list[tuple[str, dict]]:
                 seed=0,
                 prefix="p",
                 profile="turbo-references2v",
+            ),
+        ),
+        (
+            # The keyframe adapter is a third graph on a third checkpoint, and its two
+            # shapes differ in whether `last_frame` exists at all — so each earns a row.
+            "h3-keyframe-first-last",
+            build_h3_keyframe_payload(
+                prompt="p",
+                first_frame="a.png",
+                last_frame="b.png",
+                duration=5,
+                width=1280,
+                height=720,
+                seed=0,
+                prefix="p",
+            ),
+        ),
+        (
+            "h3-keyframe-first-only",
+            build_h3_keyframe_payload(
+                prompt="p",
+                first_frame="a.png",
+                last_frame=None,
+                duration=5,
+                seed=0,
+                prefix="p",
             ),
         ),
         ("ltx25-patched", patch_ltx25_dimension_boundary(template)),
@@ -1913,6 +1942,459 @@ def test_the_text_only_director_path_is_offered_no_profile_and_keeps_its_step_de
     assert all(node["class_type"] != "LoraLoaderModelOnly" for node in payload.values())
 
 
+# --- The keyframe adapter against its evidence ---------------------------------------
+#
+# `build_h3_keyframe_payload` is derived from `h3-first-last-user-export.json`, and every
+# bundle value below is *read out of that export by walking its wiring* rather than
+# retyped — the standard the turbo profile's first test had to be corrected to. The
+# export's one orphan is the inherited `ref2va` loader, which is exactly the checkpoint
+# this adapter must never load: swapping it in would cost a ~20 GB model swap per render
+# and produce a combination nobody has rendered.
+
+
+KEYFRAME_EXPORT = "h3-first-last-user-export.json"
+
+
+def keyframe_payload(**overrides) -> dict:
+    arguments = {
+        "prompt": "The wolf turns from the window to the door.",
+        "first_frame": "F:/refs/first.png",
+        "last_frame": "F:/refs/last.png",
+        "duration": 5,
+        "seed": 11,
+        "prefix": "mvp/keyframe",
+    }
+    return build_h3_keyframe_payload(**{**arguments, **overrides})
+
+
+def keyframe_export() -> dict:
+    return json.loads((REFERENCE_EXPORTS / KEYFRAME_EXPORT).read_text(encoding="utf-8"))
+
+
+def test_the_keyframe_export_has_one_orphan_and_it_is_the_ref2va_loader():
+    """The reachability fact the whole adapter stands on, derived rather than trusted.
+
+    28 nodes, 27 reachable from the single save node, and the orphan is the inherited
+    `ref2va` `UNETLoader` — so the reachable checkpoint, the one the adapter loads, is the
+    dedicated first/last `fl2va` model. If this ever fails, the evidence changed and the
+    adapter's checkpoint claim must be re-derived, not patched.
+    """
+    export = keyframe_export()
+    savers = [
+        node_id for node_id, node in export.items()
+        if node["class_type"] == "VHS_VideoCombine"
+    ]
+    assert len(savers) == 1, savers
+    reachable = reachable_node_ids(export, savers)
+
+    assert len(export) == 28
+    assert len(reachable) == 27
+    (orphan,) = set(export) - reachable
+    assert export[orphan]["class_type"] == "UNETLoader"
+    assert export[orphan]["inputs"]["unet_name"] == (
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+    )
+
+
+def test_the_keyframe_adapter_matches_the_export_it_reproduces():
+    """Every bundle value chain-walked out of the export and compared, none retyped.
+
+    The walk starts at the one *reachable* `UNETLoader` — so the orphaned `ref2va` loader
+    cannot be mistaken for the checkpoint — and follows the model chain forward to the
+    scheduler, then across the sigmas link to the sampler. The conditioner, the VAEs, the
+    CLIP and the saver are located the same way, by wiring.
+    """
+    export = keyframe_export()
+    payload = keyframe_payload()
+    savers = [
+        node_id for node_id, node in export.items()
+        if node["class_type"] == "VHS_VideoCombine"
+    ]
+    reachable = reachable_node_ids(export, savers)
+
+    def only(candidates: list[str], what: str) -> str:
+        assert len(candidates) == 1, f"{what}: {candidates}"
+        return candidates[0]
+
+    def fed_by(node_id: str, socket: str = "model") -> list[str]:
+        return [
+            other_id
+            for other_id, other in export.items()
+            if other["inputs"].get(socket) == [node_id, 0]
+        ]
+
+    # The checkpoint: the export's one reachable UNET loader, whatever it names.
+    loader = only(
+        [
+            node_id for node_id in reachable
+            if export[node_id]["class_type"] == "UNETLoader"
+        ],
+        "reachable UNET loaders",
+    )
+    assert (
+        payload["mvp:model"]["inputs"]["unet_name"]
+        == export[loader]["inputs"]["unet_name"]
+    )
+
+    # The model chain forward from the loader: Power Lora (empty) -> sigma shift -> sage
+    # attention -> Spectrum -> preview. Each value the adapter emits is compared against
+    # the node the walk found, and the two nodes the adapter deliberately does not emit
+    # are asserted below rather than skipped silently.
+    power_lora = only(fed_by(loader), "nodes reading the UNET loader")
+    assert export[power_lora]["class_type"] == "Power Lora Loader (rgthree)"
+    lora_rows = [
+        entry
+        for key, entry in export[power_lora]["inputs"].items()
+        if key.startswith("lora_") and isinstance(entry, dict) and "on" in entry
+    ]
+    # No LoRA at all — not even an off-switched row — which is why the adapter applies
+    # none and drops the empty pass-through loader for the reference adapter's recorded
+    # schema-visibility reason.
+    assert lora_rows == [], lora_rows
+    shift = only(fed_by(power_lora), "nodes reading the empty LoRA loader")
+    assert export[shift]["class_type"] == "MiniMaxH3SigmaShift"
+    for name in ("shift_video", "shift_audio"):
+        assert payload["mvp:shift"]["inputs"][name] == export[shift]["inputs"][name], name
+    attention = only(fed_by(shift), "nodes reading the sigma shift")
+    assert export[attention]["class_type"] == "PathchSageAttentionKJ"
+    assert (
+        payload["mvp:attention"]["inputs"]["sage_attention"]
+        == export[attention]["inputs"]["sage_attention"]
+    )
+    # `SpectrumApplyMiniMaxH3` sits **enabled** in this export's chain, exactly as it sits
+    # enabled in both reference exports — and the shipped reference adapter omits it. This
+    # adapter mirrors that decision deliberately: two H3 adapters silently diverging on one
+    # node is the drift the profile work exists to prevent, and Spectrum's parameters are
+    # Ask First and have not been asked. Asserted in both directions so the mirroring is a
+    # checked fact rather than a comment.
+    spectrum = only(fed_by(attention), "nodes reading the sage attention")
+    assert export[spectrum]["class_type"] == "SpectrumApplyMiniMaxH3"
+    assert export[spectrum]["inputs"]["enabled"] is True
+    for built in (payload, h3_reference_payload(h3_references("picture", 1))):
+        assert all(
+            node["class_type"] != "SpectrumApplyMiniMaxH3" for node in built.values()
+        )
+    preview = only(fed_by(spectrum), "nodes reading Spectrum")
+    assert export[preview]["class_type"] == "ModelPreviewOverrideKJ"
+    for name in (
+        "max_resolution", "jpeg_quality", "suppress_default_preview",
+        "preview_frames", "preview_fps",
+    ):
+        assert payload["mvp:preview"]["inputs"][name] == export[preview]["inputs"][name], name
+
+    # The sampling bundle, downstream of the preview node.
+    scheduler = only(
+        [
+            node_id for node_id in fed_by(preview)
+            if export[node_id]["class_type"] == "BasicScheduler"
+        ],
+        "schedulers on the preview node",
+    )
+    for name in ("scheduler", "denoise"):
+        assert (
+            payload["mvp:scheduler"]["inputs"][name] == export[scheduler]["inputs"][name]
+        ), name
+    assert H3_KEYFRAME_DEFAULT_STEPS == export[scheduler]["inputs"]["steps"]
+    assert payload["mvp:scheduler"]["inputs"]["steps"] == export[scheduler]["inputs"]["steps"]
+    sampler = only(
+        [
+            export[node_id]["inputs"]["sampler"][0]
+            for node_id in fed_by(scheduler, socket="sigmas")
+            if export[node_id]["class_type"] == "SamplerCustomAdvanced"
+        ],
+        "samplers on that scheduler's sigmas",
+    )
+    assert (
+        payload["mvp:sampler"]["inputs"]["sampler_name"]
+        == export[sampler]["inputs"]["sampler_name"]
+    )
+
+    # The conditioner and its frame wiring: first from splitter output 0, last from
+    # output 1, which are `picture_1` and `picture_2` in the recorded schema.
+    conditioner = only(
+        [
+            node_id for node_id, node in export.items()
+            if node["class_type"] == "MiniMaxH3ImageToVideo"
+        ],
+        "keyframe conditioners",
+    )
+    splitter_id, first_index = export[conditioner]["inputs"]["first_frame"]
+    assert export[splitter_id]["class_type"] == "MiniMaxH3ReferenceSplitter"
+    assert payload["mvp:condition"]["inputs"]["first_frame"] == ["mvp:split", first_index]
+    _, last_index = export[conditioner]["inputs"]["last_frame"]
+    assert payload["mvp:condition"]["inputs"]["last_frame"] == ["mvp:split", last_index]
+    assert first_index == H3_SPLIT_OFFSETS["picture"]
+    outputs = recorded_object_info()["MiniMaxH3ReferenceSplitter"]["output_name"]
+    assert outputs[first_index] == "picture_1" and outputs[last_index] == "picture_2"
+
+    # The CLIP and both VAEs, located through the conditioner's and decoders' own links.
+    clip_id = export[conditioner]["inputs"]["clip"][0]
+    assert (
+        payload["mvp:clip"]["inputs"]["clip_name"] == export[clip_id]["inputs"]["clip_name"]
+    )
+    video_vae_id = export[conditioner]["inputs"]["vae"][0]
+    assert (
+        payload["mvp:video_vae"]["inputs"]["vae_name"]
+        == export[video_vae_id]["inputs"]["vae_name"]
+    )
+    audio_decoder = only(
+        [
+            node_id for node_id, node in export.items()
+            if node["class_type"] == "VAEDecodeAudio"
+        ],
+        "audio decoders",
+    )
+    audio_vae_id = export[audio_decoder]["inputs"]["vae"][0]
+    assert (
+        payload["mvp:audio_vae"]["inputs"]["vae_name"]
+        == export[audio_vae_id]["inputs"]["vae_name"]
+    )
+
+    # The saver: every scalar the export fixes, compared by name. The links and the
+    # filename prefix are this application's; everything else is the evidence's.
+    saver = export[savers[0]]["inputs"]
+    for name, value in saver.items():
+        if isinstance(value, list):
+            continue
+        if name == "filename_prefix":
+            continue
+        assert payload["mvp:save"]["inputs"][name] == value, name
+
+
+def test_the_keyframe_length_is_the_exports_own_expression_on_the_shared_grid():
+    """The frame count the export computes in-graph, computed server-side to the digit.
+
+    The export's `ComfyMathExpression` carries the 17k+5 snap as a string; evaluating that
+    string — the export's own arithmetic, not a local restatement — must agree with what
+    the builder sends and with `timeline.align_h3_frames`, for every window shape that
+    matters: the floor, exact grid points, and either side of one.
+    """
+    export = keyframe_export()
+    expression_node = next(
+        node for node in export.values() if node["class_type"] == "ComfyMathExpression"
+    )
+    expression = expression_node["inputs"]["expression"]
+
+    for duration in (5 / 24, 0.5, 3.75, 5, 5.1, 8, 12.34, 149.5):
+        # The audited export's own arithmetic, evaluated with no builtins and no inputs
+        # but `a` — restating the formula locally is exactly what this test must not do.
+        expected = eval(
+            expression, {"__builtins__": {}}, {"a": duration, "max": max, "round": round}
+        )
+        payload = keyframe_payload(duration=duration)
+        assert payload["mvp:condition"]["inputs"]["length"] == expected, duration
+        assert align_h3_frames(max(5, round(duration * H3_FRAME_RATE))) == expected, duration
+
+
+def test_the_keyframe_payload_is_the_reachable_subgraph_minus_the_stated_drops():
+    """What is not reproduced is a named decision, never an accident.
+
+    The reachable subgraph's classes minus the payload's classes must be exactly the
+    editor-side plumbing the adapter resolves server-side (geometry and the frame
+    expression), the empty LoRA pass-through, and Spectrum — each dropped for a reason
+    the builder's docstring states. A class leaving or joining this set is a change of
+    decision and must fail here.
+    """
+    export = keyframe_export()
+    savers = [
+        node_id for node_id, node in export.items()
+        if node["class_type"] == "VHS_VideoCombine"
+    ]
+    reachable_classes = {
+        export[node_id]["class_type"]
+        for node_id in reachable_node_ids(export, savers)
+    }
+    payload_classes = {node["class_type"] for node in keyframe_payload().values()}
+
+    assert reachable_classes - payload_classes == {
+        # Geometry: derives an unmeasured ~1 MP frame from the first image, with a 0.9 MP
+        # selector fallback — resolved server-side through `select_resolution` instead,
+        # sharing the reference path's measured 0.6 MP default.
+        "ImageScaleToTotalPixels",
+        "GetImageSize",
+        "Any Switch (rgthree)",
+        "ResolutionSelector",
+        # The frame count: computed server-side, pinned against the export's expression
+        # in the test above.
+        "ComfyMathExpression",
+        "PrimitiveFloat",
+        # Carries no LoRA row at all; live schema declares no lora_* inputs on it.
+        "Power Lora Loader (rgthree)",
+        # Enabled in the export, omitted here — mirroring the reference adapter's
+        # treatment of the same node in its own evidence, deliberately.
+        "SpectrumApplyMiniMaxH3",
+    }
+    assert payload_classes <= reachable_classes
+
+
+def test_the_keyframe_last_frame_is_omitted_entirely_for_a_first_only_shot():
+    """The `image_to_video` shape: absent means absent.
+
+    The schema declares `last_frame` optional; the honest way to not send one is to omit
+    the input, not to send a null or an empty wiring. The media loader likewise carries
+    one picture, so the splitter's second output is never read.
+    """
+    payload = keyframe_payload(last_frame=None)
+
+    assert "last_frame" not in payload["mvp:condition"]["inputs"]
+    media = json.loads(payload["mvp:frames"]["inputs"]["media_state"])
+    assert [item["kind"] for item in media] == ["picture"]
+    assert media[0]["file"] == "F:/refs/first.png"
+    assert payload["mvp:condition"]["inputs"]["first_frame"] == ["mvp:split", 0]
+
+    both = keyframe_payload()
+    media = json.loads(both["mvp:frames"]["inputs"]["media_state"])
+    assert [(item["file"], item["label"]) for item in media] == [
+        ("F:/refs/first.png", "first frame"),
+        ("F:/refs/last.png", "last frame"),
+    ]
+    assert all(item["enabled"] is True for item in media)
+
+
+def test_the_keyframe_builder_refuses_frames_that_are_not_paths():
+    """`None` for the last frame is a shape; an empty string is a lost path.
+
+    Treating `""` as "no frame" would silently reroute a first/last shot to the
+    first-only graph, which is the kind of silent downgrade a refusal exists to stop.
+    """
+    for blank in ("", "   "):
+        with pytest.raises(ValueError, match="first frame must be a file path"):
+            keyframe_payload(first_frame=blank)
+        with pytest.raises(ValueError, match="last frame must be a file path"):
+            keyframe_payload(last_frame=blank)
+    for wrong in (None, 4, ["a.png"]):
+        with pytest.raises(ValueError, match="first frame|needs a first frame"):
+            keyframe_payload(first_frame=wrong)
+
+
+def test_the_keyframe_builder_shares_the_reference_geometry_contract():
+    """One `_resolve_frame` behind both adapters, observed from outside.
+
+    The default is the measured 0.6 MP selection — the same frame the reference builder
+    defaults to, asserted by comparing the two rather than by restating 1056x608 — and
+    the two ways of describing a frame are mutually exclusive here exactly as they are
+    there.
+    """
+    keyframe = keyframe_payload()["mvp:condition"]["inputs"]
+    reference = h3_reference_payload(
+        h3_references("picture", 1), width=None, height=None
+    )["mvp:condition"]["inputs"]
+    assert (keyframe["width"], keyframe["height"]) == (reference["width"], reference["height"])
+    assert (keyframe["width"], keyframe["height"]) == select_resolution()
+
+    explicit = keyframe_payload(width=640, height=384)["mvp:condition"]["inputs"]
+    assert (explicit["width"], explicit["height"]) == (640, 384)
+    selected = keyframe_payload(megapixels=0.9, aspect_ratio="16:9 (Widescreen)", multiple=32)
+    assert (
+        selected["mvp:condition"]["inputs"]["width"],
+        selected["mvp:condition"]["inputs"]["height"],
+    ) == select_resolution(megapixels=0.9, aspect_ratio="16:9 (Widescreen)", multiple=32)
+
+    with pytest.raises(ValueError, match="not both"):
+        keyframe_payload(width=640, height=384, megapixels=0.6)
+    with pytest.raises(ValueError, match="only width"):
+        keyframe_payload(width=640)
+
+
+def test_the_keyframe_builder_refuses_a_window_past_its_own_nodes_ceiling():
+    """The refusal quotes this node's ceiling, and the ceiling is the schema's."""
+    with pytest.raises(ValueError, match="H3 keyframe node's 3600-frame maximum"):
+        keyframe_payload(duration=151)
+    # 3592 frames is the last grid point at or below the ceiling; it must build.
+    assert keyframe_payload(duration=3592 / H3_FRAME_RATE)
+    schema = recorded_object_info()["MiniMaxH3ImageToVideo"]["input"]["required"]
+    assert preflight.numeric_bounds(schema["length"])[1] == H3_KEYFRAME_MAX_FRAMES
+
+
+def test_the_keyframe_path_is_offered_no_profile_and_keeps_the_exports_step_default():
+    """The Ask-First boundary, pinned the way the text-only path pins its own.
+
+    No turbo evidence exists for the `fl2va` checkpoint — the turbo exports are T2V,
+    Director and References2V graphs — so the builder takes no `profile` parameter at
+    all, and an omitted step count means the export's 20.
+    """
+    assert "profile" not in inspect.signature(build_h3_keyframe_payload).parameters
+    assert keyframe_payload()["mvp:scheduler"]["inputs"]["steps"] == H3_KEYFRAME_DEFAULT_STEPS
+    assert keyframe_payload(steps=8)["mvp:scheduler"]["inputs"]["steps"] == 8
+
+
+def test_the_keyframe_graph_offers_no_audio_reference_and_generates_its_own_track():
+    """The lip-sync answer, as payload facts.
+
+    `MiniMaxH3ImageToVideo` declares no reference-audio input — the recorded schema is
+    checked for that here and the live one in the pre-flight — so no keyframe payload can
+    carry the master song, and the audio that reaches the saver is the sampler's own
+    latent decoded through the audio VAE, exactly as the text-only path's is.
+    """
+    schema = recorded_object_info()["MiniMaxH3ImageToVideo"]["input"]
+    every_input = {**schema.get("required", {}), **schema.get("optional", {})}
+    assert not [name for name in every_input if "audio" in name.lower()]
+    assert set(schema.get("optional", {})) >= {"first_frame", "last_frame"}
+
+    payload = keyframe_payload()
+    condition = payload["mvp:condition"]["inputs"]
+    assert not [name for name in condition if "audio" in name.lower()]
+    assert payload["mvp:save"]["inputs"]["audio"] == ["mvp:audio", 0]
+    assert payload["mvp:audio"]["inputs"]["samples"] == ["mvp:sample", 0]
+
+
+#: The two pre-existing shapes the keyframe story was forbidden to move, hashed at commit
+#: `899b85f` — the commit before this adapter existed — by running that revision's builders
+#: over these exact arguments and hashing `json.dumps(payload, separators=(",", ":"))`.
+#: The references shape is `H3_DEFAULT_PROFILE_DIGEST` above, taken the same way at its own
+#: baseline and still asserted by its own test. If one of these fails, a pre-existing
+#: mode's payload changed; re-deriving the digest is the wrong fix unless the Director has
+#: renegotiated that promise.
+H3_TEXT_ONLY_PRE_KEYFRAME_DIGEST = (
+    "c454de1948ad7185112d1a9a492a129b7f3225f8218cc4f758640e0d792984c8"
+)
+H3_SONG_AUDIO_PRE_KEYFRAME_DIGEST = (
+    "b8921e81121ce10d2a880287d1448867b6bed23e799efed7696c2c5c311d7e68"
+)
+
+
+def test_every_pre_existing_h3_shape_is_byte_identical_across_the_keyframe_change():
+    """AC-3: the text-only shape and the song-audio reference shape, unchanged bytes.
+
+    Together with `test_the_default_profile_emits_the_graph_the_adapter_shipped_before_profiles`
+    — which pins the references shape to its own pre-profiles digest — this covers every
+    pre-existing mode's payload family across the change that extracted `_resolve_frame`
+    and added the keyframe branch.
+    """
+    text_only = build_h3_director_payload(
+        timeline_data='{"segments":[{"id":"s","start":0,"length":120,"prompt":"A singer turns"}]}',
+        duration=5.0,
+        requested_frames=124,
+        seed=17,
+        width=1344,
+        height=768,
+        prefix="mvp/text-only",
+        start=3.0,
+    )
+    serialized = json.dumps(text_only, separators=(",", ":")).encode("utf-8")
+    assert hashlib.sha256(serialized).hexdigest() == H3_TEXT_ONLY_PRE_KEYFRAME_DIGEST
+
+    song_audio = build_h3_reference_payload(
+        prompt=(
+            "Reference map: <Audio 1> is the master song for synchronization. "
+            "The chorus lands."
+        ),
+        references=[
+            {
+                "kind": "audio",
+                "file": "F:/refs/master.flac",
+                "label": "master song",
+                "trim": {"start": 12.0, "end": 15.75},
+            }
+        ],
+        duration=3.75,
+        seed=7,
+        prefix="mvp/song-audio",
+    )
+    serialized = json.dumps(song_audio, separators=(",", ":")).encode("utf-8")
+    assert hashlib.sha256(serialized).hexdigest() == H3_SONG_AUDIO_PRE_KEYFRAME_DIGEST
+
+
 def test_h3_reference_slots_are_numbered_per_kind_in_attachment_order():
     """FR-19's determinism at the payload boundary: order in, order out.
 
@@ -2491,8 +2973,9 @@ def test_the_h3_audit_wires_every_check_it_defines():
         preflight_h3_ultra.check_request_bounds,
         preflight_h3_ultra.check_aspect_ratios,
         preflight_h3_ultra.check_default_geometry,
+        preflight_h3_ultra.check_keyframe_schema_claims,
     }
-    assert len(preflight_h3_ultra.CHECKS) == 8
+    assert len(preflight_h3_ultra.CHECKS) == 9
     # And the class those last two read is named for recording, or they would check the live
     # schema and nothing else: absent from the fixture, both report "publishes nothing" in the
     # offline half of the suite, which reads as a real failure and is not.
@@ -2595,13 +3078,34 @@ def test_each_h3_check_passes_the_real_schema_and_names_a_moved_one():
         for problem in preflight_h3_ultra.check_default_geometry(ceilinged)
     )
 
+    # The keyframe mode table's two schema facts, each moved one at a time. A frame
+    # promoted to required breaks the first-only shape; an audio input appearing would
+    # falsify "keyframe shots cannot take the master song" — both must be named, never
+    # absorbed.
+    promoted_frame = copy.deepcopy(schema)
+    keyframe_inputs = promoted_frame["MiniMaxH3ImageToVideo"]["input"]
+    keyframe_inputs["required"]["last_frame"] = keyframe_inputs["optional"].pop("last_frame")
+    assert any(
+        "last_frame is required, not optional" in problem
+        for problem in preflight_h3_ultra.check_keyframe_schema_claims(promoted_frame)
+    )
+    grown_audio = copy.deepcopy(schema)
+    grown_audio["MiniMaxH3ImageToVideo"]["input"]["optional"]["ref_audios"] = [
+        "COMFY_AUTOGROW_V3", {"template": {"prefix": "ref_audio_", "min": 0, "max": 3}}
+    ]
+    assert any(
+        "audio-shaped inputs" in problem and "ref_audios" in problem
+        for problem in preflight_h3_ultra.check_keyframe_schema_claims(grown_audio)
+    )
 
-def test_the_h3_audit_covers_both_h3_graphs():
+
+def test_the_h3_audit_covers_every_h3_graph():
     """The text-only Director graph is the one H3 path with live render evidence.
 
     It was audited by nothing: `MiniMaxH3DirectorCS` was in no audited payload, so its
-    literals were range-checked neither live nor offline, and the two graphs share every
-    loader and sampler class — a model file renamed under one is renamed under both.
+    literals were range-checked neither live nor offline, and the H3 graphs share every
+    loader and sampler class — a model file renamed under one is renamed under all. The
+    keyframe conditioner joined the same audit when its adapter landed.
     """
     classes = {
         node["class_type"]
@@ -2609,8 +3113,33 @@ def test_the_h3_audit_covers_both_h3_graphs():
         for node in payload.values()
     }
 
-    assert {"MiniMaxH3DirectorCS", "MiniMaxH3ReferenceToVideo"} <= classes
+    assert {
+        "MiniMaxH3DirectorCS", "MiniMaxH3ReferenceToVideo", "MiniMaxH3ImageToVideo"
+    } <= classes
     assert classes <= set(recorded_object_info()), classes - set(recorded_object_info())
+
+
+def test_the_h3_audit_exercises_both_keyframe_shapes():
+    """One variant with `last_frame`, one without — the audit's optionality coverage.
+
+    An input every variant sends is an optionality nothing tests: if the first-only
+    variant vanished, the audit would go on passing while the one shape `image_to_video`
+    actually submits was validated by nothing. Derived from what the payloads carry, so a
+    variant renamed or rebuilt still counts by its shape.
+    """
+    keyframe_conditioners = [
+        node["inputs"]
+        for _, payload in preflight_h3_ultra.audit_payloads()
+        for node in payload.values()
+        if node["class_type"] == "MiniMaxH3ImageToVideo"
+    ]
+
+    assert len(keyframe_conditioners) >= 2, keyframe_conditioners
+    shapes = {"last_frame" in inputs for inputs in keyframe_conditioners}
+    assert shapes == {True, False}, shapes
+    # And every one of them draws its frames from the splitter, first at picture_1.
+    for inputs in keyframe_conditioners:
+        assert inputs["first_frame"][1] == H3_SPLIT_OFFSETS["picture"]
 
 
 def test_the_h3_audit_reads_its_model_files_out_of_the_payloads():

@@ -8033,6 +8033,234 @@ def test_a_declared_mode_that_does_not_fit_its_citations_is_refused_before_the_r
     assert comfy.prompts == []
 
 
+def keyframe_shot(client, store, project_id: str, *, mode: str, roles: dict, **fields) -> tuple[str, dict]:
+    """A ready keyframe Shot citing one uploaded image per role. Returns (shot_id, assets).
+
+    The citations are deliberately listed in **reverse** role order — last before first —
+    so any test rendering through this helper is also asserting that the route resolves
+    frames by role and never by list position.
+    """
+    assets = {
+        role: upload_asset(client, project_id, name, "image", f"{role}.png")
+        for role, name in roles.items()
+    }
+    shot_id = reference_shot(
+        store, project_id, mode=mode,
+        citations=[
+            AssetCitation(asset_id=assets[role]["id"], role=role)
+            for role in reversed(list(roles))
+        ],
+        **fields,
+    )
+    return shot_id, assets
+
+
+def test_a_first_last_shot_renders_through_the_keyframe_graph_with_frames_resolved_by_role(
+    tmp_path: Path,
+):
+    """The Director's own flow, at the route: two cited frames reach ComfyUI through the
+    keyframe graph, on the `fl2va` checkpoint, each in the role its citation names.
+
+    The citations are stored last-before-first on purpose: a route that resolved
+    positionally would render the shot backwards while looking exactly as correct.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Keyframes"))
+    shot_id, _ = keyframe_shot(
+        client, store, project.id, mode="first_last",
+        roles={"first": "Opening frame", "last": "Closing frame"},
+    )
+
+    response = submit_h3(client, project.id, shot_id, width=640, height=384)
+
+    assert response.status_code == 202
+    payload = comfy.prompts[-1]
+    assert payload["mvp:model"]["inputs"]["unet_name"] == (
+        "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    )
+    condition = payload["mvp:condition"]["inputs"]
+    assert payload["mvp:condition"]["class_type"] == "MiniMaxH3ImageToVideo"
+    assert condition["first_frame"] == ["mvp:split", 0]
+    assert condition["last_frame"] == ["mvp:split", 1]
+    assert (condition["width"], condition["height"]) == (640, 384)
+    media = json.loads(payload["mvp:frames"]["inputs"]["media_state"])
+    # Entry 0 is the *first*-role file and entry 1 the *last*-role file, despite the
+    # citation list holding them the other way round.
+    assert [item["label"] for item in media] == ["first frame", "last frame"]
+    assert media[0]["file"].endswith("first.png")
+    assert media[1]["file"].endswith("last.png")
+    assert payload["mvp:save"]["inputs"]["filename_prefix"].endswith(
+        f"{shot_id}-h3-keyframe"
+    )
+    saved = store.get(project.id)
+    assert saved.shots[0].status == "queued"
+    assert saved.jobs[-1].kind == "h3"
+
+
+def test_an_image_to_video_shot_renders_first_frame_only_with_last_frame_absent(
+    tmp_path: Path,
+):
+    """The single-frame shape the schema permits: `last_frame` is not sent at all."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="I2V"))
+    shot_id, _ = keyframe_shot(
+        client, store, project.id, mode="image_to_video", roles={"first": "Opening frame"},
+    )
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+
+    payload = comfy.prompts[-1]
+    condition = payload["mvp:condition"]["inputs"]
+    assert condition["first_frame"] == ["mvp:split", 0]
+    assert "last_frame" not in condition
+    media = json.loads(payload["mvp:frames"]["inputs"]["media_state"])
+    assert [item["label"] for item in media] == ["first frame"]
+    # An omitted geometry takes the same measured default the reference path takes.
+    assert (condition["width"], condition["height"]) == (1056, 608)
+
+
+def test_a_keyframe_shot_missing_a_role_is_refused_before_any_payload(tmp_path: Path):
+    """The matrix's missing-role row, in `mode_specification_problems`' own words."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Missing role"))
+    shot_id, _ = keyframe_shot(
+        client, store, project.id, mode="first_last", roles={"first": "Opening frame"},
+    )
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    assert "First / last frame needs 1 last frame, and this shot cites 0." in (
+        refused.json()["detail"]
+    )
+    assert comfy.prompts == []
+
+
+def test_a_keyframe_citation_whose_file_is_gone_is_refused_with_the_path_named(
+    tmp_path: Path,
+):
+    """The matrix's cited-file-gone row: 422, the path named, nothing submitted."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Gone frame"))
+    shot_id, assets = keyframe_shot(
+        client, store, project.id, mode="first_last",
+        roles={"first": "Opening frame", "last": "Closing frame"},
+    )
+    saved = store.get(project.id)
+    gone = next(item for item in saved.assets if item.id == assets["last"]["id"])
+    (store.project_dir(project.id) / gone.path).unlink()
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    detail = refused.json()["detail"]
+    assert "last frame" in detail
+    assert gone.path in detail
+    assert comfy.prompts == []
+
+
+def test_a_keyframe_citation_that_is_not_an_image_or_not_an_asset_is_refused(
+    tmp_path: Path,
+):
+    """A frame travels as a picture; an audio or video Asset cited as one is refused by
+    name, and an id no Asset carries is refused the way the reference path refuses one."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Wrong kind"))
+    song = upload_asset(client, project.id, "Room tone", "audio", "room.flac")
+    shot_id = reference_shot(
+        store, project.id, mode="image_to_video",
+        citations=[AssetCitation(asset_id=song["id"], role="first")],
+    )
+
+    refused = submit_h3(client, project.id, shot_id)
+    assert refused.status_code == 422
+    assert "A first frame must be an image, and Room tone is an audio." in (
+        refused.json()["detail"]
+    )
+
+    unknown = reference_shot(
+        store, project.id, mode="image_to_video",
+        citations=[AssetCitation(asset_id="asset_missing", role="first")],
+    )
+    refused = submit_h3(client, project.id, unknown)
+    assert refused.status_code == 422
+    assert "asset_missing" in refused.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_a_keyframe_expansion_is_submitted_alone(tmp_path: Path):
+    """`reference_prompt`'s rule on the keyframe branch: an H3-format expansion goes out
+    exactly as written, and a shot without one sends its intent exactly as written."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Expansion"))
+    expansion = "Cut to <Picture 1> at 0s.\nDescription: the wolf turns.\n"
+    shot_id, _ = keyframe_shot(
+        client, store, project.id, mode="image_to_video",
+        roles={"first": "Opening frame"}, h3_prompt=expansion,
+    )
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["prompt"] == expansion
+
+    plain_id, _ = keyframe_shot(
+        client, store, project.id, mode="image_to_video", roles={"first": "Opening frame"},
+    )
+    assert submit_h3(client, project.id, plain_id).status_code == 202
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["prompt"] == (
+        "The vocalists perform the chorus together."
+    )
+
+
+def test_song_audio_on_a_keyframe_shot_is_refused_because_the_node_has_no_slot(
+    tmp_path: Path,
+):
+    """The lip-sync answer at the route: `MiniMaxH3ImageToVideo` takes no reference audio,
+    so `use_song_audio` on a keyframe shot is refused in the mode table's words rather than
+    silently dropped — the shot cannot lip-sync to the master song and nothing pretends
+    otherwise."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="No slot"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Master", "duration": "30"},
+        files={"file": ("master.flac", b"fLaCfake", "audio/flac")},
+    )
+    shot_id, _ = keyframe_shot(
+        client, store, project.id, mode="first_last",
+        roles={"first": "Opening frame", "last": "Closing frame"},
+        use_song_audio=True,
+    )
+
+    refused = submit_h3(client, project.id, shot_id)
+
+    assert refused.status_code == 422
+    assert "has no slot for the master song" in refused.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_a_profile_or_reference_size_on_a_keyframe_shot_is_refused_not_dropped(
+    tmp_path: Path,
+):
+    """Both request fields that name reference-graph machinery are refused on this branch,
+    for the text-only branch's reason: a job logged under a configuration that was never
+    applied is worse than a refusal, because only the refusal is visible."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="No profile"))
+    shot_id, _ = keyframe_shot(
+        client, store, project.id, mode="first_last",
+        roles={"first": "Opening frame", "last": "Closing frame"},
+    )
+
+    profiled = submit_h3(client, project.id, shot_id, profile="turbo")
+    assert profiled.status_code == 422
+    assert "no evidenced profile" in profiled.json()["detail"]
+
+    sized = submit_h3(client, project.id, shot_id, ref_image_size="max")
+    assert sized.status_code == 422
+    assert "no such input" in sized.json()["detail"]
+    assert comfy.prompts == []
+
+
 def test_whether_the_performer_is_singing_is_expressible_and_nothing_infers_it(tmp_path: Path):
     """Three states, and `unknown` is not `not_singing`.
 
@@ -8255,17 +8483,21 @@ def test_every_mode_that_claims_an_adapter_has_a_branch_that_builds_it():
     had run. That failure has no symptom at the point it happens; the application refusing to start
     does.
     """
-    assert H3_ADAPTERS == {"h3-director", "h3-reference"}
+    assert H3_ADAPTERS == {"h3-director", "h3-reference", "h3-keyframe"}
     for mode, spec in SHOT_MODE_SPECS.items():
         assert not spec.adapter or spec.adapter in H3_ADAPTERS, mode
 
-    # The two the route actually has, named by the modes that use them, so a rename of either is
-    # caught here rather than in a live render.
+    # The three the route actually has, named by the modes that use them, so a rename of any is
+    # caught here rather than in a live render. Both keyframe modes share one adapter over
+    # `MiniMaxH3ImageToVideo` — the Director's ruling routes `image_to_video` through H3, and
+    # the LTX I2V evidence stays imported as the alternative path's evidence.
     assert SHOT_MODE_SPECS["references"].adapter == "h3-reference"
     assert SHOT_MODE_SPECS["text_to_video"].adapter == "h3-director"
+    assert SHOT_MODE_SPECS["image_to_video"].adapter == "h3-keyframe"
+    assert SHOT_MODE_SPECS["first_last"].adapter == "h3-keyframe"
     # Everything else is plannable and unrenderable, which is the state this story leaves them in.
     assert {mode for mode, spec in SHOT_MODE_SPECS.items() if not spec.adapter} == {
-        "image_to_video", "first_last", "first_middle_last", "extend"
+        "first_middle_last", "extend"
     }
 
 

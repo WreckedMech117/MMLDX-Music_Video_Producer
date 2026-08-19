@@ -236,6 +236,20 @@ The Director's saved editor workflow was repaired in place on 2026-08-17: node `
 
 **Where the 8k+1 grid actually comes from, found 2026-08-18.** The 192 → 185 frame change was recorded as a property of "the LTX stage". There is a more specific cause available: `VHS_LoadVideo`'s `format: "LTXV"` declares `frames: [8, 1]`, so the **loader conforms the clip to an 8k+1 grid on the way in** — 185 is 8 × 23 + 1. The `LTXVLoopingSampler`'s temporal tiling (tile 56, overlap 24) may also act on it, so this is a second and upstream cause rather than a replacement explanation, and nothing here asserts which dominates. What it does mean is that a graph loading video through VHS with the LTXV format is already on that grid before a sampler runs.
 
+## MiniMax H3 keyframe (first frame / first+last)
+
+**Immutable source:** `workflow_templates/reference_exports/h3-first-last-user-export.json` (SHA in `MANIFEST.md`; 28 nodes, 27 reachable — the single orphan is the *inherited* `ref2va` loader).
+
+**Adapter path:** `build_h3_keyframe_payload` — 18 `mvp:` nodes serving both `first_last` and, per the Director's 2026-08-18 ruling, `image_to_video` (re-routed from the planned LTX I2V path; that evidence stays imported as the alternative). Frames resolve from the Shot's **citations by role** — `first` and `last` — never positionally.
+
+**Checkpoint:** `minimax_h3_fl2va_pruned_int8_convrot.safetensors`, a dedicated first/last model. Bundle: `simple`/20/`res_multistep`, no LoRA and no profile (no evidence exists for one), `shift_video: 12`, `shift_audio: 3`, saver crf 19. Geometry shares `select_resolution`'s measured 0.6 MP / 16:9 / 32 default (1056×608); the export's in-graph sizing derives an unmeasured size from whatever image arrives and was deliberately not reproduced.
+
+**Keyframe shots cannot lip-sync, and that is the node's fact, not a policy.** Live `/object_info`: `MiniMaxH3ImageToVideo` takes `clip/vae/prompt/width/height/length` plus **optional** `first_frame` and `last_frame` — first-only is schema-legal, which is what makes one adapter serve both modes — and **no audio input of any kind** exists on it or its conditioning path. `use_song_audio` is refused in `mode_specification_problems`' words rather than silently dropped, the mode-select labels end "no song lip-sync", and the pre-flight re-reads both schema facts live every run so a ComfyUI upgrade that adds audio would surface as a check failure, not a missed opportunity. Output audio exists but is sampler-generated, as on the text-only path. Consequence for planning: **a singing shot belongs in `references` mode** — a keyframe shot has nothing to sync to.
+
+**Spectrum, now a checked fact instead of a one-line note.** `SpectrumApplyMiniMaxH3` sits enabled in this export *and in both reference exports*, and the shipped reference adapter omits it. The keyframe adapter mirrors that omission deliberately, and a chain-walk test asserts all three at once: enabled in the export, absent from both adapters' payloads, named in the stated-drops list — so the two H3 adapters cannot silently diverge on it.
+
+**`length` ceiling:** the node's own 5–3600 on the 17k+5 grid, refused locally at 422 rather than surfacing as ComfyUI's opaque 502.
+
 ## LTX 2.5 enhancement (standalone)
 
 **Immutable source:** `workflow_templates/reference_exports/ltx25-enhancer-user-export.json` (SHA-256 in the reference-exports `MANIFEST.md`).

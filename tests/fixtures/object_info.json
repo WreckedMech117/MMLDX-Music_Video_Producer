@@ -2192,6 +2192,111 @@
     "python_module": "custom_nodes.ComfyUI-MiniMaxH3-Director",
     "search_aliases": null
   },
+  "MiniMaxH3ImageToVideo": {
+    "api_node": false,
+    "category": "model/conditioning/minimax",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "MiniMax H3 Image to Video",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "first_frame": [
+          "IMAGE",
+          {}
+        ],
+        "last_frame": [
+          "IMAGE",
+          {}
+        ]
+      },
+      "required": {
+        "clip": [
+          "CLIP",
+          {}
+        ],
+        "height": [
+          "INT",
+          {
+            "default": 768,
+            "max": 16384,
+            "min": 32,
+            "step": 32
+          }
+        ],
+        "length": [
+          "INT",
+          {
+            "default": 124,
+            "max": 3600,
+            "min": 5,
+            "step": 17,
+            "tooltip": "Frame count at 24 fps, snapped up to the model's 17k+5 grid (124 = ~5s; trained range is ~124-362, longer is untested)"
+          }
+        ],
+        "prompt": [
+          "STRING",
+          {
+            "dynamicPrompts": true,
+            "multiline": true
+          }
+        ],
+        "vae": [
+          "VAE",
+          {}
+        ],
+        "width": [
+          "INT",
+          {
+            "default": 1344,
+            "max": 16384,
+            "min": 32,
+            "step": 32
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "first_frame",
+        "last_frame"
+      ],
+      "required": [
+        "clip",
+        "vae",
+        "prompt",
+        "width",
+        "height",
+        "length"
+      ]
+    },
+    "is_input_list": false,
+    "name": "MiniMaxH3ImageToVideo",
+    "output": [
+      "CONDITIONING",
+      "LATENT"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "positive",
+      "LATENT"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_minimax_h3",
+    "search_aliases": null
+  },
   "MiniMaxH3MediaLoader": {
     "category": "conditioning/video_models",
     "description": "Load MiniMax H3 reference media by drag-and-drop or file picker. Wire 'references' to the Prompt Builder, and to the Reference Splitter when you also want individual slots for MiniMaxH3ReferenceToVideo. A video's soundtrack can be split off and paired with it automatically.",

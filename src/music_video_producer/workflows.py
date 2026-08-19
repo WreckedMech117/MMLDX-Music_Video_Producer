@@ -746,6 +746,65 @@ def song_audio_window(
     return {"start": start, "end": end}
 
 
+def _resolve_frame(
+    *,
+    width: int | None,
+    height: int | None,
+    megapixels: float | None,
+    aspect_ratio: str | None,
+    multiple: int | None,
+) -> tuple[int, int]:
+    """One frame, described one way or the other, never both.
+
+    The geometry rule ``build_h3_reference_payload`` established, extracted verbatim when
+    ``build_h3_keyframe_payload`` needed the identical resolution: an explicit
+    ``width``/``height`` pair is honoured exactly, the selector triple resolves through
+    ``select_resolution``, supplying both is refused rather than resolved by precedence,
+    and omitting all five takes the Director pipeline's measured 0.6 MP / 16:9 / 32.
+    Extracted rather than copied so the two H3 adapters cannot drift apart on what a
+    geometry request means — the digest pins in ``tests/test_workflows.py`` hold the
+    reference payload byte-identical across the move.
+    """
+    explicit = {"width": width, "height": height}
+    selected = {"megapixels": megapixels, "aspect_ratio": aspect_ratio, "multiple": multiple}
+    given_explicit = [name for name, value in explicit.items() if value is not None]
+    given_selected = [name for name, value in selected.items() if value is not None]
+    if given_explicit and given_selected:
+        raise ValueError(
+            "A frame is described either by an explicit width and height or by megapixels, "
+            f"aspect ratio and multiple — not both. This request sent "
+            f"{', '.join(given_explicit)} and {', '.join(given_selected)}."
+        )
+    if given_explicit and len(given_explicit) != 2:
+        # Half an explicit frame is not a frame. Without this, `width=640` alone would fall
+        # through to the selector for its height and silently render 640x608.
+        raise ValueError(
+            f"An explicit frame needs both width and height; this request sent only "
+            f"{given_explicit[0]}"
+        )
+    if given_explicit:
+        # Type and range together, so both reach the route as the `ValueError` it turns into a
+        # 422 rather than as a `TypeError` it does not catch.
+        floor, ceiling = H3_REFERENCE_DIMENSION_LIMITS
+        for name, value in explicit.items():
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not floor <= value <= ceiling
+            ):
+                raise ValueError(
+                    f"An explicit {name} must be a whole number of pixels between {floor} "
+                    f"and {ceiling}, which the H3 node accepts, not {value!r}"
+                )
+        # `given_explicit` has both names, so neither is None here.
+        return width, height  # type: ignore[return-value]
+    return select_resolution(
+        megapixels=H3_DEFAULT_MEGAPIXELS if megapixels is None else megapixels,
+        aspect_ratio=H3_DEFAULT_ASPECT_RATIO if aspect_ratio is None else aspect_ratio,
+        multiple=H3_DEFAULT_MULTIPLE if multiple is None else multiple,
+    )
+
+
 def build_h3_reference_payload(
     *,
     prompt: str,
@@ -817,44 +876,15 @@ def build_h3_reference_payload(
     sampled_steps = sampling.steps if steps is None else steps
     # Geometry, resolved once and before any reference is looked at, so a request carrying
     # two contradictory ways to say how big the frame is fails on that rather than on
-    # whichever unrelated thing it happens to trip over next.
-    explicit = {"width": width, "height": height}
-    selected = {"megapixels": megapixels, "aspect_ratio": aspect_ratio, "multiple": multiple}
-    given_explicit = [name for name, value in explicit.items() if value is not None]
-    given_selected = [name for name, value in selected.items() if value is not None]
-    if given_explicit and given_selected:
-        raise ValueError(
-            "A frame is described either by an explicit width and height or by megapixels, "
-            f"aspect ratio and multiple — not both. This request sent "
-            f"{', '.join(given_explicit)} and {', '.join(given_selected)}."
-        )
-    if given_explicit and len(given_explicit) != 2:
-        # Half an explicit frame is not a frame. Without this, `width=640` alone would fall
-        # through to the selector for its height and silently render 640x608.
-        raise ValueError(
-            f"An explicit frame needs both width and height; this request sent only "
-            f"{given_explicit[0]}"
-        )
-    if given_explicit:
-        # Type and range together, so both reach the route as the `ValueError` it turns into a
-        # 422 rather than as a `TypeError` it does not catch.
-        floor, ceiling = H3_REFERENCE_DIMENSION_LIMITS
-        for name, value in explicit.items():
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or not floor <= value <= ceiling
-            ):
-                raise ValueError(
-                    f"An explicit {name} must be a whole number of pixels between {floor} "
-                    f"and {ceiling}, which the H3 node accepts, not {value!r}"
-                )
-    else:
-        width, height = select_resolution(
-            megapixels=H3_DEFAULT_MEGAPIXELS if megapixels is None else megapixels,
-            aspect_ratio=H3_DEFAULT_ASPECT_RATIO if aspect_ratio is None else aspect_ratio,
-            multiple=H3_DEFAULT_MULTIPLE if multiple is None else multiple,
-        )
+    # whichever unrelated thing it happens to trip over next. The rule itself lives in
+    # `_resolve_frame`, shared with the keyframe adapter.
+    width, height = _resolve_frame(
+        width=width,
+        height=height,
+        megapixels=megapixels,
+        aspect_ratio=aspect_ratio,
+        multiple=multiple,
+    )
     counts = {
         kind: sum(1 for item in references if item.get("kind") == kind)
         for kind in H3_REFERENCE_LIMITS
@@ -976,6 +1006,173 @@ def build_h3_reference_payload(
         "mvp:condition": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": condition_inputs},
         "mvp:sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampling.sampler}},
         "mvp:scheduler": {"class_type": "BasicScheduler", "inputs": {"model": ["mvp:preview", 0], "scheduler": sampling.scheduler, "steps": sampled_steps, "denoise": 1.0}},
+        "mvp:noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "mvp:guider": {"class_type": "BasicGuider", "inputs": {"model": ["mvp:preview", 0], "conditioning": ["mvp:condition", 0]}},
+        "mvp:sample": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["mvp:noise", 0], "guider": ["mvp:guider", 0], "sampler": ["mvp:sampler", 0], "sigmas": ["mvp:scheduler", 0], "latent_image": ["mvp:condition", 1]}},
+        "mvp:video": {"class_type": "VAEDecode", "inputs": {"samples": ["mvp:sample", 0], "vae": ["mvp:video_vae", 0]}},
+        "mvp:audio": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["mvp:sample", 0], "vae": ["mvp:audio_vae", 0]}},
+        "mvp:save": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["mvp:video", 0], "audio": ["mvp:audio", 0], "frame_rate": 24, "loop_count": 0, "filename_prefix": prefix, "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 19, "save_metadata": True, "trim_to_audio": False, "pingpong": False, "save_output": True}},
+    }
+
+
+#: The frame ceiling ``MiniMaxH3ImageToVideo.length`` declares, read from live
+#: ``/object_info`` on 2026-08-18. The same 3600 ``MiniMaxH3ReferenceToVideo`` declares, and
+#: deliberately *not* an alias of ``H3_REFERENCE_MAX_FRAMES``: the two adapters restate the
+#: same ceiling for their own nodes, and aliasing would make a divergence in one invisible
+#: in the other's audit — ``tests/preflight_h3_ultra.py`` checks each against its own node.
+H3_KEYFRAME_MAX_FRAMES = 3600
+
+#: The step count a keyframe render takes when the request names none, read from the
+#: audited export's own ``BasicScheduler`` (``h3-first-last-user-export.json``, node
+#: ``2345``) and pinned against it by chain-walk in ``tests/test_workflows.py``. This path
+#: is deliberately offered **no sampling profile**: the turbo exports are T2V, Director and
+#: References2V graphs on other checkpoints, no turbo evidence exists for ``fl2va``, and a
+#: profile here would be exactly the unevidenced blend the profile machinery exists to
+#: prevent. Marked Ask First in the spec and not asked.
+H3_KEYFRAME_DEFAULT_STEPS = 20
+
+
+def build_h3_keyframe_payload(
+    *,
+    prompt: str,
+    first_frame: str,
+    last_frame: str | None,
+    duration: float,
+    seed: int,
+    prefix: str,
+    width: int | None = None,
+    height: int | None = None,
+    megapixels: float | None = None,
+    aspect_ratio: str | None = None,
+    multiple: int | None = None,
+    steps: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build the MiniMax H3 first/last keyframe graph (the Director's ``I2V-FLframe`` mode).
+
+    Derived from ``workflow_templates/reference_exports/h3-first-last-user-export.json`` —
+    28 nodes of which **27 are reachable** from its single ``VHS_VideoCombine``, and the one
+    orphan is the inherited ``ref2va`` ``UNETLoader``. The reachable checkpoint is
+    ``minimax_h3_fl2va_pruned_int8_convrot.safetensors``, a dedicated first/last model, and
+    this builder must never load ``ref2va``: that would be an unevidenced combination *and*
+    a ~20 GB model swap against every reference render. ``tests/test_workflows.py`` pins
+    every bundle value here by chain-walking the export rather than restating it.
+
+    **What live ``/object_info`` settles about this graph, read 2026-08-18 and load-bearing
+    for two modes' honesty:** ``MiniMaxH3ImageToVideo`` requires ``clip`` / ``vae`` /
+    ``prompt`` / ``width`` / ``height`` / ``length`` and declares ``first_frame`` and
+    ``last_frame`` both **optional** — so a first-frame-only graph is schema-legal, which is
+    what lets ``image_to_video`` route here with ``last_frame`` simply absent. The node has
+    **no reference-audio input of any kind**: no ``ref_audios`` autogrow group, no audio
+    input anywhere on it or its conditioning path. A keyframe shot therefore **cannot be
+    conditioned on the master song and cannot lip-sync to it** — its audio track is
+    generated by the sampler and decoded through the audio VAE, exactly like the text-only
+    Director path's. ``SHOT_MODE_SPECS`` declares ``song_audio=False`` on both modes for
+    this reason, and ``use_song_audio`` on a keyframe shot is refused in
+    ``mode_specification_problems``' words rather than silently dropped.
+    ``tests/preflight_h3_ultra.py`` re-checks both schema facts against the live server.
+
+    ``last_frame=None`` is the ``image_to_video`` shape and omits the input entirely —
+    the schema treats an absent optional as absent, and sending a null would be a shape
+    nobody evidenced. An *empty string* for either frame is refused: a caller that passed
+    ``""`` lost a path, and treating it as "no frame" would silently change which graph
+    renders.
+
+    Two reachable node groups from the export are deliberately not reproduced, both
+    mirroring decisions the shipped reference adapter already made against identical
+    evidence — a silent divergence between two H3 adapters on the same node is the drift
+    the profile work exists to prevent:
+
+    * ``SpectrumApplyMiniMaxH3`` sits **enabled** in this export's model chain, exactly as
+      it sits enabled in ``h3-ultra-references-user-export.json`` and
+      ``h3-references2v-user-export.json`` — and ``build_h3_reference_payload`` omits it
+      there. Its parameters are marked Ask First in the spec and have not been asked, so
+      this adapter omits it the same way, deliberately: the model chain runs loader →
+      sigma shift → sage attention → preview, with no Spectrum node. The export's empty
+      ``Power Lora Loader (rgthree)`` is dropped for the reference adapter's recorded
+      reason too — live schema declares no ``lora_*`` inputs on it, and an empty pass-through
+      patches nothing.
+    * The export's geometry plumbing — ``ImageScaleToTotalPixels`` (1 MP) →
+      ``GetImageSize`` → two ``Any Switch (rgthree)`` with a 0.9 MP ``ResolutionSelector``
+      fallback, and the ``ComfyMathExpression`` frame counter — is editor-side convenience
+      resolved server-side here, as the reference adapter resolves the *same* plumbing in
+      its own exports. **Keyframe shots share ``select_resolution``'s 0.6 MP default**, and
+      the reason is stated rather than assumed: the export's in-graph sizing derives an
+      unmeasured ~1 MP frame from whatever the first image happens to be, while 0.6 MP /
+      16:9 / 32 is the one geometry measured from the Director's own pipeline on this
+      machine (1056x608) and the default every other H3 reference render already gets.
+      Giving the keyframe modes a different default would make one mode's renders a
+      different, unevidenced size for no reason a manifest could show. The frame count is
+      the export's own expression — ``max(5, round(a * 24))`` snapped up to the 17k+5 grid —
+      computed here exactly as ``build_h3_reference_payload`` computes it.
+
+    ``steps`` left as ``None`` takes ``H3_KEYFRAME_DEFAULT_STEPS``, the export's own count.
+    There is no ``profile`` parameter on purpose — see that constant.
+    """
+    # Both checks are one condition apiece so a wrong type and a blank string alike arrive
+    # as the `ValueError` the route translates into a 422 — a `TypeError` would escape as a
+    # 500, the same reasoning `select_resolution` records for its own combined conditions.
+    if not isinstance(first_frame, str) or not first_frame.strip():
+        raise ValueError(
+            f"A keyframe shot's first frame must be a file path, not {first_frame!r}"
+        )
+    if last_frame is not None and (not isinstance(last_frame, str) or not last_frame.strip()):
+        raise ValueError(
+            f"A keyframe shot's last frame must be a file path, not {last_frame!r}; "
+            f"a shot with no last frame passes None, never an empty string"
+        )
+    width, height = _resolve_frame(
+        width=width,
+        height=height,
+        megapixels=megapixels,
+        aspect_ratio=aspect_ratio,
+        multiple=multiple,
+    )
+    _finite("Shot duration", duration)
+    requested = max(5, round(duration * H3_FRAME_RATE))
+    # The export's own ComfyMathExpression, computed server-side: the same 17k+5 grid
+    # `timeline.align_h3_frames` rounds to, asserted to agree with the export's expression
+    # in `tests/test_workflows.py`.
+    length = requested + (5 - requested % 17) % 17
+    if length > H3_KEYFRAME_MAX_FRAMES:
+        raise ValueError(
+            f"A {duration:g}s shot needs {length} frames, above the H3 keyframe node's "
+            f"{H3_KEYFRAME_MAX_FRAMES}-frame maximum "
+            f"({H3_KEYFRAME_MAX_FRAMES / H3_FRAME_RATE:g}s at {H3_FRAME_RATE} fps)"
+        )
+    # The frames travel as `picture` entries of the same media loader the reference path
+    # uses, in a **fixed** order the conditioner wiring depends on: entry 0 is the first
+    # frame, entry 1 the last. The labels name the roles so a ComfyUI-side log reads as the
+    # shot does; which file plays which role is decided by the named parameters above,
+    # never by the order a caller happened to list citations in.
+    frames = [{"kind": "picture", "file": first_frame, "label": "first frame", "enabled": True}]
+    if last_frame is not None:
+        frames.append(
+            {"kind": "picture", "file": last_frame, "label": "last frame", "enabled": True}
+        )
+    condition_inputs: dict[str, Any] = {
+        "clip": ["mvp:clip", 0], "vae": ["mvp:video_vae", 0], "prompt": prompt,
+        "width": width, "height": height, "length": length,
+        # The splitter's picture outputs, through the same audited offsets the reference
+        # adapter wires — the export feeds `first_frame` from splitter output 0 and
+        # `last_frame` from output 1, which are `picture_1` and `picture_2` in the live
+        # schema's own output names.
+        "first_frame": ["mvp:split", H3_SPLIT_OFFSETS["picture"]],
+    }
+    if last_frame is not None:
+        condition_inputs["last_frame"] = ["mvp:split", H3_SPLIT_OFFSETS["picture"] + 1]
+    return {
+        "mvp:model": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+        "mvp:shift": {"class_type": "MiniMaxH3SigmaShift", "inputs": {"model": ["mvp:model", 0], "shift_video": 12, "shift_audio": 3}},
+        "mvp:attention": {"class_type": "PathchSageAttentionKJ", "inputs": {"model": ["mvp:shift", 0], "sage_attention": "disabled", "allow_compile": False}},
+        "mvp:preview": {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": ["mvp:attention", 0], "max_resolution": 1024, "jpeg_quality": 80, "suppress_default_preview": True, "preview_frames": 12, "preview_fps": 12}},
+        "mvp:clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
+        "mvp:video_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+        "mvp:audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+        "mvp:frames": {"class_type": "MiniMaxH3MediaLoader", "inputs": {"media_state": json.dumps(frames, separators=(",", ":"))}},
+        "mvp:split": {"class_type": "MiniMaxH3ReferenceSplitter", "inputs": {"references": ["mvp:frames", 0]}},
+        "mvp:condition": {"class_type": "MiniMaxH3ImageToVideo", "inputs": condition_inputs},
+        "mvp:sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+        "mvp:scheduler": {"class_type": "BasicScheduler", "inputs": {"model": ["mvp:preview", 0], "scheduler": "simple", "steps": H3_KEYFRAME_DEFAULT_STEPS if steps is None else steps, "denoise": 1.0}},
         "mvp:noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
         "mvp:guider": {"class_type": "BasicGuider", "inputs": {"model": ["mvp:preview", 0], "conditioning": ["mvp:condition", 0]}},
         "mvp:sample": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["mvp:noise", 0], "guider": ["mvp:guider", 0], "sampler": ["mvp:sampler", 0], "sigmas": ["mvp:scheduler", 0], "latent_image": ["mvp:condition", 1]}},
