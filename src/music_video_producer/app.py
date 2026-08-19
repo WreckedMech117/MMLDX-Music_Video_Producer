@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import re
+import shutil
 import subprocess
 import tempfile
 from collections import Counter
@@ -14,6 +16,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
+from .assembly import (
+    ClipWindow,
+    assembly_plan,
+    assembly_refusals,
+    concat_args,
+    concat_manifest,
+    probe_dimensions_args,
+    probe_duration_args,
+    probe_streams_args,
+    trim_args,
+    verification_problems,
+)
 from .batch import (
     TERMINAL_JOB_STATUSES,
     ReadinessReport,
@@ -23,6 +37,7 @@ from .batch import (
     prompt_rejection,
     readiness_refusal,
     readiness_report,
+    reconcilable_jobs,
     reconcile_render_jobs,
     render_status_report,
     shot_label,
@@ -1667,6 +1682,66 @@ class AudioRestoreResponse(BaseModel):
     length_note: str
 
 
+# ------------------------------------------------------------------------------------------
+# Assembly (FR-22, AD-9). The plan-shaped refusals — unapproved, stale, gaps — live in
+# `assembly.py` beside the logic that decides them; these are the route's own: state
+# conflicts, the song, and what a failed stage writes on the job.
+# ------------------------------------------------------------------------------------------
+
+ASSEMBLY_BUSY_REFUSAL = (
+    "An assembly is already running for this project. One export at a time — wait for it "
+    "to finish."
+)
+ASSEMBLY_RENDERS_OPEN_REFUSAL = (
+    "{count} render job(s) are still in flight for this project. Assembly reads the "
+    "manifest as it stands, and a landing job would change it mid-read. Let the queue "
+    "settle, then assemble."
+)
+ASSEMBLY_NO_SONG_REFUSAL = (
+    "This project has no song on record. Assembly synchronizes the video to the master "
+    "song — add or generate one first."
+)
+ASSEMBLY_SONG_FILE_REFUSAL = (
+    "The project's song is not on disk: {path}. Restore the file, then assemble."
+)
+ASSEMBLY_SONG_UNREADABLE_REFUSAL = (
+    "The project's song could not be measured as audio: {path}. Assembly cannot verify "
+    "a duration against a file ffprobe cannot read."
+)
+ASSEMBLY_TAKE_UNREADABLE_REFUSAL = (
+    "{shot}'s approved take could not be read as video: {path}."
+)
+#: What an interrupted assembly's job says after a restart. The in-process registry is the
+#: only thing that can settle a local job, so a running assembly job with no live process
+#: behind it is a job nothing will ever finish — healed to `error` rather than left to
+#: block every future assembly.
+ASSEMBLY_ORPHANED_ERROR = (
+    "This assembly was interrupted by an application restart and did not finish."
+)
+ASSEMBLY_STAGE_FAILED_ERROR = "Assembly failed at the {stage} stage: {detail}"
+
+
+class AssemblyResponse(BaseModel):
+    """What a completed assembly returns: the settled job and the measured facts.
+
+    Everything numeric here is a measurement of the written file or the plan that built
+    it, not an intention — `duration_seconds` is ffprobe's reading of the export, already
+    verified against `song_seconds` within one frame before this response exists.
+    """
+
+    job: RenderJob
+    #: Media-relative path under the project's media dir — `exports/assembly_00001.mp4`.
+    export: str
+    #: The URL the existing project-media route serves it at, Range service included.
+    export_url: str
+    duration_seconds: float
+    song_seconds: float
+    width: int
+    height: int
+    total_frames: int
+    clip_count: int
+
+
 class H3Request(BaseModel):
     # `None` rather than 1344/768, for `steps`' reason one field down: an omitted size has to
     # be distinguishable from one the Director typed, because the reference path now resolves
@@ -2464,6 +2539,11 @@ def create_app(
     # back below rather than captured, because a closure over the local would keep reporting
     # the startup answer forever.
     app.state.eject_source = eject_source
+    # Job ids of assemblies this *process* is running. Local jobs have no ComfyUI record to
+    # reconcile against, so this set is the one truth about "still running" — a non-terminal
+    # local job whose id is not in here was orphaned by a restart and gets healed to `error`
+    # at the next assemble. Held on `app.state` so tests can inspect it.
+    app.state.live_assemblies = set()
 
     def get_project(project_id: str) -> Project:
         try:
@@ -4210,6 +4290,254 @@ def create_app(
         shot.approved_start = 0
         shot.approved_duration = 0
         return store.save(project)
+
+    async def run_tool(args: list[str]) -> tuple[int, str, str]:
+        """One ffmpeg/ffprobe invocation, event loop left free. Returns (rc, stdout, stderr).
+
+        `vram.py`'s subprocess pattern: `create_subprocess_exec` (never a shell), stdin
+        closed, both streams captured. A missing binary reads as a failed run with the
+        absence in stderr rather than a 500 — ffmpeg not being on PATH is an environment
+        fact the job's error field should carry in words.
+        """
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return 127, "", f"{args[0]} is not installed or not on PATH"
+        out, err = await process.communicate()
+        code = process.returncode if process.returncode is not None else -1
+        return (
+            code,
+            out.decode("utf-8", "replace").strip(),
+            err.decode("utf-8", "replace").strip(),
+        )
+
+    @app.post("/api/projects/{project_id}/assemble", response_model=AssemblyResponse)
+    async def assemble_project(project_id: str) -> AssemblyResponse:
+        """Every approved take, trimmed to its window, joined to the master song. No body.
+
+        FR-22 through AD-9: local ffmpeg, never ComfyUI — `comfy.prompts` stays empty on
+        every path through here, refusal or success. No body for the approve route's
+        reason: every input is the manifest's, and the export is evidence assembled from
+        evidence — `approved_output` paths the server wrote from its own job records, a
+        song path the manifest records, windows the approve route snapshotted.
+
+        The order of refusals: state conflicts first (409 — the same request succeeds once
+        the conflict clears), then the song (without a measured song duration the plan
+        cannot be judged at all), then the one comprehensive 422 carrying *every*
+        plan-shaped reason at once — `assembly.py`'s report. A Director fixing a 15-shot
+        plan one refusal at a time is a Director being rationed.
+
+        The response is synchronous, deliberately. The work is seconds of local CPU; a
+        background lane would need local reconciliation, a task registry surviving
+        nothing, and frontend polling changes, whose only payoff is not holding a request
+        open. The `RenderJob` (kind `post`, empty `prompt_id`/`seed` by design) is still
+        written *before* the work and settled after it, so provenance survives a crash
+        mid-run: a later assemble finds the orphan and heals it to `error` rather than
+        letting it block forever. `reconcilable_jobs` skips empty-`prompt_id` jobs, so
+        nothing here ever reaches the ComfyUI queue path (AD-9's "reconciled locally").
+
+        What could still move under a running assembly: the manifest is re-read before
+        every job write, and only the job is patched on the fresh read — a Director
+        editing shots mid-assembly loses nothing, and the export honestly reflects the
+        plan as validated when the run began, which `job.inputs` records (FR-24 adapted).
+        """
+        project = get_project(project_id)
+        # Heal orphans before judging "busy": a local job left `running` by a crash has no
+        # process behind it and nothing else will ever settle it.
+        healed = False
+        for job in project.jobs:
+            if (
+                job.kind == "post"
+                and not job.prompt_id
+                and job.status not in TERMINAL_JOB_STATUSES
+                and job.id not in app.state.live_assemblies
+            ):
+                job.status = "error"
+                job.error = ASSEMBLY_ORPHANED_ERROR
+                healed = True
+        if healed:
+            project = store.save(project)
+        if any(
+            job.kind == "post"
+            and not job.prompt_id
+            and job.status not in TERMINAL_JOB_STATUSES
+            for job in project.jobs
+        ):
+            raise HTTPException(status_code=409, detail=ASSEMBLY_BUSY_REFUSAL)
+        open_jobs = reconcilable_jobs(project)
+        if open_jobs:
+            raise HTTPException(
+                status_code=409,
+                detail=ASSEMBLY_RENDERS_OPEN_REFUSAL.format(count=len(open_jobs)),
+            )
+        if not project.song or not project.song.path:
+            raise HTTPException(status_code=422, detail=ASSEMBLY_NO_SONG_REFUSAL)
+        try:
+            song_path = resolve_song_path(project_id, project.song)
+        except HTTPException as error:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSEMBLY_SONG_FILE_REFUSAL.format(path=project.song.path),
+            ) from error
+        # The song's duration is ffprobe's reading of the file, never the stored field —
+        # the stored value may be 0 (imported before measurement) or stale (file replaced),
+        # and FR-22's one-frame bound is against the audio that will actually play.
+        rc, out, _err = await run_tool(probe_duration_args(song_path))
+        try:
+            song_seconds = float(out.splitlines()[0]) if rc == 0 and out else 0.0
+        except ValueError:
+            song_seconds = 0.0
+        if song_seconds <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSEMBLY_SONG_UNREADABLE_REFUSAL.format(path=project.song.path),
+            )
+        # Re-read after the await, then judge the plan from the fresh manifest.
+        project = get_project(project_id)
+        output_root = (settings.comfy_root / "output").resolve()
+        clips: list[ClipWindow] = []
+        for shot in project.shots:
+            source: Path | None = None
+            if shot.approved_output:
+                candidate = (output_root / Path(shot.approved_output)).resolve()
+                if output_root in candidate.parents and candidate.is_file():
+                    source = candidate
+            clips.append(
+                ClipWindow(
+                    shot_id=shot.id,
+                    label=shot_label(project, shot),
+                    start=shot.start,
+                    duration=shot.duration,
+                    approved_output=shot.approved_output,
+                    approved_start=shot.approved_start,
+                    approved_duration=shot.approved_duration,
+                    source=source,
+                )
+            )
+        refusals = assembly_refusals(clips, song_seconds)
+        if refusals:
+            raise HTTPException(status_code=422, detail="\n".join(refusals))
+        dimensions: dict[str, tuple[int, int]] = {}
+        for clip in clips:
+            rc, out, _err = await run_tool(probe_dimensions_args(clip.source))
+            try:
+                first = out.splitlines()[0].split(",") if rc == 0 and out else []
+                dimensions[clip.shot_id] = (int(first[0]), int(first[1]))
+            except (ValueError, IndexError):
+                raise HTTPException(
+                    status_code=422,
+                    detail=ASSEMBLY_TAKE_UNREADABLE_REFUSAL.format(
+                        shot=clip.label, path=clip.approved_output
+                    ),
+                ) from None
+        plan = assembly_plan(clips, song_seconds, dimensions)
+
+        exports_root = store.media_dir(project_id) / "exports"
+        exports_root.mkdir(parents=True, exist_ok=True)
+        taken = [
+            int(match.group(1))
+            for match in (
+                re.fullmatch(r"assembly_(\d{5})\.mp4", item.name)
+                for item in exports_root.glob("assembly_*.mp4")
+            )
+            if match
+        ]
+        export_name = f"assembly_{max(taken, default=0) + 1:05d}.mp4"
+
+        # The job is written before any work so provenance survives a crash. `inputs` is
+        # FR-24 adapted: the exact takes this export was built from, by shot.
+        job = RenderJob(
+            kind="post",
+            status="running",
+            target_id="assembly",
+            inputs=[f"{clip.shot_id}={clip.approved_output}" for clip in plan.clips],
+        )
+        project.jobs.append(job)
+        store.save(project)
+        app.state.live_assemblies.add(job.id)
+        workdir = exports_root / f".work-{job.id}"
+        workdir.mkdir(parents=True, exist_ok=True)
+
+        def settle(patch) -> RenderJob | None:
+            """Re-read, patch only this job on the fresh manifest, save. The house re-read
+            rule: awaits happened, and shot edits made meanwhile must not be overwritten."""
+            fresh = get_project(project_id)
+            recorded = next((item for item in fresh.jobs if item.id == job.id), None)
+            if recorded:
+                patch(recorded)
+                store.save(fresh)
+            return recorded
+
+        def failed(stage: str, detail: str) -> HTTPException:
+            trimmed = detail[-500:] if detail else "no error output"
+            message = ASSEMBLY_STAGE_FAILED_ERROR.format(stage=stage, detail=trimmed)
+
+            def patch(recorded: RenderJob) -> None:
+                recorded.status = "error"
+                recorded.error = message
+
+            settle(patch)
+            return HTTPException(status_code=502, detail=message)
+
+        try:
+            intermediates: list[Path] = []
+            for index, (clip, frames) in enumerate(
+                zip(plan.clips, plan.frames, strict=True)
+            ):
+                dest = workdir / f"clip_{index:03d}.mp4"
+                rc, _out, err = await run_tool(
+                    trim_args(clip.source, dest, frames, plan.width, plan.height)
+                )
+                if rc != 0 or not dest.is_file():
+                    raise failed(f"trim ({clip.label})", err)
+                intermediates.append(dest)
+            list_file = workdir / "clips.txt"
+            list_file.write_text(concat_manifest(intermediates), encoding="utf-8")
+            candidate = workdir / export_name
+            rc, _out, err = await run_tool(concat_args(list_file, song_path, candidate))
+            if rc != 0 or not candidate.is_file():
+                raise failed("concat", err)
+            # FR-22's last consequence: verified after writing, and the export reaches its
+            # public name only after passing — a failed verification leaves nothing under
+            # `exports/` to be mistaken for a result.
+            rc, out, err = await run_tool(probe_duration_args(candidate))
+            try:
+                measured = float(out.splitlines()[0]) if rc == 0 and out else 0.0
+            except ValueError:
+                measured = 0.0
+            rc, out, err = await run_tool(probe_streams_args(candidate))
+            streams = [line for line in out.splitlines() if line] if rc == 0 else []
+            problems = verification_problems(song_seconds, measured, streams)
+            if problems:
+                raise failed("verification", " ".join(problems))
+            shutil.move(str(candidate), str(exports_root / export_name))
+        finally:
+            app.state.live_assemblies.discard(job.id)
+            shutil.rmtree(workdir, ignore_errors=True)
+
+        export_relative = f"exports/{export_name}"
+
+        def complete(recorded: RenderJob) -> None:
+            recorded.status = "complete"
+            recorded.output_files = [export_relative]
+
+        settled = settle(complete)
+        return AssemblyResponse(
+            job=settled or job,
+            export=export_relative,
+            export_url=f"/api/projects/{project_id}/media/{export_relative}",
+            duration_seconds=measured,
+            song_seconds=song_seconds,
+            width=plan.width,
+            height=plan.height,
+            total_frames=plan.total_frames,
+            clip_count=len(plan.clips),
+        )
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)
     async def director_chat(project_id: str, request: DirectorRequest) -> Project:

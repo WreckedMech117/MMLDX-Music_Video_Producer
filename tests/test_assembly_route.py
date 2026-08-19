@@ -1,0 +1,348 @@
+"""The assembly route, driven with real ffmpeg on synthesized media. No GPU, no ComfyUI.
+
+These tests build what the manifest would hold after real renders — tiny colour-source
+takes under the ComfyUI output root, a measured WAV as the imported song — then drive the
+real routes: approve (which snapshots windows), assemble (which trims, joins, muxes and
+verifies). The strongest claim here is the happy path's: the export exists, ffprobe
+measures it within one frame of the song, the takes are byte-identical afterwards, and
+`comfy.prompts` stayed empty the whole way.
+"""
+
+import subprocess
+import wave
+from io import BytesIO
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from music_video_producer.app import (
+    ASSEMBLY_BUSY_REFUSAL,
+    ASSEMBLY_NO_SONG_REFUSAL,
+    ASSEMBLY_ORPHANED_ERROR,
+    ASSEMBLY_RENDERS_OPEN_REFUSAL,
+    ASSEMBLY_SONG_FILE_REFUSAL,
+    create_app,
+)
+from music_video_producer.assembly import (
+    ASSEMBLY_GAP_REFUSAL,
+    ASSEMBLY_STALE_REFUSAL,
+    ASSEMBLY_UNAPPROVED_REFUSAL,
+)
+from music_video_producer.comfy import ComfyError
+from music_video_producer.config import Settings
+from music_video_producer.models import RenderJob
+from music_video_producer.store import ProjectStore
+
+
+class FakeComfy:
+    """The no-GPU double. Assembly must never touch it; `prompts` staying empty is the claim."""
+
+    def __init__(self):
+        self.prompts = []
+
+    async def health(self):
+        return {"online": True, "url": "http://fake"}
+
+    async def submit(self, prompt, client_id=None):
+        self.prompts.append(prompt)
+        raise ComfyError("assembly must not submit to ComfyUI")
+
+    async def queue(self):
+        return {"queue_running": [], "queue_pending": []}
+
+    async def history(self, prompt_id):
+        raise ComfyError("assembly must not read ComfyUI history")
+
+
+def make_client(tmp_path: Path):
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    store = ProjectStore(tmp_path)
+    comfy = FakeComfy()
+    app = create_app(settings=settings, store=store, comfy=comfy, director=object())
+    return TestClient(app), store, comfy, app
+
+
+def wav_bytes(seconds: float, rate: int = 8000) -> bytes:
+    content = BytesIO()
+    with wave.open(content, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(rate)
+        target.writeframes(b"\x00\x00" * int(seconds * rate))
+    return content.getvalue()
+
+
+def synthesize_take(path: Path, seconds: float, size: str = "128x72", colour: str = "red"):
+    """A real tiny take: colour source, 24 fps, yuv420p — what a render leaves, in miniature.
+
+    Deliberately *longer* than the window that will consume it, the way grid alignment
+    makes every real take run long.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"color=c={colour}:size={size}:rate=24",
+            "-t", f"{seconds}", "-pix_fmt", "yuv420p",
+            path.as_posix(),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def probe(path: Path, entries: str) -> str:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", entries, "-of", "csv=p=0", path.as_posix()],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def project_with_two_approved_takes(client, store, tmp_path: Path, *, song_seconds=8.0):
+    """A project whose plan tiles an 8 s song with two approved, on-disk, snapshotted takes."""
+    project_id = client.post("/api/projects", json={"name": "Assembly"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Assembly Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(song_seconds), "audio/wav")},
+    )
+    assert upload.status_code == 200, upload.text
+
+    shots_dir = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    )
+    synthesize_take(shots_dir / "shot_a-h3_00001-audio.mp4", 4.458, colour="red")
+    synthesize_take(
+        shots_dir / "shot_b-h3_00001-audio.mp4", 4.458, size="192x108", colour="blue"
+    )
+
+    prefix = f"music-video-producer/{project_id}/shots"
+    shots = [
+        {
+            "id": "shot_a",
+            "start": 0,
+            "duration": 4.0,
+            "prompt": "Red room",
+            "status": "complete",
+            "latest_output": f"{prefix}/shot_a-h3_00001-audio.mp4",
+        },
+        {
+            "id": "shot_b",
+            "start": 4.0,
+            "duration": 4.0,
+            "prompt": "Blue room",
+            "status": "complete",
+            "latest_output": f"{prefix}/shot_b-h3_00001-audio.mp4",
+        },
+    ]
+    saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert saved.status_code == 200, saved.text
+    for shot_id in ("shot_a", "shot_b"):
+        approved = client.post(f"/api/projects/{project_id}/shots/{shot_id}/approve")
+        assert approved.status_code == 200, approved.text
+    return project_id, shots_dir
+
+
+def test_assembly_trims_joins_muxes_and_verifies_without_touching_comfy(tmp_path: Path):
+    """The happy path, measured rather than asserted: a two-shot plan over an 8 s song
+    becomes one export whose duration ffprobe puts within a frame of the song, whose
+    geometry is the largest take present, whose takes are byte-identical afterwards, and
+    whose journey queued nothing on ComfyUI."""
+    client, store, comfy, app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    take_bytes_before = [
+        (shots_dir / "shot_a-h3_00001-audio.mp4").read_bytes(),
+        (shots_dir / "shot_b-h3_00001-audio.mp4").read_bytes(),
+    ]
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+    assert body["export"] == "exports/assembly_00001.mp4"
+    assert export.is_file()
+    # FR-22: within one frame of the song, measured on the written file.
+    measured = float(probe(export, "format=duration"))
+    assert abs(measured - 8.0) <= 1 / 24
+    assert abs(body["duration_seconds"] - measured) < 0.05
+    assert body["song_seconds"] == 8.0
+    # Normalization target: the largest-area take present (192x108 over 128x72).
+    assert (body["width"], body["height"]) == (192, 108)
+    assert probe(export, "stream=codec_type").splitlines() == ["video", "audio"]
+    # 8 s at 24 fps on the cumulative grid.
+    assert body["total_frames"] == 192
+    assert body["clip_count"] == 2
+
+    # The job settled locally: kind post, empty prompt_id by design, provenance recorded.
+    job = body["job"]
+    assert job["kind"] == "post"
+    assert job["prompt_id"] == ""
+    assert job["status"] == "complete"
+    assert job["output_files"] == ["exports/assembly_00001.mp4"]
+    assert job["inputs"] == [
+        f"shot_a=music-video-producer/{project_id}/shots/shot_a-h3_00001-audio.mp4",
+        f"shot_b=music-video-producer/{project_id}/shots/shot_b-h3_00001-audio.mp4",
+    ]
+    stored = store.get(project_id)
+    assert [j.status for j in stored.jobs] == ["complete"]
+
+    # No approved output was modified, no ComfyUI request was made, and the registry is
+    # empty again.
+    assert (shots_dir / "shot_a-h3_00001-audio.mp4").read_bytes() == take_bytes_before[0]
+    assert (shots_dir / "shot_b-h3_00001-audio.mp4").read_bytes() == take_bytes_before[1]
+    assert comfy.prompts == []
+    assert app.state.live_assemblies == set()
+
+    # The export streams through the existing media route.
+    served = client.get(body["export_url"])
+    assert served.status_code == 200
+    assert served.content[:8] == export.read_bytes()[:8]
+
+    # A second assembly is a new numbered file, never an overwrite.
+    again = client.post(f"/api/projects/{project_id}/assemble")
+    assert again.status_code == 200, again.text
+    assert again.json()["export"] == "exports/assembly_00002.mp4"
+    assert export.is_file()
+
+
+def test_every_blocking_reason_lands_in_one_422_and_no_job_is_written(tmp_path: Path):
+    """The comprehensive report: an unapproved shot and a gap against the song arrive in
+    the same detail string, nothing is written, nothing is queued."""
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Blocked"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(8.0), "audio/wav")},
+    )
+    assert upload.status_code == 200
+    shots = [
+        {"id": "shot_a", "start": 0, "duration": 4.0, "prompt": "Never rendered"},
+    ]
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    label = "SHOT 01 (shot_a)"
+    assert ASSEMBLY_UNAPPROVED_REFUSAL.format(shot=label) in detail
+    assert ASSEMBLY_GAP_REFUSAL.format(
+        start=4.0, end=8.0, before=label, after="the end of the song"
+    ) in detail
+    assert store.get(project_id).jobs == []
+    assert comfy.prompts == []
+    assert not (tmp_path / "projects" / project_id / "media" / "exports").exists()
+
+
+def test_a_window_moved_after_approval_is_refused_stale_by_id(tmp_path: Path):
+    """AD-13 end to end: the approve route snapshotted the window; moving the window makes
+    assembly refuse that shot with both windows in the sentence."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    stored = store.get(project_id)
+    stored.shots[1].start = 4.5
+    stored.shots[1].duration = 3.5
+    store.save(stored)
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+
+    assert response.status_code == 422
+    assert ASSEMBLY_STALE_REFUSAL.format(
+        shot="SHOT 02 (shot_b)",
+        approved_start=4.0,
+        approved_duration=4.0,
+        start=4.5,
+        duration=3.5,
+    ) in response.json()["detail"]
+
+
+def test_state_conflicts_are_409s_and_an_orphaned_assembly_is_healed(tmp_path: Path):
+    """The three job-shaped gates: open renders refuse, a live assembly refuses, and a
+    `running` local job with no process behind it — a restart's leftover — is healed to
+    `error` instead of blocking every future assembly."""
+    client, store, _comfy, app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    # An open ComfyUI render: 409, count named.
+    stored = store.get(project_id)
+    stored.jobs.append(RenderJob(kind="flux", status="running", prompt_id="p-9"))
+    store.save(stored)
+    busy_renders = client.post(f"/api/projects/{project_id}/assemble")
+    assert busy_renders.status_code == 409
+    assert busy_renders.json()["detail"] == ASSEMBLY_RENDERS_OPEN_REFUSAL.format(count=1)
+
+    # A live assembly (its id is in the in-process registry): 409.
+    stored = store.get(project_id)
+    stored.jobs[-1].status = "complete"
+    stored.jobs.append(
+        RenderJob(id="job_live", kind="post", status="running", target_id="assembly")
+    )
+    store.save(stored)
+    app.state.live_assemblies.add("job_live")
+    busy_assembly = client.post(f"/api/projects/{project_id}/assemble")
+    assert busy_assembly.status_code == 409
+    assert busy_assembly.json()["detail"] == ASSEMBLY_BUSY_REFUSAL
+
+    # The same job with no live process behind it is an orphan: healed, then the request
+    # proceeds to a real export.
+    app.state.live_assemblies.discard("job_live")
+    healed = client.post(f"/api/projects/{project_id}/assemble")
+    assert healed.status_code == 200, healed.text
+    jobs = {job.id: job for job in store.get(project_id).jobs}
+    assert jobs["job_live"].status == "error"
+    assert jobs["job_live"].error == ASSEMBLY_ORPHANED_ERROR
+
+
+def test_the_song_gates_refuse_before_any_work(tmp_path: Path):
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "No song"}).json()["id"]
+
+    no_song = client.post(f"/api/projects/{project_id}/assemble")
+    assert no_song.status_code == 422
+    assert no_song.json()["detail"] == ASSEMBLY_NO_SONG_REFUSAL
+
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(8.0), "audio/wav")},
+    )
+    assert upload.status_code == 200
+    recorded = store.get(project_id).song.path
+    (tmp_path / "projects" / project_id / recorded).unlink()
+
+    gone = client.post(f"/api/projects/{project_id}/assemble")
+    assert gone.status_code == 422
+    assert gone.json()["detail"] == ASSEMBLY_SONG_FILE_REFUSAL.format(path=recorded)
+
+
+def test_a_failed_verification_is_reported_with_numbers_and_leaves_no_export(tmp_path: Path):
+    """FR-22's honesty row, forced with a real defect: one take physically shorter than
+    its window, so the joined video runs short of the song. The 502 carries the measured
+    numbers, the job records the same sentence, and nothing lands under exports/."""
+    client, store, _comfy, app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    # Replace shot_b's approved take with one that cannot fill its 4 s window. The
+    # manifest still names the same path, so approval and staleness both hold.
+    synthesize_take(shots_dir / "shot_b-h3_00001-audio.mp4", 2.0, size="192x108")
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "verification" in detail
+    assert "6.0" in detail and "8.0" in detail  # measured vs song, in the sentence
+    jobs = store.get(project_id).jobs
+    assert [job.status for job in jobs] == ["error"]
+    assert jobs[0].error == detail
+    exports = tmp_path / "projects" / project_id / "media" / "exports"
+    assert list(exports.glob("*.mp4")) == []
+    assert list(exports.glob(".work-*")) == []
+    assert app.state.live_assemblies == set()
