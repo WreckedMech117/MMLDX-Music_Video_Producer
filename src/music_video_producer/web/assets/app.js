@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, formatSectionLine, parseSectionLine, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, assemblyControl, effectiveOffset, latestAssemblyExport, monitorState, takeAudioControl, trimNudgeControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
@@ -697,6 +697,66 @@ async function aiModAsset() {
   }
 }
 
+let sectionSaveChain = Promise.resolve();
+
+function saveSectionsSilently() {
+  if (!state.project) return Promise.resolve();
+  const projectId = state.project.id;
+  const sections = structuredClone(state.project.sections || []);
+  sectionSaveChain = sectionSaveChain
+    .then(() => api.saveSections(projectId, sections))
+    .then((project) => {
+      // The server sorts by start; adopt its ordering so ids and order agree everywhere.
+      if (state.project?.id === projectId) state.project.sections = project.sections;
+    })
+    .catch((error) => toast(error.message, "error"));
+  return sectionSaveChain;
+}
+
+function bindSection(pill) {
+  pill.addEventListener("pointerdown", (event) => {
+    const section = (state.project.sections || []).find((item) => item.id === pill.dataset.sectionId);
+    if (!section) return;
+    state.selectedSectionId = section.id;
+    state.selectedShotId = null;
+    renderTimeline();
+    const mode = event.target.classList.contains("left") ? "left" : event.target.classList.contains("right") ? "right" : "move";
+    const startX = event.clientX;
+    const original = { start: section.start, duration: section.duration };
+    const boundaries = shotBoundaries(state.project);
+    // Snap tolerance in seconds, scaled from 8 screen pixels so zooming in tightens it.
+    const tolerance = Math.max(0.15, 8 / state.pixelsPerSecond);
+    const move = (moveEvent) => {
+      const delta = (moveEvent.clientX - startX) / state.pixelsPerSecond;
+      if (mode === "move") {
+        const snappedStart = snapSeconds(Math.max(0, original.start + delta), boundaries, tolerance);
+        const snappedEnd = snapSeconds(snappedStart + original.duration, boundaries, tolerance);
+        // Whichever edge found a boundary wins; the box keeps its length while moving.
+        section.start = Math.max(0, Math.abs(snappedStart - (original.start + delta)) <= Math.abs((snappedEnd - original.duration) - (original.start + delta))
+          ? snappedStart : snappedEnd - original.duration);
+      }
+      if (mode === "left") {
+        const end = original.start + original.duration;
+        const snapped = snapSeconds(clamp(original.start + delta, 0, end - 1), boundaries, tolerance);
+        section.start = clamp(snapped, 0, end - 1);
+        section.duration = end - section.start;
+      }
+      if (mode === "right") {
+        const end = snapSeconds(original.start + original.duration + delta, boundaries, tolerance);
+        section.duration = Math.max(1, end - original.start);
+      }
+      renderTimeline();
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (section.start !== original.start || section.duration !== original.duration) saveSectionsSilently();
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  });
+}
+
 function projectDuration() {
   const shotEnd = Math.max(0, ...(state.project?.shots || []).map((shot) => shot.start + shot.duration));
   return Math.max(state.project?.song?.duration || 0, shotEnd, 30);
@@ -728,9 +788,13 @@ function renderTimeline() {
   // The SECTIONS track, drawn at last: the Director's own marks, each with its window
   // and shared prompt. Double-click the track to edit (one-line grammar, parsed by
   // parseSectionLine, contract-tested).
+  // The SECTIONS track: real boxes, the Director's design — drag to move, handles to
+  // resize, edges snapping to the shots below, double-click empty space to create,
+  // click to edit the shared prompt in the inspector.
   $("#section-track").innerHTML = (state.project?.sections || []).map((section) =>
-    `<span class="section-pill" title="${escapeHtml(section.prompt || section.label)}" style="left:${section.start * state.pixelsPerSecond}px;width:${Math.max(30, section.duration * state.pixelsPerSecond)}px">${escapeHtml(section.label)}</span>`
+    `<div class="section-pill ${section.id === state.selectedSectionId ? "selected" : ""}" data-section-id="${section.id}" title="${escapeHtml(section.prompt || section.label)}" style="left:${section.start * state.pixelsPerSecond}px;width:${Math.max(34, section.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="section-label">${escapeHtml(section.label)}</span><span class="resize-handle right"></span></div>`
   ).join("");
+  $$("#section-track .section-pill").forEach(bindSection);
   renderShotInspector();
   // Assistant ProducerBot's controls live in the composer, two panels away, and their state is
   // decided by the shot selection this function owns. Repainted from here because every selection
@@ -819,6 +883,7 @@ function bindClip(clip) {
   clip.addEventListener("pointerdown", (event) => {
     const shot = state.project.shots.find((item) => item.id === clip.dataset.shotId);
     state.selectedShotId = shot.id;
+    state.selectedSectionId = null;
     renderTimeline();
     const mode = event.target.classList.contains("left") ? "left" : event.target.classList.contains("right") ? "right" : "move";
     const startX = event.clientX;
@@ -944,6 +1009,34 @@ function shotCitationRows(shot, assets) {
 export function renderShotInspector() {
   const shot = selectedShot();
   const inspector = $("#shot-inspector");
+  // A selected section owns the panel: this is where its shared prompt is written, the
+  // Director's design ("when selecting that Section the info panel on the right would be
+  // for where the shared prompt for that sections shots would be input").
+  if (state.selectedSectionId) {
+    const section = (state.project?.sections || []).find((item) => item.id === state.selectedSectionId);
+    if (section) {
+      const covered = (state.project?.shots || []).filter((item) => {
+        const mid = item.start + item.duration / 2;
+        return section.start <= mid && mid < section.start + section.duration;
+      }).length;
+      inspector.innerHTML = `<span class="eyebrow">Section</span><h2>${escapeHtml(section.label)}</h2><div class="meta-list"><b>Window</b><span>${section.start.toFixed(2)}s – ${(section.start + section.duration).toFixed(2)}s (${section.duration.toFixed(2)}s)</span><b>Covers</b><span>${covered} shot${covered === 1 ? "" : "s"}</span></div><label>Label<input id="section-label" value="${escapeHtml(section.label)}"></label><label>Shared prompt — carried into every shot in this section<textarea id="section-prompt" rows="7" placeholder="What this whole section looks like: location, staging, energy. Shots inside it vary the angle and action.">${escapeHtml(section.prompt || "")}</textarea></label><button class="danger-button full" id="section-delete">Delete section</button><p class="control-reason">Drag the box to move it; drag its edges to resize. Edges snap to the shots below. The label pairs with the lyric sheet's [Tags] by order — "Verse 2" takes the second [Verse] block.</p>`;
+      $("#section-label")?.addEventListener("change", (event) => {
+        section.label = event.target.value.trim() || section.label;
+        saveSectionsSilently(); renderTimeline();
+      });
+      $("#section-prompt")?.addEventListener("change", (event) => {
+        section.prompt = event.target.value;
+        saveSectionsSilently();
+      });
+      $("#section-delete")?.addEventListener("click", () => {
+        state.project.sections = (state.project.sections || []).filter((item) => item.id !== section.id);
+        state.selectedSectionId = null;
+        saveSectionsSilently(); renderTimeline();
+      });
+      return;
+    }
+    state.selectedSectionId = null;
+  }
   if (!shot) {
     inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>No shot selected</h2><p>Add a shot to begin. Shots are rendered independently in H3's reliable 4–15 second range.</p>`;
     if (inspector.dataset) inspector.dataset.shotId = "";
@@ -2071,25 +2164,33 @@ function bindEvents() {
   $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + half; copy.duration = half; shot.duration = half; state.project.shots.push(copy); saveShotsSilently(); renderTimeline(); });
   $("#zoom-in").addEventListener("click", () => { state.pixelsPerSecond = Math.min(64, state.pixelsPerSecond * 1.25); renderTimeline(); });
   $("#zoom-out").addEventListener("click", () => { state.pixelsPerSecond = Math.max(6, state.pixelsPerSecond / 1.25); renderTimeline(); });
-  $("#section-track").addEventListener("dblclick", async () => {
+  $("#section-track").addEventListener("dblclick", (event) => {
     if (!requireProject()) return;
-    const current = formatSectionLine(state.project.sections);
-    const line = window.prompt(
-      "Mark the song's sections. Grammar: Label start-end | shared prompt; separated by semicolons.\nExample: Intro 0-8; Verse 1 8-33 | at the standing mic, kinetic; Chorus 33-55 | on the canopy bed, glamour angles",
-      current,
-    );
-    if (line === null) return;
-    const parsed = parseSectionLine(line);
-    if (parsed.problems.length) {
-      toast(`Could not read: ${parsed.problems.join(" ; ")}`, "error");
-      return;
-    }
-    const projectId = state.project.id;
-    try {
-      const project = await api.saveSections(projectId, parsed.sections);
-      if (state.project?.id === projectId) { state.project = project; renderTimeline(); }
-      toast(`${parsed.sections.length} section(s) marked`);
-    } catch (error) { toast(error.message, "error"); }
+    // Double-click on an existing box edits in the inspector (the click already selected
+    // it); creation is for empty track space only.
+    if (event.target.closest?.(".section-pill")) return;
+    const rect = $("#timeline-canvas").getBoundingClientRect();
+    const at = Math.max(0, (event.clientX - rect.left - 90) / state.pixelsPerSecond);
+    const boundaries = shotBoundaries(state.project);
+    // A new box opens at the shot edge at or before the click and runs to the next edge —
+    // "snap to the edges of the shots below" from the first gesture, not only on drag.
+    const startEdge = [...boundaries].reverse().find((edge) => edge <= at) ?? at;
+    const nextEdge = boundaries.find((edge) => edge > startEdge + 0.5);
+    const section = {
+      label: "Section",
+      start: Math.round(startEdge * 1000) / 1000,
+      duration: Math.round(((nextEdge ?? startEdge + 8) - startEdge) * 1000) / 1000,
+      prompt: "",
+    };
+    state.project.sections = [...(state.project.sections || []), section];
+    saveSectionsSilently().then(() => {
+      // Select the created box once the server has minted its id.
+      const created = (state.project.sections || []).find(
+        (item) => item.start === section.start && item.label === section.label,
+      );
+      if (created) { state.selectedSectionId = created.id; state.selectedShotId = null; }
+      renderTimeline();
+    });
   });
   $("#timeline-canvas").addEventListener("pointerdown", (event) => {
     if (event.target.closest(".shot-clip")) return;

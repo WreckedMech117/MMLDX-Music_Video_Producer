@@ -3739,8 +3739,9 @@ def test_promotion_records_its_parent_and_leaves_the_source_asset_untouched(tmp_
 class PlanningDirector:
     """A director double whose plan is chosen by the test, with the request recorded."""
 
-    def __init__(self, shots=None, message="Laid out."):
+    def __init__(self, shots=None, message="Laid out.", sections=None):
         self.shots = shots or []
+        self.sections = sections or []
         self.message = message
         self.requests = []
 
@@ -3757,6 +3758,12 @@ class PlanningDirector:
                 "treatment": "",
                 "style_bible": "",
                 "shots": [shot(*entry) for entry in self.shots],
+                "sections": [
+                    type("PlannedSection", (), {
+                        "label": label, "start": start, "duration": duration, "prompt": prompt,
+                    })()
+                    for label, start, duration, prompt in self.sections
+                ],
             },
         )()
 
@@ -11347,3 +11354,41 @@ def test_sections_route_sorts_refuses_overlap_and_reaches_the_expansion(tmp_path
     assert section["label"] == "Chorus"
     assert section["prompt"] == "on the canopy bed"
     assert section["lyrics"] == "chorus hook words"
+
+
+def test_populate_adopts_the_models_sections_when_none_are_marked(tmp_path: Path):
+    """Populate fills the section layer too (the Director's design): the model's
+    structure proposal is repaired and adopted when the Director has marked nothing,
+    the shots then tile inside those sections, and marked sections are never replaced."""
+    director = PlanningDirector(
+        shots=[(0, 6, "Open wide."), (30, 6, "Chorus glamour.")],
+        sections=[
+            ("Intro", 0, 8, ""),
+            ("Verse", 8, 22, "at the standing mic"),
+            ("Chorus", 30, 30, "on the canopy bed"),
+        ],
+    )
+    client, store, _comfy = make_client(tmp_path, director=director)
+    project = store.create(Project(name="Adopt"))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=60.0)
+    store.save(project)
+
+    response = populate(client, project.id)
+    assert response.status_code == 200, response.text
+    saved = store.get(project.id)
+    assert [section.label for section in saved.sections] == ["Intro", "Verse", "Chorus"]
+    assert saved.sections[2].prompt == "on the canopy bed"
+    # Shots tile inside sections: no shot straddles a section boundary.
+    edges = {section.start for section in saved.sections} | {section.end for section in saved.sections}
+    for shot in saved.shots:
+        for edge in edges:
+            assert not (shot.start < edge - 1e-6 < shot.start + shot.duration - 1e-6), (
+                f"shot at {shot.start} straddles section edge {edge}"
+            )
+
+    # Marked sections survive a re-populate untouched.
+    marked = store.get(project.id)
+    marked.sections[0].prompt = "hand-edited"
+    store.save(marked)
+    assert populate(client, project.id).status_code == 200
+    assert store.get(project.id).sections[0].prompt == "hand-edited"

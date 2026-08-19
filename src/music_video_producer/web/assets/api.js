@@ -2013,41 +2013,30 @@ export function multiviewPlan(asset) {
   return { prompt, ready: Boolean(asset.path) };
 }
 
-// Parse the section editor's one-line grammar: "Label 0-8.5; Verse 8.5-33 | at the mic".
-// Each entry is `label start-end` with an optional ` | prompt` tail. Returns
-// {sections, problems}: bad entries are named rather than dropped, because a silently
-// skipped section is a hole in the lyric pairing nobody chose.
-export function parseSectionLine(line) {
-  const sections = [];
-  const problems = [];
-  for (const raw of String(line || "").split(";")) {
-    const entry = raw.trim();
-    if (!entry) continue;
-    const [head, ...promptParts] = entry.split("|");
-    const match = head.trim().match(/^(.+?)\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
-    if (!match) { problems.push(entry); continue; }
-    const start = Number(match[2]);
-    const end = Number(match[3]);
-    if (!(end > start)) { problems.push(entry); continue; }
-    sections.push({
-      label: match[1].trim(),
-      start,
-      duration: Math.round((end - start) * 1000) / 1000,
-      prompt: promptParts.join("|").trim(),
-    });
+// Section boxes snap to the edges of the shots below them (the Director's design:
+// a section spans whole shots, so its boundaries ARE shot boundaries when any are near).
+// Pure so the contract tests can execute the rule: the nearest boundary within
+// `tolerance` seconds wins; nothing near leaves the value free.
+export function snapSeconds(value, boundaries, tolerance = 0.4) {
+  let best = null;
+  for (const boundary of boundaries || []) {
+    const distance = Math.abs(boundary - value);
+    if (distance <= tolerance && (best === null || distance < Math.abs(best - value))) {
+      best = boundary;
+    }
   }
-  return { sections, problems };
+  return best === null ? value : best;
 }
 
-// The inverse, for pre-filling the editor with what is already marked.
-export function formatSectionLine(sections) {
-  return (sections || [])
-    .map((section) => {
-      const end = Math.round((section.start + section.duration) * 100) / 100;
-      const base = `${section.label} ${section.start}-${end}`;
-      return section.prompt ? `${base} | ${section.prompt}` : base;
-    })
-    .join("; ");
+// Every edge a section box may snap to: the song's ends and every shot boundary.
+export function shotBoundaries(project) {
+  const edges = new Set([0]);
+  if (project?.song?.duration) edges.add(Math.round(project.song.duration * 1000) / 1000);
+  for (const shot of project?.shots || []) {
+    edges.add(Math.round(shot.start * 1000) / 1000);
+    edges.add(Math.round((shot.start + shot.duration) * 1000) / 1000);
+  }
+  return [...edges].sort((a, b) => a - b);
 }
 
 // AI Mod (the Director's stage-3 ask): whether this asset can take a prompted image edit.

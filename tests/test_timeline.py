@@ -24,6 +24,7 @@ from music_video_producer.timeline import (
     over_render_lead,
     populate_windows,
     proposal_for_position,
+    repair_sections,
     section_lyrics,
     shot_expansion_input,
     song_section,
@@ -734,3 +735,24 @@ def test_the_expansion_payload_carries_the_shots_section_block():
     bare = Project(name="Bare", song=project.song)
     bare.shots = [Shot(id="shot_c", start=27, duration=6, prompt="Glamour angle")]
     assert "section" not in shot_expansion_input(bare, bare.shots[0])["shot"]
+
+
+def test_repair_sections_sorts_clamps_and_truncates_overlaps():
+    """Model-proposed structure made legal without refusal: a proposal is scaffolding the
+    Director will drag, so repair beats a 502. Gaps survive — unmarked means unknown."""
+    repaired = repair_sections(
+        [
+            ("Chorus", 30.0, 40.0, "on the bed"),     # overlaps the next; truncated
+            ("Verse", 8.0, 22.0, "at the mic"),       # arrives out of order
+            ("Outro", 58.0, 30.0, ""),                # runs past the song; clamped
+            ("Blip", 59.0, 0.4, ""),                  # sub-second after clamping; dropped
+            ("Ghost", 70.0, 10.0, ""),                # starts past the song; dropped
+        ],
+        60.0,
+    )
+    assert [entry[0] for entry in repaired] == ["Verse", "Chorus", "Outro"]
+    verse, chorus, outro = repaired
+    assert verse == ("Verse", 8.0, 22.0, "at the mic")
+    # Chorus truncated at Outro's start; Outro clamped to the song's end.
+    assert chorus == ("Chorus", 30.0, 28.0, "on the bed")
+    assert outro == ("Outro", 58.0, 2.0, "")

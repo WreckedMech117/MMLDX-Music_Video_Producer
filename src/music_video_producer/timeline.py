@@ -138,6 +138,33 @@ def populate_windows(
     return windows
 
 
+def repair_sections(
+    proposals: list[tuple[str, float, float, str]], song_duration: float
+) -> list[tuple[str, float, float, str]]:
+    """Model-proposed sections made legal: sorted, clamped to the song, overlaps truncated.
+
+    ``(label, start, duration, prompt)`` in, same shape out. A proposal is scaffolding —
+    the Director will drag the boxes — so repair beats refusal: sort by start, clamp to
+    ``[0, song]``, truncate each at the next one's start, drop what vanishes. Gaps are
+    left alone; an unmarked stretch means unknown everywhere sections are read.
+    """
+    # Sub-second proposals drop *before* truncation, or a doomed sliver would truncate
+    # its healthy neighbour on its way out.
+    ordered = sorted(
+        (p for p in proposals if p[2] >= 1.0 and p[1] < song_duration),
+        key=lambda p: p[1],
+    )
+    repaired: list[tuple[str, float, float, str]] = []
+    for index, (label, start, duration, prompt) in enumerate(ordered):
+        start = max(0.0, start)
+        end = min(start + duration, song_duration)
+        if index + 1 < len(ordered):
+            end = min(end, max(ordered[index + 1][1], start))
+        if end - start >= 1.0:
+            repaired.append((label, round(start, 3), round(end - start, 3), prompt))
+    return repaired
+
+
 def proposal_for_position(
     position: float, song_duration: float, proposal_count: int
 ) -> int:

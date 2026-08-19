@@ -7514,3 +7514,44 @@ def test_generation_submits_are_shut_while_their_own_request_is_in_flight():
     assert '$("#music-submit")' in handler
     assert "button.disabled = true" in handler
     assert "finally { button.disabled = false; button.textContent = label; }" in handler
+
+
+def test_section_snapping_is_executed_and_the_track_is_interactive():
+    """The Director's section boxes: `snapSeconds` pulls an edge to the nearest shot
+    boundary within tolerance and otherwise leaves it free; `shotBoundaries` collects
+    every edge a box may land on. The wiring assertions pin the interactive track —
+    pills bound like clips, dblclick-create on empty space, the inspector branch — so
+    the boxes cannot silently regress to the read-only pills they replaced."""
+    states = run_module("""
+      import { shotBoundaries, snapSeconds } from './src/music_video_producer/web/assets/api.js';
+      const project = { song: { duration: 60 }, shots: [
+        { start: 0, duration: 6 }, { start: 6, duration: 6 }, { start: 12, duration: 5.5 },
+      ]};
+      const edges = shotBoundaries(project);
+      console.log(JSON.stringify({
+        edges,
+        near: snapSeconds(5.8, edges, 0.4),
+        exact: snapSeconds(12, edges, 0.4),
+        far: snapSeconds(9.1, edges, 0.4),
+        nothing: snapSeconds(3, [], 0.4),
+        ties: snapSeconds(6.1, edges, 0.4),
+      }));
+    """)
+    assert states["edges"] == [0, 6, 12, 17.5, 60]
+    assert states["near"] == 6
+    assert states["exact"] == 12
+    assert states["far"] == 9.1  # nothing within tolerance: free
+    assert states["nothing"] == 3
+    assert states["ties"] == 6
+
+    workspace = APP_JS.read_text(encoding="utf-8")
+    assert '$$("#section-track .section-pill").forEach(bindSection);' in workspace
+    assert "function bindSection(pill)" in workspace
+    assert "snapSeconds(" in workspace
+    assert 'addEventListener("dblclick"' in workspace
+    assert "state.selectedSectionId" in workspace
+    # The inspector owns the shared prompt when a section is selected.
+    assert 'id="section-prompt"' in workspace
+    assert 'id="section-delete"' in workspace
+    # Selecting a shot clears the section selection and vice versa — one panel, one owner.
+    assert "state.selectedSectionId = null;" in workspace

@@ -60,11 +60,27 @@ class PlannedShot(BaseModel):
     prompt: str = Field(min_length=1)
 
 
+class PlannedSection(BaseModel):
+    """A song-structure window the model proposes: Intro/Verse/Chorus/Bridge/Outro.
+
+    Wider duration bound than a shot's — a chorus can legitimately run a minute — and
+    the route repairs whatever arrives (sorting, clamping, truncating overlaps) rather
+    than refusing, because a section proposal is scaffolding, not a render."""
+
+    label: str = Field(min_length=1, max_length=60)
+    start: float = Field(ge=0)
+    duration: float = Field(gt=0)
+    prompt: str = ""
+
+
 class DirectorResult(BaseModel):
     message: str
     treatment: str
     style_bible: str
     shots: list[PlannedShot] = Field(default_factory=list)
+    # Populated only when the caller asks for structure (Populate Timeline); the chat
+    # route ignores it, and the default keeps every existing chat reply validating.
+    sections: list[PlannedSection] = Field(default_factory=list)
 
 
 class ExpandedShot(BaseModel):

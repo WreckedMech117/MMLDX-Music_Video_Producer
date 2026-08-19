@@ -91,6 +91,7 @@ from .timeline import (
     over_render_lead,
     populate_windows,
     proposal_for_position,
+    repair_sections,
     shot_expansion_input,
 )
 from .vram import CliUnloader, LlmEjector
@@ -1767,8 +1768,12 @@ POPULATE_INSTRUCTION = (
     "{assets}. Refer to them by these exact names in shot prompts so each shot says "
     "which character or location it uses. Every shot's prompt is a short readable "
     "visual intent (one or two sentences): what is seen, who is in frame, how the "
-    "camera behaves. Alternate framings and locations per the treatment rather than "
-    "repeating one setup."
+    "camera behaves. Vary the camera angle and movement between adjacent shots — never "
+    "repeat the same setup, framing or camera move back to back, and not every shot "
+    "needs movement at all. First divide the song into sections by its structure "
+    "(Intro, Verse, Chorus, Bridge, Outro), matching the lyric sheet's own [Tag] blocks "
+    "in order, each with start and duration in seconds and a one-sentence shared visual "
+    "prompt; return them in `sections`. Then lay the shots out inside those sections."
 )
 
 
@@ -5263,6 +5268,21 @@ def create_app(
                 detail="The project changed while the model was planning (a render or a "
                 "protection appeared). Nothing was replaced; try again.",
             )
+        # Sections come from the Director's own boxes when marked, else from the model's
+        # structure proposal (repaired: sorted, clamped, overlaps truncated) — Populate
+        # fills the section layer too, per the Director's design, and the boxes land on
+        # the track for dragging afterward.
+        if not project.sections and result.sections:
+            project.sections = [
+                SongSection(label=label, start=start, duration=length, prompt=prompt)
+                for label, start, length, prompt in repair_sections(
+                    [
+                        (item.label, item.start, item.duration, item.prompt)
+                        for item in result.sections
+                    ],
+                    duration,
+                )
+            ]
         # With sections marked, each section tiles independently so no shot straddles a
         # boundary — cuts land exactly on the music's own switches, the Director's ask.
         # Unmarked stretches (before, between, after sections) tile as their own spans so
