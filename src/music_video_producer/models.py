@@ -325,6 +325,19 @@ class Shot(BaseModel):
     latest_output: str = ""
     latest_review: VisionInspectionRecord | None = None
     approved_output: str = ""
+    # AD-13's window snapshot: the `start`/`duration` this Shot had at the moment its take
+    # was approved, written by the approve route and cleared by un-approve, nothing else.
+    # The approval is an editorial decision about one take *in one window* — assembly trims
+    # the take to the window, so a window edited after approval makes the approved file the
+    # wrong length for the plan, silently. The snapshot is what makes that staleness
+    # decidable: assembly compares these to the live values and refuses on any difference.
+    #
+    # `approved_duration == 0` means "never snapshotted": `duration` itself is constrained
+    # `gt=0`, so zero is unrepresentable as a real window and safely marks approvals made
+    # before these fields existed (they refuse assembly with re-approve wording, not the
+    # stale wording). Defaults keep every existing manifest loading unchanged.
+    approved_start: float = 0
+    approved_duration: float = 0
     locked: bool = False
 
     @field_validator("mode", mode="before")
@@ -591,6 +604,11 @@ class RenderJob(BaseModel):
     target_id: str = ""
     seed: int = 0
     output_files: list[str] = Field(default_factory=list)
+    # FR-24 adapted for local work (AD-9): what this job consumed, so an assembly is
+    # rebuildable from its record. Shot IDs paired with the take paths they contributed,
+    # as `"<shot_id>=<approved_output>"` strings. Empty for every ComfyUI job — their
+    # inputs are the submitted graph, which `prompt_id` already names.
+    inputs: list[str] = Field(default_factory=list)
     error: str = ""
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)

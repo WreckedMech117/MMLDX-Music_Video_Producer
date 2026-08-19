@@ -351,7 +351,14 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 #: model's prompt would be the largest single context regression here, in exchange for nothing: the
 #: chat Director writes treatments and intents, and the expansion specialist gets its own
 #: purpose-built payload rather than this dump.
-SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset({"h3_prompt"})
+#: The AD-13 window snapshot is withheld on the same never-been-in grounds, plus its own: the
+#: two fields are copies of `start`/`duration` taken at approval, staleness bookkeeping for
+#: assembly's refusal. The chat Director already sees the live window and `approved_output`;
+#: echoing near-duplicate numbers into every shot of every turn buys nothing, and no
+#: assistant tool writes them — approval is never the Director's act (AD-15).
+SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
+    {"h3_prompt", "approved_start", "approved_duration"}
+)
 
 #: How the reference map declares a keyframe-role picture, per MiniMax's guide §2.2.2 — read
 #: from the bundled ``Video_Prompt_Writing_Guide.pdf``, never copied: the guide's own example is
@@ -4153,10 +4160,15 @@ def create_app(
                 status_code=422,
                 detail=APPROVE_NO_TAKE_REFUSAL.format(shot=shot_label(project, shot)),
             )
-        # The whole write, both halves together. The value is the server's own resolution of
-        # what this Shot's take is; nothing from the request is on the right-hand side.
+        # The whole write, every half together. The value is the server's own resolution of
+        # what this Shot's take is; nothing from the request is on the right-hand side. The
+        # window snapshot (AD-13) rides in the same write: the approval is a decision about
+        # this take *in this window*, and assembly refuses the Shot if the window moves
+        # afterward — see `Shot.approved_start`.
         shot.approved_output = shot.latest_output
         shot.status = "approved"
+        shot.approved_start = shot.start
+        shot.approved_duration = shot.duration
         return store.save(project)
 
     @app.post("/api/projects/{project_id}/shots/{shot_id}/unapprove", response_model=Project)
@@ -4190,8 +4202,13 @@ def create_app(
                 ),
             )
         # The whole write: the decision is withdrawn, the record of what rendered is not.
+        # The window snapshot goes with it — it described the withdrawn approval, and a
+        # snapshot outliving its approval would make the *next* approval's staleness check
+        # read a window nobody decided about.
         shot.approved_output = ""
         shot.status = "complete"
+        shot.approved_start = 0
+        shot.approved_duration = 0
         return store.save(project)
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)

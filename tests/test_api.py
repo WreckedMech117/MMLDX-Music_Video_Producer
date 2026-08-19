@@ -8391,11 +8391,14 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     Director's prompt the moment it was declared, with nobody deciding that it should. This change
     added three at once, which is exactly the situation the guard exists for.
 
-    Exactly one field is withheld: `h3_prompt`. That is not the removal the classification's own
-    comment calls Ask First — the field has never been in the dump, so withholding it adds nothing
-    to the prompt rather than subtracting something from it. It is withheld on the numbers: a
-    thirty-shot plan of H3-format expansions would add many thousands of tokens to *every* chat
-    turn, and rich context is this project's recorded cause of Director degradation.
+    Three fields are withheld, none of them a removal — each was classified withheld at the
+    moment it was declared, so withholding adds nothing to the prompt rather than subtracting
+    something from it. `h3_prompt` on the numbers: a thirty-shot plan of H3-format expansions
+    would add many thousands of tokens to *every* chat turn, and rich context is this project's
+    recorded cause of Director degradation. The AD-13 window snapshot pair
+    (`approved_start`/`approved_duration`) as staleness bookkeeping: copies of `start`/`duration`
+    taken at approval for assembly's refusal, near-duplicate numbers the chat Director — who
+    already sees the live window and `approved_output` — has no decision to make from.
 
     What the classification buys either way is that the *next* field cannot arrive without the
     decision being made.
@@ -8423,16 +8426,18 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     # at all — and every field is on exactly one side.
     assert _withheld_fields(
         Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
-    ) == {"h3_prompt"}
+    ) == {"h3_prompt", "approved_start", "approved_duration"}
     assert not SHOT_DIRECTOR_VISIBLE & SHOT_DIRECTOR_WITHHELD
     assert {"mode", "citations", "singing", "prompt"} <= SHOT_DIRECTOR_VISIBLE
 
-    # The one thing withheld, and the exclusion it produces. The key exists *because* something is
+    # The withheld set, and the exclusion it produces. The key exists *because* something is
     # withheld — it is derived from the classification rather than written by hand, so a field
     # classified withheld cannot fail to be excluded, and a field classified visible cannot be
     # excluded by a stale path someone forgot to update.
-    assert SHOT_DIRECTOR_WITHHELD == {"h3_prompt"}
-    assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {"__all__": {"h3_prompt"}}
+    assert SHOT_DIRECTOR_WITHHELD == {"h3_prompt", "approved_start", "approved_duration"}
+    assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {
+        "__all__": {"h3_prompt", "approved_start", "approved_duration"}
+    }
 
     # And the intent is still shown. Withholding the expansion is only defensible because the thing
     # it was expanded *from* still reaches the Director: a chat turn can still see what each shot is
@@ -10618,6 +10623,54 @@ def test_while_approved_the_take_cannot_move_and_unapproval_is_the_way_back(tmp_
     assert approve(client, project_id, shot_id).status_code == 200
     reapproved = ProjectStore(tmp_path).get(project_id).shots[0]
     assert reapproved.approved_output == second.latest_output
+
+
+def test_approval_snapshots_the_window_and_unapproval_clears_it(tmp_path: Path):
+    """AD-13's amendment, both halves of the write and the one-writer scan.
+
+    The approval is a decision about one take *in one window* — assembly trims the take to
+    the window, so a window edited after approval makes the approved file the wrong length
+    for the plan. The snapshot is what makes that staleness decidable, and it must ride the
+    same two writes approval itself rides: set at approve, cleared at un-approve, touched by
+    nothing else in the package.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id, _ = rendered_shot(client, store, comfy, "Snapshot")
+
+    assert approve(client, project_id, shot_id).status_code == 200
+    approved = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert approved.approved_start == approved.start == 0
+    assert approved.approved_duration == approved.duration == 5
+
+    # The reversal clears the snapshot with the approval it described: a snapshot outliving
+    # its approval would make the *next* approval's staleness check read a window nobody
+    # decided about.
+    assert unapprove(client, project_id, shot_id).status_code == 200
+    cleared = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert cleared.approved_start == 0
+    assert cleared.approved_duration == 0
+
+    # Move the window, re-approve: the snapshot is the window at the *moment of approval*,
+    # not the one the first approval saw.
+    stored = store.get(project_id)
+    stored.shots[0].start = 2.5
+    stored.shots[0].duration = 3.75
+    store.save(stored)
+    assert approve(client, project_id, shot_id).status_code == 200
+    reapproved = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert reapproved.approved_start == 2.5
+    assert reapproved.approved_duration == 3.75
+
+    # The one-writer scan, mirroring the `approved_output` scan: exactly one set and one
+    # clear of each snapshot field, both in app.py's approve/unapprove pair.
+    package = Path("src/music_video_producer")
+    writes: dict[str, int] = {}
+    for source in package.rglob("*.py"):
+        text = source.read_text(encoding="utf-8")
+        count = len(re.findall(r"\.approved_(?:start|duration)\s*=[^=]", text))
+        if count:
+            writes[source.name] = count
+    assert writes == {"app.py": 4}, writes
 
 
 def test_expansion_refuses_a_route_approved_shot(tmp_path: Path):
