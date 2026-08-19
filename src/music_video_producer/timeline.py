@@ -283,6 +283,30 @@ def song_section(project: Project, shot: Shot):
     return best
 
 
+#: Below this much measured voice in a window, a `singing` mark is physically impossible:
+#: there is nothing in the reference for a mouth to sync to, and H3 told to sing over an
+#: instrumental window invents its own words and lipsyncs to them (live, 2026-08-19 —
+#: shot 02 sang invented lines over the intro, and all four outro shots were marked
+#: singing over a vocal-free 20 seconds).
+MIN_SINGING_VOCAL_SECONDS = 0.5
+
+
+def shot_vocal_overlap(song, *, start: float, duration: float) -> float | None:
+    """Seconds of measured voice inside one window, or ``None`` when nothing was measured.
+
+    Reads `Song.vocal_spans` — Whisper word timestamps, merged — and follows its rule:
+    an empty list is *unmeasured*, not silent, and answers ``None`` so callers stand
+    aside rather than downgrade a mark on no evidence.
+    """
+    if song is None or not song.vocal_spans:
+        return None
+    end = start + duration
+    return sum(
+        max(0.0, min(end, span_end) - max(start, span_start))
+        for span_start, span_end in song.vocal_spans
+    )
+
+
 #: The lyric sheet's block opener: `[Verse]`, `[Chorus 2]`, `[Pre-Chorus]`...
 _SHEET_TAG = re.compile(r"^[ \t]*\[([^\]\r\n]+)\][ \t]*$", re.MULTILINE)
 

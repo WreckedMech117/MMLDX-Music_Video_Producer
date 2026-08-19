@@ -1251,7 +1251,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
     # guard by widening a set to `Song.model_fields` fails here.
     assert _withheld_fields(
         Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD, family="SONG"
-    ) == {"lyrics_previous", "caption_previous"}
+    ) == {"lyrics_previous", "caption_previous", "vocal_spans"}
     assert not SONG_DIRECTOR_VISIBLE & SONG_DIRECTOR_WITHHELD
 
 
@@ -8854,10 +8854,13 @@ def test_whether_the_performer_is_singing_is_expressible_and_nothing_infers_it(t
         assert guess not in source, guess
     # The one permitted write: populate maps the plan model's own `performance` field --
     # a dedicated strict-schema declaration the instruction explicitly asks for, reviewed
-    # per shot in the inspector (run-2 audit, 2026-08-19). Pinned to its one blessed
-    # spelling and site; the greps above still forbid every looser form.
+    # per shot in the inspector (run-2 audit, 2026-08-19) -- downgraded by exactly one
+    # *measurement*: a window Whisper measured voiceless cannot be sung (live catch,
+    # 2026-08-19 -- the intro and the whole instrumental outro were marked singing, and
+    # H3 invented words for them). Measurement is not the inference the greps forbid:
+    # nothing reads prose, mode or library. Pinned to its one blessed spelling and site.
     app_source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
-    assert app_source.count('declared_singing: SingingState = "singing" if performing else "not_singing"') == 1
+    assert app_source.count('"singing" if performing and not voiceless else "not_singing"') == 1
 
     # And it is durable: it survives the wire, the manifest and a reload.
     client, store, _ = make_client(tmp_path)
@@ -9865,6 +9868,41 @@ def test_a_singing_song_audio_shot_gains_the_measured_sings_clause():
     # The section look still lands after the clause.
     sectioned = reference_prompt(singing, tags, section_prompt="on the canopy bed")
     assert sectioned.endswith(f"{SONG_AUDIO_SINGS_CLAUSE} Section look: on the canopy bed")
+
+
+def test_measured_silence_outranks_a_singing_mark():
+    """The Director's live catch (2026-08-19): shot 02 was marked singing over the
+    instrumental intro, so the sings clause told H3 to sing over a voiceless reference —
+    and it invented its own words and lipsynced to them. With `Song.vocal_spans`
+    measured, a voiceless window gets no clause whatever the mark says; an unmeasured
+    song (`[]` → overlap None) changes nothing, and a window with voice keeps its clause."""
+    from music_video_producer.app import SONG_AUDIO_SINGS_CLAUSE_BARE, song_audio_prose
+    from music_video_producer.timeline import shot_vocal_overlap
+
+    song = Song(title="Harder Faster", source="imported", duration=154.6,
+                vocal_spans=[(11.0, 87.7), (89.1, 99.2)])
+    intro = Shot(id="shot_i", start=4.0, duration=5.66, prompt="Slow push down the aisle.",
+                 singing="singing", use_song_audio=True)
+    sung = Shot(id="shot_s", start=19.33, duration=4.0, prompt="Lean-in at the mic.",
+                singing="singing", use_song_audio=True)
+    assert shot_vocal_overlap(song, start=4.0, duration=5.66) == 0.0
+    assert shot_vocal_overlap(None, start=4.0, duration=5.66) is None
+    assert shot_vocal_overlap(
+        Song(title="x", source="imported"), start=4.0, duration=5.66
+    ) is None
+
+    measured = Project(name="Measured", song=song, shots=[intro, sung])
+    assert "sings to camera" not in song_audio_prose(measured, intro)
+    assert song_audio_prose(measured, sung).endswith(SONG_AUDIO_SINGS_CLAUSE_BARE)
+    # Unmeasured: the mark is trusted, exactly as before spans existed.
+    unmeasured = Project(
+        name="Unmeasured",
+        song=Song(title="Harder Faster", source="imported", duration=154.6),
+        shots=[intro.model_copy(deep=True)],
+    )
+    assert song_audio_prose(unmeasured, unmeasured.shots[0]).endswith(
+        SONG_AUDIO_SINGS_CLAUSE_BARE
+    )
 
 
 def test_song_audio_prose_is_the_submit_walks_own_string(tmp_path: Path):

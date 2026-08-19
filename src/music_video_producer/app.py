@@ -88,6 +88,7 @@ from .timeline import (
     H3_FPS,
     H3_MAX_SHOT_SECONDS,
     H3_MIN_SHOT_SECONDS,
+    MIN_SINGING_VOCAL_SECONDS,
     TimelineError,
     assistant_input,
     build_director_timeline,
@@ -99,6 +100,7 @@ from .timeline import (
     proposal_for_position,
     repair_sections,
     shot_expansion_input,
+    shot_vocal_overlap,
     song_section,
 )
 from .vram import CliUnloader, LlmEjector
@@ -282,6 +284,12 @@ def mode_without_adapter_refusal(shot_name: str, mode: str) -> str:
 SONG_DIRECTOR_VISIBLE = frozenset({"title", "source", "path", "duration", "lyrics", "caption", "prompt_id"})
 SONG_DIRECTOR_WITHHELD = frozenset(
     f"{field}{RECOVERY_SLOT_SUFFIX}" for field in SONG_CONTEXT_LABELS
+) | frozenset(
+    # Measured voice activity, second pairs. Withheld as raw data: what planning needs
+    # from it is per-window facts ("this window is instrumental"), which the code derives
+    # via `shot_vocal_overlap` — a page of float pairs in the prompt is noise the model
+    # would misread long before it helped.
+    {"vocal_spans"}
 )
 
 
@@ -446,12 +454,23 @@ SONG_AUDIO_SINGS_CLAUSE = "The character from the reference sheet sings to camer
 SONG_AUDIO_SINGS_CLAUSE_BARE = "The performer sings to camera."
 
 
-def reference_prompt(shot: Shot, tags: list[str], section_prompt: str = "") -> str:
+def reference_prompt(
+    shot: Shot,
+    tags: list[str],
+    section_prompt: str = "",
+    vocal_overlap: float | None = None,
+) -> str:
     """What the reference render actually submits for this Shot.
 
     Without an expansion this is byte-for-byte the string this route has always built:
     the reference map, then the Shot's intent — plus, for a singing song-audio shot whose
     intent never says so, the measured sings-to-camera clause (see the constant above).
+
+    ``vocal_overlap`` is the window's measured voice from `shot_vocal_overlap`, and it
+    outranks the singing mark: a shot marked singing over a window the track is measured
+    to leave instrumental gets NO sings clause, because H3 told to sing over a voiceless
+    reference invents its own words and lipsyncs to them (live, 2026-08-19 — the intro
+    and all four outro shots). ``None`` means unmeasured and changes nothing.
 
     With an expansion, it is submitted **alone**: for song-audio shots the stored text is
     already the whole preamble-prose string (`song_audio_prose` built it), and for the
@@ -464,6 +483,7 @@ def reference_prompt(shot: Shot, tags: list[str], section_prompt: str = "") -> s
         shot.use_song_audio
         and shot.singing == "singing"
         and "sing" not in shot.prompt.lower()
+        and not (vocal_overlap is not None and vocal_overlap < MIN_SINGING_VOCAL_SECONDS)
     ):
         clause = SONG_AUDIO_SINGS_CLAUSE if shot.citations else SONG_AUDIO_SINGS_CLAUSE_BARE
         base = f"{base} {clause}"
@@ -543,6 +563,9 @@ def song_audio_prose(project: Project, shot: Shot) -> str:
         shot.model_copy(update={"h3_prompt": ""}),
         reference_map_tag_lines(project, shot),
         section_prompt=section.prompt if section is not None else "",
+        vocal_overlap=shot_vocal_overlap(
+            project.song, start=shot.start, duration=shot.duration
+        ),
     )
 
 
@@ -4071,6 +4094,9 @@ def create_app(
                             if (section := song_section(project, shot)) is not None
                             else ""
                         ),
+                        vocal_overlap=shot_vocal_overlap(
+                            project.song, start=shot.start, duration=shot.duration
+                        ),
                     ),
                     references=references,
                     duration=shot.duration,
@@ -5501,7 +5527,19 @@ def create_app(
             # prose. The nothing-infers-singing guard permits exactly this mapping and
             # forbids everything looser; the Director reviews the result per shot in the
             # inspector, exactly as they reviewed the hand-run script it replaces.
-            declared_singing: SingingState = "singing" if performing else "not_singing"
+            # One measured exception to the declaration, one-directional: a window the
+            # track is *measured* to leave voiceless cannot be sung, whatever the model
+            # declared — live on 2026-08-19 it marked the intro and the whole
+            # instrumental outro singing, and H3 invented words for them and lipsynced
+            # to the invention. Unmeasured (`None`) changes nothing, and a not-singing
+            # declaration over vocals is a legitimate creative choice, untouched. This
+            # is not the inference the singing guard forbids: nothing here reads prose,
+            # mode or library — only Whisper's measured voice activity on the track.
+            vocal = shot_vocal_overlap(project.song, start=start, duration=length)
+            voiceless = vocal is not None and vocal < MIN_SINGING_VOCAL_SECONDS
+            declared_singing: SingingState = (
+                "singing" if performing and not voiceless else "not_singing"
+            )
             shots.append(
                 Shot(
                     start=start,

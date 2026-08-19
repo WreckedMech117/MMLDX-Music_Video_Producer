@@ -50,6 +50,14 @@ class Song(BaseModel):
     prompt_id: str = ""
     lyrics_previous: str | None = None
     caption_previous: str | None = None
+    #: Where the track actually carries a voice, as [start, end] second pairs, sorted and
+    #: non-overlapping. Measured (Whisper word timestamps, merged at 0.75 s gaps), never
+    #: inferred from the lyric sheet — the sheet has no clock. Empty means *unmeasured*,
+    #: not silent: every guard that reads this must treat `[]` as "no evidence" and stand
+    #: aside. What it exists to stop, live on 2026-08-19: five shots marked `singing`
+    #: whose windows sit in the intro and outro — told to sing over an instrumental
+    #: reference, H3 invents its own words and lipsyncs to them.
+    vocal_spans: list[tuple[float, float]] = Field(default_factory=list)
 
 
 class SongSection(BaseModel):
