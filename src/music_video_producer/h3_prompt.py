@@ -264,7 +264,10 @@ def check_dialogue(description: str) -> list[Problem]:
 
 
 def check_sound_fields(
-    fields: dict[str, str], *, already_reported: frozenset[str] = frozenset()
+    fields: dict[str, str],
+    *,
+    already_reported: frozenset[str] = frozenset(),
+    require: bool = True,
 ) -> list[Problem]:
     """Sentence bounds on the two sound fields, with `N/A` exempt.
 
@@ -279,7 +282,8 @@ def check_sound_fields(
             continue
         value = fields.get(name)
         if value is None:
-            problems.append(Problem(name, f"{name} is missing."))
+            if require:
+                problems.append(Problem(name, f"{name} is missing."))
             continue
         if value.strip() == NOT_APPLICABLE:
             continue
@@ -316,13 +320,19 @@ def check_retention(prompt: str) -> list[Problem]:
 
 
 def check(prompt: str, *, duration: float | None = None,
-          expect_instruction: bool = False) -> ParsedPrompt:
+          expect_instruction: bool = False,
+          require_sound_fields: bool = True) -> ParsedPrompt:
     """Check the mechanical rules and report what is wrong.
 
     ``duration`` bounds the cut times when the caller knows the shot's length;
     ``expect_instruction`` is for the keyframe modes, which require an instruction
     line as the first line. T2VA requires its absence, and that is checked too —
     an instruction on a T2VA prompt is a mode confusion worth catching.
+
+    ``require_sound_fields=False`` is for song-audio shots, whose stored prompts have
+    their two audio fields stripped (`strip_audio_fields` — measured 2026-08-19: any
+    text in those fields fights the referenced track). Fields *present* on such a
+    prompt are still bounds-checked; only their absence stops being a problem.
 
     A clean result means well-formed. It does not mean good; see the module
     docstring for what deliberately is not checked here.
@@ -351,57 +361,59 @@ def check(prompt: str, *, duration: float | None = None,
         parsed.problems.extend(check_dialogue(description))
     reported = frozenset(problem.field for problem in parsed.problems)
     parsed.problems.extend(
-        check_sound_fields(parsed.fields, already_reported=reported)
+        check_sound_fields(
+            parsed.fields, already_reported=reported, require=require_sound_fields
+        )
     )
     parsed.problems.extend(check_retention(prompt))
     return parsed
 
-
-#: What a song-audio shot's two audio fields say instead of ordering a second soundtrack.
-#: Measured 2026-08-19 on one shot, same seed, three ways: with the specialist's written
-#: fields ("warehouse echo... driving electric guitars swell") the generated audio's
-#: envelope correlated with the referenced master window at 0.36 (turbo) / 0.27 (20-step);
-#: with no fields at all, 0.84 — the text was drowning the reference. These sentences keep
-#: the document well-formed (each inside its field's sentence bounds) while deferring the
-#: sound to the referenced track, which is the closest a required field can get to the
-#: measured-best absence.
-SONG_AUDIO_SOUNDSCAPE = (
-    "The referenced master song carries this clip's sound, exactly as provided."
-)
-SONG_AUDIO_MUSIC = "The referenced master song, exactly as provided."
 
 _FIELD_LINE = re.compile(
     rf"^({'|'.join(CORE_FIELDS)}):", re.MULTILINE
 )
 
 
-def defer_audio_fields(prompt: str) -> str:
-    """Rewrite a well-formed prompt's two audio fields to defer to the referenced song.
+#: The guide's own reuse declaration (§2.6): the audience-only score IS the referenced
+#: track, said by tag so the model can link the sentence to the audio slot — the link the
+#: failed deferral prose ("the referenced master song") never made.
+SONG_AUDIO_MUSIC_TEMPLATE = (
+    "<Audio {tag}> is directly reused as the complete audience-only score."
+)
 
-    Applied at expansion-write time for `use_song_audio` shots, so the stored prompt and
-    the submitted prompt stay one text. Everything outside the two field bodies —
-    instruction line, description, spacing style — is untouched byte for byte; a prompt
-    missing either field comes back unchanged, because this normalizes well-formed
-    documents and the checker owns malformed ones.
+
+def normalize_audio_fields(prompt: str, *, audio_tag: int = 1) -> str:
+    """Rewrite a song-audio shot's two audio fields to the guide's reuse declaration.
+
+    The measurement history (2026-08-19, one shot family, same seeds): the specialist's
+    freely-written fields drowned the referenced track — envelope correlation with the
+    master's actual window 0.36 (turbo) / 0.27 (20 steps); untagged deferral prose
+    recovered unreliably (0.36–0.73 — the model synthesizes from any text it cannot
+    ground); bare absence measured 0.84. The guide's §2.6 form is the official shape:
+    `non_diegetic_music` cites the audio **by tag** as the directly-reused score, and
+    `overall_soundscape` — which must never repeat singing or music — goes `N/A`, the
+    checker-exempt explicit silence. Singing itself lives in the description, where the
+    specialist writes it as visible action.
+
+    The description is untouched byte for byte; a prompt missing both fields comes back
+    unchanged (the checker owns malformed documents); idempotent by construction.
     """
     matches = list(_FIELD_LINE.finditer(prompt))
-    if not matches:
-        return prompt
     spans: dict[str, tuple[int, int]] = {}
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(prompt)
         spans[match.group(1)] = (match.end(), end)
-    if CORE_FIELDS[1] not in spans or CORE_FIELDS[2] not in spans:
+    if CORE_FIELDS[1] not in spans and CORE_FIELDS[2] not in spans:
         return prompt
     replacements = {
-        CORE_FIELDS[1]: SONG_AUDIO_SOUNDSCAPE,
-        CORE_FIELDS[2]: SONG_AUDIO_MUSIC,
+        CORE_FIELDS[1]: NOT_APPLICABLE,
+        CORE_FIELDS[2]: SONG_AUDIO_MUSIC_TEMPLATE.format(tag=audio_tag),
     }
-    # Rebuilt back-to-front so earlier spans stay valid.
     rebuilt = prompt
-    for name in sorted(replacements, key=lambda n: spans[n][0], reverse=True):
-        start, end = spans[name]
-        body = rebuilt[start:end]
-        trailing = body[len(body.rstrip()):]
-        rebuilt = rebuilt[:start] + " " + replacements[name] + trailing + rebuilt[end:]
+    for name in (CORE_FIELDS[2], CORE_FIELDS[1]):  # back-to-front keeps spans valid
+        if name in spans:
+            start, end = spans[name]
+            body = rebuilt[start:end]
+            trailing = body[len(body.rstrip()):]
+            rebuilt = rebuilt[:start] + " " + replacements[name] + trailing + rebuilt[end:]
     return rebuilt

@@ -16,6 +16,7 @@ from .models import (
     citations_in_prompt_order,
     resolve_shot_mode,
     shot_label,
+    song_audio_tag,
 )
 
 #: MiniMax H3 is trained primarily for shot windows in this range, in seconds.
@@ -690,30 +691,44 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
     # writes "<Picture 1>" into a prompt whose payload fills its anonymous slots in the render's
     # walk, so a tag numbered here under any *other* order would declare a role for somebody
     # else's picture, and the take would render plausibly and wrongly.
+    references: list[dict[str, Any]] = []
     if shot.citations:
         ordered_citations = citations_in_prompt_order(shot)
-        entry["references"] = [
+        references.extend(
             {
                 "tag": f"<Picture {position}>",
                 "role": ASSET_ROLE_LABELS.get(citation.role, citation.role),
                 "asset_id": citation.asset_id,
             }
             for position, citation in enumerate(ordered_citations, start=1)
-        ]
+        )
+    # The master song's tag, when this shot rides it — numbered by the same walk the
+    # render numbers it (`song_audio_tag`), so the "<Audio 1>" the specialist writes into
+    # the description is the slot the conditioner actually fills. This is the handle the
+    # creator's own working music-video prompts use for lipsync: the description names
+    # the audio tag as the rhythm the lips follow, and no lyric text ever appears.
+    if shot.use_song_audio and project.song:
+        references.append(
+            {
+                "tag": f"<Audio {song_audio_tag(project, shot)}>",
+                "role": "master song — this shot's exact window of the project track",
+            }
+        )
+    if references:
+        entry["references"] = references
     # The Shot's section, when the Director has marked any (2026-08-19). This is what
     # replaces guessing a shot's words from `song_fraction`: the section carries its own
-    # label, its shared characteristics, and — paired by order of appearance with the
-    # sheet's own [Tag] blocks — the exact lyric block this window sings. A section with
-    # no matching block says `lyrics: ""` and means it: no words here, write no <d>.
+    # label and its shared characteristics. NO lyric text, deliberately (2026-08-19,
+    # twice-measured): given words, the model plants them into wrong windows, and words
+    # in the prompt fight the audio reference that actually drives the mouth — the
+    # Director's own LTX observation. `section_lyrics` remains for planning surfaces;
+    # the expansion never sees words.
     section = song_section(project, shot)
     if section is not None:
         entry["section"] = {
             "label": section.label,
             "prompt": section.prompt,
-            "lyrics": section_lyrics(project, section),
-            # How far into the section this clip sits, 0..1 — the hint that picks which
-            # line(s) of the section's block this clip sings. A block is a few lines over
-            # tens of seconds; a clip is one or two of them, and position chooses which.
+            # How far into the section this clip sits, 0..1 — an energy-curve hint.
             "clip_position": round(
                 min(1.0, max(0.0, (shot.start - section.start) / section.duration)), 3
             )
@@ -733,13 +748,13 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
 
     if project.song:
         song: dict[str, Any] = {"title": project.song.title, "duration": project.song.duration}
-        if project.song.lyrics:
-            song["lyrics"] = project.song.lyrics
+        # The lyric sheet no longer rides the per-shot expansion at all — the same
+        # no-words rule as the section block above. The caption (how the track sounds)
+        # is the mood carrier, and it is all the specialist needs about the music.
         if project.song.caption:
             song["caption"] = project.song.caption
-        # Where in the song this Shot sits, computed exactly as `expansion_input` computes it.
-        # It is the only honest signal available about which part of an unaligned lyric sheet
-        # this Shot might belong to.
+        # Where in the song this Shot sits, computed exactly as `expansion_input`
+        # computes it: the energy-curve hint.
         song_duration = project.song.duration
         if song_duration:
             song["song_fraction"] = round(

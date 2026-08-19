@@ -259,18 +259,14 @@ def test_a_cut_time_belonging_to_a_shot_marker_is_not_flagged() -> None:
     assert not check_orphan_cuts("[Shot 1] She stands. [Shot 2] At 00:02.500 A wolf steps in.")
 
 
-def test_defer_audio_fields_replaces_only_the_two_audio_fields():
-    """The song-audio deferral, measured before it was written (2026-08-19): the
-    specialist's own audio fields drowned the referenced track (envelope correlation
-    0.36/0.27 with fields vs 0.84 bare, same shot, same seed), so a song-audio shot's
-    stored expansion defers both fields to the reference. The description — the picture —
-    is untouched byte for byte, the result stays checker-clean, and the rewrite is
-    idempotent."""
-    from music_video_producer.h3_prompt import (
-        SONG_AUDIO_MUSIC,
-        SONG_AUDIO_SOUNDSCAPE,
-        defer_audio_fields,
-    )
+def test_normalize_audio_fields_rewrites_both_to_the_reuse_declaration() -> None:
+    """The song-audio normalization, measured before it was written (2026-08-19): the
+    specialist's freely-written fields drowned the referenced track (0.36/0.27) and
+    untagged deferral prose recovered unreliably (0.36-0.73). The stored shape is the
+    guide's own §2.6 form — `non_diegetic_music` cites the track by tag as the
+    directly-reused score, `overall_soundscape` goes N/A — and the description is
+    untouched byte for byte."""
+    from music_video_producer.h3_prompt import normalize_audio_fields
 
     sample = (
         "integrated_multimodal_description: [Shot 1] She sings at the mic, camera "
@@ -278,19 +274,32 @@ def test_defer_audio_fields_replaces_only_the_two_audio_fields():
         "overall_soundscape: Warehouse echo hums; mic stand clicks softly.\n\n"
         "non_diegetic_music: driving electric guitars swell beneath her vocal line."
     )
-    out = defer_audio_fields(sample)
-    assert out.startswith(
+    out = normalize_audio_fields(sample, audio_tag=1)
+    assert out == (
+        "integrated_multimodal_description: [Shot 1] She sings at the mic, camera "
+        "pushing in slowly.\n\n"
+        "overall_soundscape: N/A\n\n"
+        "non_diegetic_music: <Audio 1> is directly reused as the complete "
+        "audience-only score."
+    )
+    assert normalize_audio_fields(out, audio_tag=1) == out  # idempotent
+    # The normalized shape is a fully legal prompt under the default checker.
+    assert check(out, duration=4.0).problems == []
+    # The tag follows the render's numbering, whatever it is.
+    assert "<Audio 3> is directly reused" in normalize_audio_fields(sample, audio_tag=3)
+    # A prompt missing both fields passes through untouched; the checker owns malformed
+    # documents. `require_sound_fields=False` accepts that shape while still
+    # bounds-checking any field that IS present.
+    headless = (
         "integrated_multimodal_description: [Shot 1] She sings at the mic, camera "
         "pushing in slowly."
     )
-    assert SONG_AUDIO_SOUNDSCAPE in out
-    assert SONG_AUDIO_MUSIC in out
-    assert "Warehouse echo" not in out
-    assert "electric guitars swell" not in out
-    assert check(out, duration=4.0).problems == []
-    assert defer_audio_fields(out) == out
-    # A malformed document is the checker's problem, not this normalizer's.
-    assert defer_audio_fields("integrated_multimodal_description: x") == (
-        "integrated_multimodal_description: x"
+    assert normalize_audio_fields(headless) == headless
+    assert any("missing" in p.message for p in check(headless, duration=4.0).problems)
+    assert check(headless, duration=4.0, require_sound_fields=False).problems == []
+    overlong = headless + "\n\noverall_soundscape: One. Two. Three. Four. Five. Six."
+    assert any(
+        "sentence" in p.message
+        for p in check(overlong, duration=4.0, require_sound_fields=False).problems
     )
-    assert defer_audio_fields("free text, no fields") == "free text, no fields"
+    assert normalize_audio_fields("free text, no fields") == "free text, no fields"

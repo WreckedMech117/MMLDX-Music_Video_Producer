@@ -53,6 +53,10 @@ Composition rules, across the plan:
   character; obey it.
 - Escalate across repeats of a section: a second chorus should not be shot identically
   to the first.
+- If a shot's intent says the performer sings, your rewrite MUST still say she sings —
+  the singing action drives the rendered mouth, and a rewrite that keeps the framing
+  but drops the word "sings" produces a beautiful shot of a closed mouth. Never quote
+  or invent the words being sung.
 
 Return one revised intent per shot, one or two sentences each, with shot_id copied
 verbatim. Answer for every shot in the plan."""

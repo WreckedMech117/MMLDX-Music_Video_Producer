@@ -481,6 +481,24 @@ def citations_in_prompt_order(shot: Shot) -> list[AssetCitation]:
     return sorted(shot.citations, key=lambda citation: (citation.role, citation.order))
 
 
+def song_audio_tag(project: Project, shot: Shot) -> int:
+    """The `<Audio N>` number the master song holds in this Shot's reference payload.
+
+    The render appends the song *after* every cited asset, so its number is one past the
+    audio assets the Shot cites — today always 1, since Shots cite only pictures, but
+    counted rather than assumed so a future audio citation cannot silently shift the tag
+    the expansion and the normalized `non_diegetic_music` field both point at. Same walk
+    as `citations_in_prompt_order`, same reason: one numbering, everywhere.
+    """
+    assets = {asset.id: asset.kind for asset in project.assets}
+    cited_audio = sum(
+        1
+        for citation in citations_in_prompt_order(shot)
+        if assets.get(citation.asset_id) == "audio"
+    )
+    return cited_audio + 1
+
+
 def resolve_shot_mode(shot: Shot) -> ShotMode:
     """The mode this Shot renders as: its declaration, or the mode it already behaves as.
 

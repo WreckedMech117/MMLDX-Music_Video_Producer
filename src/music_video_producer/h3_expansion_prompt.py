@@ -118,13 +118,18 @@ SEMANTIC_RULES = f"""Rules about content, which matter more than the formatting:
 #: measured on this machine to *teach* the string rather than forbid it.
 SINGING_RULES = """About singing, which this model gets wrong in both directions:
 
-- If the shot is marked as singing, the performer is singing the song's words over
-  this window. Write that as what it looks like — mouth movement matching the lyric,
-  breath, effort — and let the words themselves do the rest.
+- If the shot is marked as singing, the performer sings the referenced song to camera
+  over this window, and the renderer syncs her mouth to the provided audio. Write the
+  performance as visible action AND name the audio tag from the references list as its
+  source, like this: "she sings straight into the microphone, mouth moving precisely
+  with the words, breath and effort visible; the vocal in <Audio 1> drives her lip
+  movements." Use the audio tag exactly as the references list numbers it. Never quote,
+  paraphrase or invent the words being sung — not in a dialogue tag, not in prose, not
+  anywhere. The audio reference carries the words; text that names them fights it.
 - If the shot is marked as not singing, no one in it performs the song: do not write
-  lip movement matching the music, and write no <d> tag containing any of the song's
-  words. If the words matter to the shot, show their effect as imagery and action
-  instead.
+  lip movement matching the music, and write no sung words. The music still moves the
+  shot — cue physical action to the track's beat by its tag, like "she strides in time
+  with the beat of <Audio 1>" or "the cut lands as <Audio 1> hits its downbeat."
 - If the singing state is unknown, say nothing either way. Do not assume."""
 
 #: Lyrics, and the failure this project already predicted for them — and then measured on
@@ -133,23 +138,19 @@ SINGING_RULES = """About singing, which this model gets wrong in both directions
 #: take lip-synced nonsense against the real song. The section block is the fix: when the
 #: Director has marked sections, `shot.section.lyrics` carries the exact block this window
 #: sings, and the rules below make it the ONLY legal source of sung words.
-LYRIC_RULES = """You may be given the song's lyrics. Read them carefully:
+LYRIC_RULES = """About the song and its words:
 
-- If the shot carries a `section` object, that is this clip's place in the song. Its
-  `label` names the section (verse, chorus, bridge...), its `prompt` describes what this
-  whole section looks like — honor it in every choice — and its `lyrics` are the ONLY
-  words that may be sung in this clip. `clip_position` says how far into the section
-  this clip sits, 0 to 1: for a singing shot, pick the one or two lines of
-  `section.lyrics` nearest that position and have the performer sing exactly those, in a
-  dialogue tag. If `section.lyrics` is empty, no words are sung here: write no dialogue
-  tag with song words, whatever the full sheet suggests.
-- The full sheet, when given, is the WHOLE song, not this clip's words. Use it for
-  imagery, subject and mood only. Do NOT transcribe it into the prompt as text, and never
-  take sung words from it — sung words come from `section.lyrics` alone.
-- With no section object, which lines fall over this clip is unknown. `song_fraction`
-  tells you roughly how far into the song this clip sits — a hint about mood, never a
-  claim about which line is sung. In that case do not put any lyric inside a dialogue
-  tag, even for a singing shot."""
+- You are never given lyric text, and you must never write any: no quoted lines, no
+  paraphrased lines, no invented lines, no dialogue tags containing song words. This
+  was measured, twice: given words, this pipeline planted them into the wrong windows,
+  and text naming the words fights the audio reference that actually drives the mouth.
+- If the shot carries a `section` object, that is this clip's place in the song: its
+  `label` names the section (verse, chorus, bridge...) and its `prompt` describes what
+  the whole section looks like — honor it in every choice. `clip_position` says how far
+  into the section this clip sits.
+- The song's `caption`, when given, describes how the track sounds. Use it and the
+  section for energy, mood and imagery — how bodies move, how hard the camera works,
+  what the moment feels like — never for words."""
 
 #: Keyframes riding a references shot — the guide's §2.2.2 picture role, restated for the one
 #: shape this specialist meets it in. Appended only when the caller says this shot actually

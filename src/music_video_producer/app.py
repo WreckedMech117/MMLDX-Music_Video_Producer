@@ -58,7 +58,7 @@ from .director import (
 from .dp_prompt import DP_SYSTEM_PROMPT, dp_input
 from .h3_expansion_prompt import system_prompt as h3_system_prompt
 from .h3_prompt import check as h3_check
-from .h3_prompt import defer_audio_fields
+from .h3_prompt import normalize_audio_fields
 from .models import (
     ASSET_ROLE_LABELS,
     SHOT_MODE_SPECS,
@@ -80,6 +80,7 @@ from .models import (
     mode_specification_problems,
     new_id,
     resolve_shot_mode,
+    song_audio_tag,
 )
 from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
 from .store import ProjectNotFound, ProjectStore
@@ -2350,12 +2351,14 @@ def apply_expansions(
         if reason := shot_write_refusal(shot):
             committed.append(replace(outcome, kind=reason))
             continue
-        # A song-audio shot's audio fields defer to the referenced track at write time —
-        # stored and submitted stay one text. Measured 2026-08-19: the specialist's own
-        # audio fields drowned the reference (envelope correlation 0.36 vs 0.84 bare);
-        # see `h3_prompt.defer_audio_fields`.
+        # A song-audio shot's audio fields are normalized to the guide's own reuse
+        # declaration at write time — stored and submitted stay one text. Measured
+        # 2026-08-19: freely-written fields 0.36/0.27, untagged deferral prose
+        # 0.36-0.73 (unreliable); see `h3_prompt.normalize_audio_fields`.
         shot.h3_prompt = (
-            defer_audio_fields(outcome.text) if shot.use_song_audio else outcome.text
+            normalize_audio_fields(outcome.text, audio_tag=song_audio_tag(project, shot))
+            if shot.use_song_audio
+            else outcome.text
         )
         committed.append(replace(outcome, kind="applied"))
     return committed
@@ -5408,7 +5411,11 @@ def create_app(
                     prompt=proposal.prompt.strip(),
                     citations=prompt_citations(proposal.prompt),
                     singing=declared_singing,
-                    use_song_audio=performing,
+                    # Every shot rides its window of the master as reference — the
+                    # Director's ruling (2026-08-19): a non-singing shot still gets its
+                    # piece of the track "for dancing and moving on beat"; `singing`
+                    # alone decides whether the prompt asks for an articulating mouth.
+                    use_song_audio=True,
                     # Distinct per shot, derived from the window rather than random so a
                     # re-populate of the same plan is reproducible. Sixteen shots sharing
                     # seed 0 made one bad sampling trajectory a batch-wide risk on the
@@ -5839,9 +5846,12 @@ def create_app(
                 detail=wording.format(shot=shot_label(project, current)),
             )
 
-        # The same song-audio deferral the sweep applies; see `defer_audio_fields`.
+        # The same song-audio field normalization the sweep applies; see
+        # `normalize_audio_fields`.
         current.h3_prompt = (
-            defer_audio_fields(outcome.text) if current.use_song_audio else outcome.text
+            normalize_audio_fields(outcome.text, audio_tag=song_audio_tag(project, current))
+            if current.use_song_audio
+            else outcome.text
         )
         store.save(project)
         return ShotExpansionResult(

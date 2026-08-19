@@ -395,18 +395,18 @@ def test_the_per_shot_input_carries_the_neighbours_intents_not_their_expansions(
     assert "h3_prompt" not in json.dumps(built)
 
 
-def test_the_per_shot_input_sends_the_whole_lyric_sheet_and_never_claims_it_is_the_window():
-    """Nothing aligns lyrics to time, so "the words for this window" cannot be built.
-
-    `song_section` is an empty branch for exactly this reason: there is no BPM or section
-    field on any model and no analyser. Sending the sheet under a key claiming it was this
-    clip's words would be a fabrication, so it goes as `lyrics` with `song_fraction` beside
-    it as the honest signal of position, and the specialist's prompt tells the model the
-    sheet is unaligned.
+def test_the_per_shot_input_carries_no_lyric_text_anywhere():
+    """The Director's 2026-08-19 ruling, measured twice on live renders: given lyric text,
+    the model plants it into the wrong windows (verse-one words at 4 s when the vocal
+    starts at 13 s), and words in the prompt fight the audio reference that actually
+    drives the mouth. So no key of this payload carries song words — not the song block,
+    not the section block — while the caption (how the track sounds) and `song_fraction`
+    (where the shot sits) stay as the honest, word-free signals.
     """
     built = shot_expansion_input(_expansion_project(), _expansion_project().shots[1])
 
-    assert built["song"]["lyrics"] == "[verse] there is a hunger"
+    assert "lyrics" not in built["song"]
+    assert "there is a hunger" not in json.dumps(built)
     assert built["song"]["song_fraction"] == round(12.0 / 154.6, 4)
     assert not any("window" in key for key in built["song"])
 
@@ -424,6 +424,26 @@ def test_the_per_shot_input_numbers_the_reference_tags_the_model_may_use():
 
     assert [entry["tag"] for entry in references] == ["<Picture 1>", "<Picture 2>"]
     assert {entry["role"] for entry in references} == {"first frame", "last frame"}
+
+
+def test_the_per_shot_input_names_the_master_songs_audio_tag_for_song_audio_shots():
+    """The lipsync handle (2026-08-19): the creator's own working music-video prompts
+    drive the mouth by naming the audio tag in the description — "the vocal in <Audio 1>
+    drives her lip movements" — so a song-audio shot's payload must tell the specialist
+    the tag exists and what number the render will give it. Same walk as the render
+    (`song_audio_tag`), same reason as the picture tags: no guessed numbers."""
+    project = _expansion_project()
+    project.shots[1].use_song_audio = True
+    project.shots[1].citations = [AssetCitation(asset_id="asset_1", role="reference", order=0)]
+
+    references = shot_expansion_input(project, project.shots[1])["shot"]["references"]
+
+    assert references[-1]["tag"] == "<Audio 1>"
+    assert "master song" in references[-1]["role"]
+    # And a shot not riding the song gets no audio tag it could cite.
+    project.shots[1].use_song_audio = False
+    references = shot_expansion_input(project, project.shots[1])["shot"]["references"]
+    assert all("Audio" not in entry["tag"] for entry in references)
 
 
 def test_the_per_shot_input_numbers_mixed_roles_in_the_renders_own_walk():
@@ -464,11 +484,16 @@ def test_the_per_shot_input_numbers_mixed_roles_in_the_renders_own_walk():
 #: a dedicated first/last keyframe shot. The story rerouted this builder's numbering through
 #: `citations_in_prompt_order`, and for these shapes that function must be the identity of the
 #: old inline sort; a digest is the only assertion that cannot drift with the code it checks.
+#:
+#: Re-derived 2026-08-19 under the Director's renegotiation of the payload itself: lyric text
+#: no longer rides any per-shot expansion (measured twice — given words, the model plants them
+#: into wrong windows and the text fights the audio reference that drives the mouth), so the
+#: `song` block lost its `lyrics` key and the digests moved with it.
 EXPANSION_INPUT_REFERENCE_ONLY_DIGEST = (
-    "30fea20f3276e3fade1c567df8b469a6d36e859bf8e1f22efbb36848cc46f496"
+    "cb26a873fb86206be8e7a880617f02cb56f10003682d9a47650bf55cac2b8698"
 )
 EXPANSION_INPUT_FIRST_LAST_DIGEST = (
-    "a4a612e564402b8c114f63421af8fe04290b0fcc2bf32d9785a8a1b0c8e88354"
+    "7cba3a4c502919991883becfe4d02d9f0f3a582c8c81aec7029a428d06cd0472"
 )
 
 
@@ -727,7 +752,10 @@ def test_the_expansion_payload_carries_the_shots_section_block():
     section = built["shot"]["section"]
     assert section["label"] == "Chorus"
     assert section["prompt"] == "on the canopy bed"
-    assert section["lyrics"] == "hook line"
+    # No lyric text, deliberately: `section_lyrics` remains a planning surface, but the
+    # expansion never sees words (2026-08-19, twice-measured — see the payload builder).
+    assert "lyrics" not in section
+    assert "hook line" not in json.dumps(built)
     # 27s into a 24-36s section: a quarter of the way through.
     assert section["clip_position"] == 0.25
     # Sectionless project: the key is absent, never empty — absence must not read as a

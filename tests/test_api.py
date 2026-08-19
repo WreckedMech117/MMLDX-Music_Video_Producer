@@ -11360,7 +11360,8 @@ def test_sections_route_sorts_refuses_overlap_and_reaches_the_expansion(tmp_path
     section = shot_expansion_input(stored, stored.shots[0])["shot"]["section"]
     assert section["label"] == "Chorus"
     assert section["prompt"] == "on the canopy bed"
-    assert section["lyrics"] == "chorus hook words"
+    # Lyric text never rides the expansion payload (2026-08-19, twice-measured).
+    assert "lyrics" not in section
 
 
 def test_populate_adopts_the_models_sections_when_none_are_marked(tmp_path: Path):
