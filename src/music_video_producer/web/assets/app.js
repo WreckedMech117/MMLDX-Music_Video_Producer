@@ -1538,23 +1538,23 @@ async function restoreDocument(documentKey) {
 //
 // The reply is the whole project, so the timeline and the inspector are re-rendered from it rather
 // than patched locally, and the toast is read out of the reply rather than diffed.
-async function expandShotPrompts() {
+async function expandShotPrompts(focus = "story") {
   if (!requireProject()) return;
   if (!state.project.shots.length) return toast(SHOT_EXPANSION_WITHOUT_SHOTS, "error");
   if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to expand shots into prompts.", "error");
-  if (!confirmDiscardingDocumentEdits("Expand shots into prompts? No document is replaced, but the whole project comes back, so the editors are re-rendered from the text stored on the server.")) return;
+  if (!confirmDiscardingDocumentEdits(`${focus === "photography" ? "Recompose the camera across every shot?" : "Expand shots into prompts?"} No document is replaced, but the whole project comes back, so the editors are re-rendered from the text stored on the server.`)) return;
   // The id this call is sent for, captured before any await. `state.project` is rebound by the
   // response and the project selector stays live throughout, so without this a result for project
   // A can be written over project B and drawn -- A's shots and A's documents -- under B's name.
   const projectId = state.project.id;
-  const button = $("#expand-shot-prompts");
+  const button = $(focus === "photography" ? "#dp-pass" : "#expand-shot-prompts");
   const label = button.textContent;
   button.disabled = true;
-  button.textContent = "Expanding…";
+  button.textContent = focus === "photography" ? "Composing…" : "Expanding…";
   shotWriteInFlight = "expansion";
   try {
     await shotSaveChain;
-    const expanded = await api.expandShots(projectId);
+    const expanded = await api.expandShots(projectId, focus);
     // The Director switched projects while the model was thinking. The prompts are written and
     // saved on the server, so nothing is lost by dropping this reply -- loading that project again
     // shows them -- whereas applying it here would show one project's work under another's name.
@@ -2144,7 +2144,8 @@ function bindEvents() {
     return runAssistantFill(event.currentTarget, bulk.shotIds);
   });
   $("#send-treatment").addEventListener("click", () => document.querySelector('[data-panel="treatment"]').click());
-  $("#expand-shot-prompts").addEventListener("click", expandShotPrompts);
+  $("#expand-shot-prompts").addEventListener("click", () => expandShotPrompts("story"));
+  $("#dp-pass").addEventListener("click", () => expandShotPrompts("photography"));
   // Pass two, beside pass one and in that order on screen, because that is the order the two run
   // in: pass one lays the shots out so they flow together and writes each one's intent, pass two
   // turns each intent into H3's structured format one call at a time.

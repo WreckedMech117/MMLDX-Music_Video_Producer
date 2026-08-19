@@ -462,7 +462,11 @@ def assistant_input(project: Project, *, shot_ids: list[str]) -> dict[str, Any]:
             entry["song_fraction"] = round(min(1.0, max(0.0, shot.start / song_duration)), 4)
         section = song_section(project, shot)
         if section:
-            entry["section"] = section
+            # An explicit dict, never the model object: this payload is json.dumps'd
+            # by the client, and a raw SongSection is a TypeError at send time. These
+            # two branches were dead while song_section returned "" and came alive
+            # with the wrong type when sections landed (found by the run-2 audit).
+            entry["section"] = {"label": section.label, "prompt": section.prompt}
         shots.append(entry)
     payload: dict[str, Any] = {
         "creative_brief": project.creative_brief,
@@ -587,7 +591,11 @@ def expansion_input(project: Project) -> dict[str, Any]:
             entry["song_fraction"] = round(min(1.0, max(0.0, shot.start / song_duration)), 4)
         section = song_section(project, shot)
         if section:
-            entry["section"] = section
+            # An explicit dict, never the model object: this payload is json.dumps'd
+            # by the client, and a raw SongSection is a TypeError at send time. These
+            # two branches were dead while song_section returned "" and came alive
+            # with the wrong type when sections landed (found by the run-2 audit).
+            entry["section"] = {"label": section.label, "prompt": section.prompt}
         shots.append(entry)
     payload: dict[str, Any] = {
         "creative_brief": project.creative_brief,

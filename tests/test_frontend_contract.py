@@ -2174,16 +2174,18 @@ def test_expansion_reaches_a_real_route_and_sends_no_chat_message_or_render():
 
     url = re.search(r"`([^`]+)`", call)
     assert url, "api.expandShots no longer builds its URL from a template literal"
+    # The focus query selects the persona (story / photography) over one route.
+    assert "focus=${focus}" in url.group(1)
     assert 'method: "POST"' in call
     # No body, no headers, nothing a message could travel in.
     assert "body:" not in call, call
     assert "JSON.stringify" not in call, call
 
-    template = re.sub(r"\$\{[^}]+\}", "{project_id}", url.group(1))
+    template = re.sub(r"\$\{[^}]+\}", "{project_id}", url.group(1).split("?")[0])
     assert template in {route.path for route in create_app().routes}, template
 
     handler = app_js_block("async function expandShotPrompts")
-    assert "api.expandShots(projectId)" in handler
+    assert "api.expandShots(projectId, focus)" in handler
     assert "directorChat" not in handler
     # No render is queued from here, in any spelling. The old pattern alternated on
     # `expandShots\w`, which is not a symbol that exists, so it only ever tested `api.generate`;
@@ -2196,7 +2198,9 @@ def test_expansion_reaches_a_real_route_and_sends_no_chat_message_or_render():
     assert "shotExpansionToast(state.project)" in handler
 
     source = APP_JS.read_text(encoding="utf-8")
-    assert '$("#expand-shot-prompts").addEventListener("click", expandShotPrompts);' in source
+    assert '$("#expand-shot-prompts").addEventListener("click", () => expandShotPrompts("story"));' in source
+    # The DP pass binds the same handler with the photography focus (run-2 audit).
+    assert '$("#dp-pass").addEventListener("click", () => expandShotPrompts("photography"));' in source
 
     markup = INDEX_HTML.read_text(encoding="utf-8")
     button = re.search(r'<button[^>]*id="expand-shot-prompts"[^>]*>[^<]*</button>', markup)
@@ -2220,9 +2224,12 @@ def test_the_expansion_control_has_one_name_in_every_layer():
     assert button, "the expansion action has no button for app.js to bind"
     assert button.group(1).strip() == "Expand shots into prompts", button.group(1)
 
-    # One spelling, everywhere it is reachable: the markup id, both app.js selectors, the handler.
-    assert source.count('$("#expand-shot-prompts")') == 2, source.count('$("#expand-shot-prompts")')
-    assert "async function expandShotPrompts()" in source
+    # One spelling, everywhere it is reachable: the markup id, the binding, and the
+    # handler's focus ternary (the DP pass shares the handler, so the button lookup
+    # carries both ids in one expression).
+    assert source.count('$("#expand-shot-prompts")') == 1, source.count('$("#expand-shot-prompts")')
+    assert '$(focus === "photography" ? "#dp-pass" : "#expand-shot-prompts")' in source
+    assert 'async function expandShotPrompts(focus = "story")' in source
     # And the old name is gone from every layer, including the stylesheet.
     for layer, text in (("markup", markup), ("app.js", source), ("styles.css", styles)):
         assert "apply-shot-plan" not in text, layer
@@ -2423,7 +2430,7 @@ def test_expansion_abandons_a_result_for_a_project_that_is_no_longer_loaded():
     # The id is captured before any await, and it is the id the request is sent for.
     assert "const projectId = state.project.id;" in handler
     assert handler.index("const projectId") < handler.index("await ")
-    assert "api.expandShots(projectId)" in handler
+    assert "api.expandShots(projectId, focus)" in handler
     # The response is held aside until the guard has run, so a stale result is never assigned.
     assert "if (state.project?.id !== projectId) return;" in handler
     assert handler.index("api.expandShots(") < handler.index("state.project?.id !== projectId")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import math
 import re
 import shutil
@@ -54,17 +55,20 @@ from .director import (
     DirectorUnavailable,
     document_rejection,
 )
+from .dp_prompt import DP_SYSTEM_PROMPT, dp_input
 from .h3_expansion_prompt import system_prompt as h3_system_prompt
 from .h3_prompt import check as h3_check
 from .models import (
     ASSET_ROLE_LABELS,
     SHOT_MODE_SPECS,
     Asset,
+    AssetCitation,
     MessageNotice,
     Project,
     RenderJob,
     Shot,
     ShotStatus,
+    SingingState,
     Song,
     SongSection,
     TreatmentMessage,
@@ -93,6 +97,7 @@ from .timeline import (
     proposal_for_position,
     repair_sections,
     shot_expansion_input,
+    song_section,
 )
 from .vram import CliUnloader, LlmEjector
 from .workflows import (
@@ -430,7 +435,7 @@ REFERENCE_KEYFRAME_NOT_IMAGE = (
 )
 
 
-def reference_prompt(shot: Shot, tags: list[str]) -> str:
+def reference_prompt(shot: Shot, tags: list[str], section_prompt: str = "") -> str:
     """What the reference render actually submits for this Shot.
 
     Without an expansion this is byte-for-byte the string this route has always built:
@@ -447,7 +452,16 @@ def reference_prompt(shot: Shot, tags: list[str]) -> str:
     """
     if shot.h3_prompt.strip():
         return shot.h3_prompt
-    return f"Reference map: {'; '.join(tags)}. {shot.prompt}"
+    base = f"Reference map: {'; '.join(tags)}. {shot.prompt}"
+    # The fallback's insurance (run-2 audit item 7): the section's shared look reaches H3
+    # only through the expansion, so a shot whose every expansion attempt failed would
+    # render from one bare intent sentence with no section character. Appended, never
+    # prefixed, and only when a section prompt exists — a sectionless shot's string is
+    # byte-identical to what this route has always built, which the pinned payload
+    # digests assert.
+    if section_prompt:
+        return f"{base} Section look: {section_prompt}"
+    return base
 
 
 
@@ -1718,6 +1732,11 @@ GENERATE_BATCH_EMPTY_READY = (
 )
 GENERATE_BATCH_EMPTY_FLAGGED = "No shots are flagged for re-render."
 
+#: What a batch re-render adds to the shot's seed, so the retake differs from the take
+#: the Director just rejected. A named odd stride rather than +1 so it cannot collide
+#: with populate's 1..N first-render seeds for many rounds.
+RESUBMIT_SEED_STRIDE = 101
+
 
 # --------------------------------------------------------------------------------------------
 # Populate Timeline (the Director's user workflow, stage 4 — spec-populate-timeline).
@@ -1762,18 +1781,22 @@ POPULATE_MAX_WINDOW_SECONDS = 6.0
 POPULATE_INSTRUCTION = (
     "Lay out the complete shot plan for this music video. The song is {duration:.1f} "
     "seconds long; cover it entirely from 0 to {duration:.1f} with contiguous shots — "
-    "no gaps, no overlaps — each between 4 and 15 seconds, about {count} shots in "
-    "total. Follow the treatment and style bible; use the song's lyrics to place "
-    "performance moments where the words are. The project's assets, by name, are: "
-    "{assets}. Refer to them by these exact names in shot prompts so each shot says "
-    "which character or location it uses. Every shot's prompt is a short readable "
-    "visual intent (one or two sentences): what is seen, who is in frame, how the "
-    "camera behaves. Vary the camera angle and movement between adjacent shots — never "
-    "repeat the same setup, framing or camera move back to back, and not every shot "
-    "needs movement at all. First divide the song into sections by its structure "
-    "(Intro, Verse, Chorus, Bridge, Outro), matching the lyric sheet's own [Tag] blocks "
-    "in order, each with start and duration in seconds and a one-sentence shared visual "
-    "prompt; return them in `sections`. Then lay the shots out inside those sections."
+    "no gaps, no overlaps — each between 4 and 6 seconds, about {count} shots in "
+    "total. Deliberately mix lengths inside that band: quick 4-second cuts on "
+    "high-energy beats, 6-second holds on glamour or establishing moments; do not make "
+    "every shot the same length. Follow the treatment and style bible; use the song's "
+    "lyrics to place performance moments where the words are, and set performance=true "
+    "on every shot where a character sings the song on camera. The project's assets, "
+    "by name, are: {assets}. Refer to them by these exact names in shot prompts so "
+    "each shot says which character or location it uses. Every shot's prompt is a "
+    "short readable visual intent (one or two sentences): what is seen, who is in "
+    "frame, how the camera behaves. Vary the camera angle and movement between "
+    "adjacent shots — never repeat the same setup, framing or camera move back to "
+    "back, and not every shot needs movement at all. First divide the song into "
+    "sections by its structure (Intro, Verse, Chorus, Bridge, Outro), matching the "
+    "lyric sheet's own [Tag] blocks in order, each with start and duration in seconds "
+    "and a one-sentence shared visual prompt; return them in `sections`. Then lay the "
+    "shots out inside those sections."
 )
 
 
@@ -3932,7 +3955,15 @@ def create_app(
                 tags.append(f"<Audio {numbers['audio']}> is the master song for synchronization")
             try:
                 payload = build_h3_reference_payload(
-                    prompt=reference_prompt(shot, tags),
+                    prompt=reference_prompt(
+                        shot,
+                        tags,
+                        section_prompt=(
+                            section.prompt
+                            if (section := song_section(project, shot)) is not None
+                            else ""
+                        ),
+                    ),
                     references=references,
                     duration=shot.duration,
                     seed=shot.seed,
@@ -4237,6 +4268,19 @@ def create_app(
                 # the batch's refusals, in the same words.
                 if target.status in ("complete", "error"):
                     render_again(project_id, target.id)
+                    # A re-render at the same seed and prompt reproduces the identical
+                    # take — the fixed-seed trap the roadmap already recorded for Flux,
+                    # met again by the flag/replace loop (the run-2 audit). The stride
+                    # lands here, in the batch route, because render_again's contract is
+                    # pinned as "writes exactly one field"; a lone-click re-render keeps
+                    # its seed on purpose (comparisons want it), while resubmitting a
+                    # rejected take is asking for a different one.
+                    fresh = get_project(project_id)
+                    for candidate in fresh.shots:
+                        if candidate.id == target.id:
+                            candidate.seed += RESUBMIT_SEED_STRIDE
+                            store.save(fresh)
+                            break
                 job = await generate_h3(
                     project_id, target.id, H3Request(profile=request.profile)
                 )
@@ -5152,7 +5196,7 @@ def create_app(
         """
         project = get_project(project_id)
         ordered = sorted(request.sections, key=lambda section: section.start)
-        for first, second in zip(ordered, ordered[1:]):
+        for first, second in itertools.pairwise(ordered):
             if second.start < first.end - 1e-6:
                 raise HTTPException(
                     status_code=422,
@@ -5315,23 +5359,57 @@ def create_app(
                 duration,
                 maximum=POPULATE_MAX_WINDOW_SECONDS,
             )
-        project.shots = [
-            Shot(
-                start=start,
-                duration=length,
-                prompt=proposals[
-                    proposal_for_position(start + length / 2, duration, len(proposals))
-                ].prompt.strip(),
-                # Distinct per shot, derived from the window rather than random so a
-                # re-populate of the same plan is reproducible. Sixteen shots sharing
-                # seed 0 made one bad sampling trajectory a batch-wide risk: the first
-                # live batch lost 3 of its first 4 renders to a NaN'd audio latent that
-                # a fresh seed resolves, and a shared seed turns that coin flip into a
-                # correlated one (2026-08-19).
-                seed=1 + index,
+        # The mechanical fills the first run needed a hand-run script for, now populate's
+        # own act (the run-2 audit's items 4 and 5):
+        #
+        # * `performance` comes from the model — safe on this path, because the strict
+        #   json_schema's constrained decoder forces every key to be emitted, unlike the
+        #   tool-call path where this model family drops booleans — and maps onto
+        #   `singing`/`use_song_audio`. `resolve_shot_mode` then routes performance shots
+        #   to references automatically, so no mode needs writing.
+        # * citations come from the prompt itself: the instruction commands exact asset
+        #   names, so any asset whose name appears in a shot's prompt is cited as a
+        #   reference. Deterministic, reviewable in the inspector, reversible per shot.
+        #   Names under 4 characters are skipped as substring noise.
+        def prompt_citations(prompt_text: str) -> list[AssetCitation]:
+            lowered = prompt_text.lower()
+            return [
+                AssetCitation(asset_id=asset.id, role="reference", order=order)
+                for order, asset in enumerate(
+                    asset
+                    for asset in project.assets
+                    if len(asset.name) >= 4 and asset.name.lower() in lowered
+                )
+            ]
+
+        shots: list[Shot] = []
+        for index, (start, length) in enumerate(windows):
+            proposal = proposals[
+                proposal_for_position(start + length / 2, duration, len(proposals))
+            ]
+            performing = bool(getattr(proposal, "performance", False))
+            # Mapped from the model's own `performance` declaration — a dedicated strict-
+            # schema field the instruction explicitly asks for — never inferred from
+            # prose. The nothing-infers-singing guard permits exactly this mapping and
+            # forbids everything looser; the Director reviews the result per shot in the
+            # inspector, exactly as they reviewed the hand-run script it replaces.
+            declared_singing: SingingState = "singing" if performing else "not_singing"
+            shots.append(
+                Shot(
+                    start=start,
+                    duration=length,
+                    prompt=proposal.prompt.strip(),
+                    citations=prompt_citations(proposal.prompt),
+                    singing=declared_singing,
+                    use_song_audio=performing,
+                    # Distinct per shot, derived from the window rather than random so a
+                    # re-populate of the same plan is reproducible. Sixteen shots sharing
+                    # seed 0 made one bad sampling trajectory a batch-wide risk on the
+                    # first live batch (3 of 4 lost to a NaN'd audio latent).
+                    seed=1 + index,
+                )
             )
-            for index, (start, length) in enumerate(windows)
-        ]
+        project.shots = shots
         saved = store.save(project)
         return PopulateTimelineResponse(
             proposed=len(proposals), created=len(saved.shots), project=saved
@@ -5489,7 +5567,9 @@ def create_app(
         return store.save(project)
 
     @app.post("/api/projects/{project_id}/director/expand", response_model=Project)
-    async def expand_shot_prompts(project_id: str) -> Project:
+    async def expand_shot_prompts(
+        project_id: str, focus: Literal["story", "photography"] = "story"
+    ) -> Project:
         """Turn the Treatment, Style Bible and timed Shot windows into a prompt per Shot (FR-26).
 
         A thin delegator over two pure things: `expansion_input` builds what the model sees, and
@@ -5517,11 +5597,25 @@ def create_app(
         """
         # Built from the pre-await snapshot, exactly as the chat prompt is: this is what the
         # model sees, and it is then thrown away in favour of the re-read below.
+        #
+        # `focus` selects the persona over the identical machinery (2026-08-19): "story"
+        # is pass one; "photography" is the DP pass the Director asked for after the
+        # first full run's repeated setups — same whole-plan shape, same id-keyed apply,
+        # same guards and notices, a different job description and a camera-trimmed input.
         snapshot = get_project(project_id)
         if not snapshot.shots:
             raise HTTPException(status_code=422, detail=EXPANSION_WITHOUT_SHOTS)
+        photography = focus == "photography"
         try:
-            result = await director.expand(expansion_input=expansion_input(snapshot))
+            # The kwarg travels only on the DP pass, so every existing `expand` double —
+            # and the story pass's own call shape — stays byte-identical.
+            result = await (
+                director.expand(
+                    expansion_input=dp_input(snapshot), system_prompt=DP_SYSTEM_PROMPT
+                )
+                if photography
+                else director.expand(expansion_input=expansion_input(snapshot))
+            )
         except DirectorUnavailable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except DirectorError as error:

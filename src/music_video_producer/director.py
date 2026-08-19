@@ -58,6 +58,12 @@ class PlannedShot(BaseModel):
     start: float = Field(ge=0)
     duration: float = Field(gt=0, le=30)
     prompt: str = Field(min_length=1)
+    # Whether a character sings the song on camera in this shot. Safe to ask of the model
+    # here — unlike the assistant's tool calls, this rides `response_format: json_schema
+    # strict`, where the constrained decoder *forces* every key to be emitted, so the
+    # boolean-dropout disease the fill workaround exists for cannot occur on this path
+    # (the run-2 audit's observation). Populate maps it onto `singing`/`use_song_audio`.
+    performance: bool = False
 
 
 class PlannedSection(BaseModel):
@@ -463,6 +469,9 @@ Each entry in shots has:
 - song_fraction: how far through the song the shot starts, from 0 at the opening to 1 at the
   end. Absent when the song's length is unknown. Use it to place the shot on the song's energy
   curve: early shots establish, middle shots develop, late shots resolve or release.
+- section: when the director has marked the song's structure, this shot's section — its label
+  (verse, chorus, bridge...) and the section's shared visual prompt. Honor the shared prompt in
+  every choice for this shot; it is the look the whole section carries. Absent when unmarked.
 - neighbours: the shot ids and windows immediately before and after this one, so you can make
   each prompt deliberately different from what it cuts from and into. Their full entries are in
   shots, at index - 1 and index + 1.
@@ -721,13 +730,20 @@ class DirectorClient:
         ) as error:
             raise DirectorError(f"LLM director returned an invalid response: {error}") from error
 
-    async def expand(self, *, expansion_input: dict[str, Any]) -> ShotExpansion:
+    async def expand(
+        self, *, expansion_input: dict[str, Any], system_prompt: str | None = None
+    ) -> ShotExpansion:
         """Write one prompt per Shot, in a single whole-plan call.
 
         `expansion_input` is passed through verbatim: it is built by `timeline.expansion_input`,
         which is pure, trimmed on purpose, and the thing tests assert on. Nothing is added to
         it here, or the assertion that the route sent the builder's output would be true of a
         payload the model never saw.
+
+        `system_prompt` selects the persona over the same transport and the same
+        `ShotExpansion` contract: `None` is the story pass (pass one), and the DP pass
+        (`dp_prompt.DP_SYSTEM_PROMPT`) rides the identical wire because "revised intents
+        addressed by shot id" is exactly its output shape too.
         """
         if not self.base_url or not self.model:
             raise DirectorUnavailable(
@@ -737,7 +753,7 @@ class DirectorClient:
         body = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": EXPANSION_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt or EXPANSION_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": json.dumps(expansion_input, ensure_ascii=False),

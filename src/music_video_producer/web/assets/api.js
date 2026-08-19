@@ -2404,7 +2404,7 @@ export const api = {
   // Its own route, and it carries no body: expansion is not a chat turn. The whole input the
   // model sees is derived on the server from the project itself, so there is nothing here for a
   // message to travel in — and nothing that could queue a render.
-  expandShots: (id) => request(`/api/projects/${id}/director/expand`, { method: "POST" }),
+  expandShots: (id, focus = "story") => request(`/api/projects/${id}/director/expand?focus=${focus}`, { method: "POST" }),
   // Pass two, one shot. No body for `expandShots`' reason and one more: everything the specialist
   // needs is already on the shot, so there is nothing here a stale client could assert. The reply
   // is not the project -- it is the project *plus* whether the answer was applied, what the format

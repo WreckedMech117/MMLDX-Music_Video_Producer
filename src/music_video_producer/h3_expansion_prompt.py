@@ -84,7 +84,10 @@ SEMANTIC_RULES = f"""Rules about content, which matter more than the formatting:
   sounds. Dialogue, singing and any music the characters can hear do NOT go there —
   those belong in the description.
 - {CORE_FIELDS[2]} is score only the audience hears. Cover instrumentation, tempo and
-  dynamics.
+  dynamics — and this is a music video, so the score IS the project's own song: describe
+  that track (the song's caption when given, the section's energy), never an invented
+  one. A chorus shot's music field should read like this song's chorus, so the picture's
+  motion is paced to the track that will actually play under it.
 - On-screen text goes in double quotation marks and is left untranslated.
 - Write what a camera could record. Do not write intentions, backstory or what a
   character is feeling unless it is visible.

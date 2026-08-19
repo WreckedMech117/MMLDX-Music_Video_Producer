@@ -106,6 +106,7 @@ from music_video_producer.models import (
     ShotStatus,
     SingingState,
     Song,
+    SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
     citations_in_prompt_order,
@@ -8850,6 +8851,12 @@ def test_whether_the_performer_is_singing_is_expressible_and_nothing_infers_it(t
     )
     for guess in ('singing = "singing"', 'singing = "not_singing"', 'singing="singing"'):
         assert guess not in source, guess
+    # The one permitted write: populate maps the plan model's own `performance` field --
+    # a dedicated strict-schema declaration the instruction explicitly asks for, reviewed
+    # per shot in the inspector (run-2 audit, 2026-08-19). Pinned to its one blessed
+    # spelling and site; the greps above still forbid every looser form.
+    app_source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
+    assert app_source.count('declared_singing: SingingState = "singing" if performing else "not_singing"') == 1
 
     # And it is durable: it survives the wire, the manifest and a reload.
     client, store, _ = make_client(tmp_path)
@@ -11392,3 +11399,57 @@ def test_populate_adopts_the_models_sections_when_none_are_marked(tmp_path: Path
     store.save(marked)
     assert populate(client, project.id).status_code == 200
     assert store.get(project.id).sections[0].prompt == "hand-edited"
+
+
+def test_the_dp_pass_rides_the_expand_route_with_its_own_persona_and_input(tmp_path: Path):
+    """focus=photography selects the DP persona over the identical machinery: the input is
+    the camera-trimmed dp_input (sections inline, no citations, no lyrics), the system
+    prompt is the DP job description, and the revised intents land through the same
+    id-keyed guards — locked shots refused, story text replaced only where answered."""
+
+    class RecordingDirector:
+        def __init__(self):
+            self.calls = []
+
+        async def expand(self, *, expansion_input, system_prompt=None):
+            self.calls.append({"input": expansion_input, "system": system_prompt})
+            revised = type("ExpandedShot", (), {
+                "shot_id": expansion_input["shots"][0]["shot_id"],
+                "prompt": "Medium close-up, eye level, static shot: she holds the mic.",
+            })()
+            return type("ShotExpansion", (), {"message": "Composed.", "shots": [revised]})()
+
+    from music_video_producer.dp_prompt import DP_SYSTEM_PROMPT
+
+    director = RecordingDirector()
+    client, store, _comfy = make_client(tmp_path, director=director)
+    project = store.create(Project(name="DP"))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=30.0)
+    project.sections = [SongSection(label="Verse", start=0, duration=30, prompt="kinetic")]
+    project.shots = [
+        Shot(id="shot_a", start=0, duration=6, prompt="She walks to the mic."),
+        Shot(id="shot_b", start=6, duration=6, prompt="Locked framing.", locked=True),
+    ]
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project.id}/director/expand?focus=photography")
+    assert response.status_code == 200, response.text
+
+    call = director.calls[0]
+    assert call["system"] == DP_SYSTEM_PROMPT
+    # The camera-trimmed input: sections inline on shots and as the plan's map; no
+    # citations, no lyric sheet — the DP does not re-cast and does not need the words.
+    assert call["input"]["shots"][0]["section"] == {"label": "Verse", "prompt": "kinetic"}
+    assert call["input"]["sections"][0]["label"] == "Verse"
+    assert "song" not in call["input"]
+    assert "references" not in call["input"]["shots"][0]
+
+    saved = store.get(project.id)
+    assert saved.shots[0].prompt.startswith("Medium close-up")
+    assert saved.shots[1].prompt == "Locked framing."  # the lock held
+
+    # The story pass is untouched: no focus means the original persona and input.
+    story = client.post(f"/api/projects/{project.id}/director/expand")
+    assert story.status_code == 200
+    assert director.calls[-1]["system"] is None
+    assert "song" in director.calls[-1]["input"]
