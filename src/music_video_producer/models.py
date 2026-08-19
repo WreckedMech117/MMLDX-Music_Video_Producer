@@ -52,6 +52,38 @@ class Song(BaseModel):
     caption_previous: str | None = None
 
 
+class SongSection(BaseModel):
+    """One window of the song's structure: Intro, Verse, Chorus, Bridge, Outro…
+
+    The Director's ask, verbatim intent (2026-08-19): a Section row under References,
+    "marked with its own window and prompt … that whole section would share
+    characteristics, but shot for shot there is some variance." Sections are the layer
+    between the treatment and the shots: populate tiles within them, and the expansion
+    reads a shot's section to know which lyric block its words come from — the fix for
+    the wrong-verse lipsync found on the first full batch (a shot at 30 s was expanded
+    with the song's opening line, because unaligned lyrics left the model guessing).
+
+    `label` is free text but pairs with the lyric sheet's `[Tag]` blocks **by order of
+    appearance**: the Nth section whose label matches a sheet tag (case-insensitive,
+    "Verse 2" matches `[Verse]`) is paired with the Nth such block, so the sheet's own
+    structure carries the timing the tags themselves lack. Nothing infers sections; the
+    Director marks them by ear, or accepts populate's proposal once one exists.
+    """
+
+    id: str = Field(default_factory=lambda: new_id("section"))
+    label: str = Field(min_length=1, max_length=60)
+    start: float = Field(ge=0)
+    duration: float = Field(gt=0)
+    #: The section's shared characteristics, layered under every shot prompt inside it —
+    #: "standing at the mic" for verses, "on the bed, glamour angles" for choruses.
+    prompt: str = ""
+
+    @computed_field
+    @property
+    def end(self) -> float:
+        return self.start + self.duration
+
+
 class VisionInspectionRecord(BaseModel):
     model: str = ""
     summary: str
@@ -670,6 +702,10 @@ class Project(BaseModel):
     treatment_locked: bool = False
     style_bible_locked: bool = False
     song: Song | None = None
+    # The song's structure, the Director's own marks (see `SongSection`). Defaulted so
+    # every existing manifest loads unchanged; empty means unmarked, and everything that
+    # reads sections treats absence as unknown rather than inventing boundaries.
+    sections: list[SongSection] = Field(default_factory=list)
     assets: list[Asset] = Field(default_factory=list)
     shots: list[Shot] = Field(default_factory=list)
     messages: list[TreatmentMessage] = Field(default_factory=list)

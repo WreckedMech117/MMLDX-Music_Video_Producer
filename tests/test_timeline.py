@@ -8,6 +8,7 @@ from music_video_producer.models import (
     Project,
     Shot,
     Song,
+    SongSection,
     citations_in_prompt_order,
 )
 from music_video_producer.timeline import (
@@ -23,6 +24,7 @@ from music_video_producer.timeline import (
     over_render_lead,
     populate_windows,
     proposal_for_position,
+    section_lyrics,
     shot_expansion_input,
     song_section,
 )
@@ -240,22 +242,24 @@ def test_expansion_input_omits_the_song_fraction_rather_than_fabricating_zero():
     assert "song" not in expansion_input(expansion_project(song=None))
 
 
-def test_expansion_input_omits_the_section_because_no_analyser_exists():
-    """FR-26's "section boundaries when analysis exists" has no data source in this project.
+def test_expansion_input_omits_the_section_when_nothing_is_marked():
+    """Absence still means unknown — the slot's rule survives the slot being filled.
 
-    Asserted two ways so the empty branch cannot quietly become a fabrication: the key is absent
-    from every shot, and no model anywhere carries the section or tempo data one would be
-    derived from. If an analyser ever lands, `song_section` is the one place that changes and
-    this test is what says the slot was empty rather than forgotten.
+    The data source arrived on 2026-08-19 (the Director's own `Project.sections`, not an
+    analyser), so the claim shrinks but does not invert: a project with no marks carries
+    no `section` key anywhere, because an absent value must never reach the model as a
+    confident one.
     """
     built = expansion_input(expansion_project(song=Song(title="Spine", source="imported", duration=120)))
 
     for shot in built["shots"]:
         assert "section" not in shot, shot["shot_id"]
-    assert song_section(Project(name="Any"), Shot(start=0, duration=5)) == ""
+    assert song_section(Project(name="Any"), Shot(start=0, duration=5)) is None
+    # Tempo remains genuinely unsourced; sections are now the Director's field.
     fields = set(Song.model_fields) | set(Project.model_fields) | set(Shot.model_fields)
-    for absent in ("section", "sections", "bpm", "tempo", "beats", "structure"):
+    for absent in ("bpm", "tempo", "beats", "structure"):
         assert absent not in fields, absent
+    assert "sections" in Project.model_fields
 
 
 def test_expansion_input_names_each_shots_neighbours_without_repeating_their_prompts():
@@ -664,3 +668,69 @@ def test_proposal_for_position_maps_by_proportional_span():
     assert proposal_for_position(30.0, 30.0, 3) == 2  # clamped at the end
     with pytest.raises(TimelineError):
         proposal_for_position(1.0, 30.0, 0)
+
+
+# --- Sections: the Director's marks, and the lyric-block pairing (2026-08-19) --------------
+
+
+def sectioned_project() -> Project:
+    project = Project(name="Sections")
+    project.song = Song(
+        title="S", source="imported", duration=60,
+        lyrics=(
+            "[Verse]\nline one\nline two\n\n[Chorus]\nhook line\n\n"
+            "[Verse]\nsecond verse words\n\n[Outro]\nfade out\n"
+        ),
+    )
+    project.sections = [
+        SongSection(label="Intro", start=0, duration=8),
+        SongSection(label="Verse 1", start=8, duration=16, prompt="at the standing mic"),
+        SongSection(label="Chorus", start=24, duration=12, prompt="on the canopy bed"),
+        SongSection(label="Verse 2", start=36, duration=12),
+        SongSection(label="Outro", start=48, duration=12),
+    ]
+    return project
+
+
+def test_song_section_maps_by_midpoint_and_absence_means_unknown():
+    project = sectioned_project()
+    assert song_section(project, Shot(start=30, duration=6, prompt="x")).label == "Chorus"
+    # A shot straddling a boundary belongs to whichever section owns its midpoint.
+    assert song_section(project, Shot(start=22, duration=6, prompt="x")).label == "Chorus"
+    assert song_section(project, Shot(start=20, duration=6, prompt="x")).label == "Verse 1"
+    # No sections marked: None, never a fabricated boundary.
+    bare = Project(name="Bare")
+    assert song_section(bare, Shot(start=1, duration=4, prompt="x")) is None
+
+
+def test_section_lyrics_pair_by_order_of_appearance_within_a_label_family():
+    """The sheet's tags carry structure but no timing; the sections carry timing but no
+    words; the Nth "Verse *" section takes the Nth [Verse] block. This is the fix for the
+    wrong-verse lipsync the first batch rendered: a chorus shot at 30 s was expanded with
+    the song's opening line."""
+    project = sectioned_project()
+    verse1, chorus, verse2, outro = project.sections[1:]
+    assert section_lyrics(project, verse1) == "line one\nline two"
+    assert section_lyrics(project, chorus) == "hook line"
+    assert section_lyrics(project, verse2) == "second verse words"
+    assert section_lyrics(project, outro) == "fade out"
+    # A section with no matching block answers "" — no words, never a guess.
+    assert section_lyrics(project, project.sections[0]) == ""
+    assert section_lyrics(project, None) == ""
+
+
+def test_the_expansion_payload_carries_the_shots_section_block():
+    project = sectioned_project()
+    project.shots = [Shot(id="shot_c", start=27, duration=6, prompt="Glamour angle")]
+    built = shot_expansion_input(project, project.shots[0])
+    section = built["shot"]["section"]
+    assert section["label"] == "Chorus"
+    assert section["prompt"] == "on the canopy bed"
+    assert section["lyrics"] == "hook line"
+    # 27s into a 24-36s section: a quarter of the way through.
+    assert section["clip_position"] == 0.25
+    # Sectionless project: the key is absent, never empty — absence must not read as a
+    # confident claim.
+    bare = Project(name="Bare", song=project.song)
+    bare.shots = [Shot(id="shot_c", start=27, duration=6, prompt="Glamour angle")]
+    assert "section" not in shot_expansion_input(bare, bare.shots[0])["shot"]

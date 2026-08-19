@@ -66,6 +66,7 @@ from .models import (
     Shot,
     ShotStatus,
     Song,
+    SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
     citations_in_prompt_order,
@@ -1769,6 +1770,20 @@ POPULATE_INSTRUCTION = (
     "camera behaves. Alternate framings and locations per the treatment rather than "
     "repeating one setup."
 )
+
+
+SECTIONS_OVERLAP_REFUSAL = (
+    "Sections may not overlap: {first} ends at {end:.2f}s but {second} starts at "
+    "{start:.2f}s. Adjust the windows so each moment of the song belongs to one section."
+)
+
+
+class SectionListRequest(BaseModel):
+    """The whole section list, replaced as one — the shots-PUT idiom, with the same
+    justification: sections are a small, hand-authored structure and partial edits of a
+    timeline invite gaps nobody chose."""
+
+    sections: list[SongSection]
 
 
 class PopulateTimelineRequest(BaseModel):
@@ -5120,6 +5135,30 @@ def create_app(
             clip_count=len(plan.clips),
         )
 
+    @app.put("/api/projects/{project_id}/sections", response_model=Project)
+    def replace_sections(project_id: str, request: SectionListRequest) -> Project:
+        """The Director's section marks: Intro/Verse/Chorus/Bridge/Outro windows + prompts.
+
+        Sorted by start on write so every reader walks them in time order, refused on
+        overlap because a moment of the song belonging to two sections makes both the
+        shot→section mapping and the lyric-block pairing ambiguous. Gaps are legal — an
+        unmarked stretch simply has no section, and everything downstream treats that as
+        unknown rather than inventing coverage.
+        """
+        project = get_project(project_id)
+        ordered = sorted(request.sections, key=lambda section: section.start)
+        for first, second in zip(ordered, ordered[1:]):
+            if second.start < first.end - 1e-6:
+                raise HTTPException(
+                    status_code=422,
+                    detail=SECTIONS_OVERLAP_REFUSAL.format(
+                        first=first.label, end=first.end,
+                        second=second.label, start=second.start,
+                    ),
+                )
+        project.sections = ordered
+        return store.save(project)
+
     @app.post(
         "/api/projects/{project_id}/timeline/populate",
         response_model=PopulateTimelineResponse,
@@ -5182,6 +5221,17 @@ def create_app(
             count=max(1, round(duration / window_mean)),
             assets=assets,
         )
+        if project.sections:
+            section_map = "; ".join(
+                f"{section.label} {section.start:.1f}-{section.end:.1f}s"
+                + (f" ({section.prompt})" if section.prompt else "")
+                for section in project.sections
+            )
+            instruction += (
+                " The song's sections, marked by the director, are: "
+                f"{section_map}. Shots must respect these boundaries — every shot sits "
+                "inside one section and takes that section's character."
+            )
         context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
         try:
             result = await director.plan(message=instruction, project_context=context)
@@ -5213,11 +5263,38 @@ def create_app(
                 detail="The project changed while the model was planning (a render or a "
                 "protection appeared). Nothing was replaced; try again.",
             )
-        windows = populate_windows(
-            [(shot.start, shot.duration) for shot in proposals],
-            duration,
-            maximum=POPULATE_MAX_WINDOW_SECONDS,
-        )
+        # With sections marked, each section tiles independently so no shot straddles a
+        # boundary — cuts land exactly on the music's own switches, the Director's ask.
+        # Unmarked stretches (before, between, after sections) tile as their own spans so
+        # the plan still covers the whole song and assembly's gap refusal stays silent.
+        # Without sections, the whole song tiles as one span, exactly as before.
+        if project.sections:
+            spans: list[tuple[float, float]] = []
+            cursor = 0.0
+            for section in project.sections:
+                if section.start - cursor > 0.5:
+                    spans.append((cursor, section.start - cursor))
+                spans.append((section.start, section.duration))
+                cursor = section.end
+            if duration - cursor > 0.5:
+                spans.append((cursor, duration - cursor))
+            windows = []
+            for span_start, span_length in spans:
+                inside = [
+                    (shot.start, shot.duration)
+                    for shot in proposals
+                    if span_start <= shot.start < span_start + span_length
+                ]
+                for start, length in populate_windows(
+                    inside, span_length, maximum=POPULATE_MAX_WINDOW_SECONDS
+                ):
+                    windows.append((round(span_start + start, 3), length))
+        else:
+            windows = populate_windows(
+                [(shot.start, shot.duration) for shot in proposals],
+                duration,
+                maximum=POPULATE_MAX_WINDOW_SECONDS,
+            )
         project.shots = [
             Shot(
                 start=start,

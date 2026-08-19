@@ -2013,6 +2013,43 @@ export function multiviewPlan(asset) {
   return { prompt, ready: Boolean(asset.path) };
 }
 
+// Parse the section editor's one-line grammar: "Label 0-8.5; Verse 8.5-33 | at the mic".
+// Each entry is `label start-end` with an optional ` | prompt` tail. Returns
+// {sections, problems}: bad entries are named rather than dropped, because a silently
+// skipped section is a hole in the lyric pairing nobody chose.
+export function parseSectionLine(line) {
+  const sections = [];
+  const problems = [];
+  for (const raw of String(line || "").split(";")) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    const [head, ...promptParts] = entry.split("|");
+    const match = head.trim().match(/^(.+?)\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
+    if (!match) { problems.push(entry); continue; }
+    const start = Number(match[2]);
+    const end = Number(match[3]);
+    if (!(end > start)) { problems.push(entry); continue; }
+    sections.push({
+      label: match[1].trim(),
+      start,
+      duration: Math.round((end - start) * 1000) / 1000,
+      prompt: promptParts.join("|").trim(),
+    });
+  }
+  return { sections, problems };
+}
+
+// The inverse, for pre-filling the editor with what is already marked.
+export function formatSectionLine(sections) {
+  return (sections || [])
+    .map((section) => {
+      const end = Math.round((section.start + section.duration) * 100) / 100;
+      const base = `${section.label} ${section.start}-${end}`;
+      return section.prompt ? `${base} | ${section.prompt}` : base;
+    })
+    .join("; ");
+}
+
 // AI Mod (the Director's stage-3 ask): whether this asset can take a prompted image edit.
 // Any image-kinded asset qualifies — a character, a setting, a prop, a style frame, an
 // already-edited child (edits chain) — and only audio/video media cannot. Same shown/ready
@@ -2318,6 +2355,9 @@ export const api = {
   // route and carries no message: nothing here reaches the Director.
   restoreDocument: (id, document) => request(`/api/projects/${id}/documents/${document}/restore`, { method: "POST" }),
   saveShots: (id, shots) => request(`/api/projects/${id}/shots`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ shots }) }),
+  // The Director's section marks (Intro/Verse/Chorus...), replaced whole like the shot
+  // list and for its reason. The server sorts and refuses overlaps.
+  saveSections: (id, sections) => request(`/api/projects/${id}/sections`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ sections }) }),
   uploadSong: (id, data) => request(`/api/projects/${id}/songs/upload`, { method: "POST", body: data }),
   // Its own route, and it carries only the two context fields: the audio, the duration and the
   // provenance are not editable text, so nothing that could overwrite them is on the wire.

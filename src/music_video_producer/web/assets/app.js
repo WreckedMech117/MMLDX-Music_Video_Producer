@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, formatSectionLine, parseSectionLine, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, assemblyControl, effectiveOffset, latestAssemblyExport, monitorState, takeAudioControl, trimNudgeControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
@@ -725,6 +725,12 @@ function renderTimeline() {
   }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
+  // The SECTIONS track, drawn at last: the Director's own marks, each with its window
+  // and shared prompt. Double-click the track to edit (one-line grammar, parsed by
+  // parseSectionLine, contract-tested).
+  $("#section-track").innerHTML = (state.project?.sections || []).map((section) =>
+    `<span class="section-pill" title="${escapeHtml(section.prompt || section.label)}" style="left:${section.start * state.pixelsPerSecond}px;width:${Math.max(30, section.duration * state.pixelsPerSecond)}px">${escapeHtml(section.label)}</span>`
+  ).join("");
   renderShotInspector();
   // Assistant ProducerBot's controls live in the composer, two panels away, and their state is
   // decided by the shot selection this function owns. Repainted from here because every selection
@@ -2065,6 +2071,26 @@ function bindEvents() {
   $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + half; copy.duration = half; shot.duration = half; state.project.shots.push(copy); saveShotsSilently(); renderTimeline(); });
   $("#zoom-in").addEventListener("click", () => { state.pixelsPerSecond = Math.min(64, state.pixelsPerSecond * 1.25); renderTimeline(); });
   $("#zoom-out").addEventListener("click", () => { state.pixelsPerSecond = Math.max(6, state.pixelsPerSecond / 1.25); renderTimeline(); });
+  $("#section-track").addEventListener("dblclick", async () => {
+    if (!requireProject()) return;
+    const current = formatSectionLine(state.project.sections);
+    const line = window.prompt(
+      "Mark the song's sections. Grammar: Label start-end | shared prompt; separated by semicolons.\nExample: Intro 0-8; Verse 1 8-33 | at the standing mic, kinetic; Chorus 33-55 | on the canopy bed, glamour angles",
+      current,
+    );
+    if (line === null) return;
+    const parsed = parseSectionLine(line);
+    if (parsed.problems.length) {
+      toast(`Could not read: ${parsed.problems.join(" ; ")}`, "error");
+      return;
+    }
+    const projectId = state.project.id;
+    try {
+      const project = await api.saveSections(projectId, parsed.sections);
+      if (state.project?.id === projectId) { state.project = project; renderTimeline(); }
+      toast(`${parsed.sections.length} section(s) marked`);
+    } catch (error) { toast(error.message, "error"); }
+  });
   $("#timeline-canvas").addEventListener("pointerdown", (event) => {
     if (event.target.closest(".shot-clip")) return;
     const rect = $("#timeline-canvas").getBoundingClientRect();

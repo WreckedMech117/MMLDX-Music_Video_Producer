@@ -11310,3 +11310,40 @@ def test_sage_attention_setting_patches_every_attention_node_at_submission(tmp_p
     assert attention and all(
         node["inputs"]["sage_attention"] == "auto" for node in attention
     )
+
+
+def test_sections_route_sorts_refuses_overlap_and_reaches_the_expansion(tmp_path: Path):
+    """The Director's section marks end to end: saved sorted, overlaps refused by name,
+    and the expansion payload reads the section (label, shared prompt, lyric block) for a
+    shot inside one — the fix for the wrong-verse lipsync the first batch rendered."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Sections"))
+    project.song = Song(
+        title="S", source="imported", path="m.mp3", duration=60.0,
+        lyrics="[Verse]\nverse words here\n\n[Chorus]\nchorus hook words\n",
+    )
+    project.shots = [Shot(id="shot_c", start=27, duration=6, prompt="Glamour angle")]
+    store.save(project)
+
+    overlapping = client.put(f"/api/projects/{project.id}/sections", json={"sections": [
+        {"label": "Verse", "start": 0, "duration": 30},
+        {"label": "Chorus", "start": 24, "duration": 20},
+    ]})
+    assert overlapping.status_code == 422
+    assert "may not overlap" in overlapping.json()["detail"]
+
+    saved = client.put(f"/api/projects/{project.id}/sections", json={"sections": [
+        {"label": "Chorus", "start": 24, "duration": 20, "prompt": "on the canopy bed"},
+        {"label": "Verse", "start": 0, "duration": 24, "prompt": "at the mic"},
+    ]})
+    assert saved.status_code == 200
+    labels = [s["label"] for s in saved.json()["sections"]]
+    assert labels == ["Verse", "Chorus"]  # sorted by start on write
+
+    from music_video_producer.timeline import shot_expansion_input
+
+    stored = store.get(project.id)
+    section = shot_expansion_input(stored, stored.shots[0])["shot"]["section"]
+    assert section["label"] == "Chorus"
+    assert section["prompt"] == "on the canopy bed"
+    assert section["lyrics"] == "chorus hook words"

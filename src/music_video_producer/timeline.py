@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
@@ -232,18 +233,73 @@ def build_director_timeline(
     )
 
 
-def song_section(project: Project, shot: Shot) -> str:
-    """The song section a Shot sits in, or "" because nothing in this project produces one.
+def song_section(project: Project, shot: Shot):
+    """The `SongSection` whose window holds this Shot's midpoint, or ``None``.
 
-    FR-26 asks for section boundaries *when analysis exists*. None does: there is no BPM or
-    section field on `Song`, `Project` or any other model, the analyse-structure button is a
-    disabled stub, `#bpm-value` and `#sections-value` are hardcoded "Not analyzed", and
-    `#section-track` is never populated. This is therefore one explicit empty branch with a
-    named home for a future analyser, not a fabricated boundary list — and `expansion_input`
-    omits the key rather than sending "" or "unknown", because an absent value must never
-    reach the model as a confident one.
+    The slot this function held empty for two days is filled the way it predicted: not by
+    an analyser, but by the Director's own marks (`Project.sections`, 2026-08-19). The
+    midpoint decides membership because a shot straddling a boundary belongs to whichever
+    section owns more of it; a later start wins a tie, matching the tiling grid's rule
+    that a boundary belongs to the window it opens. Empty sections still mean unknown --
+    callers omit rather than fabricate.
     """
-    return ""
+    if not project.sections:
+        return None
+    midpoint = shot.start + shot.duration / 2
+    best = None
+    for section in project.sections:
+        if section.start <= midpoint < section.end and (
+            best is None or section.start > best.start
+        ):
+            best = section
+    return best
+
+
+#: The lyric sheet's block opener: `[Verse]`, `[Chorus 2]`, `[Pre-Chorus]`...
+_SHEET_TAG = re.compile(r"^[ \t]*\[([^\]\r\n]+)\][ \t]*$", re.MULTILINE)
+
+
+def lyric_blocks(lyrics: str) -> list[tuple[str, str]]:
+    """The sheet's own structure: ``(tag, block text)`` in order of appearance."""
+    if not lyrics.strip():
+        return []
+    blocks: list[tuple[str, str]] = []
+    matches = list(_SHEET_TAG.finditer(lyrics))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(lyrics)
+        text = lyrics[match.end():end].strip()
+        if text:
+            blocks.append((match.group(1).strip(), text))
+    return blocks
+
+
+def section_lyrics(project: Project, section) -> str:
+    """The lyric block a section sings, paired **by order of appearance**.
+
+    The sheet's tags carry structure but no timing; the Director's sections carry timing
+    but no words. The pairing is positional within a label family: the Nth section whose
+    label starts with a tag's word ("Verse 2" -> `[Verse]`, case-insensitive) takes the
+    Nth such block. A section with no matching block -- an instrumental intro, a label
+    the sheet never uses -- answers "", and the caller says *no words* rather than
+    guessing. This is what ends the wrong-verse lipsync found on the first full render run:
+    the expansion stops inferring a shot's words from a fraction and reads them off the
+    section instead.
+    """
+    if section is None or not project.song or not project.song.lyrics:
+        return ""
+    blocks = lyric_blocks(project.song.lyrics)
+
+    def family(name: str) -> str:
+        return re.split(r"[\s\-_]", name.strip().lower())[0]
+
+    wanted = family(section.label)
+    ordinal = sum(
+        1
+        for other in sorted(project.sections, key=lambda item: item.start)
+        if family(other.label) == wanted and other.start < section.start
+    )
+    matching = [text for tag, text in blocks if family(tag) == wanted]
+    return matching[ordinal] if ordinal < len(matching) else ""
 
 
 def ordered_shots(project: Project) -> list[Shot]:
@@ -609,6 +665,26 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
             }
             for position, citation in enumerate(ordered_citations, start=1)
         ]
+    # The Shot's section, when the Director has marked any (2026-08-19). This is what
+    # replaces guessing a shot's words from `song_fraction`: the section carries its own
+    # label, its shared characteristics, and — paired by order of appearance with the
+    # sheet's own [Tag] blocks — the exact lyric block this window sings. A section with
+    # no matching block says `lyrics: ""` and means it: no words here, write no <d>.
+    section = song_section(project, shot)
+    if section is not None:
+        entry["section"] = {
+            "label": section.label,
+            "prompt": section.prompt,
+            "lyrics": section_lyrics(project, section),
+            # How far into the section this clip sits, 0..1 — the hint that picks which
+            # line(s) of the section's block this clip sings. A block is a few lines over
+            # tens of seconds; a clip is one or two of them, and position chooses which.
+            "clip_position": round(
+                min(1.0, max(0.0, (shot.start - section.start) / section.duration)), 3
+            )
+            if section.duration
+            else 0.0,
+        }
     payload["shot"] = entry
 
     neighbours: dict[str, Any] = {}

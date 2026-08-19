@@ -124,16 +124,29 @@ SINGING_RULES = """About singing, which this model gets wrong in both directions
   instead.
 - If the singing state is unknown, say nothing either way. Do not assume."""
 
-#: Lyrics, and the failure this project already predicted for them.
+#: Lyrics, and the failure this project already predicted for them — and then measured on
+#: the first full batch (2026-08-19): with only the whole sheet and a fraction hint, the
+#: model wrote the song's opening verse line into a shot sitting on the chorus, and the
+#: take lip-synced nonsense against the real song. The section block is the fix: when the
+#: Director has marked sections, `shot.section.lyrics` carries the exact block this window
+#: sings, and the rules below make it the ONLY legal source of sung words.
 LYRIC_RULES = """You may be given the song's lyrics. Read them carefully:
 
-- They are the WHOLE sheet, not this clip's words. Nothing in this project aligns lyrics
-  to time, so which lines fall over this clip is unknown. `song_fraction` tells you roughly
-  how far into the song this clip sits — treat that as a hint about mood and section, never
-  as a claim about which line is being sung here.
-- Use them for imagery, subject and mood. Do NOT transcribe them into the prompt as text.
-- Do not put a lyric inside a dialogue tag unless the shot is marked as singing AND you have
-  been told which words are sung over it. You have not been told that, so do not."""
+- If the shot carries a `section` object, that is this clip's place in the song. Its
+  `label` names the section (verse, chorus, bridge...), its `prompt` describes what this
+  whole section looks like — honor it in every choice — and its `lyrics` are the ONLY
+  words that may be sung in this clip. `clip_position` says how far into the section
+  this clip sits, 0 to 1: for a singing shot, pick the one or two lines of
+  `section.lyrics` nearest that position and have the performer sing exactly those, in a
+  dialogue tag. If `section.lyrics` is empty, no words are sung here: write no dialogue
+  tag with song words, whatever the full sheet suggests.
+- The full sheet, when given, is the WHOLE song, not this clip's words. Use it for
+  imagery, subject and mood only. Do NOT transcribe it into the prompt as text, and never
+  take sung words from it — sung words come from `section.lyrics` alone.
+- With no section object, which lines fall over this clip is unknown. `song_fraction`
+  tells you roughly how far into the song this clip sits — a hint about mood, never a
+  claim about which line is sung. In that case do not put any lyric inside a dialogue
+  tag, even for a singing shot."""
 
 #: Keyframes riding a references shot — the guide's §2.2.2 picture role, restated for the one
 #: shape this specialist meets it in. Appended only when the caller says this shot actually
