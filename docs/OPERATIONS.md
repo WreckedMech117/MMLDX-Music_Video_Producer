@@ -102,6 +102,16 @@ Browser QA note: `tests/e2e_shot_controls.py` now synthesizes a playable take wi
 
 Approval now **snapshots the window** (`approved_start`/`approved_duration`, AD-13): the decision is about this take *in this window*, and assembly refuses a shot whose window moved after approval — re-approve, or restore the window, and it assembles again.
 
+## The Monitor and the over-render margin
+
+The timeline has a **program viewer**: the Monitor above the transport plays the shot under the playhead against the master song. The master audio element is the clock; the video is a muted view of it — the take's own sampler audio stays audible in the per-shot inspector player, which is where its diagnostic value lives ("voices but no phonetics" found a real bug once). Gaps and unrendered shots show a named placeholder, never a stale frame.
+
+Every shot take is now rendered **at least half a second longer than its window** (the Director's 2026-08-19 ruling — "do not generate a clip to exact or lesser length than the time it was given"): `duration + 0.5 s`, snapped up the 17k+5 grid, so a 3.75 s window renders 107 frames (4.458 s), never 90 again. For song-audio shots the conditioning window extends with the picture — up to a **quarter-second lead** ahead of the window when the song has room — so the whole take is performed against real song seconds and editable room exists at either end. The lead is recorded on the shot at submission (`latest_take_lead`); takes rendered before the margin correctly read 0.
+
+**Fine-tuning**: the inspector's *Trim nudge* control slides which slice of the take fills the window, in frame steps, floored at the recorded lead. The Monitor previews the exact slice assembly will cut — `lead + nudge` is one rule on both sides, contract-tested. The nudge stays editable on an approved shot by design: it selects a slice of the approved file; the file itself stays immovable. A nudge that runs the cut off the end of the take is refused at assembly with the take's measured length in the sentence.
+
+Two footnotes: the restore-song-audio stage still windows by the bare shot window, so on a post-margin take its output misses the lead — a deliberate Ask-First follow-up now that the Monitor plays takes against the master live. And `extend` (VideoExtender) likely only extends forward, per the Director; it is recorded, not employed.
+
 ## Assemble the video
 
 `POST /api/projects/{id}/assemble` — and the **Assembly bar at the foot of the timeline** — is the finishing lane's main act (FR-22): every approved take, trimmed to its shot's window, joined in shot order, with the **master song as the sole audio track** (shot audio is dropped at assembly; the Director's 2026-08-16 ruling). It runs **locally in ffmpeg, never on ComfyUI** (AD-9) — no GPU time, no queue entry, an idle ComfyUI throughout — and answers synchronously in seconds. `ffmpeg`/`ffprobe` must be on PATH.
