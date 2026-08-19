@@ -482,7 +482,10 @@ def reference_prompt(
     if (
         shot.use_song_audio
         and shot.singing == "singing"
-        and "sing" not in shot.prompt.lower()
+        # Word boundary, not substring: "closing image" is not singing language, and the
+        # substring form silently denied the clause to any singing intent containing
+        # "closing"/"using" (found live, 2026-08-19).
+        and not re.search(r"\bsing", shot.prompt.lower())
         and not (vocal_overlap is not None and vocal_overlap < MIN_SINGING_VOCAL_SECONDS)
     ):
         clause = SONG_AUDIO_SINGS_CLAUSE if shot.citations else SONG_AUDIO_SINGS_CLAUSE_BARE
