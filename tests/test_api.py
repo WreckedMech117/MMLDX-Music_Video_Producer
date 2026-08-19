@@ -11275,3 +11275,36 @@ def test_expansion_refuses_a_route_approved_shot(tmp_path: Path):
     assert "a render or a take already depends on the prompt" in notice
     assert shot_id in notice.split("already depends on the prompt")[1]
     assert len(comfy.prompts) == 1
+
+
+def test_sage_attention_setting_patches_every_attention_node_at_submission(tmp_path: Path):
+    """MVP_SAGE_ATTENTION's one choke point: configured, every submitted H3 payload's
+    PathchSageAttentionKJ carries the configured kernel; unset (the default), the payload
+    is byte-identical to the adapters' evidence value (`disabled`) — every other test in
+    this file runs unset, so the whole suite is the byte-identity half."""
+    settings = Settings(
+        data_root=tmp_path, comfy_root=tmp_path / "comfy", sage_attention="auto"
+    )
+    store = ProjectStore(tmp_path)
+    comfy = FakeComfy()
+    app = create_app(settings=settings, store=store, comfy=comfy, director=FakeDirector())
+    client = TestClient(app)
+    project = store.create(Project(name="Sage"))
+    media = store.media_dir(project.id)
+    (media / "lead.png").write_bytes(b"png")
+    project.assets = [Asset(id="asset_sage", name="Lead", kind="character", path="media/lead.png")]
+    # A references shot: the text-only Director graph carries no attention node,
+    # so the patch is asserted where the node exists (reference/keyframe/edit graphs).
+    project.shots = [
+        Shot(id="shot_sage", start=0, duration=4, prompt="p", asset_ids=["asset_sage"], status="ready")
+    ]
+    store.save(project)
+
+    assert submit_h3(client, project.id, "shot_sage").status_code == 202
+    attention = [
+        node for node in comfy.prompts[-1].values()
+        if node["class_type"] == "PathchSageAttentionKJ"
+    ]
+    assert attention and all(
+        node["inputs"]["sage_attention"] == "auto" for node in attention
+    )

@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     llm_eject_timeout: float = Field(default=20.0, gt=0)
     request_timeout: float = Field(default=30.0, gt=0)
     max_upload_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
+    #: SageAttention mode for every H3 submission carrying a `PathchSageAttentionKJ` node.
+    #: Blank means "leave the adapters' evidence value alone" (the exports carry
+    #: `disabled` because their creator launches ComfyUI with `--use-sage-attention`);
+    #: any other value is patched onto the node at submission by `create_app`'s one
+    #: choke point. "auto" is the sensible opt-in; the exact kernels are the node's own
+    #: options. Requires the `sageattention` package inside ComfyUI's python — installed
+    #: 2026-08-19 (woct0rdho 2.2.0+cu128torch2.7.1, kernel-probed on the RTX 5090).
+    sage_attention: str = ""
 
     @property
     def workflow_root(self) -> Path:

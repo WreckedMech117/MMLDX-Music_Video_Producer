@@ -2714,6 +2714,24 @@ def create_app(
         timeout=settings.request_timeout,
         before_submit=ejector.eject,
     )
+    # The SageAttention choke point. Every H3 adapter emits a `PathchSageAttentionKJ`
+    # node with the exports' own `disabled` (their creator launches ComfyUI with
+    # `--use-sage-attention`; this installation does not). When the Director opts in via
+    # MVP_SAGE_ATTENTION, the value is patched here — one wrapper over `comfy.submit`, so
+    # every current and future adapter is covered and no builder or digest moves. Blank
+    # (the default) leaves every payload byte-identical to the evidence.
+    if settings.sage_attention:
+        unpatched_submit = comfy.submit
+
+        async def submit_with_sage(payload, client_id=None):
+            for node in payload.values():
+                if node.get("class_type") == "PathchSageAttentionKJ":
+                    node["inputs"]["sage_attention"] = settings.sage_attention
+            if client_id is None:
+                return await unpatched_submit(payload)
+            return await unpatched_submit(payload, client_id=client_id)
+
+        comfy.submit = submit_with_sage
     catalog = WorkflowCatalog(settings.workflow_root)
 
     app = FastAPI(
