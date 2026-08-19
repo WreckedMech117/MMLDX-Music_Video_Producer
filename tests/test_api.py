@@ -3794,13 +3794,15 @@ def test_populate_timeline_lays_out_the_whole_song_from_the_models_shape(tmp_pat
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["proposed"] == 3
-    assert body["created"] >= 4  # 60 s at <=15 s per shot
+    assert body["created"] >= 10  # 60 s at <=6 s per window (the enforced speed ceiling)
     saved = store.get(project.id)
     assert all(shot.id != "shot_old" for shot in saved.shots)
     cursor = 0.0
     for shot in sorted(saved.shots, key=lambda item: item.start):
         assert shot.start == pytest.approx(cursor, abs=1e-6)
-        assert 4.0 - 1e-9 <= shot.duration <= 15.0 + 1e-9
+        # POPULATE_MAX_WINDOW_SECONDS: the enforced speed ceiling, tighter than H3's
+        # 15 s legality — 9 s windows are the measured 2.2-hour cliff.
+        assert 4.0 - 1e-9 <= shot.duration <= 6.0 + 1e-9
         assert shot.status == "draft"
         assert shot.prompt
         assert shot.seed > 0  # distinct seeds; a shared seed correlates NaN failures

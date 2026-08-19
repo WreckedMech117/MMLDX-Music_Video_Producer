@@ -1747,6 +1747,13 @@ POPULATE_NO_PLAN_REFUSAL = (
 #: measured on this card as the difference between minutes and hours per shot.
 POPULATE_TARGET_WINDOW_SECONDS = 5.2
 
+#: The *enforced* ceiling the tiling repair applies, tighter than H3's 15 s legality.
+#: Guidance alone is not enough: on the first 5.2 s-target run the local model simply
+#: echoed the previous plan's 9 s windows out of its own context, and 9 s windows are
+#: the measured 2.2-hour cliff. The bound is what the target means; a Director who
+#: wants longer shots edits them deliberately, one at a time, in the timeline.
+POPULATE_MAX_WINDOW_SECONDS = 6.0
+
 #: What the model is asked for. The count guidance and the asset roster matter: a local
 #: model told nothing about length writes five shots for a three-minute song, and one
 #: told nothing about the library invents characters the project does not hold.
@@ -5207,7 +5214,9 @@ def create_app(
                 "protection appeared). Nothing was replaced; try again.",
             )
         windows = populate_windows(
-            [(shot.start, shot.duration) for shot in proposals], duration
+            [(shot.start, shot.duration) for shot in proposals],
+            duration,
+            maximum=POPULATE_MAX_WINDOW_SECONDS,
         )
         project.shots = [
             Shot(
