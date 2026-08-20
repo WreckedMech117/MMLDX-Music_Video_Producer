@@ -2658,6 +2658,21 @@ SELECT_TAKE_NOT_VIDEO = (
 )
 SELECT_TAKE_EMPTY = "Send output (one of the shot's takes) or asset_id (a video asset)."
 
+DELETE_PROJECT_CONFIRM = (
+    "This deletes {name!r} — its manifest, its {shots} shot(s) and its media directory — "
+    "permanently. Takes already rendered into ComfyUI's output tree stay on disk. Send "
+    "confirm_delete=true to proceed."
+)
+DELETE_ASSET_CITED = (
+    "{name} is cited by {shots}, and deleting it would leave those citations dangling — "
+    "the render would refuse them one at a time. Remove it from those shots first."
+)
+CANCEL_JOB_SETTLED = "This job is already {status}; there is nothing running to cancel."
+CANCEL_JOB_NOTE = (
+    "Cancelled by the Director before it finished. Nothing was produced; render again "
+    "re-opens the shot."
+)
+
 
 class AlignLyricsRequest(BaseModel):
     #: Re-run Whisper even when words are already stored — for a replaced or re-mastered file.
@@ -3491,6 +3506,94 @@ def create_app(
             )
         setattr(project.song, slot, getattr(project.song, field))
         setattr(project.song, field, previous)
+        return store.save(project)
+
+    @app.delete("/api/projects/{project_id}/jobs/{job_id}", response_model=Project)
+    async def cancel_job(project_id: str, job_id: str) -> Project:
+        """Cancel one open render job: dequeue (and interrupt, when running) on ComfyUI,
+        settle the record, release the shot.
+
+        The gap the analyst named (2026-08-20): a mistaken Generate All could only be
+        cleared from ComfyUI's own UI — and this same night proved what THAT leaves
+        behind: pulled queue entries orphan their job records, which is exactly the
+        stuck-"queued" state the reconciler's missing-ticks rule now cleans up. This
+        route does both halves in one act, so nothing is left for the strike counter.
+        """
+        project = get_project(project_id)
+        job = next((item for item in project.jobs if item.id == job_id), None)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status in TERMINAL_JOB_STATUSES:
+            raise HTTPException(
+                status_code=422, detail=CANCEL_JOB_SETTLED.format(status=job.status)
+            )
+        if job.prompt_id:
+            try:
+                await comfy.cancel(job.prompt_id)
+            except ComfyError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+        job.status = "cancelled"
+        job.error = CANCEL_JOB_NOTE
+        if job.kind == "h3":
+            shot = next((item for item in project.shots if item.id == job.target_id), None)
+            if shot and shot.status in ("queued", "running"):
+                shot.status = "error"
+        return store.save(project)
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str, confirm_delete: bool = False) -> dict[str, str]:
+        """Remove one project — manifest and media directory — for good.
+
+        The gap the analyst named (2026-08-20): a night of experiments accumulates
+        projects the switcher can never shed; eighteen had to be deleted by hand at the
+        store level the same night. The confirmation flag is the song-replacement idiom:
+        the first call without it is refused with the sentence naming what will be lost,
+        so no client can delete by accident of a stray request.
+
+        Takes rendered into ComfyUI's output tree are NOT touched: they live outside the
+        project directory, other projects may reference study copies of them, and disk is
+        the Director's to prune. Only the manifest and the project's own media go.
+        """
+        project = get_project(project_id)  # 404 before any confirmation talk
+        if not confirm_delete:
+            raise HTTPException(
+                status_code=409,
+                detail=DELETE_PROJECT_CONFIRM.format(
+                    name=project.name, shots=len(project.shots)
+                ),
+            )
+        shutil.rmtree(store.project_dir(project_id))
+        return {"deleted": project_id}
+
+    @app.delete("/api/projects/{project_id}/assets/{asset_id}", response_model=Project)
+    def delete_asset(project_id: str, asset_id: str) -> Project:
+        """Remove one asset from the library — refused by name while any shot cites it.
+
+        Two dialogs promised this ("keep, delete, or AI Mod"; "delete it to reject") and
+        no route existed (the analyst's finding, 2026-08-20). The citation refusal names
+        the shots because a dangling citation is the render-time 422 this route would
+        otherwise be manufacturing. An uploaded asset's file goes with it; a generated
+        asset's file stays in ComfyUI's output tree, same rule as project deletion.
+        """
+        project = get_project(project_id)
+        asset = next((item for item in project.assets if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        citing = [
+            shot_label(project, shot)
+            for shot in ordered_shots(project)
+            if any(citation.asset_id == asset_id for citation in shot.citations)
+        ]
+        if citing:
+            raise HTTPException(
+                status_code=422,
+                detail=DELETE_ASSET_CITED.format(name=asset.name, shots=", ".join(citing)),
+            )
+        if asset.source == "upload" and asset.path:
+            target = store.project_dir(project_id) / asset.path
+            if target.is_file():
+                target.unlink()
+        project.assets = [item for item in project.assets if item.id != asset_id]
         return store.save(project)
 
     @app.delete("/api/projects/{project_id}/song", response_model=Project)

@@ -267,10 +267,19 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .section-track { min-height: 42px; }
 .waveform-track { min-height: 80px; }
 #timeline-waveform { display: block; width: 100%; height: 78px; }
+/* Where the track actually sings, striped along the bottom of the master row. */
+#vocal-band { position: absolute; left: 0; right: 0; bottom: 0; height: 5px; pointer-events: none; }
+.vocal-span { position: absolute; top: 0; height: 100%; background: #d4f75e66; border-radius: 2px; }
+#master-volume { width: 74px; accent-color: var(--acid); }
 .shots-track { min-height: 110px; }
 .refs-track { min-height: 52px; }
 .takes-strip { display: grid; gap: 5px; margin: 8px 0; padding: 9px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
 .clips-heading { margin: 16px 2px 8px; font: 11px Consolas, monospace; letter-spacing: .08em; color: var(--muted); }
+.batch-progress { padding: 8px 12px; margin-bottom: 6px; border: 1px solid var(--line-strong); border-left: 3px solid #4aa3c7; border-radius: var(--radius); font: 11px Consolas, monospace; color: var(--ink); background: var(--surface-0); }
+.job-row.linked { cursor: pointer; }
+.job-row.linked:hover { background: #ffffff0a; }
+.job-cancel { flex: none; width: 22px; height: 22px; border: 1px solid var(--line-strong); border-radius: 3px; background: transparent; color: var(--muted); cursor: pointer; }
+.job-cancel:hover { color: var(--red, #c75454); border-color: var(--red-edge, #7a3a3a); }
 .clips-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
 .clip-card { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
 .clip-card video { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; }

@@ -2379,6 +2379,11 @@ export const api = {
   // One pointer moves: `output` switches among the shot's own takes (provenance is its
   // job history), `asset_id` attaches a video asset as the shot's clip.
   selectTake: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/select-take`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // Deletion, each with its own server-side guard: the project asks for its confirm flag,
+  // the asset refuses while cited, the job settles its record as it cancels on ComfyUI.
+  deleteProject: (id) => request(`/api/projects/${id}?confirm_delete=true`, { method: "DELETE" }),
+  deleteAsset: (projectId, assetId) => request(`/api/projects/${projectId}/assets/${assetId}`, { method: "DELETE" }),
+  cancelJob: (projectId, jobId) => request(`/api/projects/${projectId}/jobs/${jobId}`, { method: "DELETE" }),
   uploadAsset: (id, data) => request(`/api/projects/${id}/assets/upload`, { method: "POST", body: data }),
   generateMusic: (id, body) => request(`/api/projects/${id}/generate/music`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateSongPlanner: (id, body) => request(`/api/projects/${id}/generate/songplanner`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

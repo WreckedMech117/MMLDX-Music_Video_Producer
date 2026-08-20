@@ -146,6 +146,10 @@ class FakeComfy:
         self.queue_error = False
         self.queue_calls = 0
         self.history_calls = 0
+        self.cancelled = []
+
+    async def cancel(self, prompt_id):
+        self.cancelled.append(prompt_id)
 
     async def health(self):
         return {"online": True, "url": "http://fake"}
@@ -9837,6 +9841,68 @@ def test_an_expansion_of_only_whitespace_is_treated_as_absent():
     blank = "   " + "\n" + "  "
     shot = Shot(start=0.0, duration=3.75, prompt="Wide on Lucy.", h3_prompt=blank)
     assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")
+
+
+def test_a_project_deletes_only_with_its_confirmation_and_takes_survive(tmp_path: Path):
+    """The switcher can finally shed a night of experiments (analyst finding, 2026-08-20).
+    The first call is the sentence naming the loss; only the flag deletes; rendered takes
+    live outside the project directory and are untouched by design."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Disposable"))
+    unconfirmed = client.delete(f"/api/projects/{project.id}")
+    assert unconfirmed.status_code == 409
+    assert "confirm_delete" in unconfirmed.json()["detail"]
+    assert store.manifest_path(project.id).is_file()
+    deleted = client.delete(f"/api/projects/{project.id}?confirm_delete=true")
+    assert deleted.status_code == 200
+    assert not store.project_dir(project.id).exists()
+    assert client.get(f"/api/projects/{project.id}").status_code == 404
+
+
+def test_an_asset_deletes_unless_a_shot_cites_it(tmp_path: Path):
+    """Two dialogs promised deletion and no route existed. The citation refusal names the
+    shots, because a dangling citation is the render-time 422 this would manufacture."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Prunable"))
+    (store.project_dir(project.id) / "media" / "assets").mkdir(parents=True)
+    (store.project_dir(project.id) / "media" / "assets" / "w.png").write_bytes(b"png")
+    project.assets = [Asset(id="asset_w", name="Wolf", kind="image",
+                            path="media/assets/w.png", source="upload")]
+    project.shots = [Shot(id="shot_c", start=0, duration=4, prompt="Wolf B-roll",
+                          citations=[AssetCitation(asset_id="asset_w", role="reference", order=0)])]
+    store.save(project)
+    cited = client.delete(f"/api/projects/{project.id}/assets/asset_w")
+    assert cited.status_code == 422
+    assert "SHOT 01" in cited.json()["detail"]
+    fresh = store.get(project.id)
+    # Both projections: the model reconciles `citations` back from a lingering `asset_ids`.
+    fresh.shots[0].citations = []
+    fresh.shots[0].asset_ids = []
+    store.save(fresh)
+    freed = client.delete(f"/api/projects/{project.id}/assets/asset_w")
+    assert freed.status_code == 200
+    assert freed.json()["assets"] == []
+    assert not (store.project_dir(project.id) / "media" / "assets" / "w.png").exists()
+
+
+def test_cancelling_a_job_settles_it_and_releases_the_shot(tmp_path: Path):
+    """Both halves in one act — dequeue on ComfyUI AND settle the record — because this
+    same night proved what a queue-only cancel leaves behind: a job stuck 'queued' until
+    the reconciler's strike counter cleans it up."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Cancellable"))
+    project.shots = [Shot(id="shot_r", start=0, duration=4, prompt="Wide", status="queued")]
+    project.jobs = [RenderJob(id="job_r", kind="h3", target_id="shot_r",
+                              status="queued", prompt_id="prompt-r")]
+    store.save(project)
+    cancelled = client.delete(f"/api/projects/{project.id}/jobs/job_r")
+    assert cancelled.status_code == 200
+    assert comfy.cancelled == ["prompt-r"]
+    body = cancelled.json()
+    assert body["jobs"][0]["status"] == "cancelled"
+    assert body["shots"][0]["status"] == "error"
+    settled = client.delete(f"/api/projects/{project.id}/jobs/job_r")
+    assert settled.status_code == 422
 
 
 def test_select_take_switches_takes_and_attaches_video_assets(tmp_path: Path):

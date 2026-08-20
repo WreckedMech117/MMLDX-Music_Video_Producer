@@ -143,11 +143,34 @@ function renderVramEject() {
   note.title = vramEjectTitle(status);
 }
 
+// What survives a reload: the working project, panel, zoom and shot. Nothing here is
+// authority over anything — every value is re-validated against the loaded project — so
+// stale storage costs a default, never a wrong state. (Analyst finding, 2026-08-20:
+// every reload landed on the Song panel of the first project at 100% zoom.)
+const SESSION_KEY = "mvp-session";
+function persistSession() {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      projectId: state.project?.id || "",
+      panel: state.activePanel,
+      pixelsPerSecond: state.pixelsPerSecond,
+      selectedShotId: state.selectedShotId,
+      volume: $("#master-audio")?.volume ?? 1,
+    }));
+  } catch { /* storage may be denied; the app works without it */ }
+}
+function restoreSession() {
+  try { return JSON.parse(localStorage.getItem(SESSION_KEY) || "{}"); }
+  catch { return {}; }
+}
+
 async function loadProjects(selectId = null) {
   state.projects = await api.projects();
   const select = $("#project-select");
   select.innerHTML = `<option value="">No project</option>${state.projects.map((project) => `<option value="${project.id}">${escapeHtml(project.name)}</option>`).join("")}`;
-  const next = selectId || state.project?.id || state.projects[0]?.id;
+  const remembered = restoreSession().projectId;
+  const next = selectId || state.project?.id
+    || (state.projects.some((project) => project.id === remembered) ? remembered : state.projects[0]?.id);
   if (next) {
     select.value = next;
     await loadProject(next);
@@ -406,10 +429,24 @@ function songAudioUrl(song = state.project?.song) {
   return comfyOutputUrl(comfyUrl, song.path);
 }
 
+// One decode per song file, not one per reload: loadProject runs after every queue action
+// and refresh, and re-fetching + re-decoding the whole track each time blanked both
+// waveforms over and over through a working night (analyst finding, 2026-08-20). The key
+// carries the path, so a replaced song decodes fresh.
+let decodedSongKey = "";
+let decodedSongBuffer = null;
+
 async function loadPersistedWaveform(projectId) {
   const url = songAudioUrl();
   const revision = ++waveformLoadRevision;
   if (!url) return;
+  const key = `${projectId}:${state.project?.song?.path || ""}`;
+  if (key === decodedSongKey && decodedSongBuffer) {
+    state.audioBuffer = decodedSongBuffer;
+    renderSong();
+    renderTimeline();
+    return;
+  }
   try {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -417,6 +454,8 @@ async function loadPersistedWaveform(projectId) {
     const buffer = await context.decodeAudioData(await response.arrayBuffer());
     await context.close();
     if (revision !== waveformLoadRevision || state.project?.id !== projectId) return;
+    decodedSongKey = key;
+    decodedSongBuffer = buffer;
     state.audioBuffer = buffer;
     renderSong();
     renderTimeline();
@@ -678,8 +717,17 @@ export function renderAssetInspector() {
   // AI Mod, decided by `aiModPlan` (contract-tested) exactly as promotion is decided by
   // `multiviewPlan`: shown for anything image-kinded, shut until the image exists.
   const mod = aiModPlan(asset);
-  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button>`;
+  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button><button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>`;
   $("#attach-asset")?.addEventListener("click", attachSelectedAsset);
+  $("#delete-asset")?.addEventListener("click", async () => {
+    if (!window.confirm(`Delete ${asset.name} from the library?`)) return;
+    try {
+      state.project = await api.deleteAsset(state.project.id, asset.id);
+      state.selectedAssetId = null;
+      renderAssets();
+      toast(`${asset.name} deleted`);
+    } catch (error) { toast(error.message, "error"); }
+  });
   $("#create-multiview")?.addEventListener("click", createMultiview);
   $("#ai-mod-asset")?.addEventListener("click", aiModAsset);
   $("#analyze-asset")?.addEventListener("click", async () => {
@@ -868,6 +916,15 @@ function renderTimeline() {
   // only question is whether this plan has any shots -- which is a thing this function owns.
   syncExpansionControls();
   if (state.audioBuffer) drawWaveform($("#timeline-waveform"), state.audioBuffer, "#6f7d3d");
+  // The measured voice map, striped over the master row: where the track actually sings
+  // (Whisper word timestamps, merged) — the Director's planning fact for "which Shots
+  // have words, when the cuts should happen" (2026-08-20). Unmeasured songs draw nothing.
+  const vocalBand = $("#vocal-band");
+  if (vocalBand) {
+    vocalBand.innerHTML = (state.project?.song?.vocal_spans || []).map(([from, to]) =>
+      `<span class="vocal-span" style="left:${from * state.pixelsPerSecond}px;width:${Math.max(2, (to - from) * state.pixelsPerSecond)}px"></span>`
+    ).join("");
+  }
   renderAssembly();
   updateTimelinePlayhead();
 }
@@ -1613,12 +1670,29 @@ function renderJobs() {
   const target = (job) => job.kind === "h3" && job.target_id
     ? shotLabel(state.project, job.target_id)
     : job.target_id || "—";
-  list.innerHTML = [...jobs].reverse().map((job) => `<div class="job-row ${job.kind === "h3" && job.target_id ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${job.kind === "h3" ? escapeHtml(job.target_id || "") : ""}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(target(job))}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span></div>`).join("");
+  const open = (job) => job.status === "queued" || job.status === "running";
+  // Batch progress, one line: the newest batch's done/open counts. Hours of bare
+  // "queued/running" rows carried no sense of position (analyst finding, 2026-08-20).
+  const newestBatch = [...jobs].reverse().find((job) => job.batch_id)?.batch_id;
+  const batchJobs = newestBatch ? jobs.filter((job) => job.batch_id === newestBatch) : [];
+  const remaining = batchJobs.filter(open).length;
+  const progress = remaining
+    ? `<div class="batch-progress">Batch: ${batchJobs.length - remaining} of ${batchJobs.length} settled · ${remaining} to go (~${Math.round(remaining * 2.7)} min on turbo)</div>`
+    : "";
+  list.innerHTML = progress + [...jobs].reverse().map((job) => `<div class="job-row ${job.kind === "h3" && job.target_id ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${job.kind === "h3" ? escapeHtml(job.target_id || "") : ""}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(target(job))}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span>${open(job) ? `<button class="job-cancel" data-job-id="${job.id}" title="Cancel this render: dequeued (interrupted when running) on ComfyUI, the job settled, the shot released.">×</button>` : ""}</div>`).join("");
   $$(".job-row.linked", list).forEach((row) => row.addEventListener("click", () => {
     state.selectedShotId = row.dataset.shotId;
     state.selectedSectionId = null;
     document.querySelector('[data-panel="timeline"]')?.click();
     renderTimeline();
+  }));
+  $$(".job-cancel", list).forEach((button) => button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      state.project = await api.cancelJob(state.project.id, button.dataset.jobId);
+      renderJobs(); renderTimeline();
+      toast("Render cancelled; the shot is re-openable");
+    } catch (error) { toast(error.message, "error"); }
   }));
 }
 
@@ -1971,6 +2045,7 @@ function attachSelectedAsset() {
 function bindEvents() {
   $$(".rail-item").forEach((button) => button.addEventListener("click", () => {
     state.activePanel = button.dataset.panel;
+    persistSession();
     $$(".rail-item").forEach((item) => item.classList.toggle("active", item === button));
     $$(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === `panel-${state.activePanel}`));
     if (state.activePanel === "timeline") requestAnimationFrame(renderTimeline);
@@ -1988,6 +2063,24 @@ function bindEvents() {
     catch (error) { event.target.value = previousId; toast(error.message, "error"); }
   });
   $("#new-project").addEventListener("click", () => $("#project-dialog").showModal());
+  $("#delete-project")?.addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const name = state.project.name;
+    // Type-the-name confirmation: a project is a whole production, and the browser's
+    // OK button is too cheap a gate for it. Rendered takes stay on disk either way.
+    const typed = window.prompt(
+      `Delete "${name}" permanently?\nIts manifest, shots and media directory go; takes already rendered stay on disk.\n\nType the project name to confirm:`,
+    );
+    if (typed === null) return;
+    if (typed.trim() !== name) return toast("Name did not match — nothing was deleted.", "error");
+    try {
+      await api.deleteProject(state.project.id);
+      state.project = null;
+      state.audioBuffer = null;
+      await loadProjects();
+      toast(`"${name}" deleted`);
+    } catch (error) { toast(error.message, "error"); }
+  });
   $("#project-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -2458,6 +2551,11 @@ function bindEvents() {
     seekMasterAudio(((event.clientX - rect.left) / rect.width) * duration);
   });
   $("#global-play").addEventListener("click", toggleMasterAudio);
+  $("#master-volume")?.addEventListener("input", (event) => {
+    const master = $("#master-audio");
+    if (master) master.volume = Number(event.target.value);
+    persistSession();
+  });
   // The workspace's first keyboard: transport and shot-stepping, guarded off every
   // editable element so typing a prompt never plays the song (analyst finding,
   // 2026-08-20). Space = play/pause, ←/→ = one frame, Shift+←/→ = one second,
@@ -2622,8 +2720,18 @@ async function refreshJobs() {
 
 async function init() {
   bindEvents();
+  const session = restoreSession();
+  if (Number.isFinite(session.pixelsPerSecond)) state.pixelsPerSecond = Math.min(64, Math.max(6, session.pixelsPerSecond));
   await Promise.all([loadHealth(), loadVramEject(), api.workflows().catch(() => [])]);
   try { await loadProjects(); } catch (error) { toast(error.message, "error"); }
+  if (session.panel) document.querySelector(`[data-panel="${session.panel}"]`)?.click();
+  if (session.selectedShotId && state.project?.shots.some((shot) => shot.id === session.selectedShotId)) {
+    state.selectedShotId = session.selectedShotId;
+    renderTimeline();
+  }
+  const master = $("#master-audio");
+  if (master && Number.isFinite(session.volume)) master.volume = Math.min(1, Math.max(0, session.volume));
+  setInterval(persistSession, 5000);
 }
 
 init();

@@ -142,6 +142,22 @@ class ComfyClient:
     async def object_info(self) -> dict[str, Any]:
         return self._json(await self._request("GET", "/object_info"))
 
+    async def cancel(self, prompt_id: str) -> None:
+        """Take one prompt out of ComfyUI's hands: dequeue it, and interrupt it when it
+        is the one running. Idempotent — cancelling a prompt ComfyUI no longer knows is a
+        no-op, because the caller's job record is what actually settles."""
+        payload = self._json(await self._request("GET", "/queue"))
+        running = any(
+            part == prompt_id
+            for item in payload.get("queue_running", [])
+            if isinstance(item, list)
+            for part in item
+            if isinstance(part, str)
+        )
+        await self._request("POST", "/queue", json={"delete": [prompt_id]})
+        if running:
+            await self._request("POST", "/interrupt")
+
     async def history(self, prompt_id: str) -> HistoryResult:
         payload = self._json(await self._request("GET", f"/history/{quote(prompt_id)}"))
         entry = payload.get(prompt_id)

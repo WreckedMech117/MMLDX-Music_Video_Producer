@@ -19,6 +19,7 @@
         <label class="sr-only" for="project-select">Current project</label>
         <select id="project-select"><option value="">No project</option></select>
         <button class="icon-button" id="new-project" title="New project" aria-label="New project">＋</button>
+        <button class="icon-button" id="delete-project" title="Delete this project (asks twice; rendered takes stay on disk)" aria-label="Delete project">🗑</button>
       </div>
       <div class="transport-mini" aria-label="Global transport">
         <button class="icon-button" id="jump-start" title="Jump to start" disabled>│◀</button>
@@ -299,12 +300,12 @@
             </div>
             <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><!-- The two line mutes from the Director's workflow: audition controls, session-only,
               never persisted. Muting the song silences the master element without stopping it,
-              so the playhead keeps running. --><button id="mute-song" title="Mute the audio line — the master song. The playhead keeps running.">♪ song</button><button id="mute-video" title="Mute the video line — the Monitor blanks; audio is untouched.">▣ video</button><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
+              so the playhead keeps running. --><button id="mute-song" title="Mute the audio line — the master song. The playhead keeps running.">♪ song</button><button id="mute-video" title="Mute the video line — the Monitor blanks; audio is untouched.">▣ video</button><input type="range" id="master-volume" min="0" max="1" step="0.05" value="1" title="Master song volume"><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
             <div class="timeline-scroll" id="timeline-scroll">
               <div class="timeline-canvas" id="timeline-canvas">
                 <div class="timeline-ruler" id="timeline-ruler"></div>
                 <div class="track section-track"><div class="track-label">SECTIONS</div><div class="track-content" id="section-track"></div></div>
-                <div class="track waveform-track"><div class="track-label">MASTER</div><div class="track-content"><canvas id="timeline-waveform" height="78"></canvas></div></div>
+                <div class="track waveform-track"><div class="track-label">MASTER</div><div class="track-content"><canvas id="timeline-waveform" height="78"></canvas><div id="vocal-band" title="Measured voice activity (Whisper) — where the track actually sings"></div></div></div>
                 <div class="track shots-track"><div class="track-label">SHOTS</div><div class="track-content" id="shots-track"></div></div>
                 <div class="track refs-track"><div class="track-label">REFERENCES</div><div class="track-content" id="refs-track"></div></div>
                 <div class="timeline-playhead" id="timeline-playhead"></div>
