@@ -779,13 +779,13 @@ def test_lyric_blocks_align_to_transcribed_words_and_refrains_stay_home():
     )
     words = []
     clock = 10.0
-    for text in "I keep running through the night chasing every fading light".split():
+    for text in ["I", "keep", "running", "through", "the", "night", "chasing", "every", "fading", "light"]:
         words.append((text, clock, clock + 0.4)); clock += 0.5
     clock = 30.0  # instrumental gap
-    for text in "lick it hard light me up right now come do that wicked deed".split():
+    for text in ["lick", "it", "hard", "light", "me", "up", "right", "now", "come", "do", "that", "wicked", "deed"]:
         words.append((text, clock, clock + 0.4)); clock += 0.5
     clock = 60.0  # long instrumental bridge, then the identical outro refrain
-    for text in "lick it hard lap it up right now come do that wicked deed".split():
+    for text in ["lick", "it", "hard", "lap", "it", "up", "right", "now", "come", "do", "that", "wicked", "deed"]:
         words.append((text, clock, clock + 0.4)); clock += 0.5
 
     aligned = align_lyric_blocks(sheet, words)

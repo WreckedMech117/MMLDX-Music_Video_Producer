@@ -9846,10 +9846,10 @@ def test_align_lyrics_hears_the_track_once_and_fills_the_sections(tmp_path: Path
     with no [Tag] blocks is a remedy sentence, not a guess."""
     words = []
     clock = 8.0
-    for text in "I keep running through the night chasing every fading light".split():
+    for text in ["I", "keep", "running", "through", "the", "night", "chasing", "every", "fading", "light"]:
         words.append((text, clock, clock + 0.4)); clock += 0.5
     clock = 30.0
-    for text in "lick it hard lap it up right now come do that wicked deed".split():
+    for text in ["lick", "it", "hard", "lap", "it", "up", "right", "now", "come", "do", "that", "wicked", "deed"]:
         words.append((text, clock, clock + 0.4)); clock += 0.5
     transcriptions = []
 
