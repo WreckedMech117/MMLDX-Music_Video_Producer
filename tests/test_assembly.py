@@ -148,12 +148,31 @@ def test_gaps_are_reported_at_the_start_between_shots_and_at_the_end():
     ]
 
 
-def test_overlaps_and_overruns_are_refused_by_name():
+def test_overlaps_are_an_editing_gesture_and_later_shots_win():
+    """The Director's ruling (2026-08-20): "later shots on top of earlier shots". An
+    overlapping plan passes the refusals, and the plan cuts the earlier clip at the later
+    one's start; a clip completely covered by its successor contributes nothing."""
     overlapping = [clip("a", 0, 6.0), clip("b", 5.0, 5.0)]
-    assert ASSEMBLY_OVERLAP_REFUSAL.format(
-        before="SHOT (a)", after="SHOT (b)", start=5.0, end=6.0
-    ) in assembly_refusals(overlapping, song_seconds=10.0)
+    refusals = assembly_refusals(overlapping, song_seconds=10.0)
+    assert not any("overlap" in line for line in refusals)
+    assert refusals == []
+    plan = assembly_plan(
+        overlapping, song_seconds=10.0,
+        dimensions={"a": (1056, 608), "b": (1056, 608)},
+    )
+    assert [round(c.duration, 3) for c in plan.clips] == [5.0, 5.0]
+    assert plan.total_frames == 240  # exactly the song, telescoped at the cut
+    covered = [clip("a", 0, 4.0), clip("b", 4.0, 6.0), clip("c", 4.0, 6.0)]
+    plan = assembly_plan(
+        covered, song_seconds=10.0,
+        dimensions={"a": (1056, 608), "b": (1056, 608), "c": (1056, 608)},
+    )
+    # "b" is fully under "c" (same start; sorted order puts one first) and drops out.
+    assert len(plan.clips) == 2
+    assert plan.total_frames == 240
 
+
+def test_overruns_are_refused_by_name():
     past_the_end = [clip("a", 0, 11.0)]
     assert ASSEMBLY_OVERRUN_REFUSAL.format(
         shot="SHOT (a)", end=11.0, song=10.0
@@ -171,7 +190,7 @@ def test_the_boundary_tolerance_is_half_a_frame_and_coverage_is_one_frame():
     assert any("uncovered" in line for line in assembly_refusals(parted, 10.0))
 
     lapped = [clip("a", 0, 5.0 + half_frame * 2.2), clip("b", 5.0, 5.0)]
-    assert any("overlap" in line for line in assembly_refusals(lapped, 10.0))
+    assert assembly_refusals(lapped, 10.0) == []  # later-wins: not a defect any more
 
     # The discriminating width: 0.75 of a frame. Over half a frame (refused under the
     # ruled tolerance), under a whole frame (a doubled tolerance would wave it through) —
@@ -179,7 +198,7 @@ def test_the_boundary_tolerance_is_half_a_frame_and_coverage_is_one_frame():
     barely_parted = [clip("a", 0, 5.0), clip("b", 5.0 + half_frame * 1.5, 5.0)]
     assert any("uncovered" in line for line in assembly_refusals(barely_parted, 10.0))
     barely_lapped = [clip("a", 0, 5.0 + half_frame * 1.5), clip("b", 5.0, 5.0)]
-    assert any("overlap" in line for line in assembly_refusals(barely_lapped, 10.0))
+    assert assembly_refusals(barely_lapped, 10.0) == []  # later-wins covers this too
 
     one_frame = 1 / ASSEMBLY_FPS
     shy = [clip("a", 0, 10.0 - one_frame)]
@@ -188,17 +207,20 @@ def test_the_boundary_tolerance_is_half_a_frame_and_coverage_is_one_frame():
     assert any("uncovered" in line for line in assembly_refusals(shyer, 10.0))
 
 
-def test_a_clip_contained_inside_another_is_an_overlap_not_a_gap_at_the_end():
-    """The cursor is the *furthest* covered moment, not the last clip's end. A clip nested
-    wholly inside another is an overlap — and must not also produce a phantom "uncovered to
-    the end of the song" report from the cursor snapping back to the short clip's end."""
+def test_a_clip_nested_inside_another_splits_it_and_the_underneath_resumes():
+    """Layering, not truncation: a clip wholly inside another cuts a hole in it. The
+    underneath plays to the overlay's start, the overlay plays, and the underneath
+    RESUMES — with its take offset advanced by the skipped stretch, so the same seconds
+    of the take land at the same seconds of the song on both sides of the hole. And no
+    phantom "uncovered to the end" report: the cursor is the furthest covered moment."""
     nested = [clip("a", 0, 10.0), clip("b", 2.0, 2.0)]
-    report = assembly_refusals(nested, song_seconds=10.0)
-    assert report == [
-        ASSEMBLY_OVERLAP_REFUSAL.format(
-            before="SHOT (a)", after="SHOT (b)", start=2.0, end=10.0
-        )
-    ]
+    assert assembly_refusals(nested, song_seconds=10.0) == []
+    plan = assembly_plan(
+        nested, song_seconds=10.0, dimensions={"a": (1056, 608), "b": (1056, 608)}
+    )
+    windows = [(c.shot_id, round(c.start, 3), round(c.end, 3), round(c.offset, 3)) for c in plan.clips]
+    assert windows == [("a", 0.0, 2.0, 0.0), ("b", 2.0, 4.0, 0.0), ("a", 4.0, 10.0, 4.0)]
+    assert plan.total_frames == 240
 
 
 def test_a_window_shorter_than_a_frame_is_refused():

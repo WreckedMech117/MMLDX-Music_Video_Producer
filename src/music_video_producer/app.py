@@ -1103,6 +1103,29 @@ def shot_write_refusal(shot: Shot) -> Literal["locked", "rendered"] | None:
     return None
 
 
+def expansion_write_refusal(shot: Shot) -> Literal["locked", "rendered"] | None:
+    """`shot_write_refusal`, with the prose exemption the Director asked for by hitting it.
+
+    A song-audio reference shot's expansion is `song_audio_prose` — deterministic text
+    derived from the intent, no model call — so re-deriving it after a render is not
+    provenance loss: the prompt that produced each take is recorded on its job and in the
+    take's own PNG metadata. Refusing it was the live break (2026-08-20): "The 'Expand
+    Prompt Again' button was also broken so i couldnt update the creative intent and have
+    the structured prompt updated to match" — on a plan where every shot has rendered,
+    the refusal made intent edits permanently unable to reach the prompt. Locked stays
+    locked, and the document modes keep the full refusal: their expansions are model
+    output whose in-place rewrite really does lose the record.
+    """
+    reason = shot_write_refusal(shot)
+    if (
+        reason == "rendered"
+        and shot.use_song_audio
+        and resolve_shot_mode(shot) == "references"
+    ):
+        return None
+    return reason
+
+
 #: The Shot statuses `render_again` recognises as settled — a Shot that has something to redo.
 #:
 #: `error` is in here deliberately and is the likeliest use of the whole action: a render that
@@ -2449,7 +2472,7 @@ async def expand_shots(
         # Write-refusal before prompt-gate, which is the order phase one pinned with its own test:
         # a locked shot with an empty intent must hear that it is locked, because telling it to
         # write an intent first sends the Director to do work that would then be refused anyway.
-        if reason := shot_write_refusal(shot):
+        if reason := expansion_write_refusal(shot):
             outcomes.append(ShotExpansionOutcome(shot.id, reason))
             continue
         if prompt_is_missing(shot):
@@ -2488,7 +2511,7 @@ def apply_expansions(
         if shot is None:
             committed.append(replace(outcome, kind="missing"))
             continue
-        if reason := shot_write_refusal(shot):
+        if reason := expansion_write_refusal(shot):
             committed.append(replace(outcome, kind=reason))
             continue
         # A song-audio shot's audio fields are normalized to the guide's own reuse
@@ -6053,7 +6076,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Shot not found")
 
         label = shot_label(project, shot)
-        if reason := shot_write_refusal(shot):
+        if reason := expansion_write_refusal(shot):
             wording = (
                 EXPAND_PROMPT_LOCKED if reason == "locked" else EXPAND_PROMPT_RENDERED
             )
@@ -6103,7 +6126,7 @@ def create_app(
         current = next((held for held in project.shots if held.id == shot_id), None)
         if current is None:
             raise HTTPException(status_code=404, detail="Shot not found")
-        if reason := shot_write_refusal(current):
+        if reason := expansion_write_refusal(current):
             wording = (
                 EXPAND_PROMPT_LOCKED if reason == "locked" else EXPAND_PROMPT_RENDERED
             )

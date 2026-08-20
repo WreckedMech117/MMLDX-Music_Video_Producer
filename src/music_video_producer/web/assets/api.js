@@ -1719,7 +1719,16 @@ export function expandPromptControl(shot) {
   if (!shot) return { shown: false, disabled: true, label: EXPAND_PROMPT_LABEL, title: "", reason: "" };
   const expanded = Boolean(String(shot.h3_prompt || "").trim());
   const label = expanded ? EXPAND_PROMPT_AGAIN_LABEL : EXPAND_PROMPT_LABEL;
-  const refusal = shotWriteRefusal(shot);
+  // The prose exemption, mirroring app.py's expansion_write_refusal: a song-audio
+  // reference shot's expansion is deterministic prose derived from the intent, so
+  // re-deriving it after a render loses nothing — the prompt each take rendered from is
+  // on its job and in the take's own metadata. Without this, a fully-rendered plan could
+  // never carry an intent edit into its prompt again (the Director's live break,
+  // 2026-08-20).
+  let refusal = shotWriteRefusal(shot);
+  if (refusal === "rendered" && shot.use_song_audio && resolveShotMode(shot) === "references") {
+    refusal = null;
+  }
   if (refusal) {
     const reason = refusal === "locked" ? EXPAND_PROMPT_LOCKED : EXPAND_PROMPT_RENDERED;
     return { shown: true, disabled: true, label, title: reason, reason };

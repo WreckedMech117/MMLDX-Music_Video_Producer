@@ -9839,6 +9839,26 @@ def test_an_expansion_of_only_whitespace_is_treated_as_absent():
     assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")
 
 
+def test_expansion_allows_rederiving_prose_on_a_rendered_song_audio_shot():
+    """The Director's live break (2026-08-20): on a fully-rendered plan, no intent edit
+    could ever reach the prompt again — "Expand Prompt Again" refused every shot as
+    rendered. A song-audio reference shot's expansion is deterministic prose, so
+    re-deriving it loses no record; locked stays locked, and the document modes keep the
+    full refusal because their expansions are model output."""
+    from music_video_producer.app import expansion_write_refusal
+
+    rendered = {"start": 0.0, "duration": 4.0, "prompt": "Lean-in at the mic.",
+                "status": "complete", "latest_output": "takes/one.mp4"}
+    assert expansion_write_refusal(Shot(**rendered, use_song_audio=True)) is None
+    assert expansion_write_refusal(Shot(**rendered)) == "rendered"
+    assert expansion_write_refusal(
+        Shot(**rendered, use_song_audio=True, mode="first_last")
+    ) == "rendered"
+    assert expansion_write_refusal(
+        Shot(**rendered, use_song_audio=True, locked=True)
+    ) == "locked"
+
+
 def test_align_lyrics_hears_the_track_once_and_fills_the_sections(tmp_path: Path):
     """The Director's ask (2026-08-20): the tagged sheet plus Whisper's clock fills the
     section boxes. One transcription, kept on the Song beside the vocal spans; existing

@@ -19,7 +19,7 @@ Two design facts worth stating once:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 #: Every adapter this application ships renders 24 fps — both H3 canonical exports, the
@@ -65,6 +65,10 @@ ASSEMBLY_TAKE_MISSING_REFUSAL = (
 ASSEMBLY_GAP_REFUSAL = (
     "The song is uncovered from {start:.3f}s to {end:.3f}s, between {before} and {after}."
 )
+#: Retired as a refusal (2026-08-20, the Director's ruling: "later shots on top of
+#: earlier shots"): an overlap is an editing gesture, and `assembly_plan` resolves it by
+#: cutting the earlier clip at the later one's start. The constant remains for the tests
+#: that assert it is no longer reported.
 ASSEMBLY_OVERLAP_REFUSAL = "{before} and {after} overlap from {start:.3f}s to {end:.3f}s."
 ASSEMBLY_OVERRUN_REFUSAL = (
     "The plan runs past the song: {shot} ends at {end:.3f}s but the song ends at {song:.3f}s."
@@ -227,12 +231,9 @@ def tiling_refusals(ordered: list[ClipWindow], song_seconds: float) -> list[str]
                     start=cursor, end=clip.start, before=cursor_label, after=clip.label
                 )
             )
-        elif cursor - clip.start > BOUNDARY_TOLERANCE_SECONDS:
-            problems.append(
-                ASSEMBLY_OVERLAP_REFUSAL.format(
-                    before=cursor_label, after=clip.label, start=clip.start, end=cursor
-                )
-            )
+        # An overlap is NOT a problem, by the Director's ruling (2026-08-20): "later
+        # shots on top of earlier shots" — `assembly_plan` cuts the earlier clip at the
+        # later one's start, so an overlapping plan is an editing gesture, not a defect.
         cursor = max(cursor, clip.end)
         cursor_label = clip.label
     if song_seconds - cursor > COVERAGE_TOLERANCE_SECONDS:
@@ -289,6 +290,46 @@ def assembly_plan(
     silent stretch is a defect with a face in it.
     """
     ordered = sorted(clips, key=lambda clip: clip.start)
+    # Overlaps resolve as layers, later-on-top — the Director's ruling (2026-08-20):
+    # "later shots on top of earlier shots". A clip's visible ranges are its window minus
+    # every later-starting clip's window, so an overlaid head is cut, a nested overlay
+    # splits the clip around itself and the underneath RESUMES when the overlay ends,
+    # with the take offset advanced by exactly the skipped stretch — the same seconds of
+    # the take land at the same seconds of the song, before and after. A clip completely
+    # covered contributes nothing. Every visible boundary is some clip's own start or
+    # end, so the frame telescoping the module docstring proves is untouched.
+    resolved: list[ClipWindow] = []
+    for index, clip in enumerate(ordered):
+        segments = [(clip.start, clip.end)]
+        for later in ordered[index + 1:]:
+            if later.start >= clip.end:
+                break
+            remaining: list[tuple[float, float]] = []
+            for seg_start, seg_end in segments:
+                if later.end <= seg_start or later.start >= seg_end:
+                    remaining.append((seg_start, seg_end))
+                    continue
+                if later.start - seg_start > BOUNDARY_TOLERANCE_SECONDS:
+                    remaining.append((seg_start, later.start))
+                if seg_end - later.end > BOUNDARY_TOLERANCE_SECONDS:
+                    remaining.append((later.end, seg_end))
+            segments = remaining
+        for seg_start, seg_end in segments:
+            if seg_end - seg_start <= BOUNDARY_TOLERANCE_SECONDS:
+                continue
+            if seg_start == clip.start and seg_end == clip.end:
+                resolved.append(clip)
+            else:
+                resolved.append(
+                    replace(
+                        clip,
+                        start=seg_start,
+                        duration=seg_end - seg_start,
+                        offset=clip.offset + (seg_start - clip.start),
+                    )
+                )
+    resolved.sort(key=lambda clip: clip.start)
+    ordered = resolved
     frames = [clip_frames_on_grid(clip.start, clip.end) for clip in ordered]
     width, height = max(
         (dimensions[clip.shot_id] for clip in ordered),
