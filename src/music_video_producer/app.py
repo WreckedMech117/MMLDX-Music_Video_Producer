@@ -452,6 +452,13 @@ REFERENCE_KEYFRAME_NOT_IMAGE = (
 #: lifted from the praised take verbatim, not composed.
 SONG_AUDIO_SINGS_CLAUSE = "The character from the reference sheet sings to camera."
 SONG_AUDIO_SINGS_CLAUSE_BARE = "The performer sings to camera."
+#: The anti-morph anchor, from the same two good takes the sings clause came from — both
+#: ended "stable face and wardrobe, one continuous take", and the batch prose that
+#: dropped it produced the live artifact (2026-08-19, run 2 shot 07): a sparse
+#: establishing shot ran out of described action and CUT TO THE CHARACTER SHEET ITSELF,
+#: three poses on white, for its final two seconds. "One continuous take" is what tells
+#: the sampler there is no cut to invent.
+SONG_AUDIO_CONTINUITY_CLAUSE = "Stable face and wardrobe, one continuous take."
 
 
 def reference_prompt(
@@ -490,6 +497,10 @@ def reference_prompt(
     ):
         clause = SONG_AUDIO_SINGS_CLAUSE if shot.citations else SONG_AUDIO_SINGS_CLAUSE_BARE
         base = f"{base} {clause}"
+    if shot.use_song_audio:
+        # Every song-audio shot, singing or not: the live sheet-morph hit a NOT-singing
+        # establishing shot. See the constant for the artifact this anchors against.
+        base = f"{base} {SONG_AUDIO_CONTINUITY_CLAUSE}"
     # The fallback's insurance (run-2 audit item 7): the section's shared look reaches H3
     # only through the expansion, so a shot whose every expansion attempt failed would
     # render from one bare intent sentence with no section character. Appended, never

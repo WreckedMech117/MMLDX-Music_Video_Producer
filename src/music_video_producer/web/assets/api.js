@@ -1185,8 +1185,11 @@ export const RENDER_AGAIN_STATUSES = ["complete", "error", "approved"];
 
 export const RENDER_AGAIN_LABEL = "Render again";
 export const RENDER_AGAIN_HELP =
-  "Re-open this shot so it can be queued for another take. Nothing is rendered by this and no " +
-  "GPU time is spent until the shot is queued.";
+  "Re-open this shot and queue one new take (turbo, fresh seed). The previous take stays until " +
+  "the new one lands; cancelling the dialog re-opens without rendering.";
+// app.py's RESUBMIT_SEED_STRIDE, asserted identical by a contract test: a re-render at the same
+// seed and prompt reproduces the identical take, which reads as "nothing was replaced".
+export const RESUBMIT_SEED_STRIDE = 101;
 // The two refusals the browser can see coming, in the server's words. Drawn as a disabled control
 // carrying the reason rather than as no control at all: "why can I not render this again" is a
 // question the panel should answer where it is asked, and a control that silently vanishes for a

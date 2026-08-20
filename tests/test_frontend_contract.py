@@ -3698,6 +3698,18 @@ def test_the_render_again_control_is_decided_by_executing_it_for_every_state():
     # would not re-open.
     assert states["statuses"] == list(RENDER_AGAIN_STATUSES)
 
+    # The one-click flow's seed stride is the server's own (2026-08-19, the Director's live
+    # report: render-again re-opened the shot and nothing rendered — the click now re-opens,
+    # strides the seed and queues, and a stride that drifted from the batch's would make the
+    # lone click and the batch produce different takes from the same starting seed).
+    from music_video_producer.app import RESUBMIT_SEED_STRIDE
+
+    stride = run_module("""
+      import { RESUBMIT_SEED_STRIDE } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ stride: RESUBMIT_SEED_STRIDE }));
+    """)
+    assert stride["stride"] == RESUBMIT_SEED_STRIDE
+
     # Not applicable: nothing to render again, so no control and nothing to explain.
     for status in ("draft", "ready", "queued", "running"):
         assert states["seen"][status]["shown"] is False, status
@@ -3786,8 +3798,22 @@ def test_the_shot_inspector_draws_and_binds_the_render_again_control_it_was_give
       globalThis.document.createElement = () => { const item = make('<toast>'); toasts.push(item); return item; };
       // The boot requests this module fires on import are not this click's; only what the click
       // itself puts on the wire is the thing under test.
-      requests.length = 0;
+      //
+      // First arm: the Director cancels the queue question. The old contract exactly — one
+      // bodyless request to the purpose-built route, the reply adopted, nothing rendered.
+      answer(false);
       await fire('#render-again:click', {});
+      const cancelled = { requests: [...requests], status: state.project.shots[0].status,
+                          toasts: toasts.map((item) => item.textContent) };
+      // Second arm: the Director accepts. Re-open, stride the seed through the shots write,
+      // queue one turbo take — the 2026-08-19 live report was this click re-opening the shot
+      // and stopping, which read as "nothing came across ComfyUI".
+      draw({});
+      toasts.length = 0;
+      answer(true);
+      await fire('#render-again:click', {});
+      const queued = { requests: [...requests],
+                       toasts: toasts.map((item) => item.textContent) };
       console.log(JSON.stringify({
         complete: { present: complete.present, disabled: complete.disabled },
         locked: { present: locked.present, disabled: locked.disabled, reason: locked.html.includes(contract.RENDER_AGAIN_LOCKED) },
@@ -3795,10 +3821,10 @@ def test_the_shot_inspector_draws_and_binds_the_render_again_control_it_was_give
         emptied: { present: emptied.present, disabled: emptied.disabled },
         draft: { present: draft.present },
         running: { present: running.present },
-        requests,
-        status: state.project.shots[0].status,
-        toasts: toasts.map((item) => item.textContent),
+        cancelled,
+        queued,
         notice: contract.renderAgainNotice(reopened, 'shot_a'),
+        stride: contract.RESUBMIT_SEED_STRIDE,
       }));
     """)
 
@@ -3810,20 +3836,40 @@ def test_the_shot_inspector_draws_and_binds_the_render_again_control_it_was_give
     assert rendered["draft"]["present"] is False
     assert rendered["running"]["present"] is False
 
-    # One request, to the purpose-built route, with no body: nothing a stale client could
-    # reassert over the rest of the plan travelled with it.
-    assert rendered["requests"] == [
+    # Cancelled: one request, to the purpose-built route, with no body — nothing a stale
+    # client could reassert over the rest of the plan travelled with it, and no GPU spent.
+    assert rendered["cancelled"]["requests"] == [
         {"path": "/api/projects/p1/shots/shot_a/render-again", "method": "POST", "body": None}
     ]
-    # ...and emphatically not the generic shots write, which is what this replaces.
-    assert not any(sent["path"].endswith("/shots") for sent in rendered["requests"])
-
     # The reply is adopted, so the panel and the batch button redraw from it.
-    assert rendered["status"] == "ready"
+    assert rendered["cancelled"]["status"] == "ready"
     # And the Director is told what happened to the take that is already there, rather than
     # being left to assume the application is keeping both.
-    assert rendered["toasts"] == [rendered["notice"]]
+    assert rendered["cancelled"]["toasts"] == [rendered["notice"]]
     assert "SHOT 01 (shot_a)" in rendered["notice"]
+
+    # Accepted: re-open, stride the seed, queue one take — in that order, because the render
+    # reads the seed from the store and a stride that landed after submission would render
+    # the identical take (the "nothing was replaced" the one-gesture flow exists to end).
+    # Reads (the readiness refresh the silent saver triggers, the reload) may interleave;
+    # the writes and their order are the contract.
+    writes = [
+        sent for sent in rendered["queued"]["requests"] if sent["method"] in ("POST", "PUT")
+    ]
+    assert [sent["path"] for sent in writes][:3] == [
+        "/api/projects/p1/shots/shot_a/render-again",
+        "/api/projects/p1/shots",
+        "/api/projects/p1/shots/shot_a/generate/h3",
+    ]
+    import json as json_module
+
+    saved = json_module.loads(writes[1]["body"])
+    assert saved["shots"][0]["seed"] == rendered["stride"]  # 0 + the server's own stride
+    generate = json_module.loads(writes[2]["body"])
+    assert generate["profile"] == "turbo"
+    assert rendered["queued"]["toasts"] == [
+        f"{rendered['notice']} A new take is rendering now."
+    ]
 
 
 def test_render_again_wordings_are_the_servers_own():

@@ -8242,7 +8242,11 @@ def test_the_route_offers_every_aspect_ratio_the_selector_knows(tmp_path: Path):
 # moves `length`/`duration_frames` and (for song-audio shots) the audio trim in every H3
 # payload at once. The two shapes' *structure* is unchanged; only those literals moved,
 # verified by eye on the diff before re-pinning.
-H3_REFERENCE_PAYLOAD_DIGEST = "b59a93ddcc4f8cbf3e51504d47581a70fd3e95f2c758b34c1ff6c384e9fe7c60"
+#
+# Re-pinned again 2026-08-19 (later the same day) for SONG_AUDIO_CONTINUITY_CLAUSE: every
+# song-audio prompt now ends "Stable face and wardrobe, one continuous take." after run 2
+# shot 07's take cut to the character sheet itself mid-shot. Only the prompt string moved.
+H3_REFERENCE_PAYLOAD_DIGEST = "6af5e442ca01963ae15f2b062a1f55b90666af15080de5309f051fe4e38c3c86"
 H3_TEXT_PAYLOAD_DIGEST = "d7d657a7b20c6d85b3895e23a8bd65304ef3fe014d8376ccff8d03a8c56dac8d"
 
 DIGEST_PROJECT_ID = "project_deadbeef0001"
@@ -9840,6 +9844,7 @@ def test_a_singing_song_audio_shot_gains_the_measured_sings_clause():
     rendered a closed mouth. The clause is appended only when the intent does not
     already say so, only for song-audio shots, and only when the shot sings."""
     from music_video_producer.app import (
+        SONG_AUDIO_CONTINUITY_CLAUSE,
         SONG_AUDIO_SINGS_CLAUSE,
         SONG_AUDIO_SINGS_CLAUSE_BARE,
     )
@@ -9850,24 +9855,36 @@ def test_a_singing_song_audio_shot_gains_the_measured_sings_clause():
     cited = [AssetCitation(asset_id="asset_1", role="reference", order=0)]
 
     singing = Shot(**base, singing="singing", citations=cited)
-    assert reference_prompt(singing, tags).endswith(SONG_AUDIO_SINGS_CLAUSE)
+    assert reference_prompt(singing, tags).endswith(
+        f"{SONG_AUDIO_SINGS_CLAUSE} {SONG_AUDIO_CONTINUITY_CLAUSE}"
+    )
     # Without a reference sheet the wording cannot claim one.
     uncited = Shot(**base, singing="singing")
-    assert reference_prompt(uncited, tags).endswith(SONG_AUDIO_SINGS_CLAUSE_BARE)
+    assert f"{SONG_AUDIO_SINGS_CLAUSE_BARE} " in reference_prompt(uncited, tags)
     # An intent that already sings gets no doubled clause.
     already = Shot(start=0.0, duration=3.75, prompt="She sings to camera, leaning in.",
                    use_song_audio=True, singing="singing", citations=cited)
     assert "sings to camera." not in reference_prompt(already, tags).removeprefix(
         f"Reference map: {'; '.join(tags)}. {already.prompt}"
     )
-    # Not singing, or not riding the song: the string this route always built.
+    # Not singing: no sings clause, but the continuity anchor still lands — the live
+    # sheet-morph artifact hit a NOT-singing establishing shot (run 2 shot 07).
     silent = Shot(**base, singing="not_singing", citations=cited)
     assert reference_prompt(silent, tags) == (
-        f"Reference map: {'; '.join(tags)}. {silent.prompt}"
+        f"Reference map: {'; '.join(tags)}. {silent.prompt} {SONG_AUDIO_CONTINUITY_CLAUSE}"
     )
-    # The section look still lands after the clause.
+    # A shot not riding the song: the string this route always built, byte-identical.
+    plain = Shot(start=0.0, duration=3.75, prompt="Close on her face at the mic.",
+                 singing="not_singing", citations=cited)
+    assert reference_prompt(plain, tags) == (
+        f"Reference map: {'; '.join(tags)}. {plain.prompt}"
+    )
+    # The section look still lands after every clause.
     sectioned = reference_prompt(singing, tags, section_prompt="on the canopy bed")
-    assert sectioned.endswith(f"{SONG_AUDIO_SINGS_CLAUSE} Section look: on the canopy bed")
+    assert sectioned.endswith(
+        f"{SONG_AUDIO_SINGS_CLAUSE} {SONG_AUDIO_CONTINUITY_CLAUSE} "
+        "Section look: on the canopy bed"
+    )
 
 
 def test_measured_silence_outranks_a_singing_mark():
@@ -9893,15 +9910,15 @@ def test_measured_silence_outranks_a_singing_mark():
 
     measured = Project(name="Measured", song=song, shots=[intro, sung])
     assert "sings to camera" not in song_audio_prose(measured, intro)
-    assert song_audio_prose(measured, sung).endswith(SONG_AUDIO_SINGS_CLAUSE_BARE)
+    assert f"{SONG_AUDIO_SINGS_CLAUSE_BARE} " in song_audio_prose(measured, sung)
     # Unmeasured: the mark is trusted, exactly as before spans existed.
     unmeasured = Project(
         name="Unmeasured",
         song=Song(title="Harder Faster", source="imported", duration=154.6),
         shots=[intro.model_copy(deep=True)],
     )
-    assert song_audio_prose(unmeasured, unmeasured.shots[0]).endswith(
-        SONG_AUDIO_SINGS_CLAUSE_BARE
+    assert f"{SONG_AUDIO_SINGS_CLAUSE_BARE} " in song_audio_prose(
+        unmeasured, unmeasured.shots[0]
     )
 
 
@@ -9943,6 +9960,7 @@ def test_song_audio_prose_is_the_submit_walks_own_string(tmp_path: Path):
         "<Audio 1> is the master song for synchronization. "
         "Over-the-shoulder lean-in. "
         "The character from the reference sheet sings to camera. "
+        "Stable face and wardrobe, one continuous take. "
         "Section look: moonlit warehouse"
     )
     assert "integrated_multimodal_description" not in prose
