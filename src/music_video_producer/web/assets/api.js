@@ -2346,7 +2346,10 @@ export const api = {
   // Recovery must not depend on the model that caused the problem, so this is its own
   // route and carries no message: nothing here reaches the Director.
   restoreDocument: (id, document) => request(`/api/projects/${id}/documents/${document}/restore`, { method: "POST" }),
-  saveShots: (id, shots) => request(`/api/projects/${id}/shots`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ shots }) }),
+  // `updated_at` is the revision this list was edited against; the server refuses the save
+  // when it is stale (409) instead of silently overwriting later work — the 2026-08-19
+  // revert, where one background save from a tab loaded earlier reverted 32 prompts at once.
+  saveShots: (id, shots, updated_at = null) => request(`/api/projects/${id}/shots`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(updated_at ? { shots, updated_at } : { shots }) }),
   // The Director's section marks (Intro/Verse/Chorus...), replaced whole like the shot
   // list and for its reason. The server sorts and refuses overlaps.
   saveSections: (id, sections) => request(`/api/projects/${id}/sections`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ sections }) }),

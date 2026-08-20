@@ -9838,6 +9838,38 @@ def test_an_expansion_of_only_whitespace_is_treated_as_absent():
     assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")
 
 
+def test_the_shots_write_refuses_a_stale_revision_when_the_client_sends_one(tmp_path: Path):
+    """The whole-manifest guard hole, finally with a lock the interface sends.
+
+    Live on 2026-08-19: the Director's open tab fired a background shot save with a list
+    loaded before a repair pass, and one PUT reverted 32 prompts and four singing flags at
+    once. `updated_at` in the body is the revision the list was edited against — enforced
+    when present, in `replace_project`'s exact words; absent keeps the wire every script
+    and older client already speaks, hazard and all."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Revisions"))
+    project.shots = [Shot(id="shot_a", start=0, duration=5, prompt="Wide on the room")]
+    store.save(project)
+    current = client.get(f"/api/projects/{project.id}").json()
+
+    # Fresh revision: accepted, and the reply carries the new one.
+    body = {"shots": current["shots"], "updated_at": current["updated_at"]}
+    first = client.put(f"/api/projects/{project.id}/shots", json=body)
+    assert first.status_code == 200
+    assert first.json()["updated_at"] != current["updated_at"]
+
+    # The same (now stale) revision again: refused, nothing written.
+    body["shots"][0]["prompt"] = "A stale tab's idea of the plan"
+    stale = client.put(f"/api/projects/{project.id}/shots", json=body)
+    assert stale.status_code == 409
+    assert "refresh before replacing" in stale.json()["detail"]
+    assert store.get(project.id).shots[0].prompt == "Wide on the room"
+
+    # No revision: the wire every existing caller speaks, accepted exactly as before.
+    bare = client.put(f"/api/projects/{project.id}/shots", json={"shots": current["shots"]})
+    assert bare.status_code == 200
+
+
 def test_a_singing_song_audio_shot_gains_the_measured_sings_clause():
     """The lipsync half of the 2026-08-19 measurements: the takes the Director praised
     both said the character sings to camera, and a prompt with no singing language

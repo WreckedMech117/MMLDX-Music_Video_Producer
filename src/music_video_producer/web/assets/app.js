@@ -1665,8 +1665,16 @@ function saveShotsSilently() {
   state.shotsDirty = true;
   state.dirty = true;
   shotSaveChain = shotSaveChain
-    .then(() => api.saveShots(projectId, shots))
-    .then(() => {
+    // The revision travels with the save and is read at SEND time, not at queue time: the
+    // chain runs saves one by one, and each adopts the server's fresh `updated_at` below, so
+    // a queued burst stays valid save over save. A stale one — this tab loaded before some
+    // other writer saved — is refused with a 409 instead of silently reverting that work,
+    // which is what one background save from this tab did to 32 prompts on 2026-08-19.
+    .then(() => api.saveShots(projectId, shots, state.project?.updated_at || null))
+    .then((saved) => {
+      if (state.project?.id === projectId && saved?.updated_at) {
+        state.project.updated_at = saved.updated_at;
+      }
       if (revision === shotSaveRevision) {
         state.shotsDirty = false;
         state.dirty = state.documentsDirty;

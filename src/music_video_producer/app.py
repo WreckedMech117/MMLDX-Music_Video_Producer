@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -2610,6 +2611,15 @@ class AssistantRequest(BaseModel):
 
 class ShotListRequest(BaseModel):
     shots: list[Shot]
+    #: The project revision this shot list was edited against, for optimistic concurrency —
+    #: enforced when present, so a client that sends it can never silently overwrite work
+    #: saved after it loaded. Optional because the wire has always been bare `{shots}`:
+    #: scripts and older clients keep working, with the documented hazard they always had.
+    #: What made it real (2026-08-19): the Director's open tab fired a background shot save
+    #: with a list loaded before a repair pass, and one PUT reverted 32 prompts and four
+    #: singing flags at once — the whole-manifest guard hole this codebase keeps meeting,
+    #: now with a lock the interface actually sends.
+    updated_at: datetime | None = None
 
 
 class ProjectDocumentsRequest(BaseModel):
@@ -3129,6 +3139,13 @@ def create_app(
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
     def replace_shots(project_id: str, request: ShotListRequest) -> Project:
         project = get_project(project_id)
+        # Enforced only when sent — see `ShotListRequest.updated_at`. The wording is
+        # `replace_project`'s, because it is the same rule met on the other manifest write.
+        if request.updated_at is not None and request.updated_at != project.updated_at:
+            raise HTTPException(
+                status_code=409,
+                detail="Project changed since it was loaded; refresh before replacing it",
+            )
         project.shots = request.shots
         return store.save(project)
 
