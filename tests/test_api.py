@@ -211,15 +211,16 @@ class FakeDirector:
         )()
 
 
-def make_client(tmp_path: Path, director=None):
+def make_client(tmp_path: Path, director=None, transcriber=None):
     """The default client. `director` is optional so a test can keep the FakeComfy handle —
     `make_client_with_director` does not return one, and "no render was queued" is a claim that
-    needs it."""
+    needs it. `transcriber` injects the align-lyrics route's Whisper stand-in."""
     settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
     store = ProjectStore(tmp_path)
     comfy = FakeComfy()
     app = create_app(
-        settings=settings, store=store, comfy=comfy, director=director or FakeDirector()
+        settings=settings, store=store, comfy=comfy, director=director or FakeDirector(),
+        transcriber=transcriber,
     )
     return TestClient(app), store, comfy
 
@@ -1251,7 +1252,7 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
     # guard by widening a set to `Song.model_fields` fails here.
     assert _withheld_fields(
         Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD, family="SONG"
-    ) == {"lyrics_previous", "caption_previous", "vocal_spans"}
+    ) == {"lyrics_previous", "caption_previous", "vocal_spans", "lyric_words"}
     assert not SONG_DIRECTOR_VISIBLE & SONG_DIRECTOR_WITHHELD
 
 
@@ -9836,6 +9837,71 @@ def test_an_expansion_of_only_whitespace_is_treated_as_absent():
     blank = "   " + "\n" + "  "
     shot = Shot(start=0.0, duration=3.75, prompt="Wide on Lucy.", h3_prompt=blank)
     assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")
+
+
+def test_align_lyrics_hears_the_track_once_and_fills_the_sections(tmp_path: Path):
+    """The Director's ask (2026-08-20): the tagged sheet plus Whisper's clock fills the
+    section boxes. One transcription, kept on the Song beside the vocal spans; existing
+    boxes are the Director's marks and are refused without replace_sections; a sheet
+    with no [Tag] blocks is a remedy sentence, not a guess."""
+    words = []
+    clock = 8.0
+    for text in "I keep running through the night chasing every fading light".split():
+        words.append((text, clock, clock + 0.4)); clock += 0.5
+    clock = 30.0
+    for text in "lick it hard lap it up right now come do that wicked deed".split():
+        words.append((text, clock, clock + 0.4)); clock += 0.5
+    transcriptions = []
+
+    def transcriber(path):
+        transcriptions.append(str(path))
+        return words
+
+    client, store, _ = make_client(tmp_path, transcriber=transcriber)
+    project = store.create(Project(name="Aligned"))
+    media = store.media_dir(project.id) / "songs"
+    media.mkdir(parents=True)
+    (media / "track.mp3").write_bytes(b"not audio, never decoded: the transcriber is ours")
+    project.song = Song(
+        title="Night Runner", source="imported", path="media/songs/track.mp3",
+        duration=60.0,
+        lyrics="[Verse]\nI keep runnin' through the night\nchasing every fadin' light\n"
+               "[Chorus]\nlick it hard lap it up right now\ncome do that wicked deed\n",
+    )
+    store.save(project)
+
+    aligned = client.post(f"/api/projects/{project.id}/song/align-lyrics", json={})
+    assert aligned.status_code == 200
+    body = aligned.json()
+    assert [s["label"] for s in body["sections"]] == ["Intro", "Verse", "Chorus"]
+    assert body["sections"][1]["start"] == 8.0
+    assert body["sections"][2]["start"] == 30.0
+    assert body["sections"][-1]["start"] + body["sections"][-1]["duration"] == 60.0
+    assert all(s["prompt"] == "" for s in body["sections"])
+    stored = store.get(project.id)
+    assert stored.song.lyric_words and stored.song.vocal_spans
+    assert len(transcriptions) == 1
+
+    # Boxes exist now: refused without the flag, replaced with it — and the stored words
+    # are reused, so the track is never transcribed twice.
+    refused = client.post(f"/api/projects/{project.id}/song/align-lyrics", json={})
+    assert refused.status_code == 409
+    assert "replace_sections" in refused.json()["detail"]
+    replaced = client.post(
+        f"/api/projects/{project.id}/song/align-lyrics", json={"replace_sections": True}
+    )
+    assert replaced.status_code == 200
+    assert len(transcriptions) == 1
+
+    # A sheet without tags is a remedy, not a guess.
+    untagged = store.get(project.id)
+    untagged.song.lyrics = "just words with no structure tags"
+    store.save(untagged)
+    no_tags = client.post(
+        f"/api/projects/{project.id}/song/align-lyrics", json={"replace_sections": True}
+    )
+    assert no_tags.status_code == 422
+    assert "[Verse]" in no_tags.json()["detail"]
 
 
 def test_the_shots_write_refuses_a_stale_revision_when_the_client_sends_one(tmp_path: Path):

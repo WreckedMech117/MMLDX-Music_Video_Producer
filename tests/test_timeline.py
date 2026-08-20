@@ -765,6 +765,64 @@ def test_the_expansion_payload_carries_the_shots_section_block():
     assert "section" not in shot_expansion_input(bare, bare.shots[0])["shot"]
 
 
+def test_lyric_blocks_align_to_transcribed_words_and_refrains_stay_home():
+    """The sheet is the truth about the words, the transcript about the clock — and a
+    repeated refrain must land on ITS repeat, not a later one. Modeled on the live song:
+    Whisper normalizes contractions ("runnin" -> "running"), mishears a word mid-line
+    ("lap it up" -> "light me up"), and the chorus recurs verbatim in the outro."""
+    from music_video_producer.timeline import align_lyric_blocks
+
+    sheet = (
+        "[Verse]\nI keep runnin' through the night\nchasing every fadin' light\n"
+        "[Chorus]\nlick it hard lap it up right now\ncome do that wicked deed\n"
+        "[Outro]\nlick it hard lap it up right now\ncome do that wicked deed\n"
+    )
+    words = []
+    clock = 10.0
+    for text in "I keep running through the night chasing every fading light".split():
+        words.append((text, clock, clock + 0.4)); clock += 0.5
+    clock = 30.0  # instrumental gap
+    for text in "lick it hard light me up right now come do that wicked deed".split():
+        words.append((text, clock, clock + 0.4)); clock += 0.5
+    clock = 60.0  # long instrumental bridge, then the identical outro refrain
+    for text in "lick it hard lap it up right now come do that wicked deed".split():
+        words.append((text, clock, clock + 0.4)); clock += 0.5
+
+    aligned = align_lyric_blocks(sheet, words)
+    assert [tag for tag, *_ in aligned] == ["Verse", "Chorus", "Outro"]
+    verse, chorus, outro = aligned
+    assert verse[1] == 10.0 and 13.5 <= verse[2] <= 15.0
+    # The chorus stayed on its own (misheard) repeat rather than jumping to the outro's
+    # word-perfect one 30 seconds later.
+    assert chorus[1] == 30.0 and chorus[2] < 40.0
+    assert outro[1] == 60.0
+    # A sheet block the track never sings is omitted, not guessed.
+    unsung = align_lyric_blocks(sheet + "[Bridge]\nwords nobody ever sang here\n", words)
+    assert [tag for tag, *_ in unsung] == ["Verse", "Chorus", "Outro"]
+
+
+def test_aligned_blocks_tile_the_whole_song_as_sections():
+    """Intro when the voice starts late, ordinals on repeats, instrumental tails belonging
+    to the section they follow, the last section running out the song."""
+    from music_video_producer.timeline import proposed_sections_from_alignment
+
+    proposals = proposed_sections_from_alignment(
+        [("Verse", 11.0, 31.2), ("Chorus", 32.5, 50.9), ("Verse", 56.4, 77.2)],
+        duration := 120.0,
+    )
+    assert proposals == [
+        ("Intro", 0.0, 11.0, ""),
+        ("Verse", 11.0, 21.5, ""),
+        ("Chorus", 32.5, 23.9, ""),
+        ("Verse 2", 56.4, 63.6, ""),
+    ]
+    assert proposals[-1][1] + proposals[-1][2] == duration
+    # A voice inside the first two seconds absorbs the opening into its own section.
+    early = proposed_sections_from_alignment([("Verse", 0.8, 20.0)], 60.0)
+    assert early == [("Verse", 0.0, 60.0, "")]
+    assert proposed_sections_from_alignment([], 60.0) == []
+
+
 def test_repair_sections_sorts_clamps_and_truncates_overlaps():
     """Model-proposed structure made legal without refusal: a proposal is scaffolding the
     Director will drag, so repair beats a 502. Gaps survive — unmarked means unknown."""

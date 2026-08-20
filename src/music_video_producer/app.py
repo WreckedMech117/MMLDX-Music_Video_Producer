@@ -91,19 +91,23 @@ from .timeline import (
     H3_MIN_SHOT_SECONDS,
     MIN_SINGING_VOCAL_SECONDS,
     TimelineError,
+    align_lyric_blocks,
     assistant_input,
     build_director_timeline,
     expansion_input,
+    lyric_blocks,
     ordered_shots,
     over_render_frames,
     over_render_lead,
     populate_windows,
     proposal_for_position,
+    proposed_sections_from_alignment,
     repair_sections,
     shot_expansion_input,
     shot_vocal_overlap,
     song_section,
 )
+from .transcription import merge_vocal_spans, transcribe_song_words
 from .vram import CliUnloader, LlmEjector
 from .workflows import (
     H3_DEFAULT_PROFILE,
@@ -286,11 +290,11 @@ SONG_DIRECTOR_VISIBLE = frozenset({"title", "source", "path", "duration", "lyric
 SONG_DIRECTOR_WITHHELD = frozenset(
     f"{field}{RECOVERY_SLOT_SUFFIX}" for field in SONG_CONTEXT_LABELS
 ) | frozenset(
-    # Measured voice activity, second pairs. Withheld as raw data: what planning needs
-    # from it is per-window facts ("this window is instrumental"), which the code derives
-    # via `shot_vocal_overlap` — a page of float pairs in the prompt is noise the model
-    # would misread long before it helped.
-    {"vocal_spans"}
+    # Measured voice activity: second pairs, and every transcribed word. Withheld as raw
+    # data: what planning needs from either is per-window facts ("this window is
+    # instrumental"), which the code derives via `shot_vocal_overlap` — pages of floats
+    # in the prompt are noise the model would misread long before they helped.
+    {"vocal_spans", "lyric_words"}
 )
 
 
@@ -2609,6 +2613,37 @@ class AssistantRequest(BaseModel):
     shot_ids: list[str] = Field(min_length=1)
 
 
+class AlignLyricsRequest(BaseModel):
+    #: Re-run Whisper even when words are already stored — for a replaced or re-mastered file.
+    retranscribe: bool = False
+    #: Overwrite existing section boxes with the measured proposal. Off by default because
+    #: dragged boxes are the Director's marks.
+    replace_sections: bool = False
+
+
+#: Every way the align route refuses, each naming the remedy.
+ALIGN_LYRICS_WITHOUT_SONG = (
+    "A completed project song is required before its lyrics can be aligned to time."
+)
+ALIGN_LYRICS_WITHOUT_TAGS = (
+    "The lyric sheet has no [Tag] blocks to align. Mark the sheet's structure with tags "
+    "like [Verse], [Chorus], [Bridge] in the song context editor first."
+)
+ALIGN_LYRICS_SECTIONS_EXIST = (
+    "This project already has section boxes, and they are the Director's marks. Send "
+    "replace_sections=true to overwrite them with the measured alignment."
+)
+ALIGN_LYRICS_TRANSCRIBE_FAILED = (
+    "The track could not be transcribed: {error}. Whisper (faster-whisper) must be "
+    "installed and the song file readable."
+)
+ALIGN_LYRICS_NOTHING_PLACED = (
+    "No lyric block could be placed on the track — the transcription and the sheet do not "
+    "agree anywhere. The transcribed words were kept; check the sheet matches this "
+    "recording's actual words."
+)
+
+
 class ShotListRequest(BaseModel):
     shots: list[Shot]
     #: The project revision this shot list was edited against, for optimistic concurrency —
@@ -2866,9 +2901,15 @@ def create_app(
     director: DirectorClient | Any | None = None,
     ejector: LlmEjector | Any | None = None,
     preferences: MachinePreferences | Any | None = None,
+    # The song transcriber, injectable for tests exactly as `comfy` and `director` are:
+    # a callable from an audio path to Whisper's (text, start, end) words. The default
+    # imports faster-whisper lazily inside the call, so nothing pays for the dependency
+    # until the align-lyrics route actually runs.
+    transcriber: Any | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     store = store or ProjectStore(settings.data_root)
+    transcriber = transcriber or transcribe_song_words
     # Machine-scoped, deliberately not project-scoped: see `preferences.py`. It sits beside
     # `projects/` under the same data root, so a project directory copied to another machine
     # carries no opinion about that machine's VRAM.
@@ -3306,6 +3347,56 @@ def create_app(
                 continue
             setattr(project.song, f"{field}{RECOVERY_SLOT_SUFFIX}", stored)
             setattr(project.song, field, text)
+        return store.save(project)
+
+    @app.post("/api/projects/{project_id}/song/align-lyrics", response_model=Project)
+    def align_song_lyrics(project_id: str, request: AlignLyricsRequest) -> Project:
+        """Hear the track, time the sheet's `[Tag]` blocks against it, fill the sections.
+
+        The Director's ask (2026-08-20): "I did add the tags in the lyrics so that those
+        would at least be clear... knowing where words are and arent is useful for knowing
+        which Shots have words, when the cuts should happen, when the chorus and verses
+        are." Three writes, all measured: `lyric_words` (every word Whisper hears, kept so
+        nothing ever transcribes twice), `vocal_spans` (the singing-flag guard's evidence),
+        and — when the plan has no sections, or `replace_sections` says to — the section
+        boxes themselves, one per aligned block plus an Intro when the voice starts late,
+        repaired by the same rules a populate proposal is.
+
+        A sync `def`, deliberately: FastAPI runs it in the threadpool, and a CPU
+        transcription of a whole track must not park the event loop for minutes.
+
+        Prompts on the proposed sections are left empty — timing is measured, look is
+        authored — and existing sections are never replaced without the flag: boxes the
+        Director has dragged are their marks, not this route's.
+        """
+        project = get_project(project_id)
+        if project.song is None or not project.song.path:
+            raise HTTPException(status_code=422, detail=ALIGN_LYRICS_WITHOUT_SONG)
+        if not lyric_blocks(project.song.lyrics):
+            raise HTTPException(status_code=422, detail=ALIGN_LYRICS_WITHOUT_TAGS)
+        if project.sections and not request.replace_sections:
+            raise HTTPException(status_code=409, detail=ALIGN_LYRICS_SECTIONS_EXIST)
+        words = project.song.lyric_words
+        if not words or request.retranscribe:
+            try:
+                words = transcriber(resolve_song_path(project_id, project.song))
+            except Exception as error:  # the dependency or the decode, named either way
+                raise HTTPException(
+                    status_code=502, detail=ALIGN_LYRICS_TRANSCRIBE_FAILED.format(error=error)
+                ) from error
+            project.song.lyric_words = words
+            project.song.vocal_spans = merge_vocal_spans(words)
+        aligned = align_lyric_blocks(project.song.lyrics, words)
+        if not aligned:
+            store.save(project)  # the transcription is still worth keeping
+            raise HTTPException(status_code=422, detail=ALIGN_LYRICS_NOTHING_PLACED)
+        project.sections = [
+            SongSection(label=label, start=start, duration=length, prompt=prompt)
+            for label, start, length, prompt in repair_sections(
+                proposed_sections_from_alignment(aligned, project.song.duration),
+                project.song.duration,
+            )
+        ]
         return store.save(project)
 
     @app.post(

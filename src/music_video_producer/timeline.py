@@ -354,6 +354,181 @@ def section_lyrics(project: Project, section) -> str:
     return matching[ordinal] if ordinal < len(matching) else ""
 
 
+def _lyric_tokens(text: str) -> list[str]:
+    """Words as things two spellings of one sung line can agree on: lowercased, apostrophes
+    dropped ("don't" == "dont"), and split on everything else — a hyphen splits, so the
+    sheet's "spread-eagle" meets Whisper's "spread", "eagle" as two words, not one blob."""
+    return re.findall(r"[a-z]+", text.lower().replace("'", ""))
+
+
+def _tokens_agree(sheet: str, heard: str) -> bool:
+    """Whether a sheet word and a transcribed word are plausibly the same sung word.
+
+    Exact, or one is a prefix of the other with at least four shared letters — which is
+    what survives Whisper's habit of normalizing sung contractions ("runnin" -> "running",
+    "screamin" -> "screaming") without letting "the" match "them"."""
+    if sheet == heard:
+        return True
+    shorter, longer = (sheet, heard) if len(sheet) <= len(heard) else (heard, sheet)
+    return len(shorter) >= 4 and longer.startswith(shorter)
+
+
+def align_lyric_blocks(
+    lyrics: str, words: list[tuple[str, float, float]]
+) -> list[tuple[str, float, float]]:
+    """Each `[Tag]` block of the sheet, timed against transcribed words: (tag, start, end).
+
+    The sheet is the truth about the words; the transcript is the truth about the clock.
+    Both run in song order, so the walk is monotonic: one pointer into the transcript,
+    advanced block by block. A block anchors where three of its first six tokens match
+    inside a small transcript window (a single-word match is how "the" anchors a chorus
+    to a verse), then consumes forward matches greedily; its span is first-matched-word
+    start to last-matched-word end. A block that never anchors is *omitted* rather than
+    guessed — the caller decides what an unplaced block means.
+
+    The Director's ask, verbatim intent (2026-08-20): "knowing where words are and arent
+    is useful for knowing which Shots have words, when the cuts should happen, when the
+    chorus and verses are" — this is the sheet-tags half; `Song.vocal_spans` is the
+    words-at-all half.
+    """
+    blocks = lyric_blocks(lyrics)
+    heard: list[tuple[str, float, float]] = []
+    for text, start, end in words:
+        for token in _lyric_tokens(text):
+            heard.append((token, start, end))
+    aligned: list[tuple[str, float, float]] = []
+    cursor = 0
+    for tag, text in blocks:
+        tokens = _lyric_tokens(text)
+        if not tokens:
+            continue
+        # One block aligns inside a bounded transcript window past the cursor — three
+        # times its own length plus slack, which admits mishearings and the odd ad-lib
+        # without letting a chorus match the next chorus. The alignment is a plain LCS
+        # (ordered, gaps both sides), which is what survives Whisper swapping "lap it up"
+        # for "light me up" mid-line where a greedy walk loses its place.
+        window = heard[cursor:cursor + 3 * len(tokens) + 40]
+        if not window:
+            break
+        n = len(tokens)
+        # Enough of the block must actually be heard — 40%, floored at three words — or
+        # the block is omitted rather than pinned to stray matches.
+        threshold = min(n, max(3, round(0.4 * n)))
+        count, matches = _lcs_matches(tokens, window)
+        if count < threshold:
+            continue
+        # A refrain matches its own later repeats: this song's second chorus LCS-matched
+        # its closing line to the *outro's* identical words, 24 seconds and a whole bridge
+        # later — and a global traceback can even split one block's matches across two
+        # repeats. So: group the matches into time-dense runs (split at >8 s), then score
+        # each run's own time-neighborhood with a FRESH local LCS, and the block lands on
+        # the first run that clears the threshold on its own ground (or the longest when
+        # none does). The local re-score is what stops a run being under-counted because
+        # the global path gave half its words to a later copy.
+        runs: list[list[int]] = [[matches[0]]]
+        for position in matches[1:]:
+            if window[position][1] - window[runs[-1][-1]][2] > 8.0:
+                runs.append([position])
+            else:
+                runs[-1].append(position)
+        chosen: tuple[int, int] | None = None
+        fallback: tuple[int, tuple[int, int]] | None = None
+        for run in runs:
+            low, high = run[0], run[-1]
+            # Two seconds, not more: this song's chorus-to-bridge rest is exactly 4.0 s,
+            # and an expansion that bridges it re-glues the repeats the runs just split.
+            # Two seconds still spans every breath inside a sung passage here (max 1.4 s).
+            while low > 0 and window[low][1] - window[low - 1][2] <= 2.0:
+                low -= 1
+            while high + 1 < len(window) and window[high + 1][1] - window[high][2] <= 2.0:
+                high += 1
+            local_count, local = _lcs_matches(tokens, window[low:high + 1])
+            if not local:
+                continue
+            span = (low + local[0], low + local[-1])
+            if local_count >= threshold:
+                chosen = span
+                break
+            if fallback is None or local_count > fallback[0]:
+                fallback = (local_count, span)
+        if chosen is None:
+            if fallback is None:
+                continue
+            chosen = fallback[1]
+        first, last = chosen
+        aligned.append((tag, window[first][1], window[last][2]))
+        cursor = cursor + last + 1
+    return aligned
+
+
+def _lcs_matches(
+    tokens: list[str], window: list[tuple[str, float, float]]
+) -> tuple[int, list[int]]:
+    """Longest common subsequence of a block against a transcript slice.
+
+    Returns the match count and the traceback's window indices, in order. Plain LCS —
+    ordered, gaps free on both sides — because that is what survives a mishearing
+    mid-line where any greedy walk loses its place.
+    """
+    n, m = len(tokens), len(window)
+    table = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        row, next_row = table[i], table[i + 1]
+        for j in range(m - 1, -1, -1):
+            if _tokens_agree(tokens[i], window[j][0]):
+                row[j] = 1 + next_row[j + 1]
+            else:
+                row[j] = max(next_row[j], row[j + 1])
+    i = j = 0
+    matches: list[int] = []
+    while i < n and j < m:
+        if _tokens_agree(tokens[i], window[j][0]):
+            matches.append(j)
+            i += 1
+            j += 1
+        elif table[i + 1][j] >= table[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return table[0][0], matches
+
+
+def proposed_sections_from_alignment(
+    aligned: list[tuple[str, float, float]], song_duration: float
+) -> list[tuple[str, float, float, str]]:
+    """Aligned blocks as a whole-song section tiling: (label, start, duration, prompt).
+
+    Repeated tags gain ordinals ("Verse", "Chorus", "Verse 2"…) so the timeline reads, and
+    `section_lyrics`' family pairing still matches them to their sheet blocks. Each section
+    runs to the next block's first word — an instrumental tail belongs to the section it
+    follows, which is how a Director hears it — and the last runs out the song. Time before
+    the first word is an "Intro" section when it is at least two seconds, because that gap
+    is exactly the planning fact the Director asked for (b-roll space, no lipsync).
+    Prompts are left empty: timing is measured, look is authored.
+    """
+    if not aligned or song_duration <= 0:
+        return []
+    proposals: list[tuple[str, float, float, str]] = []
+    counts: dict[str, int] = {}
+    first_start = round(aligned[0][1], 2)
+    if first_start >= 2.0:
+        proposals.append(("Intro", 0.0, first_start, ""))
+    for index, (tag, start, _end) in enumerate(aligned):
+        counts[tag] = counts.get(tag, 0) + 1
+        label = tag if counts[tag] == 1 else f"{tag} {counts[tag]}"
+        section_start = round(start, 2) if proposals or index > 0 else 0.0
+        if index == 0 and not proposals:
+            # No intro worth marking: the first section owns the opening seconds too.
+            section_start = 0.0
+        next_start = (
+            round(aligned[index + 1][1], 2) if index + 1 < len(aligned) else song_duration
+        )
+        duration = round(next_start - section_start, 2)
+        if duration > 0:
+            proposals.append((label, section_start, duration, ""))
+    return proposals
+
+
 def ordered_shots(project: Project) -> list[Shot]:
     """The project's Shots in song order — the one ordering the expansion path uses.
 

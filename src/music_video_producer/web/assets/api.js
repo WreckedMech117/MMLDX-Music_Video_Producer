@@ -2363,6 +2363,10 @@ export const api = {
   // The flag is the Director's acknowledgement, so it is passed through rather than
   // hardcoded: a caller that never showed SONG_CHANGE_CONSEQUENCE must not claim it did.
   removeSong: (id, confirmed = false) => request(`/api/projects/${id}/song?confirm_song_replacement=${confirmed ? "true" : "false"}`, { method: "DELETE" }),
+  // Whisper over the track, the sheet's [Tag] blocks timed against it, the Sections row
+  // filled from the measurement. First run transcribes (minutes, CPU); the words are kept
+  // on the Song so every later run is instant.
+  alignLyrics: (id, body = {}) => request(`/api/projects/${id}/song/align-lyrics`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   uploadAsset: (id, data) => request(`/api/projects/${id}/assets/upload`, { method: "POST", body: data }),
   generateMusic: (id, body) => request(`/api/projects/${id}/generate/music`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateSongPlanner: (id, body) => request(`/api/projects/${id}/generate/songplanner`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

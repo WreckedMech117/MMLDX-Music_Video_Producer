@@ -58,6 +58,13 @@ class Song(BaseModel):
     #: whose windows sit in the intro and outro — told to sing over an instrumental
     #: reference, H3 invents its own words and lipsyncs to them.
     vocal_spans: list[tuple[float, float]] = Field(default_factory=list)
+    #: Every word Whisper heard in the track, as (text, start, end) — the raw measurement
+    #: `vocal_spans` and the lyric-to-time alignment both derive from, kept so re-deriving
+    #: never costs another transcription. Empty means unmeasured, exactly as above. The
+    #: Director's uses, in their own words (2026-08-20): "knowing where words are and
+    #: arent is useful for knowing which Shots have words, when the cuts should happen,
+    #: when the chorus and verses are".
+    lyric_words: list[tuple[str, float, float]] = Field(default_factory=list)
 
 
 class SongSection(BaseModel):

@@ -261,7 +261,7 @@ export function renderSong() {
   $("#song-source").textContent = song?.source?.toUpperCase() || "EMPTY";
   $("#duration-value").textContent = song?.duration ? formatTime(song.duration) : "—";
   $("#timeline-value").textContent = song?.duration ? `${state.project?.shots.length || 0} shots · ready` : "Waiting for song";
-  $("#analyze-song").disabled = true;
+  $("#analyze-song").disabled = !song || !song.path;
   $("#remove-song").disabled = !song;
   $("#send-treatment").disabled = !song;
   $("#waveform-empty").style.display = state.audioBuffer ? "none" : "grid";
@@ -1923,6 +1923,33 @@ function bindEvents() {
   // Every bounded box keeps its own counter current, the import block's included: those two are not
   // seeded from anything, so a render is not what puts a number under them.
   SONG_CONTEXT_COUNTS.forEach((control) => $(control.field).addEventListener("input", renderSongContextCounts));
+  $("#analyze-song").addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const projectId = state.project.id;
+    // The two costs, said up front: a first run transcribes on CPU for a few minutes, and
+    // section boxes the Director has already placed are theirs to overwrite, never assumed.
+    const replace = Boolean(state.project.sections?.length);
+    const question = replace
+      ? "Replace the existing section boxes with the measured lyric alignment?"
+      : "Analyze the track and fill the Sections row from the lyric sheet's [Tag] blocks?" +
+        (state.project.song?.lyric_words?.length ? "" :
+          "\n(First run transcribes the song on CPU — a few minutes.)");
+    if (!window.confirm(question)) return;
+    const button = $("#analyze-song");
+    button.disabled = true;
+    button.textContent = "Analyzing…";
+    try {
+      const project = await api.alignLyrics(projectId, { replace_sections: replace });
+      if (state.project?.id !== projectId) return;
+      state.project = project;
+      renderAll();
+      toast(`Sections filled from the track: ${project.sections.map((s) => s.label).join(" · ")}`);
+    } catch (error) { toast(error.message, "error"); }
+    finally {
+      button.textContent = "Analyze structure";
+      renderSong();
+    }
+  });
   $("#remove-song").addEventListener("click", async () => {
     if (!requireProject()) return;
     if (!state.project.song) return toast("This project has no song to remove.", "error");
