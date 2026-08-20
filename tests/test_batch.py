@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import get_args
 
 from music_video_producer.batch import (
+    JOB_LOST_WITH_QUEUE,
+    MISSING_TICKS_LIMIT,
     NEAR_DUPLICATE_OVERLAP,
     PLACEHOLDER_PROMPT,
     PLAN_WITHOUT_SHOTS,
@@ -463,7 +465,7 @@ class ScriptedComfy:
         if prompt_id in self.history_errors:
             raise ComfyError("history unavailable")
         return self.histories.get(prompt_id) or HistoryResult(
-            prompt_id=prompt_id, status="queued"
+            prompt_id=prompt_id, status="queued", known=False
         )
 
 
@@ -611,20 +613,42 @@ async def test_one_failed_history_lookup_skips_that_job_and_reconciles_the_rest(
     assert project.song.path == "music-video-producer/p/out/spine_00001_.flac"
 
 
-async def test_a_vanished_prompt_keeps_its_status_rather_than_inventing_an_error():
-    """Absent from the queue with an empty history is "nothing known yet", not a failure.
+async def test_a_vanished_prompt_keeps_its_status_until_absence_persists():
+    """Absent from the queue with an empty history is "nothing known yet" — for a while.
 
-    It is also what the manual per-job refresh has always reported for that state, and the two
-    paths must not tell different stories about one job.
+    One absent tick is what the seconds of a ComfyUI restart look like, so the early ticks
+    only *count* (persisted, so the counter survives the browser's two-second poll). At
+    `MISSING_TICKS_LIMIT` the absence is the answer: the prompt died with the queue, the job
+    settles as that error in `JOB_LOST_WITH_QUEUE`'s words, and the h3 job's shot moves to
+    `error` so it stops pinning render-status "active" and can be re-opened. Met three times
+    live on 2026-08-19/20: pulled queue entries and a CUDA-crash restart each left jobs
+    "queued" forever.
     """
     project = render_plan()
     comfy = ScriptedComfy()
 
+    for tick in range(1, MISSING_TICKS_LIMIT):
+        outcome = await reconcile_render_jobs(project, comfy)
+        # The counter moved (and must be saved), but no status was invented.
+        assert outcome.changed is True
+        assert {job.status for job in project.jobs} == {"queued", "complete"}
+    assert sorted(set(comfy.history_calls)) == ["prompt-flux", "prompt-h3", "prompt-music"]
+
     outcome = await reconcile_render_jobs(project, comfy)
 
-    assert outcome.changed is False
-    assert {job.status for job in project.jobs} == {"queued", "complete"}
-    assert sorted(comfy.history_calls) == ["prompt-flux", "prompt-h3", "prompt-music"]
+    assert outcome.changed is True
+    settled = {job.id: job for job in project.jobs if job.status != "complete"}
+    assert {job.status for job in settled.values()} == {"error"}
+    assert all(job.error == JOB_LOST_WITH_QUEUE for job in settled.values())
+    # The h3 job's shot is released from its stuck in-flight status...
+    assert project.shots[0].status == "error"
+    # ...and a lost job that reappears in the queue is forgiven its strikes.
+    reborn = ScriptedComfy(pending=["prompt-h3"])
+    fresh = render_plan()
+    fresh.jobs[1].missing_ticks = MISSING_TICKS_LIMIT - 1
+    await reconcile_render_jobs(fresh, reborn)
+    assert fresh.jobs[1].missing_ticks == 0
+    assert fresh.jobs[1].status == "queued"
 
 
 async def test_h3_completion_moves_the_shot_and_displaces_the_stale_review():

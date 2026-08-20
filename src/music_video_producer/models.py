@@ -704,6 +704,14 @@ class RenderJob(BaseModel):
     # inputs are the submitted graph, which `prompt_id` already names.
     inputs: list[str] = Field(default_factory=list)
     error: str = ""
+    #: Consecutive reconcile ticks on which ComfyUI knew nothing about this job's prompt —
+    #: absent from the queue AND from history. Reset to 0 the moment either answers. At
+    #: `batch.MISSING_TICKS_LIMIT` the reconciler settles the job as its prompt having died
+    #: with the queue (a crash, a restart, or a hand-cleared queue), which is what ended the
+    #: stuck-"queued"-forever jobs met three times live on 2026-08-19/20. A small counter
+    #: rather than an immediate verdict because one absent tick is also what the seconds of
+    #: a ComfyUI restart look like, and inventing an error there would be a lie.
+    missing_ticks: int = 0
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
 

@@ -28,6 +28,11 @@ class HistoryResult:
     outputs: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    #: Whether ComfyUI's history actually holds this prompt. ``status`` alone cannot say:
+    #: an unknown prompt answers "queued", which is also what a genuinely waiting prompt
+    #: answers — and that ambiguity is how a job whose prompt died with a crashed queue
+    #: stayed "queued" in the manifest forever (met three times live on 2026-08-19/20).
+    known: bool = True
 
 
 class ComfyClient:
@@ -141,7 +146,7 @@ class ComfyClient:
         payload = self._json(await self._request("GET", f"/history/{quote(prompt_id)}"))
         entry = payload.get(prompt_id)
         if not entry:
-            return HistoryResult(prompt_id=prompt_id, status="queued", raw=payload)
+            return HistoryResult(prompt_id=prompt_id, status="queued", raw=payload, known=False)
         status_data = entry.get("status", {})
         status = status_data.get("status_str", "complete" if entry.get("outputs") else "running")
         if status == "success":

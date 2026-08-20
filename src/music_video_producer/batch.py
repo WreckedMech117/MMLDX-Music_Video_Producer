@@ -374,6 +374,17 @@ TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"complete", "error", "cancell
 #: which is the only honest reading of "there is an entry and it is not finished".
 _ADOPTED_HISTORY_STATUSES = frozenset({"queued", "running", "complete", "error"})
 
+#: How many consecutive reconcile ticks a prompt may be unknown to both ComfyUI's queue and
+#: its history before the job is settled as lost. Three ticks of the browser's two-second
+#: poll rides out a restart's ambiguous seconds; a prompt still unknown after that died
+#: with the queue.
+MISSING_TICKS_LIMIT = 3
+
+JOB_LOST_WITH_QUEUE = (
+    "ComfyUI no longer knows this prompt — its queue was cleared, restarted, or crashed "
+    "before the render ran. Nothing was produced. Render again re-opens the shot."
+)
+
 
 def reconcilable_jobs(project: Project) -> list[RenderJob]:
     """The jobs whose answer still lives on ComfyUI, in manifest order.
@@ -506,10 +517,14 @@ async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconcili
     * a dead ComfyUI fails the tick quietly (`comfy_online=False`, nothing touched) and one
       job's failed history lookup skips that job and keeps going — the next tick asks again.
 
-    A job absent from both the queue and history keeps the status it has, exactly as the
-    manual per-job refresh always left it: inventing an error for it would mark a prompt
-    "failed" in the seconds ComfyUI takes to admit a restart, and the honest answer is that
-    nothing is known yet.
+    A job absent from both the queue and history keeps the status it has for a few ticks,
+    exactly as the manual per-job refresh always left it: inventing an error on the first
+    absence would mark a prompt "failed" in the seconds ComfyUI takes to admit a restart,
+    and the honest answer there is that nothing is known yet. But absence that *persists*
+    is an answer — a crash, a restart, or a hand-cleared queue took the prompt with it, and
+    a job left "queued" forever pins render-status at "active" and blocks the shot's
+    re-open. `MISSING_TICKS_LIMIT` consecutive unknown ticks settle it as that error, with
+    the counter reset whenever ComfyUI answers (met three times live on 2026-08-19/20).
     """
     open_jobs = reconcilable_jobs(project)
     if not open_jobs:
@@ -522,16 +537,32 @@ async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconcili
     for job in open_jobs:
         in_queue = located.get(job.prompt_id)
         if in_queue is not None:
-            if job.status != in_queue:
+            if job.status != in_queue or job.missing_ticks:
                 job.status = in_queue
+                job.missing_ticks = 0
                 changed = True
             continue
         try:
             history = await comfy.history(job.prompt_id)
         except ComfyError:
             continue
+        # `getattr` with a True default: a test double built before `known` existed is a
+        # history that answered, and answering is exactly what the default means.
+        if not getattr(history, "known", True):
+            job.missing_ticks += 1
+            changed = True
+            if job.missing_ticks >= MISSING_TICKS_LIMIT:
+                job.status = "error"
+                job.error = JOB_LOST_WITH_QUEUE
+                shot = next(
+                    (item for item in project.shots if item.id == job.target_id), None
+                )
+                if job.kind == "h3" and shot and shot.status in ("queued", "running"):
+                    shot.status = "error"
+            continue
         before = (job.status, list(job.output_files), job.error)
         apply_job_history(project, job, history)
+        job.missing_ticks = 0
         if (job.status, job.output_files, job.error) != before:
             changed = True
     return RenderReconciliation(changed=changed, comfy_online=True)
