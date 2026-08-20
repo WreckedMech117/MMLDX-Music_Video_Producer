@@ -252,7 +252,7 @@
             <div class="block-heading"><h2>Flux image generation</h2><span>Characters · settings</span></div>
             <form id="flux-form">
               <label>Name<input name="name" required placeholder="Lead performer"></label>
-              <label>Asset type<select name="kind"><option value="character">Character</option><option value="setting">Setting</option><option value="prop">Prop</option><option value="style">Style reference</option></select></label>
+              <label>Asset type<select name="kind"><option value="character">Character</option><option value="setting">Setting</option><option value="prop">Prop</option><option value="style">Style reference</option><option value="video">Video clip</option><option value="audio">Audio</option></select></label>
               <label>Prompt<textarea name="prompt" rows="8" required placeholder="Full visual prompt, identity details, wardrobe, environment and lighting…"></textarea></label>
               <div class="form-row">
                 <label>Aspect<select name="aspect"><option value="1024x1024">1:1</option><option value="1344x768">16:9</option><option value="768x1344">9:16</option><option value="1216x832">3:2</option></select></label>
@@ -272,6 +272,7 @@
               <input id="asset-search" type="search" placeholder="Search library">
             </div>
             <div class="asset-grid" id="asset-grid"><div class="library-empty"><strong>No assets yet</strong><span>Generate a character or setting with Flux, or upload existing media.</span></div></div>
+            <div id="clips-library"></div>
           </div>
           <aside class="inspector" id="asset-inspector">
             <span class="eyebrow">Inspector</span><h2>Select an asset</h2><p>Review provenance, generate multiview references, and attach approved assets to shots.</p>
@@ -294,6 +295,7 @@
             <div class="timeline-monitor" id="timeline-monitor">
               <video id="monitor-video" muted playsinline preload="auto"></video>
               <div class="monitor-overlay" id="monitor-overlay">No shot under the playhead</div>
+              <button id="monitor-fullscreen" class="monitor-fullscreen" title="Fullscreen the Monitor (Esc to leave)">⛶</button>
             </div>
             <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><!-- The two line mutes from the Director's workflow: audition controls, session-only,
               never persisted. Muting the song silences the master element without stopping it,
@@ -323,7 +325,7 @@
       <section class="panel" id="panel-queue" aria-labelledby="queue-heading">
         <div class="workspace-heading">
           <div><span class="eyebrow">ComfyUI orchestration</span><h1 id="queue-heading">Render queue</h1></div>
-          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="quiet-button" id="queue-flagged" hidden title="Resubmit every flagged shot as one batch; each success clears that shot's flag">Re-queue flagged</button><label class="replace-existing-line" title="Also re-render settled shots (complete or error). Approved and locked shots are never touched — the batch report names them."><input type="checkbox" id="replace-existing"> Replace existing takes</label><button class="primary-button" id="queue-ready" disabled title="Mark a shot ready to queue H3">Generate All</button></div>
+          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="quiet-button" id="queue-flagged" hidden title="Resubmit every flagged shot as one batch; each success clears that shot's flag">Re-queue flagged</button><button class="quiet-button" id="mark-all-ready" title="Commit every unlocked draft shot to the render queue in one pass — the per-shot Mark ready, forty times, without forty clicks.">Mark all drafts ready</button><label class="replace-existing-line" title="Also re-render settled shots (complete or error). Approved and locked shots are never touched — the batch report names them."><input type="checkbox" id="replace-existing"> Replace existing takes</label><button class="primary-button" id="queue-ready" disabled title="Mark a shot ready to queue H3">Generate All</button></div>
         </div>
         <!-- The plan's readiness, directly above the batch button that acts on it: how many shots
              carry a prompt, every shot that blocks submission, and every near-duplicate pair the

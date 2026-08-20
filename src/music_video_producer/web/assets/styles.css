@@ -239,7 +239,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .timeline-panel { padding-bottom: 14px; overflow: hidden; }
 .timeline-tools .divider { height: 22px; border-left: 1px solid var(--line); margin: 0 4px; }
 .timeline-layout { display: grid; grid-template-columns: minmax(620px, 1fr) 280px; gap: 12px; height: calc(100% - 65px); min-height: 500px; }
-.timeline-main { display: grid; grid-template-rows: minmax(200px, 34vh) 42px 1fr; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+/* The Monitor row breathes with the viewport (the Director's report, 2026-08-20: a
+   fullscreened browser cut the bottom half of the video off behind the timeline) and the
+   scroll row owns the leftover, min-height 0 so grid never lets the tracks blow out over
+   the Monitor. Fullscreening the Monitor itself is the ⛶ button. */
+.timeline-main { display: grid; grid-template-rows: minmax(200px, 46vh) 42px minmax(0, 1fr); min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+.monitor-fullscreen { position: absolute; right: 10px; bottom: 10px; z-index: 2; width: 34px; height: 30px; border: 1px solid var(--line-strong); border-radius: 4px; background: #000a; color: var(--ink); cursor: pointer; opacity: 0; transition: opacity .15s; }
+.timeline-monitor:hover .monitor-fullscreen { opacity: 1; }
+.timeline-monitor:fullscreen { background: #000; }
+.timeline-monitor:fullscreen video { width: 100vw; height: 100vh; object-fit: contain; }
 .timeline-monitor { position: relative; background: #000; border-bottom: 1px solid var(--line); display: grid; place-items: center; overflow: hidden; }
 .timeline-monitor video { width: 100%; height: 100%; object-fit: contain; }
 .monitor-overlay { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font: 12px Consolas, monospace; letter-spacing: .08em; background: rgba(0,0,0,.72); pointer-events: none; }
@@ -260,7 +268,18 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .waveform-track { min-height: 80px; }
 #timeline-waveform { display: block; width: 100%; height: 78px; }
 .shots-track { min-height: 110px; }
-.refs-track { min-height: 70px; }
+.refs-track { min-height: 52px; }
+.takes-strip { display: grid; gap: 5px; margin: 8px 0; padding: 9px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
+.clips-heading { margin: 16px 2px 8px; font: 11px Consolas, monospace; letter-spacing: .08em; color: var(--muted); }
+.clips-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.clip-card { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+.clip-card video { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; }
+.clip-card footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 6px 8px; font-size: 10px; color: var(--muted); }
+.take-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; }
+.take-row span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.take-row.current span { color: var(--acid); }
+.take-row .use-take { flex: none; padding: 3px 10px; }
+.refs-track .track-content { overflow: visible; }
 .shot-clip { position: absolute; top: 12px; height: 82px; min-width: 40px; border: 1px solid #67732f; border-radius: 5px; background: #232919; color: var(--ink); overflow: hidden; user-select: none; }
 .shot-clip.selected { border-color: var(--acid); box-shadow: inset 0 -3px var(--acid); }
 /* A Shot that cannot be submitted, carried by border *style* and by the flag text app.js writes
@@ -268,13 +287,24 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    after .selected so a blocked clip stays visibly blocked while selected; selection is still
    legible there, because .selected also carries an inset shadow this rule does not touch. */
 .shot-clip.no-prompt { border-style: dashed; border-color: var(--red-edge); }
+/* Render state on the clip itself: a left bar per status, approval and flags as accents.
+   Colour is never the only signal — the inspector's status chip carries the word. */
+.shot-clip { border-left-width: 3px; }
+.shot-clip.status-ready { border-left-color: #b9c46a; }
+.shot-clip.status-queued, .shot-clip.status-running { border-left-color: #4aa3c7; }
+.shot-clip.status-complete { border-left-color: #58b06b; }
+.shot-clip.status-error { border-left-color: var(--red, #c75454); }
+.shot-clip.approved { border-left-color: #d4f75e; background: #262e1c; }
+.shot-clip.flagged { border-top: 2px solid #c78a3a; }
+.shot-clip.locked .clip-id::after { content: " 🔒"; }
 .shot-clip .clip-id { display: block; padding: 7px 9px 3px; color: var(--acid); font: 9px Consolas, monospace; }
 .shot-clip .clip-prompt { display: -webkit-box; padding: 0 9px; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: 11px; line-height: 1.35; }
 .shot-clip.no-prompt .clip-prompt { color: var(--red); font: 9px Consolas, monospace; letter-spacing: .08em; }
-.resize-handle { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; }
+.resize-handle { position: absolute; top: 0; bottom: 0; width: 12px; cursor: ew-resize; }
+.resize-handle:hover { background: linear-gradient(90deg, transparent, #d4f75e33, transparent); }
 .resize-handle.left { left: 0; }
 .resize-handle.right { right: 0; }
-.ref-pill { position: absolute; top: 14px; height: 28px; padding: 6px 9px; border: 1px solid #316866; border-radius: 3px; background: #172525; color: var(--cyan); font-size: 10px; overflow: hidden; white-space: nowrap; }
+.ref-pill { position: absolute; height: 20px; padding: 3px 9px; border: 1px solid #316866; border-radius: 3px; background: #172525; color: var(--cyan); font-size: 10px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .timeline-playhead { position: absolute; top: 0; bottom: 0; left: 90px; z-index: 8; width: 1px; background: var(--acid); pointer-events: none; }
 .timeline-playhead::before { content: ""; position: absolute; top: 0; left: -4px; border-width: 6px 4px 0; border-style: solid; border-color: var(--acid) transparent transparent; }
 .shot-status { display: inline-block; padding: 3px 6px; border: 1px solid var(--line); color: var(--muted); font: 9px Consolas, monospace; text-transform: uppercase; }
@@ -373,7 +403,10 @@ dialog p { color: var(--muted); line-height: 1.5; }
    width. Set on `.toast` as well as the region so a toast that later gains its own background,
    border or handler still cannot swallow a click aimed at what is underneath it. */
 .toast-region { position: fixed; right: 18px; bottom: 18px; z-index: 50; display: grid; gap: 8px; pointer-events: none; }
-.toast { width: min(380px, calc(100vw - 36px)); padding: 11px 13px; border: 1px solid var(--line-strong); border-left: 3px solid var(--acid); border-radius: var(--radius); background: #1b1e1d; box-shadow: 0 12px 40px #0008; font-size: 12px; pointer-events: none; }
+/* The toast itself takes clicks again — but ONLY to dismiss itself (2026-08-20): errors
+   stay until clicked and long reports linger, so a dead click-shield would trap stale
+   text over the workspace. The region stays pointer-transparent between toasts. */
+.toast { width: min(380px, calc(100vw - 36px)); padding: 11px 13px; border: 1px solid var(--line-strong); border-left: 3px solid var(--acid); border-radius: var(--radius); background: #1b1e1d; box-shadow: 0 12px 40px #0008; font-size: 12px; pointer-events: auto; cursor: pointer; }
 .toast.error { border-left-color: var(--red); }
 @media (max-width: 1180px) {
   .topbar { grid-template-columns: 220px minmax(170px, 1fr) auto; }

@@ -2636,6 +2636,29 @@ class AssistantRequest(BaseModel):
     shot_ids: list[str] = Field(min_length=1)
 
 
+class SelectTakeRequest(BaseModel):
+    #: A file one of this Shot's own h3 jobs produced (repo-relative under ComfyUI's
+    #: output root), or —
+    output: str = ""
+    #: — a video asset to attach as this Shot's clip. Exactly one of the two.
+    asset_id: str = ""
+
+
+SELECT_TAKE_LOCKED = (
+    "{shot} is locked. A lock is a deliberate hands-off on this shot, and swapping the "
+    "clip it shows is exactly the kind of change it refuses. Unlock the shot first."
+)
+SELECT_TAKE_UNKNOWN = (
+    "That file is not one of {shot}'s own takes. A shot's clip can be switched to a take "
+    "its render history produced, or to a video asset via asset_id."
+)
+SELECT_TAKE_NOT_VIDEO = (
+    "{name} is not a video asset, so it cannot be a shot's clip. Upload the video in the "
+    "Assets panel first."
+)
+SELECT_TAKE_EMPTY = "Send output (one of the shot's takes) or asset_id (a video asset)."
+
+
 class AlignLyricsRequest(BaseModel):
     #: Re-run Whisper even when words are already stored — for a replaced or re-mastered file.
     retranscribe: bool = False
@@ -5028,6 +5051,100 @@ def create_app(
         Shot whose prompt was emptied would trap it armed, which is exactly backwards.
         """
         return _set_shot_commitment(project_id, shot_id, "draft")
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/select-take", response_model=Project
+    )
+    def select_shot_take(
+        project_id: str, shot_id: str, request: SelectTakeRequest
+    ) -> Project:
+        """Point one Shot's `latest_output` at a different clip — an earlier take, or a
+        video asset.
+
+        The Director's asks, verbatim (2026-08-20): "Could also use a way to switch the
+        selected clip in a shot to a different one if i want" and "I currently have no way
+        of attaching a video of my selection from files/assets to a shot i add to the
+        timeline". One route for both, because both are the same write: the single
+        `latest_output` pointer moves, nothing else. The take strip in the inspector is
+        derived client-side from the shot's own job history, so this route only has to
+        accept what it can verify:
+
+        - ``output``: a file one of this Shot's own h3 jobs actually produced — the job
+          record is the provenance check, so the route cannot be pointed at another
+          shot's take by path games.
+        - ``asset_id``: a video asset. A generated one already lives under ComfyUI's
+          output root and is pointed at directly; an *uploaded* one is copied under
+          ``music-video-producer/{project}/clips/`` first, because every reader of
+          `latest_output` — the Monitor stream, assembly's probes — resolves against the
+          output root and teaching them all a second root is how path handling forks.
+
+        Selecting an external clip clears the over-render bookkeeping (`latest_take_lead`,
+        `trim_nudge`): those numbers describe a take rendered with the margin, and carried
+        onto a hand-picked clip they would cut its opening quarter-second for no reason.
+        A draft shot gains `complete` — it has a clip now, which is what the status tracks.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if shot.locked:
+            raise HTTPException(
+                status_code=422,
+                detail=SELECT_TAKE_LOCKED.format(shot=shot_label(project, shot)),
+            )
+        output_root = (settings.comfy_root / "output").resolve()
+        if request.output:
+            produced = {
+                file
+                for job in project.jobs
+                if job.kind == "h3" and job.target_id == shot.id
+                for file in job.output_files
+            }
+            if request.output not in produced:
+                raise HTTPException(
+                    status_code=422,
+                    detail=SELECT_TAKE_UNKNOWN.format(shot=shot_label(project, shot)),
+                )
+            target = (output_root / Path(request.output)).resolve()
+            if output_root not in target.parents or not target.is_file():
+                raise HTTPException(
+                    status_code=404,
+                    detail=TAKE_MISSING_FILE_REFUSAL.format(
+                        shot=shot_label(project, shot), path=request.output
+                    ),
+                )
+            if shot.latest_output != request.output:
+                shot.latest_review = None
+            shot.latest_output = request.output
+        elif request.asset_id:
+            asset = next((a for a in project.assets if a.id == request.asset_id), None)
+            if asset is None:
+                raise HTTPException(status_code=404, detail="Asset not found")
+            if asset.kind != "video":
+                raise HTTPException(
+                    status_code=422, detail=SELECT_TAKE_NOT_VIDEO.format(name=asset.name)
+                )
+            source = resolve_asset_path(project_id, asset)
+            if asset.source == "upload":
+                clips_dir = output_root / "music-video-producer" / project_id / "clips"
+                clips_dir.mkdir(parents=True, exist_ok=True)
+                landed = clips_dir / f"{asset.id}{source.suffix}"
+                if not landed.is_file():
+                    shutil.copyfile(source, landed)
+                pointer = landed.relative_to(output_root).as_posix()
+            else:
+                pointer = source.relative_to(output_root).as_posix()
+            if shot.latest_output != pointer:
+                shot.latest_review = None
+            shot.latest_output = pointer
+            # External clip: no over-render margin exists in it, so no lead to cut.
+            shot.latest_take_lead = 0.0
+            shot.trim_nudge = 0.0
+        else:
+            raise HTTPException(status_code=422, detail=SELECT_TAKE_EMPTY)
+        if shot.status in ("draft", "ready"):
+            shot.status = "complete"
+        return store.save(project)
 
     @app.get("/api/projects/{project_id}/shots/{shot_id}/take")
     def read_shot_take(project_id: str, shot_id: str) -> FileResponse:

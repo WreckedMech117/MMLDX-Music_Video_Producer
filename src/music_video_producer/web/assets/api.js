@@ -2376,6 +2376,9 @@ export const api = {
   // filled from the measurement. First run transcribes (minutes, CPU); the words are kept
   // on the Song so every later run is instant.
   alignLyrics: (id, body = {}) => request(`/api/projects/${id}/song/align-lyrics`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // One pointer moves: `output` switches among the shot's own takes (provenance is its
+  // job history), `asset_id` attaches a video asset as the shot's clip.
+  selectTake: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/select-take`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   uploadAsset: (id, data) => request(`/api/projects/${id}/assets/upload`, { method: "POST", body: data }),
   generateMusic: (id, body) => request(`/api/projects/${id}/generate/music`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateSongPlanner: (id, body) => request(`/api/projects/${id}/generate/songplanner`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

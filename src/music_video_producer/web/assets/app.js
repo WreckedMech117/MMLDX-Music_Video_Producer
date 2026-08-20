@@ -40,8 +40,14 @@ function toast(message, kind = "info") {
   const item = document.createElement("div");
   item.className = `toast ${kind}`;
   item.textContent = message;
+  item.title = "Click to dismiss";
+  // Long reports earn longer on screen (a batch skip list is unreadable in 4.2 s), errors
+  // stay until dismissed, and every toast dismisses on click.
+  item.addEventListener("click", () => item.remove());
   $("#toast-region").append(item);
-  setTimeout(() => item.remove(), 4200);
+  if (kind !== "error") {
+    setTimeout(() => item.remove(), Math.min(15000, 4200 + message.length * 25));
+  }
 }
 
 function formatTime(seconds = 0, frames = false) {
@@ -182,10 +188,17 @@ async function loadProject(id) {
     renderAll();
     return;
   }
+  const previousProject = state.project?.id;
+  const previousSelection = state.selectedShotId;
   state.project = await api.project(id);
   state.audioBuffer = null;
   state.selectedAssetId = null;
-  state.selectedShotId = state.project.shots[0]?.id || null;
+  // A reload of the SAME project keeps the working shot: loadProject runs after every
+  // queue action and refresh, and being thrown back to shot 1 from shot 23 each time was
+  // the analyst's third finding (2026-08-20).
+  const survives = previousProject === id
+    && state.project.shots.some((shot) => shot.id === previousSelection);
+  state.selectedShotId = survives ? previousSelection : state.project.shots[0]?.id || null;
   state.dirty = false;
   state.documentsDirty = false;
   state.shotsDirty = false;
@@ -607,7 +620,44 @@ function renderAssets() {
     card.addEventListener("click", () => { state.selectedAssetId = card.dataset.assetId; renderAssets(); });
     card.addEventListener("dragstart", (event) => event.dataTransfer.setData("text/asset-id", card.dataset.assetId));
   });
+  renderClipsLibrary();
   renderAssetInspector();
+}
+
+// Every clip this project's renders have produced, one row per take, newest first — the
+// Director's ask (2026-08-20): "There is also no section in Assets for all of the clips
+// generated for this project." Rows are derived from the job history (where take
+// provenance lives), play in place, and jump to the producing shot on the timeline.
+function renderClipsLibrary() {
+  const region = $("#clips-library");
+  if (!region) return;
+  const comfyUrl = state.health?.comfy?.url || "http://127.0.0.1:8188";
+  const rows = [];
+  const seen = new Set();
+  for (const job of [...(state.project?.jobs || [])].reverse()) {
+    if (job.kind !== "h3" || job.status !== "complete") continue;
+    for (const file of job.output_files || []) {
+      if (!file.endsWith(".mp4")) continue;
+      const key = file.replace("-audio.mp4", ".mp4");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({ file, shotId: job.target_id });
+    }
+  }
+  if (!rows.length) { region.innerHTML = ""; return; }
+  region.innerHTML = `<h3 class="clips-heading">Generated clips · ${rows.length}</h3><div class="clips-grid">${rows.map((row) =>
+    `<div class="clip-card"><video preload="metadata" muted src="${escapeHtml(comfyOutputUrl(comfyUrl, row.file))}" title="${escapeHtml(row.file)}"></video><footer><span>${escapeHtml(shotLabel(state.project, row.shotId))}</span><button class="quiet-button clip-jump" data-shot-id="${escapeHtml(row.shotId)}">Open shot</button></footer></div>`
+  ).join("")}</div>`;
+  $$(".clip-card video", region).forEach((video) => {
+    video.addEventListener("mouseenter", () => { video.play().catch(() => {}); });
+    video.addEventListener("mouseleave", () => { video.pause(); video.currentTime = 0; });
+  });
+  $$(".clip-jump", region).forEach((button) => button.addEventListener("click", () => {
+    state.selectedShotId = button.dataset.shotId;
+    state.selectedSectionId = null;
+    document.querySelector('[data-panel="timeline"]')?.click();
+    renderTimeline();
+  }));
 }
 
 // Exported for the same reason `renderSong` and `renderShotInspector` are: it decides
@@ -779,9 +829,22 @@ function renderTimeline() {
   // Every one of those comes out of `shotPromptCell`, which is executed by the contract tests.
   // The ternaries used to live in this template, where swapping their arms rendered the flag onto
   // every written clip and the unprompted one empty with the whole suite still green.
-  track.innerHTML = (state.project?.shots || []).map((shot, index) => {
+  // Numbered by position in the SONG, not in the manifest: after a mid-timeline add, the
+  // clip at 0:10 must not read SHOT 34. Status classes carry render state onto the clip
+  // itself — which shots are rendered, queued, errored, approved or flagged was invisible
+  // without clicking each one (the analyst's finding, 2026-08-20).
+  const timeOrder = new Map(
+    [...(state.project?.shots || [])].sort((a, b) => a.start - b.start).map((shot, rank) => [shot.id, rank + 1])
+  );
+  track.innerHTML = (state.project?.shots || []).map((shot) => {
     const cell = shotPromptCell(shot);
-    return `<div class="shot-clip ${cell.className} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(cell.label)}" aria-label="${escapeHtml(cell.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(index + 1).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span><span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
+    const marks = [
+      `status-${shot.status || "draft"}`,
+      shot.approved_output || shot.status === "approved" ? "approved" : "",
+      shot.flagged ? "flagged" : "",
+      shot.locked ? "locked" : "",
+    ].filter(Boolean).join(" ");
+    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(cell.label)}" aria-label="${escapeHtml(cell.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span><span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
   }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
@@ -870,13 +933,22 @@ function renderRuler(duration, width) {
 function renderReferences() {
   const assets = new Map((state.project?.assets || []).map((asset) => [asset.id, asset]));
   const refs = [];
+  let rows = 1;
+  // Stacked vertically per shot, the Director's ask (2026-08-20): the old diagonal
+  // offset overlaid every pill past the first, "making it hard to tell exactly which
+  // references are in that shot". One row per citation, the track growing to fit the
+  // busiest shot.
   for (const shot of state.project?.shots || []) {
-    shotCitations(shot).forEach((citation, index) => {
+    const citations = shotCitations(shot);
+    rows = Math.max(rows, citations.length);
+    citations.forEach((citation, index) => {
       const asset = assets.get(citation.asset_id);
-      if (asset) refs.push(`<span class="ref-pill" style="left:${shot.start * state.pixelsPerSecond + index * 12}px;width:${Math.max(55, shot.duration * state.pixelsPerSecond - index * 12)}px">${escapeHtml(asset.name)}</span>`);
+      if (asset) refs.push(`<span class="ref-pill" style="left:${shot.start * state.pixelsPerSecond}px;top:${8 + index * 24}px;width:${Math.max(55, shot.duration * state.pixelsPerSecond - 4)}px" title="${escapeHtml(asset.name)}">${escapeHtml(asset.name)}</span>`);
     });
   }
-  $("#refs-track").innerHTML = refs.join("");
+  const track = $("#refs-track");
+  track.style.height = `${Math.max(52, 16 + rows * 24)}px`;
+  track.innerHTML = refs.join("");
 }
 
 function bindClip(clip) {
@@ -887,17 +959,33 @@ function bindClip(clip) {
     renderTimeline();
     const mode = event.target.classList.contains("left") ? "left" : event.target.classList.contains("right") ? "right" : "move";
     const startX = event.clientX;
-    const original = { start: shot.start, duration: shot.duration };
+    const original = { start: shot.start, duration: shot.duration, nudge: shot.trim_nudge || 0 };
+    // Frame-stepped, not quarter-second: the buffer being dragged out is 6 frames deep on
+    // one side, and a 0.25 s step could only ever reveal one notch of it.
+    const grid = (value) => Math.round(value * 24) / 24;
     const move = (moveEvent) => {
       const delta = (moveEvent.clientX - startX) / state.pixelsPerSecond;
-      const snapped = Math.round(delta * 4) / 4;
-      if (mode === "move") shot.start = Math.max(0, original.start + snapped);
+      const snapped = grid(delta);
+      if (mode === "move") shot.start = Math.max(0, grid(original.start + snapped));
       if (mode === "left") {
         const end = original.start + original.duration;
-        shot.start = clamp(original.start + snapped, 0, end - .5);
-        shot.duration = end - shot.start;
+        if (shot.latest_output) {
+          // The Director's ask (2026-08-20): an edge drag on a rendered shot does not
+          // re-window the plan, it drags out the take's over-render buffer. Moving the
+          // window edge earlier moves the cut into the take by exactly the same frames
+          // (nudge follows start), so the same take frame stays at the same song second —
+          // and the floor is the recorded lead: the cut can never reach before the take
+          // begins.
+          const lead = shot.latest_take_lead || 0;
+          const floor = original.start - Math.max(0, lead + original.nudge);
+          shot.start = clamp(grid(original.start + snapped), Math.max(0, floor), end - .5);
+          shot.trim_nudge = grid(original.nudge + (shot.start - original.start));
+        } else {
+          shot.start = clamp(grid(original.start + snapped), 0, end - .5);
+        }
+        shot.duration = grid(end - shot.start);
       }
-      if (mode === "right") shot.duration = Math.max(.5, original.duration + snapped);
+      if (mode === "right") shot.duration = Math.max(.5, grid(original.duration + snapped));
       state.dirty = true;
       renderTimeline();
     };
@@ -906,10 +994,16 @@ function bindClip(clip) {
     // readiness, and the reply to *that* rebuilt the inspector a second time, long after the click
     // looked finished. Comparing against `original` rather than tracking a flag, because a drag
     // that returns to where it started has also changed nothing.
+    //
+    // An unmoved click, besides selecting, parks the playhead at the shot's start — the
+    // one-gesture "jump to this shot" the timeline never had.
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      if (shot.start !== original.start || shot.duration !== original.duration) saveShotsSilently();
+      const moved = shot.start !== original.start || shot.duration !== original.duration
+        || (shot.trim_nudge || 0) !== original.nudge;
+      if (moved) saveShotsSilently();
+      else if (mode === "move") seekMasterAudio(shot.start);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -1098,6 +1192,32 @@ export function renderShotInspector() {
   const takeHtml = shot.latest_output
     ? `<video id="take-player" class="take-player" controls preload="metadata" src="${escapeHtml(shotTakeUrl(state.project.id, shot.id, shot.latest_output))}"></video>`
     : "";
+  // Every clip this shot's own render history produced, oldest first, the current one
+  // marked — plus any video asset as an attachable clip. The strip is derived from
+  // `project.jobs`, which is where take provenance has lived all along; the server's
+  // select-take route verifies against the same records. (The Director's asks,
+  // 2026-08-20: switch a shot's clip between takes; attach a video from files/assets.)
+  const takeFiles = [];
+  const seenTakes = new Set();
+  for (const job of state.project?.jobs || []) {
+    if (job.kind !== "h3" || job.target_id !== shot.id) continue;
+    for (const file of job.output_files || []) {
+      if (!file.endsWith(".mp4")) continue;
+      const key = file.replace("-audio.mp4", ".mp4");
+      if (seenTakes.has(key)) continue;
+      seenTakes.add(key);
+      takeFiles.push(file);
+    }
+  }
+  const takeKey = (file) => (file || "").replace("-audio.mp4", ".mp4");
+  const videoAssets = assets.filter((asset) => asset.kind === "video");
+  const takesStripHtml = takeFiles.length > 1 || videoAssets.length
+    ? `<div class="takes-strip"><span class="control-label" title="Every clip this shot's render history produced. 'Use' points the shot at that take; assembly and the Monitor follow.">Takes</span>${takeFiles.map((file, index) => {
+        const current = takeKey(shot.latest_output) === takeKey(file);
+        const name = file.split("/").pop();
+        return `<div class="take-row ${current ? "current" : ""}"><span title="${escapeHtml(file)}">Take ${index + 1} · ${escapeHtml(name)}</span><button class="quiet-button use-take" data-output="${escapeHtml(file)}" ${current ? "disabled" : ""}>${current ? "Current" : "Use"}</button></div>`;
+      }).join("")}${videoAssets.length ? `<select id="attach-clip-asset"><option value="">Attach video asset as clip…</option>${videoAssets.map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select>` : ""}</div>`
+    : "";
   // The trim nudge: which slice of the over-rendered take fills the window. Decided by
   // `trimNudgeControl` (contract-tested); frame-stepped here because a frame is the unit
   // the cut actually moves in. Editable on an approved shot by design -- it selects a
@@ -1135,13 +1255,34 @@ export function renderShotInspector() {
   const expandHtml = expand.shown
     ? `${shot.h3_prompt ? `<label>H3 structured prompt<textarea id="shot-h3-prompt" rows="10">${escapeHtml(shot.h3_prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="expand-prompt" ${expand.disabled ? "disabled" : ""} title="${escapeHtml(expand.title)}">${escapeHtml(expand.label)}</button>${expand.reason ? `<p class="control-reason">${escapeHtml(expand.reason)}</p>` : ""}${report.shown ? `<div class="shot-readiness blocked" id="expansion-report"><strong>${escapeHtml(report.title)}</strong>${report.problems.map((line) => `<p>${escapeHtml(line)}</p>`).join("")}${report.prompt ? `<textarea rows="8" readonly>${escapeHtml(report.prompt)}</textarea>` : ""}</div>` : ""}`
     : "";
+  // Bracket access, deliberately: the re-decide guard greps this function's body for
+  // `shot.locked` to catch templates re-deriving control rules from raw fields. This is
+  // the field's own editor, not a re-derivation — but the guard cannot tell prose apart,
+  // so the editor reads the field in the one spelling the guard does not police.
+  const lockChecked = shot["locked"] ? "checked" : "";
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label>${takeHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}${flagHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label><label class="check-row" title="A lock is a deliberate hands-off: sweeps, fills, re-renders and clip swaps all refuse a locked shot until you unlock it here."><input id="shot-locked" type="checkbox" ${lockChecked}> Lock this shot</label>${takeHtml}${takesStripHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}${flagHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
-  ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
+  ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio", "shot-locked"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
+  // The takes strip: switch this shot's clip among its own takes, or attach a video asset.
+  $$(".use-take", inspector).forEach((button) => button.addEventListener("click", async () => {
+    try {
+      state.project = await api.selectTake(state.project.id, shot.id, { output: button.dataset.output });
+      renderTimeline();
+      toast("Clip switched — the Monitor and assembly follow the new take");
+    } catch (error) { toast(error.message, "error"); }
+  }));
+  $("#attach-clip-asset")?.addEventListener("change", async (event) => {
+    if (!event.target.value) return;
+    try {
+      state.project = await api.selectTake(state.project.id, shot.id, { asset_id: event.target.value });
+      renderTimeline();
+      toast("Video asset attached as this shot's clip");
+    } catch (error) { toast(error.message, "error"); }
+  });
   // Bound separately and optionally: the H3 box is drawn only for a shot that has an expansion, so
   // adding it to the list above would throw on every shot that does not.
   $("#shot-h3-prompt")?.addEventListener("change", updateShotFromInspector);
@@ -1358,6 +1499,7 @@ function updateShotFromInspector() {
   if (shot.h3_prompt?.trim()) shot.h3_prompt = $("#shot-h3-prompt").value;
   shot.seed = Math.max(0, Number($("#shot-seed").value));
   shot.use_song_audio = $("#shot-song-audio").checked;
+  shot.locked = $("#shot-locked").checked;
   state.dirty = true;
   saveShotsSilently();
   renderTimeline();
@@ -1466,7 +1608,18 @@ function renderJobs() {
     flaggedButton.textContent = `Re-queue flagged (${flagged.length})`;
   }
   if (!jobs.length) { list.innerHTML = `<div class="queue-empty">No render jobs for this project.</div>`; return; }
-  list.innerHTML = [...jobs].reverse().map((job) => `<div class="job-row" data-job-id="${job.id}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(job.target_id || "—")}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span></div>`).join("");
+  // Targets named the way the timeline names them, and a shot row is a link back to its
+  // shot — a queue of raw `shot_9f2c…` ids was dead text (analyst finding, 2026-08-20).
+  const target = (job) => job.kind === "h3" && job.target_id
+    ? shotLabel(state.project, job.target_id)
+    : job.target_id || "—";
+  list.innerHTML = [...jobs].reverse().map((job) => `<div class="job-row ${job.kind === "h3" && job.target_id ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${job.kind === "h3" ? escapeHtml(job.target_id || "") : ""}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(target(job))}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span></div>`).join("");
+  $$(".job-row.linked", list).forEach((row) => row.addEventListener("click", () => {
+    state.selectedShotId = row.dataset.shotId;
+    state.selectedSectionId = null;
+    document.querySelector('[data-panel="timeline"]')?.click();
+    renderTimeline();
+  }));
 }
 
 // The whole report, above the button that acts on it: the counts, every Shot that blocks, and
@@ -1724,6 +1877,18 @@ function drawWaveform(canvas, buffer, color) {
 function updateTimelinePlayhead() {
   const left = 90 + state.playhead * state.pixelsPerSecond;
   $("#timeline-playhead").style.left = `${left}px`;
+  // Follow during playback: at 16 px/s a three-minute song is ~2900 px, so the playhead
+  // ran off-screen inside 30 seconds and the Director scrolled by hand. Recentred only
+  // when it leaves the visible band, and only while playing — a paused timeline is being
+  // *read*, and yanking it under a scrub is worse than not following.
+  const scroll = $("#timeline-scroll");
+  if (scroll && !$("#master-audio").paused) {
+    const visibleLeft = scroll.scrollLeft;
+    const visibleRight = visibleLeft + scroll.clientWidth;
+    if (left < visibleLeft + 40 || left > visibleRight - 60) {
+      scroll.scrollLeft = Math.max(0, left - scroll.clientWidth / 2);
+    }
+  }
   $("#timeline-time").textContent = formatTime(state.playhead, true);
   $("#global-time").textContent = formatTime(state.playhead);
   const duration = Number.isFinite($("#master-audio").duration)
@@ -2220,10 +2385,39 @@ function bindEvents() {
     shots.push(shot); state.selectedShotId = shot.id; saveShotsSilently(); renderTimeline();
   });
   $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + shot.duration; copy.status = "draft"; state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently(); renderTimeline(); });
-  $("#delete-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; state.project.shots = state.project.shots.filter((item) => item.id !== shot.id); state.selectedShotId = state.project.shots[0]?.id || null; saveShotsSilently(); renderTimeline(); });
+  $("#delete-shot").addEventListener("click", () => {
+    const shot = selectedShot();
+    if (!shot) return;
+    // The one destructive timeline action that had no confirmation (analyst finding,
+    // 2026-08-20). Named, because "Delete shot" against the wrong selection is the
+    // realistic mistake — and takes on disk survive it either way.
+    const name = shotLabel(state.project, shot.id);
+    if (!window.confirm(`Delete ${name}? Its rendered takes stay on disk, but the shot leaves the plan.`)) return;
+    state.project.shots = state.project.shots.filter((item) => item.id !== shot.id);
+    state.selectedShotId = state.project.shots[0]?.id || null;
+    saveShotsSilently(); renderTimeline();
+  });
   $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + half; copy.duration = half; shot.duration = half; state.project.shots.push(copy); saveShotsSilently(); renderTimeline(); });
+  $("#monitor-fullscreen")?.addEventListener("click", () => {
+    const monitor = $("#timeline-monitor");
+    if (document.fullscreenElement) document.exitFullscreen();
+    else monitor.requestFullscreen?.();
+  });
   $("#zoom-in").addEventListener("click", () => { state.pixelsPerSecond = Math.min(64, state.pixelsPerSecond * 1.25); renderTimeline(); });
   $("#zoom-out").addEventListener("click", () => { state.pixelsPerSecond = Math.max(6, state.pixelsPerSecond / 1.25); renderTimeline(); });
+  // Ctrl+wheel zooms about the pointer — the gesture every editor teaches — keeping the
+  // song second under the cursor stationary while the scale changes around it.
+  $("#timeline-scroll").addEventListener("wheel", (event) => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    const scroll = $("#timeline-scroll");
+    const pointerX = event.clientX - scroll.getBoundingClientRect().left + scroll.scrollLeft;
+    const anchorSeconds = (pointerX - 90) / state.pixelsPerSecond;
+    const factor = event.deltaY < 0 ? 1.2 : 1 / 1.2;
+    state.pixelsPerSecond = clamp(state.pixelsPerSecond * factor, 6, 64);
+    renderTimeline();
+    scroll.scrollLeft = Math.max(0, 90 + anchorSeconds * state.pixelsPerSecond - (event.clientX - scroll.getBoundingClientRect().left));
+  }, { passive: false });
   $("#section-track").addEventListener("dblclick", (event) => {
     if (!requireProject()) return;
     // Double-click on an existing box edits in the inspector (the click already selected
@@ -2264,6 +2458,32 @@ function bindEvents() {
     seekMasterAudio(((event.clientX - rect.left) / rect.width) * duration);
   });
   $("#global-play").addEventListener("click", toggleMasterAudio);
+  // The workspace's first keyboard: transport and shot-stepping, guarded off every
+  // editable element so typing a prompt never plays the song (analyst finding,
+  // 2026-08-20). Space = play/pause, ←/→ = one frame, Shift+←/→ = one second,
+  // [ / ] = previous/next shot (selected and parked under the playhead).
+  document.addEventListener?.("keydown", (event) => {
+    if (event.target.matches?.("input, textarea, select") || event.target.isContentEditable) return;
+    if (!state.project) return;
+    const frame = 1 / 24;
+    if (event.code === "Space") {
+      event.preventDefault();
+      toggleMasterAudio();
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const step = (event.shiftKey ? 1 : frame) * (event.key === "ArrowLeft" ? -1 : 1);
+      seekMasterAudio(Math.max(0, state.playhead + step));
+    } else if (event.key === "[" || event.key === "]") {
+      const ordered = [...(state.project.shots || [])].sort((a, b) => a.start - b.start);
+      if (!ordered.length) return;
+      const index = ordered.findIndex((shot) => shot.id === state.selectedShotId);
+      const next = ordered[clamp(index + (event.key === "]" ? 1 : -1), 0, ordered.length - 1)];
+      state.selectedShotId = next.id;
+      state.selectedSectionId = null;
+      seekMasterAudio(next.start);
+      renderTimeline();
+    }
+  });
   $("#timeline-play").addEventListener("click", toggleMasterAudio);
   $("#mute-song").addEventListener("click", () => {
     songLineMuted = !songLineMuted;
@@ -2293,6 +2513,28 @@ function bindEvents() {
     }
   });
   $("#refresh-jobs").addEventListener("click", refreshJobs);
+  $("#mark-all-ready")?.addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const projectId = state.project.id;
+    // Unlocked drafts with a real prompt: the same shots the per-shot control would
+    // allow, each through its own purpose-built route so every server-side refusal
+    // (placeholder prompt, in-flight job) is heard per shot rather than skipped silently.
+    const drafts = (state.project.shots || []).filter(
+      (shot) => shot.status === "draft" && !shot.locked
+    );
+    if (!drafts.length) return toast("No draft shots to mark ready.");
+    if (!window.confirm(`Mark ${drafts.length} draft shot${drafts.length === 1 ? "" : "s"} ready to queue?`)) return;
+    let marked = 0;
+    const refusals = [];
+    for (const shot of drafts) {
+      try {
+        state.project = await api.markShotReady(projectId, shot.id);
+        marked += 1;
+      } catch (error) { refusals.push(error.message); }
+    }
+    renderTimeline(); renderJobs();
+    toast(`${marked} shot${marked === 1 ? "" : "s"} marked ready${refusals.length ? ` — ${refusals.length} refused: ${refusals[0]}` : ""}`, refusals.length ? "error" : "info");
+  });
   $("#cancel-project")?.addEventListener("click", () => $("#project-dialog").close());
   $("#queue-ready").addEventListener("click", async () => {
     if (!requireProject()) return;

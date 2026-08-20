@@ -9839,6 +9839,75 @@ def test_an_expansion_of_only_whitespace_is_treated_as_absent():
     assert reference_prompt(shot, ["<Picture 1> is Lucy"]).startswith("Reference map:")
 
 
+def test_select_take_switches_takes_and_attaches_video_assets(tmp_path: Path):
+    """The Director's asks (2026-08-20): switch a shot's clip to a different take, and
+    attach an uploaded video as a shot's clip. One pointer moves; provenance is the job
+    history; an uploaded video is copied under the output root so every reader of
+    latest_output keeps its single root."""
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Takes"))
+    shot = Shot(id="shot_t", start=0.0, duration=4.0, prompt="Wide", status="complete",
+                latest_output="p/shots/take_00002.mp4")
+    project.shots = [shot]
+    project.jobs = [
+        RenderJob(kind="h3", target_id="shot_t", status="complete", prompt_id="p1",
+                  output_files=["p/shots/take_00001.mp4"]),
+        RenderJob(kind="h3", target_id="shot_t", status="complete", prompt_id="p2",
+                  output_files=["p/shots/take_00002.mp4"]),
+    ]
+    project.assets = [
+        Asset(id="asset_clip", name="B-roll drive", kind="video",
+              path="media/assets/broll.mp4", source="upload"),
+        Asset(id="asset_img", name="Poster", kind="image", path="media/assets/p.png",
+              source="upload"),
+    ]
+    store.save(project)
+    output_root = tmp_path / "comfy" / "output"
+    (output_root / "p" / "shots").mkdir(parents=True)
+    (output_root / "p" / "shots" / "take_00001.mp4").write_bytes(b"one")
+    (output_root / "p" / "shots" / "take_00002.mp4").write_bytes(b"two")
+    (store.project_dir(project.id) / "media" / "assets").mkdir(parents=True)
+    (store.project_dir(project.id) / "media" / "assets" / "broll.mp4").write_bytes(b"clip")
+
+    # An earlier take of the shot's own history.
+    switched = client.post(
+        f"/api/projects/{project.id}/shots/shot_t/select-take",
+        json={"output": "p/shots/take_00001.mp4"},
+    )
+    assert switched.status_code == 200
+    assert switched.json()["shots"][0]["latest_output"] == "p/shots/take_00001.mp4"
+
+    # Another shot's file is refused: the job history is the provenance check.
+    foreign = client.post(
+        f"/api/projects/{project.id}/shots/shot_t/select-take",
+        json={"output": "p/shots/other_take.mp4"},
+    )
+    assert foreign.status_code == 422
+
+    # An uploaded video asset lands under the output root and becomes the clip, with the
+    # over-render bookkeeping cleared — no margin exists in a hand-picked file.
+    stored = store.get(project.id)
+    stored.shots[0].latest_take_lead = 0.25
+    stored.shots[0].trim_nudge = 0.1
+    store.save(stored)
+    attached = client.post(
+        f"/api/projects/{project.id}/shots/shot_t/select-take",
+        json={"asset_id": "asset_clip"},
+    )
+    assert attached.status_code == 200
+    body = attached.json()["shots"][0]
+    assert body["latest_output"] == f"music-video-producer/{project.id}/clips/asset_clip.mp4"
+    assert body["latest_take_lead"] == 0 and body["trim_nudge"] == 0
+    assert (output_root / "music-video-producer" / project.id / "clips" / "asset_clip.mp4").read_bytes() == b"clip"
+
+    # Not a video: refused with the remedy.
+    not_video = client.post(
+        f"/api/projects/{project.id}/shots/shot_t/select-take",
+        json={"asset_id": "asset_img"},
+    )
+    assert not_video.status_code == 422
+
+
 def test_expansion_allows_rederiving_prose_on_a_rendered_song_audio_shot():
     """The Director's live break (2026-08-20): on a fully-rendered plan, no intent edit
     could ever reach the prompt again — "Expand Prompt Again" refused every shot as
