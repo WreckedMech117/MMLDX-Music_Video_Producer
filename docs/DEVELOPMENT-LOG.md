@@ -4,6 +4,43 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-21 — First H3 renders against today's work: three claims tested, two held, one not shown
+
+The day's work was entirely offline- or LM-Studio-verified. Two real H3 renders on
+`project_59f14d19ff10` ("Harder Faster — Third Video"), turbo profile, 0.6 MP
+(1056x608), seed 3 on both, shot `shot_b51ebe410165` (11.00-15.07 s, singing, song audio).
+
+**Held: the appearance anchor reaches the render.** `Asset.consistency_prompt` set on the
+character produced `<Picture 1> is HarderFaster, a woman with long wild blonde curls in a
+black studded leather corset with oxblood panels` in the submitted prompt, and the take
+rendered normally: 1056x608, 124 frames (17k+5 for a 4.074 s window plus the over-render
+margin), 24 fps, AAC present, `latest_take_lead` 0.25. The mechanism is proven end to end.
+
+**Held: live render progress works on H3.** Observed 25 -> 50 -> 75 -> 100 (turbo is four
+steps), attributed by `prompt_id`, rows present only while running and cleared on settle.
+**And it measured its own limitation:** the first **112 s** of a 176 s render reported no
+percentage at all, because that is model loading and no step-counting node has started.
+Roughly **72% of that render was silent**. On a cold H3 render the silence is the majority
+of the wait, which is the surface the Director asked about.
+
+**NOT shown: that the anchor improves identity.** A controlled A/B — same seed, same
+window, same profile, one clause changed — held identity equally well in both takes.
+Blonde curls, studded corset, arm bracers, same face, both singing to the mic. If
+anything the *anchor-off* take stayed closer to the reference scene (it kept the concert
+stage and Marshall stacks; the anchor-on take drifted outdoors to a dusk field). N=1 at
+four steps, so this neither validates nor refutes the rule — but **no claim that the
+anchor improves consistency is supported by evidence**, and the honest reading is that a
+single-shot A/B is the wrong test: the anchor exists for identity *across* shots, which
+needs the same character rendered in three or four shots with and without.
+
+**Incidental:** `render-status` is **GET**; a POST returns 405. A polling loop written
+against POST silently observed nothing for a whole render.
+
+**Not verified:** nothing has been rendered against a snapped plan. The corrected format
+checker was not exercised by these renders — a song-audio shot takes the deterministic
+`song_audio_prose` path (expansion returned in 0.0 s with no model call), so the H3
+document checker never ran on it.
+
 ## 2026-08-20 — A shift key walked through the cut-time guard, and through two others nobody had looked at
 
 **The defect.** `h3_prompt`'s cut-time patterns matched a **literal capital `At`**. `_SHOT` read `[Shot N] At MM:SS.mmm` and `_ANY_CUT` read `At MM:SS.mmm`, so `at 00:02.500` in lower case was not a cut time as far as any check in the module was concerned — and `check_orphan_cuts`, which exists for exactly one purpose (a cut time belonging to no declared shot), never saw one. Everything downstream inherited the blindness: monotonicity, the Shot-1-carries-no-timestamp rule, and the `duration` bound.
