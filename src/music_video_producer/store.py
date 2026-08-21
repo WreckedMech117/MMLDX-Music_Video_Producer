@@ -205,12 +205,14 @@ class ProjectStore:
             # Checked inside the lock and before the temp file, so it is genuinely atomic with
             # the replace it guards — a writer cannot slip between the comparison and the write,
             # because every writer in this process takes this lock to land its bytes.
-            if if_generation is not None:
-                if _MANIFEST_WRITES.get(_write_key(target), 0) != if_generation:
-                    raise ProjectChangedDuringSave(
-                        f"{target.parent.name} was written after this caller read it; re-read "
-                        "the project and re-apply the change"
-                    )
+            if (
+                if_generation is not None
+                and _MANIFEST_WRITES.get(_write_key(target), 0) != if_generation
+            ):
+                raise ProjectChangedDuringSave(
+                    f"{target.parent.name} was written after this caller read it; re-read "
+                    "the project and re-apply the change"
+                )
             with NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False) as temp:
                 temp.write(payload)
                 temp.flush()

@@ -8,7 +8,7 @@ import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clamp
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
-import { GAP_FILL_TOAST, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, playheadSnap, undoControl, undoGestureLabel } from "./api.js";
+import { GAP_FILL_TOAST, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, anchoredNudge, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, playheadSnap, undoControl, undoGestureLabel } from "./api.js";
 // The shot-length band, as the server judges it: the report carries the verdict and the clip
 // reads it. Nothing on this side re-derives the band -- see `clipWindowState` for why.
 import { clipWindowState, windowWarningsByShot } from "./api.js";
@@ -1566,6 +1566,51 @@ function takeAnchor(shot) {
   return takeAnchorControl(shot, unlockedFromMusic.has(shot?.id));
 }
 
+// **The one door every write of a shot's `start` goes through**, and the reason it exists is the
+// Director's ruling of 2026-08-21: "those gestures should only slide the window bounds but leave
+// the clip position intact." The rule itself is `anchoredNudge`'s -- executed there, over numbers
+// -- and this is the only thing in this file that moves a window and the only thing that has to
+// remember to ask.
+//
+// It reads the *moving shot's own* lock, whichever gesture is moving it. That is the ruling's
+// sharp end: when snapping a cut carries the neighbour's edge, or a gap fill runs a window out to
+// meet a clip, the shot whose start is being written may be nowhere near the pointer -- and it is
+// still that shot's take that must stay on the music, so it is still that shot's toggle that
+// decides. The previous shape applied the compensation to the shot under the hand and left the
+// neighbour to slide; there is no such distinction in the principle.
+//
+// `original` is the pair a drag captured before it began -- a `pointermove` mutates the live shot
+// on every event, so the shot's current nudge is the previous frame's answer and compounding onto
+// it would multiply the compensation by the number of mouse events. Omit it for the gestures that
+// write once, and the shot's own current pair is the "before".
+//
+// Nothing here clamps, refuses or snaps back on take-coverage grounds. A window dragged past what
+// its take holds is a real, representable state that the readiness report turns amber and
+// assembly refuses with the numbers; this writes what it was asked to write.
+function moveWindowStart(shot, to, original = null) {
+  if (!shot) return;
+  const from = original ? original.start : shot.start;
+  const was = original ? original.nudge : (shot.trim_nudge || 0);
+  shot.start = to;
+  const nudge = anchoredNudge(shot, {
+    from, to: shot.start, nudge: was, unlocked: unlockedFromMusic.has(shot.id),
+  });
+  // Assigned only when it changes, so an untouched shot is never given a `trim_nudge` field it
+  // did not have.
+  if (nudge !== (shot.trim_nudge || 0)) shot.trim_nudge = nudge;
+}
+
+// Put a shot back exactly as a gesture found it. A *restore*, never a move: `start` and
+// `trim_nudge` come back as one pair, so the take's anchor comes back with them and nothing here
+// compensates -- compensating a restore would move the take by the amount the gesture had already
+// been rolled back by. The same reasoning governs undo and redo, which restore a whole snapshotted
+// shot list through `PUT /shots` and must not be routed through the door above.
+function restoreWindow(shot, original) {
+  shot.start = original.start;
+  shot.duration = original.duration;
+  shot.trim_nudge = original.nudge;
+}
+
 // Whether the song is running right now, read from the master element rather than from a flag.
 // A moving playhead is not something an edge can be lined up against, which is why the snap is
 // off while it plays.
@@ -1583,9 +1628,7 @@ function masterPlaying() {
 function applyPlayheadSnap(shot, mode, seconds, original) {
   // Measured against the plan as it was before the drag: the neighbour shares the *original*
   // cut, and the shot has been mutated live by the pointermove handler.
-  shot.start = original.start;
-  shot.duration = original.duration;
-  shot.trim_nudge = original.nudge;
+  restoreWindow(shot, original);
   const plan = boundaryMovePlan(state.project, shot.id, mode, seconds);
   if (!plan.ok) {
     renderTimeline();
@@ -1593,16 +1636,20 @@ function applyPlayheadSnap(shot, mode, seconds, original) {
     return false;
   }
   const byId = new Map(state.project.shots.map((item) => [item.id, item]));
+  // **Both windows through the same door, the shot under the hand and the neighbour that shares
+  // the cut alike.** This is the ruling of 2026-08-21 at its sharpest: a right-edge snap moves the
+  // *neighbour's* `start` and leaves this shot's alone, so under the old shape -- which
+  // compensated the dragged shot and only on its left edge -- the one take this gesture could
+  // possibly displace was the one take it never compensated. The dragged shot needs no special
+  // case: on a right-edge snap its start does not move, and `moveWindowStart` writes nothing.
+  //
+  // `shot` was restored above, so reading each target's own live `start`/`trim_nudge` as the
+  // "before" is exact for the neighbour, which no pointermove touched, and for the dragged shot.
   for (const window of plan.windows) {
     const target = byId.get(window.id);
     if (!target) continue;
-    target.start = window.start;
+    moveWindowStart(target, window.start);
     target.duration = window.duration;
-  }
-  // The rendered-shot rule from the freehand drag, unchanged: moving the left edge moves the cut
-  // into the take by the same amount, so the same take frame stays at the same song second.
-  if (mode === "left" && shot.latest_output) {
-    shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));
   }
   state.dirty = true;
   saveShotsSilently("snap");
@@ -1615,9 +1662,18 @@ function applyPlayheadSnap(shot, mode, seconds, original) {
 // meet the neighbour. `gapFillPlan` decides everything -- which neighbour, how big the gap is,
 // and whether either shot at the resulting cut refuses to have it moved.
 //
-// The window moves and nothing else. `trim_nudge` is deliberately left alone even on a rendered
-// shot: closing a 0.002 s gap must not silently re-time a take, and a window that outgrows its
-// take is assembly's judgement to make and refuse, which it already does.
+// **The gesture has two directions and only one of them moves a start.** `gapFillPlan` never
+// touches the neighbour: filling *rightward* grows this shot's `duration` and leaves its `start`
+// exactly where it was, so there is nothing to anchor and `moveWindowStart` writes nothing;
+// filling *leftward* runs this shot's own `start` back to meet the clip behind it, which moves
+// its take by that many seconds unless the nudge follows.
+//
+// So the leftward fill is compensated, and this reverses a recorded decision. Until 2026-08-21
+// this function left `trim_nudge` alone on purpose -- "closing a 0.002 s gap must not silently
+// re-time a take" -- and the Director has ruled the other way: "same for double click, those
+// gestures should only slide the window bounds but leave the clip position intact." Closing a
+// 0.002 s gap by moving a window 0.002 s earlier *is* a re-timing of the take unless something
+// compensates; what the old note called leaving the take alone was leaving it to slide.
 function runGapFill(shotId, edge) {
   if (!state.project) return;
   const plan = gapFillPlan(state.project, shotId, edge);
@@ -1627,7 +1683,7 @@ function runGapFill(shotId, edge) {
   }
   const shot = state.project.shots.find((item) => item.id === shotId);
   if (!shot) return;
-  shot.start = plan.start;
+  moveWindowStart(shot, plan.start);
   shot.duration = plan.duration;
   state.dirty = true;
   saveShotsSilently("gapfill");
@@ -1686,7 +1742,6 @@ function bindClip(clip) {
       travelled = Math.max(travelled, Math.abs(moveEvent.clientX - startX));
       magnetised = null;
       if (mode === "move") {
-        shot.start = Math.max(0, grid(original.start + snapped));
         // The Director's ask, 2026-08-21: "When dragging in the timeline though it would just
         // move the window over the clip but keep the clip aligned where it belongs with the
         // music." Which is the rule the *left edge* below has followed since 2026-08-20, applied
@@ -1695,9 +1750,11 @@ function bindClip(clip) {
         // plays at -- comes out unchanged. Unlocked, or on a shot with no take, nothing is
         // written and the move is byte for byte the one this file made before.
         //
-        // Measured as `shot.start - original.start` rather than as the raw delta, so the clamp at
-        // 0 s above is accounted for: a drag that ran into the head of the song moved the window
-        // less than the pointer moved, and compensating by the pointer would slide the take.
+        // `moveWindowStart` measures from `original` rather than from the raw pointer delta, so
+        // the clamp at 0 s here is accounted for: a drag that ran into the head of the song moved
+        // the window less than the pointer moved, and compensating by the pointer would slide the
+        // take. It also re-reads the *drag's* starting nudge each time rather than the live one,
+        // which is what stops a hundred pointermoves compounding a hundred compensations.
         //
         // **Deliberately not floored at the take's first frame.** The left edge clamps there and
         // keeps its clamp; this gesture must not, because the Director's ruling is that the
@@ -1705,39 +1762,30 @@ function bindClip(clip) {
         // the actual position of a clip if we need to". A window dragged off its take is a real,
         // representable state that the readiness report turns amber (`take_uncovered`) and
         // assembly refuses with the numbers; a clamp here would silently stop the drag instead.
-        //
-        // `exactSeconds`, not `grid` -- `applyPlayheadSnap`'s spelling, and the reason is a real
-        // desync a browser measured on 2026-08-21. The window is stepped to the frame grid, but a
-        // window that did not *start* on the grid moves by an off-grid amount, so re-gridding the
-        // compensation rounds it to a different number than the window moved by: a 1.608 s move of
-        // a shot starting at 32.517 s wrote a 1.625 s nudge and pulled the take 17 ms off the
-        // music. The compensation is not its own gesture; it is exactly what the window did, with
-        // float noise trimmed. The left edge below carried the same defect and is corrected with
-        // it, which is what makes the two gestures one rule.
-        if (takeAnchor(shot).held) shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));
+        moveWindowStart(shot, Math.max(0, grid(original.start + snapped)), original);
       }
       if (mode === "left") {
         const end = original.start + original.duration;
         const pull = magnet(original.start + delta);
         const want = pull.snapped ? pull.seconds : grid(original.start + snapped);
-        if (shot.latest_output) {
-          // The Director's ask (2026-08-20): an edge drag on a rendered shot does not
-          // re-window the plan, it drags out the take's over-render buffer. Moving the
-          // window edge earlier moves the cut into the take by exactly the same frames
-          // (nudge follows start), so the same take frame stays at the same song second —
-          // and the floor is the recorded lead: the cut can never reach before the take
-          // begins.
-          //
-          // `exactSeconds` rather than `grid` since 2026-08-21: re-gridding the compensation
-          // rounded it away from the seconds the window had actually moved whenever the window
-          // did not start on the frame grid, which put the take up to half a frame out. See the
-          // move branch above, where a browser measured it.
+        // The Director's ask (2026-08-20): an edge drag on a rendered shot does not re-window
+        // the plan, it drags out the take's over-render buffer. Moving the window edge earlier
+        // moves the cut into the take by exactly the same frames (`moveWindowStart` writes the
+        // nudge), so the same take frame stays at the same song second -- and the floor is the
+        // recorded lead: the cut can never reach before the take begins.
+        //
+        // Read from `takeAnchor(shot).held` since 2026-08-21, where it read `shot.latest_output`.
+        // That is the same generalisation the ruling makes everywhere else in this file: an
+        // *unlocked* shot is one the Director has said is being repositioned deliberately, so its
+        // left edge behaves exactly like a shot with no take -- the take travels with the window,
+        // and the floor at the take's first frame goes with it, because a floor that holds a cut
+        // off a frame the take is no longer anchored to is a clamp bounding nothing.
+        if (takeAnchor(shot).held) {
           const lead = shot.latest_take_lead || 0;
           const floor = original.start - Math.max(0, lead + original.nudge);
-          shot.start = clamp(want, Math.max(0, floor), end - .5);
-          shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));
+          moveWindowStart(shot, clamp(want, Math.max(0, floor), end - .5), original);
         } else {
-          shot.start = clamp(want, 0, end - .5);
+          moveWindowStart(shot, clamp(want, 0, end - .5), original);
         }
         shot.duration = exactSeconds(end - shot.start);
         // Only when the clamp did not fight the magnet: an edge held off the playhead by the
@@ -2422,7 +2470,13 @@ export function renderShotInspector() {
 
 function updateShotFromInspector() {
   const shot = selectedShot();
-  shot.start = Math.max(0, Number($("#shot-start").value));
+  // Through the same door as every drag, on the ruling's own terms: this box and the move-drag
+  // are one edit written two ways, and a typed 1.5 s that slid the take while a dragged 1.5 s did
+  // not would be exactly the inconsistency the Director objected to. The lock is drawn a few rows
+  // below this field, so a Director who means to reposition the take has it to hand. Untouched,
+  // the box holds `shot.start` at full precision, so re-reading it while editing the prompt moves
+  // nothing and compensates nothing.
+  moveWindowStart(shot, Math.max(0, Number($("#shot-start").value)));
   shot.duration = Math.max(.5, Number($("#shot-duration").value));
   // `null` rather than `""`: an empty select means the Director has not declared a mode, and the
   // model's field is `ShotMode | None` precisely so that "undeclared" is representable. Sending ""

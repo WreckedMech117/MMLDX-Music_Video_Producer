@@ -50,6 +50,7 @@ from music_video_producer.app import (
     RENDER_AGAIN_LOCKED_REFUSAL,
     RENDER_AGAIN_STATUSES,
     RENDER_IN_FLIGHT_STATUSES,
+    RENDER_STATUS_SAVE_ATTEMPTS,
     REPLACE_ASSET_APPROVED_NOTE,
     REPLACE_ASSET_IN_FLIGHT,
     REPLACE_ASSET_KIND_CHANGE,
@@ -109,6 +110,7 @@ from music_video_producer.batch import (
     MISSING_TICKS_LIMIT,
     PENDING_SUBMISSION_PROMPT_ID,
     PLACEHOLDER_PROMPT,
+    accept_submission,
     readiness_refusal,
     reconcilable_jobs,
     shot_label,
@@ -16703,7 +16705,9 @@ def refusing_save(store: ProjectStore, monkeypatch):
     """
     calls: list[str] = []
 
-    def refuse(project):
+    def refuse(project, **_):
+        # `**_` because the `/render-status` tick passes `if_generation` — the same refusal
+        # reaches it, and this helper stands in for both of the store's ways of raising it.
         calls.append(project.id)
         raise ProjectChangedDuringSave("another save landed first")
 
@@ -16720,6 +16724,11 @@ def test_a_render_status_tick_that_loses_a_save_race_still_answers_200(tmp_path:
     that it never turns a transient condition into a toast, so the refusal is absorbed: the tick
     still reports what it learned, the manifest simply is not written, and the next tick two
     seconds later re-derives the identical answer from ComfyUI.
+
+    Also the exhaustion end of `RENDER_STATUS_SAVE_ATTEMPTS`, because a store that refuses every
+    time is exactly what running out of the bound looks like. The count is asserted: a retry
+    without a bound would not stop, and a tick that gave up after one would never recover from
+    the single foreign write the retry exists for.
     """
     client, store, comfy = make_client(tmp_path)
     project_id, _job = flux_job(client, store, comfy, "Poll loses the race")
@@ -16739,10 +16748,279 @@ def test_a_render_status_tick_that_loses_a_save_race_still_answers_200(tmp_path:
     assert response.status_code == 200
     # The tick's own reconciliation is still in the answer — only the write was dropped.
     assert [item["status"] for item in response.json()["jobs"]] == ["complete"]
-    assert calls == [project_id], "the tick never attempted the save this test is about"
+    assert calls == [project_id] * RENDER_STATUS_SAVE_ATTEMPTS, (
+        "the tick did not attempt its save exactly as many times as the bound allows"
+    )
+    # Bounded on the ComfyUI side too: each retry is a fresh reconciliation, and there are no
+    # more of them than there are attempts. Nothing here spins.
+    assert comfy.queue_calls == RENDER_STATUS_SAVE_ATTEMPTS
     # And the manifest is untouched, which is the point: whatever the other writer put there
     # stands. The job settles again on the next tick.
     assert ProjectStore(tmp_path).get(project_id).jobs[0].status == "queued"
+
+
+def another_writer_lands_mid_tick(comfy, change) -> list[bool]:
+    """Land another writer's save between the poll's read and the poll's save, by ordering.
+
+    `reconcile_render_jobs` reads the project, *then* awaits `/queue`, then the route saves — so
+    a hook on `/queue` is that window exactly, and it is the same window a real writer lands in
+    while ComfyUI is answering over the network. No threads and no clock: the interleaving is a
+    fact about the call order, so this cannot flake in either direction.
+
+    Fires once. The tick's retry must find a world that has stopped moving, or the test would be
+    measuring the bound rather than the overwrite.
+    """
+    fired: list[bool] = []
+    answer = comfy.queue
+
+    async def queue(*args, **kwargs):
+        if not fired:
+            fired.append(True)
+            change()
+        return await answer(*args, **kwargs)
+
+    comfy.queue = queue
+    return fired
+
+
+def completing_history(*outputs: dict):
+    """A ComfyUI history that says the prompt finished, with the files it left."""
+
+    async def history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "complete",
+                "outputs": list(outputs),
+                "error": "",
+            },
+        )()
+
+    return history
+
+
+def unknown_prompt_history():
+    """A ComfyUI that has never heard of the prompt — the reconciler's unknown tick."""
+
+    async def history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "queued",
+                "outputs": [],
+                "error": "",
+                "known": False,
+            },
+        )()
+
+    return history
+
+
+def test_a_poll_tick_cannot_overwrite_a_change_that_landed_while_it_was_reconciling(
+    tmp_path: Path,
+):
+    """**The defect.** The poll is the most frequent writer, so it is the most likely thief.
+
+    A tick reads the manifest, spends a `/queue` and a `/history` asking ComfyUI what happened,
+    and writes the whole manifest back. Anything saved inside that window was written from a
+    copy that predates it, so the plain read-mutate-save every route performs reverts it — and
+    the store's `ProjectChangedDuringSave` guard never fires, because it covers only a writer
+    landing inside a *replace backoff* and there is no contention on the replace here at all.
+
+    Both halves are asserted, because a fix that merely dropped the write would pass the first:
+    the Director's edit survives, *and* the tick's own verdict about the render still lands.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, _job = flux_job(client, store, comfy, "Poll steals")
+    landed_file = f"music-video-producer/{project_id}/assets/Lead singer_00001_.png"
+    comfy.history = completing_history(
+        {"subfolder": f"music-video-producer/{project_id}/assets",
+         "filename": "Lead singer_00001_.png"}
+    )
+
+    def the_director_edits_a_shot():
+        edited = store.get(project_id)
+        edited.creative_brief = "typed while the tick was asking ComfyUI"
+        edited.shots = [Shot(id="shot_a", start=0, duration=4, prompt="A corridor widens")]
+        store.save(edited)
+
+    fired = another_writer_lands_mid_tick(comfy, the_director_edits_a_shot)
+
+    response = client.get(f"/api/projects/{project_id}/render-status")
+
+    assert response.status_code == 200
+    assert fired == [True], "the other writer never landed inside the tick"
+    saved = store.get(project_id)
+    # What the poll does not own, and therefore cannot move.
+    assert saved.creative_brief == "typed while the tick was asking ComfyUI"
+    assert [shot.prompt for shot in saved.shots] == ["A corridor widens"]
+    # What it does own, still written — one re-read and one more reconciliation.
+    assert saved.jobs[0].status == "complete"
+    assert saved.assets[0].path == landed_file
+    assert comfy.queue_calls == 2
+    assert response.json()["jobs"][0]["status"] == "complete"
+
+
+def test_a_poll_tick_cannot_revert_an_accepted_prompt_id_stamp(tmp_path: Path):
+    """The reported case, and the reason it cost a take rather than a keystroke.
+
+    A submission writes its record, submits, and stamps the accepted `prompt_id` back. A tick
+    that read the manifest between those two saves used to write the sentinel back over the
+    stamp — so the record stayed on `PENDING_SUBMISSION_PROMPT_ID`, the reconciler settled it as
+    never submitted on its next unknown tick, and the file landed on disk attached to nothing
+    while the render was genuinely executing on the GPU.
+
+    Set up on the last unknown tick before the settle, which is the worst moment for the stamp
+    to be lost: one more reverted tick and the record is terminal and never reconciled again.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Stamp survives"))
+    project.shots = [
+        Shot(id="shot_a", start=0, duration=5, prompt="A singer turns", status="queued")
+    ]
+    project.jobs = [
+        RenderJob(
+            kind="h3",
+            status="queued",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id="shot_a",
+            missing_ticks=MISSING_TICKS_LIMIT - 1,
+        )
+    ]
+    store.save(project)
+    comfy.history = unknown_prompt_history()
+
+    def comfy_accepts_the_graph():
+        stamping = store.get(project.id)
+        accept_submission(stamping.jobs[0], "p-live")
+        store.save(stamping)
+        comfy.queue_payload = {"queue_running": [[0, "p-live", {}]], "queue_pending": []}
+
+    another_writer_lands_mid_tick(comfy, comfy_accepts_the_graph)
+
+    report = client.get(f"/api/projects/{project.id}/render-status").json()
+
+    saved = store.get(project.id)
+    assert saved.jobs[0].prompt_id == "p-live"
+    assert saved.jobs[0].error == ""
+    assert saved.jobs[0].missing_ticks == 0
+    # And the retry read the live prompt, so the tick reports the render for what it is.
+    assert saved.jobs[0].status == "running"
+    assert saved.shots[0].status == "queued"
+    assert reconcilable_jobs(saved) == [saved.jobs[0]]
+    assert report["active"] is True
+    assert report["jobs"][0]["prompt_id"] == "p-live"
+
+
+def test_a_contended_poll_still_settles_a_genuinely_orphaned_record(tmp_path: Path):
+    """The fix must not buy its safety by disabling reconciliation.
+
+    Same orphan as `test_an_orphaned_pre_submit_record_reconciles_through_the_poll` — a record
+    saved before its graph went out, for a prompt ComfyUI never heard of — but with a foreign
+    write landing inside *every* tick, so every tick is refused once and redone. The settle still
+    arrives on the third unknown tick and not before: the discarded first pass of each tick must
+    not have counted, or the record would settle a tick early.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Contended orphan"))
+    project.shots = [Shot(id="shot_a", start=0, duration=5, prompt="A corridor", status="queued")]
+    project.jobs = [
+        RenderJob(
+            kind="h3", status="queued", prompt_id=PENDING_SUBMISSION_PROMPT_ID, target_id="shot_a"
+        )
+    ]
+    store.save(project)
+    comfy.history = unknown_prompt_history()
+
+    counted: list[int] = []
+    for tick in range(MISSING_TICKS_LIMIT):
+        def the_director_types(tick=tick):
+            edited = store.get(project.id)
+            edited.creative_brief = f"edit {tick}"
+            store.save(edited)
+
+        another_writer_lands_mid_tick(comfy, the_director_types)
+        report = client.get(f"/api/projects/{project.id}/render-status")
+        counted.append(store.get(project.id).jobs[0].missing_ticks)
+
+    # One increment per tick, never two: the refused pass was thrown away whole.
+    assert counted == [1, 2, MISSING_TICKS_LIMIT]
+    settled = store.get(project.id)
+    assert settled.jobs[0].status == "error"
+    assert settled.jobs[0].error == JOB_NEVER_SUBMITTED
+    assert settled.shots[0].status == "error"
+    assert settled.creative_brief == f"edit {MISSING_TICKS_LIMIT - 1}"
+    assert report.json()["active"] is False
+
+
+def test_a_poll_tick_that_changes_nothing_writes_no_manifest_at_all(tmp_path: Path):
+    """The cheapest half of the fix, and the one that removes most collisions outright.
+
+    A render sitting in ComfyUI's queue is the normal state for minutes at a time. Every tick
+    through that re-derives the same verdict, and a tick that learned nothing must not rewrite
+    the manifest — both because `updated_at` moving twice a second collides with the Director's
+    own optimistic-concurrency checks, and because a write that never happens cannot revert
+    anything. Asserted on the file as well as the field: a rewrite with identical content is
+    still a write, and still a lost update for whoever saved in between.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, job = flux_job(client, store, comfy, "Quiet queue")
+    comfy.queue_payload = {"queue_running": [[0, job["prompt_id"], {}]], "queue_pending": []}
+    manifest = Path(tmp_path) / "projects" / project_id / "project.json"
+
+    # The first tick genuinely learns something: queued becomes running. That one writes.
+    assert client.get(f"/api/projects/{project_id}/render-status").json()["jobs"][0][
+        "status"
+    ] == "running"
+    stamp = store.get(project_id).updated_at
+    written = manifest.stat().st_mtime_ns
+
+    for _ in range(5):
+        assert client.get(f"/api/projects/{project_id}/render-status").status_code == 200
+
+    assert store.get(project_id).updated_at == stamp
+    assert manifest.stat().st_mtime_ns == written
+    assert comfy.queue_calls == 6, "a quiet tick must still be one /queue, and only one"
+
+
+def test_a_render_status_tick_retries_a_refused_save_and_lands_it(
+    tmp_path: Path, monkeypatch
+):
+    """The bound's useful end: refused twice, landed on the third, inside one tick.
+
+    The exhaustion end is `test_a_render_status_tick_that_loses_a_save_race_still_answers_200`.
+    Here the store relents, which is what a real burst of writes does, and the tick keeps its
+    reconciliation instead of throwing it away for a race that has already finished.
+
+    The counts below are literals on purpose. A test that derives its expectation from the very
+    constant it is checking moves with that constant and pins nothing — the bound could be
+    halved and this would still pass — so the number the fix was designed around is asserted
+    outright, and changing it has to be a deliberate act with this line in the diff.
+    """
+    assert RENDER_STATUS_SAVE_ATTEMPTS == 3
+    client, store, comfy = make_client(tmp_path)
+    project_id, _job = flux_job(client, store, comfy, "Retried tick")
+    comfy.history = completing_history()
+    landed = store.save
+    calls = {"n": 0}
+
+    def refuse_twice(project, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise ProjectChangedDuringSave("another save landed first")
+        return landed(project, **kwargs)
+
+    monkeypatch.setattr(store, "save", refuse_twice)
+
+    response = client.get(f"/api/projects/{project_id}/render-status")
+
+    assert response.status_code == 200
+    assert calls["n"] == 3
+    assert store.get(project_id).jobs[0].status == "complete"
 
 
 def test_a_route_save_that_loses_a_race_answers_409_and_never_500(tmp_path: Path, monkeypatch):

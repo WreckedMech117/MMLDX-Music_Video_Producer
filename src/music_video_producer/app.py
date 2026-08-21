@@ -1781,6 +1781,27 @@ SAVE_RACE_REFUSAL = (
     "saved; refresh before replacing it"
 )
 
+#: How many times one `/render-status` tick may re-read, re-reconcile and try its save again
+#: before giving up on writing this tick at all. The poll is the most frequent writer in the
+#: application — every two seconds, per open project — so it is the most likely thief, and it
+#: passes `save`'s `if_generation` precisely so it is refused rather than allowed to lay a
+#: manifest it read a moment ago over whatever the Director just saved.
+#:
+#: Three because the collision it is built for is a single foreign write landing inside one
+#: tick's window (a submission stamping its accepted prompt id, a shot edit, an approval), and
+#: one re-read clears that; the second and third are there for a burst, which a batch
+#: submission genuinely produces. Bigger would be worse, not better: each attempt is another
+#: `/queue` and another round of `/history`, and a tick that cannot win three in a row is losing
+#: to a writer that is still going.
+#:
+#: Exhausting it is deliberately harmless and deliberately silent. Nothing is lost — the
+#: reconciliation is *derived* from ComfyUI rather than authored here, so the tick two seconds
+#: from now re-reads, asks ComfyUI the same question and reaches the same verdict. Raising would
+#: put a toast on the Director's screen for a race the Director caused by typing, which is the
+#: same reasoning that made this route absorb `ProjectChangedDuringSave` in the first place. No
+#: user-initiated write may copy this: there, the caller is owed the 409.
+RENDER_STATUS_SAVE_ATTEMPTS = 3
+
 GENERIC_WRITE_APPROVAL_REFUSAL = (
     "This save would change {shot}'s approval. An approval is an editorial decision about one "
     "specific take, so it is not something an ordinary save carries: approve and un-approve are "
@@ -4570,6 +4591,18 @@ def create_app(
     def get_project(project_id: str) -> Project:
         try:
             return store.get(project_id)
+        except ProjectNotFound as error:
+            raise HTTPException(status_code=404, detail="Project not found") from error
+
+    def get_project_for_update(project_id: str) -> tuple[Project, int]:
+        """`get_project`, plus the write generation to hand back to `save(if_generation=...)`.
+
+        For the background writer only — see `RENDER_STATUS_SAVE_ATTEMPTS`. A route the Director
+        triggered keeps `get_project`: it wants last-writer-wins and a 409 it can show, not a
+        silent retry.
+        """
+        try:
+            return store.read_for_update(project_id)
         except ProjectNotFound as error:
             raise HTTPException(status_code=404, detail="Project not found") from error
 
@@ -9819,25 +9852,62 @@ def create_app(
         that learned only "the sampler is on step 7" still writes no manifest. A percentage that
         moved `updated_at` twice a second would collide with every optimistic-concurrency check
         the Director's own edits ride on.
+
+        **This tick cannot overwrite anybody.** Its save is a compare-and-swap on the generation
+        it read at (`ProjectStore.read_for_update`), because the plain read-mutate-save every
+        route performs is a thief when the reader is a loop: this one holds the manifest across
+        a `/queue` and a round of `/history`, and anything saved inside that window — a shot
+        edit, an approval, a submission stamping its accepted prompt id — would be laid back
+        under a two-second-old copy the moment the tick wrote. It cost a real take: the stamp
+        reverted, the record kept `PENDING_SUBMISSION_PROMPT_ID`, and the reconciler then
+        settled a render that was running on the GPU as never submitted.
+
+        Refused, the tick re-reads and reconciles again rather than re-applying field by field.
+        That costs a `/queue` on collision and buys the thing a field list cannot: the verdict is
+        always derived from the manifest as it now stands, so `missing_ticks` is incremented from
+        the current count exactly once per tick, and nothing here has to be kept in step with
+        what `apply_job_history` happens to write this month.
+
+        **What this tick owns**, and the whole of it: each open job's `status`, `error`,
+        `missing_ticks` and `output_files`, and what `batch.apply_job_history` writes onto the
+        thing a finished job produced — a Shot's `status`, `latest_output` and `latest_review`,
+        an Asset's `path`, the Song's `path`. Every one of those is *derived* from ComfyUI's
+        answer and authored nowhere else. It owns no shot window, no prompt, no citation, no
+        approval, no asset the Director made, no section and no document, so it must never be
+        the reason one of those moves — and after this change it cannot be, because the only
+        manifest it can write is one it read after the last writer landed.
         """
-        project = get_project(project_id)
-        outcome = await reconcile_render_jobs(project, comfy)
-        if outcome.changed:
+        project, generation = get_project_for_update(project_id)
+        for attempt in range(RENDER_STATUS_SAVE_ATTEMPTS):
+            outcome = await reconcile_render_jobs(project, comfy)
+            if not outcome.changed:
+                # The commonest tick by far, and the cheapest: nothing moved, so nothing is
+                # written and no collision is possible. Left first because it is also the reason
+                # the retry below is rare enough to afford.
+                break
             try:
-                store.save(project)
+                store.save(project, if_generation=generation)
+                break
             except ProjectChangedDuringSave:
-                # The one save in this application that must not become a 409. This tick read
-                # the project before the Director's own edit landed, so refusing it is right —
-                # the alternative is the 2026-08-19 revert — but the poll is a loop, and the
-                # next tick two seconds from now re-reads and re-derives exactly this same
-                # reconciliation from ComfyUI, so there is nothing to recover and nothing to
-                # tell anyone. Reporting it would put an error toast on the Director's screen
-                # for a race the Director caused by typing. The report below still describes
-                # what the tick actually learned; only the manifest write was dropped.
-                logger.info(
-                    "Render-status tick for %s lost a save race; the next tick redoes it",
-                    project_id,
-                )
+                # Both sources of the refusal land here and both want the same thing: the
+                # generation check above, and the store's older guard against a writer landing
+                # inside a replace backoff. Either way this caller's copy is stale and re-reading
+                # is the documented remedy.
+                if attempt == RENDER_STATUS_SAVE_ATTEMPTS - 1:
+                    # The one save in this application that must not become a 409. Refusing it
+                    # is right — the alternative is the revert above — but the poll is a loop,
+                    # and the next tick two seconds from now re-reads and re-derives exactly
+                    # this reconciliation from ComfyUI, so there is nothing to recover and
+                    # nothing to tell anyone. Reporting it would put an error toast on the
+                    # Director's screen for a race the Director caused by typing. The report
+                    # below still describes what the tick learned; only the write was dropped.
+                    logger.info(
+                        "Render-status tick for %s lost %d save races; the next tick redoes it",
+                        project_id,
+                        RENDER_STATUS_SAVE_ATTEMPTS,
+                    )
+                    break
+                project, generation = get_project_for_update(project_id)
         return render_status_report(
             project,
             comfy_online=outcome.comfy_online,

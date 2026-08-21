@@ -11029,50 +11029,182 @@ def test_the_lock_is_session_state_and_never_a_field_on_the_shot():
     assert "documentConsentClearedOnLoad(state.project?.id, id)" in cleared.split("\n")[-3]
 
 
-def test_a_locked_move_drag_writes_the_nudge_and_an_unlocked_one_leaves_it_alone():
-    """The gesture reassignment itself, read off the drag handler. The rule was already in this
-    file for the *left edge*; this is the same rule reaching the gesture the Director described.
+def test_the_take_anchoring_rule_is_one_executed_function_with_three_answers():
+    """The ruling of 2026-08-21, executed rather than read: "those gestures should only slide the
+    window bounds but leave the clip position intact."
 
-    Read as source because a `pointermove` handler is not reachable from node -- the behaviour is
-    driven in a real browser by `tests/e2e_timeline_edit.py`, which reads the plan back off disk
-    and checks the song second the take lands on."""
-    # Anchored inside `bindClip`, not merely on the first `mode === "move"` in the file -- the
-    # section pills have a move branch of their own, and it is not this gesture.
-    clip_drag = APP_JS.read_text(encoding="utf-8").split("function bindClip(clip) {", 1)[1]
-    move = without_comments(
-        clip_drag.split('if (mode === "move") {', 1)[1].split("\n      }", 1)[0]
-    )
-    # The window moves exactly as it always did.
-    assert "shot.start = Math.max(0, grid(original.start + snapped));" in move
-    # And the nudge follows it, by the window's *own* movement rather than by the pointer's, so a
-    # drag clamped at the head of the song does not slide the take.
-    assert (
-        "if (takeAnchor(shot).held) "
-        "shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));"
-    ) in move
-    # The same expression the left edge and the playhead snap write: one rule, three gestures.
-    #
-    # `exactSeconds` and never `grid`, which is a defect a browser measured on 2026-08-21: the
-    # window steps to the frame grid, so a window that did not start on the grid moves by an
-    # off-grid amount, and re-gridding the compensation rounds it to a different number than the
-    # window moved by. A 1.608 s move of a shot starting at 32.517 s wrote a 1.625 s nudge and put
-    # the take 17 ms off the music -- with every offline assertion in this file passing.
-    compensation = "shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));"
-    edge = without_comments(app_js_block("if (shot.latest_output) {", "\n        }"))
-    assert compensation in edge
-    snap = without_comments(app_js_block("function applyPlayheadSnap(", "\n}"))
-    assert compensation in snap
+    A take's anchor is `start - lead - nudge` -- the song second its first frame plays at -- so a
+    window whose `start` moves takes its take with it unless `trim_nudge` follows. `anchoredNudge`
+    is the whole rule and the only copy of it; every gesture in `app.js` writes through the one
+    door that calls it."""
+    answers = run_module("""
+      import { anchoredNudge } from './src/music_video_producer/web/assets/api.js';
+      const rendered = { id: 'a', latest_output: 'shots/a_00001.mp4', latest_take_lead: 0.25,
+                         trim_nudge: 0.125 };
+      const bare = { id: 'b', latest_output: '', trim_nudge: 0 };
+      const anchor = (shot, nudge) => shot.start - (shot.latest_take_lead || 0) - nudge;
+      console.log(JSON.stringify({
+        // Locked, with a take: the nudge moves by exactly what the window moved by.
+        locked: anchoredNudge(rendered, { from: 10, to: 11.5, nudge: 0.125 }),
+        // Backwards is the same rule with the other sign -- the leftward gap fill's direction.
+        backwards: anchoredNudge(rendered, { from: 15.017, to: 15.002, nudge: 0.125 }),
+        // Unlocked: the Director is repositioning this clip deliberately, so the take travels.
+        unlocked: anchoredNudge(rendered, { from: 10, to: 11.5, nudge: 0.125, unlocked: true }),
+        // No take: nothing to anchor, and no `trim_nudge` invented for a shot that has none.
+        bare: anchoredNudge(bare, { from: 10, to: 11.5, nudge: 0 }),
+        bareUnlocked: anchoredNudge(bare, { from: 10, to: 11.5, nudge: 0, unlocked: true }),
+        // A window that did not move writes nothing, whatever else is true.
+        still: anchoredNudge(rendered, { from: 10, to: 10, nudge: 0.125 }),
+        // The nudge defaults to the shot's own field for the gestures that write once.
+        defaulted: anchoredNudge(rendered, { from: 10, to: 11.5 }),
+        absent: anchoredNudge(undefined, { from: 10, to: 11.5, nudge: 0.5 }),
+        // The 17 ms drift, in the numbers a browser measured it in: a 1.608 s move of a window
+        // starting at 32.517 s. The anchor has to come out unchanged to the microsecond.
+        offGrid: (() => {
+          const shot = { ...rendered, start: 32.517, trim_nudge: 0 };
+          const to = 34.125;
+          const nudge = anchoredNudge(shot, { from: shot.start, to, nudge: 0 });
+          return {
+            nudge,
+            before: anchor(shot, 0),
+            after: anchor({ ...shot, start: to }, nudge),
+          };
+        })(),
+        // A hundred pointermoves of one drag, each measured from the drag's own starting pair --
+        // which is what stops the compensation compounding once per mouse event.
+        dragged: (() => {
+          const shot = { ...rendered, start: 32.517, trim_nudge: 0.125 };
+          let nudge = 0.125;
+          for (let step = 1; step <= 100; step += 1) {
+            nudge = anchoredNudge(shot, { from: 32.517, to: 32.517 + step / 100, nudge: 0.125 });
+          }
+          return nudge;
+        })(),
+      }));
+    """)
+    assert answers["locked"] == pytest.approx(1.625)
+    assert answers["backwards"] == pytest.approx(0.11)
+    assert answers["unlocked"] == pytest.approx(0.125)
+    assert answers["bare"] == 0
+    assert answers["bareUnlocked"] == 0
+    assert answers["still"] == pytest.approx(0.125)
+    assert answers["defaulted"] == pytest.approx(1.625)
+    assert answers["absent"] == pytest.approx(0.5)
+    # The anchor is unchanged to the microsecond, which is what `exactSeconds` buys and what the
+    # 1/24 s grid cost: `grid(0 + 1.608)` is 1.625, and the take landed 17 ms off the music.
+    assert answers["offGrid"]["nudge"] == pytest.approx(1.608)
+    assert answers["offGrid"]["after"] == pytest.approx(answers["offGrid"]["before"], abs=1e-9)
+    assert answers["dragged"] == pytest.approx(1.125)
     assert "grid(original.nudge" not in APP_JS.read_text(encoding="utf-8"), (
         "a compensation is re-gridded somewhere, which rounds it away from the seconds the "
         "window actually moved and puts the take off the music by up to half a frame"
     )
-    # The toggle and the drag read one function, so the box on screen and the gesture can never
-    # disagree -- and that function is the contract-tested one, not a re-derivation.
+    # And the rule has one home: nothing re-derives `- lead - nudge` or hand-rolls the sum.
+    assert API_JS.read_text(encoding="utf-8").count("takeAnchorControl(shot, unlocked).held") == 1
+    for source, name in ((API_JS, "api.js"), (APP_JS, "app.js")):
+        assert "original.nudge + (shot.start" not in source.read_text(encoding="utf-8"), (
+            f"{name} still spells the compensation out at a call site, which is how this rule "
+            "came to be applied at two gestures and not at the other two"
+        )
+
+
+def test_every_write_of_a_shot_start_goes_through_the_one_door():
+    """The ruling generalised, asserted structurally -- because the failure it corrects was not a
+    wrong rule but a right rule applied at some call sites and not others.
+
+    Every assignment to a `.start` in `app.js` is either a *section* pill's (sections have no
+    takes), or inside `moveWindowStart`, or inside `restoreWindow`. A new gesture that writes a
+    shot's start anywhere else fails here rather than silently sliding a take off the music."""
+    source = APP_JS.read_text(encoding="utf-8")
+    door = app_js_block("function moveWindowStart(shot, to, original = null) {", "\n}")
+    restore = app_js_block("function restoreWindow(shot, original) {", "\n}")
+    writes = [
+        line.strip() for line in source.splitlines()
+        if re.search(r"\.start\s*=[^=]", line) and not line.strip().startswith("//")
+    ]
+    assert writes, "the scan found no start writes at all, so it is asserting nothing"
+    for line in writes:
+        if line.startswith("section.start"):
+            continue
+        assert line in door or line in restore, (
+            f"a shot's start is written outside the anchoring door: {line}"
+        )
+    # The door asks the rule, and asks it about the shot whose start is moving.
+    assert "anchoredNudge(shot, {" in door
+    assert "unlocked: unlockedFromMusic.has(shot.id)" in door
+    # The restore is a restore: it puts the nudge back beside the start it belongs to, and it must
+    # never compensate -- compensating a roll-back would move the take by what was rolled back.
+    assert "shot.trim_nudge = original.nudge;" in restore
+    assert "anchoredNudge" not in restore and "moveWindowStart" not in restore
+    # The toggle and every gesture read one function, so the box on screen and the writes can
+    # never disagree -- and that function is the contract-tested one, not a re-derivation.
     anchor = without_comments(app_js_block("function takeAnchor(shot) {", "\n}"))
     assert "takeAnchorControl(shot, unlockedFromMusic.has(shot?.id))" in anchor
     # The release still saves a move whose only change was the nudge: `moved()` compares it.
     up = without_comments(app_js_block("const moved = () =>", ";"))
     assert "(shot.trim_nudge || 0) !== original.nudge" in up
+
+
+def test_the_neighbours_own_lock_governs_the_neighbours_take():
+    """The half of the ruling the previous pass declined: "we dont want to slide the take next to
+    the one we are adjusting either."
+
+    A right-edge snap moves the *neighbour's* `start` and leaves the dragged shot's alone, so the
+    one take that gesture can displace was the one take it never compensated. Both windows now go
+    through the door, which reads each target's own id -- so it is B's lock that decides what
+    happens to B's take, not the lock of whatever clip the pointer was on."""
+    snap = without_comments(app_js_block("function applyPlayheadSnap(", "\n}"))
+    # Every window the plan carries, the shared neighbour included, and no special case for the
+    # dragged shot: on a right-edge snap its start does not move and the door writes nothing.
+    assert "moveWindowStart(target, window.start);" in snap
+    assert "target.start =" not in snap
+    assert 'mode === "left" && shot.latest_output' not in snap, (
+        "the snap still carries its own copy of the compensation, which is the shape that left "
+        "the neighbour out"
+    )
+    # The gap fill's one direction that moves a start: leftward, this shot's own.
+    fill = without_comments(app_js_block("function runGapFill(shotId, edge) {", "\n}"))
+    assert "moveWindowStart(shot, plan.start);" in fill
+    assert "shot.start =" not in fill
+    # And the planner it reads still never moves the neighbour, in either direction -- which is
+    # what makes "this shot's own start, leftward only" the complete account of the gesture.
+    windows = run_module("""
+      import { gapFillPlan } from './src/music_video_producer/web/assets/api.js';
+      const project = { song: { duration: 60 }, shots: [
+        { id: 'a', start: 0, duration: 5, prompt: 'x', mode: 'text' },
+        { id: 'b', start: 15.017, duration: 5, prompt: 'x', mode: 'text' },
+        { id: 'c', start: 25, duration: 5, prompt: 'x', mode: 'text' },
+      ] };
+      console.log(JSON.stringify({
+        left: gapFillPlan(project, 'b', 'left'),
+        right: gapFillPlan(project, 'b', 'right'),
+      }));
+    """)
+    # Leftward: this shot's start moves back to meet the clip behind it.
+    assert windows["left"]["start"] == pytest.approx(5.0)
+    assert windows["left"]["duration"] == pytest.approx(15.017)
+    # Rightward: the start stays exactly where it was and only the duration grows, so there is no
+    # take anywhere that this direction could move.
+    assert windows["right"]["start"] == pytest.approx(15.017)
+    assert windows["right"]["duration"] == pytest.approx(9.983)
+
+
+def test_undo_restores_a_snapshot_and_never_compensates_on_top_of_it():
+    """The one place the rule must *not* reach. Undo and redo replay a snapshotted shot list
+    through `PUT /shots`, and that snapshot already carries the `start` and the `trim_nudge` that
+    belonged together at the moment it was taken. Compensating a restore would move every anchored
+    take by the amount the gesture had already been rolled back by -- the rule applied twice."""
+    step = without_comments(app_js_block("async function stepHistory(from, onto, redo) {", "\n}"))
+    assert "moveWindowStart" not in step and "anchoredNudge" not in step
+    assert "trim_nudge" not in step
+    # The whole list is adopted from the server's reply, field for field -- there is no per-shot
+    # write here for a compensation to attach itself to.
+    assert "state.project.shots = saved.shots;" in step
+    assert "api.saveShots(projectId, entry.shots, undoRevision)" in step
+    # And the snapshot it replays is a structural clone of the plan, not a re-derivation of it.
+    save = without_comments(app_js_block('function saveShotsSilently(kind = "edit") {', "\n}"))
+    assert "structuredClone(shotsBaseline)" in save
+    assert "moveWindowStart" not in save and "anchoredNudge" not in save
 
 
 def test_the_lock_is_drawn_next_to_the_nudge_and_writes_nothing_when_toggled():

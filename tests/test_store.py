@@ -631,6 +631,94 @@ def test_save_that_gives_up_raises_and_leaves_no_temp_file(tmp_path: Path, monke
     assert ProjectStore(tmp_path).get(project.id).name == "Blocked"
 
 
+def test_an_ordinary_read_mutate_save_reverts_the_other_writer_and_raises_nothing(
+    tmp_path: Path,
+):
+    """The scoping fact the compare-and-swap exists for, pinned so it cannot be misremembered.
+
+    `ProjectChangedDuringSave` covers exactly one window: another save landing while this one is
+    *backing off* a blocked replace. The ordinary read, mutate, save has no contention on the
+    replace at all — it lays a manifest read seconds ago over a newer one, silently, and both
+    callers are told they succeeded. That is the documented "last writer wins" rule for a route
+    the Director triggered by clicking, and it is exactly what a two-second background loop must
+    not do, which is why `save` takes `if_generation` and the poll passes it.
+    """
+    store = ProjectStore(tmp_path)
+    created = store.create(_polled_project("Unguarded"))
+
+    reader = store.get(created.id)  # the loop's read
+    other = store.get(created.id)  # a route's read, moments later
+    other.creative_brief = "the other writer's change, already answered 200"
+    store.save(other)
+
+    reader.treatment = "written from a copy that predates the change above"
+    store.save(reader)  # no exception: this is the hole
+
+    on_disk = ProjectStore(tmp_path).get(created.id)
+    assert on_disk.treatment == "written from a copy that predates the change above"
+    assert on_disk.creative_brief == "", "the guard now covers this; the poll's fix can be simpler"
+
+
+def test_a_save_naming_the_generation_it_read_at_is_refused_once_the_manifest_moves(
+    tmp_path: Path,
+):
+    """The same sequence, with the token — refused, and the other writer's manifest untouched.
+
+    Deterministic by ordering, not by timing: `read_for_update` hands back the write count it
+    read at, so "did somebody land a manifest since" is a comparison rather than a race. The
+    refusal is the existing exception, because it means the existing thing and has the existing
+    remedy: re-read, re-apply, save again.
+    """
+    store = ProjectStore(tmp_path)
+    created = store.create(_polled_project("Guarded"))
+
+    reader, generation = store.read_for_update(created.id)
+    other = store.get(created.id)
+    other.creative_brief = "the other writer's change"
+    store.save(other)
+    landed = store.manifest_path(created.id).read_text(encoding="utf-8")
+
+    reader.treatment = "the reconciliation this save would have carried"
+    with pytest.raises(ProjectChangedDuringSave):
+        store.save(reader, if_generation=generation)
+
+    # Byte for byte what the other writer wrote, `updated_at` included — a refused save is not a
+    # save, so nothing of the loser's is on disk and nothing of the winner's moved.
+    assert store.manifest_path(created.id).read_text(encoding="utf-8") == landed
+    assert ProjectStore(tmp_path).get(created.id).treatment == ""
+    leftovers = sorted(
+        path.name for path in store.project_dir(created.id).iterdir() if path.is_file()
+    )
+    assert leftovers == ["project.json"], "the refused save left a temp file behind"
+
+
+def test_the_generation_token_lets_an_uncontended_save_through_and_is_per_project(
+    tmp_path: Path,
+):
+    """The other three quarters of the truth table, so the guard is not simply "always refuse".
+
+    A save whose manifest nobody touched lands; the token it was handed moves with the write, so
+    the same caller can read and write again; and a save to a *different* project does not refuse
+    this one, because the count is keyed on the manifest path rather than on the process.
+    """
+    store = ProjectStore(tmp_path)
+    created = store.create(_polled_project("Uncontended"))
+    elsewhere = store.create(Project(name="Somebody else's project"))
+
+    project, generation = store.read_for_update(created.id)
+    elsewhere.creative_brief = "a busy neighbour"
+    store.save(elsewhere)
+    project.treatment = "landed"
+    store.save(project, if_generation=generation)
+
+    again, next_generation = store.read_for_update(created.id)
+    assert next_generation == generation + 1
+    again.treatment = "landed twice"
+    store.save(again, if_generation=next_generation)
+
+    assert ProjectStore(tmp_path).get(created.id).treatment == "landed twice"
+
+
 def test_uncontended_reads_stay_cheap(tmp_path: Path):
     """The poll runs every two seconds and every route reads: the lock must be nearly free.
 

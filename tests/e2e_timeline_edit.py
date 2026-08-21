@@ -51,6 +51,13 @@ What is asserted, in order:
     resolves and the words the readiness report supplies, and it warns without blocking.
 11. **Expand All Prompts** is on the cuts bar, wired to the whole-plan sweep, and states what it
     will cost before it spends anything.
+13. **The ruling of 2026-08-21** — *"we dont want to slide the take next to the one we are
+    adjusting either ... those gestures should only slide the window bounds but leave the clip
+    position intact."* Section 12 proves the shot under the hand; this proves the shot that is
+    **not**: the neighbour whose `start` a playhead snap carries, and the shot a double-click gap
+    fill runs back. Both anchors are read off the manifest, both directions of the gap fill are
+    driven, the neighbour's *own* lock is unticked to show it is the one that governs, and undo
+    and redo are stepped through to show a restore is not compensated a second time.
 12. **The music lock and the second yellow** (2026-08-21). The lock is beside the trim nudge and
     starts ticked; a locked move-drag leaves the take on the same second of the song and an
     unlocked one moves it, both read back as `start - lead - nudge` off the manifest; a window
@@ -103,6 +110,7 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -179,6 +187,50 @@ LEGACY_TAKE_FIELDS = {
     "trim_nudge": 9.0,
     "status": "complete",
 }
+
+#: The takes section 13 needs, one per gesture the Director's ruling of 2026-08-21 reaches.
+#:
+#:     "Well we dont want to slide the take next to the one we are adjusting either, rather move
+#:     its windows edge while both clips stay in place, same for double click, those gestures
+#:     should only slide the window bounds but leave the clip position intact."
+#:
+#: Four shots carry a take, and each is there for a gesture:
+#:
+#: * `shot_04` has 0.015 s of empty song in front of it -- the Director's own residue, measured
+#:   from their real project -- so its left edge is the *leftward* gap fill, the direction that
+#:   moves a start. 0.015 s is also nowhere near the 1/24 s grid, so a compensation rounded to a
+#:   frame comes out visibly wrong rather than accidentally right.
+#: * `shot_05` has 2.5 s of empty song *after* it, so its right edge is the *rightward* fill --
+#:   the direction that grows a duration and moves no start at all.
+#: * `shot_07` is the shot under the hand when a cut is snapped to the playhead.
+#: * `shot_08` shares that cut, so it is the *neighbour* whose `start` the snap moves and whose
+#:   take the old shape slid. It is the whole point of the ruling.
+#:
+#: Every one starts with a **non-zero** nudge, and no two the same: a compensation that wrote the
+#: delta instead of adding it to what was there would land on the right anchor from a zero nudge
+#: and be invisible. The recorded windows are 9 s against live windows of 5 s -- takes the Director
+#: shortened after rendering -- which is `TAKE_FIELDS`' own reason: 10.125 s of picture leaves room
+#: for a real drag inside the take.
+RULING_TAKES = {
+    "shot_04": {"latest_take_start": 15.017, "trim_nudge": 0.125},
+    "shot_05": {"latest_take_start": 20.017, "trim_nudge": 0.375},
+    "shot_07": {"latest_take_start": 32.517, "trim_nudge": 0.25},
+    "shot_08": {"latest_take_start": 37.517, "trim_nudge": 0.0625},
+}
+
+
+def ruling_plan() -> list[dict]:
+    """`SHOTS`, with a take on each of `RULING_TAKES`. Written through `PUT /shots` exactly as the
+    H3 submission route writes one, which is what makes section 13 cost no GPU time at all."""
+    return [
+        {**shot, "prompt": f"{shot['id']}: the corridor, pushing in.", "mode": "text",
+         "status": "draft",
+         **({"latest_output": f"music-video-producer/qa/shots/{shot['id']}-h3_00001.mp4",
+             "latest_take_lead": 0.25, "latest_take_duration": 9.0, "status": "complete",
+             **RULING_TAKES[shot["id"]]} if shot["id"] in RULING_TAKES else {})}
+        for shot in SHOTS
+    ]
+
 
 #: Everything the browser knows about one clip's two handles and about the playhead, in screen
 #: coordinates. Only a layout engine can answer any of it.
@@ -1658,6 +1710,270 @@ def main() -> None:
                 "readiness": readiness_text[:600],
             }
 
+            # --- 13. The ruling: the take next to the one being adjusted -----------------------
+            #
+            # The Director, 2026-08-21, overruling the half-applied version of section 12's rule:
+            #
+            #     "Well we dont want to slide the take next to the one we are adjusting either,
+            #     rather move its windows edge while both clips stay in place, same for double
+            #     click, those gestures should only slide the window bounds but leave the clip
+            #     position intact."
+            #
+            # Section 12 proves the shot *under the hand*. This proves the two gestures that write
+            # some *other* shot's start -- snapping a cut to the playhead, which carries the
+            # neighbour's edge, and the double-click gap fill -- and it proves them the only way
+            # they can be proven: as `start - lead - nudge` read off the stored manifest, for the
+            # shot the pointer was never on.
+            #
+            # It also settles whose lock decides. When a gesture on A moves B's start it is B's
+            # take that must stay on the music, so it is B's toggle that governs -- driven here by
+            # unticking B and repeating the same drag on A.
+            ruling: dict[str, object] = {}
+
+            def load_ruling_plan() -> None:
+                put_json(
+                    f"{server.base_url}/api/projects/{project_id}/shots",
+                    {"shots": ruling_plan()},
+                )
+                driver.refresh()
+                select_project(driver, wait, project_id)
+                driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+                wait.until(
+                    lambda browser: len(
+                        browser.find_elements(By.CSS_SELECTOR, "#shots-track .shot-clip")
+                    ) == SHOT_COUNT
+                )
+                settle(driver, "#shots-track")
+
+            def held(before: dict, after: dict, what: str) -> None:
+                """The take is still on the same second of the song, and the nudge moved by
+                exactly the seconds the window moved by. One microsecond of tolerance, which is
+                `exactSeconds`' own resolution -- a frame of tolerance would have passed the
+                17 ms drift a browser measured on 2026-08-21."""
+                assert abs(after["anchor"] - before["anchor"]) < 1e-6, (
+                    (f"{what}: the take slid "
+                     f"{(after['anchor'] - before['anchor']) * 1000:.1f}ms off the music"),
+                    before, after,
+                )
+                assert abs(
+                    (after["start"] - before["start"])
+                    - (after["trim_nudge"] - before["trim_nudge"])
+                ) < 1e-6, (f"{what}: the nudge did not follow the window", before, after)
+
+            load_ruling_plan()
+            magnet = driver.execute_script(SNAP_STATE)
+            assert magnet["pressed"] == "true", ("the magnet is off before section 13", magnet)
+
+            # --- 13a. Snapping a cut carries the neighbour's window, not its take -------------
+            #
+            # The reported case. A *right*-edge snap moves the dragged shot's `duration` and the
+            # neighbour's `start` -- so the one take this gesture can displace is the neighbour's,
+            # and the neighbour's was the one take that was never compensated.
+            neighbour_before = take_anchor_second(server, project_id, "shot_08")
+            dragged_before = take_anchor_second(server, project_id, "shot_07")
+
+            def snap_shot_07_right() -> float:
+                """Park the playhead inside shot_07 and drag the cut at its right edge onto it.
+                Answers where the playhead actually landed.
+
+                The scrub is inside this helper rather than done once, because *selecting a clip
+                moves the playhead*: an unmoved click on a clip parks it at that shot's start, and
+                section 13c has to select two clips between its two runs of this drag.
+                """
+                at = scrub_to(driver, 36.8)
+                assert 32.6 < at < 37.4, f"the scrub left the playhead at {at}s"
+                # Off the frame grid, or "landed on the playhead" and "quantised to the frame"
+                # are the same number and this section would pass whether the magnet fired or not.
+                assert abs(at * 24 - round(at * 24)) > 0.15, (
+                    f"the playhead landed on the frame grid at {at}s"
+                )
+                facts = geometry(driver, "shot_07")
+                cut = take_state(server, project_id, "shot_07")
+                travel = int(
+                    (at - (cut["start"] + cut["duration"])) * facts["pixelsPerSecond"]
+                ) - 3
+                assert abs(travel) > 8, ("the drag is too short to be a drag at this zoom", travel)
+                handle = clip_for(driver, "shot_07").find_element(
+                    By.CSS_SELECTOR, ".resize-handle.right"
+                )
+                was = shots_writes(driver)
+                ActionChains(driver).click_and_hold(handle).move_by_offset(
+                    travel, 0
+                ).release().perform()
+                await_shots_write(driver, was, "the snap onto the playhead")
+                settle(driver, "#shots-track")
+                return at
+
+            playhead = snap_shot_07_right()
+            snapped_08 = take_state(server, project_id, "shot_08")
+            snapped_07 = take_state(server, project_id, "shot_07")
+            # The gesture really did what it says: the shared cut is on the playhead and the
+            # neighbour's window followed it.
+            assert abs(snapped_08["start"] - playhead) < 0.003, (
+                ("the neighbour's edge did not land on the playhead, so this section is not "
+                 "measuring the gesture the ruling is about"), playhead, snapped_08,
+            )
+            assert abs(snapped_08["start"] - neighbour_before["start"]) > 0.05, (
+                "the neighbour's start did not move at all", neighbour_before, snapped_08
+            )
+            # And the ruling: the neighbour's take is still on the same second of the song.
+            held(neighbour_before, snapped_08, "the snapped neighbour")
+            # The dragged shot's own start never moved, so nothing was written to its nudge --
+            # a duration is not in the anchor and cannot displace a take.
+            assert snapped_07["start"] == dragged_before["start"], snapped_07
+            assert snapped_07["trim_nudge"] == dragged_before["trim_nudge"], (
+                "a right-edge drag wrote a nudge, and a duration cannot move a take",
+                dragged_before, snapped_07,
+            )
+            assert contiguity(windows(server, project_id)) == contiguity(seeded), (
+                "the snap changed the plan's contiguity",
+                contiguity(windows(server, project_id)),
+            )
+            ruling["snap_neighbour"] = {
+                "playhead": playhead,
+                "before": neighbour_before, "after": snapped_08,
+                "dragged_before": dragged_before, "dragged_after": snapped_07,
+            }
+
+            # --- 13b. Undo restores the pair and does not compensate a second time ------------
+            #
+            # Undo replays a snapshotted shot list, and that snapshot already holds the `start`
+            # and the `trim_nudge` that belonged together when it was taken. If the restore were
+            # routed through the anchoring rule it would move every anchored take by the amount
+            # the gesture had just been rolled back by -- the rule applied twice. Both fields are
+            # compared, not only the anchor: a double-application that moved `start` and
+            # `trim_nudge` by the same amount would leave the anchor right and the plan wrong.
+            press_history(driver, server, project_id, "undo-shots")
+            undone_08 = take_state(server, project_id, "shot_08")
+            assert undone_08 == neighbour_before, (
+                "undo did not put the neighbour back exactly -- start, nudge and anchor together",
+                neighbour_before, snapped_08, undone_08,
+            )
+            assert take_state(server, project_id, "shot_07") == dragged_before
+            press_history(driver, server, project_id, "redo-shots")
+            redone_08 = take_state(server, project_id, "shot_08")
+            assert redone_08 == snapped_08, (
+                "redo did not reach the state undo displaced", snapped_08, redone_08
+            )
+            press_history(driver, server, project_id, "undo-shots")
+            assert take_state(server, project_id, "shot_08") == neighbour_before
+            ruling["undo_restores"] = {
+                "undone": undone_08, "redone": redone_08,
+            }
+
+            # --- 13c. And it is the *neighbour's* lock that governs the neighbour -------------
+            #
+            # Unticked on shot_08, which the pointer never touches: the same drag on shot_07's
+            # right edge now lets shot_08's take travel with its window. Nothing about shot_07
+            # changes, and shot_07 stays locked throughout -- so a client reading the lock of the
+            # clip under the hand would answer "locked" here and hold the take still.
+            select_clip(driver, "shot_08")
+            unlock = driver.find_element(By.ID, "take-anchor")
+            assert unlock.get_property("checked") is True
+            unlock.click()
+            assert driver.find_element(By.ID, "take-anchor").get_property("checked") is False
+            select_clip(driver, "shot_07")
+            assert driver.find_element(By.ID, "take-anchor").get_property("checked") is True, (
+                "unticking the neighbour unticked the shot under the hand as well, so the two "
+                "clips share one flag and this section proves nothing"
+            )
+            free_playhead = snap_shot_07_right()
+            free_08 = take_state(server, project_id, "shot_08")
+            assert abs(free_08["start"] - free_playhead) < 0.003, (
+                "the unlocked neighbour's edge did not land on the playhead", free_08
+            )
+            assert free_08["trim_nudge"] == neighbour_before["trim_nudge"], (
+                ("the unlocked neighbour's nudge was still compensated, so unlocking it did "
+                 "nothing"), neighbour_before, free_08,
+            )
+            # The take travelled with the window: the anchor moved by exactly what the window did.
+            assert abs(
+                (free_08["anchor"] - neighbour_before["anchor"])
+                - (free_08["start"] - neighbour_before["start"])
+            ) < 1e-6, (neighbour_before, free_08)
+            assert abs(free_08["anchor"] - neighbour_before["anchor"]) > 0.05, (
+                ("the unlocked neighbour's take stayed on the same song second, which is the "
+                 "locked behaviour"), neighbour_before, free_08,
+            )
+            ruling["neighbour_lock_governs"] = {
+                "locked": snapped_08, "unlocked": free_08,
+            }
+
+            # --- 13d. The double-click, in both of its directions ------------------------------
+            #
+            # The other reported case, and an earlier explicit ruling is superseded here: this
+            # gesture used to leave `trim_nudge` alone on purpose, on the reasoning that closing a
+            # 0.002 s gap must not silently re-time a take. The Director has ruled the other way,
+            # and the reasoning was inverted: moving a window 0.015 s earlier and leaving the nudge
+            # alone *is* the re-timing.
+            #
+            # `gapFillPlan` never moves the neighbour in either direction, so the two directions
+            # are: leftward, which moves this shot's own start, and rightward, which only grows
+            # its duration. Both are driven.
+            load_ruling_plan()
+            fill_before = take_anchor_second(server, project_id, "shot_04")
+            double_click_handle("shot_04", "left")
+            filled_left = take_state(server, project_id, "shot_04")
+            # 0.015 s of the Director's own residue, closed exactly -- and closed off the frame
+            # grid, so a compensation quantised to 1/24 s would be 0.0417 s wrong here.
+            assert filled_left["start"] == 15.002, filled_left
+            assert round(filled_left["start"] - fill_before["start"], 6) == -0.015, filled_left
+            held(fill_before, filled_left, "the leftward gap fill")
+            # Rightward: 2.5 s of empty song after shot_05, closed by growing a duration. The
+            # start does not move, so nothing is written to the nudge at all.
+            right_before = take_anchor_second(server, project_id, "shot_05")
+            double_click_handle("shot_05", "right")
+            filled_right = take_state(server, project_id, "shot_05")
+            assert round(filled_right["duration"], 6) == 7.5, filled_right
+            assert filled_right["start"] == right_before["start"], filled_right
+            assert filled_right["trim_nudge"] == right_before["trim_nudge"], (
+                "the rightward fill wrote a nudge, and it moved no start to compensate for",
+                right_before, filled_right,
+            )
+            held(right_before, filled_right, "the rightward gap fill")
+            ruling["gap_fill_left"] = {"before": fill_before, "after": filled_left}
+            ruling["gap_fill_right"] = {"before": right_before, "after": filled_right}
+
+            # Unlocked, the same double-click lets the take travel -- one rule, every gesture.
+            press_history(driver, server, project_id, "undo-shots")
+            press_history(driver, server, project_id, "undo-shots")
+            assert take_state(server, project_id, "shot_04") == fill_before
+            select_clip(driver, "shot_04")
+            driver.find_element(By.ID, "take-anchor").click()
+            assert driver.find_element(By.ID, "take-anchor").get_property("checked") is False
+            double_click_handle("shot_04", "left")
+            free_04 = take_state(server, project_id, "shot_04")
+            assert free_04["start"] == 15.002, free_04
+            assert free_04["trim_nudge"] == fill_before["trim_nudge"], free_04
+            assert abs(free_04["anchor"] - fill_before["anchor"]) > 1e-6, (
+                "an unlocked gap fill left the take on the same song second", fill_before, free_04
+            )
+            ruling["gap_fill_unlocked"] = free_04
+
+            # --- 13e. The inspector's own Start box is the same edit written as a number -------
+            #
+            # Not a gesture the Director named, and included because a typed 1.5 s that slid the
+            # take while a dragged 1.5 s did not would be exactly the inconsistency the ruling is
+            # about. The box is a few rows above the lock, so a Director who means to move the take
+            # has the toggle to hand.
+            load_ruling_plan()
+            typed_before = take_anchor_second(server, project_id, "shot_07")
+            select_clip(driver, "shot_07")
+            box = driver.find_element(By.ID, "shot-start")
+            assert float(box.get_attribute("value")) == typed_before["start"]
+            was = shots_writes(driver)
+            box.send_keys(Keys.CONTROL, "a")
+            box.send_keys("34.767")
+            box.send_keys(Keys.TAB)
+            await_shots_write(driver, was, "the typed start")
+            settle(driver, "#shots-track")
+            typed = take_state(server, project_id, "shot_07")
+            assert typed["start"] == 34.767, ("the typed start never reached disk", typed)
+            held(typed_before, typed, "the typed start")
+            ruling["typed_start"] = {"before": typed_before, "after": typed}
+
+            result["ruling_2026_08_21"] = ruling
+
             # The plan is put back the way the seed left it, so the final contiguity recorded
             # below describes the Director's own shape rather than this section's drags.
             put_json(
@@ -1688,7 +2004,8 @@ def main() -> None:
             # still fails the run.
             console_gate(
                 driver, NAME, result,
-                expected=["409", f"shots/{TAKE_SHOT}/take", f"shots/{LEGACY_SHOT}/take"],
+                expected=["409", f"shots/{TAKE_SHOT}/take", f"shots/{LEGACY_SHOT}/take"]
+                + [f"shots/{shot_id}/take" for shot_id in RULING_TAKES],
             )
             report(NAME, result)
         finally:

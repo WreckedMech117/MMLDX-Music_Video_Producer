@@ -3552,6 +3552,56 @@ export function takeAnchorControl(shot, unlocked = false) {
   };
 }
 
+// What a shot's `trim_nudge` becomes when its window's `start` moves from `from` to `to`.
+//
+// **The whole anchoring rule, in one function, for every gesture that moves any shot's start.**
+// The Director's ruling, 2026-08-21:
+//
+//     "Well we dont want to slide the take next to the one we are adjusting either, rather move
+//     its windows edge while both clips stay in place, same for double click, those gestures
+//     should only slide the window bounds but leave the clip position intact."
+//
+// This supersedes the reasoning that had the compensation on the shot *under the hand* only.
+// The principle is about the take, not about which clip the pointer is on: a take's anchor is
+// `start - lead - nudge`, the song second its first frame plays at, so *any* uncompensated write
+// to `start` slides that shot's take off the music -- and a Director snapping one cut to a beat
+// did not ask for the take on the other side of it to move. Written as a function over numbers
+// rather than as a line repeated at each site, because "repeated at each site" is exactly how it
+// came to be applied at two of the four and not at the other two.
+//
+// Three answers, and only the first writes anything:
+//
+// * **A take, and locked.** The nudge moves by exactly the seconds the window moved, so
+//   `start - lead - nudge` comes out unchanged. This is what the lock means.
+// * **No take.** Nothing to anchor -- there is no take whose position could be preserved -- so
+//   the window moves alone, exactly as it did before any of this existed.
+// * **Unlocked.** The Director has said this clip is being repositioned deliberately; the take
+//   travels with the window, which is what a b-roll reposition wants.
+//
+// `unlocked` is the *moving shot's own* lock, never the lock of whatever clip the gesture was
+// aimed at. When a drag on shot A moves shot B's start it is B's take that must stay on the
+// music, so it is B's toggle that decides -- and B's toggle is the one a Director would go and
+// untick if they wanted B's take to travel.
+//
+// `nudge` is what `trim_nudge` was *at* `from`, passed in rather than read off the shot: a drag
+// mutates the live shot on every `pointermove`, so the shot's current nudge is the previous
+// frame's answer and compounding onto it would multiply the compensation by the number of mouse
+// events. It defaults to the shot's own field for the callers that write once.
+//
+// **`exactSeconds`, never the frame grid.** Windows step to 1/24 s; a window that did not *start*
+// on the grid moves by an off-grid amount, and re-gridding the compensation rounds it to a
+// different number than the window moved by. A browser measured a 1.608 s move written as a
+// 1.625 s nudge on 2026-08-21, leaving the take 17 ms off the music with every offline assertion
+// green. The compensation is not its own gesture; it is exactly what the window did, with float
+// noise trimmed.
+export function anchoredNudge(shot, { from, to, nudge = null, unlocked = false } = {}) {
+  const was = nudge === null ? (Number(shot?.trim_nudge) || 0) : (Number(nudge) || 0);
+  if (!takeAnchorControl(shot, unlocked).held) return was;
+  const moved = exactSeconds(Number(to) - Number(from));
+  if (!Number.isFinite(moved) || moved === 0) return was;
+  return exactSeconds(was + moved);
+}
+
 // The shot whose window holds this moment of the song, or null over a gap. Later starts
 // win a boundary tie, matching assembly's cumulative grid where a boundary frame belongs
 // to the clip it opens.
