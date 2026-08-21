@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -26,6 +25,17 @@ from .models import Project, now_utc
 #: `_replace_atomically` for what covers handles this process does not own.
 _MANIFEST_LOCK = threading.RLock()
 
+#: How the replace backoff waits. A plain `time.sleep` there ran *under* the lock above, so a
+#: foreign handle on one manifest stalled every unrelated request in the process — including the
+#: two-second `/render-status` poll the lock exists to keep working, and including it on the
+#: event loop, because `get` and `save` are called straight from `async def` routes. Waiting on a
+#: condition built over the same lock releases it for the duration and re-acquires it afterwards,
+#: so contention no longer blocks anyone; each replace *attempt* still happens with the lock held,
+#: which is the whole guard. `Condition.wait` releases an `RLock` to its full recursion depth and
+#: restores that depth, which matters because `create` nests inside it. Nothing in the application
+#: notifies; a test does, to end a backoff on demand instead of on the clock.
+_MANIFEST_WAIT = threading.Condition(_MANIFEST_LOCK)
+
 #: Attempts, and the backoff step between them, for the atomic replace. The lock above removes
 #: every reader this process owns; these cover the ones it does not — a virus scanner, the
 #: search indexer, an editor left open on `project.json`, a second app instance — which hold the
@@ -43,6 +53,19 @@ class ProjectNotFound(KeyError):
 def _replace_atomically(temporary_path: Path, target: Path) -> None:
     """Move the finished temp file onto the manifest, retrying a transient Windows lock.
 
+    Call with `_MANIFEST_LOCK` held — the backoff waits on `_MANIFEST_WAIT`, which requires it,
+    and every attempt must be made under it or a reader in this process could have the target
+    open at the moment of the replace, which is the failure the lock exists to prevent.
+
+    The lock is *dropped across the wait* and taken again for the next attempt, so a save held up
+    by a handle this process does not own no longer freezes every other manifest call. What that
+    lets in between attempts is another whole `get`, `save` or `list` — never a half one, because
+    each of those is itself atomic under the same lock. A reader that slips in opens and closes
+    the manifest entirely inside the window and holds nothing by the time this loop re-acquires,
+    so the retry cannot be broken by it. A writer that slips in lands its own complete manifest
+    and this one then replaces it: last writer wins, which is already how the store behaves for
+    routes that read, mutate and save as three separate acquisitions.
+
     Failure leaves no debris: a save that gives up removes its own temp file rather than
     accumulating one per attempt inside the project directory, which is what the unlocked
     version did — a few seconds of contention left thousands of them beside the manifest.
@@ -55,7 +78,7 @@ def _replace_atomically(temporary_path: Path, target: Path) -> None:
             if attempt == _REPLACE_ATTEMPTS - 1:
                 temporary_path.unlink(missing_ok=True)
                 raise
-            time.sleep(_REPLACE_BACKOFF * (attempt + 1))
+            _MANIFEST_WAIT.wait(_REPLACE_BACKOFF * (attempt + 1))
 
 
 class ProjectStore:

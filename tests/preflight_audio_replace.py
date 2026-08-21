@@ -88,6 +88,11 @@ AUDIT_SONG = "F:/MusicVideoProducer/data/projects/preflight/media/songs/master.m
 AUDIT_START = 12.0
 AUDIT_DURATION = 3.75
 AUDIT_SONG_DURATION = 154.644898
+#: The lead such a take records at submission (`Shot.latest_take_lead`): a normal-length window
+#: mid-song takes the quarter second. The audited window is therefore the *take's* 11.75 s to
+#: 16.2083 s and not the shot's 12 s to 15.75 s — the take is 107 frames of picture beginning a
+#: quarter second before the window, and the audio has to cover it (2026-08-21).
+AUDIT_TAKE_LEAD = 0.25
 
 #: Filename suffixes that make a payload string a model file. The same set
 #: ``preflight_h3_ultra.model_files`` and ``preflight_ltx25_enhance`` use.
@@ -105,6 +110,7 @@ def audit_payloads() -> list[tuple[str, dict]]:
                 start=AUDIT_START,
                 duration=AUDIT_DURATION,
                 song_duration=AUDIT_SONG_DURATION,
+                take_lead=AUDIT_TAKE_LEAD,
                 prefix="music-video-producer/preflight/shot-song-audio",
             ),
         )

@@ -7,12 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# The 17k+5 grid, imported rather than re-derived. `build_h3_reference_payload` computes the
-# same rounding inline and `tests/test_workflows.py` pins the two against each other over the
-# whole window range; `audio_replace_lengths` is new code and has no such history to preserve,
-# so it calls the function. `timeline` imports only `models`, which imports nothing local, so
-# this direction cannot cycle.
-from .timeline import align_h3_frames, over_render_frames
+# The render length and the take's own seconds of the song, imported rather than re-derived.
+# `build_h3_reference_payload` computes the 17k+5 rounding inline and `tests/test_workflows.py`
+# pins the two against each other over the whole window range; the audio-replace pair is new
+# code with no such history to preserve, so it calls the functions — and calling them is the
+# whole of what makes the restored audio match the take (2026-08-21). `timeline` imports only
+# `models`, which imports nothing local, so this direction cannot cycle.
+from .timeline import over_render_frames, over_render_window
 
 
 @dataclass(frozen=True, slots=True)
@@ -2060,6 +2061,7 @@ def build_audio_replace_payload(
     start: float,
     duration: float,
     song_duration: float,
+    take_lead: float,
     prefix: str,
 ) -> dict[str, dict[str, Any]]:
     """Put the master song's own seconds back over a finished take.
@@ -2074,15 +2076,33 @@ def build_audio_replace_payload(
     generates anything. ``reachable_node_ids`` is the rule and ``tests/test_workflows.py``
     checks this payload against the export through it rather than against a list retyped here.
 
-    **The window is not computed here and cannot be.** ``start``, ``duration`` and
-    ``song_duration`` are the three numbers the *render* was given, and they are handed
-    straight to ``song_audio_window`` — the same function ``generate_h3`` calls to decide which
-    seconds of the master conditioned this shot. There is deliberately no window parameter: a
-    caller cannot pass a window this builder would then trust, so there is no second
-    computation of "which seconds is this shot" anywhere on this path and no way for the two to
-    drift. The refusal for a window past the end of the song is inherited from that function
-    rather than restated, so the two stages refuse the same shot for the same reason in the
-    same words.
+    **The window is not computed here and cannot be.** ``start``, ``duration``,
+    ``song_duration`` and ``take_lead`` are the four numbers the *render* was given or recorded,
+    and every one of them is handed straight to a function ``generate_h3`` also calls. There is
+    deliberately no window parameter: a caller cannot pass a window this builder would then
+    trust, so there is no second computation of "which seconds is this take" anywhere on this
+    path and no way for the two to drift.
+
+    Two functions, because there are two questions and they have different answers:
+
+    * ``song_audio_window`` answers *is this shot legal at all* — the past-the-end refusal,
+      inherited rather than restated, so the two stages refuse the same shot for the same reason
+      in the same words. Its window is the **exposed slice**, and that is what it is used for;
+    * ``timeline.over_render_window`` answers *which seconds is the take*, which is the window
+      this graph actually carries. Since the over-render margin (2026-08-19) and the micro-cut
+      floor (2026-08-20), a take is not its window: it is `over_render_frames(duration)` frames
+      of picture beginning ``take_lead`` seconds before the window. Windowing this stage by
+      ``start``/``duration`` — which is what it did until 2026-08-21 — laid the exposed slice's
+      seconds over the *whole* take, so the sound ran ``take_lead`` seconds ahead of the mouth
+      and stopped a margin early. On a centred micro-cut that is a 2.083 s slice over 4.4583 s
+      of picture, offset by 1.2083 s.
+
+    ``take_lead`` is `Shot.latest_take_lead`, **recorded at submission and never recomputed**: a
+    pre-margin take and a post-margin one are indistinguishable by arithmetic on their lengths,
+    which is the whole reason that field exists. This builder therefore refuses a lead it can
+    prove is not this shot's (negative, or longer than the shot's own start) rather than
+    repairing it into a plausible window. Deciding what a *missing* lead means is the caller's:
+    see ``app.restore_song_audio``.
 
     The window reaches ComfyUI as ``VHS_LoadAudio``'s ``seek_seconds`` and ``duration``, which
     is the node slicing the file as it reads it. Nothing downstream trims: ``trim_to_audio`` is
@@ -2144,10 +2164,30 @@ def build_audio_replace_payload(
             raise ValueError(
                 f"{label} must be one of {', '.join(accepted)}; {value} is not one of those"
             )
-    # The whole correctness argument of this stage, in one call. See the docstring: there is no
-    # window parameter for a caller to disagree with, and the past-the-end refusal is this
-    # function's, not a second one written here.
-    window = song_audio_window(start=start, duration=duration, song_duration=song_duration)
+    # The whole correctness argument of this stage, in two calls. See the docstring: there is no
+    # window parameter for a caller to disagree with, and neither the past-the-end refusal nor
+    # the take's own arithmetic is a second copy written here.
+    #
+    # First the shot's legality, in the render's own words. Its answer is deliberately not the
+    # window sent: this is the *exposed slice*, and what this graph lays audio over is the whole
+    # take.
+    song_audio_window(start=start, duration=duration, song_duration=song_duration)
+    _finite("Take lead", take_lead)
+    if take_lead < 0 or take_lead > start:
+        raise ValueError(
+            f"A take of a shot at {start:g}s cannot begin {take_lead:g}s before it — that lead "
+            f"does not describe this shot, and guessing one would put the picture out of sync "
+            f"with the sound that produced it."
+        )
+    # Then the take's own seconds. `over_render_frames` is the render's frame count, so the
+    # audio is exactly as long as the picture the render asked H3 for, and `over_render_window`
+    # is the offset rule `generate_h3` conditions with.
+    trim_start, trim_end = over_render_window(
+        start=start,
+        lead=take_lead,
+        picture_seconds=over_render_frames(duration) / H3_FRAME_RATE,
+        song_duration=song_duration,
+    )
     return {
         "mvp:source": {
             "class_type": "VHS_LoadVideoPath",
@@ -2175,8 +2215,8 @@ def build_audio_replace_payload(
             "class_type": "VHS_LoadAudio",
             "inputs": {
                 "audio_file": source_audio,
-                "seek_seconds": window["start"],
-                "duration": window["end"] - window["start"],
+                "seek_seconds": trim_start,
+                "duration": trim_end - trim_start,
             },
         },
         "mvp:save": {
@@ -2205,35 +2245,54 @@ def build_audio_replace_payload(
     }
 
 
-def audio_replace_lengths(*, duration: float) -> dict[str, float]:
+def audio_replace_lengths(
+    *, start: float, duration: float, song_duration: float, take_lead: float
+) -> dict[str, float]:
     """How many seconds of picture a shot's take holds against the seconds of song it gets.
 
     The matrix's length-mismatch row, answered with the two numbers that are actually known
     before anything is submitted, and named so neither is mistaken for the other:
 
-    * ``audio_seconds`` is the window's own length — ``duration``, exactly, because
-      ``song_audio_window`` returns ``start`` to ``start + duration``;
+    * ``audio_seconds`` is the length of the window this stage actually sends — the take's own
+      seconds, from `timeline.over_render_window`, which is the same call
+      `build_audio_replace_payload` fills the loader from;
     * ``requested_picture_seconds`` is the H3 **request**, not a measurement: the render asked
-      for ``align_h3_frames(max(5, round(duration * 24)))`` frames at 24 fps, and the 17k+5
-      grid rounds *up*. A 3.75 s shot asks for 90 frames, which is 3.75 s exactly; a 5 s shot
-      asks for 124, which is 5.1667 s. That 0.1667 s is a real mismatch, computable here, and
-      it is the reason this function exists rather than a line saying the two agree.
+      for `timeline.over_render_frames` frames at 24 fps. A 3.75 s shot asks for 107 frames,
+      which is 4.4583 s; a 2.083 s micro-cut asks for 107 as well, because every take is floored
+      at H3's own four-second minimum.
 
-    The distinction is load-bearing and is the matrix's "frame count is measured, never
-    asserted equal to the input": what the render *asked for* is knowable from the shot; what
-    the take *contains* is an ``ffprobe`` reading of a file. This returns the first and never
-    claims the second. The saver is told ``trim_to_audio: False``, so whichever is longer stays
-    longer.
+    **Both numbers moved on 2026-08-21 and the pair is the point.** ``requested_picture_seconds``
+    was still ``align_h3_frames(max(5, round(duration * 24)))`` — the formula from before the
+    over-render margin existed — and under-reported a 2.083 s shot's take as 50 frames when the
+    render asked for 107. ``audio_seconds`` was the shot's bare ``duration``, which was the same
+    defect on the other side: the audio this stage sends covers the whole take, not the exposed
+    slice. Reported together they now agree by construction, and the *remaining* way they can
+    differ is the honest one — the song ending before the picture does, where
+    ``over_render_window`` clamps the tail and the take keeps its unbacked frames rather than
+    being cut.
 
-    Computed from `timeline.align_h3_frames` rather than from a copy of the grid, so a shot
-    that rendered through that function is measured against that function.
+    The measured/requested distinction is load-bearing and is the matrix's "frame count is
+    measured, never asserted equal to the input": what the render *asked for* is knowable from
+    the shot; what the take *contains* is an ``ffprobe`` reading of a file. This returns the
+    first and never claims the second. The saver is told ``trim_to_audio: False``, so whichever
+    is longer stays longer.
+
+    Every number here comes from the `timeline` functions the submission path renders through,
+    never from a copy of the grid, so what the Director is told a take is cannot disagree with
+    what was asked for.
     """
     _finite("Shot duration", duration)
     if duration <= 0:
         raise ValueError(f"A shot must last longer than zero seconds, not {duration:g}s")
-    frames = align_h3_frames(max(5, round(duration * H3_FRAME_RATE)))
+    frames = over_render_frames(duration)
+    trim_start, trim_end = over_render_window(
+        start=start,
+        lead=take_lead,
+        picture_seconds=frames / H3_FRAME_RATE,
+        song_duration=song_duration,
+    )
     return {
-        "audio_seconds": float(duration),
+        "audio_seconds": trim_end - trim_start,
         "requested_picture_seconds": frames / H3_FRAME_RATE,
         "requested_frames": float(frames),
     }

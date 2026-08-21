@@ -110,7 +110,7 @@ Every shot take is now rendered **at least half a second longer than its window*
 
 **Fine-tuning**: the inspector's *Trim nudge* control slides which slice of the take fills the window, in frame steps, floored at the recorded lead. The Monitor previews the exact slice assembly will cut — `lead + nudge` is one rule on both sides, contract-tested. The nudge stays editable on an approved shot by design: it selects a slice of the approved file; the file itself stays immovable. A nudge that runs the cut off the end of the take is refused at assembly with the take's measured length in the sentence.
 
-Two footnotes: the restore-song-audio stage still windows by the bare shot window, so on a post-margin take its output misses the lead — a deliberate Ask-First follow-up now that the Monitor plays takes against the master live. And `extend` (VideoExtender) likely only extends forward, per the Director; it is recorded, not employed.
+Two footnotes: the restore-song-audio stage windows by the **take**, not by the shot's window, as of 2026-08-21 — it sends `over_render_frames(duration)` frames of song from `start − latest_take_lead`, the same seconds `generate_h3` conditioned the take with, and refuses a take that records no lead (rendered before the margin, or a hand-picked clip) rather than guessing an offset. Not re-measured against a live render. And `extend` (VideoExtender) likely only extends forward, per the Director; it is recorded, not employed.
 
 ## Assemble the video
 

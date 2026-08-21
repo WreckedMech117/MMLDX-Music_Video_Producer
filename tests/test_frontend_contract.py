@@ -3224,14 +3224,16 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
     # against its own refusal constants. A route with neither would fail this test.
     ungated = {
         "enhance_with_ltx25": ("ENHANCE_NO_TAKE_REFUSAL", "ENHANCE_MISSING_TAKE_REFUSAL"),
-        # Plus the two that make this route's window the render's own: a shot that never rode
-        # the master has no window to take, and a project with no song has nothing to take it
-        # from. Both refuse before the submission for the same reason the take checks do.
+        # Plus the three that make this route's window the render's own: a shot that never rode
+        # the master has no window to take, a project with no song has nothing to take it from,
+        # and a take with no recorded lead cannot be placed against the song at all. All three
+        # refuse before the submission for the same reason the take checks do.
         "restore_song_audio": (
             "RESTORE_AUDIO_NO_TAKE_REFUSAL",
             "RESTORE_AUDIO_MISSING_TAKE_REFUSAL",
             "RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL",
             "RESTORE_AUDIO_NO_SONG_REFUSAL",
+            "RESTORE_AUDIO_NO_LEAD_REFUSAL",
         ),
     }
     for name, refusals in sorted(ungated.items()):
@@ -10796,6 +10798,139 @@ def test_the_section_look_confirmation_names_every_section_and_every_skip_reason
     assert confirmation.rstrip().endswith("Write these looks?")
 
 
+#: The report a fully written structure gets back, and the exact shape of the Director's live
+#: project: the route short-circuits it **without a model call**, so `filled` is 0, every row
+#: carries the look they wrote, and the message names the consent word.
+SECTION_LOOKS_ALL_WRITTEN_REPORT = {
+    "applied": False,
+    "filled": 0,
+    "skipped": 2,
+    "message": (
+        "Every section already has a look. Nothing was changed — send overwrite=true to "
+        "replace what is there."
+    ),
+    "sections": [
+        {"section_id": "section_intro", "label": "Intro", "start": 0.0, "filled": False,
+         "prompt": "", "previous": "Mine: the corridor, low and slow.",
+         "reason": "already has a look you wrote; send overwrite=true to replace it"},
+        {"section_id": "section_outro", "label": "Outro", "start": 11.0, "filled": False,
+         "prompt": "", "previous": "Mine: the door, closing on the light.",
+         "reason": "already has a look you wrote; send overwrite=true to replace it"},
+    ],
+}
+
+
+def test_the_overwrite_consent_is_reachable_when_every_section_is_already_written():
+    """Review Finding 3, 2026-08-21. The handler bailed with
+    `if (!report.filled) return toast(report.message, "error")` **before** it ever asked the
+    overwrite question — and a structure where every section already carries a look is exactly
+    the state the route answers with `0 filled`. So for the Director's live project the button
+    could only ever error, while the sentence it showed described a consent the screen had no way
+    to give.
+
+    Driven end to end against a real server and a real browser in `tests/e2e_section_looks.py`,
+    where the looks are read back off the stored manifest; this is the fast gate on the same rule.
+    """
+    driven = run_workspace(
+        """
+        state.project = {
+          id: 'p9', updated_at: 'rev-1', name: 'x', assets: [], jobs: [], messages: [],
+          shots: [], song: { duration: 140, path: 'songs/000-x.wav' },
+          sections: [
+            { id: 'section_intro', label: 'Intro', start: 0, duration: 11,
+              prompt: 'Mine: the corridor, low and slow.' },
+            { id: 'section_outro', label: 'Outro', start: 11, duration: 11,
+              prompt: 'Mine: the door, closing on the light.' },
+          ],
+        };
+        state.selectedSectionId = 'section_intro';
+        app.renderShotInspector();
+        answer(false);
+        await fire('#section-fill-looks:click', {});
+        await flush();
+        console.log(JSON.stringify({
+          question: contract.FILL_SECTION_LOOKS_OVERWRITE_QUESTION,
+          asked,
+          sent: requests.filter((entry) => entry.method === 'POST')
+            .map((entry) => JSON.parse(entry.body)),
+          panel: String(at('#shot-inspector').innerHTML),
+        }));
+        """,
+        responses={
+            "/api/projects/p9/sections/fill-looks": {
+                "body": SECTION_LOOKS_ALL_WRITTEN_REPORT
+            },
+        },
+    )
+    assert driven["asked"] == [driven["question"]], (
+        "the overwrite consent was not the question a fully written structure asks", driven
+    )
+    # Declined, so nothing further goes on the wire: one report, no confirm, no apply.
+    assert driven["sent"] == [{"confirm_apply": False, "overwrite": False, "plan": None}], (
+        driven["sent"]
+    )
+    # And the reasons survive the dialog rather than vanishing with it: the panel names every
+    # section, why it was skipped, and the words the consent would have replaced.
+    for row in SECTION_LOOKS_ALL_WRITTEN_REPORT["sections"]:
+        assert row["label"] in driven["panel"], (row["label"], driven["panel"])
+        assert row["reason"] in driven["panel"], driven["panel"]
+        assert row["previous"] in driven["panel"], (
+            ("the look the consent would replace is not on screen beside the question "
+             "about replacing it"), driven["panel"],
+        )
+
+
+def test_the_section_look_report_says_what_a_look_would_replace():
+    """A look the Director wrote themselves is the one thing this pass can destroy, so the
+    overwrite consent is only a real question while the words it takes away are on screen beside
+    the words it puts there. "6 filled, 1 left alone" is not a sentence anybody can agree to."""
+    lines = run_module("""
+      import { sectionLooksReportLines }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        replacing: sectionLooksReportLines({ sections: [
+          { label: 'Chorus', start: 35, filled: true, prompt: 'The canopy bed, wide.',
+            previous: 'Mine: the chrome mic.', reason: '' },
+        ] }),
+        fresh: sectionLooksReportLines({ sections: [
+          { label: 'Intro', start: 0, filled: true, prompt: 'The corridor.',
+            previous: '', reason: '' },
+        ] }),
+        withheld: sectionLooksReportLines({ sections: [
+          { label: 'Outro', start: 124, filled: false, prompt: 'The door, closing.',
+            previous: 'Mine: the door.',
+            reason: 'already has a look you wrote; send overwrite=true to replace it' },
+        ] }),
+        silent: sectionLooksReportLines({ sections: [
+          { label: 'Bridge', start: 103, filled: false, prompt: '', previous: '',
+            reason: 'the treatment does not describe this section' },
+        ] }),
+        nothing: sectionLooksReportLines(null),
+      }));
+    """)
+    assert lines["nothing"] == []
+    # A look that lands over one the Director wrote names both.
+    replacing = lines["replacing"][0]
+    assert replacing["kind"] == "fill"
+    assert "The canopy bed, wide." in replacing["text"]
+    assert "Mine: the chrome mic." in replacing["text"], (
+        "a look about to replace hand-written words did not say which words", replacing
+    )
+    # A look landing in an empty box replaces nothing, and does not claim to.
+    assert lines["fresh"][0]["text"] == "0.0s Intro: The corridor."
+    # A skip carries what saying yes would buy, *and* what is there now -- the route puts the
+    # proposal on that row for exactly this reason.
+    withheld = lines["withheld"][0]
+    assert withheld["kind"] == "skip"
+    assert "already has a look you wrote" in withheld["text"]
+    assert "The door, closing." in withheld["text"], withheld
+    assert "Mine: the door." in withheld["text"], withheld
+    # And a skip with nothing behind it stays one sentence.
+    assert lines["silent"][0]["text"] == (
+        "103.0s Bridge: skipped — the treatment does not describe this section"
+    )
+
+
 def test_the_fill_section_looks_control_sits_in_the_section_inspector_and_reports_first():
     """Where the gap was reported, and in the order the server enforces.
 
@@ -10859,6 +10994,126 @@ def test_a_second_press_on_an_edge_is_only_the_same_gesture_while_the_window_is_
     assert presses["backwards"] is False
     assert presses["nothingBefore"] is False
     assert presses["notAnEdge"] is False
+
+
+def test_a_drag_consumes_the_press_that_started_it():
+    """Review Finding 5, 2026-08-21. A press on a resize handle starts *both* gestures -- the
+    drag and the first half of a double-click -- and only the release can tell them apart.
+    `lastEdgePress` was cleared only when a double-press completed, and `doubleEdgePress`
+    measures from the *first* press, so a 300 ms edge drag followed by re-grabbing the same edge
+    100 ms later fell inside the window and ran the gap fill instead of starting the second drag.
+
+    The slop is what keeps the fix from taking gesture B away: a real double-click on a 7 px
+    handle does not travel, and a hand that jitters a pixel between clicks is still
+    double-clicking. The browser drives both directions in `tests/e2e_timeline_edit.py`.
+    """
+    travel = run_module("""
+      import { EDGE_DRAG_SLOP_PX, edgePressSurvivesDrag }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        slop: EDGE_DRAG_SLOP_PX,
+        still: edgePressSurvivesDrag(0),
+        jitter: edgePressSurvivesDrag(EDGE_DRAG_SLOP_PX),
+        justOver: edgePressSurvivesDrag(EDGE_DRAG_SLOP_PX + 1),
+        drag: edgePressSurvivesDrag(60),
+        backwards: edgePressSurvivesDrag(-60),
+        nothingMeasured: edgePressSurvivesDrag(undefined),
+      }));
+    """)
+    assert travel["slop"] == 3
+    # A click, and a click with a shaky hand, are both still clicks.
+    assert travel["still"] is True
+    assert travel["jitter"] is True
+    assert travel["nothingMeasured"] is True
+    # A drag is a drag in either direction, and it takes its press with it.
+    assert travel["justOver"] is False
+    assert travel["drag"] is False
+    assert travel["backwards"] is False, (
+        "a leftward drag left its press standing, so the next grab on that edge would close a "
+        "gap nobody asked to close"
+    )
+
+
+def test_one_undo_steps_back_one_gesture_when_two_were_made_in_one_round_trip():
+    """Review Finding 4, 2026-08-21, and the invariant this whole section is built on: the state
+    before save N is the state after save N-1.
+
+    `restores` used to be cloned when a save was *queued*, from a baseline that only advances
+    when a save *lands*. Two gestures made before the first write came back therefore recorded
+    the same "before": one Undo rolled back **both** while the button named only the second, a
+    second Undo replayed the same plan and did nothing visible, and the plan between the two
+    gestures could not be reached at all.
+
+    Driven here by holding the first write open, which is the only way the window exists -- and
+    driven again as two real clicks against a real server in `tests/e2e_timeline_edit.py`, where
+    the plan is read back off disk.
+    """
+    driven = run_workspace(
+        """
+        state.project = {
+          id: 'p9', updated_at: 'rev-1', name: 'x', assets: [], jobs: [], messages: [],
+          sections: [], song: { duration: 20, path: 'songs/000-x.wav' },
+          shots: [
+            { id: 's1', start: 0, duration: 10, prompt: 'one', status: 'draft', citations: [] },
+            { id: 's2', start: 10, duration: 10, prompt: 'two', status: 'draft', citations: [] },
+          ],
+        };
+        state.selectedShotId = 's1';
+        app.syncUndoControls();
+        // Both gestures are made before either write comes back. `setTimeout` is stubbed out in
+        // this harness, so the writes are held by hand instead of by a timer.
+        const release = [];
+        const real = globalThis.fetch;
+        let revision = 1;
+        globalThis.fetch = (path, options = {}) => {
+          if (options.method !== 'PUT') return real(path, options);
+          requests.push({ path, method: 'PUT', body: options.body });
+          return new Promise((resolve) => release.push(() => {
+            revision += 1;
+            resolve({
+              ok: true, status: 200, statusText: 'held',
+              headers: { get: () => 'application/json' },
+              json: async () => ({ id: 'p9', updated_at: 'rev-' + revision, shots: [] }),
+            });
+          }));
+        };
+        fire('#split-shot:click', {});
+        fire('#add-shot:click', {});
+        await flush();
+        const openWrites = release.length;
+        release[0]();
+        await flush();
+        release[1]();
+        await flush();
+        const afterBoth = state.project.shots.length;
+        const named = at('#undo-shots').title;
+        requests.length = 0;
+        fire('#undo-shots:click', {});
+        await flush();
+        release[2]();
+        await flush();
+        const undone = requests.filter((entry) => entry.method === 'PUT');
+        console.log(JSON.stringify({
+          openWrites,
+          afterBoth,
+          named,
+          restored: undone.length ? JSON.parse(undone[0].body).shots.length : null,
+          namedAfter: at('#undo-shots').title,
+        }));
+        """,
+    )
+    # Only the first write was ever in flight: the chain sends them one at a time, and the
+    # second gesture was made while the first was open. That is the whole window.
+    assert driven["openWrites"] == 1, driven
+    assert driven["afterBoth"] == 4, driven
+    assert "adding a shot" in driven["named"], driven
+    assert driven["restored"] == 3, (
+        "one Undo did not step back exactly one gesture: it put back a plan of "
+        f"{driven['restored']} shots, and the plan between the two gestures had 3 -- Finding 4"
+    )
+    assert "the split" in driven["namedAfter"], (
+        "after stepping back the second gesture the button does not name the first", driven
+    )
 
 
 def test_a_gesture_saved_after_another_writer_moved_the_project_records_nothing():

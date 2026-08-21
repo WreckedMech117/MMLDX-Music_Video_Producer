@@ -237,6 +237,201 @@ def test_save_retries_a_replace_a_foreign_handle_blocked(tmp_path: Path, monkeyp
     assert reopened.creative_brief == "written once the scanner let go"
 
 
+def test_the_replace_backoff_does_not_hold_the_manifest_lock(tmp_path: Path, monkeypatch):
+    """The retry waits for a foreign handle without freezing the rest of the process.
+
+    The backoff used to be a `time.sleep` inside the lock, so up to half a second of waiting on
+    a virus scanner blocked every other manifest call — and `get`/`save` are reached straight
+    from `async def` routes, so that half second was the event loop, `/render-status` poll
+    included. The lock the sleep sat under exists to keep exactly that poll working.
+
+    Asserted on *order*, not on elapsed time: a real reader takes the lock during the backoff and
+    records itself, and the lock alone guarantees it lands between the two replace attempts —
+    the retry cannot resume until the reader lets go. A version that holds the lock across the
+    backoff records the reader last instead, deterministically. The five-second backoff is not a
+    measurement; it is only the bound on how long such a version takes to fail.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(_polled_project("Backoff"))
+
+    real_replace = Path.replace
+    entering_backoff = threading.Event()
+    attempts: list[Path] = []
+    order: list[str] = []
+    reader_errors: list[Exception] = []
+
+    def flaky(self: Path, target: Path) -> None:
+        attempts.append(target)
+        order.append("replace")
+        if len(attempts) == 1:
+            entering_backoff.set()
+            raise PermissionError(5, "Access is denied")
+        real_replace(self, target)
+
+    def reader() -> None:
+        try:
+            entering_backoff.wait(timeout=30)
+            # The poll's own call, not a bare acquire: it must be able to open, read and close
+            # the manifest while the retry is waiting.
+            store.get(project.id)
+            with store_module._MANIFEST_LOCK:
+                order.append("reader")
+                # Ends the backoff on the reader's terms rather than on the clock.
+                store_module._MANIFEST_WAIT.notify_all()
+        except Exception as error:  # noqa: BLE001 - a thread must not lose its own failure
+            reader_errors.append(error)
+
+    monkeypatch.setattr(store_module, "_REPLACE_BACKOFF", 5.0)
+    monkeypatch.setattr(Path, "replace", flaky)
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        store.save(project)
+    finally:
+        monkeypatch.undo()
+        thread.join(timeout=60)
+
+    assert reader_errors == []
+    assert order == ["replace", "reader", "replace"], (
+        "the manifest lock was held across the retry backoff"
+    )
+    assert ProjectStore(tmp_path).get(project.id).name == "Backoff"
+    leftovers = sorted(
+        path.name for path in store.project_dir(project.id).iterdir() if path.is_file()
+    )
+    assert leftovers == ["project.json"]
+
+
+def test_a_save_inside_another_saves_backoff_leaves_one_whole_manifest(
+    tmp_path: Path, monkeypatch
+):
+    """What dropping the lock between attempts actually admits — and why it is not the old race.
+
+    The original bug was a *reader* holding the destination open at the instant of the replace.
+    That cannot come back: every attempt is still made with the lock held, and a reader only ever
+    has the manifest open while holding that same lock, so no handle of ours survives into an
+    attempt. What the window does admit is another complete `save`, which lands whole and is then
+    replaced by the retry — last writer wins, exactly as it already does for the read, mutate,
+    save that every route performs as three separate acquisitions. Neither manifest is partial at
+    any point, and no temp file is orphaned.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(_polled_project("Interleaved"))
+    saver = threading.get_ident()
+
+    real_replace = Path.replace
+    entering_backoff = threading.Event()
+    attempts: list[int] = []
+    order: list[str] = []
+    landed: list[str] = []
+    other_errors: list[Exception] = []
+
+    def flaky(self: Path, target: Path) -> None:
+        attempts.append(threading.get_ident())
+        order.append("replace" if threading.get_ident() == saver else "interleaved replace")
+        if len(attempts) == 1:
+            entering_backoff.set()
+            raise PermissionError(5, "Access is denied")
+        real_replace(self, target)
+
+    def interleaved() -> None:
+        try:
+            entering_backoff.wait(timeout=30)
+            other = store.get(project.id)
+            other.creative_brief = "written inside the other save's backoff"
+            store.save(other)
+            with store_module._MANIFEST_LOCK:
+                # Read raw, under the lock, so this is what is genuinely on disk mid-backoff.
+                on_disk = store.manifest_path(project.id).read_text(encoding="utf-8")
+                landed.append(json.loads(on_disk)["creative_brief"])
+                order.append("interleaved save")
+                store_module._MANIFEST_WAIT.notify_all()
+        except Exception as error:  # noqa: BLE001 - a thread must not lose its own failure
+            other_errors.append(error)
+
+    project.creative_brief = "the retried save"
+    monkeypatch.setattr(store_module, "_REPLACE_BACKOFF", 5.0)
+    monkeypatch.setattr(Path, "replace", flaky)
+    thread = threading.Thread(target=interleaved, daemon=True)
+    thread.start()
+    try:
+        store.save(project)
+    finally:
+        monkeypatch.undo()
+        thread.join(timeout=60)
+
+    assert other_errors == []
+    assert order == ["replace", "interleaved replace", "interleaved save", "replace"]
+    assert landed == ["written inside the other save's backoff"]
+    assert ProjectStore(tmp_path).get(project.id).creative_brief == "the retried save"
+    leftovers = sorted(
+        path.name for path in store.project_dir(project.id).iterdir() if path.is_file()
+    )
+    assert leftovers == ["project.json"]
+
+
+def test_a_backoff_under_a_nested_create_also_releases_the_lock(tmp_path: Path, monkeypatch):
+    """`create` calls `save` while already holding the lock, so the release must be recursive.
+
+    A single `release()` would leave the outer acquisition standing and the stall intact — and an
+    unbalanced one would corrupt the count. `Condition.wait` drops an `RLock` to its full depth
+    and restores that depth, which is why the backoff waits rather than sleeps.
+    """
+    store = ProjectStore(tmp_path)
+    real_replace = Path.replace
+    entering_backoff = threading.Event()
+    attempts: list[Path] = []
+    order: list[str] = []
+    reader_errors: list[Exception] = []
+
+    def flaky(self: Path, target: Path) -> None:
+        attempts.append(target)
+        order.append("replace")
+        if len(attempts) == 1:
+            entering_backoff.set()
+            raise PermissionError(5, "Access is denied")
+        real_replace(self, target)
+
+    def reader() -> None:
+        try:
+            entering_backoff.wait(timeout=30)
+            with store_module._MANIFEST_LOCK:
+                order.append("reader")
+                store_module._MANIFEST_WAIT.notify_all()
+        except Exception as error:  # noqa: BLE001 - a thread must not lose its own failure
+            reader_errors.append(error)
+
+    monkeypatch.setattr(store_module, "_REPLACE_BACKOFF", 5.0)
+    monkeypatch.setattr(Path, "replace", flaky)
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        created = store.create(Project(name="Nested backoff"))
+    finally:
+        monkeypatch.undo()
+        thread.join(timeout=60)
+
+    assert reader_errors == []
+    assert order == ["replace", "reader", "replace"], (
+        "the outer `create` acquisition survived the backoff"
+    )
+    assert ProjectStore(tmp_path).get(created.id).name == "Nested backoff"
+    # The count came back balanced: `create` released both levels on the way out, so a thread
+    # that never held it can take it uncontended. An over-release would have raised inside
+    # `create` instead; an under-release leaves this acquisition failing.
+    released = threading.Event()
+
+    def check_free() -> None:
+        if store_module._MANIFEST_LOCK.acquire(blocking=False):
+            store_module._MANIFEST_LOCK.release()
+            released.set()
+
+    checker = threading.Thread(target=check_free, daemon=True)
+    checker.start()
+    checker.join(timeout=30)
+    assert released.is_set(), "the lock stayed held after a nested create's backoff"
+
+
 def test_save_that_gives_up_raises_and_leaves_no_temp_file(tmp_path: Path, monkeypatch):
     """A permanently blocked manifest is an error the caller sees, not a hang and not debris."""
     store = ProjectStore(tmp_path)

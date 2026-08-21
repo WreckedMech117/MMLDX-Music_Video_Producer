@@ -3,12 +3,12 @@ import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyContro
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
 // Fill section looks: the Director's empty shared prompt, read out of the Treatment.
-import { FILL_SECTION_LOOKS_APPLIED, FILL_SECTION_LOOKS_HELP, FILL_SECTION_LOOKS_LABEL, FILL_SECTION_LOOKS_OVERWRITE_QUESTION, FILL_SECTION_LOOKS_RUNNING, sectionLooksConfirmation } from "./api.js";
+import { FILL_SECTION_LOOKS_APPLIED, FILL_SECTION_LOOKS_HELP, FILL_SECTION_LOOKS_LABEL, FILL_SECTION_LOOKS_OVERWRITE_QUESTION, FILL_SECTION_LOOKS_RUNNING, sectionLooksConfirmation, sectionLooksReportLines, sectionLooksWritten } from "./api.js";
 import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clampTimelineZoom, timelineWheelPlan, zoomFromSlider, zoomLabelText, zoomSliderValue, zoomViewport } from "./api.js";
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
-import { GAP_FILL_TOAST, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, boundaryMovePlan, doubleEdgePress, exactSeconds, gapFillPlan, playheadSnap, undoControl, undoGestureLabel } from "./api.js";
+import { GAP_FILL_TOAST, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, playheadSnap, undoControl, undoGestureLabel } from "./api.js";
 // The shot-length band, as the server judges it: the report carries the verdict and the clip
 // reads it. Nothing on this side re-derives the band -- see `clipWindowState` for why.
 import { clipWindowState, windowWarningsByShot } from "./api.js";
@@ -50,6 +50,13 @@ let snapInFlight = false;
 // report naming one plan's shots drawn under another plan is a claim about shots not on screen.
 let expansionSweepInFlight = false;
 let expansionSweepReport = null;
+// The section-look pass's own report, held for the section inspector to draw. Module state for
+// `snapReport`'s reason exactly -- derived, never saved, never sent back -- and it is held rather
+// than shown once and dropped because the per-section skip reasons *are* half this feature: "the
+// treatment does not describe this section" is the sentence that sends the Director back to the
+// treatment, and a confirm dialog they have already dismissed cannot be re-read. Cleared by a
+// project load, because it names one structure's sections.
+let sectionLooksReport = null;
 // Whether a dragged shot edge is pulled onto the playhead when it comes within a few pixels of
 // it (the Director's ask, 2026-08-21). A working preference, not project data: it lives in this
 // browser's session storage beside the zoom and the panel, exactly as the two line mutes and the
@@ -263,6 +270,10 @@ async function loadProject(id) {
   // by label, and a report drawn under another project's name would be a claim about shots that
   // are not on screen.
   expansionSweepReport = null;
+  // And the section-look report, for the sweep report's reason exactly: it names one structure's
+  // sections by label and start, and a report drawn under another project's name would be a claim
+  // about boxes that are not on the timeline.
+  sectionLooksReport = null;
   // And the replacement report, for the same reason and with a sharper edge: it names asset ids
   // and shot labels from the project being left, so an apply offered under another project's name
   // would rewrite citations on shots nobody was looking at.
@@ -1565,6 +1576,10 @@ function bindClip(clip) {
     }
     const startX = event.clientX;
     const original = { start: shot.start, duration: shot.duration, nudge: shot.trim_nudge || 0 };
+    // The furthest this pointer got from where it went down, in screen pixels. Read at release
+    // by `edgePressSurvivesDrag`, which is what stops a drag from leaving its press standing as
+    // the first half of a double-click -- see there.
+    let travelled = 0;
     // Where the playhead caught this edge, or null. Read at release, which is what makes the
     // snap a decision about where the drag *ended* rather than about every frame it crossed.
     let magnetised = null;
@@ -1584,6 +1599,7 @@ function bindClip(clip) {
     const move = (moveEvent) => {
       const delta = (moveEvent.clientX - startX) / state.pixelsPerSecond;
       const snapped = grid(delta);
+      travelled = Math.max(travelled, Math.abs(moveEvent.clientX - startX));
       magnetised = null;
       if (mode === "move") shot.start = Math.max(0, grid(original.start + snapped));
       if (mode === "left") {
@@ -1631,11 +1647,26 @@ function bindClip(clip) {
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      const moved = shot.start !== original.start || shot.duration !== original.duration
+      // A drag consumes the press that started it. Without this the press was remembered past
+      // the release, and `doubleEdgePress` measures from the *first* press -- so re-grabbing the
+      // same edge shortly after a drag read as a double-click and ran the gap fill instead of
+      // starting the second drag, stretching the shot to its neighbour.
+      if (!edgePressSurvivesDrag(travelled)) lastEdgePress = null;
+      // Re-read after every step rather than computed once, because a refused snap puts `shot`
+      // back the way it was: `applyPlayheadSnap` restores it from `original` and answers false.
+      // A `moved` measured before that call was still true afterwards, so a refusal the Director
+      // had just been shown sent a no-op `PUT /shots` -- which bumped `updated_at`, pushed an
+      // undo entry for a gesture that never happened, and threw the redo stack away.
+      const moved = () => shot.start !== original.start || shot.duration !== original.duration
         || (shot.trim_nudge || 0) !== original.nudge;
-      if (moved && magnetised !== null && applyPlayheadSnap(shot, mode, magnetised, original)) return;
-      if (moved) saveShotsSilently(mode === "move" ? "move" : "resize");
-      else if (mode === "move") seekMasterAudio(shot.start);
+      if (moved() && magnetised !== null && applyPlayheadSnap(shot, mode, magnetised, original)) return;
+      if (moved()) return saveShotsSilently(mode === "move" ? "move" : "resize");
+      // Nothing to save, so nothing is outstanding. `move` sets the dirty flag on the first
+      // pixel, and every drag used to end in a write, so leaving it set was invisible; now that
+      // a refused snap and a drag that returns to where it started both end here, a flag left
+      // standing would have the navigation guards warning about work that does not exist.
+      state.dirty = state.documentsDirty;
+      if (mode === "move") seekMasterAudio(shot.start);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -1745,7 +1776,20 @@ export function renderShotInspector() {
         const mid = item.start + item.duration / 2;
         return section.start <= mid && mid < section.start + section.duration;
       }).length;
-      inspector.innerHTML = `<span class="eyebrow">Section</span><h2>${escapeHtml(section.label)}</h2><div class="meta-list"><b>Window</b><span>${section.start.toFixed(2)}s – ${(section.start + section.duration).toFixed(2)}s (${section.duration.toFixed(2)}s)</span><b>Covers</b><span>${covered} shot${covered === 1 ? "" : "s"}</span></div><label>Label<input id="section-label" value="${escapeHtml(section.label)}"></label><label>Shared prompt — carried into every shot in this section<textarea id="section-prompt" rows="7" placeholder="What this whole section looks like: location, staging, energy. Shots inside it vary the angle and action.">${escapeHtml(section.prompt || "")}</textarea></label><button class="quiet-button full" id="section-fill-looks" title="${escapeHtml(FILL_SECTION_LOOKS_HELP)}">${escapeHtml(FILL_SECTION_LOOKS_LABEL)}</button><button class="danger-button full" id="section-delete">Delete section</button><p class="control-reason">Drag the box to move it; drag its edges to resize. Edges snap to the shots below. The label pairs with the lyric sheet's [Tags] by order — "Verse 2" takes the second [Verse] block.</p>`;
+      // The last section-look pass's own report, drawn where the button that asked for it is.
+      // Every line, nothing summarised -- `renderSnapCuts`' rule, and for its reason: the section
+      // that was skipped and *why* is the half the Director has to be able to read, and a report
+      // that only ever appeared inside a confirm dialog was a report nobody could read twice.
+      const looksLines = sectionLooksReportLines(sectionLooksReport);
+      const looksHtml = looksLines.length
+        ? `<div class="snap-report section-looks-report">${looksLines.map((line) =>
+            `<div class="snap-${line.kind === "fill" ? "move" : "skip"}">${escapeHtml(line.text)}</div>`).join("")}<button class="quiet-button" id="section-looks-dismiss">${escapeHtml(SNAP_CUTS_DISMISS_LABEL)}</button></div>`
+        : "";
+      inspector.innerHTML = `<span class="eyebrow">Section</span><h2>${escapeHtml(section.label)}</h2><div class="meta-list"><b>Window</b><span>${section.start.toFixed(2)}s – ${(section.start + section.duration).toFixed(2)}s (${section.duration.toFixed(2)}s)</span><b>Covers</b><span>${covered} shot${covered === 1 ? "" : "s"}</span></div><label>Label<input id="section-label" value="${escapeHtml(section.label)}"></label><label>Shared prompt — carried into every shot in this section<textarea id="section-prompt" rows="7" placeholder="What this whole section looks like: location, staging, energy. Shots inside it vary the angle and action.">${escapeHtml(section.prompt || "")}</textarea></label><button class="quiet-button full" id="section-fill-looks" title="${escapeHtml(FILL_SECTION_LOOKS_HELP)}">${escapeHtml(FILL_SECTION_LOOKS_LABEL)}</button>${looksHtml}<button class="danger-button full" id="section-delete">Delete section</button><p class="control-reason">Drag the box to move it; drag its edges to resize. Edges snap to the shots below. The label pairs with the lyric sheet's [Tags] by order — "Verse 2" takes the second [Verse] block.</p>`;
+      $("#section-looks-dismiss")?.addEventListener("click", () => {
+        sectionLooksReport = null;
+        renderShotInspector();
+      });
       $("#section-label")?.addEventListener("change", (event) => {
         section.label = event.target.value.trim() || section.label;
         saveSectionsSilently(); renderTimeline();
@@ -1765,17 +1809,45 @@ export function renderShotInspector() {
         button.disabled = true;
         button.textContent = FILL_SECTION_LOOKS_RUNNING;
         try {
-          const report = await api.fillSectionLooks(projectId);
+          let report = await api.fillSectionLooks(projectId);
           if (state.project?.id !== projectId) return;
+          // Held before any question is asked, so the reasons survive every way out of this
+          // handler -- including the ways that write nothing at all.
+          sectionLooksReport = report;
+          let overwrite = false;
+          // The Director's own structure has all seven sections written, and the route
+          // short-circuits that to `0 filled` **without a model call** and says "send
+          // overwrite=true to replace what is there". Treating that as an error was how the
+          // button came to be able to do nothing *but* error for them, while the sentence it
+          // showed described a consent the screen never offered. So it is asked here, and only
+          // here: there is nothing to preview yet, because a report that wrote nothing proposed
+          // nothing. Answering yes re-reports *with* the consent -- which is what makes the
+          // preview below the looks that would actually land.
+          if (!report.filled && sectionLooksWritten(report)) {
+            if (!window.confirm(FILL_SECTION_LOOKS_OVERWRITE_QUESTION)) return toast(report.message);
+            overwrite = true;
+            report = await api.fillSectionLooks(projectId, { overwrite: true });
+            if (state.project?.id !== projectId) return;
+            sectionLooksReport = report;
+          }
+          // Nothing to write and no consent that would change that -- the model was asked and
+          // had nothing to say for any section. The report stays on screen rather than being
+          // swallowed by this sentence: "the treatment does not describe this section" names the
+          // section to go and write, and the summary alone names none of them.
           if (!report.filled) return toast(report.message, "error");
           if (!window.confirm(sectionLooksConfirmation(report))) return;
-          // The second consent, asked only when there is something to overwrite. Declining it
-          // still writes the empty ones, which is the whole point of the flags being separate.
-          const written = report.sections.some((row) => row.previous && !row.filled);
-          const overwrite = written && window.confirm(FILL_SECTION_LOOKS_OVERWRITE_QUESTION);
-          const applied = await api.fillSectionLooks(projectId, { confirmApply: true, overwrite });
+          // The narrower consent, asked only when there is something to overwrite and it has not
+          // been asked already. Declining it still writes the empty ones, which is the whole
+          // point of the flags being separate.
+          if (!overwrite && sectionLooksWritten(report)) {
+            overwrite = window.confirm(FILL_SECTION_LOOKS_OVERWRITE_QUESTION);
+          }
+          // The report goes back with the confirm: the server applies that plan or refuses,
+          // and never reads the treatment a second time to answer a question already answered.
+          const applied = await api.fillSectionLooks(projectId, { confirmApply: true, overwrite, plan: report });
           if (state.project?.id !== projectId) return;
           state.project = applied.project || state.project;
+          sectionLooksReport = applied;
           renderAll();
           toast(FILL_SECTION_LOOKS_APPLIED
             .replace("{filled}", String(applied.filled))
@@ -2691,12 +2763,23 @@ function saveShotsSilently(kind = "edit") {
   const revision = ++shotSaveRevision;
   state.shotsDirty = true;
   state.dirty = true;
-  // What the plan looked like before this write, captured at queue time and *not* re-read at
-  // send time: it is the state the last landed save left behind, and it is what an undo of this
-  // gesture puts back. Held apart from the entry itself because the entry is only created if
-  // the write lands -- an undo of something that was never applied is the one thing this
-  // feature must not offer.
-  const restores = shotsBaseline ? structuredClone(shotsBaseline) : null;
+  // What the plan looked like before this write, and what an undo of this gesture puts back.
+  // Held apart from the entry itself because the entry is only created if the write lands -- an
+  // undo of something that was never applied is the one thing this feature must not offer.
+  //
+  // Read at SEND time, inside the chain, for the revision's reason below and for a sharper one
+  // of its own. `shotsBaseline` only advances when a save *lands*, so two gestures made inside
+  // one round trip -- split then drag, or two clicks on `#split-shot` -- both read the same
+  // baseline at queue time and both recorded it. One Undo then rolled back *both* while the
+  // button named only the second, a second Undo replayed the same plan and visibly did nothing,
+  // and the state between the two gestures was unrecoverable. Read here it is the plan the
+  // previous save actually left behind, which is this gesture's own "before" -- the invariant
+  // stated at the top of this section rather than an approximation of it.
+  let restores = null;
+  // Queue time, deliberately, and not moved down with `restores`: this is the generation the
+  // gesture was *made* in, and a discard between the click and the send is exactly what it has
+  // to notice. Read at send time it would adopt the post-discard generation and agree with
+  // itself, which is the failure the comment below records.
   const bornAt = undoGeneration;
   shotSaveChain = shotSaveChain
     // The revision travels with the save and is read at SEND time, not at queue time: the
@@ -2704,7 +2787,10 @@ function saveShotsSilently(kind = "edit") {
     // a queued burst stays valid save over save. A stale one — this tab loaded before some
     // other writer saved — is refused with a 409 instead of silently reverting that work,
     // which is what one background save from this tab did to 32 prompts on 2026-08-19.
-    .then(() => api.saveShots(projectId, shots, state.project?.updated_at || null))
+    .then(() => {
+      restores = shotsBaseline ? structuredClone(shotsBaseline) : null;
+      return api.saveShots(projectId, shots, state.project?.updated_at || null);
+    })
     .then((saved) => {
       if (state.project?.id === projectId && saved?.updated_at) {
         state.project.updated_at = saved.updated_at;

@@ -144,7 +144,49 @@ DIRECTOR_SECTIONS = [
     ("Outro", 124.1, 30.54),
 ]
 
-LIVE_PROJECT = Path("data/projects/project_59f14d19ff10/project.json")
+LIVE_PROJECT_ID = "project_59f14d19ff10"
+LIVE_DATA_ROOT = Path("data")
+LIVE_PROJECT = LIVE_DATA_ROOT / "projects" / LIVE_PROJECT_ID / "project.json"
+
+LIVE_ROOT_REFUSAL = (
+    "A test in this module resolved a project directory inside the live data root ({path}). "
+    "That root holds the Director's hand-edited, actively-rendered project; every test here "
+    "builds its own plan under tmp_path."
+)
+
+
+@pytest.fixture(autouse=True)
+def never_touches_the_directors_data_root(monkeypatch: pytest.MonkeyPatch):
+    """Enforce the read-only rule, rather than checking up on it afterwards.
+
+    This replaced an assertion (2026-08-21) that the live manifest still held 33 shots and 24
+    echoing prompts. The *intent* was right and is kept — prove this module never writes the
+    Director's project — but the mechanism coupled a test to the **content** of a file the
+    Director changes as part of doing their job. It went red the night they applied this very
+    feature (24 echoes became 0), and it would have gone red again on their next timeline
+    touch-up. Rebasing the number would only have moved the breakage.
+
+    A bytes-unchanged snapshot across the run is the obvious repair and is also wrong here: the
+    app writes job records into that manifest while a render batch runs, so the snapshot would
+    fail for reasons this module has nothing to do with.
+
+    So the guarantee is enforced at the one seam every read and every write of a project passes
+    through. `ProjectStore.project_dir` builds the path for the manifest, for the media
+    directory and for the atomic replace alike, so a test that reached for the live store fails
+    inside the call that reached — naming itself — instead of being noticed later by the
+    Director. It asserts nothing about what the file contains, which is their business.
+    """
+    original = ProjectStore.project_dir
+    forbidden = LIVE_DATA_ROOT.resolve()
+
+    def guarded(self: ProjectStore, project_id: str) -> Path:
+        directory = original(self, project_id)
+        resolved = directory.resolve()
+        if resolved == forbidden or forbidden in resolved.parents:
+            raise AssertionError(LIVE_ROOT_REFUSAL.format(path=resolved))
+        return directory
+
+    monkeypatch.setattr(ProjectStore, "project_dir", guarded)
 
 
 class CleanupDirector:
@@ -286,6 +328,26 @@ def director_project(store: ProjectStore, **fields) -> Project:
 
 def clean(client, project_id: str, **body):
     return client.post(f"/api/projects/{project_id}/timeline/clean-prompts", json=body)
+
+
+def clean_applying(client, project_id: str, **body):
+    """Report, then confirm **with that report as the plan** — the two calls this route takes.
+
+    Every test below that used to say `clean(..., confirm_apply=True)` says this instead, and
+    the change is the fix rather than an accommodation of it: a single confirming call used to
+    generate its own rewrites and apply them, which is exactly how a rewrite nobody read landed
+    on the Director's plan (2026-08-21, 1 of 24). A confirm now has to carry the report it is
+    confirming, so a test that applies has to read one first, like a person.
+
+    A non-200 report is handed straight back, so the refusal tests still read as one call: the
+    refusals they are about happen before any model is asked, which is where they always were.
+    Between the two calls the model is asked exactly **once** — on the report — and several
+    tests below assert that on `director.calls`.
+    """
+    report = clean(client, project_id, **body)
+    if report.status_code != 200:
+        return report
+    return clean(client, project_id, confirm_apply=True, plan=report.json())
 
 
 def repopulate(client, project_id: str):
@@ -889,7 +951,7 @@ def test_the_report_writes_nothing_and_the_confirm_changes_only_the_prompt(tmp_p
     # Nothing on disk moved on the report path.
     assert {shot.id: shot.model_dump() for shot in store.get(project.id).shots} == before
 
-    applied = clean(client, project.id, confirm_apply=True)
+    applied = clean_applying(client, project.id)
     assert applied.status_code == 200, applied.text
     assert applied.json()["applied"] is True
     assert applied.json()["project"] is not None
@@ -926,7 +988,7 @@ def test_the_cleanup_cannot_move_a_window_or_change_the_shot_count(tmp_path: Pat
 
     assert clean(client, project.id).status_code == 200
     assert window_fingerprint(store.get(project.id)) == geometry
-    assert clean(client, project.id, confirm_apply=True).status_code == 200
+    assert clean_applying(client, project.id).status_code == 200
 
     reread = ProjectStore(tmp_path).get(project.id)
     assert window_fingerprint(reread) == geometry
@@ -961,7 +1023,7 @@ def test_every_shots_citations_are_byte_identical_before_and_after(tmp_path: Pat
     # The plan really does have citations to preserve, or this test proves nothing.
     assert sum(len(value) for value in before.values()) >= 25
 
-    assert clean(client, project.id, confirm_apply=True).status_code == 200
+    assert clean_applying(client, project.id).status_code == 200
     reread = ProjectStore(tmp_path).get(project.id)
     assert {shot.id: citation_fingerprint(shot) for shot in reread.shots} == before
     # And the flat projection the render path reads.
@@ -993,7 +1055,7 @@ def test_a_harmless_mention_is_rephrased_and_not_mangled(tmp_path: Path):
     client, store, comfy = make_client(tmp_path, director)
     project = director_project(store)
 
-    body = clean(client, project.id, confirm_apply=True).json()
+    body = clean_applying(client, project.id).json()
     rows = {row["shot_id"]: row for row in body["shots"]}
 
     kept = rows["shot_25b661593524"]
@@ -1038,7 +1100,7 @@ def test_a_prompt_with_no_echo_is_left_completely_alone_and_reported_as_such(
     ]
     assert already_clean
 
-    body = clean(client, project.id, confirm_apply=True).json()
+    body = clean_applying(client, project.id).json()
     sent = {entry["shot_id"] for entry in director.calls[0]["input"]["shots"]}
     assert sent.isdisjoint(already_clean)
 
@@ -1080,7 +1142,7 @@ def test_a_locked_shot_and_an_in_flight_render_are_skipped_in_the_existing_words
     by_id["shot_c8efd34a8333"].status = "running"
     store.save(project)
 
-    body = clean(client, project.id, confirm_apply=True).json()
+    body = clean_applying(client, project.id).json()
     sent = {entry["shot_id"] for entry in director.calls[0]["input"]["shots"]}
     assert "shot_aa9f610512f6" not in sent
     assert "shot_c8efd34a8333" not in sent
@@ -1133,7 +1195,7 @@ def test_a_rendered_or_approved_shot_is_rewritten_and_reported(tmp_path: Path):
     approved.approved_duration = approved.duration
     store.save(project)
 
-    body = clean(client, project.id, confirm_apply=True).json()
+    body = clean_applying(client, project.id).json()
     # They are *sent*, which is the half a report-shaped assertion cannot see: the model
     # selection is built from the protections, so a gate that refused a rendered shot would
     # simply leave it out of the payload and the row would still be filled by whatever the
@@ -1178,7 +1240,7 @@ def test_a_plan_with_no_echoes_refuses_rather_than_reporting_over_nothing(tmp_pa
         shot.prompt = "A performer alone in a moonlit room, singing to the lens."
     store.save(project)
 
-    response = clean(client, project.id, confirm_apply=True)
+    response = clean_applying(client, project.id)
     assert response.status_code == 422
     assert response.json()["detail"] == CLEAN_PROMPTS_NOTHING_TO_CLEAN
     assert director.calls == []
@@ -1203,7 +1265,7 @@ def test_every_echoing_shot_being_protected_refuses_before_spending_a_model_call
             shot.locked = True
     store.save(project)
 
-    response = clean(client, project.id, confirm_apply=True)
+    response = clean_applying(client, project.id)
     assert response.status_code == 422
     assert response.json()["detail"].startswith(CLEAN_PROMPTS_ALL_PROTECTED[:40])
     assert director.calls == []
@@ -1232,7 +1294,7 @@ def test_an_unanswered_a_duplicated_and_a_stray_shot_are_reported_not_guessed_at
     client, store, comfy = make_client(tmp_path, director)
     project = director_project(store)
 
-    body = clean(client, project.id, confirm_apply=True).json()
+    body = clean_applying(client, project.id).json()
     rows = {row["shot_id"]: row for row in body["shots"]}
     assert rows["shot_59f8da92c2d8"]["after"] == good
     assert "addressed no shot in this project" in body["message"]
@@ -1311,7 +1373,7 @@ def test_the_geometry_guard_refuses_without_saving_when_a_window_would_move(
 
     monkeypatch.setattr(app_module, "window_fingerprint", drifting)
 
-    response = clean(client, project.id, confirm_apply=True)
+    response = clean_applying(client, project.id)
     assert response.status_code == 500
     assert response.json()["detail"] == CLEAN_PROMPTS_WINDOWS_MOVED
     # Nothing was saved — not the windows it refused over, and not the prose either.
@@ -1347,37 +1409,298 @@ def test_the_citation_guard_refuses_without_saving_when_a_citation_would_move(
 
     monkeypatch.setattr(app_module, "citation_fingerprint", drifting)
 
-    response = clean(client, project.id, confirm_apply=True)
+    response = clean_applying(client, project.id)
     assert response.status_code == 500
     assert response.json()["detail"] == CLEAN_PROMPTS_WINDOWS_MOVED
     assert {shot.id: shot.model_dump() for shot in ProjectStore(tmp_path).get(project.id).shots} == before
     assert comfy.prompts == []
 
 
-def test_the_directors_live_project_is_never_written_by_this_test_module():
-    """The manifest under `data/` is evidence, not a fixture. Read, never touched.
+# --------------------------------------------------------------------------------------
+# Half B — report then confirm, made real (2026-08-21)
+#
+# The route asked the model *before* it looked at `confirm_apply`, so applying meant a second,
+# independent generation at `PLAN_TEMPERATURE = 0.7`. Measured live on the Director's plan that
+# night: 24 rewrites read and approved, **one landed as different text** — reviewed "Extreme
+# close up of smeared crimson lips, wet.", applied "Extreme close up of crimson lips, smeared
+# and wet.". Both readings were fine, which was luck. These tests hold the fix.
+# --------------------------------------------------------------------------------------
 
-    Every test above rebuilds the plan in `tmp_path`. This asserts the real file is still there
-    and still holds the 33 shots and 24 echoes the whole feature was measured against, so a
-    test that accidentally reached for the live store would be caught here rather than by the
-    Director noticing their timeline had changed.
+
+class DriftingCleanupDirector(CleanupDirector):
+    """`CleanupDirector`, except every call answers differently — the defect made visible.
+
+    A double that returns identical prose on every call cannot tell a route that re-asks the
+    model from one that does not, so every test in this file that used such a double would have
+    passed against the broken code. This one numbers its answers, which is the honest stand-in
+    for a 0.7-temperature local model: the applied text either says "take 1" — the report's
+    words, the ones a person read — or it says "take 2", and "take 2" is the bug.
     """
-    if not LIVE_PROJECT.exists():
-        pytest.skip("the Director's live project is not present in this checkout")
-    manifest = json.loads(LIVE_PROJECT.read_text(encoding="utf-8"))
-    assert len(manifest["shots"]) == 33
-    library = [
-        Asset(id=item["id"], name=item["name"], kind=item["kind"], path=item["path"])
-        for item in manifest["assets"]
-    ]
-    echoing = [
-        shot for shot in manifest["shots"] if echoed_labels(shot["prompt"], library)
-    ]
-    assert len(echoing) == DIRECTOR_ECHOING
-    # `DIRECTOR_PLAN` rounds to milliseconds for readability; the manifest holds the raw floats
-    # the drag produced. The identity that matters is the shot list and its geometry to the
-    # millisecond, which is finer than any edit this feature could make.
-    assert [
-        (shot["id"], round(shot["start"], 3), round(shot["duration"], 3))
-        for shot in manifest["shots"]
-    ] == [(shot_id, start, duration) for shot_id, start, duration, _ in DIRECTOR_PLAN]
+
+    async def expand(self, *, expansion_input, system_prompt=None):
+        answer = await super().expand(
+            expansion_input=expansion_input, system_prompt=system_prompt
+        )
+        take = len(self.calls)
+        for shot in answer.shots:
+            shot.prompt = f"{shot.prompt} Take {take}."
+        return answer
+
+
+def test_the_confirm_writes_the_reviewed_text_and_asks_no_model_to_write_it(tmp_path: Path):
+    """The finding, closed, on the Director's real plan and with a drifting double.
+
+    Three claims in one pass, because they are one guarantee: the model is asked **once** (on
+    the report) and **not at all** on the confirm; the confirm's body is the report's body but
+    for `applied` and `project`; and the prose that reaches the manifest is byte-for-byte the
+    `after` the report showed, read back through a fresh `ProjectStore`.
+    """
+    store = ProjectStore(tmp_path)
+    project = director_project(store)
+    director = DriftingCleanupDirector(rewrites=plain_rewrites(project))
+    client, store, comfy = make_client(tmp_path, director)
+    project = director_project(store)
+
+    report = clean(client, project.id)
+    assert report.status_code == 200, report.text
+    plan = report.json()
+    assert len(director.calls) == 1
+    # A report identifies itself, which is what makes confirming it possible at all.
+    assert len(plan["plan_id"]) == 64
+    assert plan["updated_at"]
+    assert plan["rewritten"] == DIRECTOR_ECHOING
+
+    applied = clean(client, project.id, confirm_apply=True, plan=plan)
+    assert applied.status_code == 200, applied.text
+    body = applied.json()
+    # The cost half of the finding: the confirm asked no model. This is the assertion that
+    # would fail on the pre-fix route, where the second call was a second generation.
+    assert len(director.calls) == 1
+    assert body["applied"] is True and body["project"] is not None
+    # And the report half: every other field of the answer rode back untouched.
+    assert {key: value for key, value in body.items() if key not in {"applied", "project"}} == {
+        key: value for key, value in plan.items() if key not in {"applied", "project"}
+    }
+
+    # Byte-equality between what was reviewed and what landed, through a fresh store.
+    stored = {shot.id: shot.prompt for shot in ProjectStore(tmp_path).get(project.id).shots}
+    changed = [row for row in plan["shots"] if row["rewritten"]]
+    assert len(changed) == DIRECTOR_ECHOING
+    for row in changed:
+        assert stored[row["shot_id"]] == row["after"]
+    # Named rather than only implied: the drift is take 2, and no shot carries it.
+    assert all(prose.endswith("Take 1.") is (shot_id in {row["shot_id"] for row in changed})
+               for shot_id, prose in stored.items())
+    assert not any("Take 2." in prose for prose in stored.values())
+    assert comfy.prompts == []
+
+
+def test_a_confirm_that_cannot_prove_its_plan_refuses_and_writes_nothing(tmp_path: Path):
+    """Absent, tampered, forged and stale — four ways a confirm fails to be a confirm.
+
+    Each refuses, none writes, and none of them re-asks the model: regenerating is precisely
+    how prose nobody read used to land on a hand-reviewed plan, so it is not the fallback.
+    """
+    from music_video_producer.app import (
+        CLEAN_PROMPTS_NO_PLAN,
+        CLEAN_PROMPTS_PLAN_MISMATCH,
+        PROJECT_CHANGED_REFUSAL,
+    )
+
+    store = ProjectStore(tmp_path)
+    project = director_project(store)
+    director = DriftingCleanupDirector(rewrites=plain_rewrites(project))
+    client, store, comfy = make_client(tmp_path, director)
+    project = director_project(store)
+    before = {shot.id: shot.model_dump() for shot in project.shots}
+
+    plan = clean(client, project.id).json()
+    assert len(director.calls) == 1
+
+    # Absent: the old wire, and the shape that used to mean "generate and apply".
+    absent = clean(client, project.id, confirm_apply=True)
+    assert absent.status_code == 422
+    assert absent.json()["detail"] == CLEAN_PROMPTS_NO_PLAN
+
+    # Tampered: one rewrite swapped for prose nobody reviewed.
+    tampered = json.loads(json.dumps(plan))
+    next(row for row in tampered["shots"] if row["rewritten"])["after"] = (
+        "A sentence that was never in any report."
+    )
+    swapped = clean(client, project.id, confirm_apply=True, plan=tampered)
+    assert swapped.status_code == 422
+    assert swapped.json()["detail"] == CLEAN_PROMPTS_PLAN_MISMATCH
+
+    # Forged: a client minting its own id rather than returning the one it was given.
+    forged = json.loads(json.dumps(plan))
+    forged["plan_id"] = "0" * 64
+    minted = clean(client, project.id, confirm_apply=True, plan=forged)
+    assert minted.status_code == 422
+    assert minted.json()["detail"] == CLEAN_PROMPTS_PLAN_MISMATCH
+
+    # Stale: the project moved after the report was read.
+    moved = store.get(project.id)
+    moved.name = "Harder Faster (renamed while the report sat open)"
+    store.save(moved)
+    stale = clean(client, project.id, confirm_apply=True, plan=plan)
+    assert stale.status_code == 409
+    assert stale.json()["detail"] == PROJECT_CHANGED_REFUSAL
+
+    # And a client that edits the revision to get past that check fails the digest instead,
+    # which is why `updated_at` is inside the fingerprint as well as compared against it.
+    refreshed = json.loads(json.dumps(plan))
+    refreshed["updated_at"] = store.get(project.id).updated_at.isoformat()
+    relabelled = clean(client, project.id, confirm_apply=True, plan=refreshed)
+    assert relabelled.status_code == 422
+    assert relabelled.json()["detail"] == CLEAN_PROMPTS_PLAN_MISMATCH
+
+    # Nothing was written by any of the five, and no model was asked a second time.
+    assert {shot.id: shot.model_dump() for shot in ProjectStore(tmp_path).get(project.id).shots} == before
+    assert len(director.calls) == 1
+    assert comfy.prompts == []
+
+
+def test_the_confirms_row_check_refuses_a_plan_whose_prompt_moved_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The confirm's last line of defence, forced to fire.
+
+    Unreachable while the revision check holds — a prompt cannot change without the manifest
+    being saved, and a save moves `updated_at` — which is exactly why it is a check on data
+    rather than a claim about ordering, and exactly why it needs a test that does not depend on
+    the ordering being wrong. `CLEAN_PROMPTS_WINDOWS_MOVED`'s own test does the same thing for
+    the same reason. The digest is stood in for by one that accepts whatever it is handed; the
+    route must then still refuse on the row, and save nothing.
+    """
+    from music_video_producer import app as app_module
+    from music_video_producer.app import CLEAN_PROMPTS_PLAN_MISMATCH
+
+    store = ProjectStore(tmp_path)
+    project = director_project(store)
+    director = CleanupDirector(rewrites=plain_rewrites(project))
+    client, store, comfy = make_client(tmp_path, director)
+    project = director_project(store)
+    before = {shot.id: shot.model_dump() for shot in project.shots}
+
+    # Accepts anything, and still mints a non-empty id so the plan is not refused as absent.
+    monkeypatch.setattr(
+        app_module, "plan_fingerprint", lambda project, plan: plan.plan_id or "minted"
+    )
+    plan = clean(client, project.id).json()
+    # The sentence this rewrite was made from is not the sentence on the shot.
+    next(row for row in plan["shots"] if row["rewritten"])["before"] = (
+        "Some other sentence entirely."
+    )
+
+    response = clean(client, project.id, confirm_apply=True, plan=plan)
+    assert response.status_code == 422
+    assert response.json()["detail"] == CLEAN_PROMPTS_PLAN_MISMATCH
+    assert {shot.id: shot.model_dump() for shot in ProjectStore(tmp_path).get(project.id).shots} == before
+    assert comfy.prompts == []
+
+
+def test_a_prompt_edited_while_the_model_reads_is_named_and_left_exactly_as_typed(
+    tmp_path: Path,
+):
+    """The second finding: the hand edit that used to be silently overwritten.
+
+    The route re-reads the project after the await, so `labels` and `before` were recomputed
+    from the fresh prompt — but `answered[shot.id]` was a rewrite of the **stale** one, and the
+    stale rewrite was what got written. The Director edits shot 2 while the model is reading and
+    their sentence is replaced by a revision of the sentence they deleted.
+
+    Dropped and named now, which is this codebase's convention: a named skip beats a silent
+    guess, and re-asking would spend the 300 s call again. The docstring that claimed the
+    prompt was "re-examined on its new text" was corrected in the same change — it described
+    behaviour the code never had.
+    """
+    from music_video_producer.app import CLEAN_PROMPTS_EDITED
+
+    edited_id = "shot_59f8da92c2d8"
+    store = ProjectStore(tmp_path)
+    project = director_project(store)
+    rewrites = plain_rewrites(project)
+    assert edited_id in rewrites, "the shot this test edits has to be one that was sent"
+    # Still names its labels, so the row reaches the hand-edit branch rather than being
+    # reported as already clean — and it is unmistakably the Director's own typing.
+    original = next(shot.prompt for shot in project.shots if shot.id == edited_id)
+    hand_typed = f"{original} She stops, looks straight down the lens, and waits."
+
+    class EditingDirector(CleanupDirector):
+        """Answers, and edits the project by hand while it is 'thinking'."""
+
+        store: ProjectStore
+        project_id: str
+
+        async def expand(self, *, expansion_input, system_prompt=None):
+            answer = await super().expand(
+                expansion_input=expansion_input, system_prompt=system_prompt
+            )
+            live = self.store.get(self.project_id)
+            for shot in live.shots:
+                if shot.id == edited_id:
+                    shot.prompt = hand_typed
+            self.store.save(live)
+            return answer
+
+    director = EditingDirector(rewrites=rewrites)
+    client, store, comfy = make_client(tmp_path, director)
+    project = director_project(store)
+    director.store = store
+    director.project_id = project.id
+
+    report = clean(client, project.id)
+    assert report.status_code == 200, report.text
+    plan = report.json()
+    rows = {row["shot_id"]: row for row in plan["shots"]}
+    assert rows[edited_id]["rewritten"] is False
+    assert rows[edited_id]["reason"] == CLEAN_PROMPTS_EDITED
+    # The report shows the Director's text, not the text the model was given.
+    assert rows[edited_id]["before"] == hand_typed
+    assert rows[edited_id]["after"] == ""
+    # Every other echoing shot is unaffected: one edit skips one shot, not the pass.
+    assert plan["rewritten"] == DIRECTOR_ECHOING - 1
+
+    applied = clean(client, project.id, confirm_apply=True, plan=plan)
+    assert applied.status_code == 200, applied.text
+    stored = {shot.id: shot.prompt for shot in ProjectStore(tmp_path).get(project.id).shots}
+    assert stored[edited_id] == hand_typed
+    # The thing that used to happen, named so a regression reads clearly.
+    assert stored[edited_id] != rewrites[edited_id]
+    for row in plan["shots"]:
+        if row["rewritten"]:
+            assert stored[row["shot_id"]] == row["after"]
+    assert comfy.prompts == []
+
+
+def test_the_directors_live_project_is_never_written_by_this_test_module(tmp_path: Path):
+    """The guard is armed for every test in this module, and it fires.
+
+    The guarantee is worth having and is not theoretical: three agents have now been told to
+    treat `project_59f14d19ff10` as read-only and an earlier one wrote to it anyway while
+    reporting it untouched. What changed (2026-08-21) is *how* it is held — see
+    `never_touches_the_directors_data_root`, which enforces it at the store's own path seam
+    instead of asserting afterwards that the Director's file still says what it said last
+    night. Nothing here reads the manifest's content: what it contains is the Director's
+    business and changes every time they work, and a test that cares would go red every time
+    they do their job.
+
+    Both halves are checked, because a guard nobody proves fires is a guard that can silently
+    stop being installed: a store aimed at the live root refuses on read and on write, and an
+    ordinary store under `tmp_path` — which is every other test in this file — is untouched.
+    """
+    ordinary = ProjectStore(tmp_path)
+    saved = ordinary.create(Project(name="Somewhere else entirely"))
+    assert ordinary.get(saved.id).name == "Somewhere else entirely"
+
+    # Aimed at the live root without constructing a store on it: `ProjectStore.__init__`
+    # creates its own projects directory, and this test may not write there either.
+    aimed = ProjectStore(tmp_path)
+    aimed.projects_root = LIVE_DATA_ROOT / "projects"
+    with pytest.raises(AssertionError) as read_refused:
+        aimed.get(LIVE_PROJECT_ID)
+    assert LIVE_ROOT_REFUSAL[:40] in str(read_refused.value)
+    with pytest.raises(AssertionError):
+        aimed.save(Project(id=LIVE_PROJECT_ID, name="Would have overwritten it"))
+    # The file is where it was, and that is the whole of what is asserted about it.
+    assert not LIVE_PROJECT.exists() or LIVE_PROJECT.is_file()

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
+import json
 import logging
 import math
 import re
@@ -130,6 +132,7 @@ from .timeline import (
     ordered_shots,
     over_render_frames,
     over_render_lead,
+    over_render_window,
     populate_windows,
     proposal_for_position,
     proposed_sections_from_alignment,
@@ -1586,6 +1589,30 @@ RESTORE_AUDIO_MISSING_SONG_REFUSAL = (
     "This project's song is recorded as {path} and there is no file there, so {shot} has "
     "nothing to take its seconds from. Nothing was submitted."
 )
+# The legacy take, and the one refusal on this route that is about the *take's bookkeeping*
+# rather than about the shot, the song or the file.
+#
+# A take begins `latest_take_lead` seconds before its window, and that number is recorded at
+# submission because it cannot be derived afterwards — a pre-margin take and a post-margin one
+# are indistinguishable by arithmetic on their lengths (`Shot.latest_take_lead`). Since the
+# margin shipped, every song-audio submission records a lead of `min(ideal, extra, start)` with
+# `ideal` at least a quarter second and `extra` always positive, so a recorded lead is zero
+# **exactly when the shot starts at 0 s** — which is legitimate and is not refused here.
+#
+# A zero lead on a shot that starts later therefore means one of two things, and neither can be
+# repaired from the manifest: the take was rendered before the margin existed, or its
+# bookkeeping was cleared when an external clip was selected for the shot (`select_shot_clip`).
+# Windowing such a take by any rule is a guess about its provenance, and the failure a wrong
+# guess produces is a subtle desync rather than an error — the same reason a shot that never
+# rode the master is refused instead of given a window. Re-render the shot and the lead is
+# recorded.
+RESTORE_AUDIO_NO_LEAD_REFUSAL = (
+    "{shot} starts at {start:g}s but its take records no sync lead, so this take was rendered "
+    "before takes carried one, or its clip was chosen by hand. How far before the window the "
+    "picture begins cannot be worked out after the fact, and a guessed offset would put the "
+    "sound out of sync with the mouth. Render the shot again and the lead is recorded with it. "
+    "Nothing was submitted."
+)
 # Concurrency, as the concrete harm. Covers a live render, a live enhancement and a second
 # restoration: all three can move or race the file this one reads or the prefix it writes under.
 RESTORE_AUDIO_IN_FLIGHT_REFUSAL = (
@@ -2296,6 +2323,73 @@ POPULATE_ATTEMPTS = 2
 POPULATE_RETRY_TEMPERATURE = 0.2
 
 
+# ------------------------------------------------------------------------------------------
+# Report-then-confirm, made real: the plan the Director read is the plan that lands.
+#
+# Both model-backed bulk passes below (`clean_shot_prompts`, `fill_section_looks`) are
+# report-first by design, and both were report-first in name only until 2026-08-21: each call
+# asked the model *before* looking at `confirm_apply`, so the report and the apply were two
+# independent generations at `PLAN_TEMPERATURE = 0.7`. Measured on the Director's live 33-shot
+# plan that night: of 24 rewrites read and approved in the report, **one landed as different
+# text** ("Extreme close up of smeared crimson lips, wet." reviewed, "Extreme close up of
+# crimson lips, smeared and wet." applied). Both readings happened to be acceptable; that is
+# luck, not a guarantee, and the guarantee is the whole point of a report a person reads. It
+# also spent a second local-model call — up to 300 s — to do it.
+#
+# The fix: **the confirm carries the report back**, whole, and the route applies exactly that.
+# `plan` on each request is the response model of the same route, so the client echoes the body
+# it was given rather than reconstructing a plan the server would have to trust. Two things
+# make the echo as strong as a server-side cache would be:
+#
+# * `plan_id` — a SHA-256 the *server* mints over the report it emitted, recomputed here over
+#   the report it is handed. Any field of any row that changed in between fails it, so the
+#   text that lands is provably the text that was reported.
+# * `updated_at` — the report's revision of the project, checked against the live one with
+#   `PROJECT_CHANGED_REFUSAL`, the wording `replace_project` and `replace_shots` already use.
+#   It is inside the digest too, so a client cannot pass the revision check by rewriting it.
+#
+# Echo rather than a server-side cache keyed by plan id, weighed and chosen:
+#
+# * No server state, so no lifetime, no eviction, no "which worker holds it", and a plan
+#   survives a restart exactly the way a shot list does.
+# * It is this codebase's existing idiom rather than a new one — `ShotListRequest` is a full
+#   payload plus a revision token for precisely this reason, and the refusal is already
+#   written.
+# * The guarantee becomes checkable from the wire alone: the report body and the confirm body
+#   can be compared byte for byte by anything holding both, with no reach into server internals.
+# * A cache would still need the revision check (so it is strictly more machinery for the same
+#   promise), and its extra failure mode — plan evicted — refuses in a way the Director can
+#   only fix by spending the 300 s call again, which is the cost this change exists to remove.
+#
+# The digest is a plain hash, not a keyed MAC, and that is honest about what it defends: this
+# is a single-user local application, and the hazard measured here is a *client that
+# regenerates*, not an attacker. A client that recomputes the digest over substituted text is
+# asserting "this is what I reviewed" as deliberately as any `PUT /shots` asserts its body.
+# What the digest ends is text arriving that nobody chose.
+#: Fields left out of the digest: the two a confirm is *allowed* to change about the report it
+#: echoes, and the id itself, which cannot be inside its own hash.
+PLAN_DIGEST_EXCLUDE = {"applied", "project", "plan_id"}
+
+
+def plan_fingerprint(project: Project, plan: BaseModel) -> str:
+    """The id a report is minted with and a confirm is checked against.
+
+    Canonical by construction: pydantic has already coerced every field to its declared type
+    before this runs (so `12` and `12.0` hash alike), `mode="json"` renders datetimes as their
+    ISO strings, and `sort_keys` removes key order from the answer. The project id is inside it
+    so a plan cannot be replayed against a different project.
+    """
+    payload = json.dumps(
+        {
+            "project": project.id,
+            "plan": plan.model_dump(mode="json", exclude=PLAN_DIGEST_EXCLUDE),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 #: The honest-empty refusal, `snap_timeline_cuts`' rule: nothing was examined that could
 #: change, so there is no plan to report over and a 200 saying "0 rewritten" would read as the
 #: model having been asked and having had nothing to say. Names the good news, because on this
@@ -2323,9 +2417,34 @@ CLEAN_PROMPTS_DUPLICATED = (
     "the model answered for this shot more than once; the first answer was used and the rest "
     "discarded"
 )
+#: The hand-edit rule, and the defect it closes (2026-08-21). The rewrites come back addressed
+#: to shot ids, and the route re-reads the project after the await so a lock or a deletion in
+#: that window is honoured — but the *rewrite* was made from the prompt as it read when the
+#: call went out. If the Director edited that prompt while the model was reading, applying the
+#: answer replaces their edit with a rewrite of the text they replaced. Dropped and named, not
+#: guessed at: a named skip beats a silent guess, and re-asking would cost the call again.
+CLEAN_PROMPTS_EDITED = (
+    "this prompt was edited by hand while the model was reading it, so the rewrite that came "
+    "back was made from text that no longer exists; your edit was left exactly as you wrote it"
+)
 #: Counted, never written. An id that matches no shot cannot be created into one: that would
 #: invent a window, which is the one thing this pass exists not to do.
 CLEAN_PROMPTS_STRAY = "; {count} rewrite(s) addressed no shot in this project"
+#: A confirm that carries nothing to apply. The rewrites are model output read by a person, so
+#: "apply whatever you generate now" is not an act this route offers at all — see the
+#: plan-carrying block above.
+CLEAN_PROMPTS_NO_PLAN = (
+    "This confirm carries no plan, so there is nothing it could apply. The rewrites this pass "
+    "writes are the ones a person read in a report: run the report, read it, then confirm with "
+    "that report as `plan`. Nothing was written and no model was asked."
+)
+#: The digest firing. Deliberately a refusal rather than a re-ask: re-asking is how prose that
+#: nobody read used to land on a hand-reviewed plan.
+CLEAN_PROMPTS_PLAN_MISMATCH = (
+    "The plan sent with this confirm is not the plan this pass reported: it does not match its "
+    "own plan_id. Refused rather than rewriting the prompts again, because the text that lands "
+    "has to be the text that was read. Nothing was written. Run the report again."
+)
 #: Reported, never refused — `REPLACE_ASSET_RENDERED_NOTE`'s shape and its argument, applied to
 #: prose. The Director's ruling on citations (2026-08-20): *"even with takes we do want the
 #: asset for the shot replaceable ... This helps facilitate experimentation."* Prose is the
@@ -2428,6 +2547,19 @@ SECTION_LOOK_SKIP_MISLABELLED = (
     "the model addressed this section but called it {label!r}; refused rather than risk "
     "writing another section's look here"
 )
+#: The plan-carrying refusals, `CLEAN_PROMPTS_NO_PLAN`'s and `CLEAN_PROMPTS_PLAN_MISMATCH`'s
+#: rule in this pass's own words — see the plan-carrying block above for why the confirm echoes
+#: the report rather than asking the treatment to be read a second time.
+SECTION_LOOKS_NO_PLAN = (
+    "This confirm carries no plan, so there is nothing it could write. The looks this pass "
+    "writes are the ones a person read in a report: run the report, read it, then confirm with "
+    "that report as `plan`. Nothing was written and no model was asked."
+)
+SECTION_LOOKS_PLAN_MISMATCH = (
+    "The plan sent with this confirm is not the plan this pass reported: it does not match its "
+    "own plan_id. Refused rather than reading the treatment again, because the look that lands "
+    "has to be the look that was read. Nothing was written. Run the report again."
+)
 
 
 class SectionLooksRequest(BaseModel):
@@ -2441,10 +2573,18 @@ class SectionLooksRequest(BaseModel):
     report-then-confirm convention exists to forbid, and confirming *this pass* is not the
     same act as agreeing to lose that sentence. Empty looks fill on `confirm_apply` alone;
     written ones need both, and the report names them individually either way.
+
+    `plan` is the report being confirmed, echoed back whole — see the plan-carrying block
+    above. A `confirm_apply` without one is refused rather than served by reading the
+    treatment a second time. `overwrite` is deliberately **outside** the plan and outside its
+    digest: it is a consent given after the report is read, and the report already carries the
+    proposed look for a written section on its row, so the confirm can honour the second
+    question without the treatment being read again to answer it.
     """
 
     confirm_apply: bool = False
     overwrite: bool = False
+    plan: SectionLooksResponse | None = None
 
 
 class SectionLookRow(BaseModel):
@@ -2469,6 +2609,12 @@ class SectionLooksResponse(BaseModel):
 
     `project` is `None` on a report, `SnapCutsResponse`'s rule and for its reason: the
     absence is the wire's own statement that nothing was written.
+
+    This model is also the *request* body of the confirm that applies it (`plan` on
+    `SectionLooksRequest`), which is why `plan_id` and `updated_at` are on it: a report has to
+    be able to identify itself when it comes back. `stray` is the one count the message says
+    and the rows cannot, and it is a field rather than prose so the confirm can rebuild that
+    sentence exactly instead of losing its last clause.
     """
 
     applied: bool
@@ -2477,6 +2623,13 @@ class SectionLooksResponse(BaseModel):
     sections: list[SectionLookRow]
     message: str = ""
     project: Project | None = None
+    #: Answers that addressed no section in this project. Counted, never written.
+    stray: int = 0
+    #: The digest that ties this report to the confirm that applies it — `plan_fingerprint`.
+    plan_id: str = ""
+    #: The project revision this report was read from. Checked against the live one on the
+    #: confirm with `PROJECT_CHANGED_REFUSAL`, `replace_shots`' rule and its wording.
+    updated_at: datetime | None = None
 
 
 class CleanPromptsRequest(BaseModel):
@@ -2492,9 +2645,15 @@ class CleanPromptsRequest(BaseModel):
     replacing a sentence the Director typed; this pass only ever replaces a sentence a *tool*
     wrote badly, and it replaces it with the same sentence minus a library label, so there is
     no second trade to consent to separately.
+
+    `plan` is the report being confirmed, echoed back whole — see the plan-carrying block
+    above. A `confirm_apply` without one is refused rather than served by rewriting the prompts
+    a second time, because a second rewrite is a second generation and the Director read the
+    first.
     """
 
     confirm_apply: bool = False
+    plan: CleanPromptsResponse | None = None
 
 
 class CleanPromptRow(BaseModel):
@@ -2534,6 +2693,13 @@ class CleanPromptsResponse(BaseModel):
 
     The counts are the sanity check a Director reads first and they partition the plan
     exactly: `examined` is every shot, and `clean + rewritten + skipped == examined`.
+
+    This model is also the *request* body of the confirm that applies it (`plan` on
+    `CleanPromptsRequest`), which is why `plan_id` and `updated_at` are on it: a report has to
+    be able to identify itself when it comes back. Every other field rides back untouched — the
+    confirm returns the report it was handed with `applied` flipped and `project` filled in, so
+    the counts, the notes and every row of diff on screen after the write are the same bytes
+    that were on screen before it.
     """
 
     applied: bool
@@ -2548,6 +2714,137 @@ class CleanPromptsResponse(BaseModel):
     shots: list[CleanPromptRow] = Field(default_factory=list)
     message: str = ""
     project: Project | None = None
+    #: The digest that ties this report to the confirm that applies it — `plan_fingerprint`.
+    plan_id: str = ""
+    #: The project revision this report was read from. Checked against the live one on the
+    #: confirm with `PROJECT_CHANGED_REFUSAL`, `replace_shots`' rule and its wording.
+    updated_at: datetime | None = None
+
+
+# Both requests name their route's response model as `plan`, and both are declared above it —
+# `from __future__ import annotations` makes that a forward reference, so the two are rebuilt
+# here rather than left for whatever first touches them to discover.
+SectionLooksRequest.model_rebuild()
+CleanPromptsRequest.model_rebuild()
+
+
+def section_looks_summary(filled: int, left: int, stray: int) -> str:
+    """The report's one-line summary. One spelling, because the confirm rebuilds it.
+
+    A `overwrite=true` confirm can turn a written section's skip into a write, which changes
+    both counts — so the sentence has to be reproducible from the numbers rather than carried
+    as prose, or the confirm would either lie about what it did or lose the stray clause.
+    """
+    summary = f"{filled} filled, {left} left alone"
+    if stray:
+        summary += f"; {stray} answer(s) addressed no section in this project"
+    return summary
+
+
+def section_looks_plan_writes(
+    project: Project, request: SectionLooksRequest
+) -> tuple[SectionLooksResponse, list[tuple[SongSection, str]]]:
+    """Check a confirm's echoed report against the live project; say what it writes.
+
+    No model is asked on this path and none can be: the looks it writes are the strings that
+    came back on the report, and the three checks above them are what makes "the look that
+    lands is the look that was read" a fact rather than a hope. Raises rather than reporting,
+    because a confirm that cannot prove its plan has nothing to report *about* — the thing it
+    was asked to write is exactly the thing it cannot identify.
+    """
+    plan = request.plan
+    if plan is None or not plan.sections or not plan.plan_id:
+        raise HTTPException(status_code=422, detail=SECTION_LOOKS_NO_PLAN)
+    if plan.updated_at is None or plan.updated_at != project.updated_at:
+        raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
+    if plan_fingerprint(project, plan) != plan.plan_id:
+        raise HTTPException(status_code=422, detail=SECTION_LOOKS_PLAN_MISMATCH)
+    by_id = {section.id: section for section in project.sections}
+    response = plan.model_copy(deep=True)
+    response.applied = False
+    response.project = None
+    pending: list[tuple[SongSection, str]] = []
+    for row in response.sections:
+        section = by_id.get(row.section_id)
+        # Unreachable while the revision check above holds — a section cannot be added,
+        # deleted, renamed or written without the manifest being saved, and a save moves
+        # `updated_at`. Checked rather than argued, `CLEAN_PROMPTS_WINDOWS_MOVED`'s rule.
+        if (
+            section is None
+            or section.label.strip().casefold() != row.label.strip().casefold()
+            or section.prompt != row.previous
+        ):
+            raise HTTPException(status_code=422, detail=SECTION_LOOKS_PLAN_MISMATCH)
+        if not row.prompt.strip():
+            continue
+        # The second consent is answered *here*, against the report, which is what keeps it
+        # from costing a second reading of the treatment: the report deliberately carries the
+        # proposed look on a written section's row so this decision has something to be taken
+        # against. Declining still writes the empty ones — the whole point of two flags.
+        if section.prompt.strip() and not request.overwrite:
+            row.filled = False
+            row.reason = SECTION_LOOK_SKIP_WRITTEN
+            continue
+        row.filled = True
+        row.reason = ""
+        pending.append((section, row.prompt))
+    response.filled = sum(1 for row in response.sections if row.filled)
+    response.skipped = len(response.sections) - response.filled
+    # Rebuilt only when `overwrite` actually changed the outcome. Left alone otherwise, so an
+    # unchanged confirm returns the reported message byte for byte — including
+    # `SECTION_LOOKS_ALL_WRITTEN`, which is not this sentence at all.
+    if (response.filled, response.skipped) != (plan.filled, plan.skipped):
+        response.message = section_looks_summary(
+            response.filled, response.skipped, response.stray
+        )
+    return response, pending
+
+
+def clean_prompts_plan_writes(
+    project: Project, request: CleanPromptsRequest
+) -> tuple[CleanPromptsResponse, list[tuple[Shot, str]]]:
+    """Check a confirm's echoed report against the live project; say what it writes.
+
+    `section_looks_plan_writes`' three checks, and then the row-level ones. Nothing is
+    recomputed into the response: this pass has no second flag, so every count, note and row
+    of diff rides back exactly as it was read, and the confirm's body differs from the
+    report's in `applied` and `project` alone.
+    """
+    plan = request.plan
+    if plan is None or not plan.shots or not plan.plan_id:
+        raise HTTPException(status_code=422, detail=CLEAN_PROMPTS_NO_PLAN)
+    if plan.updated_at is None or plan.updated_at != project.updated_at:
+        raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
+    if plan_fingerprint(project, plan) != plan.plan_id:
+        raise HTTPException(status_code=422, detail=CLEAN_PROMPTS_PLAN_MISMATCH)
+    by_id = {shot.id: shot for shot in project.shots}
+    library = list(project.assets)
+    response = plan.model_copy(deep=True)
+    response.applied = False
+    response.project = None
+    pending: list[tuple[Shot, str]] = []
+    for row in response.shots:
+        if not row.rewritten:
+            continue
+        shot = by_id.get(row.shot_id)
+        # All three are unreachable while the revision check above holds, and all three are
+        # checked anyway: they are the statements the report made about the world, re-read
+        # against the world it is about to write to. The prompt still reads as it did, the
+        # shot is still unprotected, and the rewrite still passes the acceptance rule.
+        if (
+            shot is None
+            or shot.prompt != row.before
+            or shot.locked
+            or shot_render_in_flight(project, shot)
+            or rewrite_rejection(
+                row.after,
+                original=shot.prompt,
+                labels=echoed_labels(shot.prompt, library),
+            )
+        ):
+            raise HTTPException(status_code=422, detail=CLEAN_PROMPTS_PLAN_MISMATCH)
+        pending.append((shot, row.after))
+    return response, pending
 
 
 class PopulateTimelineRequest(BaseModel):
@@ -2841,10 +3138,13 @@ class AudioRestoreResponse(BaseModel):
     """
 
     job: RenderJob
-    #: The window's own length, in seconds. Equal to the Shot's duration, exactly.
+    #: The length of the window this stage sends, in seconds — the **take's** own seconds of the
+    #: song, not the exposed slice's. A 2.083 s micro-cut's take is 4.4583 s long and gets
+    #: 4.4583 s of song, beginning `latest_take_lead` before the window.
     audio_seconds: float
-    #: Seconds of picture the render was asked to produce. May exceed `audio_seconds` because
-    #: the H3 grid rounds up: a 5 s shot is 124 frames, which is 5.1667 s.
+    #: Seconds of picture the render was asked to produce, from `timeline.over_render_frames` —
+    #: the same count the submission sent. Equal to `audio_seconds` except where the song ends
+    #: before the picture does, which is the one mismatch left after 2026-08-21.
     requested_picture_seconds: float
     requested_frames: int
     #: False when the two above differ by more than half a frame at 24 fps. Half a frame rather
@@ -5774,13 +6074,19 @@ def create_app(
                     picture_seconds=picture_seconds,
                     song_duration=project.song.duration,
                 )
-                trim_start = shot.start - take_lead
-                trim_end = trim_start + picture_seconds
-                if project.song.duration > 0:
-                    # The whole-song edge: no room either side, so the file simply ends
-                    # before the picture does — rendered with the mismatch, exactly as
-                    # every pre-margin render behaved, never silently shortened elsewhere.
-                    trim_end = min(trim_end, project.song.duration)
+                # The take's own seconds of the song, through the one function that expresses
+                # them (`over_render_window`). The whole-song edge lives in there: no room
+                # either side, so the file simply ends before the picture does — rendered with
+                # the mismatch, exactly as every pre-margin render behaved, never silently
+                # shortened elsewhere. `restore_song_audio` calls the same function with the
+                # lead this submission is about to record, so the seconds conditioned and the
+                # seconds restored are one computation rather than two that agree.
+                trim_start, trim_end = over_render_window(
+                    start=shot.start,
+                    lead=take_lead,
+                    picture_seconds=picture_seconds,
+                    song_duration=project.song.duration,
+                )
                 references.append(
                     {
                         "kind": "audio",
@@ -6309,17 +6615,29 @@ def create_app(
         it, and this route is the stage that was missing: the one that puts the real track back
         over the finished picture.
 
-        **The window is not computed here.** This route hands `build_audio_replace_payload` the
-        same three numbers `generate_h3` hands `song_audio_window` — `shot.start`,
-        `shot.duration`, `project.song.duration` — and that builder calls that function. There
-        is no window parameter anywhere on this path for the two stages to disagree through. A
-        shot conditioned on 12–15.75 s therefore gets the master's 12–15.75 s by construction
-        rather than by two computations agreeing, and the failure a second computation would
-        produce — a subtle desync rather than an error — has nowhere to come from.
+        **The window is not computed here.** This route hands `build_audio_replace_payload` four
+        numbers off the Shot — `start`, `duration`, `song_duration` and the recorded
+        `latest_take_lead` — and that builder puts them through the same two functions
+        `generate_h3` puts them through. There is no window parameter anywhere on this path for
+        the two stages to disagree through, and the failure a second computation would produce —
+        a subtle desync rather than an error — has nowhere to come from.
 
-        The refusal for a window past the end of the song is that function's, raised inside the
-        builder and translated here, so this stage refuses exactly the shots the render refuses
-        and in the same words. It is not a second rule.
+        **The window is the take's, not the shot's** (fixed 2026-08-21). Since the over-render
+        margin a take is longer than its window and, below about 3.271 s, centred on it: a
+        2.083 s window is 4.4583 s of picture whose first frame is song second `start - 1.2083`.
+        This route windowed by the bare `start`/`duration` until that date, which laid the
+        exposed slice's seconds over the whole take — the sound running `lead` ahead of the mouth
+        and stopping a margin early. It now sends `over_render_frames(duration)` frames of song
+        from `start - latest_take_lead`, which is `over_render_window`: the same call, with the
+        same lead, that conditioned the render. A shot at 12 s with a 0.25 s lead is restored
+        from 11.75 s, and frame 6 of that take is song second 12.000 exactly.
+
+        The refusal for a window past the end of the song is `song_audio_window`'s, raised inside
+        the builder and translated here, so this stage refuses exactly the shots the render
+        refuses and in the same words. It is not a second rule. The one refusal this route owns
+        beyond the render's is the take with no recorded lead — see
+        `RESTORE_AUDIO_NO_LEAD_REFUSAL`, which is a refusal precisely because the alternative is
+        a guess about a take's provenance.
 
         **Nothing here writes to the Shot.** Not `status`, not `latest_output`, not
         `latest_review`, not `prompt_id`. Only a `RenderJob` of `kind="post"` is appended, and
@@ -6414,6 +6732,17 @@ def create_app(
                     shot=shot_label(project, shot), path=project.song.path
                 ),
             ) from error
+        # The take's own bookkeeping, last of the refusals and still before any submission. See
+        # `RESTORE_AUDIO_NO_LEAD_REFUSAL`: a shot past 0 s whose take records no lead is a take
+        # this route cannot place, and placing it anyway is the guess the whole stage refuses to
+        # make elsewhere.
+        if shot.start > 0 and not shot.latest_take_lead:
+            raise HTTPException(
+                status_code=422,
+                detail=RESTORE_AUDIO_NO_LEAD_REFUSAL.format(
+                    shot=shot_label(project, shot), start=shot.start
+                ),
+            )
         try:
             payload = build_audio_replace_payload(
                 # Forward slashes on Windows too, for `enhance_with_ltx25`'s reason: the value
@@ -6421,11 +6750,16 @@ def create_app(
                 # doubled and unreadable in every log and error message on the way.
                 source_video=source.as_posix(),
                 source_audio=song.as_posix(),
-                # The three numbers, unmodified. Everything correct about this stage follows
-                # from these going to `song_audio_window` rather than to a window computed here.
+                # The four numbers, unmodified. Everything correct about this stage follows from
+                # these going to `song_audio_window` and `over_render_window` rather than to a
+                # window computed here. `latest_take_lead` is read off the Shot and never
+                # recomputed: it describes the take that exists, and `over_render_lead` would
+                # answer for the take a submission *now* would produce, which is a different
+                # number the moment the window has been edited.
                 start=shot.start,
                 duration=shot.duration,
                 song_duration=project.song.duration,
+                take_lead=shot.latest_take_lead,
                 prefix=(
                     f"music-video-producer/{project_id}/shots/"
                     f"{shot.id}{RESTORE_AUDIO_PREFIX_SUFFIX}"
@@ -6436,7 +6770,14 @@ def create_app(
             # builder, and every path-shape refusal beside it. Before `comfy.submit`, so none of
             # them costs anything.
             raise HTTPException(status_code=422, detail=str(error)) from error
-        lengths = audio_replace_lengths(duration=shot.duration)
+        # The same four numbers again, so what the Director is told about the take is the take
+        # the payload above carries rather than a second description of it.
+        lengths = audio_replace_lengths(
+            start=shot.start,
+            duration=shot.duration,
+            song_duration=project.song.duration,
+            take_lead=shot.latest_take_lead,
+        )
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
@@ -6463,13 +6804,17 @@ def create_app(
             lengths_match=matched,
             length_note=(
                 f"{lengths['audio_seconds']:g}s of the master song, from "
-                f"{shot.start:g}s to {shot.start + shot.duration:g}s, over a picture the render "
-                f"asked H3 for as {int(lengths['requested_frames'])} frames "
+                f"{shot.start - shot.latest_take_lead:g}s to "
+                f"{shot.start - shot.latest_take_lead + lengths['audio_seconds']:g}s, over a "
+                f"picture the render asked H3 for as {int(lengths['requested_frames'])} frames "
                 f"({lengths['requested_picture_seconds']:.4g}s at 24 fps). "
                 + (
                     "The two agree. "
                     if matched
-                    else "They differ because the 17k+5 frame grid rounds up. "
+                    # The one way they can still differ now that both come from the same
+                    # over-render arithmetic: the song runs out before the picture does, so the
+                    # tail of the take keeps its own audio rather than being cut to the song.
+                    else "They differ because the song ends before the picture does. "
                 )
                 + "Neither is padded or cut: trim_to_audio is off. The frames the file "
                 "actually holds are an ffprobe reading, not a number this application claims."
@@ -7275,10 +7620,28 @@ def create_app(
         (`ExpandedShot.shot_id`'s contract) and also copies the label back; a pair that
         disagrees is refused, an unknown id is dropped, and neither writes anything.
 
+        **Report and confirm are two different acts here, and only the report asks the
+        model.** Until 2026-08-21 both did: the call was made before `confirm_apply` was
+        looked at, so the confirmed pass read the treatment a second time at
+        `PLAN_TEMPERATURE` and wrote whatever *that* reading said. The confirm now carries the
+        report back as `plan` and writes exactly it — see the plan-carrying block above for the
+        digest, the revision check and why the plan travels on the wire rather than in a cache.
+
         Nothing here renders, arms, queues or approves. It writes one string per section and
         touches no other field on the project.
         """
         project = get_project(project_id)
+        # The confirm, and the only path that writes. No model is asked on it: `plan` is the
+        # report a person read, and the looks it writes are that report's own strings.
+        if request.confirm_apply:
+            response, pending = section_looks_plan_writes(project, request)
+            if not pending:
+                return response
+            for section, prompt in pending:
+                section.prompt = prompt
+            response.applied = True
+            response.project = store.save(project)
+            return response
         if not project.sections:
             raise HTTPException(status_code=422, detail=SECTION_LOOKS_NO_SECTIONS)
         # The absent-analysis rule, applied to prose: an empty treatment is *unwritten*, not
@@ -7296,7 +7659,7 @@ def create_app(
         if not request.overwrite and all(
             section.prompt.strip() for section in ordered
         ):
-            return SectionLooksResponse(
+            written = SectionLooksResponse(
                 applied=False,
                 filled=0,
                 skipped=len(ordered),
@@ -7312,7 +7675,13 @@ def create_app(
                     for section in ordered
                 ],
                 message=SECTION_LOOKS_ALL_WRITTEN,
+                updated_at=project.updated_at,
             )
+            # Identified like any other report, though no row of it carries a look to write:
+            # one shape for every answer this route gives means a client never has to ask
+            # which kind of report it is holding before it can confirm one.
+            written.plan_id = plan_fingerprint(project, written)
+            return written
         try:
             answer = await director.section_looks(
                 looks_input=section_looks_input(project)
@@ -7335,7 +7704,6 @@ def create_app(
         for look in answer.looks:
             answered.setdefault(look.section_id, look)
         rows: list[SectionLookRow] = []
-        pending: list[tuple[Any, str]] = []
         for section in sorted(project.sections, key=lambda item: item.start):
             row = SectionLookRow(
                 section_id=section.id,
@@ -7364,29 +7732,24 @@ def create_app(
             else:
                 row.filled = True
                 row.prompt = look.prompt.strip()
-                pending.append((section, row.prompt))
             rows.append(row)
         # Ids the model invented or copied from another project are dropped in silence above
         # (they match no section) and counted here, so the report can say so rather than the
         # Director wondering why a look they can see in the message never landed.
         stray = sum(1 for section_id in answered if section_id not in by_id)
         filled = sum(1 for row in rows if row.filled)
-        summary = f"{filled} filled, {len(rows) - filled} left alone"
-        if stray:
-            summary += f"; {stray} answer(s) addressed no section in this project"
         response = SectionLooksResponse(
             applied=False,
             filled=filled,
             skipped=len(rows) - filled,
             sections=rows,
-            message=summary,
+            message=section_looks_summary(filled, len(rows) - filled, stray),
+            stray=stray,
+            updated_at=project.updated_at,
         )
-        if not request.confirm_apply or not pending:
-            return response
-        for section, prompt in pending:
-            section.prompt = prompt
-        response.applied = True
-        response.project = store.save(project)
+        # Minted last, over the finished report, and over the *fresh* project's revision — the
+        # one the confirm will be checked against. Nothing is written on this path.
+        response.plan_id = plan_fingerprint(project, response)
         return response
 
     @app.post(
@@ -7945,6 +8308,14 @@ def create_app(
         visible on the wire. Every row carries the old prose beside the proposed prose, because
         this report exists to be read by a person before it lands.
 
+        **And the report is what lands.** Until 2026-08-21 it was not: the model was asked
+        before `confirm_apply` was looked at, so the confirming call was a second, independent
+        generation at `PLAN_TEMPERATURE = 0.7`. Measured on the Director's live plan that night
+        — 24 rewrites read and approved, **one landed as different text**. The confirm now
+        carries the report back as `plan`, this route asks no model on that path at all, and
+        `clean_prompts_plan_writes` refuses any plan it cannot tie to a report it emitted. See
+        the plan-carrying block above.
+
         **A shot with no echo is not sent to the model at all** and is reported as already
         clean. Asking for a rewrite of a prompt nobody complained about is how a hand-reviewed
         plan quietly acquires 33 changes when it needed 24.
@@ -7970,6 +8341,29 @@ def create_app(
         `status` moves.
         """
         project = get_project(project_id)
+        # The confirm, and the only path that writes. No model is asked on it: `plan` is the
+        # report a person read, and the prose it writes is that report's own `after` strings.
+        if request.confirm_apply:
+            response, pending = clean_prompts_plan_writes(project, request)
+            if not pending:
+                return response
+            # The guarantee, taken on the project about to be written and checked against it
+            # after.
+            geometry = window_fingerprint(project)
+            citations = {shot.id: citation_fingerprint(shot) for shot in project.shots}
+            for shot, prose in pending:
+                shot.prompt = prose
+            if window_fingerprint(project) != geometry or any(
+                citation_fingerprint(shot) != citations[shot.id]
+                for shot in project.shots
+            ):
+                # Nothing has been saved at this point, and nothing will be. Unreachable by
+                # construction — the loop above assigns one field — which is exactly why it is
+                # checked rather than argued.
+                raise HTTPException(status_code=500, detail=CLEAN_PROMPTS_WINDOWS_MOVED)
+            response.project = store.save(project)
+            response.applied = True
+            return response
         # Detection runs over the **whole** library, not `citable_assets`. The roster rule is
         # about what a model is offered; this is about what is already written down, and a
         # label that reached the prose before a promotion hid its asset is still a label.
@@ -8012,6 +8406,12 @@ def create_app(
                     )
                 ),
             )
+        # The text each rewrite will have been made from, kept across the await. A rewrite is
+        # an edit *of a particular sentence*, so the sentence has to be part of the answer's
+        # identity — see `CLEAN_PROMPTS_EDITED`, and the loop below that spends this.
+        asked_prompts = {
+            shot.id: shot.prompt for shot in project.shots if shot.id in askable
+        }
         try:
             # `director.expand`'s wire and `ShotExpansion`'s contract, selected by system
             # prompt — the DP pass's own idiom (`dp_prompt.DP_SYSTEM_PROMPT`), because
@@ -8028,9 +8428,14 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(error)) from error
         # Re-read after the await — a local model can hold this open for minutes, and the
         # Director may have locked, edited, split or deleted a shot meanwhile. The fresh
-        # project is the one being written, so it is also the one being matched and re-scanned
-        # against: a prompt edited by hand in that window is re-examined on its new text, and a
-        # lock set in that window protects.
+        # project is the one being reported on, so it is also the one being matched and
+        # re-scanned against: a lock set in that window protects, a shot deleted in it has no
+        # row, and a prompt **edited by hand** in that window is dropped and named
+        # (`CLEAN_PROMPTS_EDITED`) rather than overwritten by a rewrite of the text it
+        # replaced. The docstring here claimed the opposite until 2026-08-21 — that such a
+        # prompt was "re-examined on its new text" — and the code never did it: `labels` and
+        # `before` were recomputed from the fresh prompt while `answered[shot.id]` stayed a
+        # rewrite of the stale one, and the stale rewrite was what got written.
         project = get_project(project_id)
         library = list(project.assets)
         protected = {}
@@ -8055,7 +8460,6 @@ def create_app(
                 continue
             answered[item.shot_id] = item.prompt
         rows: list[CleanPromptRow] = []
-        pending: list[tuple[Shot, str]] = []
         for shot in ordered_shots(project):
             labels = echoed_labels(shot.prompt, library)
             row = CleanPromptRow(
@@ -8081,6 +8485,12 @@ def create_app(
                 row.reason = reason
             elif shot.id not in answered:
                 row.reason = CLEAN_PROMPTS_UNANSWERED
+            elif shot.prompt != asked_prompts.get(shot.id, shot.prompt):
+                # The hand-edit rule. The rewrite in hand is an edit of a sentence that no
+                # longer exists, so applying it would replace the Director's own words with a
+                # revision of the words they threw away. Dropped and named — a named skip
+                # beats a silent guess, and re-asking would spend the call a second time.
+                row.reason = CLEAN_PROMPTS_EDITED
             elif problem := rewrite_rejection(
                 answered[shot.id], original=shot.prompt, labels=labels
             ):
@@ -8091,7 +8501,6 @@ def create_app(
             else:
                 row.rewritten = True
                 row.after = answered[shot.id].strip()
-                pending.append((shot, row.after))
             if shot.id in duplicated and not row.reason:
                 row.reason = CLEAN_PROMPTS_DUPLICATED
             rows.append(row)
@@ -8141,23 +8550,11 @@ def create_app(
             notes=notes,
             shots=rows,
             message=summary,
+            updated_at=project.updated_at,
         )
-        if not request.confirm_apply or not pending:
-            return response
-        # The guarantee, taken on the project about to be written and checked against it after.
-        geometry = window_fingerprint(project)
-        citations = {shot.id: citation_fingerprint(shot) for shot in project.shots}
-        for shot, prose in pending:
-            shot.prompt = prose
-        if window_fingerprint(project) != geometry or any(
-            citation_fingerprint(shot) != citations[shot.id] for shot in project.shots
-        ):
-            # Nothing has been saved at this point, and nothing will be. Unreachable by
-            # construction — the loop above assigns one field — which is exactly why it is
-            # checked rather than argued.
-            raise HTTPException(status_code=500, detail=CLEAN_PROMPTS_WINDOWS_MOVED)
-        response.project = store.save(project)
-        response.applied = True
+        # Minted last, over the finished report, and over the *fresh* project's revision — the
+        # one the confirm will be checked against. Nothing is written on this path.
+        response.plan_id = plan_fingerprint(project, response)
         return response
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)

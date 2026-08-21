@@ -39,8 +39,18 @@ What is asserted, in order:
    refused on a locked neighbour.
 6. **Snap to playhead moves the shared boundary**: the neighbour's edge follows, the plan stays
    contiguous, and the same drag with the magnet switched off does not land on the playhead.
-7. **Expand All Prompts** is on the cuts bar, wired to the whole-plan sweep, and states what it
-   will cost before it spends anything.
+7. **One Undo steps back one gesture**, even when two gestures were made inside a single round
+   trip -- and the state between them is reachable (review Finding 4, 2026-08-21).
+8. **A drag does not leave a double-click behind**: re-grabbing an edge just after dragging it
+   starts a second drag rather than running the gap fill (Finding 5). The genuine double-click
+   is driven again afterwards, because a fix that simply forgot the press would take gesture B
+   away and no count of writes would notice.
+9. **A refused snap writes nothing at all**: no `PUT /shots`, no revision bump, no phantom undo
+   entry and no discarded redo stack (Finding 6).
+10. **The shot-length band** is taken on a real drag past 15 s, in the colour the stylesheet
+    resolves and the words the readiness report supplies, and it warns without blocking.
+11. **Expand All Prompts** is on the cuts bar, wired to the whole-plan sweep, and states what it
+    will cost before it spends anything.
 
 **No GPU time and no model time is spent.** Nothing here reaches `/prompt`; the one control that
 could spend model time is deliberately driven only as far as its own confirmation and then
@@ -71,6 +81,7 @@ from e2e_support import (
     console_gate,
     edge_driver,
     get_json,
+    post_json,
     post_multipart,
     put_json,
     report,
@@ -160,6 +171,55 @@ return {
 };
 """
 
+#: Latency, injected into the page, for `PUT /shots` alone.
+#:
+#: Nothing about the application's own code path changes: `request()` in api.js looks the global
+#: `fetch` up by name on every call, so this is the network being slow and nothing else. It exists
+#: because review Finding 4 is a race that only lives *inside* one round trip -- two gestures made
+#: before the first save comes back -- and against a loopback server that window is a millisecond
+#: or two wide. Widened here rather than hoped for, and `__mvpOpenShotWrites` is what lets the
+#: section prove the second gesture really was made while the first write was open, instead of
+#: assuming it.
+DELAY_SHOT_WRITES = """
+window.__mvpDelayShots = arguments[0];
+if (!window.__mvpRealFetch) {
+  window.__mvpOpenShotWrites = 0;
+  window.__mvpRealFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = String((input && input.url) || input || '');
+    const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+    const held = window.__mvpDelayShots || 0;
+    if (held > 0 && method === 'PUT' && url.indexOf('/shots') >= 0) {
+      window.__mvpOpenShotWrites += 1;
+      return new Promise((resolve, reject) => setTimeout(() => {
+        window.__mvpRealFetch(input, init).then(resolve, reject)
+          .finally(() => { window.__mvpOpenShotWrites -= 1; });
+      }, held));
+    }
+    return window.__mvpRealFetch(input, init);
+  };
+}
+return window.__mvpDelayShots;
+"""
+
+#: Every press on a resize handle, stamped, recorded from the capture phase so it lands before the
+#: clip's own handler. The only way to prove the two drags of the Finding 5 section really did fall
+#: inside `EDGE_DOUBLE_CLICK_MS` of each other: a wall-clock measurement around `perform()` includes
+#: the driver round trip and would report a gesture as too slow that the page saw as fast.
+WATCH_EDGE_PRESSES = """
+window.__mvpEdgePresses = [];
+if (!window.__mvpEdgeWatch) {
+  window.__mvpEdgeWatch = true;
+  document.addEventListener('pointerdown', (event) => {
+    if (event.target && event.target.classList
+        && event.target.classList.contains('resize-handle')) {
+      window.__mvpEdgePresses.push(Date.now());
+    }
+  }, true);
+}
+return true;
+"""
+
 #: The magnet's own state, as the button announces it rather than as the module holds it.
 SNAP_STATE = """
 const button = document.querySelector('#snap-playhead');
@@ -189,8 +249,6 @@ def seed(base_url: str) -> str:
 
 
 def post_multipart_project(base_url: str) -> str:
-    from e2e_support import post_json
-
     project = post_json(base_url + "/api/projects", {"name": "Timeline edit browser QA"})
     song = artifact_dir() / "timeline-edit-song.wav"
     synthesize_song(song)
@@ -349,6 +407,53 @@ def await_shots_write(driver, before: int, what: str) -> None:
             return
         time.sleep(0.1)
     raise AssertionError(f"{what} never reached the server. {diagnostics(driver)}")
+
+
+def await_shot_writes(driver, target: int, what: str, timeout: float = 60) -> None:
+    """Block until the browser has completed at least `target` writes to the shot list.
+
+    `await_shots_write`'s rule for a burst rather than a single write: the sections below hold two
+    saves open on purpose, so the wait is against a count instead of against "one more than
+    before" -- which would come back the moment the *first* of the two landed.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if shots_writes(driver) >= target:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"{what} never reached the server. {diagnostics(driver)}")
+
+
+def toasts_on_screen(driver) -> list[str]:
+    return [str(entry) for entry in driver.execute_script(
+        "return [...document.querySelectorAll('#toast-region .toast')]"
+        ".map((node) => node.textContent);"
+    )]
+
+
+def reseed(driver, wait, server: ManagedServer, project_id: str) -> list[dict]:
+    """Put the plan back to `SHOTS` and reload the page onto it. Answers what is on disk.
+
+    The block sections 4 and 6 already do by hand, factored out because three more sections need
+    it. A reload rather than a walk back through Undo: what those sections prove is about the
+    history stacks themselves, so they must not start from a stack an earlier section left
+    standing -- and a reload is the one thing that empties them.
+    """
+    put_json(
+        f"{server.base_url}/api/projects/{project_id}/shots",
+        {"shots": [{**shot, "prompt": f"{shot['id']}: the corridor, pushing in.",
+                    "mode": "text", "status": "draft"} for shot in SHOTS]},
+    )
+    driver.refresh()
+    select_project(driver, wait, project_id)
+    driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+    wait.until(
+        lambda browser: len(
+            browser.find_elements(By.CSS_SELECTOR, "#shots-track .shot-clip")
+        ) == SHOT_COUNT
+    )
+    settle(driver, "#shots-track")
+    return windows(server, project_id)
 
 
 def press_history(driver, server: ManagedServer, project_id: str, control: str) -> None:
@@ -893,7 +998,251 @@ def main() -> None:
             settle(driver, "#shots-track", quiet_ms=300)
             press_history(driver, server, project_id, "undo-shots")
 
-            # --- 7. The shot-length band on the clip ------------------------------------------
+            # --- 7. Two gestures inside one round trip ----------------------------------------
+            #
+            # Review Finding 4, 2026-08-21, and the only shape that shows it. The undo snapshot
+            # used to be cloned when a save was *queued*, from a baseline that only advanced when
+            # a save *landed*. Two gestures made before the first write came back therefore
+            # recorded the same "before": one Undo rolled back **both** of them while the button
+            # named only the second, and a second Undo replayed the same plan and did nothing
+            # visible. The state between the two gestures was unreachable.
+            #
+            # `add-shot` is the second gesture on purpose: it appends against the end of the song,
+            # so the shot it adds is last in song order and the split's copy is not -- which makes
+            # the comparison below an exact plan, not a count of shots.
+            assert reseed(driver, wait, server, project_id) == seeded
+            driver.execute_script(DELAY_SHOT_WRITES, 2500)
+            select_clip(driver, "shot_01")
+            was = shots_writes(driver)
+            driver.find_element(By.ID, "split-shot").click()
+            driver.find_element(By.ID, "add-shot").click()
+            # The proof that this is one round trip and not two.
+            open_writes = driver.execute_script("return window.__mvpOpenShotWrites;")
+            assert open_writes >= 1, (
+                "the split's write had already landed before the second gesture was made, so "
+                "this section is not testing what it says it is"
+            )
+            await_shot_writes(driver, was + 2, "both gestures of the round trip")
+            driver.execute_script("window.__mvpDelayShots = 0;")
+            settle(driver, "#shots-track")
+            both = windows(server, project_id)
+            assert len(both) == SHOT_COUNT + 2, both
+            named = history_state(driver)
+            assert "adding a shot" in named["undo"]["name"], named
+            press_history(driver, server, project_id, "undo-shots")
+            intermediate = windows(server, project_id)
+            assert intermediate != seeded, (
+                "one Undo rolled back both gestures at once, so the plan between them cannot be "
+                "reached at all -- Finding 4"
+            )
+            assert intermediate == both[:-1], (
+                "one Undo did not step back exactly one gesture.\n"
+                f"  after both: {both}\n  after one undo: {intermediate}"
+            )
+            after_one = history_state(driver)
+            assert "the split" in after_one["undo"]["name"], after_one
+            press_history(driver, server, project_id, "undo-shots")
+            assert windows(server, project_id) == seeded, (
+                "the second Undo did not reach the plan the two gestures started from"
+            )
+            result["one_round_trip"] = {
+                "open_writes_at_second_gesture": open_writes,
+                "after_both": len(both),
+                "after_one_undo": len(intermediate),
+                "undo_names": [named["undo"]["name"], after_one["undo"]["name"]],
+            }
+
+            # --- 8. A drag does not leave a double-click behind -------------------------------
+            #
+            # Review Finding 5. The press on a resize handle was remembered until a double-press
+            # completed and nothing cleared it on release -- and `doubleEdgePress` measures from
+            # the *first* press. So a short edge drag followed by re-grabbing the same edge inside
+            # the window read as a double-click and ran the gap fill: the shot ran out to meet its
+            # neighbour instead of taking the second drag.
+            #
+            # Both drags go in ONE W3C action sequence, because the whole defect lives in the
+            # milliseconds between them and two `perform()` calls could not be relied on to land
+            # inside the window at all. The second press looks up no element: the first drag has
+            # already replaced every clip node in the document, and the pointer is standing on the
+            # edge it just dragged, which is where the handle now is.
+            assert reseed(driver, wait, server, project_id) == seeded
+            clear_toasts(driver)
+            double_click_ms = driver.execute_async_script(
+                "const done = arguments[0];"
+                "import('/assets/api.js').then((m) => done(m.EDGE_DOUBLE_CLICK_MS),"
+                " () => done(null));"
+            )
+            assert isinstance(double_click_ms, (int, float)) and double_click_ms > 0, (
+                "the double-click window could not be read out of api.js", double_click_ms
+            )
+            driver.execute_script(WATCH_EDGE_PRESSES)
+            pps = geometry(driver, "shot_05")["pixelsPerSecond"]
+            first_travel = round(1.0 * pps)
+            second_travel = round(0.5 * pps)
+            handle = clip_for(driver, "shot_05").find_element(
+                By.CSS_SELECTOR, ".resize-handle.right"
+            )
+            was = shots_writes(driver)
+            chain = ActionChains(driver, duration=60)
+            chain.move_to_element(handle).click_and_hold()
+            chain.move_by_offset(first_travel, 0).release()
+            chain.pause(0.08)
+            chain.click_and_hold().move_by_offset(second_travel, 0).release()
+            chain.perform()
+            await_shot_writes(driver, was + 2, "the two edge drags")
+            settle(driver, "#shots-track")
+            presses = driver.execute_script("return window.__mvpEdgePresses;")
+            assert len(presses) == 2, ("the sequence did not land two presses on the handle",
+                                       presses)
+            interval = presses[1] - presses[0]
+            assert interval <= double_click_ms, (
+                f"the two presses were {interval} ms apart, outside the {double_click_ms} ms "
+                "double-click window, so this section proves nothing about Finding 5"
+            )
+            dragged = windows(server, project_id)[4]
+            assert dragged["id"] == "shot_05", dragged
+            meets_neighbour = SHOTS[5]["start"]
+            assert abs(dragged["start"] + dragged["duration"] - meets_neighbour) > 0.2, (
+                "re-grabbing an edge just after dragging it ran the gap fill: the shot was "
+                f"stretched to its neighbour at {meets_neighbour}s -- Finding 5"
+            )
+            want = SHOTS[4]["duration"] + (first_travel + second_travel) / pps
+            assert abs(dragged["duration"] - want) < 0.3, (
+                "the second gesture was neither the drag it was nor the gap fill it must not be",
+                dragged, want,
+            )
+            assert not [line for line in toasts_on_screen(driver) if "close the gap" in line], (
+                toasts_on_screen(driver)
+            )
+            # And the genuine double-click still fills the gap. Both directions matter: a fix
+            # that simply stopped remembering the press would take gesture B away entirely, and
+            # nothing above would notice.
+            clear_toasts(driver)
+            double_click_handle("shot_05", "right")
+            filled_after = windows(server, project_id)[4]
+            assert round(filled_after["start"] + filled_after["duration"], 6) == round(
+                meets_neighbour, 6
+            ), ("a real double-click no longer closes the gap", filled_after)
+            result["drag_then_regrab"] = {
+                "press_interval_ms": interval,
+                "double_click_window_ms": double_click_ms,
+                "after_two_drags": dragged,
+                "after_a_real_double_click": filled_after,
+            }
+
+            # --- 9. A refused snap writes nothing ---------------------------------------------
+            #
+            # Review Finding 6. `moved` was measured *before* the snap was attempted, and a
+            # refused snap puts the shot back and answers false -- so control fell into the save
+            # anyway and sent a no-op `PUT /shots`: it bumped `updated_at`, pushed an undo entry
+            # for a gesture that never happened, and threw the redo stack away, immediately after
+            # telling the Director the edit was refused.
+            #
+            # A redo entry is built first, deliberately: "redo is still offered afterwards" is the
+            # half of the damage no count of writes can see.
+            #
+            # A second project is created before the reload so its option is in the selector: the
+            # last assertion here is that a refused snap leaves *nothing* outstanding, and the
+            # only place the dirty flag is observable is the switch guard. It was invisible while
+            # every drag ended in a write; now that one can end without one, a flag left standing
+            # would have the guard warning about work that does not exist.
+            scratch = post_json(
+                server.base_url + "/api/projects", {"name": "Somewhere else to switch to"}
+            )["id"]
+            assert reseed(driver, wait, server, project_id) == seeded
+            was = shots_writes(driver)
+            driver.find_element(By.ID, "add-shot").click()
+            await_shots_write(driver, was, "the gesture that fills the redo stack")
+            settle(driver, "#shots-track")
+            press_history(driver, server, project_id, "undo-shots")
+            assert windows(server, project_id) == seeded
+            standing = history_state(driver)
+            assert standing["redo"]["disabled"] is False, standing
+            before = windows(server, project_id)
+            before_revision = revision(server, project_id)
+            writes_before = shots_writes(driver)
+
+            # The playhead inside shot_11, whose left edge is the cut it shares with the locked
+            # shot_10. Dragging that edge onto the playhead is a boundary move, and the boundary
+            # is protected -- so the snap is refused in the snap route's own sentence.
+            playhead = scrub_to(driver, 54.0)
+            assert 52.7 < playhead < 57.0, f"the scrub left the playhead at {playhead}s"
+            pps = geometry(driver, "shot_11")["pixelsPerSecond"]
+            travel = int((playhead - before[10]["start"]) * pps) - 3
+            assert travel > 8, ("the drag is too short to be a drag at this zoom", travel, pps)
+            handle = clip_for(driver, "shot_11").find_element(
+                By.CSS_SELECTOR, ".resize-handle.left"
+            )
+            clear_toasts(driver)
+            ActionChains(driver).click_and_hold(handle).move_by_offset(
+                travel, 0
+            ).release().perform()
+            snap_refusal = wait_for_toast(driver, wait, "is locked")
+            assert snap_refusal == SNAP_LOCKED_REFUSAL.format(shot="SHOT 10 (shot_10)"), (
+                snap_refusal
+            )
+            settle(driver, "#shots-track")
+            assert windows(server, project_id) == before, (
+                "the refused snap wrote a window anyway"
+            )
+            assert shots_writes(driver) == writes_before, (
+                "a refused snap still sent a PUT /shots -- it bumps updated_at, pushes a phantom "
+                "undo entry and clears the redo stack, immediately after refusing the edit "
+                "-- Finding 6"
+            )
+            assert revision(server, project_id) == before_revision, (
+                "the refused snap moved the project's revision, so every other client's stack "
+                "was dropped for an edit that never happened"
+            )
+            after_state = history_state(driver)
+            assert after_state == standing, (
+                "the refused snap changed the history stacks", standing, after_state
+            )
+            # And nothing is left outstanding. Switching projects asks before discarding unsaved
+            # work; after a gesture that changed nothing there is none to discard, so it must not
+            # ask. The dialog is answered either way so a failure here does not wedge the run.
+            switched = driver.find_element(
+                By.CSS_SELECTOR, f'#project-select option[value="{scratch}"]'
+            )
+            switched.click()
+            asked_to_discard = ""
+            try:
+                alert = WebDriverWait(driver, 3).until(EC.alert_is_present())
+                asked_to_discard = alert.text
+                alert.accept()
+            except TimeoutException:
+                pass
+            assert not asked_to_discard, (
+                ("switching projects after a refused snap asked about unsaved work that does "
+                 "not exist: the drag set the dirty flag and nothing put it back"),
+                asked_to_discard,
+            )
+            wait.until(
+                lambda browser: browser.find_element(By.ID, "project-select").get_attribute(
+                    "value"
+                ) == scratch
+            )
+            select_project(driver, wait, project_id)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            wait.until(
+                lambda browser: len(
+                    browser.find_elements(By.CSS_SELECTOR, "#shots-track .shot-clip")
+                ) == SHOT_COUNT
+            )
+            settle(driver, "#shots-track")
+            assert windows(server, project_id) == before
+            result["refused_snap"] = {
+                "refusal": snap_refusal,
+                "playhead": playhead,
+                "travel_px": travel,
+                "writes": {"before": writes_before, "after": shots_writes(driver)},
+                "revision_unchanged": True,
+                "history_before": standing,
+                "history_after": after_state,
+                "switch_asked_about_unsaved_work": bool(asked_to_discard),
+            }
+
+            # --- 10. The shot-length band on the clip -----------------------------------------
             #
             # The Director's ruling, 2026-08-20: "I dont anticipate a shot being requested over
             # 15 seconds, when dragging a clip past that it should turn yellow but we arent dead
@@ -975,7 +1324,7 @@ def main() -> None:
                 "readiness": readiness_text[:400],
             }
 
-            # --- 8. Expand All Prompts, on the cuts bar ---------------------------------------
+            # --- 11. Expand All Prompts, on the cuts bar --------------------------------------
             #
             # The Director asked for it "up by where the Cuts and Snap Cuts stuff are". It is a
             # second door to `POST /shots/expand-prompts`, which spends one model call per shot,

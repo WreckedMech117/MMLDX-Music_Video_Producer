@@ -224,6 +224,7 @@ def every_builder_payload() -> list[tuple[str, dict]]:
                 start=12.0,
                 duration=3.75,
                 song_duration=154.644898,
+                take_lead=0.25,
                 prefix="p",
             ),
         ),
@@ -4122,6 +4123,10 @@ def audio_replace_payload(**overrides) -> dict:
         "start": 12.0,
         "duration": 3.75,
         "song_duration": 154.644898,
+        # The lead a submission of this shot records: a normal-length window at 12 s takes the
+        # quarter second. Every case below is a real take's four numbers, never three of them
+        # and a default.
+        "take_lead": 0.25,
         "prefix": "music-video-producer/p/shots/s-song-audio",
     }
     return build_audio_replace_payload(**{**arguments, **overrides})
@@ -4231,46 +4236,93 @@ def test_the_audio_replace_payload_names_no_model_file_at_all():
     ), classes
 
 
-def test_the_restore_window_comes_from_song_audio_window_and_not_a_second_computation(
+def test_the_restore_window_comes_from_over_render_window_and_not_a_second_computation(
     monkeypatch,
 ):
     """The single correctness argument of this whole stage, driven as a mutation.
 
-    `song_audio_window` is replaced with one that returns a window nothing else could produce.
-    If the builder computed the window itself — even with arithmetic that agrees today — the
-    payload would carry 12 to 15.75 and this would fail. It carries the replacement's numbers
-    instead, which is only possible if the shared function is the single source of the window.
+    `timeline.over_render_window` — the function that answers "which seconds of the song is this
+    take", and the one `generate_h3` conditions with — is replaced with one that returns a window
+    nothing else could produce. If the builder computed the window itself, even with arithmetic
+    that agrees today, the payload would carry the real 11.75 s and this would fail. It carries
+    the replacement's numbers instead, which is only possible if the shared function is the
+    single source of the window.
 
-    That is the failure this guards: two independent computations of "which seconds is this
-    shot" drift, and the symptom is a subtle desync rather than an error.
+    That is the failure this guards, and it is the one that actually happened: until 2026-08-21
+    this stage windowed by `shot.start`/`shot.duration` while the render windowed by the take's
+    own lead and length, and the symptom of two computations drifting is a subtle desync rather
+    than an error.
     """
     calls: list[dict] = []
 
-    def only_this_function_could_have_produced_it(*, start, duration, song_duration):
-        calls.append({"start": start, "duration": duration, "song_duration": song_duration})
-        return {"start": 101.5, "end": 108.25}
+    def only_this_function_could_have_produced_it(
+        *, start, lead, picture_seconds, song_duration
+    ):
+        calls.append(
+            {
+                "start": start,
+                "lead": lead,
+                "picture_seconds": picture_seconds,
+                "song_duration": song_duration,
+            }
+        )
+        return 101.5, 108.25
 
     monkeypatch.setattr(
-        workflows_module, "song_audio_window", only_this_function_could_have_produced_it
+        workflows_module, "over_render_window", only_this_function_could_have_produced_it
     )
 
-    payload = audio_replace_payload(start=12.0, duration=3.75, song_duration=154.644898)
+    payload = audio_replace_payload(
+        start=12.0, duration=3.75, song_duration=154.644898, take_lead=0.25
+    )
 
-    # Called with the render's own three numbers, unmodified on the way.
-    assert calls == [{"start": 12.0, "duration": 3.75, "song_duration": 154.644898}]
+    # Called with the take's own four numbers: the shot's start and the *recorded* lead,
+    # unmodified on the way, and the render's own frame count as seconds.
+    assert calls == [
+        {
+            "start": 12.0,
+            "lead": 0.25,
+            "picture_seconds": over_render_frames(3.75) / 24,
+            "song_duration": 154.644898,
+        }
+    ]
     # And the payload is that function's answer, not the builder's own arithmetic.
     window = payload["mvp:song"]["inputs"]
     assert window["seek_seconds"] == 101.5
     assert window["duration"] == pytest.approx(6.75)
 
 
+def test_the_restore_stage_still_inherits_the_renders_own_legality_check(monkeypatch):
+    """`song_audio_window` is still called, and still with the *shot's* three numbers.
+
+    It answers a different question from the window above — is this shot legal at all — and its
+    refusal is the one the render gives. Mutated to prove the call is real: a builder that
+    dropped it would stop refusing a shot that runs past the end of the song, which is the
+    refusal `test_a_shot_running_past_the_end_of_the_song_is_refused_in_the_renders_own_words`
+    depends on.
+    """
+    calls: list[dict] = []
+
+    def recording(*, start, duration, song_duration):
+        calls.append({"start": start, "duration": duration, "song_duration": song_duration})
+        return {"start": start, "end": start + duration}
+
+    monkeypatch.setattr(workflows_module, "song_audio_window", recording)
+
+    audio_replace_payload(start=12.0, duration=3.75, song_duration=154.644898)
+
+    assert calls == [{"start": 12.0, "duration": 3.75, "song_duration": 154.644898}]
+
+
 def test_the_restore_builder_offers_no_window_parameter_for_a_caller_to_disagree_through():
     """The structural half of the argument above: there is nothing to pass a window as.
 
-    The mutation test proves the builder *uses* the shared function. This proves a caller
-    cannot route around it — the signature takes the three numbers the render was given and
-    accepts no window, no start second, no end second and no trim. A parameter added here
-    would be the seam a second computation arrives through, so the signature is pinned.
+    The mutation test proves the builder *uses* the shared functions. This proves a caller
+    cannot route around them — the signature takes the four numbers the render was given or
+    recorded and accepts no window, no start second, no end second and no trim. A parameter
+    added here would be the seam a second computation arrives through, so the signature is
+    pinned. `take_lead` is not that seam: it is a *recorded* number, not a derived one, and it
+    is the one fact about a take that cannot be recomputed from the manifest.
     """
     parameters = inspect.signature(build_audio_replace_payload).parameters
 
@@ -4280,6 +4332,7 @@ def test_the_restore_builder_offers_no_window_parameter_for_a_caller_to_disagree
         "start",
         "duration",
         "song_duration",
+        "take_lead",
         "prefix",
     }
     # Keyword-only throughout, so no positional call can transpose start and duration.
@@ -4304,6 +4357,30 @@ def test_a_shot_running_past_the_end_of_the_song_is_refused_in_the_renders_own_w
     # A song whose length was never recorded compares against an unknown, so it is not refused —
     # the shared function's rule, inherited whole rather than tightened here.
     assert audio_replace_payload(start=152.0, duration=5.0, song_duration=0)
+
+
+def test_a_lead_that_cannot_describe_this_shot_is_refused_rather_than_repaired():
+    """`take_lead` is a *recorded* number, so a value this shot could not have produced means
+    the record does not belong to this shot — and windowing on it would put the sound ahead of
+    or behind the mouth by exactly that much.
+
+    `over_render_lead` answers `min(ideal, extra, start)`, so a lead is never negative and never
+    longer than the shot's own start; a take at 3 s cannot begin 5 s before its window, because
+    that is a second and a half before the song. Refused rather than clamped to something
+    plausible: a clamp here would produce a graph that renders happily and is out of sync, which
+    is the failure this whole stage exists to remove.
+    """
+    with pytest.raises(ValueError, match="cannot begin"):
+        audio_replace_payload(start=3.0, duration=3.75, take_lead=5.0)
+    with pytest.raises(ValueError, match="cannot begin"):
+        audio_replace_payload(take_lead=-0.25)
+    # Non-finite, on the same footing as every other number this module takes.
+    with pytest.raises(ValueError, match="Take lead"):
+        audio_replace_payload(take_lead=float("nan"))
+    # A lead of exactly the shot's start is legal: the take begins at the song's first sample,
+    # which is what a shot at 0 s and a shot whose whole buffer is lead both produce.
+    assert audio_replace_payload(start=0.25, duration=3.75, take_lead=0.25)
+    assert audio_replace_payload(start=0.0, duration=3.75, take_lead=0.0)
 
 
 def test_the_restored_file_carries_the_master_and_never_the_takes_generated_audio():
@@ -4355,10 +4432,11 @@ def test_the_restore_payload_does_not_conform_the_takes_frames_the_way_the_expor
     assert source["select_every_nth"] == 1
     assert source["custom_width"] == 0
     assert source["custom_height"] == 0
-    # 90 frames is what a 3.75 s H3 shot is, and 8n+1 does not contain it — the arithmetic the
-    # paragraph above rests on, computed rather than asserted from memory.
-    frames = align_h3_frames(max(5, round(3.75 * H3_FRAME_RATE)))
-    assert frames == 90
+    # 107 frames is what a 3.75 s H3 shot is rendered as since the over-render margin, and 8n+1
+    # does not contain it — the arithmetic the paragraph above rests on, computed rather than
+    # asserted from memory, and computed through the function the render itself calls.
+    frames = over_render_frames(3.75)
+    assert frames == 107
     assert (frames - 1) % 8 != 0
 
 
@@ -4397,31 +4475,64 @@ def test_the_restore_payload_never_pads_or_cuts_the_picture_to_the_audio():
     assert payload["mvp:save"]["inputs"]["crf"] == AUDIO_REPLACE_CRF
 
 
-def test_restore_lengths_report_the_grid_rounding_rather_than_asserting_agreement():
-    """The two numbers, and the case where they differ.
+def test_restore_lengths_report_the_take_the_render_asked_for(monkeypatch):
+    """The two numbers, what they mean since the over-render margin, and the case left where
+    they differ.
 
-    A 3.75 s shot is 90 frames, which is 3.75 s exactly. A 5 s shot is 124, which is 5.1667 s —
-    a sixth of a second of picture past the end of its own audio window. That mismatch is real,
-    computable before anything is submitted, and reported rather than corrected.
+    Until 2026-08-21 `requested_picture_seconds` was `align_h3_frames(round(duration * 24))` —
+    the formula from before the margin existed — so a 3.75 s shot was reported as 90 frames when
+    the render had asked H3 for 107, and a 2.083 s micro-cut as 50 against the same 107. Nothing
+    rendered from that number; it is the sentence the Director reads, and it disagreed with what
+    the take is.
+
+    Both sides now come from the take: the picture from `over_render_frames`, the audio from the
+    window `build_audio_replace_payload` actually sends. They agree by construction, and the one
+    way left to differ is the song ending before the picture does.
     """
-    exact = audio_replace_lengths(duration=3.75)
+    exact = audio_replace_lengths(
+        start=12.0, duration=3.75, song_duration=154.644898, take_lead=0.25
+    )
 
-    assert exact["audio_seconds"] == 3.75
-    assert exact["requested_picture_seconds"] == 3.75
-    assert exact["requested_frames"] == 90
+    assert exact["requested_frames"] == 107
+    assert exact["requested_picture_seconds"] == pytest.approx(107 / 24)
+    assert exact["audio_seconds"] == pytest.approx(107 / 24)
 
-    rounded = audio_replace_lengths(duration=5.0)
+    micro = audio_replace_lengths(
+        start=12.0, duration=2.083, song_duration=154.644898, take_lead=1.2083333333333333
+    )
 
-    assert rounded["audio_seconds"] == 5.0
-    assert rounded["requested_frames"] == 124
-    assert rounded["requested_picture_seconds"] == pytest.approx(124 / 24)
-    assert rounded["requested_picture_seconds"] > rounded["audio_seconds"]
-    # Read off `align_h3_frames` rather than a copy of the grid, so a shot that rendered
-    # through that function is measured against that function.
-    for duration in (0.1, 3.75, 5.0, 8.0, 12.5, 15.0):
-        assert audio_replace_lengths(duration=duration)["requested_frames"] == align_h3_frames(
-            max(5, round(duration * H3_FRAME_RATE))
-        )
+    # The floor: a micro-cut's take is the same 107 frames, not 50.
+    assert micro["requested_frames"] == 107
+    assert micro["audio_seconds"] == pytest.approx(107 / 24)
+
+    # The song's end. For a legal shot with its own recorded lead the clamp cannot fire —
+    # `over_render_lead`'s overflow branch always has the room, because a shot ending inside the
+    # song leaves at least `overflow` of buffer to spend — so this is the state where the lead no
+    # longer matches the window: a take whose shot was moved afterwards. The tail is clamped to
+    # the song, the audio comes up short of the picture, and the pair says so rather than
+    # refusing or padding. `trim_to_audio` is off, so the take keeps its unbacked frames.
+    end = audio_replace_lengths(
+        start=150.0, duration=4.0, song_duration=154.0, take_lead=0.25
+    )
+
+    assert end["audio_seconds"] == pytest.approx(4.25)
+    assert end["requested_picture_seconds"] > end["audio_seconds"]
+
+    # Read off `over_render_frames` rather than a copy of the grid, so a shot that rendered
+    # through that function is measured against that function — including the micro-cut band,
+    # where a copy of the *old* formula is exactly what was wrong.
+    for duration in (0.5, 1.75, 2.083, 3.75, 5.0, 8.0, 12.5, 15.0):
+        assert audio_replace_lengths(
+            start=20.0, duration=duration, song_duration=154.644898, take_lead=0.25
+        )["requested_frames"] == over_render_frames(duration)
+
+    # Driven as a mutation, because "agrees with the function" and "calls the function" are
+    # different claims and the pre-margin bug passed the first.
+    monkeypatch.setattr(workflows_module, "over_render_frames", lambda duration: 217)
+    mutated = audio_replace_lengths(
+        start=12.0, duration=3.75, song_duration=154.644898, take_lead=0.25
+    )
+    assert mutated["requested_frames"] == 217
 
 
 def test_the_restore_builder_refuses_paths_the_loaders_could_not_open():
@@ -4561,8 +4672,11 @@ def test_nothing_on_the_restore_path_claims_the_frame_count_is_preserved():
         text = source.read_text(encoding="utf-8")
         assert not pattern.search(text), source
     # And what the route reports is named as a *request*, never as a measurement.
-    assert "requested_picture_seconds" in audio_replace_lengths(duration=3.75)
-    assert "picture_seconds" not in audio_replace_lengths(duration=3.75)
+    reported = audio_replace_lengths(
+        start=12.0, duration=3.75, song_duration=154.644898, take_lead=0.25
+    )
+    assert "requested_picture_seconds" in reported
+    assert "picture_seconds" not in reported
 
 
 # --- LTX 2.5 video extension ---------------------------------------------------------------

@@ -2356,15 +2356,49 @@ export const FILL_SECTION_LOOKS_APPLIED = "{filled} section look(s) written, {sk
 // section that was skipped, and why, is exactly the one the Director needs to see, because
 // "the treatment does not describe this section" is a sentence that sends them back to the
 // treatment rather than leaving a box mysteriously blank.
+export function sectionLooksReportLines(report) {
+  return (report?.sections || []).map((row) => {
+    const at = `${Number(row.start).toFixed(1)}s ${row.label}`;
+    const proposal = String(row.prompt || "");
+    const previous = String(row.previous || "");
+    // What a look would replace, said beside what it would write, wherever both exist. A look
+    // the Director wrote themselves is the one thing this pass can destroy, and the overwrite
+    // consent is only a real question while the words it takes away are on screen next to the
+    // words it puts there -- "6 filled, 1 left alone" is not a sentence anybody can agree to.
+    if (row.filled) {
+      return { kind: "fill", text: previous
+        ? `${at}: ${proposal} — replaces what you wrote: “${previous}”`
+        : `${at}: ${proposal}` };
+    }
+    // A skipped row carries the look it *would* have written whenever the only thing stopping it
+    // is a consent: the route puts it on the row so the report can show what saying yes buys.
+    // And a section that was skipped because it is already written says what is already there,
+    // because "already has a look you wrote" names no words at all.
+    let text = `${at}: skipped — ${row.reason}`;
+    if (proposal) text += ` — it would write: “${proposal}”`;
+    if (previous) text += ` — yours now: “${previous}”`;
+    return { kind: "skip", text };
+  });
+}
+
 export function sectionLooksConfirmation(report) {
   if (!report) return "";
-  const lines = (report.sections || []).map((row) => {
-    const at = `${Number(row.start).toFixed(1)}s ${row.label}`;
-    if (row.filled) return `${at}: ${row.prompt}`;
-    return `${at}: skipped — ${row.reason}`;
-  });
+  const lines = sectionLooksReportLines(report).map((line) => line.text);
   const head = report.message ? [report.message, ""] : [];
   return [...head, ...lines, "", "Write these looks?"].join("\n");
+}
+
+// Whether this report holds a look the Director wrote themselves that the pass would replace --
+// the one question `FILL_SECTION_LOOKS_OVERWRITE_QUESTION` asks.
+//
+// Derived rather than read off `filled`, and that is the whole point. A structure where *every*
+// section already carries a look short-circuits server-side to `0 filled` **without a model
+// call**, which is exactly the state in which the consent is worth asking for: a client that
+// treated "nothing was filled" as an error could never ask it, and the sentence the route
+// answers with -- "send overwrite=true to replace what is there" -- would describe something the
+// screen could not do.
+export function sectionLooksWritten(report) {
+  return (report?.sections || []).some((row) => row.previous && !row.filled);
 }
 
 // AI Mod (the Director's stage-3 ask): whether this asset can take a prompted image edit.
@@ -2923,6 +2957,26 @@ export function cutMoveRefusal(project, shot) {
 //: 400 ms is the platform's own double-click window on Windows, and the value is here rather
 //: than inline so the rule can be executed.
 export const EDGE_DOUBLE_CLICK_MS = 400;
+
+//: How far the pointer may wander between a press on a resize handle and its release and still
+//: leave that press standing as the first half of a double-click. Three pixels: a real
+//: double-click on a 7 px handle does not travel, and a hand that jitters a pixel between the
+//: two clicks is still double-clicking.
+export const EDGE_DRAG_SLOP_PX = 3;
+
+// Whether the press that started this gesture is still available to pair with the next one.
+//
+// A press on a resize handle starts *both* gestures -- the drag and the first half of a
+// double-click -- and only the release can tell them apart. Until this existed the press was
+// remembered across a drag, and `doubleEdgePress` measures from the *first* press: a 300 ms edge
+// drag followed by re-grabbing the same edge 100 ms later fell inside the window above and ran
+// the gap fill instead of starting the second drag, stretching the shot to its neighbour.
+//
+// `travelPx` is the furthest the pointer got from where it went down, not where it ended: a drag
+// that wandered out and came back has still been a drag.
+export function edgePressSurvivesDrag(travelPx, slop = EDGE_DRAG_SLOP_PX) {
+  return Math.abs(Number(travelPx) || 0) <= slop;
+}
 
 // Whether this press on a resize handle completes a double-click.
 //
@@ -3687,7 +3741,10 @@ export const api = {
   // Read every section's shared look out of the Treatment and the Style Bible. Report first,
   // apply on confirm -- `snapCuts`' two-stage shape and `populate`'s at bottom -- and
   // `overwrite` is the *separate* consent for replacing a look the Director wrote by hand.
-  fillSectionLooks: (id, { confirmApply = false, overwrite = false } = {}) => request(`/api/projects/${id}/sections/fill-looks`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ confirm_apply: confirmApply, overwrite }) }),
+  // `plan` is the report being confirmed, echoed back whole. The server mints a `plan_id` over
+  // the report it emitted and refuses a confirm it cannot match, so the looks that land are the
+  // looks that were read in the confirm dialog — and the confirming call asks no model at all.
+  fillSectionLooks: (id, { confirmApply = false, overwrite = false, plan = null } = {}) => request(`/api/projects/${id}/sections/fill-looks`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ confirm_apply: confirmApply, overwrite, plan }) }),
   uploadSong: (id, data) => request(`/api/projects/${id}/songs/upload`, { method: "POST", body: data }),
   // Its own route, and it carries only the two context fields: the audio, the duration and the
   // provenance are not editable text, so nothing that could overwrite them is on the wire.

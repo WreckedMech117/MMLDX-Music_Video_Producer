@@ -313,6 +313,50 @@ def over_render_lead(
     return lead
 
 
+def over_render_window(
+    *, start: float, lead: float, picture_seconds: float, song_duration: float
+) -> tuple[float, float]:
+    """The master song's own seconds **for a whole take**: ``(trim_start, trim_end)``.
+
+    One expression of the invariant `over_render_lead` states, extracted so the two stages that
+    need it cannot write it twice:
+
+        take second ``t`` is song second ``start - lead + t``
+
+    — so a take that is ``picture_seconds`` long was performed against the song from
+    ``start - lead`` for ``picture_seconds``, and that is both the window `generate_h3`
+    conditions it with and the window `restore_song_audio` must lay back over it. Those two were
+    separate arithmetic until 2026-08-21, and the restore half was the one that was wrong: it
+    windowed by the bare ``start``/``duration``, which is the *exposed slice* rather than the
+    take, and on a centred micro-cut that is both the wrong length and the wrong offset (a
+    2.083 s window renders 4.4583 s of picture beginning 1.2083 s before the window).
+
+    ``lead`` is a value that was **recorded** — `Shot.latest_take_lead`, written at submission —
+    and never one recomputed here, because a pre-margin take and a post-margin one are
+    indistinguishable by arithmetic on their lengths. This function therefore takes it as a
+    parameter rather than calling `over_render_lead`: the render's caller has just computed it,
+    the restore's caller reads it off the Shot, and neither is allowed to guess it.
+
+    The only clamp is the song's own end, and it is the render's: ``min(trim_end,
+    song_duration)``. A whole-song shot has no room either side, so the file simply ends before
+    the picture does and the take is rendered — and restored — with the mismatch rather than
+    silently shortened. The clamp moves the *tail*, never ``trim_start``, so it cannot move the
+    exposure. A ``song_duration`` of 0 means the length was never recorded and nothing can be
+    compared against an unknown, so no clamp is applied; `song_audio_window`'s own refusal makes
+    the same reading.
+
+    Nothing is clamped at the front. ``start - lead`` below zero would mean a lead longer than
+    the shot's own start, which `over_render_lead` cannot produce (``min(…, start)``); it means
+    the recorded lead does not describe this shot, and it surfaces as `song_audio_window`'s
+    refusal in the caller rather than as a silently repaired window here.
+    """
+    trim_start = start - lead
+    trim_end = trim_start + picture_seconds
+    if song_duration > 0:
+        trim_end = min(trim_end, song_duration)
+    return trim_start, trim_end
+
+
 def build_director_timeline(
     shots: list[Shot],
     *,

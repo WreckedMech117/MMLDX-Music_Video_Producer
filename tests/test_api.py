@@ -60,6 +60,7 @@ from music_video_producer.app import (
     RESTORE_AUDIO_IN_FLIGHT_REFUSAL,
     RESTORE_AUDIO_MISSING_SONG_REFUSAL,
     RESTORE_AUDIO_MISSING_TAKE_REFUSAL,
+    RESTORE_AUDIO_NO_LEAD_REFUSAL,
     RESTORE_AUDIO_NO_SONG_REFUSAL,
     RESTORE_AUDIO_NO_TAKE_REFUSAL,
     RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL,
@@ -164,6 +165,9 @@ from music_video_producer.timeline import (
     SNAP_UNMEASURED,
     SNAP_WITHOUT_CUTS,
     expansion_input,
+    over_render_frames,
+    over_render_lead,
+    over_render_window,
     shot_expansion_input,
 )
 from music_video_producer.workflows import (
@@ -10637,6 +10641,13 @@ def restorable_project(
 
     `song=None` leaves the project songless; a `song` naming a file that is never written
     leaves the manifest pointing at nothing, which is the other half of the song refusals.
+
+    The Shot carries the `latest_take_lead` a submission of *these* numbers would have recorded,
+    computed through the same two functions `generate_h3` computes it with, because that is what
+    a rendered take actually looks like on the manifest: a take begins `lead` seconds before its
+    window and the restore stage windows the take, not the window. A lead typed in here would be
+    a number no render produces. Pass `latest_take_lead` to override — 0 on a shot past 0 s is
+    the legacy take, which this route refuses by name.
     """
     project = store.create(Project(name="Restore"))
     if take:
@@ -10663,6 +10674,15 @@ def restorable_project(
         "use_song_audio": True,
         **shot,
     }
+    fields.setdefault(
+        "latest_take_lead",
+        over_render_lead(
+            start=fields["start"],
+            duration=fields["duration"],
+            picture_seconds=over_render_frames(fields["duration"]) / 24,
+            song_duration=song_duration or 0.0,
+        ),
+    )
     project.shots = [Shot(**fields)]
     store.save(project)
     return project
@@ -10701,11 +10721,23 @@ def test_restoring_a_take_takes_the_masters_own_window_and_leaves_the_take_alone
         "takes/shot-h3-reference_00001-audio.mp4"
     )
     assert Path(payload["mvp:source"]["inputs"]["video"]).is_file()
-    # The master is the sound, sliced at 12–15.75 s.
+    # The master is the sound, sliced at the seconds **the take** holds: 107 frames of picture
+    # beginning a quarter second before the window, which is 11.75–16.2083 s. Not 12–15.75 s —
+    # that is the exposed slice, and laying it over the whole take is the desync fixed on
+    # 2026-08-21. The measured +0.9945-at-lag-0 precedent is preserved rather than moved: frame
+    # `round(lead * 24)` = 6 of this take is song second 12.000 either way.
+    lead = store.get(project.id).shots[0].latest_take_lead
+    assert lead == 0.25
     assert payload["mvp:song"]["inputs"]["audio_file"].endswith("media/songs/master.mp3")
     assert Path(payload["mvp:song"]["inputs"]["audio_file"]).is_file()
-    assert payload["mvp:song"]["inputs"]["seek_seconds"] == RESTORE_SHOT_START
-    assert payload["mvp:song"]["inputs"]["duration"] == RESTORE_SHOT_DURATION
+    assert payload["mvp:song"]["inputs"]["seek_seconds"] == RESTORE_SHOT_START - lead == 11.75
+    assert payload["mvp:song"]["inputs"]["duration"] == pytest.approx(107 / 24)
+    # take second `t` is song second `start - lead + t`, which is the invariant the render
+    # conditions on and the one thing this stage must not break.
+    assert (
+        payload["mvp:song"]["inputs"]["seek_seconds"] + lead
+        == pytest.approx(RESTORE_SHOT_START)
+    )
     # Nothing on this path regenerates anything: no model file anywhere in the payload.
     assert not any(
         isinstance(value, str) and value.endswith(".safetensors")
@@ -10895,36 +10927,209 @@ def test_a_shot_running_past_the_end_of_the_song_is_refused_by_the_renders_own_r
 
 
 def test_a_restoration_reports_both_lengths_and_never_pads_or_cuts(tmp_path: Path):
-    """The matrix's length-mismatch row, in both the agreeing and the differing case.
+    """The matrix's length-mismatch row, reported against the take rather than the window.
 
-    A 3.75 s shot is 90 frames, which is 3.75 s exactly. A 5 s shot is 124, which is 5.1667 s —
-    a real mismatch, computable before submission, reported with both numbers rather than
-    silently corrected. `trim_to_audio` is off in both.
+    A 3.75 s shot is **107** frames since the over-render margin, which is 4.4583 s, and the
+    audio this stage sends is those same 4.4583 s. Both numbers used to describe something else:
+    the picture through the pre-margin formula (90 frames), the audio as the shot's bare
+    duration. Reported together they now agree by construction, which is the fix — the pair is
+    the report, and a report that disagrees with the take is what the Director would have read
+    as truth.
     """
     client, store, comfy = make_client(tmp_path)
     exact = restore_audio(client, restorable_project(store, tmp_path)).json()
 
-    assert exact["audio_seconds"] == 3.75
-    assert exact["requested_picture_seconds"] == 3.75
-    assert exact["requested_frames"] == 90
+    assert exact["requested_frames"] == 107
+    assert exact["requested_picture_seconds"] == pytest.approx(107 / 24)
+    assert exact["audio_seconds"] == pytest.approx(107 / 24)
     assert exact["lengths_match"] is True
 
-    project = restorable_project(store, tmp_path, start=0.0, duration=5.0)
-    rounded = restore_audio(client, project).json()
+    # A micro-cut: 2.083 s of window, the same 107 frames of take, centred. The number this
+    # route reported for it before 2026-08-21 was 50 frames.
+    micro = restore_audio(
+        client, restorable_project(store, tmp_path, start=12.0, duration=2.083)
+    ).json()
 
-    assert rounded["audio_seconds"] == 5.0
-    assert rounded["requested_frames"] == 124
-    assert rounded["requested_picture_seconds"] == pytest.approx(124 / 24)
-    assert rounded["lengths_match"] is False
+    assert micro["requested_frames"] == 107
+    assert micro["audio_seconds"] == pytest.approx(107 / 24)
+    assert micro["lengths_match"] is True
+    assert "107 frames" in micro["length_note"]
+    # The sentence names the seconds actually sent, not the window's.
+    assert "10.7917s to 15.25s" in micro["length_note"]
+
     # Both numbers in the sentence, and the sentence is present either way.
-    for body in (exact, rounded):
-        assert "5" in body["length_note"] or "3.75" in body["length_note"]
+    for body in (exact, micro):
         assert "trim_to_audio is off" in body["length_note"]
         assert "ffprobe" in body["length_note"]
-    assert "124 frames" in rounded["length_note"]
+        assert "107 frames" in body["length_note"]
     assert all(
         prompt["mvp:save"]["inputs"]["trim_to_audio"] is False for prompt in comfy.prompts
     )
+
+
+def test_the_restored_window_is_the_takes_own_seconds_for_every_window_shape(tmp_path: Path):
+    """Defect 1, across the four shapes a take can have. Nothing here renders.
+
+    The take is the whole rendered clip and not the exposed slice, so the audio must cover the
+    whole take at the take's own offset:
+
+        take second `t` is song second `start - lead + t`
+
+    — one invariant, four clamps, and the clamps move the buffer rather than the exposure. A
+    normal window leads by a quarter second; a micro-cut is centred on its window and leads by
+    half its buffer; a shot at 0.0 s cannot lead at all because there is no song before 0 s; a
+    shot at the song's end has its whole buffer ahead of it. In every one of them the audio is
+    the take's own length, and `seek_seconds + lead` is the window's first second exactly.
+    """
+    client, store, comfy = make_client(tmp_path)
+    song_end = RESTORE_SONG_DURATION
+    cases = {
+        "normal": (12.0, 3.75),
+        "micro-cut, centred": (12.0, 2.083),
+        "at the song's start": (0.0, 2.083),
+        "at the song's end": (song_end - 2.083, 2.083),
+    }
+
+    for name, (start, duration) in cases.items():
+        project = restorable_project(store, tmp_path, start=start, duration=duration)
+        assert restore_audio(client, project).status_code == 202, name
+
+        shot = store.get(project.id).shots[0]
+        window = comfy.prompts[-1]["mvp:song"]["inputs"]
+        expected_start, expected_end = over_render_window(
+            start=start,
+            lead=shot.latest_take_lead,
+            picture_seconds=over_render_frames(duration) / 24,
+            song_duration=song_end,
+        )
+        assert window["seek_seconds"] == pytest.approx(expected_start), name
+        assert window["duration"] == pytest.approx(expected_end - expected_start), name
+        # The take's whole length, every time: 107 frames, floored at H3's own four-second
+        # minimum. The bare window — 3.75 s, or 2.083 s three times over — is what this stage
+        # used to send.
+        assert window["duration"] == pytest.approx(107 / 24), name
+        assert window["duration"] != pytest.approx(duration), name
+        # The invariant, which is the whole claim: the take's own frame `round(lead * 24)` is
+        # the window's first second, in the restored audio exactly as in the conditioning.
+        assert window["seek_seconds"] + shot.latest_take_lead == pytest.approx(start), name
+        # Nothing before the song, nothing past its end.
+        assert window["seek_seconds"] >= 0, name
+        assert window["seek_seconds"] + window["duration"] <= song_end + 1e-9, name
+
+    # The two edges really are the edges, so the clamps above were exercised rather than
+    # trivially satisfied: the shot at 0 s takes the song from its first sample, and the shot at
+    # the end takes it to its last.
+    starts = [prompt["mvp:song"]["inputs"]["seek_seconds"] for prompt in comfy.prompts]
+    assert starts[2] == 0.0
+    assert starts[3] + 107 / 24 == pytest.approx(song_end)
+
+
+def test_a_take_whose_audio_runs_out_at_the_songs_end_says_so_instead_of_padding(
+    tmp_path: Path,
+):
+    """The one length mismatch left, and the only way to reach it.
+
+    For a shot rendered where it sits, the pair always agrees: `over_render_lead` grows the lead
+    to keep the tail inside the song, and it always has the room to. What is left is a take whose
+    *window was moved after it was rendered* — the recorded lead is the old window's, so the
+    take's own seconds now reach past the end of the song. The tail is clamped there, the audio
+    comes up short of the picture by that much, and both numbers are reported rather than the
+    picture being cut to fit (`trim_to_audio` is off) or the audio padded to length.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(
+        store,
+        tmp_path,
+        start=150.0,
+        duration=4.0,
+        song_duration=154.0,
+        latest_take_lead=0.25,
+    )
+
+    body = restore_audio(client, project).json()
+
+    window = comfy.prompts[-1]["mvp:song"]["inputs"]
+    assert window["seek_seconds"] == 149.75
+    # Clamped to the song's last second, not to the take's own 124 frames (5.1667 s).
+    assert window["duration"] == pytest.approx(4.25)
+    assert body["audio_seconds"] == pytest.approx(4.25)
+    assert body["requested_frames"] == 124
+    assert body["requested_picture_seconds"] == pytest.approx(124 / 24)
+    assert body["lengths_match"] is False
+    assert "the song ends before the picture does" in body["length_note"]
+    assert comfy.prompts[-1]["mvp:save"]["inputs"]["trim_to_audio"] is False
+
+
+def test_the_restored_window_is_the_one_the_render_conditioned_with(tmp_path: Path):
+    """The anti-drift pin: two stages, two code paths, one window — read off both graphs.
+
+    `generate_h3` submits the master with a `trim`; this route submits it as `seek_seconds` and
+    `duration`. They were separate arithmetic until 2026-08-21 and the restore half was wrong.
+    Compared here as *submitted graphs* rather than as two calls to the same helper, because the
+    failure being guarded is precisely a route computing its own window on the way.
+    """
+    client, store, comfy = make_client(tmp_path)
+
+    for start, duration in ((12.0, 3.75), (12.0, 2.083), (0.0, 2.083)):
+        rendered = windowed_project(store, client, start=start, duration=duration)
+        assert submit_h3(client, rendered.id, rendered.shots[0].id).status_code == 202
+        trim = next(
+            item for item in submitted_media(comfy) if item["label"] == "master song"
+        )["trim"]
+        # The lead this submission recorded, carried onto the take the restore stage reads —
+        # which is exactly what the manifest carries after a real render.
+        recorded = ProjectStore(tmp_path).get(rendered.id).shots[0].latest_take_lead
+
+        restoring = restorable_project(
+            store,
+            tmp_path,
+            start=start,
+            duration=duration,
+            # `windowed_project`'s song, so the two stages are answering about one track.
+            song_duration=154.0,
+            latest_take_lead=recorded,
+        )
+        assert restore_audio(client, restoring).status_code == 202
+
+        window = comfy.prompts[-1]["mvp:song"]["inputs"]
+        assert window["seek_seconds"] == pytest.approx(trim["start"]), (start, duration)
+        assert window["duration"] == pytest.approx(trim["end"] - trim["start"]), (
+            start,
+            duration,
+        )
+
+
+def test_a_take_with_no_recorded_lead_is_refused_rather_than_given_a_guessed_offset(
+    tmp_path: Path,
+):
+    """The legacy take, and the shot at 0 s that is not one.
+
+    Since the margin shipped, a song-audio submission records `min(ideal, extra, start)` with
+    `ideal` at least a quarter second and `extra` always positive, so a recorded lead is zero
+    exactly when the shot starts at 0 s. A zero lead any later means the take predates the margin
+    or its bookkeeping was cleared for a hand-picked clip — and which of those it is, and how far
+    before the window the picture begins, cannot be worked out from the manifest. Refused by name
+    rather than windowed on a guess, for the same reason a shot that never rode the master is.
+    """
+    client, store, comfy = make_client(tmp_path)
+    legacy = restorable_project(store, tmp_path, latest_take_lead=0.0)
+
+    response = restore_audio(client, legacy)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == RESTORE_AUDIO_NO_LEAD_REFUSAL.format(
+        shot=shot_label(store.get(legacy.id), store.get(legacy.id).shots[0]),
+        start=RESTORE_SHOT_START,
+    )
+    # No GPU time, and no submission of any kind.
+    assert comfy.prompts == []
+
+    # A shot at 0 s records a lead of 0 legitimately — its take begins at the window and the
+    # whole buffer is tail — so it is not the legacy case and is not refused.
+    opening = restorable_project(store, tmp_path, start=0.0, latest_take_lead=0.0)
+
+    assert restore_audio(client, opening).status_code == 202
+    assert comfy.prompts[-1]["mvp:song"]["inputs"]["seek_seconds"] == 0.0
 
 
 def test_a_restoration_in_flight_refuses_a_second_one_and_so_does_a_live_render(
@@ -13245,6 +13450,27 @@ def fill_looks(client, project_id: str, **body):
     return client.post(f"/api/projects/{project_id}/sections/fill-looks", json=body)
 
 
+def fill_looks_applying(client, project_id: str, **body):
+    """Report, then confirm **with that report as the plan** — the two calls this route takes.
+
+    Every test below that used to say `fill_looks(..., confirm_apply=True)` says this instead,
+    and the change is the fix rather than an accommodation of it: a single confirming call used
+    to read the treatment a second time at `PLAN_TEMPERATURE` and write whatever that reading
+    said, so the look that landed was not the look the report showed. A confirm now has to
+    carry the report it is confirming, so a test that applies has to read one first, like a
+    person.
+
+    A non-200 report is handed straight back, so the refusal tests still read as one call: the
+    refusals they are about happen before any model is asked, which is where they always were.
+    The model is asked exactly **once** across the two calls — on the report — and
+    `director.calls` is asserted on below.
+    """
+    report = fill_looks(client, project_id, **body)
+    if report.status_code != 200:
+        return report
+    return fill_looks(client, project_id, confirm_apply=True, plan=report.json(), **body)
+
+
 def test_fill_section_looks_reports_first_then_writes_and_reaches_the_prompts(tmp_path: Path):
     """The gap closed end to end.
 
@@ -13282,7 +13508,7 @@ def test_fill_section_looks_reports_first_then_writes_and_reaches_the_prompts(tm
     # Nothing on disk moved on the report path.
     assert [s.prompt for s in store.get(project.id).sections] == ["", ""]
 
-    applied = fill_looks(client, project.id, confirm_apply=True)
+    applied = fill_looks_applying(client, project.id)
     assert applied.status_code == 200, applied.text
     assert applied.json()["applied"] is True
     assert applied.json()["project"] is not None
@@ -13356,14 +13582,14 @@ def test_fill_section_looks_never_replaces_a_written_look_without_consent(tmp_pa
     assert written_row["prompt"] == "A model look for the intro."
     assert report.json()["filled"] == 1
 
-    applied = fill_looks(client, project.id, confirm_apply=True)
+    applied = fill_looks_applying(client, project.id)
     assert applied.status_code == 200
     saved = store.get(project.id)
     assert saved.sections[0].prompt == "MY OWN INTRO LOOK, typed by hand."  # untouched
     assert saved.sections[1].prompt == "A model look for the verse."
 
     # The consent path: both flags, and only then does the hand-written sentence go.
-    overwritten = fill_looks(client, project.id, confirm_apply=True, overwrite=True)
+    overwritten = fill_looks_applying(client, project.id, overwrite=True)
     assert overwritten.status_code == 200
     assert overwritten.json()["filled"] == 2
     assert store.get(project.id).sections[0].prompt == "A model look for the intro."
@@ -13382,7 +13608,7 @@ def test_fill_section_looks_is_a_no_op_when_every_section_already_has_one(tmp_pa
     project.sections[0].prompt = "Already written."
     store.save(project)
 
-    response = fill_looks(client, project.id, confirm_apply=True)
+    response = fill_looks_applying(client, project.id)
     assert response.status_code == 200
     assert response.json()["filled"] == 0
     assert response.json()["applied"] is False
@@ -13431,7 +13657,7 @@ def test_fill_section_looks_matches_the_directors_seven_by_id_and_label(tmp_path
     client, store, comfy = make_client(tmp_path, director=director)
     project = sectioned_project(store)
 
-    response = fill_looks(client, project.id, confirm_apply=True)
+    response = fill_looks_applying(client, project.id)
     assert response.status_code == 200, response.text
 
     # The input the model was shown: the two documents and the boxes with their ids, in song
@@ -13496,7 +13722,7 @@ def test_fill_section_looks_refuses_a_look_whose_id_and_label_disagree(tmp_path:
     client, store, comfy = make_client(tmp_path, director=director)
     project = sectioned_project(store)
 
-    response = fill_looks(client, project.id, confirm_apply=True)
+    response = fill_looks_applying(client, project.id)
     assert response.status_code == 200, response.text
     rows = {row["label"]: row for row in response.json()["sections"]}
 
@@ -13534,21 +13760,21 @@ def test_fill_section_looks_refuses_absent_source_material_without_a_model_call(
     client, store, comfy = make_client(tmp_path, director=director)
 
     no_sections = sectioned_project(store, [])
-    refused = fill_looks(client, no_sections.id, confirm_apply=True)
+    refused = fill_looks_applying(client, no_sections.id)
     assert refused.status_code == 422
     assert refused.json()["detail"] == SECTION_LOOKS_NO_SECTIONS
 
     blank = sectioned_project(
         store, [("section_intro", "Intro", 0.0, 11.0)], treatment="   \n "
     )
-    refused = fill_looks(client, blank.id, confirm_apply=True)
+    refused = fill_looks_applying(client, blank.id)
     assert refused.status_code == 422
     assert refused.json()["detail"] == SECTION_LOOKS_NO_TREATMENT
 
     bibleless = sectioned_project(
         store, [("section_intro", "Intro", 0.0, 11.0)], style_bible=""
     )
-    refused = fill_looks(client, bibleless.id, confirm_apply=True)
+    refused = fill_looks_applying(client, bibleless.id)
     assert refused.status_code == 422
     assert refused.json()["detail"] == SECTION_LOOKS_NO_STYLE_BIBLE
 
@@ -13579,10 +13805,201 @@ def test_fill_section_looks_translates_the_model_being_down(tmp_path: Path):
     ):
         client, store, comfy = make_client(tmp_path / f"root{code}", director=DownDirector(error))
         project = sectioned_project(store, [("section_intro", "Intro", 0.0, 11.0)])
-        response = fill_looks(client, project.id, confirm_apply=True)
+        response = fill_looks_applying(client, project.id)
         assert response.status_code == code, response.text
         assert store.get(project.id).sections[0].prompt == ""
         assert comfy.prompts == []
+
+
+def test_fill_section_looks_writes_the_look_that_was_read_and_asks_no_model_to_write_it(
+    tmp_path: Path,
+):
+    """The report-then-confirm finding, closed on this route (2026-08-21).
+
+    The route asked the model *before* it looked at `confirm_apply`, so the confirming call
+    read the treatment a second time at `PLAN_TEMPERATURE = 0.7` and wrote whatever that
+    reading said — the look that landed was not the look the confirm dialog showed. The double
+    here answers differently on every call, which is what makes the difference visible: a
+    section either holds "take 1", the words that were read, or "take 2", which is the bug.
+    """
+    takes = {"n": 0}
+
+    def drifting(looks_input):
+        takes["n"] += 1
+        return [
+            ("section_intro", "Intro", f"The empty moonlit warehouse, take {takes['n']}."),
+            ("section_v1", "Verse", f"Handheld at the chrome mic, take {takes['n']}."),
+        ]
+
+    director = SectionLookingDirector(looks=drifting)
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(
+        store,
+        [("section_intro", "Intro", 0.0, 11.0), ("section_v1", "Verse", 11.0, 21.54)],
+    )
+
+    report = fill_looks(client, project.id)
+    assert report.status_code == 200, report.text
+    plan = report.json()
+    assert len(director.calls) == 1
+    assert len(plan["plan_id"]) == 64 and plan["updated_at"]
+    assert [row["prompt"] for row in plan["sections"]] == [
+        "The empty moonlit warehouse, take 1.",
+        "Handheld at the chrome mic, take 1.",
+    ]
+
+    applied = fill_looks(client, project.id, confirm_apply=True, plan=plan)
+    assert applied.status_code == 200, applied.text
+    body = applied.json()
+    # The cost half: the confirm asked no model. This fails on the pre-fix route.
+    assert len(director.calls) == 1
+    assert body["applied"] is True and body["project"] is not None
+    assert {key: value for key, value in body.items() if key not in {"applied", "project"}} == {
+        key: value for key, value in plan.items() if key not in {"applied", "project"}
+    }
+    # Byte-equality between what was read and what landed, through a fresh store.
+    reread = ProjectStore(tmp_path).get(project.id)
+    assert [section.prompt for section in reread.sections] == [
+        row["prompt"] for row in plan["sections"]
+    ]
+    assert not any("take 2" in section.prompt for section in reread.sections)
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_refuses_a_confirm_that_cannot_prove_its_plan(tmp_path: Path):
+    """Absent, tampered, forged and stale — and none of them reads the treatment again.
+
+    Regenerating on a confirm it cannot match is exactly the behaviour being removed, so the
+    fallback is a refusal. Nothing is written on any of the four paths.
+    """
+    import json as json_module
+
+    from music_video_producer.app import (
+        PROJECT_CHANGED_REFUSAL,
+        SECTION_LOOKS_NO_PLAN,
+        SECTION_LOOKS_PLAN_MISMATCH,
+    )
+
+    director = SectionLookingDirector(
+        looks=[("section_intro", "Intro", "The empty moonlit warehouse, wide and lonely.")]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(store, [("section_intro", "Intro", 0.0, 11.0)])
+
+    plan = fill_looks(client, project.id).json()
+    assert len(director.calls) == 1
+
+    absent = fill_looks(client, project.id, confirm_apply=True)
+    assert absent.status_code == 422
+    assert absent.json()["detail"] == SECTION_LOOKS_NO_PLAN
+
+    tampered = json_module.loads(json_module.dumps(plan))
+    tampered["sections"][0]["prompt"] = "A look that was never in any report."
+    swapped = fill_looks(client, project.id, confirm_apply=True, plan=tampered)
+    assert swapped.status_code == 422
+    assert swapped.json()["detail"] == SECTION_LOOKS_PLAN_MISMATCH
+
+    forged = json_module.loads(json_module.dumps(plan))
+    forged["plan_id"] = "0" * 64
+    minted = fill_looks(client, project.id, confirm_apply=True, plan=forged)
+    assert minted.status_code == 422
+    assert minted.json()["detail"] == SECTION_LOOKS_PLAN_MISMATCH
+
+    moved = store.get(project.id)
+    moved.name = "Renamed while the report sat open"
+    store.save(moved)
+    stale = fill_looks(client, project.id, confirm_apply=True, plan=plan)
+    assert stale.status_code == 409
+    assert stale.json()["detail"] == PROJECT_CHANGED_REFUSAL
+
+    assert [section.prompt for section in ProjectStore(tmp_path).get(project.id).sections] == [""]
+    assert len(director.calls) == 1
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_refuses_a_plan_whose_section_moved_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The confirm's row check, forced to fire.
+
+    Unreachable while the revision check holds — a section cannot be renamed or written without
+    the manifest being saved — so, `CLEAN_PROMPTS_WINDOWS_MOVED`'s rule, it is checked rather
+    than argued and tested by standing in a digest that accepts whatever it is handed. The id
+    and the label must still describe the same box, and the look being replaced must still be
+    the one the report showed as `previous`.
+    """
+    from music_video_producer import app as app_module
+    from music_video_producer.app import SECTION_LOOKS_PLAN_MISMATCH
+
+    director = SectionLookingDirector(
+        looks=[("section_intro", "Intro", "The empty moonlit warehouse, wide and lonely.")]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(store, [("section_intro", "Intro", 0.0, 11.0)])
+    monkeypatch.setattr(
+        app_module, "plan_fingerprint", lambda project, plan: plan.plan_id or "minted"
+    )
+    plan = fill_looks(client, project.id).json()
+
+    mislabelled = {**plan, "sections": [{**plan["sections"][0], "label": "Chorus 2"}]}
+    response = fill_looks(client, project.id, confirm_apply=True, plan=mislabelled)
+    assert response.status_code == 422
+    assert response.json()["detail"] == SECTION_LOOKS_PLAN_MISMATCH
+
+    moved = {**plan, "sections": [{**plan["sections"][0], "previous": "Not what it held."}]}
+    response = fill_looks(client, project.id, confirm_apply=True, plan=moved)
+    assert response.status_code == 422
+    assert response.json()["detail"] == SECTION_LOOKS_PLAN_MISMATCH
+
+    assert store.get(project.id).sections[0].prompt == ""
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_takes_the_overwrite_consent_without_reading_again(
+    tmp_path: Path,
+):
+    """The second consent is answered against the report, not by asking the model twice.
+
+    The browser reports first, asks "also replace the looks you wrote yourself?", and confirms
+    with the answer — so the report has to carry the proposed look for a written section (it
+    does, on the row) and the confirm has to be able to act on it (it does, and `overwrite`
+    is deliberately outside the plan's digest for exactly this). One model call, both halves.
+    """
+    from music_video_producer.app import SECTION_LOOK_SKIP_WRITTEN
+
+    director = SectionLookingDirector(
+        looks=[
+            ("section_intro", "Intro", "A model look for the intro."),
+            ("section_v1", "Verse", "A model look for the verse."),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(
+        store,
+        [("section_intro", "Intro", 0.0, 11.0), ("section_v1", "Verse", 11.0, 21.54)],
+    )
+    project.sections[0].prompt = "MY OWN INTRO LOOK, typed by hand."
+    store.save(project)
+
+    plan = fill_looks(client, project.id).json()
+    assert plan["sections"][0]["reason"] == SECTION_LOOK_SKIP_WRITTEN
+    assert plan["sections"][0]["prompt"] == "A model look for the intro."
+    assert plan["filled"] == 1
+
+    applied = fill_looks(
+        client, project.id, confirm_apply=True, overwrite=True, plan=plan
+    ).json()
+    assert len(director.calls) == 1
+    assert applied["filled"] == 2
+    assert applied["sections"][0]["filled"] is True
+    assert applied["sections"][0]["reason"] == ""
+    assert applied["message"] == "2 filled, 0 left alone"
+    reread = ProjectStore(tmp_path).get(project.id)
+    assert [section.prompt for section in reread.sections] == [
+        "A model look for the intro.",
+        "A model look for the verse.",
+    ]
+    assert comfy.prompts == []
 
 
 def test_populate_adopts_the_models_sections_when_none_are_marked(tmp_path: Path):

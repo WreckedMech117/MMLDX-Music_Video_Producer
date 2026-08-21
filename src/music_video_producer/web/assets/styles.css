@@ -523,6 +523,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .snap-heading { color: var(--dim); font: 9px Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; margin-top: 6px; }
 .snap-move { color: var(--ink); font-family: Consolas, monospace; }
 .snap-skip { color: var(--muted); }
+/* The same report, drawn in the section inspector rather than on the cuts bar: it is a block
+   between two full-width buttons there, so it earns the breathing room the bar's flex row gives
+   for free. Everything else about it is `.snap-report`. */
+.section-looks-report { margin: 8px 0; }
 /* The H3 sweep's per-shot report, in the same bar and in the same shell as the cuts report: two
    report surfaces in one place that looked like two different ideas would be worse than either.
    Each line leads with its kind in words (Change applied / Safety notice / Check this) because
