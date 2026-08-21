@@ -7,7 +7,7 @@ import pytest
 
 from music_video_producer import store as store_module
 from music_video_producer.models import Project, Shot
-from music_video_producer.store import ProjectNotFound, ProjectStore
+from music_video_producer.store import ProjectChangedDuringSave, ProjectNotFound, ProjectStore
 
 
 def test_store_persists_projects_across_instances(tmp_path: Path):
@@ -302,18 +302,24 @@ def test_the_replace_backoff_does_not_hold_the_manifest_lock(tmp_path: Path, mon
     assert leftovers == ["project.json"]
 
 
-def test_a_save_inside_another_saves_backoff_leaves_one_whole_manifest(
+def test_a_save_that_lands_inside_another_saves_backoff_is_never_reverted(
     tmp_path: Path, monkeypatch
 ):
-    """What dropping the lock between attempts actually admits — and why it is not the old race.
+    """The lost update the backoff window admits, and the refusal that closes it.
 
-    The original bug was a *reader* holding the destination open at the instant of the replace.
-    That cannot come back: every attempt is still made with the lock held, and a reader only ever
-    has the manifest open while holding that same lock, so no handle of ours survives into an
-    attempt. What the window does admit is another complete `save`, which lands whole and is then
-    replaced by the retry — last writer wins, exactly as it already does for the read, mutate,
-    save that every route performs as three separate acquisitions. Neither manifest is partial at
-    any point, and no temp file is orphaned.
+    The retry's temp file was serialised *before* it began waiting. Replaying it over a manifest
+    another save landed during the wait reverts a write whose caller already got a 200, and puts
+    that caller's older `updated_at` back on disk, so its next save is refused for being stale
+    while its edits are the ones that vanished — the 2026-08-19 defect, thirty-two prompts.
+    "Last writer wins" is the rule for read/mutate/save and does not stretch to cover this: there,
+    the loser is never told it won.
+
+    So the retry refuses. `B`'s manifest is what a reader sees afterwards, byte for byte, with
+    `B`'s `updated_at` intact; `A` is told, by a named exception that says what to do about it,
+    that nothing of its own was written. Deterministic by ordering, not by timing: the interleaved
+    thread starts only once the first replace has failed, and it ends the backoff by notifying the
+    condition itself rather than by letting a clock run out — the five-second backoff is only the
+    bound on how long a broken version takes to fail.
     """
     store = ProjectStore(tmp_path)
     project = store.create(_polled_project("Interleaved"))
@@ -355,19 +361,191 @@ def test_a_save_inside_another_saves_backoff_leaves_one_whole_manifest(
     thread = threading.Thread(target=interleaved, daemon=True)
     thread.start()
     try:
+        with pytest.raises(ProjectChangedDuringSave):
+            store.save(project)
+    finally:
+        monkeypatch.undo()
+        thread.join(timeout=60)
+
+    assert other_errors == []
+    # Three entries, not four: the retry never made a second attempt, because it refused first.
+    assert order == ["replace", "interleaved replace", "interleaved save"]
+    assert landed == ["written inside the other save's backoff"]
+    assert ProjectStore(tmp_path).get(project.id).creative_brief == (
+        "written inside the other save's backoff"
+    )
+    leftovers = sorted(
+        path.name for path in store.project_dir(project.id).iterdir() if path.is_file()
+    )
+    assert leftovers == ["project.json"]
+
+
+def test_a_refused_save_leaves_the_other_writers_updated_at_ahead_of_its_own(
+    tmp_path: Path, monkeypatch
+):
+    """The consequence the refusal exists for, asserted as the client's concurrency check sees it.
+
+    `A` reads at revision one and starts saving. `B` reads the same revision, saves, and is told
+    revision two. If `A`'s retry replays its temp file, disk goes back to revision one — and `B`,
+    holding two, is refused by `PUT`'s `updated_at` comparison for a change that is already lost.
+    The assertion is the ordering that check depends on: what is on disk is never older than the
+    newest revision any caller was handed.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(_polled_project("Revision"))
+    stale = store.get(project.id)
+
+    real_replace = Path.replace
+    entering_backoff = threading.Event()
+    attempts: list[int] = []
+    handed_out: list[str] = []
+    other_errors: list[Exception] = []
+
+    def flaky(self: Path, target: Path) -> None:
+        attempts.append(target)
+        if len(attempts) == 1:
+            entering_backoff.set()
+            raise PermissionError(5, "Access is denied")
+        real_replace(self, target)
+
+    def interleaved() -> None:
+        try:
+            entering_backoff.wait(timeout=30)
+            other = store.get(project.id)
+            other.name = "B won"
+            handed_out.append(store.save(other).updated_at)
+            with store_module._MANIFEST_LOCK:
+                store_module._MANIFEST_WAIT.notify_all()
+        except Exception as error:  # noqa: BLE001 - a thread must not lose its own failure
+            other_errors.append(error)
+
+    stale.name = "A lost"
+    monkeypatch.setattr(store_module, "_REPLACE_BACKOFF", 5.0)
+    monkeypatch.setattr(Path, "replace", flaky)
+    thread = threading.Thread(target=interleaved, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(ProjectChangedDuringSave):
+            store.save(stale)
+    finally:
+        monkeypatch.undo()
+        thread.join(timeout=60)
+
+    assert other_errors == []
+    on_disk = json.loads(store.manifest_path(project.id).read_text(encoding="utf-8"))
+    assert on_disk["name"] == "B won"
+    assert handed_out == [ProjectStore(tmp_path).get(project.id).updated_at], (
+        "the revision B was told it had is not the one on disk, so B's next save is refused "
+        "for a change that was silently reverted"
+    )
+
+
+def test_two_stores_spelling_one_data_root_differently_still_see_each_others_writes(
+    tmp_path: Path, monkeypatch
+):
+    """The lock is on the module because two `ProjectStore` objects can address one data root.
+
+    The write count that closes the lost-update window has to agree with that: keyed on the path
+    as each store happens to spell it, the same manifest becomes two counters and two writers that
+    cannot see each other — the refusal never fires and the revert comes straight back. The second
+    store here reaches the same directory through a `..` segment, which is the same file and a
+    different string.
+    """
+    (tmp_path / "elsewhere").mkdir()
+    store = ProjectStore(tmp_path)
+    other_spelling = ProjectStore(tmp_path / "elsewhere" / "..")
+    project = store.create(_polled_project("Two spellings"))
+    assert other_spelling.get(project.id).name == "Two spellings"
+
+    real_replace = Path.replace
+    entering_backoff = threading.Event()
+    attempts: list[Path] = []
+    other_errors: list[Exception] = []
+
+    def flaky(self: Path, target: Path) -> None:
+        attempts.append(target)
+        if len(attempts) == 1:
+            entering_backoff.set()
+            raise PermissionError(5, "Access is denied")
+        real_replace(self, target)
+
+    def interleaved() -> None:
+        try:
+            entering_backoff.wait(timeout=30)
+            other = other_spelling.get(project.id)
+            other.creative_brief = "written through the other spelling"
+            other_spelling.save(other)
+            with store_module._MANIFEST_LOCK:
+                store_module._MANIFEST_WAIT.notify_all()
+        except Exception as error:  # noqa: BLE001 - a thread must not lose its own failure
+            other_errors.append(error)
+
+    project.creative_brief = "the retried save"
+    monkeypatch.setattr(store_module, "_REPLACE_BACKOFF", 5.0)
+    monkeypatch.setattr(Path, "replace", flaky)
+    thread = threading.Thread(target=interleaved, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(ProjectChangedDuringSave):
+            store.save(project)
+    finally:
+        monkeypatch.undo()
+        thread.join(timeout=60)
+
+    assert other_errors == []
+    assert ProjectStore(tmp_path).get(project.id).creative_brief == (
+        "written through the other spelling"
+    )
+
+
+def test_a_backoff_is_not_refused_by_a_save_to_a_different_project(tmp_path: Path, monkeypatch):
+    """The guard is per manifest, so an unrelated save is not a reason to refuse.
+
+    A batch saves job records on one project while the Director edits another; those two writes
+    touch different files and neither is stale with respect to the other. Refusing on *any*
+    concurrent write would turn the busiest ordinary case in this application into an error.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(_polled_project("Mine"))
+    unrelated = store.create(Project(name="Someone else's"))
+    project.creative_brief = "landed after the scanner let go"
+
+    real_replace = Path.replace
+    entering_backoff = threading.Event()
+    attempts: list[Path] = []
+    other_errors: list[Exception] = []
+
+    def flaky(self: Path, target: Path) -> None:
+        attempts.append(target)
+        if len(attempts) == 1:
+            entering_backoff.set()
+            raise PermissionError(5, "Access is denied")
+        real_replace(self, target)
+
+    def interleaved() -> None:
+        try:
+            entering_backoff.wait(timeout=30)
+            other = store.get(unrelated.id)
+            other.creative_brief = "a different manifest entirely"
+            store.save(other)
+            with store_module._MANIFEST_LOCK:
+                store_module._MANIFEST_WAIT.notify_all()
+        except Exception as error:  # noqa: BLE001 - a thread must not lose its own failure
+            other_errors.append(error)
+
+    monkeypatch.setattr(store_module, "_REPLACE_BACKOFF", 5.0)
+    monkeypatch.setattr(Path, "replace", flaky)
+    thread = threading.Thread(target=interleaved, daemon=True)
+    thread.start()
+    try:
         store.save(project)
     finally:
         monkeypatch.undo()
         thread.join(timeout=60)
 
     assert other_errors == []
-    assert order == ["replace", "interleaved replace", "interleaved save", "replace"]
-    assert landed == ["written inside the other save's backoff"]
-    assert ProjectStore(tmp_path).get(project.id).creative_brief == "the retried save"
-    leftovers = sorted(
-        path.name for path in store.project_dir(project.id).iterdir() if path.is_file()
-    )
-    assert leftovers == ["project.json"]
+    assert ProjectStore(tmp_path).get(project.id).creative_brief == "landed after the scanner let go"
+    assert ProjectStore(tmp_path).get(unrelated.id).creative_brief == "a different manifest entirely"
 
 
 def test_a_backoff_under_a_nested_create_also_releases_the_lock(tmp_path: Path, monkeypatch):

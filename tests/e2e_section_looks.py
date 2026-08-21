@@ -4,7 +4,8 @@ The finding: the section inspector's button asked the route for a report and the
 `if (!report.filled) return toast(report.message, "error")` **before** it ever asked the overwrite
 question. A structure where every section already carries a look short-circuits server-side to
 `0 filled` with `SECTION_LOOKS_ALL_WRITTEN` — *"Every section already has a look. Nothing was
-changed — send overwrite=true to replace what is there."* — so for that project the button could
+changed and no look was read for any of them — run this again with overwrite=true to see what
+would replace them, then confirm that report."* — so for that project the button could
 do nothing but error, while the sentence it showed described a consent the screen never offered.
 The Director's live project is in exactly that state: all seven sections written.
 
@@ -87,6 +88,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from music_video_producer.app import (
+    SECTION_LOOK_SKIP_ALL_WRITTEN,
     SECTION_LOOK_SKIP_UNDESCRIBED,
     SECTION_LOOK_SKIP_WRITTEN,
     SECTION_LOOKS_ALL_WRITTEN,
@@ -434,7 +436,7 @@ def main() -> None:
                 assert len(declined_lines) == len(SECTIONS), declined_lines
                 for section in SECTIONS:
                     line = section_line(declined_lines, section)
-                    assert SECTION_LOOK_SKIP_WRITTEN in line, line
+                    assert SECTION_LOOK_SKIP_ALL_WRITTEN in line, line
                     assert WRITTEN[section["id"]] in line, (
                         ("the look the consent would replace is not on screen beside "
                          "the question about replacing it"), line,

@@ -1661,11 +1661,18 @@ function bindClip(clip) {
         || (shot.trim_nudge || 0) !== original.nudge;
       if (moved() && magnetised !== null && applyPlayheadSnap(shot, mode, magnetised, original)) return;
       if (moved()) return saveShotsSilently(mode === "move" ? "move" : "resize");
-      // Nothing to save, so nothing is outstanding. `move` sets the dirty flag on the first
-      // pixel, and every drag used to end in a write, so leaving it set was invisible; now that
-      // a refused snap and a drag that returns to where it started both end here, a flag left
-      // standing would have the navigation guards warning about work that does not exist.
-      state.dirty = state.documentsDirty;
+      // Nothing to save *from this gesture*, so this gesture's dirt is cleared. `move` sets the
+      // dirty flag on the first pixel, and every drag used to end in a write, so leaving it set
+      // was invisible; now that a refused snap and a drag that returns to where it started both
+      // end here, a flag left standing would have the navigation guards warning about work that
+      // does not exist.
+      //
+      // `shotsDirty` is ORed back in, not dropped: unlike the two sites that clear this pair
+      // (the undo apply and the settled save), nothing here has cleared it, so an *earlier*
+      // drag's save can still be in flight. Assigning `documentsDirty` alone made
+      // `hasUnsavedWork` answer false while a shot write was outstanding, so closing the tab or
+      // switching project in that window skipped the very guard this line exists to keep honest.
+      state.dirty = state.documentsDirty || state.shotsDirty;
       if (mode === "move") seekMasterAudio(shot.start);
     };
     window.addEventListener("pointermove", move);

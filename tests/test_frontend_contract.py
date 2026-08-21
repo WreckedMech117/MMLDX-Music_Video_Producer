@@ -21,6 +21,9 @@ from music_video_producer.app import (
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_RESTORE_REFUSAL,
     MULTIVIEW_SUBJECTS,
+    SECTION_LOOK_SKIP_ALL_WRITTEN,
+    SECTION_LOOK_SKIP_WRITTEN,
+    SECTION_LOOKS_ALL_WRITTEN,
     SONG_CAPTION_LIMIT,
     SONG_CONTEXT_LABELS,
     SONG_CONTEXT_RESTORE_NOTICE,
@@ -7994,6 +7997,8 @@ RENDERED_SHOT = {
     "approved_start": 12.5,
     "approved_duration": 4.25,
     "latest_take_lead": 0.25,
+    "latest_take_start": 12.5,
+    "latest_take_duration": 4.25,
     "trim_nudge": -0.125,
     "mix_take_audio": True,
     "flagged": True,
@@ -10766,7 +10771,7 @@ SECTION_LOOKS_REPORT = {
          "reason": "the treatment does not describe this section"},
         {"section_id": "section_d", "label": "Outro", "start": 124.1, "filled": False,
          "prompt": "A proposed outro look.", "previous": "My own outro look.",
-         "reason": "already has a look you wrote; send overwrite=true to replace it"},
+         "reason": SECTION_LOOK_SKIP_WRITTEN},
     ],
 }
 
@@ -10805,17 +10810,14 @@ SECTION_LOOKS_ALL_WRITTEN_REPORT = {
     "applied": False,
     "filled": 0,
     "skipped": 2,
-    "message": (
-        "Every section already has a look. Nothing was changed — send overwrite=true to "
-        "replace what is there."
-    ),
+    "message": SECTION_LOOKS_ALL_WRITTEN,
     "sections": [
         {"section_id": "section_intro", "label": "Intro", "start": 0.0, "filled": False,
          "prompt": "", "previous": "Mine: the corridor, low and slow.",
-         "reason": "already has a look you wrote; send overwrite=true to replace it"},
+         "reason": SECTION_LOOK_SKIP_ALL_WRITTEN},
         {"section_id": "section_outro", "label": "Outro", "start": 11.0, "filled": False,
          "prompt": "", "previous": "Mine: the door, closing on the light.",
-         "reason": "already has a look you wrote; send overwrite=true to replace it"},
+         "reason": SECTION_LOOK_SKIP_ALL_WRITTEN},
     ],
 }
 
@@ -10899,7 +10901,7 @@ def test_the_section_look_report_says_what_a_look_would_replace():
         withheld: sectionLooksReportLines({ sections: [
           { label: 'Outro', start: 124, filled: false, prompt: 'The door, closing.',
             previous: 'Mine: the door.',
-            reason: 'already has a look you wrote; send overwrite=true to replace it' },
+            reason: __SKIP_WRITTEN__ },
         ] }),
         silent: sectionLooksReportLines({ sections: [
           { label: 'Bridge', start: 103, filled: false, prompt: '', previous: '',
@@ -10907,7 +10909,7 @@ def test_the_section_look_report_says_what_a_look_would_replace():
         ] }),
         nothing: sectionLooksReportLines(null),
       }));
-    """)
+    """.replace("__SKIP_WRITTEN__", json.dumps(SECTION_LOOK_SKIP_WRITTEN)))
     assert lines["nothing"] == []
     # A look that lands over one the Director wrote names both.
     replacing = lines["replacing"][0]

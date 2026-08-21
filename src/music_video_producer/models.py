@@ -429,6 +429,22 @@ class Shot(BaseModel):
     # of the approved file — the "fine tune with the extra added length" the ruling asks
     # for — while the file itself stays immovable.
     latest_take_lead: float = Field(default=0, ge=0)
+    # The window the take was rendered *for*, snapshotted at submission beside
+    # `latest_take_lead` — AD-13's `approved_start`/`approved_duration` idiom, for the
+    # same reason and with the same "0 means never snapshotted" reading (`duration` is
+    # `gt=0`, so no real window is 0 seconds long).
+    #
+    # A take is fixed at render time and `start`/`duration` go on being edited afterwards
+    # — dragging a rendered clip's left edge moves `start` while `trim_nudge` compensates,
+    # and the take still begins where it always did. Without this snapshot the only
+    # description of the take was the *live* window, so `restore_song_audio` laid the
+    # master over the take at an offset the take had never been performed against and by
+    # a frame count the render never asked for, silently. Recorded rather than derived,
+    # exactly as the lead is: nothing in the take's own bytes says which window produced
+    # it. Takes rendered before 2026-08-21 read 0 here and are reported as undescribed
+    # rather than described wrongly.
+    latest_take_start: float = Field(default=0, ge=0)
+    latest_take_duration: float = Field(default=0, ge=0)
     trim_nudge: float = 0
     # Whether this shot's take audio is *accepted* into the mix (spec-take-audio-mix):
     # the Monitor plays it over the master and assembly mixes its window-slice under the
@@ -523,7 +539,9 @@ SHOT_PLAN_CONTENT_FIELDS = frozenset(
 #: `status` is here because every value but the default describes a render; a new Shot is a
 #: `draft`, which is what `Shot.status`'s own default already says. `trim_nudge` and
 #: `latest_take_lead` select a slice of one specific file, and on a Shot with no file the pair
-#: would silently cut a future take at an offset nobody chose. `mix_take_audio` accepts *this
+#: would silently cut a future take at an offset nobody chose. `latest_take_start` and
+#: `latest_take_duration` are that same file's window snapshot — a copy would claim to hold a
+#: take rendered for a window it has never rendered anything for. `mix_take_audio` accepts *this
 #: take's* audio into the mix. `latest_review` is a vision report about a take that is not the
 #: copy's. `flagged` is AD-5's re-render mark — "a shot whose take fell short" — and inheriting
 #: it enlarges the flagged batch scope, which is GPU minutes spent on a shot nobody flagged.
@@ -537,6 +555,8 @@ SHOT_TAKE_PROVENANCE_FIELDS = frozenset(
         "approved_start",
         "approved_duration",
         "latest_take_lead",
+        "latest_take_start",
+        "latest_take_duration",
         "trim_nudge",
         "mix_take_audio",
         "flagged",

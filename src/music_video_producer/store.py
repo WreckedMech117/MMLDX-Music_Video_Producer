@@ -45,9 +45,36 @@ _MANIFEST_WAIT = threading.Condition(_MANIFEST_LOCK)
 _REPLACE_ATTEMPTS = 5
 _REPLACE_BACKOFF = 0.05
 
+#: How many times each manifest has been replaced by this process, keyed by normalised absolute
+#: path. Read and written only under `_MANIFEST_LOCK`, which every write in this application
+#: holds at the instant of its replace, so the count is exact for this process — the same scope
+#: the lock itself claims, and for the same reason (`_MANIFEST_LOCK` cannot see another process
+#: either). It exists for one question, asked in `_replace_atomically` after the backoff hands
+#: the lock back: *did somebody else land a manifest here while I was waiting?* A counter answers
+#: that without touching the disk, which matters because the disk is exactly what is contended in
+#: the moment the question is asked. Keyed on `normcase(abspath(...))` rather than on the `Path`,
+#: because two `ProjectStore` objects can address one data root by different spellings and two
+#: unequal keys would be two writers that cannot see each other.
+_MANIFEST_WRITES: dict[str, int] = {}
+
+
+def _write_key(target: Path) -> str:
+    return os.path.normcase(os.path.abspath(target))
+
 
 class ProjectNotFound(KeyError):
     pass
+
+
+class ProjectChangedDuringSave(RuntimeError):
+    """Another writer landed a complete manifest while this save was backing off.
+
+    Raised instead of replacing it. The save did **not** happen: nothing of this caller's is on
+    disk, and what is there is the other writer's whole manifest, untouched. The caller holds a
+    `Project` that was read before that write, so every field of it is potentially stale — which
+    is precisely why this cannot be resolved down here. Re-read the project, re-apply the change,
+    save again.
+    """
 
 
 def _replace_atomically(temporary_path: Path, target: Path) -> None:
@@ -62,23 +89,49 @@ def _replace_atomically(temporary_path: Path, target: Path) -> None:
     lets in between attempts is another whole `get`, `save` or `list` — never a half one, because
     each of those is itself atomic under the same lock. A reader that slips in opens and closes
     the manifest entirely inside the window and holds nothing by the time this loop re-acquires,
-    so the retry cannot be broken by it. A writer that slips in lands its own complete manifest
-    and this one then replaces it: last writer wins, which is already how the store behaves for
-    routes that read, mutate and save as three separate acquisitions.
+    so the retry cannot be broken by it.
+
+    A *writer* that slips in is the one case the retry may not simply carry on through, and the
+    reason this function counts. The temp file was serialised before the wait, so replaying it
+    over the newer manifest would revert a save whose caller has already been told it succeeded,
+    and would restore that caller's own older `updated_at` — leaving the browser holding a
+    revision the server no longer has, refused by the optimistic-concurrency check on its next
+    save with its edits already gone. That is the 2026-08-19 defect, where one background save
+    reverted thirty-two prompts. "Last writer wins" is the rule for the read/mutate/save that
+    every route performs, and it does not extend to here: there, the loser is never told it won.
+
+    So after the wait, if the count for this manifest moved, this save refuses. Re-serialising
+    the caller's model instead would fix nothing — the model was read before the other writer
+    landed, so fresh bytes of it overwrite exactly the same fields, only now carrying a *newer*
+    `updated_at`, which converts a detectable revert into an undetectable one. The staleness is
+    in the caller's object and only the caller can resolve it, so the caller is told.
 
     Failure leaves no debris: a save that gives up removes its own temp file rather than
     accumulating one per attempt inside the project directory, which is what the unlocked
     version did — a few seconds of contention left thousands of them beside the manifest.
     """
+    key = _write_key(target)
+    generation = _MANIFEST_WRITES.get(key, 0)
     for attempt in range(_REPLACE_ATTEMPTS):
         try:
             temporary_path.replace(target)
-            return
         except OSError:
             if attempt == _REPLACE_ATTEMPTS - 1:
                 temporary_path.unlink(missing_ok=True)
                 raise
             _MANIFEST_WAIT.wait(_REPLACE_BACKOFF * (attempt + 1))
+            # Checked after the wait rather than before the next attempt's `replace`, so the
+            # refusal costs nothing on the ordinary path: with no competing writer the count is
+            # unchanged and the loop proceeds exactly as it did before this guard existed.
+            if _MANIFEST_WRITES.get(key, 0) != generation:
+                temporary_path.unlink(missing_ok=True)
+                raise ProjectChangedDuringSave(
+                    f"{target.parent.name} was written by another save while this one waited "
+                    "for the manifest; re-read the project and re-apply the change"
+                )
+        else:
+            _MANIFEST_WRITES[key] = generation + 1
+            return
 
 
 class ProjectStore:
@@ -113,6 +166,15 @@ class ProjectStore:
         return project
 
     def save(self, project: Project) -> Project:
+        """Write the whole manifest atomically, or raise. A return is a landed manifest.
+
+        Two failures reach the caller, and both mean nothing of this project was written:
+        `OSError` when the destination stayed locked by a handle outside this process for the
+        whole bounded retry, and `ProjectChangedDuringSave` when another save landed its own
+        complete manifest inside that retry. The second is recoverable and says how: re-read,
+        re-apply, save again. Do not swallow it into a success — its whole purpose is that the
+        caller who was told 200 keeps what it wrote.
+        """
         directory = self.project_dir(project.id)
         directory.mkdir(parents=True, exist_ok=True)
         self.media_dir(project.id).mkdir(parents=True, exist_ok=True)

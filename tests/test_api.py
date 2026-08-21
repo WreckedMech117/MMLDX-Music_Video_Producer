@@ -65,6 +65,7 @@ from music_video_producer.app import (
     RESTORE_AUDIO_NO_TAKE_REFUSAL,
     RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL,
     RESTORE_AUDIO_PREFIX_SUFFIX,
+    SAVE_RACE_REFUSAL,
     SHOT_CLAIM_MISMATCH_NOTICE,
     SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
     SHOT_DIRECTOR_VISIBLE,
@@ -91,6 +92,7 @@ from music_video_producer.app import (
     create_app,
     document_change_notice,
     document_first_draft_notice,
+    heal_orphaned_local_jobs_at_startup,
     multiview_refusal,
     prose_claims_shots,
     reference_map_tag_lines,
@@ -154,7 +156,7 @@ from music_video_producer.models import (
     resolve_shot_mode,
     song_audio_tag,
 )
-from music_video_producer.store import ProjectStore
+from music_video_producer.store import ProjectChangedDuringSave, ProjectStore
 from music_video_producer.timeline import (
     SNAP_APPROVED_REFUSAL,
     SNAP_IN_FLIGHT_REFUSAL,
@@ -10146,7 +10148,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     Director's prompt the moment it was declared, with nobody deciding that it should. This change
     added three at once, which is exactly the situation the guard exists for.
 
-    Seven fields are withheld, none of them a removal — each was classified withheld at the
+    Nine fields are withheld, none of them a removal — each was classified withheld at the
     moment it was declared, so withholding adds nothing to the prompt rather than subtracting
     something from it. The over-render pair (`latest_take_lead`/`trim_nudge`) is render
     bookkeeping and the human's own editorial fine-tune, neither a plan fact a chat turn
@@ -10155,7 +10157,10 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     recorded cause of Director degradation. The AD-13 window snapshot pair
     (`approved_start`/`approved_duration`) as staleness bookkeeping: copies of `start`/`duration`
     taken at approval for assembly's refusal, near-duplicate numbers the chat Director — who
-    already sees the live window and `approved_output` — has no decision to make from.
+    already sees the live window and `approved_output` — has no decision to make from. The take
+    snapshot pair (`latest_take_start`/`latest_take_duration`, 2026-08-21) is the same argument
+    one lane over: copies taken at *submission* so `restore_song_audio` can tell the window a
+    take was rendered for from the window the timeline reads now.
 
     What the classification buys either way is that the *next* field cannot arrive without the
     decision being made.
@@ -10188,6 +10193,8 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         "approved_start",
         "approved_duration",
         "latest_take_lead",
+        "latest_take_start",
+        "latest_take_duration",
         "trim_nudge",
         "mix_take_audio",
         "flagged",
@@ -10204,6 +10211,8 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         "approved_start",
         "approved_duration",
         "latest_take_lead",
+        "latest_take_start",
+        "latest_take_duration",
         "trim_nudge",
         "mix_take_audio",
         "flagged",
@@ -10214,6 +10223,8 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
             "approved_start",
             "approved_duration",
             "latest_take_lead",
+            "latest_take_start",
+            "latest_take_duration",
             "trim_nudge",
             "mix_take_audio",
             "flagged",
@@ -10648,6 +10659,12 @@ def restorable_project(
     window and the restore stage windows the take, not the window. A lead typed in here would be
     a number no render produces. Pass `latest_take_lead` to override — 0 on a shot past 0 s is
     the legacy take, which this route refuses by name.
+
+    It carries the window snapshot beside it for the same reason (`latest_take_start`,
+    `latest_take_duration`): a real render records both together, and a manifest with the lead
+    and without the window is the *pre-2026-08-21* shape rather than a current one. Both are
+    overridable, which is how the two interesting shapes are built — a moved window (a snapshot
+    that differs from `start`/`duration`) and an undescribed take (`latest_take_duration=0.0`).
     """
     project = store.create(Project(name="Restore"))
     if take:
@@ -10683,6 +10700,12 @@ def restorable_project(
             song_duration=song_duration or 0.0,
         ),
     )
+    # And the window that lead was recorded beside, which is what `generate_h3` writes: a take
+    # rendered *for this window*. Pass `latest_take_duration=0.0` for the take that carries no
+    # window of its own — a take from before 2026-08-21, or a hand-picked clip — and pass a
+    # different pair for a take whose window has been edited since it was rendered.
+    fields.setdefault("latest_take_start", fields["start"])
+    fields.setdefault("latest_take_duration", fields["duration"])
     project.shots = [Shot(**fields)]
     store.save(project)
     return project
@@ -11031,10 +11054,19 @@ def test_a_take_whose_audio_runs_out_at_the_songs_end_says_so_instead_of_padding
 
     For a shot rendered where it sits, the pair always agrees: `over_render_lead` grows the lead
     to keep the tail inside the song, and it always has the room to. What is left is a take whose
-    *window was moved after it was rendered* — the recorded lead is the old window's, so the
-    take's own seconds now reach past the end of the song. The tail is clamped there, the audio
-    comes up short of the picture by that much, and both numbers are reported rather than the
-    picture being cut to fit (`trim_to_audio` is off) or the audio padded to length.
+    *song* got shorter — the lead was recorded against a longer master, so the take's own seconds
+    now reach past the end of the one on disk. (Before the window snapshot this was also how a
+    moved window surfaced; since 2026-08-21 the take carries the window it was rendered for, so
+    dragging the clip no longer changes these numbers at all.) The tail is clamped at the song's
+    end, the audio comes up short of the picture by that much, and both numbers are reported
+    rather than the picture being cut to fit (`trim_to_audio` is off) or the audio padded.
+
+    The sentence is scoped to the two numbers it is about (2026-08-21): `over_render_window`'s
+    only clamp is the song's own end, so a shortfall between *these two* is always the master
+    running out before the requested picture would reach — but "the picture" was reading as the
+    file, and on a take with no window snapshot the requested picture is the plan's count rather
+    than the render's. Saying "the requested picture" is what keeps this branch from explaining
+    a mismatch with a cause that may not have produced it.
     """
     client, store, comfy = make_client(tmp_path)
     project = restorable_project(
@@ -11056,7 +11088,10 @@ def test_a_take_whose_audio_runs_out_at_the_songs_end_says_so_instead_of_padding
     assert body["requested_frames"] == 124
     assert body["requested_picture_seconds"] == pytest.approx(124 / 24)
     assert body["lengths_match"] is False
-    assert "the song ends before the picture does" in body["length_note"]
+    assert (
+        "The two differ: the master runs out before the requested picture does"
+        in body["length_note"]
+    )
     assert comfy.prompts[-1]["mvp:save"]["inputs"]["trim_to_audio"] is False
 
 
@@ -11130,6 +11165,209 @@ def test_a_take_with_no_recorded_lead_is_refused_rather_than_given_a_guessed_off
 
     assert restore_audio(client, opening).status_code == 202
     assert comfy.prompts[-1]["mvp:song"]["inputs"]["seek_seconds"] == 0.0
+
+    # The question is asked of the take's window, not the shot's (2026-08-21). A take rendered
+    # for 12 s that records no lead stays unplaceable however the clip is dragged afterwards —
+    # and the refusal names 12 s, which is where the picture it cannot place actually is.
+    dragged = restorable_project(
+        store,
+        tmp_path,
+        start=0.0,
+        latest_take_start=RESTORE_SHOT_START,
+        latest_take_duration=RESTORE_SHOT_DURATION,
+        latest_take_lead=0.0,
+    )
+    refused = restore_audio(client, dragged)
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == RESTORE_AUDIO_NO_LEAD_REFUSAL.format(
+        shot=shot_label(store.get(dragged.id), store.get(dragged.id).shots[0]),
+        start=RESTORE_SHOT_START,
+    )
+    assert len(comfy.prompts) == 1  # the 0 s shot above, and nothing since
+
+
+def test_a_window_edited_after_the_render_restores_the_take_and_not_the_new_window(
+    tmp_path: Path,
+):
+    """Finding 2, the whole of it: the take is fixed and the window is not.
+
+    A shot rendered at 12 s for 3.75 s records a 0.25 s lead, and its take is 107 frames of song
+    from 11.75 s. Drag that rendered clip's left edge a quarter second right — `start` becomes
+    12.25 and `trim_nudge` compensates, which is exactly what the timeline does — and the take
+    still begins at song second 11.75. Until the window snapshot existed this route read the
+    live `start`, so the master went on the take a quarter second off the lip-sync it was
+    performed against, by a frame count the render had not asked for, while the response called
+    it "the same count the submission sent".
+
+    The window here is dragged at *both* edges — 12.0 s for 3.75 s becomes 12.25 s for 5.25 s —
+    because the offset and the length are two separate claims and a drag that changed only the
+    offset would leave the second one untested: `over_render_frames` answers 107 for every
+    window under four seconds, so 3.75 and 3.5 are the same count and a report reading the live
+    duration would still look right.
+
+    Now the numbers come off `latest_take_start`/`latest_take_duration`, so the payload is the
+    same payload as before the drag, and the report says the window has moved instead of
+    quietly reporting the moved one as the take's.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = restorable_project(store, tmp_path)
+    unmoved = restore_audio(client, project).json()
+
+    moved_project = restorable_project(
+        store,
+        tmp_path,
+        # The window as it reads after the drag...
+        start=RESTORE_SHOT_START + 0.25,
+        duration=5.25,
+        trim_nudge=-0.25,
+        # ...over the take that was rendered before it.
+        latest_take_start=RESTORE_SHOT_START,
+        latest_take_duration=RESTORE_SHOT_DURATION,
+        latest_take_lead=0.25,
+    )
+    response = restore_audio(client, moved_project)
+
+    assert response.status_code == 202
+    body = response.json()
+    # The take's seconds, unchanged by the drag: 11.75 s, not 12.0 s, and 107 frames' worth.
+    window = comfy.prompts[-1]["mvp:song"]["inputs"]
+    assert window["seek_seconds"] == 11.75
+    assert window["duration"] == pytest.approx(107 / 24)
+    # The same window the undragged shot sent, field for field. Reading the live `start` would
+    # have made this 12.0 s — a quarter second off the mouth — for 124 frames' worth of song.
+    first = comfy.prompts[0]["mvp:song"]["inputs"]
+    assert (window["seek_seconds"], window["duration"]) == (
+        first["seek_seconds"],
+        first["duration"],
+    )
+    # The count the render asked for, not the count a render of the new window would: the
+    # edited window is 5.25 s, which is 141 frames, and none of these three numbers is it.
+    assert over_render_frames(5.25) == 141
+    assert body["requested_frames"] == unmoved["requested_frames"] == 107
+    assert body["requested_picture_seconds"] == pytest.approx(107 / 24)
+    assert body["audio_seconds"] == pytest.approx(unmoved["audio_seconds"])
+
+    # The claim is now true, and the move is said rather than hidden.
+    assert body["describes_take"] is True
+    assert "window has been edited since the take was rendered" in body["length_note"]
+    assert "12.25s for 5.25s" in body["length_note"]  # what the timeline reads now
+    assert "12s for 3.75s" in body["length_note"]  # what the take was rendered for
+    # And an unmoved window says none of it: the sentence appears only when a window moved.
+    assert "window has been edited" not in unmoved["length_note"]
+    assert unmoved["describes_take"] is True
+
+
+def test_an_unmoved_window_reports_exactly_what_it_did_before_the_snapshot_existed(
+    tmp_path: Path,
+):
+    """The pin on the other side: recording the window changed nothing for a take nobody moved.
+
+    Same shot twice — once with the snapshot a render now writes, once with the pre-2026-08-21
+    manifest that carries the lead alone. The payload and every number in the report are
+    identical; the only difference is `describes_take` and the sentence that says why, which is
+    the whole of what "stop claiming" means here.
+    """
+    from music_video_producer.app import RESTORE_AUDIO_UNDESCRIBED_TAKE
+
+    client, store, comfy = make_client(tmp_path)
+    described = restore_audio(client, restorable_project(store, tmp_path)).json()
+    undescribed = restore_audio(
+        client,
+        restorable_project(
+            store, tmp_path, latest_take_start=0.0, latest_take_duration=0.0
+        ),
+    ).json()
+
+    windows = [
+        (prompt["mvp:song"]["inputs"]["seek_seconds"], prompt["mvp:song"]["inputs"]["duration"])
+        for prompt in comfy.prompts
+    ]
+    assert windows[1] == windows[0]
+    for field in ("audio_seconds", "requested_picture_seconds", "requested_frames"):
+        assert described[field] == undescribed[field], field
+    assert described["lengths_match"] == undescribed["lengths_match"] is True
+
+    assert described["describes_take"] is True
+    assert RESTORE_AUDIO_UNDESCRIBED_TAKE not in described["length_note"]
+    assert undescribed["describes_take"] is False
+    assert RESTORE_AUDIO_UNDESCRIBED_TAKE in undescribed["length_note"]
+    # The undescribed note never claims the window moved either — it cannot know.
+    assert "window has been edited" not in undescribed["length_note"]
+
+
+def test_a_legacy_take_at_zero_seconds_is_placed_but_never_described(tmp_path: Path):
+    """Finding 4: the 0 s exemption, and the sentence it used to make untrue.
+
+    `RESTORE_AUDIO_NO_LEAD_REFUSAL` exempts a shot at 0 s, and the argument it used to give —
+    "a post-margin submission records zero only at 0 s" — is true and proves nothing: a take at
+    0 s is exactly as likely to be a legacy one as a take at 12 s, and a recorded zero there
+    could not have been anything else. What makes the exemption safe is the *offset*: at a
+    window start of 0 s the take begins at song second 0 whether it was rendered before the
+    over-render margin or after it, so there is no sync to guess wrong about.
+
+    What can still differ is the length — a pre-margin take holds 90 frames where this route
+    reports the 107 a render would ask for now — and that is why the report must not describe
+    such a take. It does not: `describes_take` is false and the note says where its numbers came
+    from. And it does not explain anything either, because nothing here is a mismatch: the two
+    lengths agree, so the branch that names the song running out is not reached at all.
+    """
+    from music_video_producer.app import RESTORE_AUDIO_UNDESCRIBED_TAKE
+
+    client, store, comfy = make_client(tmp_path)
+    legacy = restorable_project(
+        store,
+        tmp_path,
+        start=0.0,
+        latest_take_lead=0.0,
+        latest_take_start=0.0,
+        latest_take_duration=0.0,
+    )
+
+    response = restore_audio(client, legacy)
+
+    assert response.status_code == 202
+    body = response.json()
+    # Placed at the song's first sample, which is where such a take begins either way.
+    assert comfy.prompts[-1]["mvp:song"]["inputs"]["seek_seconds"] == 0.0
+    # Not described, and the sentence says so instead of asserting the render asked for 107.
+    assert body["describes_take"] is False
+    assert RESTORE_AUDIO_UNDESCRIBED_TAKE in body["length_note"]
+    # No mismatch here, so no cause is named for one. This is the assertion the old wording
+    # failed: the `else` branch had become reachable for a second reason it did not name.
+    assert body["lengths_match"] is True
+    assert "The two agree." in body["length_note"]
+    assert "runs out" not in body["length_note"]
+    assert "ends before" not in body["length_note"]
+
+
+def test_a_submission_records_the_window_its_take_is_rendered_for(tmp_path: Path):
+    """The other half of finding 2: the number that was missing is now written.
+
+    Recorded at the moment of truth beside `latest_take_lead`, because it cannot be derived
+    later — nothing in a take's bytes says which window produced it. Written on every H3
+    submission and not only on the song-audio ones: the snapshot describes the take, and which
+    of them can be restored is a different question asked later. (Its clearing for a hand-picked
+    clip is pinned with the lead's, in the select-take test.)
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=12.0, duration=3.75)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    assert len(comfy.prompts) == 1  # one render, and the snapshot is that render's
+    recorded = store.get(project.id).shots[0]
+    assert recorded.latest_take_start == 12.0
+    assert recorded.latest_take_duration == 3.75
+    assert recorded.latest_take_lead == 0.25
+    # It is the window as it read at submission, so editing the shot afterwards leaves it be —
+    # which is the entire point of recording it.
+    live = store.get(project.id)
+    live.shots[0].start = 20.0
+    live.shots[0].duration = 6.0
+    store.save(live)
+    after = store.get(project.id).shots[0]
+    assert (after.latest_take_start, after.latest_take_duration) == (12.0, 3.75)
 
 
 def test_a_restoration_in_flight_refuses_a_second_one_and_so_does_a_live_render(
@@ -11334,6 +11572,8 @@ def test_select_take_switches_takes_and_attaches_video_assets(tmp_path: Path):
     # over-render bookkeeping cleared — no margin exists in a hand-picked file.
     stored = store.get(project.id)
     stored.shots[0].latest_take_lead = 0.25
+    stored.shots[0].latest_take_start = 12.0
+    stored.shots[0].latest_take_duration = 3.75
     stored.shots[0].trim_nudge = 0.1
     store.save(stored)
     attached = client.post(
@@ -11344,6 +11584,9 @@ def test_select_take_switches_takes_and_attaches_video_assets(tmp_path: Path):
     body = attached.json()["shots"][0]
     assert body["latest_output"] == f"music-video-producer/{project.id}/clips/asset_clip.mp4"
     assert body["latest_take_lead"] == 0 and body["trim_nudge"] == 0
+    # The window snapshot goes with the lead: no render of this plan made that file, so it
+    # describes no window of it either, and `restore_song_audio` reads the absence.
+    assert body["latest_take_start"] == 0 and body["latest_take_duration"] == 0
     assert (output_root / "music-video-producer" / project.id / "clips" / "asset_clip.mp4").read_bytes() == b"clip"
 
     # Not a video: refused with the remedy.
@@ -13599,8 +13842,8 @@ def test_fill_section_looks_never_replaces_a_written_look_without_consent(tmp_pa
 def test_fill_section_looks_is_a_no_op_when_every_section_already_has_one(tmp_path: Path):
     """Every look written and no consent to replace them: the answer is already known, so
     the 300 s local-model call is not spent to arrive at it. A report, not a refusal —
-    nothing is wrong — and the sentence names the word that would overrule it."""
-    from music_video_producer.app import SECTION_LOOKS_ALL_WRITTEN
+    nothing is wrong — and the sentence names the step that would overrule it."""
+    from music_video_producer.app import SECTION_LOOK_SKIP_ALL_WRITTEN, SECTION_LOOKS_ALL_WRITTEN
 
     director = SectionLookingDirector(looks=[("section_intro", "Intro", "Replacement.")])
     client, store, comfy = make_client(tmp_path, director=director)
@@ -13608,13 +13851,75 @@ def test_fill_section_looks_is_a_no_op_when_every_section_already_has_one(tmp_pa
     project.sections[0].prompt = "Already written."
     store.save(project)
 
-    response = fill_looks_applying(client, project.id)
+    response = fill_looks(client, project.id)
     assert response.status_code == 200
     assert response.json()["filled"] == 0
     assert response.json()["applied"] is False
     assert response.json()["message"] == SECTION_LOOKS_ALL_WRITTEN
+    # Every row says why, and says it in this report's own words rather than the ordinary
+    # written-skip's: there is no proposed look on these rows to send a consent about.
+    assert [row["reason"] for row in response.json()["sections"]] == [
+        SECTION_LOOK_SKIP_ALL_WRITTEN
+    ]
+    assert [row["prompt"] for row in response.json()["sections"]] == [""]
     assert director.calls == []  # the model was never asked
     assert store.get(project.id).sections[0].prompt == "Already written."
+    assert comfy.prompts == []
+
+
+def test_the_all_written_report_is_refused_as_a_plan_rather_than_writing_nothing(
+    tmp_path: Path,
+):
+    """Finding 5: the report that tells you what to do next is not itself the thing to send.
+
+    The short-circuit above returns *ahead of* the model call, so every row carries an empty
+    `prompt`. Confirming it — which is exactly what the old message's "send overwrite=true to
+    replace what is there" described — walked every plan check, `continue`d past every row for
+    want of a prompt, and answered 200 with `applied: false` and an untouched project: the route
+    answering its own documented sequence with silence.
+
+    Both halves are pinned here. The sentence now names the step that works, and the step that
+    does not is refused by name whether or not anybody reads the sentence.
+    """
+    from music_video_producer.app import SECTION_LOOKS_ALL_WRITTEN, SECTION_LOOKS_UNREAD_PLAN
+
+    director = SectionLookingDirector(looks=[("section_intro", "Intro", "Replacement.")])
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(store, [("section_intro", "Intro", 0.0, 11.0)])
+    project.sections[0].prompt = "Already written."
+    store.save(project)
+
+    report = fill_looks(client, project.id).json()
+    # The message names re-reporting, and does not tell a caller to confirm this report.
+    assert report["message"] == SECTION_LOOKS_ALL_WRITTEN
+    assert "run this again with overwrite=true" in SECTION_LOOKS_ALL_WRITTEN
+    assert "send overwrite=true" not in SECTION_LOOKS_ALL_WRITTEN
+
+    for body in (
+        {"confirm_apply": True, "overwrite": True, "plan": report},
+        {"confirm_apply": True, "plan": report},
+    ):
+        refused = fill_looks(client, project.id, **body)
+        assert refused.status_code == 422, body
+        assert refused.json()["detail"] == SECTION_LOOKS_UNREAD_PLAN, body
+
+    # Nothing written, no model asked, no GPU touched — on either attempt.
+    assert store.get(project.id).sections[0].prompt == "Already written."
+    assert director.calls == []
+    assert comfy.prompts == []
+
+    # And the step the sentence names does work, end to end: report again with the consent, and
+    # that report is a plan the confirm writes.
+    second = fill_looks(client, project.id, overwrite=True)
+    assert second.status_code == 200
+    assert second.json()["filled"] == 1
+    applied = fill_looks(
+        client, project.id, confirm_apply=True, overwrite=True, plan=second.json()
+    )
+    assert applied.status_code == 200
+    assert applied.json()["applied"] is True
+    assert store.get(project.id).sections[0].prompt == "Replacement."
+    assert len(director.calls) == 1  # the model was asked once, on the report
     assert comfy.prompts == []
 
 
@@ -16317,3 +16622,116 @@ def test_a_manifest_written_before_this_feature_loads_and_replaces_unchanged(tmp
     assert legacy.asset_ids == [sheet]
     assert [(c.asset_id, c.role, c.order) for c in legacy.citations] == [(sheet, "reference", 0)]
     assert legacy.reference_labels == {}
+
+
+# --------------------------------------------------------------------------------------------
+# `ProjectStore.save` can refuse a write that raced another one. What each caller does with that.
+# --------------------------------------------------------------------------------------------
+
+
+def refusing_save(store: ProjectStore, monkeypatch):
+    """Make this store's next `save` refuse, as it does when another save lands in its backoff.
+
+    Patched onto the instance the app holds rather than onto the class, so the fixtures that had
+    to write a project before the test could start are unaffected. The race itself is proved in
+    `tests/test_store.py`; what is under test here is only what the caller does when told.
+    """
+    calls: list[str] = []
+
+    def refuse(project):
+        calls.append(project.id)
+        raise ProjectChangedDuringSave("another save landed first")
+
+    monkeypatch.setattr(store, "save", refuse)
+    return calls
+
+
+def test_a_render_status_tick_that_loses_a_save_race_still_answers_200(tmp_path: Path, monkeypatch):
+    """The poll is the one save that must swallow the refusal, and the only one.
+
+    A tick reads the project, asks ComfyUI, and saves what moved. The Director editing a shot
+    mid-tick makes that save stale, and the store refuses it — correctly, because writing it back
+    is the 2026-08-19 revert. But this endpoint runs every two seconds and its whole contract is
+    that it never turns a transient condition into a toast, so the refusal is absorbed: the tick
+    still reports what it learned, the manifest simply is not written, and the next tick two
+    seconds later re-derives the identical answer from ComfyUI.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, _job = flux_job(client, store, comfy, "Poll loses the race")
+
+    async def completed_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {"prompt_id": prompt_id, "status": "complete", "outputs": [], "error": ""},
+        )()
+
+    comfy.history = completed_history
+    calls = refusing_save(store, monkeypatch)
+
+    response = client.get(f"/api/projects/{project_id}/render-status")
+
+    assert response.status_code == 200
+    # The tick's own reconciliation is still in the answer — only the write was dropped.
+    assert [item["status"] for item in response.json()["jobs"]] == ["complete"]
+    assert calls == [project_id], "the tick never attempted the save this test is about"
+    # And the manifest is untouched, which is the point: whatever the other writer put there
+    # stands. The job settles again on the next tick.
+    assert ProjectStore(tmp_path).get(project_id).jobs[0].status == "queued"
+
+
+def test_a_route_save_that_loses_a_race_answers_409_and_never_500(tmp_path: Path, monkeypatch):
+    """Every other save answers once, through the app-wide handler, in the client's own language.
+
+    Roughly seventy routes call `store.save`; the refusal means the same thing at all of them, so
+    it is translated in one place. 409 rather than 500 because this is the client's to act on and
+    is the status the optimistic-concurrency refusal already uses for the same remedy — and
+    `PUT /shots`, the route in the original defect, is the one asserted here.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Shots lose the race"))
+    calls = refusing_save(store, monkeypatch)
+
+    response = client.put(f"/api/projects/{project.id}/shots", json={"shots": []})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == SAVE_RACE_REFUSAL
+    assert calls == [project.id]
+    # Nothing of the refused request reached the disk.
+    assert ProjectStore(tmp_path).get(project.id).shots == []
+
+
+def test_a_create_that_loses_a_save_race_answers_409_rather_than_a_traceback(
+    tmp_path: Path, monkeypatch
+):
+    """`create` calls `save` under the same lock, so it inherits the same refusal and the same
+    answer. Asserted separately because it is the one caller that reaches `save` indirectly."""
+    client, store, _ = make_client(tmp_path)
+    refusing_save(store, monkeypatch)
+
+    response = client.post("/api/projects", json={"name": "Never landed"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == SAVE_RACE_REFUSAL
+
+
+def test_startup_healing_survives_a_save_race_on_one_project(tmp_path: Path, monkeypatch):
+    """Boot cannot fail, and a refused save is one more thing it must not fail on.
+
+    The healer's per-project guard already catches anything the store raises; this pins that the
+    new refusal is inside it, because the alternative is an application that will not start while
+    another process is writing the same data root.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Orphaned at boot"))
+    project.jobs.append(
+        RenderJob(kind="post", status="running", target_id="assembly", prompt_id="")
+    )
+    store.save(project)
+    refusing_save(store, monkeypatch)
+
+    healed = heal_orphaned_local_jobs_at_startup(store)
+
+    assert healed == 0, "a job that could not be written must not be counted as healed"
+    # Still open on disk, and still healable by the next boot that manages to write.
+    assert ProjectStore(tmp_path).get(project.id).jobs[0].status == "running"

@@ -18,8 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
@@ -114,7 +114,7 @@ from .prompt_cleanup import (
     rewrite_rejection,
     window_fingerprint,
 )
-from .store import ProjectNotFound, ProjectStore
+from .store import ProjectChangedDuringSave, ProjectNotFound, ProjectStore
 from .timeline import (
     H3_FPS,
     H3_MAX_SHOT_SECONDS,
@@ -448,6 +448,10 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 #: render bookkeeping written at submission, and `trim_nudge` is the human's own editorial
 #: fine-tune on a rendered file — neither is a plan fact a chat turn writes or reads, and
 #: nothing the conversational model could do with them is anything but noise.
+#: `latest_take_start`/`latest_take_duration` are withheld on the AD-13 pair's own grounds,
+#: which they are the take-side twin of: copies of `start`/`duration` taken at submission so
+#: `restore_song_audio` can tell a take's window from the live one, near-duplicate numbers a
+#: chat turn has no decision to make from and no route lets it write.
 #: `mix_take_audio` is the same class again: the human's acceptance of a rendered file's
 #: audio into the mix, decided by ear, never by the chat model. `flagged` likewise: the
 #: Director's own re-render mark (AD-5), decided by eye on a take, resubmitted by a
@@ -458,6 +462,8 @@ SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
         "approved_start",
         "approved_duration",
         "latest_take_lead",
+        "latest_take_start",
+        "latest_take_duration",
         "trim_nudge",
         "mix_take_audio",
         "flagged",
@@ -1606,6 +1612,19 @@ RESTORE_AUDIO_MISSING_SONG_REFUSAL = (
 # guess produces is a subtle desync rather than an error — the same reason a shot that never
 # rode the master is refused instead of given a window. Re-render the shot and the lead is
 # recorded.
+#
+# **Why 0 s is exempt, corrected 2026-08-21.** The argument above — "a post-margin submission
+# records zero only at 0 s" — is true and is *not* what makes the exemption safe: a take at 0 s
+# is exactly as likely to be a legacy one as a take at 12 s, and a recorded zero there
+# distinguishes nothing, because `min(ideal, extra, start)` could not have recorded anything
+# else. What makes it safe is the *offset*, which is the thing this refusal protects: at a
+# window start of 0 s, `over_render_window` answers `trim_start = 0` for lead 0, and a take
+# rendered before the margin also begins at song second 0. Pre-margin or post-margin, the first
+# frame of that take is the song's first sample, so there is no desync to guess wrong about.
+# What can still differ at 0 s is the take's *length* — a pre-margin take holds fewer frames
+# than `over_render_frames` now asks for — and a length is reported, never assumed: see
+# `RESTORE_AUDIO_UNDESCRIBED_TAKE`, which is what the response says whenever the take carries no
+# window snapshot to be described from.
 RESTORE_AUDIO_NO_LEAD_REFUSAL = (
     "{shot} starts at {start:g}s but its take records no sync lead, so this take was rendered "
     "before takes carried one, or its clip was chosen by hand. How far before the window the "
@@ -1632,6 +1651,42 @@ RESTORE_AUDIO_PREFIX_SUFFIX = "-song-audio"
 #: floats and one of them is a division, so an exact `==` would report a mismatch on arithmetic
 #: rather than on a real difference in length.
 RESTORE_AUDIO_LENGTH_TOLERANCE = 0.5 / 24
+#: The same tolerance, spent on a different question: has the shot's window been edited since
+#: this take was rendered? Both sides are manifest floats that survived a JSON round trip, so an
+#: exact `!=` would report a move on the last bit of a number nobody touched.
+RESTORE_AUDIO_WINDOW_TOLERANCE = 1e-6
+#: What the length note says when the take carries no window snapshot — every take rendered
+#: before `Shot.latest_take_start` existed (2026-08-21), and every hand-picked clip, whose
+#: bookkeeping `select_shot_clip` clears.
+#:
+#: This is the "stop claiming" half of the 2026-08-21 finding and it is the honest reading of
+#: what the numbers are: without a snapshot the only window on the manifest is the *live* one,
+#: and the live window is a fact about the plan, not about the file. If it has not been edited
+#: since the render the numbers are the take's; if it has, they are not, and nothing in the
+#: manifest can tell those apart. Reported rather than refused, because refusing would disable
+#: this stage for every take that exists today — including the ones on the GPU right now —
+#: over a staleness there is no evidence of, and the failure it would prevent is a *reported*
+#: length, not a silent one. The offset is safe on its own terms: `latest_take_lead` is refused
+#: when it cannot place the take at all (`RESTORE_AUDIO_NO_LEAD_REFUSAL`).
+RESTORE_AUDIO_UNDESCRIBED_TAKE = (
+    "These two numbers are read from the shot's window as it reads now, because this take "
+    "recorded none of its own — it was rendered before takes carried a window, or its clip was "
+    "chosen by hand. They describe the take only if the window has not been edited since, which "
+    "the manifest cannot say. Render the shot again and the take's own window is recorded with "
+    "it. "
+)
+#: And what it says when the take *does* carry a snapshot and the window has since moved. Not a
+#: refusal: the take is a fixed file and its recorded window places it exactly, so this stage
+#: still lays the seconds it was performed against over it — the same file it would have made
+#: the moment the render landed. What has changed is the plan around it, which is assembly's
+#: refusal to make (`assembly.ASSEMBLY_STALE_REFUSAL`) and not this stage's; said here so the
+#: Director reads it from the report rather than discovering it at export.
+RESTORE_AUDIO_WINDOW_MOVED = (
+    "This shot's window has been edited since the take was rendered — it now reads "
+    "{start:g}s for {duration:g}s, and the take was rendered for {take_start:g}s for "
+    "{take_duration:g}s. The numbers above are the take's, which is what the master is laid "
+    "over; the timeline's own window is a separate decision and assembly answers for it. "
+)
 # Deliberately ASCII, exactly as `batch.READINESS_REFUSAL` and the render-again refusals are, and
 # for the same reason: the frontend halves are read back through node, whose stdout the contract
 # test decodes with the platform encoding on Windows.
@@ -1709,6 +1764,19 @@ APPROVAL_FIELDS: tuple[str, ...] = ("approved_output", "approved_start", "approv
 #: the button can explain itself rather than only failing -- and a second wording of one rule is a
 #: second thing to keep true. `api.js` carries a copy pinned to this one by a contract test.
 PROJECT_CHANGED_REFUSAL = "Project changed since it was loaded; refresh before replacing it"
+
+#: The same 409 for the same reason, one layer down and without a revision to compare. Where
+#: `PROJECT_CHANGED_REFUSAL` is a request that arrived carrying a stale `updated_at`,
+#: `SAVE_RACE_REFUSAL` is a request whose *write* found the manifest moved underneath it — the
+#: store's `ProjectChangedDuringSave`, raised when another save landed inside this one's replace
+#: backoff. Deliberately a separate sentence rather than a reuse of the constant above: that one
+#: is pinned byte for byte to a copy in `api.js` by a contract test, and this refusal is about
+#: something the client could not have pre-flighted, so it carries "nothing was saved" explicitly.
+#: Same remedy either way, which is why the wording ends in the same instruction.
+SAVE_RACE_REFUSAL = (
+    "Another change was saved to this project while this one was being written, so nothing was "
+    "saved; refresh before replacing it"
+)
 
 GENERIC_WRITE_APPROVAL_REFUSAL = (
     "This save would change {shot}'s approval. An approval is an editorial decision about one "
@@ -2529,17 +2597,39 @@ SECTION_LOOKS_NO_STYLE_BIBLE = (
 )
 
 #: What the report says when every section already carries a look the Director wrote. Not a
-#: refusal: the answer is that there is nothing *to* do, and the sentence names the consent
-#: word so the Director does not have to guess how to overrule it.
+#: refusal: the answer is that there is nothing *to* do, and the sentence names the step that
+#: would overrule it so the Director does not have to guess.
+#:
+#: Reworded 2026-08-21, because the sentence named the wrong step. "Send overwrite=true"
+#: describes a *confirm*, and this report has nothing for a confirm to write: it short-circuits
+#: ahead of the model call, so its rows carry no proposed look. An API caller that followed it
+#: literally — `confirm_apply` and `overwrite` with this report as `plan` — passed every check,
+#: skipped every row for want of a prompt, and got 200 with `applied: false` and nothing
+#: written. Two halves to the fix and this is the first: name the step that actually works,
+#: which is the one the browser has always taken (report again *with* the consent, read what it
+#: proposes, confirm that). The second half is `SECTION_LOOKS_UNREAD_PLAN`, which refuses this
+#: report if it comes back as a plan anyway.
 SECTION_LOOKS_ALL_WRITTEN = (
-    "Every section already has a look. Nothing was changed — send overwrite=true to "
-    "replace what is there."
+    "Every section already has a look. Nothing was changed and no look was read for any of "
+    "them — run this again with overwrite=true to see what would replace them, then confirm "
+    "that report."
 )
 
 #: The per-section skip reasons, one sentence each, because "skipped" without a why is the
 #: report step doing nothing (`spec-arm-a-plan`'s argument, and snap-cuts' `SnapCutSkip`).
 SECTION_LOOK_SKIP_WRITTEN = (
     "already has a look you wrote; send overwrite=true to replace it"
+)
+#: The same skip, on the one report where "send overwrite=true" would be a lie: the all-written
+#: short-circuit, which never asked the model, so this row carries no proposed look for a
+#: confirm to write. Its own sentence rather than a reuse of the one above, and that is not only
+#: wording — `section_looks_plan_writes` reads this string to recognise the report and refuse it
+#: as a plan, and `plan_fingerprint` covers `sections`, so the marker cannot be stripped off a
+#: plan without the digest failing first. Opens with the same clause the browser's preview
+#: renders, so the two skips read alike where they mean alike.
+SECTION_LOOK_SKIP_ALL_WRITTEN = (
+    "already has a look you wrote; nothing was read for it — report again with overwrite=true "
+    "to see what would replace it"
 )
 SECTION_LOOK_SKIP_UNDESCRIBED = "the treatment does not describe this section"
 SECTION_LOOK_SKIP_UNANSWERED = "the model returned no look for this section"
@@ -2559,6 +2649,20 @@ SECTION_LOOKS_PLAN_MISMATCH = (
     "The plan sent with this confirm is not the plan this pass reported: it does not match its "
     "own plan_id. Refused rather than reading the treatment again, because the look that lands "
     "has to be the look that was read. Nothing was written. Run the report again."
+)
+#: The plan that can write nothing, refused as a plan (2026-08-21). The all-written report is
+#: produced *ahead of* the model call — see `SECTION_LOOKS_ALL_WRITTEN` — so every row of it
+#: carries an empty `prompt`, and confirming it walked every check, skipped every row, and
+#: answered 200 `applied: false` having written nothing. A 200 that means "your request was
+#: fine and I did nothing" is the silence this codebase refuses everywhere else, and it was
+#: reachable by following this route's own message. Refused rather than served, because the
+#: thing to do instead is a different call and the sentence has to name it: this pass cannot
+#: write a look nobody read, and nobody read one here.
+SECTION_LOOKS_UNREAD_PLAN = (
+    "This confirm carries the report that said every section already has a look. That report "
+    "stops before the treatment is read, so it holds no look for any section and confirming it "
+    "would write nothing. Run the report again with overwrite=true, read the looks it proposes, "
+    "then confirm that report. Nothing was written and no model was asked."
 )
 
 
@@ -2747,10 +2851,15 @@ def section_looks_plan_writes(
     """Check a confirm's echoed report against the live project; say what it writes.
 
     No model is asked on this path and none can be: the looks it writes are the strings that
-    came back on the report, and the three checks above them are what makes "the look that
-    lands is the look that was read" a fact rather than a hope. Raises rather than reporting,
-    because a confirm that cannot prove its plan has nothing to report *about* — the thing it
-    was asked to write is exactly the thing it cannot identify.
+    came back on the report, and the checks above them are what makes "the look that lands is
+    the look that was read" a fact rather than a hope. Raises rather than reporting, because a
+    confirm that cannot prove its plan has nothing to report *about* — the thing it was asked
+    to write is exactly the thing it cannot identify.
+
+    Four checks, not three: the fourth is the all-written short-circuit, a report that is
+    genuinely this pass's own and genuinely matches its digest, and still cannot write anything
+    because no look was ever read for it. Refused by name (`SECTION_LOOKS_UNREAD_PLAN`) rather
+    than allowed to fall through the loop and answer 200 with nothing written.
     """
     plan = request.plan
     if plan is None or not plan.sections or not plan.plan_id:
@@ -2759,6 +2868,14 @@ def section_looks_plan_writes(
         raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
     if plan_fingerprint(project, plan) != plan.plan_id:
         raise HTTPException(status_code=422, detail=SECTION_LOOKS_PLAN_MISMATCH)
+    # Fourth, and after the digest deliberately: this is a statement about *which* report is
+    # being confirmed, so it is only worth making once the report has proved it is the one it
+    # says it is. The all-written short-circuit never asked the model, so it carries no look on
+    # any row; without this the loop below would `continue` past every one of them and the
+    # route would answer 200 having written nothing — while its own message told the caller to
+    # send exactly this. See `SECTION_LOOKS_UNREAD_PLAN`.
+    if any(row.reason == SECTION_LOOK_SKIP_ALL_WRITTEN for row in plan.sections):
+        raise HTTPException(status_code=422, detail=SECTION_LOOKS_UNREAD_PLAN)
     by_id = {section.id: section for section in project.sections}
     response = plan.model_copy(deep=True)
     response.applied = False
@@ -2805,7 +2922,8 @@ def clean_prompts_plan_writes(
 ) -> tuple[CleanPromptsResponse, list[tuple[Shot, str]]]:
     """Check a confirm's echoed report against the live project; say what it writes.
 
-    `section_looks_plan_writes`' three checks, and then the row-level ones. Nothing is
+    `section_looks_plan_writes`' plan-identity checks (its fourth is that pass's own — this one
+    has no short-circuit report to recognise), and then the row-level ones. Nothing is
     recomputed into the response: this pass has no second flag, so every count, note and row
     of diff rides back exactly as it was read, and the confirm's body differs from the
     report's in `applied` and `project` alone.
@@ -3142,11 +3260,24 @@ class AudioRestoreResponse(BaseModel):
     #: song, not the exposed slice's. A 2.083 s micro-cut's take is 4.4583 s long and gets
     #: 4.4583 s of song, beginning `latest_take_lead` before the window.
     audio_seconds: float
-    #: Seconds of picture the render was asked to produce, from `timeline.over_render_frames` —
-    #: the same count the submission sent. Equal to `audio_seconds` except where the song ends
-    #: before the picture does, which is the one mismatch left after 2026-08-21.
+    #: Seconds of picture a render of `latest_take_start`/`latest_take_duration` asks for, from
+    #: `timeline.over_render_frames`. Equal to `audio_seconds` except where the song ends before
+    #: the picture does, which is the only way the two numbers *this route computes* can differ.
+    #:
+    #: **Whether that is the count the submission sent is `describes_take`'s question, not this
+    #: field's** (corrected 2026-08-21). It read "the same count the submission sent", and that
+    #: was a guarantee the code did not provide: the window was rebuilt from the shot's live
+    #: `start`/`duration`, which go on being edited after the take is fixed. It is the count the
+    #: submission sent whenever `describes_take` is true, and a count read off the current plan
+    #: when it is false.
     requested_picture_seconds: float
     requested_frames: int
+    #: Whether the three numbers above describe **this take** or merely the shot as it reads now.
+    #: True when the take carried a window snapshot to compute them from; false for a take
+    #: rendered before those existed and for a hand-picked clip. `length_note` says the same
+    #: thing in the sentence the Director reads — this is the machine-readable half, so a client
+    #: never has to match on prose to know which kind of answer it is holding.
+    describes_take: bool
     #: False when the two above differ by more than half a frame at 24 fps. Half a frame rather
     #: than an exact comparison because both are floats and one is a division.
     lengths_match: bool
@@ -4412,6 +4543,26 @@ def create_app(
     # lifespan hook would not run for the many callers that never enter the app's context.
     # It cannot raise: see `heal_orphaned_local_jobs_at_startup`. ComfyUI jobs are untouched.
     app.state.startup_healed_jobs = heal_orphaned_local_jobs_at_startup(store)
+
+    @app.exception_handler(ProjectChangedDuringSave)
+    async def handle_save_race(_: Request, error: ProjectChangedDuringSave) -> JSONResponse:
+        """One answer for the store's lost-update refusal, across every route that saves.
+
+        `ProjectStore.save` refuses rather than replay a manifest it serialised before another
+        save landed, because replaying it would revert a write whose caller was already told 200.
+        Roughly seventy routes call `save`, and the refusal means the same thing at every one of
+        them — *nothing was written, re-read and try again* — so it is answered once here rather
+        than seventy times. A 409 and not a 500: this is the client's to act on, it is the status
+        the optimistic-concurrency refusal already uses for the same remedy, and `api.js` already
+        knows to re-read on one. The `detail` shape matches `HTTPException`'s so the client's
+        error reader needs no special case.
+
+        Not registered for the store's other failure, an `OSError` from a manifest that stayed
+        locked for the whole retry: that one is not a concurrency problem and a retry will not
+        fix it, so it stays a 500 with its traceback.
+        """
+        logger.warning("Refused a save that raced another write: %s", error)
+        return JSONResponse(status_code=409, content={"detail": SAVE_RACE_REFUSAL})
 
     def get_project(project_id: str) -> Project:
         try:
@@ -6345,6 +6496,15 @@ def create_app(
         # (0 for every non-song path). Recorded at the moment of truth because it cannot
         # be derived later; the Monitor, the nudge control and assembly all cut from it.
         shot.latest_take_lead = take_lead
+        # And the window it begins that far before, snapshotted with it (2026-08-21). The
+        # lead alone does not describe a take: `start` and `duration` are edited afterwards
+        # — dragging a rendered clip's left edge moves `start` while `trim_nudge`
+        # compensates — and every number `restore_song_audio` reported was read off the
+        # live window as though it were the take's. Two fields written where one already
+        # was, in the same statement, so a take can never carry half a description. See
+        # `Shot.latest_take_start`.
+        shot.latest_take_start = shot.start
+        shot.latest_take_duration = shot.duration
         job = RenderJob(
             kind="h3",
             prompt_id=submission.prompt_id,
@@ -6616,8 +6776,8 @@ def create_app(
         over the finished picture.
 
         **The window is not computed here.** This route hands `build_audio_replace_payload` four
-        numbers off the Shot — `start`, `duration`, `song_duration` and the recorded
-        `latest_take_lead` — and that builder puts them through the same two functions
+        numbers off the Shot — a window start, a window duration, `song_duration` and the
+        recorded `latest_take_lead` — and that builder puts them through the same two functions
         `generate_h3` puts them through. There is no window parameter anywhere on this path for
         the two stages to disagree through, and the failure a second computation would produce —
         a subtle desync rather than an error — has nowhere to come from.
@@ -6631,6 +6791,27 @@ def create_app(
         from `start - latest_take_lead`, which is `over_render_window`: the same call, with the
         same lead, that conditioned the render. A shot at 12 s with a 0.25 s lead is restored
         from 11.75 s, and frame 6 of that take is song second 12.000 exactly.
+
+        **And the take's window is the one recorded on the take** (2026-08-21, second pass). The
+        paragraph above was the whole fix at first, and it still read the window off the *live*
+        `start`/`duration`: correct only until somebody edited them. A take is fixed the moment
+        it is submitted; a window is not. Drag a rendered clip's left edge and `start` moves by
+        `delta` while `trim_nudge` compensates — the take goes on beginning where it always did —
+        so the master was laid `delta` seconds off the lip-sync it was performed against, by a
+        frame count the render had not asked for, and both the docstring and
+        `AudioRestoreResponse.requested_picture_seconds` called the result "the same count the
+        submission sent". `generate_h3` now snapshots the window beside the lead
+        (`Shot.latest_take_start`), this route computes from the snapshot, and the claim is true
+        by construction rather than by nobody having dragged anything.
+
+        For a take with no snapshot — every take rendered before that date, and every clip
+        chosen by hand — the live window is all there is, and the route uses it and **says so**:
+        `describes_take` is false and `RESTORE_AUDIO_UNDESCRIBED_TAKE` opens the note. Not
+        refused, and the choice is deliberate: nothing distinguishes an unmoved legacy window
+        from a moved one, so a refusal would disable this stage for every take that exists today
+        over a staleness there is no evidence of, and the harm it would avert is a length
+        reported wrongly rather than a sync lost silently — the offset such a take is placed at
+        is the one `RESTORE_AUDIO_NO_LEAD_REFUSAL` already refuses to guess.
 
         The refusal for a window past the end of the song is `song_audio_window`'s, raised inside
         the builder and translated here, so this stage refuses exactly the shots the render
@@ -6732,15 +6913,31 @@ def create_app(
                     shot=shot_label(project, shot), path=project.song.path
                 ),
             ) from error
+        # The take's own window, before anything is computed from a window at all. A
+        # `latest_take_duration` of 0 is "never snapshotted" — the model constrains a real
+        # `duration` to `gt=0` — and it is what every take rendered before 2026-08-21 reads, and
+        # every clip `select_shot_clip` cleared the bookkeeping for. Described takes compute from
+        # the take; undescribed ones fall back to the live window and the response says which of
+        # the two it was. See `Shot.latest_take_start` and `RESTORE_AUDIO_UNDESCRIBED_TAKE`.
+        describes_take = shot.latest_take_duration > 0
+        take_start = shot.latest_take_start if describes_take else shot.start
+        take_duration = shot.latest_take_duration if describes_take else shot.duration
+        # Only askable of a described take: an undescribed one has nothing to compare the live
+        # window against, which is exactly why it cannot be claimed to describe anything.
+        window_moved = describes_take and (
+            abs(take_start - shot.start) > RESTORE_AUDIO_WINDOW_TOLERANCE
+            or abs(take_duration - shot.duration) > RESTORE_AUDIO_WINDOW_TOLERANCE
+        )
         # The take's own bookkeeping, last of the refusals and still before any submission. See
-        # `RESTORE_AUDIO_NO_LEAD_REFUSAL`: a shot past 0 s whose take records no lead is a take
-        # this route cannot place, and placing it anyway is the guess the whole stage refuses to
-        # make elsewhere.
-        if shot.start > 0 and not shot.latest_take_lead:
+        # `RESTORE_AUDIO_NO_LEAD_REFUSAL`: a take that begins past 0 s and records no lead is a
+        # take this route cannot place, and placing it anyway is the guess the whole stage
+        # refuses to make elsewhere. Asked of the take's window rather than the shot's, so a
+        # rendered shot dragged to 0 s is still refused for the take it actually holds.
+        if take_start > 0 and not shot.latest_take_lead:
             raise HTTPException(
                 status_code=422,
                 detail=RESTORE_AUDIO_NO_LEAD_REFUSAL.format(
-                    shot=shot_label(project, shot), start=shot.start
+                    shot=shot_label(project, shot), start=take_start
                 ),
             )
         try:
@@ -6752,12 +6949,14 @@ def create_app(
                 source_audio=song.as_posix(),
                 # The four numbers, unmodified. Everything correct about this stage follows from
                 # these going to `song_audio_window` and `over_render_window` rather than to a
-                # window computed here. `latest_take_lead` is read off the Shot and never
-                # recomputed: it describes the take that exists, and `over_render_lead` would
-                # answer for the take a submission *now* would produce, which is a different
-                # number the moment the window has been edited.
-                start=shot.start,
-                duration=shot.duration,
+                # window computed here. All four describe the take rather than the plan:
+                # `latest_take_lead` is read off the Shot and never recomputed, because
+                # `over_render_lead` would answer for the take a submission *now* would produce;
+                # and the window is the one recorded with that lead, for the same reason one step
+                # further out — the live `start`/`duration` are a different pair the moment
+                # anybody drags the clip.
+                start=take_start,
+                duration=take_duration,
                 song_duration=project.song.duration,
                 take_lead=shot.latest_take_lead,
                 prefix=(
@@ -6773,8 +6972,8 @@ def create_app(
         # The same four numbers again, so what the Director is told about the take is the take
         # the payload above carries rather than a second description of it.
         lengths = audio_replace_lengths(
-            start=shot.start,
-            duration=shot.duration,
+            start=take_start,
+            duration=take_duration,
             song_duration=project.song.duration,
             take_lead=shot.latest_take_lead,
         )
@@ -6802,19 +7001,36 @@ def create_app(
             requested_picture_seconds=lengths["requested_picture_seconds"],
             requested_frames=int(lengths["requested_frames"]),
             lengths_match=matched,
+            describes_take=describes_take,
             length_note=(
                 f"{lengths['audio_seconds']:g}s of the master song, from "
-                f"{shot.start - shot.latest_take_lead:g}s to "
-                f"{shot.start - shot.latest_take_lead + lengths['audio_seconds']:g}s, over a "
+                f"{take_start - shot.latest_take_lead:g}s to "
+                f"{take_start - shot.latest_take_lead + lengths['audio_seconds']:g}s, over a "
                 f"picture the render asked H3 for as {int(lengths['requested_frames'])} frames "
                 f"({lengths['requested_picture_seconds']:.4g}s at 24 fps). "
                 + (
                     "The two agree. "
                     if matched
-                    # The one way they can still differ now that both come from the same
-                    # over-render arithmetic: the song runs out before the picture does, so the
-                    # tail of the take keeps its own audio rather than being cut to the song.
-                    else "They differ because the song ends before the picture does. "
+                    # The one way the two numbers *this route computed* can differ, and it is
+                    # stated about them rather than about the file: `over_render_window`'s only
+                    # clamp is the song's own end, so a shortfall is the song running out before
+                    # the requested picture would have reached. Whether the file on disk holds
+                    # that many frames is a separate claim and the sentence below refuses to
+                    # make it — which is what keeps this branch honest for an undescribed take,
+                    # where the requested count is the plan's rather than the render's.
+                    else "The two differ: the master runs out before the requested picture "
+                    "does, so the tail of the take keeps its own audio. "
+                )
+                + (RESTORE_AUDIO_UNDESCRIBED_TAKE if not describes_take else "")
+                + (
+                    RESTORE_AUDIO_WINDOW_MOVED.format(
+                        start=shot.start,
+                        duration=shot.duration,
+                        take_start=take_start,
+                        take_duration=take_duration,
+                    )
+                    if window_moved
+                    else ""
                 )
                 + "Neither is padded or cut: trim_to_audio is off. The frames the file "
                 "actually holds are an ffprobe reading, not a number this application claims."
@@ -7038,8 +7254,13 @@ def create_app(
             if shot.latest_output != pointer:
                 shot.latest_review = None
             shot.latest_output = pointer
-            # External clip: no over-render margin exists in it, so no lead to cut.
+            # External clip: no over-render margin exists in it, so no lead to cut — and no
+            # window snapshot either, because nothing rendered this file for a window of this
+            # plan. Cleared together with the lead so the pair cannot claim a provenance the
+            # clip does not have; `restore_song_audio` reads the absence and says so.
             shot.latest_take_lead = 0.0
+            shot.latest_take_start = 0.0
+            shot.latest_take_duration = 0.0
             shot.trim_nudge = 0.0
         else:
             raise HTTPException(status_code=422, detail=SELECT_TAKE_EMPTY)
@@ -7627,6 +7848,16 @@ def create_app(
         report back as `plan` and writes exactly it — see the plan-carrying block above for the
         digest, the revision check and why the plan travels on the wire rather than in a cache.
 
+        **One report is not a plan**, and it is the one this route answers with most often on a
+        finished project: the all-written short-circuit below returns ahead of the model call,
+        so its rows hold no look for a confirm to write. It used to say "send overwrite=true to
+        replace what is there", and a caller who did exactly that got 200, `applied: false`, and
+        an untouched project — the route answering its own documented sequence with silence. The
+        message now names the step that works (report again *with* the consent, then confirm
+        that report, which is what the browser has always done) and
+        `section_looks_plan_writes` refuses the short-circuit report if it comes back as a plan
+        regardless.
+
         Nothing here renders, arms, queues or approves. It writes one string per section and
         touches no other field on the project.
         """
@@ -7670,7 +7901,11 @@ def create_app(
                         start=section.start,
                         filled=False,
                         previous=section.prompt,
-                        reason=SECTION_LOOK_SKIP_WRITTEN,
+                        # Not `SECTION_LOOK_SKIP_WRITTEN`: that row carries the look the
+                        # consent would buy, and this one cannot — the model was never asked.
+                        # The distinct sentence is also what lets a confirm recognise this
+                        # report and refuse it rather than write nothing.
+                        reason=SECTION_LOOK_SKIP_ALL_WRITTEN,
                     )
                     for section in ordered
                 ],
@@ -9455,7 +9690,21 @@ def create_app(
         project = get_project(project_id)
         outcome = await reconcile_render_jobs(project, comfy)
         if outcome.changed:
-            store.save(project)
+            try:
+                store.save(project)
+            except ProjectChangedDuringSave:
+                # The one save in this application that must not become a 409. This tick read
+                # the project before the Director's own edit landed, so refusing it is right —
+                # the alternative is the 2026-08-19 revert — but the poll is a loop, and the
+                # next tick two seconds from now re-reads and re-derives exactly this same
+                # reconciliation from ComfyUI, so there is nothing to recover and nothing to
+                # tell anyone. Reporting it would put an error toast on the Director's screen
+                # for a race the Director caused by typing. The report below still describes
+                # what the tick actually learned; only the manifest write was dropped.
+                logger.info(
+                    "Render-status tick for %s lost a save race; the next tick redoes it",
+                    project_id,
+                )
         return render_status_report(
             project,
             comfy_online=outcome.comfy_online,

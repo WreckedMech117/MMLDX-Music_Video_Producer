@@ -2083,6 +2083,14 @@ def build_audio_replace_payload(
     trust, so there is no second computation of "which seconds is this take" anywhere on this
     path and no way for the two to drift.
 
+    ``start`` and ``duration`` are **the take's window, not the shot's live one**, and this
+    builder cannot check that — the two are the same numbers and only the caller knows which
+    pair it read. `app.restore_song_audio` passes `Shot.latest_take_start`/
+    `latest_take_duration`, the snapshot written beside the lead at submission, and falls back
+    to the live window only for a take that recorded none, reporting that it did. The
+    distinction is the 2026-08-21 finding: a window edited after a render leaves this builder
+    computing a correct payload for a take that does not exist.
+
     Two functions, because there are two questions and they have different answers:
 
     * ``song_audio_window`` answers *is this shot legal at all* — the past-the-end refusal,
@@ -2280,6 +2288,13 @@ def audio_replace_lengths(
     Every number here comes from the `timeline` functions the submission path renders through,
     never from a copy of the grid, so what the Director is told a take is cannot disagree with
     what was asked for.
+
+    **Which window it is told about is the caller's to get right.** ``requested_picture_seconds``
+    is what a render of ``start``/``duration`` asks H3 for, and that is the count the submission
+    sent only if those are the numbers the submission was given. `app.restore_song_audio` passes
+    the take's recorded window for exactly this reason, and reports ``describes_take: false``
+    when the take has none to pass — see `Shot.latest_take_start`. Nothing here can tell the two
+    apart, so nothing here claims to.
     """
     _finite("Shot duration", duration)
     if duration <= 0:
