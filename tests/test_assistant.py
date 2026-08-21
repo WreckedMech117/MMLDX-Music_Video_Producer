@@ -2002,3 +2002,65 @@ def test_a_keyframe_citation_is_never_swapped_for_a_contact_sheet(tmp_path: Path
     ]
     # No sheets at all: the same citations back, field for field.
     assert prefer_identity_sheets(mixed, {}) == mixed
+
+
+def test_a_re_cited_shot_has_its_reference_map_re_expanded_and_no_model_is_asked_for_it(
+    tmp_path: Path,
+):
+    """The other writer of citations, and the fifth route the refresh had to reach.
+
+    `assistant_fill` writes `Shot.citations` onto shots that may already carry an expansion, so
+    it is exactly the live defect's shape arriving through a tool call instead of a drag: the
+    references move and the stored reference map goes on naming the old ones. Dropping the
+    refresh from this route survived the whole suite, because every other test of it drives
+    shots that have never been expanded.
+
+    **No model is asked for the re-expansion.** The turn's own `assist` call is the only one this
+    test allows — `FillingDirector` has no `expand_shot` at all, so a route that reached for the
+    specialist here would raise rather than quietly spend a call.
+    """
+    from music_video_producer.app import song_audio_prose
+
+    director = FillingDirector(
+        turn(
+            {
+                "shot_id": "shot_one",
+                "citations": [{"asset_id": "asset_forest", "role": "reference"}],
+            },
+            message="Put the forest plate behind it.",
+        )
+    )
+    client, store, comfy = make_client(tmp_path, director)
+    project = producer_project(store)
+    project.song = Song(title="Signal Bloom", source="imported", duration=60)
+    project.shots[0] = Shot(
+        id="shot_one", start=0, duration=5, prompt="She turns toward camera.",
+        mode="references", use_song_audio=True,
+        citations=[AssetCitation(asset_id="asset_wolf", role="reference", order=0)],
+    )
+    store.save(project)
+
+    # Expanded through the route that writes expansions. A song-audio references shot's
+    # expansion is deterministic, so this costs no model call either.
+    expanded = client.post(f"/api/projects/{project.id}/shots/shot_one/expand-prompt")
+    assert expanded.status_code == 200, expanded.text
+    before = store.get(project.id).shots[0].h3_prompt
+    assert "Grey wolf" in before
+    assert "Pine forest" not in before
+
+    response = client.post(
+        FILL.format(project=project.id),
+        json={"message": "cite the forest instead", "shot_ids": ["shot_one"]},
+    )
+
+    assert response.status_code == 200, response.text
+    stored = store.get(project.id)
+    shot = stored.shots[0]
+    assert [item.asset_id for item in shot.citations] == ["asset_forest"]
+    assert "Pine forest" in shot.h3_prompt
+    assert "Grey wolf" not in shot.h3_prompt
+    assert shot.h3_prompt == song_audio_prose(stored, shot)
+    # The Director's own intent is not this route's to touch, and nothing rendered.
+    assert shot.prompt == "She turns toward camera."
+    assert len(director.messages) == 1, "one assist call, and no expansion call behind it"
+    assert comfy.prompts == []

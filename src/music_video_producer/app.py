@@ -462,6 +462,11 @@ SHOT_DIRECTOR_VISIBLE = frozenset(
 SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
     {
         "h3_prompt",
+        # Withheld with the expansion it describes, and for the same two reasons: it has never
+        # been in the dump, and it is bookkeeping about the machine-facing text rather than a
+        # plan fact a chat turn writes or reads. No tool schema exposes it either — the only
+        # writers are the expansion paths and `refresh_reference_maps`.
+        "h3_prompt_map",
         "approved_start",
         "approved_duration",
         "latest_take_lead",
@@ -496,6 +501,25 @@ REFERENCE_MAP_ROLE_TAGS = {
 REFERENCE_KEYFRAME_NOT_IMAGE = (
     "A {role} must be an image, and {name} is {article} {kind}."
 )
+
+
+#: How every reference map this application writes opens. Named because three things now read
+#: it rather than one writing it: `reference_prompt` builds the sentence, `Shot.h3_prompt_map`
+#: stores it, and `stale_reference_map` decides from it whether a stored expansion still
+#: describes the references the shot cites. The bytes are exactly what this route has always
+#: emitted — the prefix, the tags joined by `"; "`, a full stop — so every prompt ever built
+#: from it is unchanged.
+REFERENCE_MAP_PREFIX = "Reference map: "
+
+
+def reference_map_sentence(tags: list[str]) -> str:
+    """The reference map as one sentence: the single construction of it.
+
+    One function rather than an f-string in each of its three readers, because the whole point
+    of storing the map beside the expansion is that the stored copy and the live one are
+    *comparable* — two spellings of the same join would report every shot as stale.
+    """
+    return f"{REFERENCE_MAP_PREFIX}{'; '.join(tags)}."
 
 
 #: The measured lipsync clause (2026-08-19, the night's decisive experiment): the two
@@ -538,7 +562,7 @@ def reference_prompt(
     """
     if shot.h3_prompt.strip():
         return shot.h3_prompt
-    base = f"Reference map: {'; '.join(tags)}. {shot.prompt}"
+    base = f"{reference_map_sentence(tags)} {shot.prompt}"
     if (
         shot.use_song_audio
         and shot.singing == "singing"
@@ -613,6 +637,33 @@ REFERENCE_BOUNDS_REFUSAL = (
     "wrong rather than failing. Attach the media or renumber the tag, then submit again."
 )
 
+#: What a stale reference map's refusal says. The invariant this route exists to keep after
+#: 2026-08-20: **no stale reference map ever reaches ComfyUI.** `refresh_reference_maps` re-derives
+#: every map it can for free, so what reaches this sentence is one of the three it deliberately
+#: cannot — a document-mode expansion, which would cost an unrequested model call; a locked shot;
+#: or one with a render in flight.
+#:
+#: **Clearing the box is named first because it is the remedy that always works**, and getting
+#: that order right matters more than it reads. An empty `h3_prompt` is not a gap — it is the
+#: fallback, and `reference_prompt` then builds the map from the shot's own citations at
+#: submission, so a cleared box submits a map that is correct by construction. It works on a
+#: locked shot too, because a lock stops the automated writers and never the human in the
+#: inspector (`EXPANSION_LOCKED_NOTICE` says so in as many words).
+#:
+#: Re-expanding is named second and named *accurately*, with the step it actually needs. Anything
+#: reaching this sentence is at `ready` — `generate_h3` refuses every other status — and
+#: `shot_render_provenance` counts every status past `draft` as a render, so a document-mode
+#: shot's expansion route would answer `EXPAND_PROMPT_RENDERED` if it were pressed from here.
+#: `mark-draft` is the existing way back and is deliberately as cheap as arming was.
+STALE_REFERENCE_MAP_REFUSAL = (
+    "Not submitted: {shot}'s expanded prompt was written against a different set of references "
+    "than the shot now cites, so the reference map it carries is stale. Nothing was sent to "
+    "ComfyUI, because a render conditioned on a map naming the wrong pictures comes back "
+    "plausible and wrong rather than failing. Clear the expanded prompt and the render will "
+    "build the map from the shot's own references, or send the shot back to draft and expand "
+    "it again."
+)
+
 
 def reference_slot_counts(project: Project, shot: Shot) -> dict[str, int] | None:
     """How many slots of each kind this Shot's render will wire, or `None` when that is unknowable.
@@ -672,6 +723,53 @@ def song_audio_prose(project: Project, shot: Shot) -> str:
         ),
     )
 
+
+def song_audio_prose_expansion(shot: Shot) -> bool:
+    """Whether this Shot's stored expansion is the deterministic prose form.
+
+    Read off the *text*, not off the mode, and that is the whole point: `use_song_audio` and
+    `mode` say which form the **next** expansion would take, while this says which form the one
+    already stored actually is. A song-audio reference shot can be holding a document expansion
+    written before the prose recipe existed (`song_audio_prose` blanks the field precisely so it
+    can build over one), and rewriting that from a rule about the shot rather than a fact about
+    the text would throw away model output nobody asked to replace.
+    """
+    return shot.h3_prompt.startswith(REFERENCE_MAP_PREFIX)
+
+
+def stale_reference_map(project: Project, shot: Shot) -> bool:
+    """Whether this Shot's stored expansion names references the Shot no longer cites.
+
+    The live defect, 2026-08-20: a shot whose take had invented a woman in a wedding dress got
+    the character sheet attached, `Shot.citations` changed, and `h3_prompt` went on carrying the
+    old map naming only the bed. `reference_prompt` submits a stored expansion **alone**, so the
+    next render would have been conditioned on a map that described a different set of pictures
+    than the payload wired — which comes back plausible and wrong rather than failing.
+
+    Two answers because there are two kinds of expansion, and each is decided from what can
+    actually be known about it:
+
+    * **The prose form carries its own map**, verbatim and at the front, so it is compared
+      against the map the shot would get now. Nothing is stored and nothing can be clobbered by
+      a client reasserting an old `h3_prompt` — which is exactly what the shots write does,
+      since it never adopts its own reply. This is the arm the Director's whole project uses.
+    * **A document expansion never writes the map down** — the specialist weaves `<Picture 2>`
+      into prose — so it is compared against `Shot.h3_prompt_map`, the map recorded beside it
+      when it was written.
+
+    Three states are deliberately *not* stale. A Shot with no expansion has nothing to be stale:
+    it has not been expanded, and manufacturing a map for it would invent an expansion. A
+    document expansion written before `h3_prompt_map` existed records no map, and nothing knows
+    which one it had — refusing that render on a guess is worse than the render, and the next
+    expansion records one. And a shot citing nothing at all with no song audio has an empty map,
+    which the prose form spells `"Reference map: ."` and compares equal to itself.
+    """
+    if not shot.h3_prompt.strip():
+        return False
+    sentence = reference_map_sentence(reference_map_tag_lines(project, shot))
+    if song_audio_prose_expansion(shot):
+        return not shot.h3_prompt.startswith(sentence)
+    return bool(shot.h3_prompt_map) and shot.h3_prompt_map != sentence
 
 
 #: The check, run for its refusal. See `SHOT_DIRECTOR_VISIBLE`.
@@ -1495,6 +1593,64 @@ def shot_enhancement_in_flight(project: Project, shot: Shot) -> bool:
     )
 
 
+def refresh_reference_maps(project: Project) -> list[str]:
+    """Re-derive every stale reference map that can be re-derived for free. No model call, ever.
+
+    The Director's ask, in full: *"make the re-expand automatic when an asset is attached"* — after
+    attaching a character sheet to a shot whose take had invented a bride, and then having to press
+    Expand Prompt Again by hand before the re-render was right.
+
+    **Expansion is two things and this only does the free one.** A song-audio reference shot's
+    expansion is `song_audio_prose`: deterministic text built from the shot, the project and the
+    section, with no model call and measured at 0.0 s. Re-deriving it on attach is free, and the
+    result is byte-identical to what pressing the button would have produced — `attempt_expansion`
+    returns that same string for that same shot, and `apply_expansions` puts it through the same
+    `normalize_audio_fields`. A document-mode expansion is model output. **Nothing here calls the
+    specialist**: attaching three assets would fire three unrequested calls on a local model that
+    can take minutes, and this codebase refuses by name rather than guessing. Those shots are left
+    stale on purpose and `generate_h3` refuses them by name — see `STALE_REFERENCE_MAP_REFUSAL`.
+
+    Idempotent, and swept over the whole plan rather than over "the shots this request touched",
+    because the caller does not always know. The shots write does not adopt its own reply, so a
+    client holding the pre-refresh `h3_prompt` reasserts it on its very next gesture; a pass keyed
+    on what *changed in this request* would see no citation change there and let the stale text
+    stand. Keyed on the text instead, the same pass simply re-derives it again. That is also why a
+    hand-edited prose whose map no longer matches is rewritten rather than preserved: the map is
+    what conditions the render, `Shot.prompt` is where the Director's own words live and is never
+    touched here, and this is what re-expanding means.
+
+    **Three shots are skipped and none of them is silently rewritten.** A shot with no expansion is
+    not stale (see `stale_reference_map`). A `locked` shot is the Director's explicit hands-off and
+    only they clear it. A shot with a render **in flight** is `replace_asset_citations`' one genuine
+    correctness block: the job was submitted against the prompt as it stands, and rewriting it
+    underneath would leave that job's record describing a submission that never happened. A
+    *rendered or approved* shot is refreshed, which is `expansion_write_refusal`'s existing carve-out
+    in its existing words — the prompt each take was submitted with is recorded on its job and in
+    the take's own PNG metadata, so a prompt is not a take.
+
+    Returns the ids it rewrote, so a caller that wants to report can.
+    """
+    refreshed: list[str] = []
+    for shot in project.shots:
+        if not stale_reference_map(project, shot):
+            continue
+        # The free arm and only the free arm: the deterministic prose recipe, identified by the
+        # form of the text actually stored rather than by a rule about the shot.
+        if not (song_audio_prose_expansion(shot) and shot.use_song_audio):
+            continue
+        if resolve_shot_mode(shot) != "references":
+            continue
+        if expansion_write_refusal(shot) or shot_render_in_flight(project, shot):
+            continue
+        # `apply_expansions`' two lines, not a third spelling of them.
+        shot.h3_prompt = normalize_audio_fields(
+            song_audio_prose(project, shot), audio_tag=song_audio_tag(project, shot)
+        )
+        shot.h3_prompt_map = reference_map_sentence(reference_map_tag_lines(project, shot))
+        refreshed.append(shot.id)
+    return refreshed
+
+
 # Why one Shot's take may not be sent to the LTX 2.5 enhancer. Each names the Shot as the
 # timeline names it, for `render_again`'s reason: a bare `shot_a1b2c3d4e5f6` appears nowhere in
 # the interface.
@@ -1994,6 +2150,45 @@ def _require_in_flight_status_kept(project: Project, shots: list[Shot]) -> None:
             raise HTTPException(
                 status_code=409,
                 detail=MARK_READY_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, was)),
+            )
+
+
+def _adopt_expansion_maps(project: Project, stored: dict[str, Shot]) -> None:
+    """Server-own `Shot.h3_prompt_map` across the two generic whole-shot writes.
+
+    The recorded hole in this repository, met for the fifth time on `replace_project` and at least
+    the third on `replace_shots`: a whole-manifest body binds a defaulted model, so a client
+    written before this field existed simply omits it, it arrives as `""`, and one ordinary save
+    would erase the recorded map on every shot at once. For a document-mode expansion that record
+    is the *only* thing that can tell a stale reference map from a fresh one — its own text never
+    writes the map down — so clearing it would silently retire the refusal that keeps a stale map
+    out of ComfyUI. Exactly the shape `consistency_prompt` and `default_setting_id` have here.
+
+    Two cases, and the second is why this adopts rather than simply overwrites. A body whose
+    `h3_prompt` **equals** the stored one is not writing an expansion at all, whatever else it
+    carries, so the stored record is kept and the body's value is ignored. A body whose `h3_prompt`
+    **differs** is the inspector's H3 box being written by hand, and the text a Director typed just
+    now was typed against the plan as it stands now — so it is stamped with the current map. That
+    is what lets someone fix a stale document expansion themselves instead of being told to
+    re-expand something they have already corrected. A blank expansion records no map, because an
+    unexpanded shot has none.
+
+    A Shot the stored project does not hold is new: it gets the map its own text implies by the
+    same two rules, against a stored value of `""`.
+
+    `project` is the project **as it will be saved** — the map is built from the assets and the
+    citations this write is landing, never from the ones it is replacing — and `stored` is the
+    previous shots by id, which the caller snapshots before overwriting them.
+    """
+    for shot in project.shots:
+        was = stored.get(shot.id)
+        if was is not None and shot.h3_prompt == was.h3_prompt:
+            shot.h3_prompt_map = was.h3_prompt_map
+        elif not shot.h3_prompt.strip():
+            shot.h3_prompt_map = ""
+        else:
+            shot.h3_prompt_map = reference_map_sentence(
+                reference_map_tag_lines(project, shot)
             )
 
 
@@ -3877,6 +4072,13 @@ def apply_expansions(
             if shot.use_song_audio
             else outcome.text
         )
+        # The map this expansion was written against, recorded beside it. Every writer of
+        # `h3_prompt` writes this too — that is what makes `stale_reference_map` able to answer
+        # for a document expansion, whose own text never spells the map out. Taken from the
+        # project the write lands on, which is the re-read one, so a citation changed while the
+        # model was thinking is recorded as the map this prompt now disagrees with rather than
+        # as the one it was handed.
+        shot.h3_prompt_map = reference_map_sentence(reference_map_tag_lines(project, shot))
         committed.append(replace(outcome, kind="applied"))
     return committed
 
@@ -4832,6 +5034,16 @@ def create_app(
         # the Director's choice. `PUT .../default-setting` is its one writer, which also keeps
         # it out of reach of anything a model can call.
         project.default_setting_id = current.default_setting_id
+        # The recorded map is server-owned here for the fifth time this exact hole has been found
+        # in this exact route. See `_adopt_expansion_maps`.
+        _adopt_expansion_maps(project, {shot.id: shot for shot in current.shots})
+        # The generic write is the widest citation writer there is: a body carries every field of
+        # every Shot *and* every Asset, so one save can move a citation, re-role one, rename a
+        # reference, rename an asset, or remove one — and this is the recorded sibling-write hole
+        # in this route three times over. Re-derived rather than trusted, and after every
+        # server-owned field above has been re-adopted, so the map is built from the assets and
+        # anchors that are actually being saved rather than from whatever the body claimed.
+        refresh_reference_maps(project)
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -4846,7 +5058,20 @@ def create_app(
         # that only wants to move a clip still sends every field of every Shot back.
         _require_in_flight_status_kept(project, request.shots)
         _require_approval_unchanged(project, request.shots)
+        # Snapshotted before the assignment below overwrites them: `_adopt_expansion_maps` needs
+        # the expansion each shot had, and this route is the narrower sibling that has been the
+        # guard hole at least as often as the whole-project one.
+        previous = {shot.id: shot for shot in project.shots}
         project.shots = request.shots
+        _adopt_expansion_maps(project, previous)
+        # **This is the route the live defect came in on.** Attach, detach and re-role are all one
+        # gesture in the browser — mutate the shot's `citations`, write the whole shot list — so
+        # this is where "re-expand automatically when an asset is attached" has to happen. The
+        # sweep is over the plan rather than over a diff against the stored shots, for the reason
+        # `refresh_reference_maps` gives: this client does not adopt its own reply, so it
+        # reasserts the pre-refresh `h3_prompt` on its next gesture and the sweep must catch that
+        # too, where a diff would see no citation change and let it stand.
+        refresh_reference_maps(project)
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/documents", response_model=Project)
@@ -5201,6 +5426,10 @@ def create_app(
                 ),
             )
         asset.consistency_prompt = anchor
+        # The anchor is *in* the map — `anchored_label` composes it into every tag line — so
+        # setting or clearing one changes what every shot citing this asset should be saying about
+        # it. Free to re-derive for the prose shots, and recorded as stale for the rest.
+        refresh_reference_maps(project)
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/default-setting", response_model=Project)
@@ -5482,6 +5711,12 @@ def create_app(
         for index, shot in enumerate(project.shots):
             if (candidate := plan.candidates.get(shot.id)) is not None:
                 project.shots[index] = candidate
+        # Where the free rebuild pays off most: this route rewrites citations across up to 22
+        # shots at once, and every one of them whose expansion is the prose form is re-derived in
+        # this one pass, with no model call. After the commit loop and before the single save, so
+        # a plan that raised part-way through has still written nothing — the guarantee this
+        # route's own commit loop makes.
+        refresh_reference_maps(project)
         response.project = store.save(project)
         response.applied = True
         return response
@@ -6235,6 +6470,22 @@ def create_app(
                         shot=shot_label(project, shot), problems=" ".join(blocking)
                     ),
                 )
+        # Then whether the stored expansion still describes the references this shot cites. After
+        # the bounds check because the bounds refusal is the sharper sentence when both apply — a
+        # prompt naming `<Picture 3>` on a two-picture shot has a concrete tag to fix — and before
+        # the payload and ComfyUI, for the reason every other refusal on this route is.
+        #
+        # **This is the guarantee, and it is a refusal rather than a rewrite.** The free half of
+        # staleness is already gone by the time a submission happens: `refresh_reference_maps` runs
+        # on every route that can move a citation, a label or an anchor. What is left is the half
+        # that would cost a model call nobody asked for, plus the two shots nothing automated may
+        # write — and a render is the wrong moment to spend either. `generate_batch` submits
+        # through this same handler, so its per-shot skip carries this sentence too.
+        if stale_reference_map(project, shot):
+            raise HTTPException(
+                status_code=422,
+                detail=STALE_REFERENCE_MAP_REFUSAL.format(shot=shot_label(project, shot)),
+            )
         # The sync-correct offset of the take the submission below will produce — nonzero
         # only when the reference branch extends a song-audio window ahead of the shot.
         # Written onto the Shot with `prompt_id` at submission; see `Shot.latest_take_lead`.
@@ -9394,6 +9645,12 @@ def create_app(
             if current.use_song_audio
             else outcome.text
         )
+        # Beside it, `apply_expansions`' line and for its reason: the map this prompt was written
+        # against, so a citation moved afterwards is decidable rather than invisible. Taken off the
+        # re-read project, which is the one this write lands on.
+        current.h3_prompt_map = reference_map_sentence(
+            reference_map_tag_lines(project, current)
+        )
         store.save(project)
         return ShotExpansionResult(
             project=project,
@@ -9831,6 +10088,11 @@ def create_app(
         # thread is the audit trail for what the Director asked as well as for what was written.
         project.messages.append(TreatmentMessage(role="user", content=request.message))
         project.messages.append(assistant_reply(message, notices))
+        # The other writer of citations, and it writes them onto shots that may already carry an
+        # expansion. After `apply_expansions` above rather than before it, so a shot this turn both
+        # re-cited and re-expanded keeps the expansion the model just wrote — that one is already
+        # against the new citations and its recorded map says so, and this pass finds it fresh.
+        refresh_reference_maps(project)
         return store.save(project)
 
     @app.get(

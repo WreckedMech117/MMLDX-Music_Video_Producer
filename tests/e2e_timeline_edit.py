@@ -1972,6 +1972,137 @@ def main() -> None:
             held(typed_before, typed, "the typed start")
             ruling["typed_start"] = {"before": typed_before, "after": typed}
 
+            # --- 13f. The left edge reads the lock too -----------------------------------------
+            #
+            # The oldest of the four gestures, and until this ruling the only one that decided
+            # from `latest_output` alone: a rendered shot's left edge dragged the take's buffer
+            # out whether the Director had unticked the lock or not. The ruling's third answer --
+            # "unlocked means this clip is being repositioned deliberately" -- is one answer for
+            # every gesture, so the left edge now behaves on an unlocked shot exactly as it does
+            # on a shot with no take.
+            load_ruling_plan()
+            # The playhead parked far away, so the magnet cannot catch this edge and turn the
+            # gesture into a boundary snap, which is a different code path proven in 13a.
+            parked = scrub_to(driver, 8.0)
+            assert parked < 20, f"the playhead is too near shot_07 at {parked}s"
+            edge_before = take_anchor_second(server, project_id, "shot_07")
+
+            def drag_shot_07_left_edge(seconds: float, what: str = "the left-edge drag") -> None:
+                # The scale is re-read for every drag: the section reloads the page in the middle
+                # of itself, and a pixel count from before that reload is a guess.
+                pixels = int(seconds * geometry(driver, "shot_07")["pixelsPerSecond"])
+                assert abs(pixels) > 8, ("the drag is too short to be a drag", pixels)
+                handle = clip_for(driver, "shot_07").find_element(
+                    By.CSS_SELECTOR, ".resize-handle.left"
+                )
+                was = shots_writes(driver)
+                ActionChains(driver).click_and_hold(handle).move_by_offset(
+                    pixels, 0
+                ).release().perform()
+                # A drag that moved the window nowhere sends nothing, so this wait is also the
+                # assertion that the edge was free to move at all -- which is how a floor left
+                # standing on an unlocked shot is caught.
+                await_shots_write(driver, was, what)
+                settle(driver, "#shots-track")
+
+            def unlock_shot_07(want: bool) -> None:
+                select_clip(driver, "shot_07")
+                box = driver.find_element(By.ID, "take-anchor")
+                if box.get_property("checked") is want:
+                    box.click()
+                assert driver.find_element(By.ID, "take-anchor").get_property(
+                    "checked"
+                ) is not want
+                # Selecting a clip parks the playhead at that shot's start -- which is where this
+                # edge is -- so it is moved away again before the next drag.
+                assert scrub_to(driver, 8.0) < 20
+
+            # Rightward, into the take: the window moves and the take stays on the music.
+            drag_shot_07_left_edge(1.0)
+            edge_locked = take_state(server, project_id, "shot_07")
+            assert edge_locked["start"] > edge_before["start"], (
+                "the left-edge drag moved nothing", edge_before, edge_locked
+            )
+            assert edge_locked["duration"] < edge_before["duration"], edge_locked
+            held(edge_before, edge_locked, "the locked left-edge drag")
+            # Unlocked, the same drag lets the take travel and writes no nudge at all.
+            unlock_shot_07(True)
+            drag_shot_07_left_edge(1.0)
+            edge_free = take_state(server, project_id, "shot_07")
+            assert edge_free["start"] > edge_locked["start"], (
+                "the unlocked left-edge drag moved nothing", edge_locked, edge_free
+            )
+            assert edge_free["trim_nudge"] == edge_locked["trim_nudge"], (
+                "the unlocked left edge still wrote a nudge", edge_locked, edge_free
+            )
+            assert abs(
+                (edge_free["anchor"] - edge_locked["anchor"])
+                - (edge_free["start"] - edge_locked["start"])
+            ) < 1e-6, (edge_locked, edge_free)
+
+            # And the floor goes with the lock. *Leftward* is the direction that reaches it: a
+            # locked cut can never move earlier than the take's own first frame, which for
+            # shot_07 is `32.517 - (0.25 lead + 0.25 nudge)` = 32.017 s. An unlocked shot has no
+            # such frame to be held off -- its take moves with its window -- so the same drag runs
+            # the whole way. This is the only place the two branches of the left edge are
+            # distinguishable, because the compensation itself is the door's, not this branch's.
+            load_ruling_plan()
+            assert scrub_to(driver, 8.0) < 20
+            floor = round(edge_before["start"]
+                          - edge_before["latest_take_lead"] - edge_before["trim_nudge"], 6)
+            drag_shot_07_left_edge(-2.0)
+            edge_floored = take_state(server, project_id, "shot_07")
+            assert abs(edge_floored["start"] - floor) < 1e-6, (
+                "a locked left edge dragged past the first frame of its own take", floor,
+                edge_floored,
+            )
+            held(edge_before, edge_floored, "the locked left-edge drag onto its floor")
+            unlock_shot_07(True)
+            drag_shot_07_left_edge(
+                -2.0, "the unlocked left-edge drag back past the take's first frame"
+            )
+            edge_past = take_state(server, project_id, "shot_07")
+            assert edge_past["start"] < floor - 0.5, (
+                ("an unlocked left edge was still held off the take's first frame, which is a "
+                 "clamp bounding a frame the take is no longer anchored to"), floor, edge_past,
+            )
+            assert edge_past["trim_nudge"] == edge_floored["trim_nudge"], edge_past
+            ruling["left_edge"] = {
+                "before": edge_before, "locked": edge_locked, "unlocked": edge_free,
+                "floor": floor, "locked_at_floor": edge_floored, "unlocked_past_floor": edge_past,
+                "playhead_parked_at": parked,
+            }
+
+            # --- 13g. A drag is many pointer moves, not one ------------------------------------
+            #
+            # **A gesture in this panel fires `pointermove` dozens of times, and the compensation
+            # is recomputed on every one of them.** So it must be measured from the pair the drag
+            # *started* with, never from the shot's live nudge -- reading the live one adds this
+            # frame's movement to the last frame's answer and multiplies the compensation by the
+            # number of mouse events the browser happened to deliver.
+            #
+            # Every other drag in this file is a single `move_by_offset`, which is exactly one
+            # `pointermove`, and a compounding bug is invisible at N=1: it survived the whole of
+            # section 12 and the whole of 13a-13f. Six steps is a hand.
+            load_ruling_plan()
+            many_before = take_anchor_second(server, project_id, "shot_07")
+            step = max(4, int(0.25 * geometry(driver, "shot_07")["pixelsPerSecond"]))
+            gesture = ActionChains(driver).click_and_hold(clip_for(driver, "shot_07"))
+            for _ in range(6):
+                gesture = gesture.move_by_offset(step, 0)
+            was = shots_writes(driver)
+            gesture.release().perform()
+            await_shots_write(driver, was, "the six-step move drag")
+            settle(driver, "#shots-track")
+            many = take_state(server, project_id, "shot_07")
+            assert many["start"] > many_before["start"] + 0.5, (
+                "the six-step drag moved the window nowhere", many_before, many
+            )
+            held(many_before, many, "a move drag made of six pointer moves")
+            ruling["many_pointer_moves"] = {
+                "steps": 6, "step_px": step, "before": many_before, "after": many,
+            }
+
             result["ruling_2026_08_21"] = ruling
 
             # The plan is put back the way the seed left it, so the final contiguity recorded

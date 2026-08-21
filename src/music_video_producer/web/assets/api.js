@@ -1017,6 +1017,10 @@ export const SHOT_PLAN_CONTENT_FIELDS = [
   "duration",
   "prompt",
   "h3_prompt",
+  // `Shot.h3_prompt_map`: the reference map that expansion was written against. It travels with
+  // `h3_prompt` because a copy carrying the prompt without the map would claim an expansion
+  // nothing can check for staleness -- see the model's own note on the field.
+  "h3_prompt_map",
   "mode",
   "asset_ids",
   "citations",
@@ -3598,7 +3602,10 @@ export function anchoredNudge(shot, { from, to, nudge = null, unlocked = false }
   const was = nudge === null ? (Number(shot?.trim_nudge) || 0) : (Number(nudge) || 0);
   if (!takeAnchorControl(shot, unlocked).held) return was;
   const moved = exactSeconds(Number(to) - Number(from));
-  if (!Number.isFinite(moved) || moved === 0) return was;
+  // A window whose new position is not a number has not moved anywhere. Without this the sum is
+  // `NaN`, and a `NaN` nudge is a shot the whole panel then draws and assembles from as garbage;
+  // there is no version of this where writing it is better than leaving the nudge alone.
+  if (!Number.isFinite(moved)) return was;
   return exactSeconds(was + moved);
 }
 

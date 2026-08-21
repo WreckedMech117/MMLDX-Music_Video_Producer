@@ -8024,6 +8024,7 @@ RENDERED_SHOT = {
     "duration": 4.25,
     "prompt": "A singer turns toward camera",
     "h3_prompt": "Shot 1: a singer turns toward camera",
+    "h3_prompt_map": "Reference map: <Picture 1> is the wolf.",
     "mode": "references",
     "asset_ids": ["asset_wolf"],
     "citations": [{"asset_id": "asset_wolf", "role": "reference", "order": 0}],
@@ -11058,6 +11059,10 @@ def test_the_take_anchoring_rule_is_one_executed_function_with_three_answers():
         // The nudge defaults to the shot's own field for the gestures that write once.
         defaulted: anchoredNudge(rendered, { from: 10, to: 11.5 }),
         absent: anchoredNudge(undefined, { from: 10, to: 11.5, nudge: 0.5 }),
+        // A window whose new position is not a number has not moved anywhere: `NaN` written to a
+        // nudge is a shot the whole panel then draws and assembles from as garbage.
+        nowhere: anchoredNudge(rendered, { nudge: 0.125 }),
+        noArguments: anchoredNudge(rendered),
         // The 17 ms drift, in the numbers a browser measured it in: a 1.608 s move of a window
         // starting at 32.517 s. The anchor has to come out unchanged to the microsecond.
         offGrid: (() => {
@@ -11090,6 +11095,8 @@ def test_the_take_anchoring_rule_is_one_executed_function_with_three_answers():
     assert answers["still"] == pytest.approx(0.125)
     assert answers["defaulted"] == pytest.approx(1.625)
     assert answers["absent"] == pytest.approx(0.5)
+    assert answers["nowhere"] == pytest.approx(0.125)
+    assert answers["noArguments"] == pytest.approx(0.125)
     # The anchor is unchanged to the microsecond, which is what `exactSeconds` buys and what the
     # 1/24 s grid cost: `grid(0 + 1.608)` is 1.625, and the take landed 17 ms off the music.
     assert answers["offGrid"]["nudge"] == pytest.approx(1.608)
@@ -11132,6 +11139,9 @@ def test_every_write_of_a_shot_start_goes_through_the_one_door():
     # The door asks the rule, and asks it about the shot whose start is moving.
     assert "anchoredNudge(shot, {" in door
     assert "unlocked: unlockedFromMusic.has(shot.id)" in door
+    # Never `state.selectedShotId` or any other stand-in for "the clip under the hand": that is
+    # precisely the confusion this ruling corrects, and a gesture on A can move B.
+    assert "selectedShot" not in door
     # The restore is a restore: it puts the nudge back beside the start it belongs to, and it must
     # never compensate -- compensating a roll-back would move the take by what was rolled back.
     assert "shot.trim_nudge = original.nudge;" in restore
@@ -11162,6 +11172,22 @@ def test_the_neighbours_own_lock_governs_the_neighbours_take():
         "the snap still carries its own copy of the compensation, which is the shape that left "
         "the neighbour out"
     )
+    # The left edge, which until this ruling decided from `latest_output` alone -- so a rendered
+    # shot's left edge dragged the take's buffer out whether the Director had unticked the lock or
+    # not. One answer for every gesture: unlocked behaves exactly like a shot with no take, floor
+    # and all, because a floor holding a cut off a frame the take is no longer anchored to bounds
+    # nothing.
+    # Anchored inside `bindClip` -- the section pills have a left branch of their own, and it is
+    # not this gesture; sections have no takes.
+    clip_drag = APP_JS.read_text(encoding="utf-8").split("function bindClip(clip) {", 1)[1]
+    edge = without_comments(
+        clip_drag.split('if (mode === "left") {', 1)[1].split("\n        shot.duration =", 1)[0]
+    )
+    assert "if (takeAnchor(shot).held) {" in edge
+    assert "shot.latest_output" not in edge, (
+        "the left edge still decides from the take's existence rather than from the lock"
+    )
+    assert edge.count("moveWindowStart(shot,") == 2, edge
     # The gap fill's one direction that moves a start: leftward, this shot's own.
     fill = without_comments(app_js_block("function runGapFill(shotId, edge) {", "\n}"))
     assert "moveWindowStart(shot, plan.start);" in fill

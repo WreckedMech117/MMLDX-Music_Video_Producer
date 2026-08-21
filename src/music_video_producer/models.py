@@ -382,6 +382,25 @@ class Shot(BaseModel):
     # Empty means "not expanded", which is a real state and not a defect: a Shot is plannable long
     # before it is expanded, and the render path falls back to `prompt` exactly as it always did.
     h3_prompt: str = ""
+    # The reference map `h3_prompt` was expanded against — `app.reference_map_sentence`'s string,
+    # written by every writer of `h3_prompt` and by nothing else.
+    #
+    # It exists because a citation change leaves the stored expansion naming the *old* references
+    # while the render wires the new ones, and that staleness is undecidable from the expansion's
+    # own text for a document-mode prompt: the specialist weaves `<Picture 2>` into prose and never
+    # writes the map's sentences down, so nothing in the manifest said which map it had been handed.
+    # The live defect (2026-08-20): a shot whose take had invented a woman in a wedding dress got
+    # the character sheet attached, and `h3_prompt` went on naming only the bed. A song-audio
+    # reference shot's expansion *is* the map, verbatim, so that one is decided from the text and
+    # this field is only read for the document modes — but it is written for both, because
+    # `use_song_audio` can be turned off on a shot that already has an expansion.
+    #
+    # `""` means "not recorded", which is what every expansion written before this field existed
+    # has and is deliberately **not** read as stale: nothing knows what map that prompt was built
+    # from, and refusing a render on a guess is worse than the render. The next expansion records
+    # one. Plan content rather than take provenance — it travels with `h3_prompt` and a duplicate
+    # that carried the prompt without the map would claim an unverifiable expansion.
+    h3_prompt_map: str = ""
     # Defaulted to `None` — undeclared — rather than to any mode. A default here is a declaration
     # nobody made, and the one thing this field exists to end is a Shot whose kind was decided by
     # something other than the Director.
@@ -524,6 +543,7 @@ SHOT_PLAN_CONTENT_FIELDS = frozenset(
         "duration",
         "prompt",
         "h3_prompt",
+        "h3_prompt_map",
         "mode",
         "asset_ids",
         "citations",

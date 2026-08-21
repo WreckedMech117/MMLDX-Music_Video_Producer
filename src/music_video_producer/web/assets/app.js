@@ -1587,17 +1587,16 @@ function takeAnchor(shot) {
 // Nothing here clamps, refuses or snaps back on take-coverage grounds. A window dragged past what
 // its take holds is a real, representable state that the readiness report turns amber and
 // assembly refuses with the numbers; this writes what it was asked to write.
+//
+// And it is no more defensive than its callers: every one of them has already established that
+// there is a shot here, and a silent no-op would hide a selection bug rather than report one.
 function moveWindowStart(shot, to, original = null) {
-  if (!shot) return;
   const from = original ? original.start : shot.start;
   const was = original ? original.nudge : (shot.trim_nudge || 0);
   shot.start = to;
-  const nudge = anchoredNudge(shot, {
+  shot.trim_nudge = anchoredNudge(shot, {
     from, to: shot.start, nudge: was, unlocked: unlockedFromMusic.has(shot.id),
   });
-  // Assigned only when it changes, so an untouched shot is never given a `trim_nudge` field it
-  // did not have.
-  if (nudge !== (shot.trim_nudge || 0)) shot.trim_nudge = nudge;
 }
 
 // Put a shot back exactly as a gesture found it. A *restore*, never a move: `start` and

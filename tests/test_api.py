@@ -10257,6 +10257,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         Shot, visible=SHOT_DIRECTOR_VISIBLE, withheld=SHOT_DIRECTOR_WITHHELD, family="SHOT"
     ) == {
         "h3_prompt",
+        "h3_prompt_map",
         "approved_start",
         "approved_duration",
         "latest_take_lead",
@@ -10275,6 +10276,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     # excluded by a stale path someone forgot to update.
     assert SHOT_DIRECTOR_WITHHELD == {
         "h3_prompt",
+        "h3_prompt_map",
         "approved_start",
         "approved_duration",
         "latest_take_lead",
@@ -10287,6 +10289,7 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
     assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {
         "__all__": {
             "h3_prompt",
+            "h3_prompt_map",
             "approved_start",
             "approved_duration",
             "latest_take_lead",
@@ -17343,3 +17346,1010 @@ def test_a_partly_submitted_asset_fill_settles_only_the_graphs_that_never_went_o
     assert [job.error for job in saved.jobs[1:]] == [JOB_NEVER_SUBMITTED] * 2
     assert len(saved.assets) == 1
     assert len(reconcilable_jobs(saved)) == 1
+
+
+# ------------------------------------------------------------------------------------------
+# Auto re-expansion: a citation change must never leave a stale reference map behind.
+#
+# The live defect, 2026-08-20. A shot's take had invented a woman in a wedding dress because no
+# character was referenced; the Director attached the character sheet, which changed
+# `Shot.citations` -- and `h3_prompt` went on holding the old reference map, naming only the bed.
+# `reference_prompt` submits a stored expansion **alone**, so the next render would have been
+# conditioned on a map describing a different set of pictures than the payload wired, and would
+# have come back plausible and wrong rather than failing. Re-expanding by hand fixed it.
+#
+# The invariant these tests hold is one sentence: **no stale reference map ever reaches ComfyUI.**
+# It is kept two ways, and every test below says which one it is exercising --
+# `refresh_reference_maps` re-derives the free half on every route that can move a citation, and
+# `generate_h3` refuses the half that would cost a model call nobody asked for.
+#
+# **Nothing in this section may spend a model call it did not ask for**, and `CountingDirector`
+# is how that is a measurement rather than a claim: every assertion about the free path checks the
+# call list is empty, and the two tests that do want an expansion check the exact count.
+# ------------------------------------------------------------------------------------------
+
+
+class CountingDirector(FakeDirector):
+    """Records every expansion call it is handed. The recording double the no-model claims use."""
+
+    def __init__(self, text: str = GOOD_EXPANSION):
+        self.text = text
+        self.calls: list[dict] = []
+
+    async def expand_shot(self, *, shot_input, system_prompt, **_):
+        self.calls.append(shot_input)
+        return self.text
+
+
+def map_project(tmp_path: Path, *, director=None):
+    """A project with a master song and two library pictures. Returns the pieces the tests name."""
+    director = director or CountingDirector()
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    store = ProjectStore(tmp_path)
+    comfy = FakeComfy()
+    client = TestClient(
+        create_app(settings=settings, store=store, comfy=comfy, director=director)
+    )
+    project = store.create(Project(name="Reference maps"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Harder Faster", "duration": "154.6"},
+        files={"file": ("master.flac", b"fLaCfake", "audio/flac")},
+    )
+    bed = upload_asset(client, project.id, "Dusk Warehouse Bed", "setting", "bed.png")
+    lead = upload_asset(client, project.id, "HarderFaster sheet", "character", "lead.png")
+    return client, store, comfy, director, project.id, bed, lead
+
+
+def write_shot(store, project_id: str, **fields) -> str:
+    """One draft shot with the given wiring, appended to whatever the project already holds.
+
+    Draft deliberately: `shot_render_provenance` counts every status past `draft` as a render, so
+    a shot armed before it is expanded meets `EXPAND_PROMPT_RENDERED` on the document path. `arm`
+    below is the second step, taken when a test actually wants to submit.
+    """
+    project = store.get(project_id)
+    shot = Shot(start=0, duration=5, prompt="She turns toward camera.", **fields)
+    project.shots.append(shot)
+    store.save(project)
+    return shot.id
+
+
+def arm(store, project_id: str) -> None:
+    """Every draft shot to `ready`, which is what `generate_h3` requires before it will submit."""
+    project = store.get(project_id)
+    for shot in project.shots:
+        if shot.status == "draft":
+            shot.status = "ready"
+    store.save(project)
+
+
+def attach(shot: dict, *asset_ids: str) -> dict:
+    """Rewrite one shot's references, both halves — the client's `reconcileShotCitations`.
+
+    `asset_ids` is written beside `citations` because `Shot._reconcile_citations` reads the flat
+    list as the migration source when `citations` is empty: a body that cleared the citations and
+    left the flat list standing would have its references silently restored.
+    """
+    shot["citations"] = [
+        {"asset_id": asset_id, "role": "reference", "order": index}
+        for index, asset_id in enumerate(asset_ids)
+    ]
+    shot["asset_ids"] = list(asset_ids)
+    return shot
+
+
+def expand_one(client, project_id: str, shot_id: str) -> dict:
+    """The inspector's own Expand Prompt Again, through the route that writes the expansion."""
+    response = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def shots_body(store, project_id: str) -> list[dict]:
+    """The shot list exactly as the browser holds it: whole shots, every field, straight back."""
+    return store.get(project_id).model_dump(mode="json")["shots"]
+
+
+def put_shots(client, project_id: str, shots: list[dict]):
+    return client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+
+
+def held(store, project_id: str, shot_id: str) -> Shot:
+    return next(shot for shot in store.get(project_id).shots if shot.id == shot_id)
+
+
+def test_attaching_an_asset_re_expands_the_reference_map_and_calls_no_model(tmp_path: Path):
+    """The Director's ask, at the route the gesture actually uses.
+
+    Attach is not its own endpoint: the browser mutates `shot.citations` and writes the whole
+    shot list, so `PUT /shots` is where "make the re-expand automatic when an asset is attached"
+    has to happen. The refreshed text is asserted equal to `song_audio_prose` byte for byte,
+    which is the same string pressing Expand Prompt Again would have produced -- so this is the
+    button, fired automatically, and not a second construction of the prompt.
+    """
+    from music_video_producer.app import reference_map_sentence, song_audio_prose
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references", singing="singing",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    before = held(store, project_id, shot_id)
+    assert director.calls == [], "a song-audio reference shot's expansion is deterministic"
+    assert bed["name"] in before.h3_prompt
+    assert lead["name"] not in before.h3_prompt
+
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    after = held(store, project_id, shot_id)
+    saved = store.get(project_id)
+    assert lead["name"] in after.h3_prompt
+    assert after.h3_prompt == song_audio_prose(saved, after)
+    assert after.h3_prompt.startswith(
+        f"Reference map: <Picture 1> is {bed['name']}; <Picture 2> is {lead['name']}; "
+        "<Audio 1> is the master song for synchronization."
+    )
+    assert after.h3_prompt_map == reference_map_sentence(
+        [
+            "<Picture 1> is Dusk Warehouse Bed",
+            "<Picture 2> is HarderFaster sheet",
+            "<Audio 1> is the master song for synchronization",
+        ]
+    )
+    # The Director's own words are not this route's to touch, and no model was asked.
+    assert after.prompt == before.prompt == "She turns toward camera."
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_detaching_an_asset_re_expands_the_map_too(tmp_path: Path):
+    """A removed reference is exactly as stale as an added one, and the trailing removal --
+    where every surviving line still appears in the old text and only the *whole* map sentence
+    differs -- is the one a per-line comparison would miss."""
+    from music_video_producer.app import song_audio_prose
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[
+            AssetCitation(asset_id=bed["id"], role="reference", order=0),
+            AssetCitation(asset_id=lead["id"], role="reference", order=1),
+        ],
+    )
+    expand_one(client, project_id, shot_id)
+
+    # The *trailing* picture goes: `<Picture 1> is the bed` still reads true, and the map is
+    # still stale because it goes on naming a second picture nothing fills.
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+    after = held(store, project_id, shot_id)
+    assert lead["name"] not in after.h3_prompt
+    assert "<Picture 2>" not in after.h3_prompt
+    assert after.h3_prompt == song_audio_prose(store.get(project_id), after)
+
+    # And the last one: the map is the master song alone, and the prose says so.
+    shots = shots_body(store, project_id)
+    attach(shots[0])
+    assert put_shots(client, project_id, shots).status_code == 200
+    empty = held(store, project_id, shot_id)
+    assert empty.h3_prompt.startswith(
+        "Reference map: <Audio 1> is the master song for synchronization."
+    )
+    assert "<Picture" not in empty.h3_prompt
+    assert empty.prompt == "She turns toward camera."
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_replace_citations_re_expands_every_shot_it_rewrote_in_one_pass(tmp_path: Path):
+    """Where the free rebuild pays off most: the route rewrites citations across many shots at
+    once, and every prose expansion among them is re-derived in the same save, for nothing."""
+    from music_video_producer.app import song_audio_prose
+
+    client, store, comfy, director, project_id, _bed, lead = map_project(tmp_path)
+    krea = upload_asset(client, project_id, "Krea multiview", "character", "krea.png")
+    ids = [
+        write_shot(
+            store, project_id, use_song_audio=True, mode="references",
+            citations=[AssetCitation(asset_id=lead["id"], role="reference", order=0)],
+        )
+        for _ in range(3)
+    ]
+    for shot_id in ids:
+        expand_one(client, project_id, shot_id)
+    assert director.calls == []
+
+    response = client.post(
+        f"/api/projects/{project_id}/assets/{lead['id']}/replace-citations",
+        json={"replacement_id": krea["id"], "confirm_apply": True},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["swapped"] == 3
+
+    saved = store.get(project_id)
+    for shot_id in ids:
+        shot = next(item for item in saved.shots if item.id == shot_id)
+        assert krea["name"] in shot.h3_prompt
+        assert lead["name"] not in shot.h3_prompt
+        assert shot.h3_prompt == song_audio_prose(saved, shot)
+        assert shot.prompt == "She turns toward camera."
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_a_stale_document_expansion_is_refused_rather_than_re_expanded(tmp_path: Path):
+    """**The headline.** A document-mode expansion is model output: rebuilding it on attach would
+    spend a call nobody asked for, and three attachments would spend three. So nothing here calls
+    the specialist -- and the staleness is instead made unable to reach a render.
+
+    The refusal is `generate_h3`'s, which is also `generate_batch`'s, because the batch submits
+    through this same handler. The way out is the affordance the Director already reaches for,
+    and pressing it is what makes the render go through.
+    """
+    from music_video_producer.app import STALE_REFERENCE_MAP_REFUSAL, reference_map_sentence
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    assert len(director.calls) == 1, "a document-mode expansion is one model call"
+    before = held(store, project_id, shot_id)
+    assert before.h3_prompt == GOOD_EXPANSION
+    assert before.h3_prompt_map == reference_map_sentence(["<Picture 1> is Dusk Warehouse Bed"])
+
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    after = held(store, project_id, shot_id)
+    # Not rewritten, not re-expanded, and the recorded map is the one it was written against --
+    # which the generic write did not get to clear on its way past.
+    assert after.h3_prompt == GOOD_EXPANSION
+    assert after.h3_prompt_map == before.h3_prompt_map
+    assert len(director.calls) == 1
+    assert after.prompt == "She turns toward camera."
+
+    arm(store, project_id)
+    refused = submit_h3(client, project_id, shot_id)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == STALE_REFERENCE_MAP_REFUSAL.format(
+        shot=shot_label(store.get(project_id), after)
+    )
+    assert comfy.prompts == [], "nothing reached ComfyUI"
+
+    # The second named way out, and the only thing that was in the way: one explicit expansion,
+    # through the step the refusal names. `mark-draft` is needed because `shot_render_provenance`
+    # counts every status past `draft` as a render, and anything reaching that refusal is armed.
+    assert client.post(
+        f"/api/projects/{project_id}/shots/{shot_id}/mark-draft"
+    ).status_code == 200
+    expand_one(client, project_id, shot_id)
+    assert len(director.calls) == 2
+    assert held(store, project_id, shot_id).h3_prompt_map == reference_map_sentence(
+        ["<Picture 1> is Dusk Warehouse Bed", "<Picture 2> is HarderFaster sheet"]
+    )
+    assert client.post(
+        f"/api/projects/{project_id}/shots/{shot_id}/mark-ready"
+    ).status_code == 200
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+    assert len(comfy.prompts) == 1
+
+
+def test_clearing_the_expansion_is_the_other_way_out_and_needs_no_model(tmp_path: Path):
+    """The second remedy the refusal names, and the reason it is offered: an empty `h3_prompt`
+    is not a gap. `reference_prompt` builds the map from the shot's own citations at submission,
+    so a cleared box submits a map that is correct by construction."""
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    put_shots(client, project_id, shots)
+    arm(store, project_id)
+    assert submit_h3(client, project_id, shot_id).status_code == 422
+
+    shots = shots_body(store, project_id)
+    shots[0]["h3_prompt"] = ""
+    assert put_shots(client, project_id, shots).status_code == 200
+    cleared = held(store, project_id, shot_id)
+    assert cleared.h3_prompt == ""
+    assert cleared.h3_prompt_map == "", "an unexpanded shot records no map"
+
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+    assert len(director.calls) == 1, "clearing the box asked no model"
+    assert lead["name"] in comfy.prompts[0]["mvp:condition"]["inputs"]["prompt"]
+
+
+def test_a_locked_shot_is_never_rewritten_and_is_refused_in_the_existing_words(tmp_path: Path):
+    """A lock is the Director's own hands-off and only they clear it, so the free rebuild skips
+    a locked shot exactly as every other automated writer does -- and the render is then refused
+    rather than allowed through on a map nobody could fix."""
+    from music_video_producer.app import EXPAND_PROMPT_LOCKED, STALE_REFERENCE_MAP_REFUSAL
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    before = held(store, project_id, shot_id)
+
+    shots = shots_body(store, project_id)
+    shots[0]["locked"] = True
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    after = held(store, project_id, shot_id)
+    assert after.h3_prompt == before.h3_prompt, "a locked shot is not rewritten"
+
+    locked = client.post(f"/api/projects/{project_id}/shots/{shot_id}/expand-prompt")
+    assert locked.status_code == 422
+    assert locked.json()["detail"] == EXPAND_PROMPT_LOCKED.format(
+        shot=shot_label(store.get(project_id), after)
+    )
+
+    arm(store, project_id)
+    refused = submit_h3(client, project_id, shot_id)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == STALE_REFERENCE_MAP_REFUSAL.format(
+        shot=shot_label(store.get(project_id), after)
+    )
+    assert comfy.prompts == []
+    assert director.calls == []
+
+
+def test_a_render_in_flight_is_not_rewritten_underneath_itself(tmp_path: Path):
+    """The one genuine correctness block, `replace_asset_citations`' own: the job was submitted
+    with the prompt as it stands and is executing now, so rewriting it underneath would leave
+    that job's record describing a submission that never happened."""
+    from music_video_producer.app import REPLACE_ASSET_IN_FLIGHT
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    before = held(store, project_id, shot_id)
+
+    project = store.get(project_id)
+    project.shots[0].status = "queued"
+    store.save(project)
+
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+    assert held(store, project_id, shot_id).h3_prompt == before.h3_prompt
+
+    # And the replacement route reports the skip in the sentence it already had.
+    report = client.post(
+        f"/api/projects/{project_id}/assets/{bed['id']}/replace-citations",
+        json={"replacement_id": lead["id"], "confirm_apply": True},
+    )
+    assert report.status_code == 200, report.text
+    assert [skip["reason"] for skip in report.json()["skips"]] == [
+        REPLACE_ASSET_IN_FLIGHT.format(
+            shot=shot_label(store.get(project_id), before), replaced=bed["name"]
+        )
+    ]
+    assert held(store, project_id, shot_id).h3_prompt == before.h3_prompt
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_renaming_a_reference_for_one_shot_re_expands_that_shots_map(tmp_path: Path):
+    """`reference_labels` is *in* the map -- `<Picture 1> is the woman upstage` -- so renaming a
+    reference for one shot changes that shot's text and nobody else's."""
+    from music_video_producer.app import song_audio_prose
+
+    client, store, comfy, director, project_id, _bed, lead = map_project(tmp_path)
+    first = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=lead["id"], role="reference", order=0)],
+    )
+    second = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=lead["id"], role="reference", order=0)],
+    )
+    for shot_id in (first, second):
+        expand_one(client, project_id, shot_id)
+    untouched = held(store, project_id, second).h3_prompt
+
+    shots = shots_body(store, project_id)
+    shots[0]["reference_labels"] = {lead["id"]: "the woman upstage"}
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    saved = store.get(project_id)
+    renamed = next(shot for shot in saved.shots if shot.id == first)
+    assert "<Picture 1> is the woman upstage" in renamed.h3_prompt
+    assert renamed.h3_prompt == song_audio_prose(saved, renamed)
+    assert held(store, project_id, second).h3_prompt == untouched
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_an_appearance_anchor_re_expands_every_map_that_names_it(tmp_path: Path):
+    """The anchor is composed into the label by `anchored_label`, so setting one changes what
+    every citing shot's map says about that asset -- on a route that writes no shot at all."""
+    from music_video_producer.app import song_audio_prose
+
+    client, store, comfy, director, project_id, _bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=lead["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    assert "red leather jacket" not in held(store, project_id, shot_id).h3_prompt
+
+    response = client.put(
+        f"/api/projects/{project_id}/assets/{lead['id']}/consistency-prompt",
+        json={"consistency_prompt": "a woman in a red leather jacket"},
+    )
+    assert response.status_code == 200, response.text
+
+    saved = store.get(project_id)
+    shot = next(item for item in saved.shots if item.id == shot_id)
+    assert "<Picture 1> is HarderFaster sheet, a woman in a red leather jacket" in shot.h3_prompt
+    assert shot.h3_prompt == song_audio_prose(saved, shot)
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_the_whole_project_put_re_expands_and_cannot_clear_the_recorded_map(tmp_path: Path):
+    """The widest sibling write path there is: one body carries every field of every Shot *and*
+    every Asset. It can move a citation and it can rename an asset, so it re-derives -- and a
+    body that has never heard of `h3_prompt_map` must not clear the record on its way past."""
+    from music_video_producer.app import song_audio_prose
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    prose_shot = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=lead["id"], role="reference", order=0)],
+    )
+    document_shot = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    for shot_id in (prose_shot, document_shot):
+        expand_one(client, project_id, shot_id)
+    recorded = held(store, project_id, document_shot).h3_prompt_map
+
+    body = store.get(project_id).model_dump(mode="json")
+    # A client written before the field existed: it simply omits it, on every shot.
+    for shot in body["shots"]:
+        shot.pop("h3_prompt_map", None)
+    for asset in body["assets"]:
+        if asset["id"] == lead["id"]:
+            asset["name"] = "HarderFaster Krea multiview"
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+
+    saved = store.get(project_id)
+    renamed = next(shot for shot in saved.shots if shot.id == prose_shot)
+    assert "<Picture 1> is HarderFaster Krea multiview" in renamed.h3_prompt
+    assert renamed.h3_prompt == song_audio_prose(saved, renamed)
+    kept = next(shot for shot in saved.shots if shot.id == document_shot)
+    assert kept.h3_prompt_map == recorded, "an ordinary save cleared the recorded map"
+    assert kept.h3_prompt == GOOD_EXPANSION
+    assert len(director.calls) == 1, "the whole-project save asked no model of its own"
+    assert comfy.prompts == []
+
+
+def test_a_client_reasserting_the_pre_refresh_expansion_gets_it_re_derived(tmp_path: Path):
+    """The reason the sweep is keyed on the text rather than on a diff of this request.
+
+    The shots write deliberately does not adopt its own reply, so the browser goes on holding
+    the `h3_prompt` it sent and reasserts it on its very next gesture -- a drag, a resize,
+    anything. A pass keyed on "what changed in this request" would see no citation change there
+    and let the stale text stand. Keyed on the text, the same pass simply re-derives it.
+    """
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    stale_client = shots_body(store, project_id)
+
+    reattached = [dict(shot) for shot in stale_client]
+    attach(reattached[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, reattached).status_code == 200
+    refreshed = held(store, project_id, shot_id).h3_prompt
+    assert lead["name"] in refreshed
+
+    # The next gesture, sent from the browser's own copy: new citations, the *old* expansion.
+    resize = [dict(shot) for shot in stale_client]
+    attach(resize[0], bed["id"], lead["id"])
+    resize[0]["duration"] = 6.5
+    assert put_shots(client, project_id, resize).status_code == 200
+
+    landed = held(store, project_id, shot_id)
+    assert landed.duration == 6.5
+    assert landed.h3_prompt == refreshed, "the reverted expansion was not re-derived"
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_a_shot_with_no_expansion_is_never_given_one(tmp_path: Path):
+    """Empty `h3_prompt` is a real state, not a defect: a shot is plannable long before it is
+    expanded, and the render path falls back to the intent exactly as it always did. Attaching
+    an asset must not manufacture an expansion, and must not manufacture a map either."""
+    client, store, comfy, director, project_id, _bed, lead = map_project(tmp_path)
+    shot_id = write_shot(store, project_id, use_song_audio=True, mode="references")
+
+    shots = shots_body(store, project_id)
+    attach(shots[0], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    shot = held(store, project_id, shot_id)
+    assert shot.h3_prompt == ""
+    assert shot.h3_prompt_map == ""
+    assert shot.prompt == "She turns toward camera."
+    assert director.calls == []
+    assert comfy.prompts == []
+    # And it still submits, on the fallback map the submit route builds from the citations.
+    arm(store, project_id)
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+    assert lead["name"] in comfy.prompts[0]["mvp:condition"]["inputs"]["prompt"]
+
+
+def test_an_expansion_written_before_the_map_was_recorded_is_not_called_stale(tmp_path: Path):
+    """Old manifests load unchanged and render unchanged. `h3_prompt_map` defaults to `""`, and
+    that means "not recorded" rather than "stale": nothing knows which map that prompt was built
+    from, and refusing a render on a guess is worse than the render."""
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    project = store.get(project_id)
+    project.shots.append(
+        Shot(
+            id="shot_legacy", start=0, duration=5, status="ready",
+            prompt="She turns toward camera.", mode="references", h3_prompt=GOOD_EXPANSION,
+            citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+        )
+    )
+    store.save(project)
+    assert held(store, project_id, "shot_legacy").h3_prompt_map == ""
+
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    assert held(store, project_id, "shot_legacy").h3_prompt == GOOD_EXPANSION
+    assert submit_h3(client, project_id, "shot_legacy").status_code == 202
+    assert comfy.prompts[0]["mvp:condition"]["inputs"]["prompt"] == GOOD_EXPANSION
+    assert director.calls == []
+
+
+def test_no_refresh_path_ever_writes_the_directors_own_intent(tmp_path: Path):
+    """`Shot.prompt` is never overwritten -- `apply_expansions`' rule, held across every path
+    this change touched, per shot, in one sweep. The intent is what re-expansion works from, and
+    the first expansion will not be the good one."""
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    intents = {}
+    ids = []
+    for index, wiring in enumerate(
+        (
+            {"use_song_audio": True, "mode": "references"},
+            {"mode": "references"},
+            {"use_song_audio": True, "mode": "references", "locked": True},
+        )
+    ):
+        shot_id = write_shot(
+            store, project_id,
+            citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+            **wiring,
+        )
+        ids.append(shot_id)
+        intents[shot_id] = f"Intent {index}"
+    project = store.get(project_id)
+    for shot in project.shots:
+        shot.prompt = intents[shot.id]
+    store.save(project)
+    for shot_id in ids:
+        if not held(store, project_id, shot_id).locked:
+            expand_one(client, project_id, shot_id)
+
+    def intents_intact(where: str):
+        for shot in store.get(project_id).shots:
+            assert shot.prompt == intents[shot.id], f"{where} rewrote an intent"
+
+    shots = shots_body(store, project_id)
+    for shot in shots:
+        attach(shot, bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+    intents_intact("PUT /shots")
+
+    body = store.get(project_id).model_dump(mode="json")
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    intents_intact("PUT /projects/{id}")
+
+    assert client.put(
+        f"/api/projects/{project_id}/assets/{lead['id']}/consistency-prompt",
+        json={"consistency_prompt": "a woman in a red leather jacket"},
+    ).status_code == 200
+    intents_intact("PUT /consistency-prompt")
+
+    krea = upload_asset(client, project_id, "Krea multiview", "character", "krea.png")
+    assert client.post(
+        f"/api/projects/{project_id}/assets/{lead['id']}/replace-citations",
+        json={"replacement_id": krea["id"], "confirm_apply": True},
+    ).status_code == 200
+    intents_intact("POST /replace-citations")
+    # One model call in the whole test — the document shot's own expansion. Every refresh above
+    # was free, and none of them added a call of its own.
+    assert len(director.calls) == 1
+    assert comfy.prompts == []
+
+
+def test_the_recorded_map_is_the_sentence_the_fallback_builds(tmp_path: Path):
+    """The stored record and the live map are one construction, `reference_map_sentence` -- two
+    spellings of the same join would report every shot in the project as stale."""
+    from music_video_producer.app import (
+        reference_map_sentence,
+        reference_map_tag_lines,
+        reference_prompt,
+        stale_reference_map,
+    )
+
+    client, store, comfy, director, project_id, bed, _lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    saved = store.get(project_id)
+    shot = saved.shots[0]
+    tags = reference_map_tag_lines(saved, shot)
+    sentence = reference_map_sentence(tags)
+    assert sentence == (
+        "Reference map: <Picture 1> is Dusk Warehouse Bed; "
+        "<Audio 1> is the master song for synchronization."
+    )
+    # The fallback the submit route builds still opens with exactly that, byte for byte.
+    assert reference_prompt(shot, tags).startswith(sentence)
+    assert not stale_reference_map(saved, shot), "an unexpanded shot is not stale"
+
+    expand_one(client, project_id, shot_id)
+    saved = store.get(project_id)
+    assert saved.shots[0].h3_prompt_map == sentence
+    assert not stale_reference_map(saved, saved.shots[0])
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+# ------------------------------------------------------------------------------------------
+# The five branches mutation testing found nothing was holding. Each of these was written
+# because a mutation survived, and each names the mutation it kills.
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_hand_edited_prose_survives_a_save_while_its_map_is_current(tmp_path: Path):
+    """The staleness guard is not an optimisation, and this is what it protects.
+
+    Dropping `if not stale_reference_map(...)` from the sweep survived every test, because
+    re-deriving a *fresh* machine-written prose produces the identical string. What it does not
+    survive is a Director's own edit: the sweep would then regenerate that text on every
+    unrelated save — a resize, a drag — and the edit would vanish with nothing said.
+
+    So the rule is stated at both ends. A hand edit whose reference map is still current stands,
+    however many saves go past it; the companion test below is the other half, where the map has
+    gone stale and the text is regenerated from the intent because the map is what conditions
+    the render.
+    """
+    client, store, comfy, director, project_id, bed, _lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+
+    machine = held(store, project_id, shot_id).h3_prompt
+    edited = f"{machine} She never looks away from the lens."
+    shots = shots_body(store, project_id)
+    shots[0]["h3_prompt"] = edited
+    assert put_shots(client, project_id, shots).status_code == 200
+    assert held(store, project_id, shot_id).h3_prompt == edited
+
+    # Two more ordinary saves that touch nothing about the references at all.
+    for duration in (6.0, 6.5):
+        shots = shots_body(store, project_id)
+        shots[0]["duration"] = duration
+        assert put_shots(client, project_id, shots).status_code == 200
+        assert held(store, project_id, shot_id).h3_prompt == edited, "an unrelated save rewrote it"
+
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_a_hand_edited_prose_whose_map_has_gone_stale_is_regenerated(tmp_path: Path):
+    """The other half of the rule above, said out loud because it discards a Director's words.
+
+    A hand edit is preserved while its map is current and regenerated when it is not. The map is
+    what conditions the render, so a prose whose map has gone stale is not text worth keeping —
+    and nothing is lost that the Director cannot get back, because `Shot.prompt` is where their
+    intent lives and the regeneration is built from it.
+    """
+    from music_video_producer.app import song_audio_prose
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+
+    shots = shots_body(store, project_id)
+    shots[0]["h3_prompt"] = f"{held(store, project_id, shot_id).h3_prompt} Hand-written tail."
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    saved = store.get(project_id)
+    shot = next(item for item in saved.shots if item.id == shot_id)
+    assert "Hand-written tail." not in shot.h3_prompt
+    assert shot.h3_prompt == song_audio_prose(saved, shot)
+    assert shot.prompt == "She turns toward camera.", "the intent it was rebuilt from is untouched"
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_a_shot_that_no_longer_rides_the_song_is_refused_rather_than_rebuilt_as_prose(
+    tmp_path: Path,
+):
+    """`use_song_audio` is a condition on the *rebuild*, not only on the staleness check.
+
+    Dropping it from the sweep survived, because the form of the stored text already selects the
+    prose arm. But the deterministic recipe is only the right expansion for a song-audio
+    references shot: `attempt_expansion` short-circuits for exactly that shape and sends every
+    other shot to the specialist. Turning the song off makes this shot a document-mode shot, so
+    rebuilding it as prose would cement a form the expansion route would never have written —
+    and it would do so silently, on a save the Director made for another reason.
+    """
+    from music_video_producer.app import stale_reference_map
+
+    client, store, comfy, director, project_id, bed, _lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    before = held(store, project_id, shot_id).h3_prompt
+    assert "<Audio 1>" in before
+
+    shots = shots_body(store, project_id)
+    shots[0]["use_song_audio"] = False
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    saved = store.get(project_id)
+    after = next(item for item in saved.shots if item.id == shot_id)
+    assert after.h3_prompt == before, "the prose recipe was applied to a shot it is not for"
+    assert stale_reference_map(saved, after)
+    # And it cannot reach a render. **The sharper refusal wins here, by design**: the stored prose
+    # still names `<Audio 1>` and the shot no longer has an audio slot, so `check_reference_bounds`
+    # answers first with the concrete tag to fix. The staleness gate sits behind it precisely so
+    # that the more specific sentence is the one the Director reads.
+    arm(store, project_id)
+    refused = submit_h3(client, project_id, shot_id)
+    assert refused.status_code == 422
+    assert "cites a reference slot it does not have" in refused.json()["detail"]
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_a_shot_whose_mode_moved_off_references_is_refused_rather_than_rebuilt_as_prose(
+    tmp_path: Path,
+):
+    """The mode is the second condition on the rebuild, and it is a real state to be in.
+
+    The keyframe modes keep the document path — `attempt_expansion` says so, and their graphs
+    differ — so a shot moved from `references` to `first_last` in the inspector must not have
+    the prose recipe re-applied to the expansion it is still carrying. Changing a shot's mode is
+    an ordinary edit, and it arrives on the same whole-shot write as everything else.
+    """
+    from music_video_producer.app import stale_reference_map
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, use_song_audio=True, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    before = held(store, project_id, shot_id).h3_prompt
+
+    shots = shots_body(store, project_id)
+    shots[0]["mode"] = "first_last"
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    saved = store.get(project_id)
+    after = next(item for item in saved.shots if item.id == shot_id)
+    assert after.mode == "first_last"
+    assert after.h3_prompt == before, "the prose recipe was applied to a keyframe-mode shot"
+    # Stale, and therefore unable to reach a render — which is the point of not rebuilding it.
+    assert stale_reference_map(saved, after)
+    assert director.calls == []
+    assert comfy.prompts == []
+
+
+def test_writing_the_h3_box_by_hand_records_the_map_it_was_written_against(tmp_path: Path):
+    """The branch of the generic-write guard that lets a Director fix a stale expansion themselves.
+
+    `_adopt_expansion_maps` keeps the stored record when the body's `h3_prompt` is unchanged —
+    that is what stops a client which has never heard of the field clearing it. When the body's
+    `h3_prompt` *differs*, the inspector's box has been written by hand, and the text someone
+    typed just now was typed against the plan as it stands now. Recording `""` there instead
+    survived every test, and would have left a Director who had already corrected the prompt
+    unable to render it and told to correct it again.
+    """
+    from music_video_producer.app import reference_map_sentence
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+    arm(store, project_id)
+    assert submit_h3(client, project_id, shot_id).status_code == 422
+
+    # The Director corrects it themselves, in the inspector, naming both pictures.
+    corrected = GOOD_EXPANSION.replace(
+        "A grey wolf paces", "A grey wolf paces past <Picture 2> and"
+    )
+    shots = shots_body(store, project_id)
+    shots[0]["h3_prompt"] = corrected
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    fixed = held(store, project_id, shot_id)
+    assert fixed.h3_prompt == corrected
+    assert fixed.h3_prompt_map == reference_map_sentence(
+        ["<Picture 1> is Dusk Warehouse Bed", "<Picture 2> is HarderFaster sheet"]
+    )
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+    assert comfy.prompts[0]["mvp:condition"]["inputs"]["prompt"] == corrected
+    assert len(director.calls) == 1, "the hand correction asked no model"
+
+
+def test_the_plan_wide_expansion_records_each_shots_map_too(tmp_path: Path):
+    """The sibling of the single-shot expansion route, and the gap that is always this one.
+
+    `expand_shot_prompt` was covered and `apply_expansions` — which the whole-plan sweep and the
+    assistant's expansion tool both commit through — was not, so dropping its record survived.
+    A document expansion written by the sweep would then have carried no map at all, and every
+    citation change after it would have been undetectable: the refusal would simply never fire
+    for a plan expanded the way a plan is actually expanded.
+    """
+    from music_video_producer.app import STALE_REFERENCE_MAP_REFUSAL, reference_map_sentence
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    response = client.post(f"/api/projects/{project_id}/shots/expand-prompts")
+    assert response.status_code == 200, response.text
+    assert len(director.calls) == 1
+
+    expanded = held(store, project_id, shot_id)
+    assert expanded.h3_prompt == GOOD_EXPANSION
+    assert expanded.h3_prompt_map == reference_map_sentence(["<Picture 1> is Dusk Warehouse Bed"])
+
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+    arm(store, project_id)
+
+    refused = submit_h3(client, project_id, shot_id)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == STALE_REFERENCE_MAP_REFUSAL.format(
+        shot=shot_label(store.get(project_id), held(store, project_id, shot_id))
+    )
+    assert comfy.prompts == []
+    assert len(director.calls) == 1
+
+
+def test_every_writer_of_an_expansion_records_the_map_it_was_written_against():
+    """The sibling gap, closed structurally instead of one instance at a time.
+
+    `expand_shot_prompt` recorded the map and `apply_expansions` did not, and nothing noticed
+    because the tested route and the untested one are different functions doing the same job —
+    the shape this repository keeps rediscovering. So the rule is asserted over the module rather
+    than over the two writers anybody happens to know about: **any function that assigns
+    `h3_prompt` must also assign `h3_prompt_map`.** A third writer added later fails here.
+
+    Parsed rather than grepped, and attributed to the *innermost* enclosing function, because
+    every route in this module is nested inside `create_app` and a scan that credited the outer
+    function would pass on any file that recorded a map anywhere at all.
+    """
+    import ast
+
+    source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    enclosing: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            enclosing[child] = parent
+
+    def innermost_function(node: ast.AST) -> str:
+        while node in enclosing:
+            node = enclosing[node]
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                return node.name
+        return "<module>"
+
+    written: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and target.attr in (
+                "h3_prompt", "h3_prompt_map"
+            ):
+                written.setdefault(innermost_function(node), set()).add(target.attr)
+
+    expansion_writers = {name for name, fields in written.items() if "h3_prompt" in fields}
+    # The scan has to find the writers it is asserting over, or it asserts nothing.
+    assert expansion_writers >= {"apply_expansions", "refresh_reference_maps"}, expansion_writers
+    for name in sorted(expansion_writers):
+        assert "h3_prompt_map" in written[name], (
+            f"{name} writes an expansion without recording the reference map it was written "
+            "against, so a citation change under it would be undetectable"
+        )
+
+
+def test_neither_whole_shot_write_can_clear_the_recorded_map(tmp_path: Path):
+    """Both siblings, from one list, because they have been the same hole at different times.
+
+    `PUT /projects/{id}` and `PUT /projects/{id}/shots` each bind a whole client-supplied shot
+    list, so a client written before `h3_prompt_map` existed omits it on every shot and one
+    ordinary save would erase the record — silently retiring the refusal that keeps a stale map
+    out of ComfyUI. Driven against both rather than one, so a fix that lands on the wider route
+    and not the narrower one fails here.
+    """
+    def whole_project(client, store, project_id):
+        body = store.get(project_id).model_dump(mode="json")
+        for shot in body["shots"]:
+            shot.pop("h3_prompt_map", None)
+        return client.put(f"/api/projects/{project_id}", json=body)
+
+    def shots_only(client, store, project_id):
+        shots = shots_body(store, project_id)
+        for shot in shots:
+            shot.pop("h3_prompt_map", None)
+        return put_shots(client, project_id, shots)
+
+    for name, save in (("PUT /projects/{id}", whole_project), ("PUT /shots", shots_only)):
+        client, store, comfy, director, project_id, bed, lead = map_project(tmp_path / name[4:9])
+        shot_id = write_shot(
+            store, project_id, mode="references",
+            citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+        )
+        expand_one(client, project_id, shot_id)
+        recorded = held(store, project_id, shot_id).h3_prompt_map
+        assert recorded, name
+
+        assert save(client, store, project_id).status_code == 200, name
+        assert held(store, project_id, shot_id).h3_prompt_map == recorded, (
+            f"{name} cleared the recorded map from a body that merely omitted it"
+        )
+        assert len(director.calls) == 1, f"{name} asked a model of its own"
+
+        # And the record still does its job: a citation moved afterwards is still refused.
+        shots = shots_body(store, project_id)
+        attach(shots[0], bed["id"], lead["id"])
+        assert put_shots(client, project_id, shots).status_code == 200
+        arm(store, project_id)
+        assert submit_h3(client, project_id, shot_id).status_code == 422, name
+        assert comfy.prompts == [], name
