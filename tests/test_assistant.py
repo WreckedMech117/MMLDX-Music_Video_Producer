@@ -1895,3 +1895,110 @@ def test_a_whitespace_only_expansion_does_not_count_as_expanded():
     built = assistant_input(project, shot_ids=["shot_one"])
 
     assert built["shots"][0]["expanded"] is False
+
+
+def test_a_fill_cites_the_identity_sheet_and_says_so(tmp_path: Path):
+    """The identity-sheet rule reaches the assistant too, and it does not do it quietly.
+
+    This is the second writer of citations from a model's answer, and it has populate's defect:
+    the library offers the source picture and the sheet promoted from it as two rows, and a shot
+    conditioned on the single frame is using the weaker of the two. The substitution is one
+    function (`models.prefer_identity_sheets`) so both callers cannot drift; the notice is what
+    keeps it from being a silent rewrite of an id the model named out loud. A subject with no
+    sheet is untouched, which is the control that matters.
+    """
+    from music_video_producer.app import ASSISTANT_IDENTITY_SHEET_NOTICE
+
+    director = FillingDirector(
+        turn(
+            {
+                "shot_id": "shot_one",
+                "citations": [
+                    {"asset_id": "asset_wolf", "role": "reference"},
+                    {"asset_id": "asset_sheet", "role": "reference"},
+                ],
+            },
+            {"shot_id": "shot_two", "citations": [{"asset_id": "asset_forest", "role": "reference"}]},
+        )
+    )
+    client, store, _comfy = make_client(tmp_path, director)
+    project = producer_project(store, name="Sheets")
+    project.assets.append(
+        Asset(id="asset_sheet", name="Grey wolf · multiview", kind="character",
+              path="out/sheet.png", source="krea-multiview", parent_id="asset_wolf")
+    )
+    store.save(project)
+
+    response = client.post(
+        FILL.format(project=project.id),
+        json={"message": "cite the wolf and the forest", "shot_ids": ["shot_one", "shot_two"]},
+    )
+
+    assert response.status_code == 200, response.text
+    stored = store.get(project.id)
+    # Both of the model's ids collapse onto the sheet: the source is the sheet, once.
+    assert [item.asset_id for item in stored.shots[0].citations] == ["asset_sheet"]
+    # The forest has no sheet, so nothing about it changed.
+    assert [item.asset_id for item in stored.shots[1].citations] == ["asset_forest"]
+    text = reply_text(stored)
+    assert ASSISTANT_IDENTITY_SHEET_NOTICE.format(shots=shot_label(stored, stored.shots[0])) in text
+    assert shot_label(stored, stored.shots[1]) not in text.split("Cited the promoted")[1]
+
+
+def test_a_fill_whose_prompt_is_refused_reports_no_substitution(tmp_path: Path):
+    """The substitution is reported at the commit point, never at the substitution.
+
+    A fill whose prompt is rejected is discarded whole — mode, citations and all — so a notice
+    saying its citations were re-pointed would be reporting a change to a shot nothing was
+    written to.
+    """
+    director = FillingDirector(
+        turn(
+            {
+                "shot_id": "shot_one",
+                "prompt": '{"prompt": "a wolf"}',
+                "citations": [{"asset_id": "asset_wolf", "role": "reference"}],
+            },
+        )
+    )
+    client, store, _comfy = make_client(tmp_path, director)
+    project = producer_project(store, name="Refused")
+    project.assets.append(
+        Asset(id="asset_sheet", name="Grey wolf · multiview", kind="character",
+              path="out/sheet.png", source="krea-multiview", parent_id="asset_wolf")
+    )
+    store.save(project)
+
+    response = client.post(
+        FILL.format(project=project.id),
+        json={"message": "cite the wolf", "shot_ids": ["shot_one"]},
+    )
+
+    assert response.status_code == 200, response.text
+    stored = store.get(project.id)
+    assert stored.shots[0].citations == []
+    assert "Cited the promoted identity sheet" not in reply_text(stored)
+
+
+def test_a_keyframe_citation_is_never_swapped_for_a_contact_sheet(tmp_path: Path):
+    """`first`, `last` and `middle` name a concrete frame the render pins the picture to.
+
+    Substituting a four-panel sheet for a shot's first frame would make the first frame a contact
+    sheet, which is the opposite of what the role asks for. Only `reference` is re-pointed.
+    """
+    from music_video_producer.models import prefer_identity_sheets
+
+    sheets = {"asset_wolf": "asset_sheet"}
+    keyframes = [
+        AssetCitation(asset_id="asset_wolf", role="first", order=0),
+        AssetCitation(asset_id="asset_wolf", role="last", order=1),
+    ]
+    assert prefer_identity_sheets(keyframes, sheets) == keyframes
+    mixed = [*keyframes, AssetCitation(asset_id="asset_wolf", role="reference", order=2)]
+    assert [item.asset_id for item in prefer_identity_sheets(mixed, sheets)] == [
+        "asset_wolf",
+        "asset_wolf",
+        "asset_sheet",
+    ]
+    # No sheets at all: the same citations back, field for field.
+    assert prefer_identity_sheets(mixed, {}) == mixed

@@ -40,6 +40,7 @@ from .assembly import (
     verification_problems,
     with_progress,
 )
+from .asset_replacement import ReplacementChange, asset_replacement_plan
 from .batch import (
     TERMINAL_JOB_STATUSES,
     ReadinessReport,
@@ -86,14 +87,19 @@ from .models import (
     SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
+    citable_assets,
     citations_in_role,
     dangling_citations,
+    default_setting_asset,
+    identity_sheet_ids,
     mode_specification_problems,
     new_id,
     numbered_references,
+    prefer_identity_sheets,
     reference_slot_totals,
     resolve_shot_mode,
     song_audio_tag,
+    with_default_setting,
 )
 from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
 from .store import ProjectNotFound, ProjectStore
@@ -129,6 +135,7 @@ from .workflows import (
     H3_DEFAULT_PROFILE,
     H3_DIRECTOR_DEFAULT_HEIGHT,
     H3_DIRECTOR_DEFAULT_WIDTH,
+    H3_REFERENCE_LIMITS,
     LTX25_ENHANCE_SEED,
     SONGPLANNER_DEFAULT_DURATION_HEADROOM,
     SONGPLANNER_MAX_DURATION_HEADROOM,
@@ -1050,6 +1057,16 @@ ASSISTANT_EMPTY_FILL_NOTICE = (
 ASSISTANT_SPECIFICATION_NOTICE = (
     "Filled in, and still not fully specified for its mode:\n{details}\n"
     "This does not block anything now; it is refused at render."
+)
+# A citation the model aimed at a source picture and this route re-pointed at that subject's
+# promoted identity sheet (`models.prefer_identity_sheets`). Said out loud rather than applied
+# quietly: the model named one asset and the shot ended up citing another, and a substitution the
+# reply did not mention is a substitution the Director would have to diff the manifest to find.
+# The sheet is what the promotion exists to be cited as; the row is editable in the inspector.
+ASSISTANT_IDENTITY_SHEET_NOTICE = (
+    "Cited the promoted identity sheet instead of the single source picture on: {shots}. A "
+    "multi-view sheet is the stronger identity reference and takes the same one slot; change the "
+    "cited assets on any of those shots if you wanted the source frame itself."
 )
 # The model talking instead of calling the tool. Its own notice because it is the failure the
 # system prompt is most likely to be iterated against, and a turn that quietly changed nothing
@@ -2136,8 +2153,10 @@ POPULATE_INSTRUCTION = (
     "`performance` flag: answer it on each shot — true where a character sings the song "
     "on camera, false everywhere else. It is a field of the shot object and never words "
     "in the shot: no prompt may mention that flag or its value. The project's assets, "
-    "by name, are: {assets}. Refer to them by these exact names in shot prompts so "
-    "each shot says which character or location it uses. Every shot's prompt is a "
+    "by name, are: {assets}. Each shot's prompt names the ones that shot uses, by these "
+    "exact names and no others — they are the names of the people and places in frame, "
+    "so write them as ordinary description, and never write a name that is not on that "
+    "list. Every shot's prompt is a "
     "short readable visual intent (one or two sentences): what is seen, who is in "
     "frame, how the camera behaves. Vary the camera angle and movement between "
     "adjacent shots — never repeat the same setup, framing or camera move back to "
@@ -2162,6 +2181,25 @@ POPULATE_SECTIONS_ASK = (
 )
 POPULATE_SECTIONS_CONSTRAINT = (
     "\n4. `sections` must not be empty — return the song's structure blocks there."
+)
+
+#: The declared location, named to the model when the Director has declared one
+#: (`Project.default_setting_id`). Appended by the route rather than interpolated into
+#: POPULATE_INSTRUCTION, so the instruction's `format` keys are unchanged and the live smoke
+#: scripts that call it directly keep working.
+#:
+#: Newline-led, and that is load-bearing for exactly the reason the section map's is: this text
+#: lands after "3. Every shot needs a non-empty `prompt`.", and a leading space glued it onto the
+#: end of a numbered hard constraint where it read as a continuation of one (found live,
+#: 2026-08-20).
+#:
+#: It is the *soft* half of the setting fix and is expected to be unreliable — this model family
+#: names what it feels like naming, which is the measured defect (a location cited by 5 of 30
+#: shots). The half that does not depend on the model is `models.with_default_setting`, which
+#: gives the location to any shot that did not name one.
+POPULATE_LOCATION_LINE = (
+    "\nThe video's location is {name}. Every shot that plays there names it in its prompt, "
+    "by that exact name."
 )
 
 #: Stage one of the two-stage populate: structure only, from the lyric sheet. Deliberately
@@ -2330,6 +2368,93 @@ class SnapCutsResponse(BaseModel):
     project: Project | None = None
 
 
+class AssetReplacementRequest(BaseModel):
+    """Which asset takes over, and whether this call is allowed to write.
+
+    `confirm_apply` is `SnapCutsRequest`'s field in the same key and for the same reason, which
+    is `populate`'s `confirm_replace` at bottom: the default is a **report**, and only an
+    explicit true writes. Server-enforced rather than trusted to the browser — the report is the
+    moment a Director sees that eight of their thirty shots already cite the replacement, and a
+    client that skipped showing it must not be able to skip the decision.
+    """
+
+    replacement_id: str
+    confirm_apply: bool = False
+
+
+class AssetReplacementShot(BaseModel):
+    """One shot the replacement changes, named as the timeline names it.
+
+    `roles` is every role the replaced asset held on this shot, so the "role and order are
+    carried across" guarantee is checkable from the report itself. `carried_label` is the
+    `reference_labels` entry that travels, `""` when none does.
+
+    `provenance` is `"approved"`, `"rendered"` or `""` — whether this shot already holds a take
+    produced against the old asset. It changes nothing about what happens to the shot; it is why
+    the row is also counted into `rendered`/`approved` and named in `notes`.
+    """
+
+    shot_id: str
+    label: str
+    roles: list[str]
+    carried_label: str = ""
+    provenance: str = ""
+
+
+class AssetReplacementSkip(BaseModel):
+    """One shot left exactly as it is, and the sentence saying why. `BatchSkippedShot`'s shape."""
+
+    shot_id: str
+    label: str
+    reason: str
+
+
+class AssetReplacementResponse(BaseModel):
+    """The report, and — only on an applied call — the saved project.
+
+    `project` is `None` on a report, `SnapCutsResponse`'s rule verbatim: the absence is the
+    wire's own statement that nothing was written.
+
+    `merged` is the Director's "already in N shots" — the shots that cite both, where the old
+    citation is removed and the standing one is left alone. `still_cited` is what the delete this
+    was reached from will meet next, which is why the counts are three and not two.
+
+    `rendered` and `approved` count shots **that are being changed** and already hold a take made
+    against the old asset. They are not skips and do not overlap `skipped`: they are a subset of
+    `swapped` + `merged`, reported because the consequence is real and unrecoverable. `notes`
+    carries the sentences naming them, which is what a client draws.
+    """
+
+    applied: bool
+    replaced: str
+    replacement: str
+    swapped: int
+    merged: int
+    skipped: int
+    still_cited: int
+    rendered: int = 0
+    approved: int = 0
+    swaps: list[AssetReplacementShot] = Field(default_factory=list)
+    merges: list[AssetReplacementShot] = Field(default_factory=list)
+    skips: list[AssetReplacementSkip] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    warning: str = ""
+    message: str = ""
+    project: Project | None = None
+
+
+def _replacement_row(change: ReplacementChange) -> AssetReplacementShot:
+    """One planned change on the wire. The two buckets are the same row shape, so it is written
+    once — a second copy is a second thing to keep true."""
+    return AssetReplacementShot(
+        shot_id=change.shot_id,
+        label=change.label,
+        roles=list(change.roles),
+        carried_label=change.carried_label,
+        provenance=change.provenance,
+    )
+
+
 class GenerateBatchRequest(BaseModel):
     """One batch, one confirmation. `scope` picks FR-4's ready set or AD-5's flagged set;
     `replace_existing` widens the ready scope to settled, unprotected shots; `profile`
@@ -2390,6 +2515,23 @@ class AssetConsistencyRequest(BaseModel):
     """
 
     consistency_prompt: str = ""
+
+
+class DefaultSettingRequest(BaseModel):
+    """Which `setting` Asset is this video's location — one field, `AssetConsistencyRequest`'s
+    argument verbatim: an omission and a clear must mean the same thing, and a body carrying the
+    rest of the project alongside it is the shape that made the generic `PUT` a data-loss hole."""
+
+    asset_id: str = ""
+
+
+#: The refusal for a location that is not a location. Named rather than generic, because "422"
+#: on a picker is indistinguishable from a bug: the Director picked a real asset and it was the
+#: wrong kind of real asset.
+DEFAULT_SETTING_NOT_A_SETTING = (
+    "{name} is a {kind} asset, and a video's location has to be a setting. Pick a setting "
+    "asset, or send an empty asset_id to declare no location."
+)
 
 
 class TimelineRequest(BaseModel):
@@ -3156,6 +3298,99 @@ DELETE_ASSET_CITED = (
     "{name} is cited by {shots}, and deleting it would leave those citations dangling — "
     "the render would refuse them one at a time. Remove it from those shots first."
 )
+#: The act `DELETE_ASSET_CITED` implies, and the Director asked for by hitting that refusal:
+#: "a nice Replace With/Cancel option set would be nice so then i could select another image
+#: while i am here in assets and auto replace the one i am trying to remove across the affected
+#: shots" (2026-08-20). The refusal above is unchanged and stays — this is the way through it,
+#: not a way around it, and it deliberately does **not** delete: `replace_asset_citations`
+#: moves citations and `delete_asset` deletes, so a replacement that had to skip a locked shot
+#: still meets the same refusal for the same reason instead of half-deleting an asset.
+REPLACE_ASSET_WITH_ITSELF = (
+    "{name} cannot replace itself. Pick a different asset from the library, or cancel — "
+    "replacing an asset with itself would report every shot that cites it as changed and "
+    "change nothing."
+)
+REPLACE_ASSET_UNKNOWN = "Replacement asset not found"
+#: The one genuine correctness block, and the only refusal here that is not a lock.
+#:
+#: A new sentence rather than a reuse, because no existing one says this: the two in-flight
+#: wordings this module already carries name a different act — `RENDER_AGAIN_IN_FLIGHT_REFUSAL`
+#: says "nothing was re-opened" and `MARK_READY_IN_FLIGHT_REFUSAL` says a status is not yours to
+#: set — and a refusal about a *citation* that claimed either would be describing something that
+#: did not happen. It keeps their staleness escape verbatim, because job status only moves when
+#: the queue is polled (`shot_render_in_flight`).
+REPLACE_ASSET_IN_FLIGHT = (
+    "A render for {shot} has not finished, and it was submitted against {replaced}. Rewriting "
+    "the citation now would leave that job's record describing a render that never happened. "
+    "Wait for it, or refresh the render queue if it has already finished and this project has "
+    "not been told yet."
+)
+#: An asset no shot cites needs no replacement, and saying so is more useful than an empty
+#: report: the delete it was reached from will now simply go through. `snap_timeline_cuts`'
+#: honest-empty rule — refuse when there was nothing to examine, rather than reporting a plan
+#: over zero shots.
+REPLACE_ASSET_UNCITED = (
+    "No shot cites {name}, so there is nothing to replace. Delete it directly — the citation "
+    "refusal will not fire."
+)
+#: Reported, never refused. `Asset.kind` is the library's own taxonomy, and the render path
+#: buckets `character`, `setting`, `prop`, `style` and `image` into one anonymous picture series
+#: (`models.citation_slot_kind`) — so citing a setting where a character was is a creative
+#: change, not a structural error, and refusing it would block the ordinary act of replacing a
+#: rough concept `image` with the finished `character` drawn from it. The structural half of a
+#: kind change *is* refused, per shot and by name: a replacement that moves a citation between
+#: the picture, video and audio series is checked against `H3_REFERENCE_LIMITS` and skips any
+#: shot it would push over (`asset_replacement.REPLACE_OVER_SLOT_LIMIT`).
+REPLACE_ASSET_KIND_CHANGE = (
+    "{replacement} is a {replacement_kind} asset and {replaced} is a {replaced_kind}. The "
+    "replacement is allowed, but every shot below will be conditioned on a different sort of "
+    "reference than it was — read the list before confirming."
+)
+#: A shot whose take was rendered against the asset being replaced. **A note, not a refusal**, on
+#: the Director's ruling of 2026-08-20: "So even with takes we do want the asset for the shot
+#: replaceable, that way a re-render would use the updated asset without losing previous takes.
+#: This helps facilitate experimentation."
+#:
+#: Deliberately not `EXPANSION_RENDERED_NOTICE`, and that is the point rather than an oversight:
+#: that sentence says a shot was *left unchanged*, and these shots are changed. Reusing it here
+#: would be the drift the verbatim rule exists to prevent, in the other direction. What it does
+#: keep is that wording's argument — the take and what sits beside it now disagree — because the
+#: consequence is real and unrecoverable: nothing in this application records which assets
+#: produced a take, so the old take's true references are gone the moment this is applied.
+REPLACE_ASSET_RENDERED_NOTE = (
+    "{count} shot(s) already hold a take that was rendered against {replaced}: {shots}. The "
+    "takes are untouched — the files, the takes strip and the job records are all exactly as "
+    "they are — but nothing records which assets produced them, so after this those takes and "
+    "the references beside them no longer agree. Re-rendering uses the new asset."
+)
+#: The same, for shots carrying an editorial approval. Its own line so the count is visible: an
+#: approval is a stronger statement than a render, and a Director changing the references under
+#: eight approved shots should see the number before confirming.
+#:
+#: The approval itself is untouched — `approved_output`, `approved_start` and `approved_duration`
+#: are not written by this route on any path. AD-13's staleness comparison is between the stored
+#: window and the live one, and citations are not the window, so assembly reads exactly what it
+#: read before.
+REPLACE_ASSET_APPROVED_NOTE = (
+    "{count} shot(s) carry an approved take rendered against {replaced}: {shots}. The approval "
+    "and its window snapshot are untouched and assembly is unaffected — citations are not the "
+    "window — but the approved file was produced from the old reference."
+)
+#: The counts a Director sanity-checks first, in their own phrasing: "a report would be nice and
+#: could include 'already in N shots'".
+REPLACE_ASSET_REPORT = (
+    "{replacement} would replace {replaced} in {swapped} shot(s); {merged} shot(s) already "
+    "cite {replacement}, and there the {replaced} reference is simply removed. {skipped} "
+    "shot(s) skipped. Role and order are carried across, and nothing is rendered, armed or "
+    "queued."
+)
+#: Said after an applied call, because "can I delete it now" is the next question by
+#: construction — this route is only ever reached from the delete refusal.
+REPLACE_ASSET_FREED = "No shot cites {replaced} any more, so it can now be deleted."
+REPLACE_ASSET_STILL_CITED = (
+    "{count} shot(s) still cite {replaced}, so deleting it will still be refused until those "
+    "are resolved."
+)
 #: How long an appearance anchor may be. It is an *anchor*, not a description: the Calliope
 #: teardown's own example is eight words ("a teenage girl with a chestnut ponytail and yellow
 #: rain jacket"), and the string is appended to every tag line of every prompt citing the asset,
@@ -3801,6 +4036,12 @@ def create_app(
         stored_anchors = {asset.id: asset.consistency_prompt for asset in current.assets}
         for asset in project.assets:
             asset.consistency_prompt = stored_anchors.get(asset.id, "")
+        # The declared location is server-owned on the same argument, and it is the *fourth*
+        # time this route has been the hole: `default_setting_id` is a defaulted `str`, so
+        # every client written before it existed sends `""` and one ordinary save would clear
+        # the Director's choice. `PUT .../default-setting` is its one writer, which also keeps
+        # it out of reach of anything a model can call.
+        project.default_setting_id = current.default_setting_id
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -4175,6 +4416,49 @@ def create_app(
         asset.consistency_prompt = anchor
         return store.save(project)
 
+    @app.put("/api/projects/{project_id}/default-setting", response_model=Project)
+    def replace_default_setting(
+        project_id: str, request: DefaultSettingRequest
+    ) -> Project:
+        """Declare which library setting is this video's location — the one writer of it.
+
+        The Director's report (2026-08-20): on a 30-shot plan whose brief specifies a location,
+        the setting asset was cited by 5 shots, because whether a shot carried its environment
+        reference depended entirely on whether the model happened to spell the asset's display
+        name into prose. This is the half of the fix that does not depend on a model:
+        `populate` gives the declared location to every new shot that named no location of its
+        own, and names it in the instruction so the model has a chance to name it first.
+
+        **Explicit, and therefore refusable and reversible.** Nothing infers this field — no
+        route derives it from a library that happens to hold one setting, no tool schema exposes
+        it to a model, and the generic full-project `PUT` re-adopts the stored value rather than
+        trusting a body (`replace_consistency_prompt`'s rule, for the reason that route's
+        docstring gives). An empty `asset_id` clears it, which is what "no location" means, and
+        an unset field is a genuine no-op: `populate` writes exactly the citations it wrote
+        before this existed.
+
+        What it does *not* do is touch a single existing shot. It is a declaration about the
+        project, read by the next plan; a sweep over a plan the Director already has is the
+        silent bulk edit this codebase's report-then-confirm convention exists to forbid.
+        """
+        project = get_project(project_id)
+        asset_id = request.asset_id.strip()
+        if not asset_id:
+            project.default_setting_id = ""
+            return store.save(project)
+        asset = next((item for item in project.assets if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        if asset.kind != "setting":
+            raise HTTPException(
+                status_code=422,
+                detail=DEFAULT_SETTING_NOT_A_SETTING.format(
+                    name=asset.name, kind=asset.kind
+                ),
+            )
+        project.default_setting_id = asset_id
+        return store.save(project)
+
     @app.delete("/api/projects/{project_id}/assets/{asset_id}", response_model=Project)
     def delete_asset(project_id: str, asset_id: str) -> Project:
         """Remove one asset from the library — refused by name while any shot cites it.
@@ -4204,7 +4488,216 @@ def create_app(
             if target.is_file():
                 target.unlink()
         project.assets = [item for item in project.assets if item.id != asset_id]
+        # A location that is no longer in the library is not this project's location. Cleared
+        # here rather than left to `default_setting_asset`'s re-validation — which would also
+        # no-op it — so the manifest never carries a pointer to something that is gone, and a
+        # later asset re-using the id could not silently inherit the declaration.
+        if project.default_setting_id == asset_id:
+            project.default_setting_id = ""
         return store.save(project)
+
+    @app.post(
+        "/api/projects/{project_id}/assets/{asset_id}/replace-citations",
+        response_model=AssetReplacementResponse,
+    )
+    def replace_asset_citations(
+        project_id: str, asset_id: str, request: AssetReplacementRequest
+    ) -> AssetReplacementResponse:
+        """Re-point every shot citing this asset at another one. The way through `delete_asset`.
+
+        The Director hit `DELETE_ASSET_CITED` trying to remove the HarderFaster source now that
+        its Krea multiview exists, liked that it was caught, and asked for the act the refusal
+        implies: "a nice Replace With/Cancel option set ... so then i could select another image
+        while i am here in assets and auto replace the one i am trying to remove across the
+        affected shots" (2026-08-20). **The delete refusal is untouched**, and this route does
+        not delete: it moves citations, and the Director deletes afterwards — so an asset one
+        locked shot still cites meets the same refusal for the same reason, rather than
+        half-vanishing from a library it is still referenced in.
+
+        Report first, apply on confirm, enforced here rather than trusted to the browser —
+        `snap_timeline_cuts`' shape, which is `populate`'s `confirm_replace` in a smaller key.
+        Without `confirm_apply` this route **does not call `store.save`** and the response
+        carries no project at all, so "nothing was written" is visible on the wire.
+
+        Every decision is `asset_replacement.asset_replacement_plan`'s. This route's own additions
+        are the two lookups, the three refusals, the protection map, the kind warning, the
+        sentences, and the write.
+
+        **A rendered shot is replaced, and told about — `shot_write_refusal` is deliberately not
+        the gate here.** This route shipped using it and the Director overruled that the same day:
+        *"So even with takes we do want the asset for the shot replaceable, that way a re-render
+        would use the updated asset without losing previous takes. This helps facilitate
+        experimentation."* The reasoning is the general rule for citations and is worth keeping in
+        one place: **replacing a citation does not touch the take.** The file is still on disk,
+        `latest_output` still names it, the takes strip still lists it, `RenderJob.output_files` is
+        unchanged, and a citation describes what a *future* render would use. `shot_write_refusal`
+        is right about prose — an in-place prompt rewrite really does destroy the record — and its
+        `rendered` arm does not transfer to a field that is not the prompt. `timeline.
+        window_move_refusal` already reasons this way for windows, for the same reason.
+
+        What survives is the report. `REPLACE_ASSET_RENDERED_NOTE` and
+        `REPLACE_ASSET_APPROVED_NOTE` name those shots before the confirm, because the consequence
+        is real and unrecoverable: nothing in this application records which assets produced a
+        take, so afterwards the take and the references beside it simply disagree with no way back.
+
+        **Approved shots are the same case, and their approval is untouched.** No path here writes
+        `approved_output`, `approved_start` or `approved_duration`. AD-13's staleness comparison is
+        between the stored window and the live one, and citations are not the window, so assembly
+        reads exactly what it read before. They get their own report line rather than their own
+        rule, because an approval is a stronger statement than a render and the count should be
+        visible.
+
+        **Two protections remain.** A `locked` shot is an explicit hands-off the Director set and
+        only they may clear it. An **in-flight** render is the one genuine correctness block: the
+        job was submitted against the old asset and is executing now, so rewriting the citation
+        underneath it would leave that job's record describing a render that never happened. Read
+        through `shot_render_in_flight`, the single reader of the job records, which also catches
+        a shot whose status was walked backwards by hand.
+
+        Nothing renders, arms, queues or approves. `comfy` is not touched on any path, no
+        `status` moves, and the only fields any shot differs in afterwards are `citations`,
+        `reference_labels` and the `asset_ids` projection the model rebuilds from the first.
+        """
+        project = get_project(project_id)
+        replaced = next((item for item in project.assets if item.id == asset_id), None)
+        if replaced is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        replacement = next(
+            (item for item in project.assets if item.id == request.replacement_id), None
+        )
+        if replacement is None:
+            raise HTTPException(status_code=404, detail=REPLACE_ASSET_UNKNOWN)
+        # Before the plan, because a self-replacement is not an empty plan: every citation would
+        # match, every shot would be reported as changed, and the manifest would be rewritten to
+        # exactly what it already said. A report claiming thirty changes and a save that changes
+        # nothing is worse than a refusal.
+        if replacement.id == replaced.id:
+            raise HTTPException(
+                status_code=422,
+                detail=REPLACE_ASSET_WITH_ITSELF.format(name=replaced.name),
+            )
+        # Two protections and no more. A lock is the Director's own hands-off and only they clear
+        # it; a render executing right now is the one genuine correctness block. `shot_write_refusal`
+        # is deliberately NOT the gate here — see the ruling in the docstring — so the lock is read
+        # from the Shot directly rather than through a function whose `rendered` arm this route no
+        # longer honours. In-flight is `shot_render_in_flight`, the one reader of the job records,
+        # rather than a second walk over them.
+        protected: dict[str, str] = {}
+        for shot in project.shots:
+            if shot.locked:
+                protected[shot.id] = EXPANSION_LOCKED_NOTICE.format(
+                    shots=shot_label(project, shot)
+                )
+            elif shot_render_in_flight(project, shot):
+                protected[shot.id] = REPLACE_ASSET_IN_FLIGHT.format(
+                    shot=shot_label(project, shot), replaced=replaced.name
+                )
+        # Not a protection: a note. Approved outranks rendered because an approval is the stronger
+        # statement about the same take, and a shot reported under both headings would be counted
+        # twice. `shot_render_provenance` is the same predicate `shot_write_refusal`'s second arm
+        # reads — the fact is unchanged, only what this route does about it.
+        provenance = {
+            shot.id: (
+                "approved"
+                if shot.approved_output or shot.status == "approved"
+                else "rendered"
+            )
+            for shot in project.shots
+            if shot_render_provenance(shot)
+        }
+        plan = asset_replacement_plan(
+            project,
+            replaced=replaced,
+            replacement=replacement,
+            protected=protected,
+            provenance=provenance,
+            limits=H3_REFERENCE_LIMITS,
+        )
+        # The honest-empty refusal, `snap_timeline_cuts`' rule: nothing cites this asset, so there
+        # is no plan to report over. Checked on `cited` rather than on the writable buckets, so an
+        # asset every one of whose citing shots is locked still *reports* — those skips are the
+        # answer to "why can I still not delete it", and refusing them into a 422 would hide it.
+        if not plan.cited:
+            raise HTTPException(
+                status_code=422,
+                detail=REPLACE_ASSET_UNCITED.format(name=replaced.name),
+            )
+        still_cited = len(plan.skips)
+        # The two provenance lines, each drawn only when it has shots. Grouped rather than one row
+        # per shot, `expansion_sweep_notices`' rule: listing twenty shots through a `{shot}`-shaped
+        # sentence twenty times is not a report anyone reads.
+        rendered = plan.with_provenance("rendered")
+        approved = plan.with_provenance("approved")
+        notes = [
+            wording.format(
+                count=len(changes),
+                replaced=replaced.name,
+                shots=", ".join(change.label for change in changes),
+            )
+            for wording, changes in (
+                (REPLACE_ASSET_APPROVED_NOTE, approved),
+                (REPLACE_ASSET_RENDERED_NOTE, rendered),
+            )
+            if changes
+        ]
+        response = AssetReplacementResponse(
+            applied=False,
+            replaced=replaced.name,
+            replacement=replacement.name,
+            swapped=len(plan.swaps),
+            merged=len(plan.merges),
+            skipped=len(plan.skips),
+            still_cited=still_cited,
+            rendered=len(rendered),
+            approved=len(approved),
+            notes=notes,
+            swaps=[_replacement_row(change) for change in plan.swaps],
+            merges=[_replacement_row(change) for change in plan.merges],
+            skips=[
+                AssetReplacementSkip(
+                    shot_id=skip.shot_id, label=skip.label, reason=skip.reason
+                )
+                for skip in plan.skips
+            ],
+            warning=(
+                ""
+                if replacement.kind == replaced.kind
+                else REPLACE_ASSET_KIND_CHANGE.format(
+                    replacement=replacement.name,
+                    replacement_kind=replacement.kind,
+                    replaced=replaced.name,
+                    replaced_kind=replaced.kind,
+                )
+            ),
+            message=" ".join(
+                (
+                    REPLACE_ASSET_REPORT.format(
+                        replacement=replacement.name,
+                        replaced=replaced.name,
+                        swapped=len(plan.swaps),
+                        merged=len(plan.merges),
+                        skipped=len(plan.skips),
+                    ),
+                    REPLACE_ASSET_FREED.format(replaced=replaced.name)
+                    if not still_cited
+                    else REPLACE_ASSET_STILL_CITED.format(
+                        count=still_cited, replaced=replaced.name
+                    ),
+                )
+            ),
+        )
+        if not request.confirm_apply or not plan.writes:
+            return response
+        # Committed by position from the plan's own candidates, `assistant_fill`'s one pass after
+        # every shot has been judged: nothing above this line touched the project, so a plan that
+        # raised part-way through would have left both the manifest and the in-memory project
+        # exactly as they were.
+        for index, shot in enumerate(project.shots):
+            if (candidate := plan.candidates.get(shot.id)) is not None:
+                project.shots[index] = candidate
+        response.project = store.save(project)
+        response.applied = True
+        return response
 
     @app.delete("/api/projects/{project_id}/song", response_model=Project)
     def remove_song(project_id: str, confirm_song_replacement: bool = False) -> Project:
@@ -6533,9 +7026,16 @@ def create_app(
         if not request.confirm_replace:
             raise HTTPException(status_code=422, detail=POPULATE_CONFIRM_REFUSAL)
         duration = project.song.duration
+        # The roster the model is offered, and it is `citable_assets` rather than the whole
+        # library on purpose. A promoted identity sheet is no longer separately citable — a
+        # citation of its source resolves to it below — so offering its display name buys
+        # nothing and costs the naming leak the Director reported: `"Close up on eyes of
+        # HarderFaster · multiview with flickering light reflections"`, an internal asset label
+        # sitting in a shot's creative prose, written there because citation correctness used
+        # to depend on the model typing that label. A name never shown cannot be echoed.
+        citable = citable_assets(project)
         assets = (
-            "; ".join(f"{asset.name} ({asset.kind})" for asset in project.assets)
-            or "none yet"
+            "; ".join(f"{asset.name} ({asset.kind})" for asset in citable) or "none yet"
         )
         # The count comes from `POPULATE_TARGET_WINDOW_SECONDS`, the target window populate
         # steers the model toward and thereby the plan's typical shot length. NOT the
@@ -6546,6 +7046,15 @@ def create_app(
         # music video than 9 s holds.
         required = populate_required_shots(duration)
         context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+        # The roster's rule applied to the context dump, which is the other place the model can
+        # read an asset's name from — and the place it would still have read `· multiview` from
+        # if only the instruction had been trimmed. Done here, on populate's own copy, rather
+        # than in `DIRECTOR_CONTEXT_EXCLUDE`: that mapping withholds *fields* from every caller,
+        # and this withholds *rows* from this one. The chat route's dump is untouched.
+        citable_ids = {asset.id for asset in citable}
+        context["assets"] = [
+            asset for asset in context["assets"] if asset["id"] in citable_ids
+        ]
         # Stage one of the two-stage populate, opt-in and skipped entirely when the
         # Director has already marked the boxes: structure first, on its own, from the
         # lyric sheet. It gets exactly one call and no retry — its whole premise is that a
@@ -6593,6 +7102,12 @@ def create_app(
             sections_ask=POPULATE_SECTIONS_ASK if wants_sections else "",
             sections_constraint=POPULATE_SECTIONS_CONSTRAINT if wants_sections else "",
         )
+        # The declared location, named before the section map so the two read as project fact
+        # then song structure. Only when there is one: nothing is invented, and a project with
+        # no declaration sends the instruction it has always sent, character for character.
+        declared_location = default_setting_asset(project)
+        if declared_location is not None:
+            instruction += POPULATE_LOCATION_LINE.format(name=declared_location.name)
         if known_sections:
             section_map = "; ".join(
                 f"{section.label} {section.start:.1f}-{section.end:.1f}s"
@@ -6783,16 +7298,38 @@ def create_app(
         #   names, so any asset whose name appears in a shot's prompt is cited as a
         #   reference. Deterministic, reviewable in the inspector, reversible per shot.
         #   Names under 4 characters are skipped as substring noise.
+        #
+        #   The scan is over `citable_assets`, not the whole library, and that is the same
+        #   line the roster and the context dump are drawn on: an identity sheet is not
+        #   separately citable, and scanning for its name was also a live substring bug —
+        #   "HarderFaster · multiview" contains "HarderFaster", so a prompt naming the sheet
+        #   matched *both* assets and spent two picture slots on one face.
+        #
+        #   Two rules then run over what the scan produced, in this order and no other:
+        #   `with_default_setting` may append the project's declared location (it counts
+        #   picture slots, so it must see the pre-substitution list — the widest the list
+        #   can be), and `prefer_identity_sheets` then re-points every reference at the
+        #   promoted sheet of what it names and collapses duplicates, which can only make
+        #   the list shorter. Both are no-ops on a project with no promotions and no
+        #   declared location, so such a project's citations are byte-identical to what
+        #   populate has always written.
+        library = citable_assets(project)
+        sheets = identity_sheet_ids(project)
+
         def prompt_citations(prompt_text: str) -> list[AssetCitation]:
             lowered = prompt_text.lower()
-            return [
+            named = [
                 AssetCitation(asset_id=asset.id, role="reference", order=order)
                 for order, asset in enumerate(
                     asset
-                    for asset in project.assets
+                    for asset in library
                     if len(asset.name) >= 4 and asset.name.lower() in lowered
                 )
             ]
+            located = with_default_setting(
+                project, named, picture_limit=H3_REFERENCE_LIMITS["picture"]
+            )
+            return prefer_identity_sheets(located, sheets)
 
         shots: list[Shot] = []
         for index, (start, length) in enumerate(windows):
@@ -7550,6 +8087,15 @@ def create_app(
         unknown_assets: list[MessageNotice] = []
         rejected: list[MessageNotice] = []
         specification: list[str] = []
+        # The identity-sheet rule is populate's, applied here for the reason it is one function
+        # in `models` rather than a branch in one route: this is the *other* writer of citations
+        # from a model's answer, and it has the same defect — the assistant is offered the source
+        # picture and the sheet promoted from it as two library rows, and a shot conditioned on
+        # the single frame is using the weaker of the two. `substituted` collects the shots it
+        # changed, because a substitution the reply does not mention is one the Director would
+        # have to diff the manifest to find.
+        sheets = identity_sheet_ids(project)
+        substituted: list[str] = []
         for fill in turn.fills:
             if fill.shot_id not in open_to_writing:
                 # A Shot the selection already reports on — locked, or carrying provenance — is not
@@ -7572,6 +8118,7 @@ def create_app(
             # thereby blank the prompt a Director wrote by hand, so the change set is built from
             # the keys that are actually present.
             changes: dict[str, Any] = {}
+            redirected = False
             if fill.mode is not None:
                 changes["mode"] = fill.mode
             # Set, never inferred: this is only reached because the tool call carried a value, and
@@ -7579,8 +8126,13 @@ def create_app(
             if fill.singing is not None:
                 changes["singing"] = fill.singing
             if fill.citations is not None:
+                asked = [
+                    AssetCitation(**citation.model_dump()) for citation in fill.citations
+                ]
+                preferred = prefer_identity_sheets(asked, sheets)
+                redirected = preferred != asked
                 changes["citations"] = [
-                    citation.model_dump() for citation in fill.citations
+                    citation.model_dump() for citation in preferred
                 ]
             if fill.prompt is not None:
                 reason = assistant_prompt_rejection(fill.prompt)
@@ -7635,6 +8187,11 @@ def create_app(
                 # happens where GPU time would be spent.
                 specification.append(f"{labels[fill.shot_id]}: {' '.join(problems)}")
             staged.append((position[fill.shot_id], candidate))
+            # Recorded at the commit point, never at the substitution: a fill whose prompt was
+            # refused is discarded whole, and reporting a substitution on a shot nothing was
+            # written to would be reporting a change that did not happen.
+            if redirected:
+                substituted.append(fill.shot_id)
             summaries.append(f"{labels[fill.shot_id]}: {assistant_fill_summary(changes)}")
         # Nothing above this line has written to the project. What makes "a failure mid-sequence
         # leaves nothing half-applied" structural is the single terminal `store.save` below —
@@ -7717,6 +8274,17 @@ def create_app(
                         ),
                     )
                 )
+        # Beside the applied notice, because it is part of what was written rather than a refusal:
+        # these shots were filled in, and the citations they got are not the ids the model named.
+        if substituted:
+            notices.append(
+                MessageNotice(
+                    kind="change",
+                    text=ASSISTANT_IDENTITY_SHEET_NOTICE.format(
+                        shots=", ".join(labels[shot_id] for shot_id in substituted)
+                    ),
+                )
+            )
         notices.extend(unknown_assets)
         notices.extend(rejected)
         if out_of_scope:

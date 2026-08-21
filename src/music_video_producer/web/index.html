@@ -284,7 +284,12 @@
       <section class="panel timeline-panel" id="panel-timeline" aria-labelledby="timeline-heading">
         <div class="workspace-heading compact">
           <div><span class="eyebrow">Music-aware edit</span><h1 id="timeline-heading">Director timeline</h1></div>
-          <div class="timeline-tools"><button class="quiet-button" id="add-shot">＋ Shot</button><button class="quiet-button" id="split-shot">Split</button><button class="quiet-button" id="duplicate-shot">Duplicate</button><button class="danger-button" id="delete-shot">Delete</button><span class="divider"></span><button class="quiet-button" id="zoom-out">−</button><span id="zoom-label">100%</span><button class="quiet-button" id="zoom-in">＋</button></div>
+          <!-- The edit tools and the zoom used to sit here, in the panel heading. The Director's
+               report, 2026-08-21: "Timeline functions like +Shot, Split, Duplicate, Delete, and the
+               zoom window are up by the Director Timeline header instead of down just below the
+               [view] window in that bar". They are in `.timeline-transport` now, beside the
+               transport and one row under the Monitor — next to the thing they manipulate. The
+               heading keeps only its title. -->
         </div>
         <!-- Snap cuts to phrase boundaries (the Director's ruling on "vocal transition points
              between shots"). Empty in the markup and drawn whole by app.js's renderSnapCuts
@@ -312,9 +317,29 @@
               <p class="monitor-note" id="monitor-note"></p>
               <button id="monitor-fullscreen" class="monitor-fullscreen" title="Fullscreen the Monitor (Esc to leave)">⛶</button>
             </div>
-            <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><!-- The two line mutes from the Director's workflow: audition controls, session-only,
+            <!-- The bar directly under the Monitor: transport, the edit tools, the zoom, the two
+                 line mutes and the master volume. It **wraps** rather than squeezing or hiding —
+                 this project has a recorded defect where three controls vanished behind media
+                 queries, and every control on this row is one the Director reaches for mid-edit,
+                 so there is nothing here that may be dropped at a narrow width. -->
+            <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><span class="divider"></span><div class="timeline-tools"><!-- Icon buttons with tooltips, the Director's ruling on the cramped bar (2026-08-21) —
+              "use button icons with tooltips when needed". Three rules held to: every glyph carries
+              an `aria-label` saying the same words as its `title`, because a tooltip is not an
+              accessible name and meaning is never carried by a glyph alone, exactly as this
+              stylesheet says state is never carried by colour alone; Delete keeps `danger-button`,
+              so an icon-only destructive control still does not look like its neighbours; and
+              ＋ Shot keeps its word, because a bare ＋ is what the zoom-in button beside it already
+              says and "the meaning is genuinely unambiguous" is the test for dropping a word. --><button class="quiet-button" id="add-shot" title="Add a shot to the plan" aria-label="Add a shot to the plan">＋ Shot</button><button class="quiet-button icon-tool" id="split-shot" title="Split the selected shot in two" aria-label="Split the selected shot in two">✂</button><button class="quiet-button icon-tool" id="duplicate-shot" title="Duplicate the selected shot" aria-label="Duplicate the selected shot">⧉</button><button class="danger-button icon-tool" id="delete-shot" title="Delete the selected shot. Its rendered takes stay on disk." aria-label="Delete the selected shot. Its rendered takes stay on disk.">🗑</button><span class="divider"></span><!-- The zoom slider the Director expected to find and did not: what was there was
+              `#master-volume` further along this same bar, which is a volume control. Both sliders
+              now carry a visible label, because two unlabelled sliders in one row is the confusion
+              that produced the report. This one drives the same `state.pixelsPerSecond` the two
+              buttons do, logarithmically between 6 and 64 px/s (api.js's zoomFromSlider), and every
+              one of the three holds the playhead — or, when the playhead is off screen, the centre
+              of the visible band — still while the scale changes around it. --><span class="slider-field"><label for="zoom-slider">ZOOM</label><button class="quiet-button" id="zoom-out" title="Zoom the timeline out">−</button><input type="range" id="zoom-slider" min="0" max="1000" step="1" value="414" aria-label="Timeline zoom" title="Timeline zoom. The playhead — or the middle of what you are looking at — stays put. Over the tracks: the wheel scrolls along the song, Ctrl+wheel zooms about the pointer, Shift+wheel scrolls down."><button class="quiet-button" id="zoom-in" title="Zoom the timeline in">＋</button><span id="zoom-label">100%</span></span></div><div class="timeline-spacer"></div><!-- The two line mutes from the Director's workflow: audition controls, session-only,
               never persisted. Muting the song silences the master element without stopping it,
-              so the playhead keeps running. --><button id="mute-song" title="Mute the audio line — the master song. The playhead keeps running.">♪ song</button><button id="mute-video" title="Mute the video line — the Monitor blanks; audio is untouched.">▣ video</button><input type="range" id="master-volume" min="0" max="1" step="0.05" value="1" title="Master song volume"><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
+              so the playhead keeps running. --><button id="mute-song" title="Mute the audio line — the master song. The playhead keeps running.">♪ song</button><button id="mute-video" title="Mute the video line — the Monitor blanks; audio is untouched.">▣ video</button><!-- Session-only by the same decision as the mutes, and unchanged in behaviour: what it
+              gained is a visible name. Unlabelled between two labelled mute buttons it read as a
+              mystery control, and the Director took it for the zoom. --><span class="slider-field"><label for="master-volume">VOL</label><input type="range" id="master-volume" min="0" max="1" step="0.05" value="1" aria-label="Master song volume" title="Master song volume — how loud the master song plays. Session-only; never saved to the project."></span><span>24 FPS</span><span id="timeline-duration">No master song</span></div>
             <div class="timeline-scroll" id="timeline-scroll">
               <div class="timeline-canvas" id="timeline-canvas">
                 <div class="timeline-ruler" id="timeline-ruler"></div>

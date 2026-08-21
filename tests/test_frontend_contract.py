@@ -8993,3 +8993,946 @@ def test_the_percentage_is_dropped_when_the_render_settles_and_when_the_project_
 
     assert dropped["rendering"] == {"a1": 42}
     assert dropped["settled"] == {}
+
+
+# ---------------------------------------------------------------------------------------------
+# The timeline's viewport: the zoom scale, its slider, and what the wheel means.
+#
+# The Director's report, 2026-08-20: "I cant scroll left or right and i see what i think is a zoom
+# slider that isnt functional." The scroll half is a layout fact and is gated in a real browser by
+# `tests/e2e_timeline_scroll.py` -- a stub DOM has no layout and structurally cannot see a
+# scrollbar laid out below the bottom of the window. What *is* provable here is the arithmetic the
+# controls run on, which is why it was written as pure functions in api.js rather than inline in a
+# handler: a zoom that jumps to zero and a wheel that means the wrong thing are both decidable
+# without a screen.
+
+
+def test_the_edit_tools_and_the_zoom_live_in_the_bar_under_the_monitor():
+    """The Director's report, 2026-08-21: "Timeline functions like +Shot, Split, Duplicate, Delete,
+    and the zoom window are up by the Director Timeline header instead of down just below the [view]
+    window in that bar." The panel heading is not where an editor reaches for them -- the bar under
+    the picture is, because that is next to the thing being manipulated.
+
+    Asserted by containment rather than by adjacency: every one of the six controls must be inside
+    `.timeline-transport`, and none of them may be back in `.workspace-heading`."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    heading = re.search(
+        r'<div class="workspace-heading compact">.*?<!-- Snap cuts', markup, re.DOTALL
+    )
+    assert heading, "the timeline panel's heading is gone"
+    transport = re.search(
+        r'<div class="timeline-transport">.*?<div class="timeline-scroll"', markup, re.DOTALL
+    )
+    assert transport, "the bar under the Monitor is gone"
+    for control in ("add-shot", "split-shot", "duplicate-shot", "delete-shot",
+                    "zoom-out", "zoom-slider", "zoom-in", "zoom-label"):
+        assert f'id="{control}"' in transport.group(0), (
+            f"#{control} is not in the bar under the Monitor"
+        )
+        assert f'id="{control}"' not in heading.group(0), (
+            f"#{control} is back up in the panel heading, which is where the Director found it"
+        )
+    # The transport's own controls did not move out to make room.
+    for control in ("timeline-start", "timeline-play", "timeline-time", "mute-song",
+                    "mute-video", "master-volume", "timeline-duration"):
+        assert f'id="{control}"' in transport.group(0), f"#{control} left the transport bar"
+
+
+def test_the_timeline_has_a_zoom_slider_beside_its_zoom_buttons():
+    """The control the Director went looking for. What was there was `#master-volume`, a working
+    volume slider in the same bar, which is why the report says "what I think is a zoom slider" --
+    so a real one is added rather than the volume one repurposed, and both are asserted here so a
+    future edit cannot quietly resolve the confusion by deleting the wrong one."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    tools = re.search(r'<div class="timeline-tools">.*?</div>', markup, re.DOTALL)
+    assert tools, "the timeline's tool row is gone"
+    assert 'id="zoom-slider"' in tools.group(0), (
+        "the zoom slider is not in the timeline's tool row beside the zoom buttons"
+    )
+    assert 'id="zoom-out"' in tools.group(0) and 'id="zoom-in"' in tools.group(0), (
+        "the +/- zoom buttons were removed; the slider is an addition, not a replacement"
+    )
+    assert 'type="range"' in tools.group(0)
+    assert 'aria-label="Timeline zoom"' in tools.group(0), (
+        "the slider has no accessible name, and a bare range input announces nothing"
+    )
+    # The volume slider is still what it was, and is not the zoom. Its accessible name is pinned
+    # exactly rather than by substring: an exact pin is what makes this able to catch the next
+    # accidental change. The tooltip is deliberately the longer sentence -- reworded 2026-08-21 to
+    # say what the control does *and* that it is session-only, because "Master song volume" alone
+    # never explained why nothing about it survives a reload.
+    assert 'id="master-volume"' in markup
+    assert 'aria-label="Master song volume"' in markup, (
+        "the volume slider has no accessible name; a `title` is not one, and the label it paints "
+        "is the abbreviation VOL"
+    )
+    assert (
+        'title="Master song volume \u2014 how loud the master song plays. Session-only; never '
+        'saved to the project."'
+    ) in markup, "the volume tooltip was reworded; update this pin deliberately or put it back"
+    assert 'id="master-volume"' not in tools.group(0)
+
+
+def test_both_sliders_in_the_bar_carry_a_visible_label():
+    """Two unlabelled sliders in one row is exactly the confusion the report came from: the Director
+    was looking at `#master-volume` and reading it as a zoom. A `title` is not enough -- it appears
+    only on hover, and the control beside it announces itself in plain text on the button face.
+
+    Each label is a real `<label for>`, so it is announced, and clicking the word focuses the slider
+    rather than being decorative text that happens to sit nearby."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    labels = dict(re.findall(r'<label for="([^"]+)">([^<]+)</label>', markup))
+    for slider, expected in (("zoom-slider", "ZOOM"), ("master-volume", "VOL")):
+        assert slider in labels, f"#{slider} has no visible label, only a tooltip"
+        assert labels[slider].strip() == expected, (slider, labels[slider])
+    # Both sit inside a `.slider-field`, which is what pairs the word with the control visually.
+    for slider in ("zoom-slider", "master-volume"):
+        field = re.search(
+            rf'<span class="slider-field"><label for="{slider}">.*?</span>', markup, re.DOTALL
+        )
+        assert field and f'id="{slider}"' in field.group(0), (
+            f"#{slider}'s label is not grouped with the slider it names"
+        )
+    # Each slider also carries an accessible name that *contains* the abbreviation it paints, so
+    # the word a Director reads and the word a screen reader announces are one name.
+    names = dict(re.findall(r'id="(zoom-slider|master-volume)"[^>]*aria-label="([^"]+)"', markup))
+    assert names == {"zoom-slider": "Timeline zoom", "master-volume": "Master song volume"}, names
+    for slider, painted in (("zoom-slider", "ZOOM"), ("master-volume", "VOL")):
+        assert painted.lower() in names[slider].lower().replace(" ", ""), (
+            f"#{slider} paints {painted!r} and announces {names[slider]!r}, which are two names "
+            "for one control"
+        )
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".slider-field > label" in styles, "the slider labels have no style of their own"
+
+
+def test_the_icon_only_edit_tools_carry_their_meaning_in_words_as_well_as_a_glyph():
+    """The Director's ruling on the cramped bar (2026-08-21): "use button icons with tooltips when
+    needed". A glyph is not a label -- this stylesheet's own rule is that state is never carried by
+    colour alone, and the same holds for a picture. So every icon button announces the same sentence
+    its tooltip shows, and Delete keeps its destructive styling, because an icon-only destructive
+    control that looks like the two beside it is a foot-gun on a bar used constantly.
+
+    The add button deliberately keeps its word: a bare + is what the zoom-in button in this same bar
+    already says, and "the meaning is genuinely unambiguous" is the test for dropping a word."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    tools = re.search(r'<div class="timeline-tools">.*?</div>', markup, re.DOTALL).group(0)
+    for control in ("split-shot", "duplicate-shot", "delete-shot"):
+        button = re.search(rf'<button[^>]*id="{control}"[^>]*>([^<]*)</button>', tools)
+        assert button, f"#{control} is not a button in the tool row any more"
+        attributes = dict(re.findall(r'(\w[\w-]*)="([^"]*)"', button.group(0)))
+        assert attributes.get("aria-label"), (
+            f"#{control} shows the glyph {button.group(1)!r} and announces nothing"
+        )
+        assert attributes["aria-label"] == attributes.get("title"), (
+            f"#{control}'s tooltip and its accessible name are different sentences: {attributes}"
+        )
+        assert "icon-tool" in attributes.get("class", ""), attributes
+    # The destructive one is still styled as destructive, not as one more glyph in a row.
+    delete = re.search(r'<button[^>]*id="delete-shot"[^>]*>', tools).group(0)
+    assert "danger-button" in delete, delete
+    for safe in ("split-shot", "duplicate-shot"):
+        assert "danger-button" not in re.search(
+            rf'<button[^>]*id="{safe}"[^>]*>', tools
+        ).group(0)
+    # And the add button keeps its word, because the glyph it would use is taken.
+    add = re.search(r'<button[^>]*id="add-shot"[^>]*>([^<]*)</button>', tools)
+    assert "Shot" in add.group(1), add.group(1)
+    assert "icon-tool" not in add.group(0), "the add button went icon-only beside a zoom-in +"
+
+
+def test_the_zoom_sliders_markup_bounds_are_the_helper_the_handler_reads_it_with():
+    """A slider whose markup range disagreed with `zoomFromSlider` would map its own travel onto
+    part of the scale, and the mismatch would show only at one end of the drag. The default value
+    the markup ships is asserted against `zoomSliderValue(TIMELINE_ZOOM_BASE)` for the same reason:
+    it is the thumb position before the first render writes one, and 100% is where the timeline
+    opens."""
+    bounds = run_module("""
+      import { TIMELINE_ZOOM_BASE, TIMELINE_ZOOM_SLIDER_MAX, TIMELINE_LABEL_WIDTH, zoomSliderValue }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        sliderMax: TIMELINE_ZOOM_SLIDER_MAX, label: TIMELINE_LABEL_WIDTH,
+        atBase: zoomSliderValue(TIMELINE_ZOOM_BASE),
+      }));
+    """)
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    slider = re.search(r'<input type="range" id="zoom-slider"[^>]*>', markup)
+    assert slider, "the zoom slider is not a range input any more"
+    attributes = dict(re.findall(r'(\w[\w-]*)="([^"]*)"', slider.group(0)))
+    assert int(attributes["min"]) == 0
+    assert int(attributes["max"]) == bounds["sliderMax"], (attributes, bounds)
+    assert int(attributes["value"]) == bounds["atBase"], (
+        "the slider's shipped thumb position is not where 100% zoom sits on its own scale",
+        attributes, bounds,
+    )
+    # The label gutter every pixel<->second conversion offsets by, held against the stylesheet
+    # that makes it real. A drift here silently moves every clip by 90px worth of seconds.
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert f"grid-template-columns: {bounds['label']}px 1fr" in styles, (
+        "TIMELINE_LABEL_WIDTH no longer matches `.track`'s label column"
+    )
+
+
+def test_the_zoom_slider_covers_the_whole_scale_and_round_trips():
+    """Executed, not read. The mapping is logarithmic so a notch is the same proportional change
+    at either end -- a linear one spends four fifths of its travel above 100% and leaves the
+    readable half unpickable. Both ends must land exactly on the clamps, or the slider cannot
+    reach a zoom the buttons can."""
+    measured = run_module("""
+      import { TIMELINE_ZOOM_BASE, TIMELINE_ZOOM_MAX, TIMELINE_ZOOM_MIN,
+        TIMELINE_ZOOM_SLIDER_MAX, zoomFromSlider, zoomLabelText, zoomSliderValue }
+        from './src/music_video_producer/web/assets/api.js';
+      const roundTrip = [6, 8, 11, 16, 24, 32, 48, 64].map(
+        (scale) => zoomFromSlider(zoomSliderValue(scale))
+      );
+      console.log(JSON.stringify({
+        floor: zoomFromSlider(0),
+        ceiling: zoomFromSlider(TIMELINE_ZOOM_SLIDER_MAX),
+        below: zoomFromSlider(-500),
+        above: zoomFromSlider(TIMELINE_ZOOM_SLIDER_MAX * 4),
+        rubbish: zoomFromSlider('not a number'),
+        roundTrip,
+        // Equal proportional steps across the travel: the ratio between neighbouring quarters is
+        // the same number everywhere on a logarithmic scale, and is not on a linear one.
+        quarters: [0, 0.25, 0.5, 0.75, 1].map(
+          (part) => zoomFromSlider(part * TIMELINE_ZOOM_SLIDER_MAX)
+        ),
+        labels: [zoomLabelText(TIMELINE_ZOOM_BASE), zoomLabelText(TIMELINE_ZOOM_MIN),
+                 zoomLabelText(TIMELINE_ZOOM_MAX)],
+        clamps: [TIMELINE_ZOOM_MIN, TIMELINE_ZOOM_MAX],
+      }));
+    """)
+
+    floor, ceiling = measured["clamps"]
+    assert measured["floor"] == pytest.approx(floor)
+    assert measured["ceiling"] == pytest.approx(ceiling)
+    # Out-of-range input is clamped rather than trusted: a range input can be driven by keyboard,
+    # and nothing here may put the timeline at 0 px/s.
+    assert measured["below"] == pytest.approx(floor)
+    assert measured["above"] == pytest.approx(ceiling)
+    assert measured["rubbish"] == pytest.approx(floor)
+
+    for asked, got in zip([6, 8, 11, 16, 24, 32, 48, 64], measured["roundTrip"]):
+        assert got == pytest.approx(asked, rel=0.02), (asked, got)
+
+    ratios = [
+        measured["quarters"][index + 1] / measured["quarters"][index]
+        for index in range(len(measured["quarters"]) - 1)
+    ]
+    for ratio in ratios[1:]:
+        assert ratio == pytest.approx(ratios[0], rel=0.01), (
+            "the slider's travel is not proportional, so a notch means something different at "
+            f"each end of it: {measured['quarters']}"
+        )
+
+    assert measured["labels"] == ["100%", "38%", "400%"]
+
+
+def test_zooming_holds_the_playhead_when_it_is_on_screen_and_the_centre_when_it_is_not():
+    """The anchor rule, executed. Zooming a 30-shot timeline back to the head of the song every
+    time is its own usability defect, and it is the one the +/- buttons had -- they wrote the new
+    scale and left the scroll offset where it was, which at 195% puts the viewport somewhere
+    nobody asked for.
+
+    The playhead wins while it is visible because it is the timeline's subject: the Monitor plays
+    the shot under it, so it is the frame being judged and it must not move. Scrolled away it is
+    not on screen at all, and holding an off-screen second still would move everything the
+    Director *is* reading -- so there the middle of the visible band is the honest invariant."""
+    zoomed = run_module("""
+      import { TIMELINE_LABEL_WIDTH, TIMELINE_ZOOM_ANCHORS, zoomViewport }
+        from './src/music_video_producer/web/assets/api.js';
+      const gutter = TIMELINE_LABEL_WIDTH;
+      // A viewport 1000px wide, 900px along a timeline drawn at 16 px/s. The playhead is parked
+      // at 4s -- pixel 154 -- which is behind the left edge, so the centre anchors.
+      const away = zoomViewport({
+        scrollLeft: 900, viewportWidth: 1000, pixelsPerSecond: 16, toPixelsPerSecond: 32,
+        playheadSeconds: 4,
+      });
+      // The same viewport with the playhead at 70s -- pixel 1210, comfortably inside it.
+      const onScreen = zoomViewport({
+        scrollLeft: 900, viewportWidth: 1000, pixelsPerSecond: 16, toPixelsPerSecond: 32,
+        playheadSeconds: 70,
+      });
+      // Zooming out from the same place, and from the head of the song where there is nowhere
+      // left to go.
+      const out = zoomViewport({
+        scrollLeft: 900, viewportWidth: 1000, pixelsPerSecond: 16, toPixelsPerSecond: 8,
+        playheadSeconds: 4,
+      });
+      const atHead = zoomViewport({
+        scrollLeft: 0, viewportWidth: 1000, pixelsPerSecond: 16, toPixelsPerSecond: 32,
+        playheadSeconds: 0,
+      });
+      const secondsAtCentre = (plan, scale) => (plan.scrollLeft + 1000 / 2 - gutter) / scale;
+      const screenXOfPlayhead = (plan, scale, seconds) =>
+        gutter + seconds * scale - plan.scrollLeft;
+      console.log(JSON.stringify({
+        anchors: TIMELINE_ZOOM_ANCHORS,
+        away: {
+          ...away,
+          centreBefore: (900 + 500 - gutter) / 16,
+          centreAfter: secondsAtCentre(away, 32),
+        },
+        onScreen: {
+          ...onScreen,
+          screenBefore: gutter + 70 * 16 - 900,
+          screenAfter: screenXOfPlayhead(onScreen, 32, 70),
+        },
+        out: {
+          ...out,
+          centreBefore: (900 + 500 - gutter) / 16,
+          centreAfter: secondsAtCentre(out, 8),
+        },
+        atHead,
+      }));
+    """)
+
+    assert zoomed["away"]["anchor"] == zoomed["anchors"]["centre"]
+    assert zoomed["away"]["centreAfter"] == pytest.approx(zoomed["away"]["centreBefore"])
+    assert zoomed["away"]["scrollLeft"] > 0, (
+        "zooming in threw a scrolled timeline back to the head of the song"
+    )
+
+    assert zoomed["onScreen"]["anchor"] == zoomed["anchors"]["playhead"]
+    assert zoomed["onScreen"]["screenAfter"] == pytest.approx(zoomed["onScreen"]["screenBefore"])
+    assert zoomed["onScreen"]["anchorSeconds"] == pytest.approx(70)
+
+    # Zooming out holds the same second, and the offset shrinks with the content rather than
+    # running off the front of it.
+    assert zoomed["out"]["centreAfter"] == pytest.approx(zoomed["out"]["centreBefore"])
+    assert zoomed["out"]["scrollLeft"] >= 0
+
+    # Already at the head with the playhead at zero: nothing moves, and nothing goes negative.
+    assert zoomed["atHead"]["scrollLeft"] == 0
+    assert zoomed["atHead"]["anchor"] == zoomed["anchors"]["playhead"]
+
+
+def test_one_wheel_notch_over_the_tracks_scrolls_along_the_song():
+    """What the plain wheel means, executed. It scrolls along the song -- the convention in every
+    editing application the Director already uses, and the direct answer to "I cant scroll left or
+    right", because the axis this panel is about is time.
+
+    The rule that was written first was "hijack deltaY only when there is nothing to scroll
+    vertically", and the browser measured it wrong: at 1600x1100 the four tracks overflowed their
+    box by *four pixels*, which was enough to hand the wheel straight back and leave the gesture as
+    dead as it was before. Shift is the way back to vertical, and a box with nothing to scroll
+    horizontally keeps the browser's own behaviour."""
+    meant = run_module("""
+      import { TIMELINE_WHEEL_ACTIONS, timelineWheelPlan }
+        from './src/music_video_producer/web/assets/api.js';
+      const wide = { canScrollX: true, canScrollY: true };
+      console.log(JSON.stringify({
+        actions: TIMELINE_WHEEL_ACTIONS,
+        // The four-pixel case the browser found: vertical overflow exists and the plain wheel
+        // must still scroll along the song.
+        plain: timelineWheelPlan({ deltaY: 120, ...wide }),
+        fitsVertically: timelineWheelPlan({ deltaY: 120, canScrollX: true }),
+        ctrl: timelineWheelPlan({ deltaY: -120, ctrlKey: true, ...wide }),
+        meta: timelineWheelPlan({ deltaY: -120, metaKey: true, ...wide }),
+        // Ctrl zooms even where there is nothing to scroll, so the gesture never depends on how
+        // long the plan happens to be.
+        ctrlOnAShortPlan: timelineWheelPlan({ deltaY: -120, ctrlKey: true }),
+        trackpadSwipe: timelineWheelPlan({ deltaX: -80, deltaY: 0, ...wide }),
+        shift: timelineWheelPlan({ deltaY: 120, shiftKey: true, ...wide }),
+        shiftWithNothingBelow: timelineWheelPlan({ deltaY: 120, shiftKey: true, canScrollX: true }),
+        nothingToScroll: timelineWheelPlan({ deltaY: 120, canScrollY: true }),
+        nothingAtAll: timelineWheelPlan({}),
+      }));
+    """)
+    actions = meant["actions"]
+
+    assert meant["plain"]["action"] == actions["scroll"]
+    assert meant["plain"]["scrollX"] == 120 and meant["plain"]["scrollY"] == 0
+    assert meant["fitsVertically"] == meant["plain"]
+
+    for key in ("ctrl", "meta", "ctrlOnAShortPlan"):
+        assert meant[key]["action"] == actions["zoom"], key
+        assert meant[key]["delta"] == -120, key
+        assert meant[key]["scrollX"] == 0, key
+
+    assert meant["trackpadSwipe"]["action"] == actions["scroll"]
+    assert meant["trackpadSwipe"]["scrollX"] == -80
+
+    # Shift is the escape hatch back to vertical, because the plain wheel is taken.
+    assert meant["shift"]["action"] == actions["scroll"]
+    assert meant["shift"]["scrollY"] == 120 and meant["shift"]["scrollX"] == 0
+    # And with nothing below, shift does nothing rather than scrolling sideways by surprise.
+    assert meant["shiftWithNothingBelow"]["action"] == actions["native"]
+
+    # A plan that fits its box behaves exactly as any other page does.
+    assert meant["nothingToScroll"]["action"] == actions["native"]
+    assert meant["nothingAtAll"]["action"] == actions["native"]
+
+
+def test_the_zoom_slider_is_bound_to_something_that_redraws_the_timeline():
+    """The slider executed through the workspace, because "wired to nothing that reads" is exactly
+    what the Director suspected. Dragging it must change what `renderTimeline` draws -- the clip
+    geometry, not merely a number in `state` -- and the thumb must follow the +/- buttons so the
+    three controls can never be left disagreeing."""
+    shots = [
+        {"id": "shot_a", "start": 0, "duration": 4, "prompt": "a wolf at the window"},
+        {"id": "shot_b", "start": 4, "duration": 4, "prompt": "a wolf in the snow"},
+    ]
+    driven = run_workspace(f"""
+      import {{ TIMELINE_ZOOM_SLIDER_MAX, zoomFromSlider }}
+        from './src/music_video_producer/web/assets/api.js';
+      state.project = {{ id: 'p1', shots: {json.dumps(shots)}, jobs: [], assets: [], sections: [] }};
+      const widthOf = (id) => {{
+        const html = at('#shots-track').innerHTML;
+        const clip = html.split('data-shot-id="' + id + '"')[1] || '';
+        return (/width:([0-9.]+)px/.exec(clip) || [null, ''])[1];
+      }};
+      fire('#zoom-in:click');
+      const before = {{ scale: state.pixelsPerSecond, thumb: at('#zoom-slider').value,
+                        width: widthOf('shot_b'), label: at('#zoom-label').textContent }};
+      // Dragged to three quarters of its travel, the way a Director drags it.
+      const wanted = Math.round(0.75 * TIMELINE_ZOOM_SLIDER_MAX);
+      at('#zoom-slider').value = String(wanted);
+      fire('#zoom-slider:input', {{ target: at('#zoom-slider') }});
+      const after = {{ scale: state.pixelsPerSecond, thumb: at('#zoom-slider').value,
+                       width: widthOf('shot_b'), label: at('#zoom-label').textContent }};
+      fire('#zoom-out:click');
+      const zoomedOut = {{ scale: state.pixelsPerSecond, thumb: at('#zoom-slider').value,
+                           width: widthOf('shot_b') }};
+      console.log(JSON.stringify({{
+        before, after, zoomedOut, asked: wanted, expected: zoomFromSlider(wanted),
+      }}));
+    """)
+
+    assert driven["after"]["scale"] == pytest.approx(driven["expected"])
+    assert driven["after"]["scale"] != driven["before"]["scale"]
+    # The clip is redrawn at the new scale: the slider reaches the render, not just `state`.
+    assert float(driven["after"]["width"]) == pytest.approx(4 * driven["expected"], rel=0.01)
+    assert driven["after"]["label"] != driven["before"]["label"]
+    # And the thumb is written back from the scale by `renderTimeline`, so a button moves it too.
+    assert int(driven["after"]["thumb"]) == pytest.approx(driven["asked"], abs=2)
+    assert driven["zoomedOut"]["scale"] < driven["after"]["scale"]
+    assert int(driven["zoomedOut"]["thumb"]) < int(driven["after"]["thumb"])
+    assert float(driven["zoomedOut"]["width"]) < float(driven["after"]["width"])
+
+
+# ------------------------------------------------------------------------------------------
+# Replace With / Cancel: the browser half of the way through the delete refusal. The pure
+# decisions are executed under node, and the affordance is *run* against the stub DOM with its
+# markup read afterwards — never grepped for in `app.js`, which is the recorded incident.
+# ------------------------------------------------------------------------------------------
+
+
+def _replace_asset(asset_id: str, name: str, kind: str, source: str) -> dict:
+    return {
+        "id": asset_id, "name": name, "kind": kind, "source": source,
+        "path": f"media/assets/{asset_id}.png", "prompt": "", "prompt_id": "",
+        "created_at": "2026-08-20T10:00:00Z", "consistency_prompt": "", "vision": None,
+    }
+
+
+REPLACE_PROJECT = {
+    "id": "p1",
+    "jobs": [],
+    "song": None,
+    "assets": [
+        _replace_asset("a_lucy", "Lucy", "character", "upload"),
+        _replace_asset("a_sheet", "Lucy multiview", "character", "krea-multiview"),
+        _replace_asset("a_room", "Dusk Warehouse", "setting", "upload"),
+    ],
+    "shots": [
+        {"id": "s0", "start": 0, "duration": 5, "prompt": "One",
+         "citations": [{"asset_id": "a_lucy", "role": "reference", "order": 0}]},
+        {"id": "s1", "start": 5, "duration": 5, "prompt": "Two",
+         "citations": [{"asset_id": "a_lucy", "role": "reference", "order": 0},
+                       {"asset_id": "a_sheet", "role": "reference", "order": 1}]},
+        {"id": "s2", "start": 10, "duration": 5, "prompt": "Three",
+         "citations": [{"asset_id": "a_room", "role": "reference", "order": 0}]},
+    ],
+}
+
+DELETE_REFUSAL = (
+    "Lucy is cited by SHOT 01 (s0), SHOT 02 (s1), and deleting it would leave those "
+    "citations dangling — the render would refuse them one at a time. Remove it from those "
+    "shots first."
+)
+
+REPLACE_REPORT = {
+    "applied": False,
+    "replaced": "Lucy",
+    "replacement": "Lucy multiview",
+    "swapped": 1,
+    "merged": 1,
+    "skipped": 1,
+    "still_cited": 1,
+    "rendered": 1,
+    "approved": 0,
+    "notes": ["1 shot(s) already hold a take that was rendered against Lucy: SHOT 01 (s0)."],
+    "swaps": [{"shot_id": "s0", "label": "SHOT 01 (s0)", "roles": ["reference"],
+               "carried_label": "Lucy", "provenance": "rendered"}],
+    "merges": [{"shot_id": "s1", "label": "SHOT 02 (s1)", "roles": ["reference"],
+                "carried_label": "", "provenance": ""}],
+    "skips": [{"shot_id": "s3", "label": "SHOT 04 (s3)",
+               "reason": "Left unchanged because they are locked: SHOT 04 (s3)."}],
+    "warning": "",
+    "message": "Lucy multiview would replace Lucy in 1 shot(s); 1 shot(s) already cite it.",
+    # Carried on both stages of the canned answer so one entry serves the report and the apply;
+    # the workspace only reads it when it asked to apply.
+    "project": {**REPLACE_PROJECT, "assets": REPLACE_PROJECT["assets"]},
+}
+
+
+def test_the_replace_with_menu_never_offers_the_asset_being_removed():
+    """A menu entry for the asset itself is a control whose only outcome is the route's 422.
+
+    `assetIsCited` is asserted beside it because it is what decides the affordance appears at
+    all — read from the manifest the browser already holds, never matched against the refusal's
+    prose, so a reworded refusal cannot make the answer vanish.
+    """
+    decisions = run_module("""
+      import { assetReplacementOptions, assetIsCited }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = __PROJECT__;
+      console.log(JSON.stringify({
+        offered: assetReplacementOptions(project, 'a_lucy').map((asset) => asset.id),
+        forSheet: assetReplacementOptions(project, 'a_sheet').map((asset) => asset.id),
+        empty: assetReplacementOptions(null, 'a_lucy'),
+        cited: assetIsCited(project, 'a_lucy'),
+        uncited: assetIsCited(project, 'a_missing'),
+        noProject: assetIsCited(null, 'a_lucy'),
+      }));
+    """.replace("__PROJECT__", json.dumps(REPLACE_PROJECT)))
+
+    assert decisions["offered"] == ["a_sheet", "a_room"]
+    assert decisions["forSheet"] == ["a_lucy", "a_room"]
+    assert decisions["empty"] == []
+    assert decisions["cited"] is True
+    assert decisions["uncited"] is False
+    assert decisions["noProject"] is False
+
+
+def test_the_replace_control_decides_its_two_stages():
+    """Executed, not read. The same button reports until a report exists and applies after.
+
+    The nothing-to-do case is the one that matters: a report whose shots are all skips must not
+    offer an apply, because there is nothing for it to write.
+    """
+    decisions = run_module("""
+      import { assetReplacementControl, REPLACE_WITH_LABEL, REPLACE_WITH_UNCHOSEN,
+               REPLACE_WITH_NOTHING_TO_DO }
+        from './src/music_video_producer/web/assets/api.js';
+      const report = __REPORT__;
+      console.log(JSON.stringify({
+        unchosen: assetReplacementControl('', null),
+        unchosenWithReport: assetReplacementControl('', report),
+        chosen: assetReplacementControl('a_sheet', null),
+        reported: assetReplacementControl('a_sheet', report),
+        allSkipped: assetReplacementControl('a_sheet',
+          { ...report, swapped: 0, merged: 0, skipped: 3 }),
+        wording: { REPLACE_WITH_LABEL, REPLACE_WITH_UNCHOSEN, REPLACE_WITH_NOTHING_TO_DO },
+      }));
+    """.replace("__REPORT__", json.dumps(REPLACE_REPORT)))
+
+    wording = decisions["wording"]
+    assert decisions["unchosen"] == {
+        "disabled": True, "apply": False,
+        "label": wording["REPLACE_WITH_LABEL"], "reason": wording["REPLACE_WITH_UNCHOSEN"],
+    }
+    # A report in hand does not make an unchosen menu runnable.
+    assert decisions["unchosenWithReport"]["disabled"] is True
+    assert decisions["chosen"] == {
+        "disabled": False, "apply": False, "label": wording["REPLACE_WITH_LABEL"], "reason": "",
+    }
+    assert decisions["reported"]["apply"] is True
+    assert decisions["reported"]["label"] == "Replace in 2 shot(s)"
+    assert decisions["reported"]["reason"] == REPLACE_REPORT["message"]
+    assert decisions["allSkipped"]["apply"] is False
+    assert decisions["allSkipped"]["disabled"] is True
+    assert decisions["allSkipped"]["reason"] == wording["REPLACE_WITH_NOTHING_TO_DO"]
+
+
+def test_the_replacement_report_lines_carry_every_bucket_and_every_skip_reason_verbatim():
+    """All three lists in full. A skip's line is the server's own sentence, unedited.
+
+    The refusals are decided once, in Python, and a client that paraphrased one would be a
+    second opinion that can drift from the rule that actually stops the write.
+    """
+    lines = run_module("""
+      import { assetReplacementReportLines }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        lines: assetReplacementReportLines(__REPORT__),
+        empty: assetReplacementReportLines(null),
+      }));
+    """.replace("__REPORT__", json.dumps(REPLACE_REPORT)))
+
+    assert lines["empty"] == []
+    assert [line["kind"] for line in lines["lines"]] == ["note", "swap", "merge", "skip"]
+    # The take-provenance sentence is the server's, drawn above the lists rather than among the
+    # skips: those shots are being changed, so a line among the skips would say the opposite.
+    assert lines["lines"][0]["text"] == REPLACE_REPORT["notes"][0]
+    assert lines["lines"][1]["text"] == (
+        'SHOT 01 (s0): reference · label "Lucy" carried · has a take rendered against Lucy'
+    )
+    # The "already have" line says what happens in the Director's own terms: the standing
+    # citation stays and the old one is removed. No take behind it, so no marker.
+    assert lines["lines"][2]["text"] == (
+        "SHOT 02 (s1): already cites Lucy multiview, so the reference citation of Lucy is removed"
+    )
+    assert lines["lines"][3]["text"] == REPLACE_REPORT["skips"][0]["reason"]
+
+
+def test_a_refused_delete_offers_replace_with_and_only_the_second_click_applies():
+    """The whole affordance, driven against the stub DOM and read as markup.
+
+    The delete is refused; the refusal itself is unchanged and stays on screen; the Replace With
+    menu appears beneath it without the asset being removed; the first click on the button
+    fetches a report with `confirm_apply` false; the report is drawn in full; and only then does
+    the same button become the apply.
+    """
+    run = run_workspace(
+        """
+      state.project = __PROJECT__;
+      state.selectedAssetId = 'a_lucy';
+      app.renderAssetInspector();
+      const beforeDelete = at('#asset-inspector').innerHTML;
+      answer(true);
+      await fire('#delete-asset:click');
+      await flush();
+      const refused = at('#asset-inspector').innerHTML;
+      const deleteRequest = requests[0];
+      fire('#replace-with:change', { currentTarget: { value: 'a_sheet' } });
+      const chosen = at('#asset-inspector').innerHTML;
+      requests.length = 0;
+      await fire('#replace-run:click');
+      await flush();
+      const reported = at('#asset-inspector').innerHTML;
+      const reportRequest = requests[0];
+      requests.length = 0;
+      await fire('#replace-run:click');
+      await flush();
+      const applyRequest = requests[0];
+      const afterApply = at('#asset-inspector').innerHTML;
+      console.log(JSON.stringify({
+        beforeDelete, refused, chosen, reported, afterApply,
+        deleteRequest, reportRequest, applyRequest,
+      }));
+    """.replace("__PROJECT__", json.dumps(REPLACE_PROJECT)),
+        responses={
+            "/api/projects/p1/assets/a_lucy": {"status": 422, "body": {"detail": DELETE_REFUSAL}},
+            "/api/projects/p1/assets/a_lucy/replace-citations": {"body": REPLACE_REPORT},
+        },
+    )
+
+    # Nothing about replacing is on screen until a delete has actually been refused.
+    assert 'id="delete-asset"' in run["beforeDelete"]
+    assert "replace-panel" not in run["beforeDelete"]
+    assert run["deleteRequest"]["method"] == "DELETE"
+
+    # The refusal is unchanged and stays readable beside the way through it.
+    assert DELETE_REFUSAL in run["refused"]
+    assert "replace-panel" in run["refused"]
+    assert 'id="replace-with"' in run["refused"]
+    assert 'id="replace-cancel"' in run["refused"]
+    # The menu offers the other two assets and never the one being removed.
+    assert '<option value="a_sheet"' in run["refused"]
+    assert '<option value="a_room"' in run["refused"]
+    assert '<option value="a_lucy"' not in run["refused"]
+    # Unchosen, the button is shut and says why; no report has been fetched.
+    assert "Pick the asset that takes over." in run["refused"]
+    assert "snap-report" not in run["refused"]
+    assert 'id="replace-run" disabled' in run["refused"]
+
+    # Chosen but unreported: runnable, still not an apply.
+    assert 'id="replace-run"' in run["chosen"]
+    assert 'id="replace-run" disabled' not in run["chosen"]
+    assert "Report the replacement" in run["chosen"]
+    assert "snap-report" not in run["chosen"]
+
+    # Stage one asked for a report and wrote nothing.
+    assert run["reportRequest"]["path"] == "/api/projects/p1/assets/a_lucy/replace-citations"
+    assert json.loads(run["reportRequest"]["body"]) == {
+        "replacement_id": "a_sheet", "confirm_apply": False
+    }
+    # Stage two: the whole report on screen — all three headings, every line, every skip reason.
+    assert "snap-report" in run["reported"]
+    assert "Would be replaced (1)" in run["reported"]
+    assert "Already cite the replacement (1)" in run["reported"]
+    assert "Would be left alone (1)" in run["reported"]
+    assert "SHOT 01 (s0): reference" in run["reported"]
+    assert "already cites Lucy multiview" in run["reported"]
+    assert REPLACE_REPORT["skips"][0]["reason"] in run["reported"]
+    # The take-provenance note is on screen, and it is set apart from the skip list rather than
+    # drawn as one — those shots are being changed.
+    assert "snap-note" in run["reported"]
+    assert REPLACE_REPORT["notes"][0] in run["reported"]
+    assert "Replace in 2 shot(s)" in run["reported"]
+    # Only the second click carries the confirmation.
+    assert json.loads(run["applyRequest"]["body"]) == {
+        "replacement_id": "a_sheet", "confirm_apply": True
+    }
+    # And the affordance closes once it has been applied.
+    assert "replace-panel" not in run["afterApply"]
+
+
+def test_the_assets_panel_offers_replace_in_shots_only_for_a_cited_asset():
+    """`replaceInShotsControl`, executed. The Director's second entry point, decided by the count.
+
+    The browser already knows how many shots cite an asset, so an uncited asset gets no button at
+    all rather than one whose only outcome is the route's 422.
+    """
+    decisions = run_module("""
+      import { replaceInShotsControl, citingShotCount }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = __PROJECT__;
+      console.log(JSON.stringify({
+        cited: replaceInShotsControl(project, 'a_lucy'),
+        once: replaceInShotsControl(project, 'a_room'),
+        uncited: replaceInShotsControl(project, 'a_sheet_alone'),
+        noProject: replaceInShotsControl(null, 'a_lucy'),
+        counted: citingShotCount(project, 'a_sheet'),
+      }));
+    """.replace("__PROJECT__", json.dumps(REPLACE_PROJECT)))
+
+    assert decisions["cited"] == {"shown": True, "count": 2, "label": "Replace in 2 shot(s) with…"}
+    assert decisions["once"] == {"shown": True, "count": 1, "label": "Replace in 1 shot(s) with…"}
+    assert decisions["uncited"]["shown"] is False
+    assert decisions["noProject"] == {
+        "shown": False, "count": 0, "label": "Replace in 0 shot(s) with…"
+    }
+    assert decisions["counted"] == 1
+
+
+def test_replace_in_shots_opens_the_same_affordance_with_no_delete_in_the_path():
+    """The Assets-panel way in, driven against the stub DOM.
+
+    Same panel, same two-stage button, and **no DELETE is ever sent** — the Director asked for
+    "the same replacement function but without resulting in asset deletion". Because there is no
+    refusal to read, the panel carries its own explanation instead.
+    """
+    run = run_workspace(
+        """
+      state.project = __PROJECT__;
+      state.selectedAssetId = 'a_room';
+      app.renderAssetInspector();
+      const oneShot = at('#asset-inspector').innerHTML;
+      state.selectedAssetId = 'a_lucy';
+      app.renderAssetInspector();
+      const closed = at('#asset-inspector').innerHTML;
+      requests.length = 0;
+      fire('#replace-in-shots:click');
+      const opened = at('#asset-inspector').innerHTML;
+      fire('#replace-with:change', { currentTarget: { value: 'a_sheet' } });
+      await fire('#replace-run:click');
+      await flush();
+      const reported = at('#asset-inspector').innerHTML;
+      console.log(JSON.stringify({
+        oneShot, closed, opened, reported,
+        methods: requests.map((entry) => entry.method),
+        firstRequest: requests[0],
+      }));
+    """.replace("__PROJECT__", json.dumps(REPLACE_PROJECT)),
+        responses={
+            "/api/projects/p1/assets/a_lucy/replace-citations": {"body": REPLACE_REPORT},
+        },
+    )
+
+    # The button is drawn beside "Attach to selected shot" and carries the count, because the
+    # timeline is not visible from this panel.
+    assert 'id="attach-asset"' in run["closed"]
+    assert 'id="replace-in-shots"' in run["closed"]
+    assert "Replace in 2 shot(s) with" in run["closed"]
+    assert "Replace in 1 shot(s) with" in run["oneShot"]
+    # Closed until it is clicked — no delete was attempted and none is needed.
+    assert "replace-panel" not in run["closed"]
+    assert "replace-panel" in run["opened"]
+    # No refusal to show, so the panel explains itself.
+    assert "Nothing is deleted and nothing is rendered" in run["opened"]
+    assert "citations dangling" not in run["opened"]
+    # Nothing but the report request was ever sent, and it is a POST.
+    assert run["methods"] == ["POST"]
+    assert "DELETE" not in run["methods"]
+    assert json.loads(run["firstRequest"]["body"]) == {
+        "replacement_id": "a_sheet", "confirm_apply": False
+    }
+    # And it is the same report, named shot by shot — which is what makes this control usable
+    # from a panel where the timeline cannot be seen.
+    assert "SHOT 01 (s0)" in run["reported"]
+    assert "Replace in 2 shot(s)" in run["reported"]
+
+
+def test_cancel_closes_the_affordance_without_sending_anything():
+    """The other half of the option set the Director asked for, by name.
+
+    Cancel is the whole point of "Replace With/Cancel": a Director who opened the menu and
+    thought better of it must be able to leave without a request having been made.
+    """
+    run = run_workspace(
+        """
+      state.project = __PROJECT__;
+      state.selectedAssetId = 'a_lucy';
+      app.renderAssetInspector();
+      answer(true);
+      await fire('#delete-asset:click');
+      await flush();
+      fire('#replace-with:change', { currentTarget: { value: 'a_sheet' } });
+      requests.length = 0;
+      fire('#replace-cancel:click');
+      const closed = at('#asset-inspector').innerHTML;
+      console.log(JSON.stringify({ closed, sent: requests.length }));
+    """.replace("__PROJECT__", json.dumps(REPLACE_PROJECT)),
+        responses={
+            "/api/projects/p1/assets/a_lucy": {"status": 422, "body": {"detail": DELETE_REFUSAL}},
+        },
+    )
+
+    assert run["sent"] == 0
+    assert "replace-panel" not in run["closed"]
+    # The delete button is still there: cancelling a replacement is not cancelling the intent.
+    assert 'id="delete-asset"' in run["closed"]
+def test_a_take_row_is_a_button_over_its_whole_width_not_a_chip_at_the_end_of_a_line():
+    """The Director's report, 2026-08-21: "i can see the takes in the shot info window but clicking
+    on either does nothing instead of hot swapping between available shots."
+
+    Driven in a browser before anything changed (`tests/e2e_take_swap.py`), and both halves of that
+    sentence were measurable: clicking the **row** left `latest_output` untouched, clicking the
+    **chip** switched it correctly. So the row model was never wrong and the handler was never
+    stale -- the affordance was, and a 286px line of text with a 40px live button at its right end
+    reads as broken while working.
+
+    Executed through `renderShotInspector` rather than read, because "the row is the control" is a
+    property of the markup that function produces. A real `<button>` is the whole point: focus,
+    Enter and Space come from the platform instead of from a role/tabindex/keydown trio this file
+    would have to keep correct, and `disabled` is what makes the current row read as deliberately
+    closed rather than as one more piece of inert text."""
+    jobs = [
+        {"id": "job_1", "kind": "h3", "target_id": "shot_a", "status": "complete", "seed": 3,
+         "output_files": ["shots/shot_a/take_1.mp4"],
+         "updated_at": "2026-08-20T09:21:00Z"},
+        {"id": "job_2", "kind": "h3", "target_id": "shot_a", "status": "complete", "seed": 104,
+         "output_files": ["shots/shot_a/take_2.mp4"],
+         "updated_at": "2026-08-20T11:08:00Z"},
+    ]
+    drawn = run_workspace(f"""
+      state.project = {{ id: 'p1', jobs: {json.dumps(jobs)}, assets: [], shots: [
+        {{ id: 'shot_a', start: 0, duration: 4, prompt: 'a wolf', status: 'complete',
+           latest_output: 'shots/shot_a/take_2.mp4' }},
+      ] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      const html = at('#shot-inspector').innerHTML;
+      const rows = html.split('<button type="button" class="take-row').slice(1)
+        .map((part) => '<button type="button" class="take-row' + part.split('</button>')[0]);
+      console.log(JSON.stringify({{ rows, html }}));
+    """)
+
+    rows = drawn["rows"]
+    assert len(rows) == 2, drawn["html"]
+    # Every row is a button over its whole width, and the one the shot points at is the disabled
+    # one. Nothing else in the strip is clickable, so there is no small live target beside a dead
+    # line any more.
+    assert '<div class="take-row' not in drawn["html"], (
+        "a take row is a div again, which is the shape that could not be clicked"
+    )
+    assert 'class="quiet-button use-take"' not in drawn["html"], (
+        "the small chip button is back; the row itself is supposed to be the control"
+    )
+    selectable, current = rows
+    assert 'data-output="shots/shot_a/take_1.mp4"' in selectable, selectable
+    assert "disabled" not in selectable, (
+        "the take the shot is pointed away from is drawn shut", selectable
+    )
+    assert 'data-output="shots/shot_a/take_2.mp4"' in current, current
+    assert "disabled" in current, (
+        "the row the shot already points at is live, so it invites a click that does nothing",
+        current,
+    )
+    assert "current" in current.split(">")[0]
+    # The handler's selector still matches every row, so `disabled` stays the one place that
+    # decides which takes are selectable.
+    assert selectable.count("use-take") == 1 and current.count("use-take") == 1, rows
+    # The full path is on the row itself now -- it used to be on an inner span, which is not
+    # where a pointer rests when the row is the control.
+    assert 'title="shots/shot_a/take_1.mp4"' in selectable, selectable
+
+
+def test_each_take_row_says_which_render_it_came_from():
+    """Two takes of one shot differ only by a serial buried in a filename the row truncates to an
+    ellipsis -- `…-h3-reference_00001-audio.mp4` against `…_00002-audio.mp4` -- so the Director
+    choosing between them was choosing between two identical-looking lines. The job record already
+    holds the two facts that separate them: the seed the render used, and when the take landed.
+
+    `takesStripRows` carries both as raw values and formats neither. The time is a locale string
+    and that is a rendering decision; the seed is a number. A row whose record carries neither
+    draws no provenance line at all rather than an empty one or an `Invalid Date`."""
+    jobs = [
+        {"id": "job_1", "kind": "h3", "target_id": "shot_a", "status": "complete", "seed": 3,
+         "output_files": ["shots/shot_a/take_1.mp4"],
+         "created_at": "2026-08-20T09:15:00Z", "updated_at": "2026-08-20T09:21:00Z"},
+        # No seed and no timestamps: a record written before those fields existed.
+        {"id": "job_2", "kind": "h3", "target_id": "shot_a", "status": "complete",
+         "output_files": ["shots/shot_a/take_2.mp4"]},
+        # A seed of 0 is a seed a render can genuinely have used, so it must not read as unknown.
+        {"id": "job_3", "kind": "h3", "target_id": "shot_a", "status": "complete", "seed": 0,
+         "output_files": ["shots/shot_a/take_3.mp4"], "updated_at": "2026-08-20T12:00:00Z"},
+    ]
+    read = run_module(f"""
+      import {{ takesStripRows }} from './src/music_video_producer/web/assets/api.js';
+      const strip = takesStripRows(
+        {{ jobs: {json.dumps(jobs)} }},
+        {{ id: 'shot_a', status: 'complete', latest_output: 'shots/shot_a/take_1.mp4' }},
+      );
+      console.log(JSON.stringify(strip.rows.map(
+        (row) => ({{ file: row.file, seed: row.seed, at: row.at }})
+      )));
+    """)
+
+    assert read[0] == {"file": "shots/shot_a/take_1.mp4", "seed": 3,
+                       "at": "2026-08-20T09:21:00Z"}, read[0]
+    # `updated_at` is when the take landed; `created_at` is when the render was queued. The row
+    # says when the file appeared.
+    assert read[0]["at"] != "2026-08-20T09:15:00Z"
+    # An old record loses the line rather than inventing one.
+    assert read[1] == {"file": "shots/shot_a/take_2.mp4", "seed": None, "at": ""}, read[1]
+    # Seed 0 is a seed.
+    assert read[2]["seed"] == 0, read[2]
+
+    # And what the panel writes from that: a provenance line, formatted here rather than in the
+    # pure function, absent entirely when there is nothing to say.
+    drawn = run_workspace(rf"""
+      state.project = {{ id: 'p1', jobs: {json.dumps(jobs)}, assets: [], shots: [
+        {{ id: 'shot_a', start: 0, duration: 4, prompt: 'a wolf', status: 'complete',
+           latest_output: 'shots/shot_a/take_1.mp4' }},
+      ] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      const html = at('#shot-inspector').innerHTML;
+      const metas = [...html.matchAll(/<span class="take-meta">([^<]*)<\/span>/g)].map((m) => m[1]);
+      console.log(JSON.stringify({{ metas, rowCount: html.split('take-row').length - 1 }}));
+    """)
+
+    assert drawn["rowCount"] == 3, drawn
+    # Two lines for three rows: the record carrying neither a seed nor a time draws none.
+    assert len(drawn["metas"]) == 2, drawn["metas"]
+    assert drawn["metas"][0].startswith("seed 3"), drawn["metas"]
+    assert "seed 0" in drawn["metas"][1], drawn["metas"]
+    assert drawn["metas"][0] != drawn["metas"][1], (
+        "two takes of one shot render the same provenance line", drawn["metas"]
+    )
+
+
+def test_the_take_row_and_the_current_row_are_styled_as_open_and_closed():
+    """A control that looks identical whether it is live is the defect this row is the fix for, so
+    the two states are separated in the stylesheet as well as in the markup: the selectable row
+    gets a hover, and the disabled one loses the pointer. `button:focus-visible` in the base rules
+    is what gives the row a visible focus ring once it is a real button."""
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".take-row:not(:disabled):hover" in styles, (
+        "the selectable take row has no hover state, so it does not read as clickable"
+    )
+    assert ".take-row:disabled { cursor: default;" in styles, (
+        "the current take row keeps a pointer cursor and so still invites a dead click"
+    )
+    for rule in (".take-row .take-chip", ".take-row .take-meta"):
+        assert rule in styles, f"{rule} has no style of its own"
+    # The name is what truncates; the provenance line beneath it is what stays distinguishing.
+    assert ".take-row .take-name { grid-column: 1; overflow: hidden;" in styles
+    assert "button:focus-visible" in styles, (
+        "nothing in this stylesheet gives a focused button a visible ring, and the take row is "
+        "now reached by keyboard"
+    )

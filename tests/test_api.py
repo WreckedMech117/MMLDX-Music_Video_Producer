@@ -23,6 +23,7 @@ from music_video_producer.app import (
     CHAT_EMPTY_MESSAGE,
     CONSISTENCY_PROMPT_LIMIT,
     CONSISTENCY_PROMPT_TOO_LONG,
+    DELETE_ASSET_CITED,
     DIRECTOR_CONTEXT_EXCLUDE,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
@@ -32,6 +33,7 @@ from music_video_producer.app import (
     ENHANCE_PREFIX_SUFFIX,
     EXPAND_PROMPTS_WITHOUT_SHOTS,
     EXPANSION_ATTEMPTS,
+    EXPANSION_LOCKED_NOTICE,
     EXPANSION_REJECTED_EMPTY_NOTICE,
     GENERIC_WRITE_APPROVAL_REFUSAL,
     H3_ADAPTERS,
@@ -48,6 +50,13 @@ from music_video_producer.app import (
     RENDER_AGAIN_LOCKED_REFUSAL,
     RENDER_AGAIN_STATUSES,
     RENDER_IN_FLIGHT_STATUSES,
+    REPLACE_ASSET_APPROVED_NOTE,
+    REPLACE_ASSET_IN_FLIGHT,
+    REPLACE_ASSET_KIND_CHANGE,
+    REPLACE_ASSET_RENDERED_NOTE,
+    REPLACE_ASSET_UNCITED,
+    REPLACE_ASSET_UNKNOWN,
+    REPLACE_ASSET_WITH_ITSELF,
     RESTORE_AUDIO_IN_FLIGHT_REFUSAL,
     RESTORE_AUDIO_MISSING_SONG_REFUSAL,
     RESTORE_AUDIO_MISSING_TAKE_REFUSAL,
@@ -86,6 +95,10 @@ from music_video_producer.app import (
     reference_map_tag_lines,
     reference_prompt,
     reference_slot_counts,
+)
+from music_video_producer.asset_replacement import (
+    REPLACE_MIXED_ROLES,
+    REPLACE_OVER_SLOT_LIMIT,
 )
 from music_video_producer.batch import (
     JOB_SUPERSEDED,
@@ -4437,6 +4450,488 @@ def test_an_empty_structure_pass_is_not_retried_and_the_shots_call_covers_for_it
     assert "`sections` must not be empty" in shots_call["message"]
     assert [section.label for section in store.get(project.id).sections] == ["Verse"]
     assert comfy.prompts == []
+
+
+# ---------------------------------------------------------------------------------------------
+# How a shot picks its reference assets: the identity sheet, the declared location, and the leak
+#
+# The Director's report, 2026-08-20, measured on `project_59f14d19ff10` (30 Gemma-populated shots):
+# the uploaded source frame `HarderFaster` was cited 22 times, the Krea QuadView sheet promoted
+# from it 8, and the `Dusk Warehouse Bed` setting 5. So most shots were conditioned on the weaker
+# of two identity references while the sheet that exists to *be* the identity reference sat
+# unused; 25 shots went to render with no environment reference at all; and the sheet won its 8
+# only because the model typed its internal display name into creative prose ("Close up on eyes of
+# HarderFaster · multiview with flickering light reflections").
+# ---------------------------------------------------------------------------------------------
+
+
+def sheet_project(store, name: str = "Sheets", *, path: str = "out/sheet.png") -> Project:
+    """A library with one promoted character, one un-promoted character, and one setting.
+
+    The un-promoted character is the control that matters: the rule must be a substitution where
+    a sheet exists and *nothing at all* where one does not.
+    """
+    project = store.create(Project(name=name))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=52.0)
+    project.assets = [
+        Asset(id="asset_lucy", name="Lucy Vane", kind="character", path="media/lucy.png"),
+        Asset(
+            id="asset_sheet",
+            name="Lucy Vane · multiview",
+            kind="character",
+            path=path,
+            source="krea-multiview",
+            parent_id="asset_lucy",
+        ),
+        Asset(id="asset_mate", name="Bass Player", kind="character", path="media/mate.png"),
+        Asset(id="asset_bed", name="Dusk Warehouse Bed", kind="setting", path="media/bed.png"),
+    ]
+    store.save(project)
+    return project
+
+
+def cited_names(project: Project) -> list[list[str]]:
+    """Every shot's citations, by asset name, in citation order."""
+    names = {asset.id: asset.name for asset in project.assets}
+    return [
+        [names.get(citation.asset_id, citation.asset_id) for citation in shot.citations]
+        for shot in project.shots
+    ]
+
+
+def sheet_director(*prompts: str) -> PlanningDirector:
+    """Ten shots covering the 52 s song, cycling the given prompts."""
+    from music_video_producer.app import populate_required_shots
+
+    return PlanningDirector(
+        shots=[
+            (index * 5.2, 5.2, prompts[index % len(prompts)])
+            for index in range(populate_required_shots(52.0))
+        ]
+    )
+
+
+def test_populate_cites_the_identity_sheet_instead_of_the_frame_it_was_promoted_from(
+    tmp_path: Path,
+):
+    """Defect one: the sheet loses to its own source.
+
+    The promotion exists to give H3 a four-view identity reference, and a shot citing the single
+    source frame is using the weaker one. The substitution is **instead of**, not in addition to:
+    H3 wires nine pictures, and citing both spends two of them arguing one face. It also means a
+    shot that named *both* (which the live plan did eight times, because "HarderFaster · multiview"
+    contains "HarderFaster") collapses to one citation rather than growing.
+
+    The character with no sheet is the control: nothing about it changes.
+    """
+    director = sheet_director(
+        "Lucy Vane at the microphone.",
+        "Bass Player in silhouette.",
+        "Lucy Vane and the Bass Player back to back.",
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sheet_project(store)
+
+    assert populate(client, project.id).status_code == 200
+    cited = cited_names(store.get(project.id))
+    assert ["Lucy Vane · multiview"] in cited
+    assert ["Bass Player"] in cited  # no sheet, no substitution
+    assert ["Lucy Vane · multiview", "Bass Player"] in cited
+    # The source frame is never cited once its sheet exists, and never cited twice over.
+    assert all("Lucy Vane" not in row for row in cited)
+    assert all(len(row) == len(set(row)) for row in cited)
+    assert comfy.prompts == []
+
+
+def test_a_sheet_with_no_file_and_a_sheet_of_a_sheet_both_behave(tmp_path: Path):
+    """The two shapes that could make this rule misbehave, pinned as no-op and as chain.
+
+    A promoted child with no `path` is a render that has not landed (or never landed): the row is
+    in the manifest and there is no picture behind it, so substituting would trade a real
+    reference for nothing. A sheet promoted from a sheet resolves to the end of the chain, and a
+    `parent_id` cycle — which nothing here can create and a hand-edited manifest can — stops at
+    the first repeat instead of spinning.
+    """
+    from music_video_producer.models import identity_sheet_ids
+
+    pending = Project(
+        name="Pending",
+        assets=[
+            Asset(id="asset_lucy", name="Lucy Vane", kind="character", path="media/lucy.png"),
+            Asset(
+                id="asset_sheet", name="Lucy Vane · multiview", kind="character", path="",
+                source="krea-multiview", parent_id="asset_lucy",
+            ),
+        ],
+    )
+    assert identity_sheet_ids(pending) == {}
+
+    chained = Project(
+        name="Chained",
+        assets=[
+            Asset(id="a", name="Lucy Vane", kind="character", path="media/lucy.png"),
+            Asset(id="b", name="Sheet one", kind="character", path="out/1.png",
+                  source="krea-multiview", parent_id="a"),
+            Asset(id="c", name="Sheet two", kind="character", path="out/2.png",
+                  source="krea-multiview", parent_id="b"),
+        ],
+    )
+    # Both the source and the intermediate land on the newest sheet, so which of the two a
+    # prompt happens to name cannot change what the shot is conditioned on.
+    assert identity_sheet_ids(chained) == {"a": "c", "b": "c"}
+
+    looped = Project(
+        name="Looped",
+        assets=[
+            Asset(id="x", name="X", kind="character", path="out/x.png",
+                  source="krea-multiview", parent_id="y"),
+            Asset(id="y", name="Y", kind="character", path="out/y.png",
+                  source="krea-multiview", parent_id="x"),
+        ],
+    )
+    assert identity_sheet_ids(looped) == {"x": "y", "y": "x"}  # one hop each, no spin
+
+
+def test_a_shot_that_names_a_pending_sheet_still_cites_the_source(tmp_path: Path):
+    """The pathless sheet, end to end: populate cites the picture that exists, once.
+
+    The prompt names the sheet outright, which is the case that separates the two libraries:
+    a scan over the *whole* library would cite a manifest row with no file behind it — and cite
+    the source beside it, because "Lucy Vane · multiview" contains "Lucy Vane", so one subject
+    would take two of the render's nine picture slots and one of them would be nothing.
+    """
+    director = sheet_director("Lucy Vane · multiview at the microphone.")
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sheet_project(store, name="Pending sheet", path="")
+
+    assert cited_names(store.get(project.id)) == []
+    assert populate(client, project.id).status_code == 200
+    assert cited_names(store.get(project.id)) == [["Lucy Vane"]] * len(
+        store.get(project.id).shots
+    )
+    assert comfy.prompts == []
+
+
+def test_the_declared_location_reaches_every_shot_that_named_no_location(tmp_path: Path):
+    """Defect two: a shot in a location carrying no location reference.
+
+    The mechanism is a declaration the Director makes and can undo — `default_setting_id`, set by
+    one route — never a guess at which of a library's settings the video is in. It reaches the
+    instruction (so the model can name it first) *and* the citations of every new shot that named
+    none (so the plan does not depend on whether the model did).
+
+    A shot that named a setting of its own keeps it: two locations in one shot is worse than none.
+    """
+    director = sheet_director("Lucy Vane at the microphone.", "Wide on the Dusk Warehouse Bed.")
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sheet_project(store, name="Located")
+
+    declare = client.put(
+        f"/api/projects/{project.id}/default-setting", json={"asset_id": "asset_bed"}
+    )
+    assert declare.status_code == 200
+    assert declare.json()["default_setting_id"] == "asset_bed"
+
+    assert populate(client, project.id).status_code == 200
+    cited = cited_names(store.get(project.id))
+    assert ["Lucy Vane · multiview", "Dusk Warehouse Bed"] in cited
+    assert ["Dusk Warehouse Bed"] in cited  # named it itself; not cited twice
+    assert all("Dusk Warehouse Bed" in row for row in cited)
+    assert all(row.count("Dusk Warehouse Bed") == 1 for row in cited)
+    # Named in the instruction too, on its own line so it cannot read as a hard constraint.
+    sent = director.requests[0]["message"]
+    assert "\nThe video's location is Dusk Warehouse Bed." in sent
+    assert comfy.prompts == []
+
+
+def test_a_shot_that_named_a_different_setting_is_not_sent_to_two_places(tmp_path: Path):
+    """The guard that matters, and the one the end-to-end test cannot see.
+
+    A shot that names *the declared location itself* is protected twice over — by this guard and,
+    afterwards, by `prefer_identity_sheets` collapsing the duplicate — so removing the guard is
+    invisible there. The case it actually exists for is a shot that named a **different** setting:
+    the live project holds two (`Dusk Warehouse Bed` and `Gritty Warehouse Floor`), and adding the
+    project's location beside the one the shot chose would put that shot in two places at once.
+    """
+    from music_video_producer.models import with_default_setting
+
+    project = Project(
+        name="Two settings",
+        default_setting_id="asset_bed",
+        assets=[
+            Asset(id="asset_bed", name="Dusk Warehouse Bed", kind="setting", path="bed.png"),
+            Asset(id="asset_floor", name="Gritty Warehouse Floor", kind="setting", path="f.png"),
+            Asset(id="asset_lucy", name="Lucy Vane", kind="character", path="lucy.png"),
+        ],
+    )
+    chose_other = [
+        AssetCitation(asset_id="asset_lucy", role="reference", order=0),
+        AssetCitation(asset_id="asset_floor", role="reference", order=1),
+    ]
+    assert with_default_setting(project, chose_other, picture_limit=9) == chose_other
+    # And a shot that named no setting at all still gets the declared one.
+    chose_none = chose_other[:1]
+    assert [
+        citation.asset_id
+        for citation in with_default_setting(project, chose_none, picture_limit=9)
+    ] == ["asset_lucy", "asset_bed"]
+
+
+def test_a_promoted_location_is_cited_as_its_own_identity_sheet(tmp_path: Path):
+    """The two rules compose, and the order they run in is the reason they do.
+
+    `with_default_setting` names the location the Director declared; `prefer_identity_sheets`
+    then re-points it, exactly as it re-points a character — a setting can be promoted too
+    (`MULTIVIEW_SUBJECTS` holds `setting`), and the sheet inherits the setting kind. Running the
+    location rule first is also what makes its picture count the *widest* the list can be, since
+    the substitution can only collapse.
+    """
+    from music_video_producer.models import (
+        identity_sheet_ids,
+        prefer_identity_sheets,
+        with_default_setting,
+    )
+
+    project = Project(
+        name="Promoted location",
+        default_setting_id="asset_bed",
+        assets=[
+            Asset(id="asset_bed", name="Bed", kind="setting", path="media/bed.png"),
+            Asset(id="asset_bedsheet", name="Bed · multiview", kind="setting",
+                  path="out/bed.png", source="krea-multiview", parent_id="asset_bed"),
+        ],
+    )
+    located = with_default_setting(project, [], picture_limit=9)
+    assert [citation.asset_id for citation in located] == ["asset_bed"]
+    preferred = prefer_identity_sheets(located, identity_sheet_ids(project))
+    assert [citation.asset_id for citation in preferred] == ["asset_bedsheet"]
+
+
+def test_a_project_with_no_declared_location_is_a_clean_no_op(tmp_path: Path):
+    """No declaration, nothing invented — and the same for a declaration that no longer holds.
+
+    The three ways a pointer can stop meaning anything are all no-ops rather than crashes or
+    fabricated citations: never set, aimed at an asset the library no longer holds, and aimed at
+    an asset that is not a setting. A library holding exactly one setting is deliberately *not*
+    enough either; picking it for the Director is the invisible attachment this must not make.
+    """
+    from music_video_producer.models import default_setting_asset
+
+    project = Project(
+        name="Unset",
+        assets=[Asset(id="asset_bed", name="Bed", kind="setting", path="media/bed.png")],
+    )
+    assert default_setting_asset(project) is None  # one setting, and still no declaration
+
+    project.default_setting_id = "asset_gone"
+    assert default_setting_asset(project) is None
+
+    project.default_setting_id = "asset_bed"
+    assert default_setting_asset(project) is not None
+    project.assets[0].kind = "prop"
+    assert default_setting_asset(project) is None
+    project.assets[0].kind = "setting"
+    project.assets[0].path = ""
+    assert default_setting_asset(project) is None
+
+
+def test_the_location_never_takes_a_picture_slot_the_render_does_not_have(tmp_path: Path):
+    """The slot ceiling, and what happens at it: the shot keeps what it has.
+
+    H3 wires nine pictures. A shot already holding nine is not given a tenth, and it does not
+    trade one of its own away for the location either — the deliberate choice is that a full shot
+    is a shot whose references the Director or the model already decided.
+    """
+    from music_video_producer.models import with_default_setting
+    from music_video_producer.workflows import H3_REFERENCE_LIMITS
+
+    limit = H3_REFERENCE_LIMITS["picture"]
+    project = Project(
+        name="Full",
+        default_setting_id="asset_bed",
+        assets=[
+            Asset(id="asset_bed", name="Bed", kind="setting", path="media/bed.png"),
+            *[
+                Asset(id=f"asset_{index}", name=f"Prop {index}", kind="prop", path="p.png")
+                for index in range(limit)
+            ],
+        ],
+    )
+    full = [
+        AssetCitation(asset_id=f"asset_{index}", role="reference", order=index)
+        for index in range(limit)
+    ]
+    assert with_default_setting(project, full, picture_limit=limit) == full
+    assert len(with_default_setting(project, full[:-1], picture_limit=limit)) == limit
+    # An audio citation is not a picture, so it does not consume the budget the ceiling is about.
+    project.assets.append(Asset(id="asset_stem", name="Stem", kind="audio", path="s.wav"))
+    with_audio = [*full[:-1], AssetCitation(asset_id="asset_stem", role="reference", order=99)]
+    assert len(with_default_setting(project, with_audio, picture_limit=limit)) == limit + 1
+
+
+def test_populate_writes_byte_identical_citations_without_sheets_or_a_location(
+    tmp_path: Path,
+):
+    """The pin. A project with no promotions and no declared location must produce exactly the
+    citations populate has always produced — same ids, same roles, same orders, same list order.
+
+    Both rules are written to be no-ops in that state, and this is what makes them safe to add to
+    a manifest full of existing work. Asserted against the citation list built the old way — a
+    plain name scan over the whole library — rather than against a snapshot, so the comparison is
+    to the *rule* that shipped and not to a copy of today's output.
+    """
+    prompts = (
+        "Lucy Vane at the microphone.",
+        "Bass Player in silhouette.",
+        "Wide on the Dusk Warehouse Bed with Lucy Vane.",
+        "An empty room.",
+    )
+    director = sheet_director(*prompts)
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = store.create(Project(name="Plain"))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=52.0)
+    project.assets = [
+        Asset(id="asset_lucy", name="Lucy Vane", kind="character", path="media/lucy.png"),
+        Asset(id="asset_mate", name="Bass Player", kind="character", path="media/mate.png"),
+        Asset(id="asset_bed", name="Dusk Warehouse Bed", kind="setting", path="media/bed.png"),
+    ]
+    store.save(project)
+
+    assert populate(client, project.id).status_code == 200
+    saved = store.get(project.id)
+    for shot in saved.shots:
+        lowered = shot.prompt.lower()
+        expected = [
+            AssetCitation(asset_id=asset.id, role="reference", order=order)
+            for order, asset in enumerate(
+                asset
+                for asset in saved.assets
+                if len(asset.name) >= 4 and asset.name.lower() in lowered
+            )
+        ]
+        assert shot.citations == expected
+        assert shot.asset_ids == [citation.asset_id for citation in expected]
+    assert comfy.prompts == []
+
+
+def test_populate_never_shows_the_model_an_internal_sheet_label(tmp_path: Path):
+    """Defect three: the naming leak, and both places the label could be read from.
+
+    Citation correctness used to depend on the model degrading its own writing — the sheet was
+    cited only when "HarderFaster · multiview" appeared verbatim in a shot's creative prose. Now
+    that citing the source *means* citing the sheet, the sheet has no separate identity to offer,
+    so its name is withheld from the asset roster in the instruction **and** from the project
+    context dump the same call is handed. A name never shown cannot be echoed.
+
+    The count enforcement is the untouched variable, pinned here beside the wording that moved:
+    three placements of the number, and the FINAL CHECK still last.
+    """
+    director = sheet_director("Lucy Vane at the microphone.")
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sheet_project(store, name="No leak")
+
+    assert populate(client, project.id).status_code == 200
+    request = director.requests[0]
+    assert "Lucy Vane (character)" in request["message"]
+    assert "multiview" not in request["message"]
+    assert [asset["name"] for asset in request["context"]["assets"]] == [
+        "Lucy Vane",
+        "Bass Player",
+        "Dusk Warehouse Bed",
+    ]
+    # The exact-name mechanism the matcher runs on is still asked for, and now bounded.
+    assert "by these exact names and no others" in request["message"]
+    assert "never write a name that is not on that list" in request["message"]
+    # Count enforcement, undisturbed.
+    from music_video_producer.app import populate_required_shots
+
+    required = populate_required_shots(52.0)
+    assert f"Return EXACTLY {required} shots." in request["message"]
+    assert f"`shots` must contain EXACTLY {required} entries. Not fewer." in request["message"]
+    assert f"It must equal {required}." in request["message"]
+    assert request["message"].rstrip().endswith("just return the corrected list.")
+    assert comfy.prompts == []
+
+
+def test_a_sheet_whose_source_is_gone_is_still_offered_and_still_cited(tmp_path: Path):
+    """Hiding the sheet behind its source only works while the source is there.
+
+    Once the source is deleted the sheet is the only asset for that subject, and a roster that
+    hid it would hide the subject — so it is listed under its own name and cited under it.
+    """
+    from music_video_producer.models import citable_assets, identity_sheet_ids
+
+    orphan = Project(
+        name="Orphan",
+        assets=[
+            Asset(id="asset_sheet", name="Lucy Vane · multiview", kind="character",
+                  path="out/sheet.png", source="krea-multiview", parent_id="asset_lucy"),
+        ],
+    )
+    assert [asset.id for asset in citable_assets(orphan)] == ["asset_sheet"]
+    # The map still names the substitution, and it simply matches nothing this library holds.
+    assert identity_sheet_ids(orphan) == {"asset_lucy": "asset_sheet"}
+
+
+def test_the_declared_location_is_set_by_one_route_and_nothing_else(tmp_path: Path):
+    """The write path, and every sibling that must not become a second one.
+
+    `Asset.consistency_prompt`'s rule, applied to a field with the same shape: a defaulted `str`
+    that every client written before it existed simply omits. The generic full-project `PUT` is
+    the route that has been this hole three times, so it re-adopts the stored value; deleting the
+    asset clears the pointer rather than leaving it aimed at nothing.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = sheet_project(store, name="One door")
+
+    assert client.put(
+        f"/api/projects/{project.id}/default-setting", json={"asset_id": "asset_gone"}
+    ).status_code == 404
+    wrong_kind = client.put(
+        f"/api/projects/{project.id}/default-setting", json={"asset_id": "asset_lucy"}
+    )
+    assert wrong_kind.status_code == 422
+    assert "has to be a setting" in wrong_kind.json()["detail"]
+    assert store.get(project.id).default_setting_id == ""
+
+    assert client.put(
+        f"/api/projects/{project.id}/default-setting", json={"asset_id": "asset_bed"}
+    ).status_code == 200
+
+    # An ordinary save from a client that has never heard of the field must not clear it.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body.pop("default_setting_id")
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert store.get(project.id).default_setting_id == "asset_bed"
+
+    # Emptying the box is how "no location" is said.
+    assert client.put(
+        f"/api/projects/{project.id}/default-setting", json={"asset_id": ""}
+    ).status_code == 200
+    assert store.get(project.id).default_setting_id == ""
+
+    assert client.put(
+        f"/api/projects/{project.id}/default-setting", json={"asset_id": "asset_bed"}
+    ).status_code == 200
+    assert client.delete(
+        f"/api/projects/{project.id}/assets/asset_bed"
+    ).status_code == 200
+    assert store.get(project.id).default_setting_id == ""
+
+
+def test_the_declared_location_leaves_an_existing_plan_alone(tmp_path: Path):
+    """No silent sweep. Declaring a location is a statement about the *project*, read by the next
+    plan; a route that reached back over shots the Director already has would be the invisible
+    bulk edit this codebase's report-then-confirm convention forbids."""
+    client, store, _comfy = make_client(tmp_path)
+    project = sheet_project(store, name="Untouched")
+    project.shots = [Shot(id="shot_one", start=0, duration=5, prompt="A wide shot.")]
+    store.save(project)
+
+    assert client.put(
+        f"/api/projects/{project.id}/default-setting", json={"asset_id": "asset_bed"}
+    ).status_code == 200
+    assert store.get(project.id).shots[0].citations == []
 
 
 def batch_plan_project(store, shots: list[Shot], name: str = "Batch") -> str:
@@ -14166,3 +14661,676 @@ def test_snap_cuts_refuses_a_plan_that_is_not_a_contiguous_tiling(tmp_path: Path
     assert response.status_code == 422
     assert "not a contiguous tiling" in response.json()["detail"]
     assert "SHOT 01 (s0)" in response.json()["detail"]
+
+
+# --- Replace With: moving every citation of one asset onto another (2026-08-20) -----------
+#
+# The Director hit the delete refusal removing the HarderFaster source now that its Krea
+# multiview exists, kept the refusal, and asked for the act it implies. The buckets below are
+# their live project's, measured: 14 shots cite the source alone, 8 cite both, 8 cite neither,
+# and one of the 14 has rendered.
+
+
+def replacement_project(tmp_path: Path):
+    """The Director's four buckets, in miniature. Returns the client, store, comfy and ids.
+
+    Shots are written through the store rather than through a route, `gated_project`'s rule:
+    the routes are what is under test, and two of these shots are in states the generic writes
+    deliberately refuse to create.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Harder Faster"}).json()["id"]
+    lucy = upload_asset(client, project_id, "Lucy", "character", "lucy.png")["id"]
+    sheet = upload_asset(client, project_id, "Lucy multiview", "character", "sheet.png")["id"]
+    warehouse = upload_asset(client, project_id, "Dusk Warehouse", "setting", "dusk.png")["id"]
+    reference = [{"asset_id": lucy, "role": "reference", "order": 0}]
+    project = store.get(project_id)
+    project.shots = [
+        # Straight swaps. The second holds the warehouse first, so `order` has something to be
+        # wrong about: Lucy sits at order 1 and must still sit at order 1 afterwards.
+        Shot(id="swap_a", start=0, duration=5, prompt="Lucy alone.", citations=reference),
+        Shot(
+            id="swap_b",
+            start=5,
+            duration=5,
+            prompt="Lucy in the warehouse.",
+            citations=[
+                {"asset_id": warehouse, "role": "reference", "order": 0},
+                {"asset_id": lucy, "role": "reference", "order": 1},
+            ],
+            reference_labels={lucy: "Lucy"},
+        ),
+        # The Director's collision: cites both, same role. The old citation goes, the standing
+        # one is left exactly as it is.
+        Shot(
+            id="both_a",
+            start=10,
+            duration=5,
+            prompt="Lucy twice over.",
+            citations=[
+                {"asset_id": lucy, "role": "reference", "order": 0},
+                {"asset_id": sheet, "role": "reference", "order": 1},
+            ],
+        ),
+        Shot(
+            id="both_b",
+            start=15,
+            duration=5,
+            prompt="Lucy twice over again.",
+            citations=[
+                {"asset_id": lucy, "role": "reference", "order": 0},
+                {"asset_id": warehouse, "role": "reference", "order": 1},
+                {"asset_id": sheet, "role": "reference", "order": 2},
+            ],
+            reference_labels={lucy: "Lucy", sheet: "The turnaround"},
+        ),
+        # Untouched: cites neither.
+        Shot(
+            id="untouched",
+            start=20,
+            duration=5,
+            prompt="The empty warehouse.",
+            citations=[{"asset_id": warehouse, "role": "reference", "order": 0}],
+        ),
+        # Protected: a lock the Director set, and a shot whose take was rendered from Lucy.
+        Shot(id="locked", start=25, duration=5, prompt="Locked.", citations=reference, locked=True),
+        Shot(
+            id="rendered",
+            start=30,
+            duration=5,
+            prompt="Rendered.",
+            citations=reference,
+            status="complete",
+            prompt_id="p-9",
+            latest_output="take.mp4",
+        ),
+    ]
+    store.save(project)
+    return client, store, comfy, project_id, lucy, sheet, warehouse
+
+
+def replace_citations(client, project_id: str, asset_id: str, **body):
+    return client.post(
+        f"/api/projects/{project_id}/assets/{asset_id}/replace-citations", json=body
+    )
+
+
+def test_the_replacement_report_names_every_bucket_and_writes_nothing(tmp_path: Path):
+    """Report first. The counts are the Director's own three, and the manifest does not move.
+
+    Proven through a fresh `ProjectStore` rather than from the response: the claim is that
+    nothing was written to disk, and re-reading the manifest is the only evidence of that.
+    """
+    client, store, comfy, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    before = store.get(project_id).model_dump_json()
+
+    response = replace_citations(client, project_id, lucy, replacement_id=sheet)
+
+    assert response.status_code == 200, response.text
+    report = response.json()
+    assert report["applied"] is False
+    # `project` absent is the wire's own statement that nothing was written.
+    assert report["project"] is None
+    assert (report["swapped"], report["merged"], report["skipped"]) == (3, 2, 1)
+    # The rendered shot is a swap like any other — the Director's ruling — and is *also* counted
+    # into `rendered`, which is a subset of the changes and never of the skips.
+    assert [row["shot_id"] for row in report["swaps"]] == ["swap_a", "swap_b", "rendered"]
+    assert [row["shot_id"] for row in report["merges"]] == ["both_a", "both_b"]
+    assert [row["shot_id"] for row in report["skips"]] == ["locked"]
+    assert (report["rendered"], report["approved"]) == (1, 0)
+    # Every skipped shot still cites Lucy afterwards, which is what the delete will meet next.
+    assert report["still_cited"] == 1
+    assert "2 shot(s) already cite Lucy multiview" in report["message"]
+    assert "1 shot(s) still cite Lucy" in report["message"]
+    # Same kind, so no warning; and no report row for the shot citing neither asset.
+    assert report["warning"] == ""
+    assert '"shot_id":"untouched"' not in response.text
+
+    assert ProjectStore(tmp_path).get(project_id).model_dump_json() == before
+    assert comfy.prompts == []
+
+
+def test_confirming_carries_role_order_and_the_asset_ids_projection(tmp_path: Path):
+    """Apply. A citation is one slot and the replacement is a new occupant for it.
+
+    `asset_ids` is checked against the reference-role citations rather than against a literal
+    list, because it is a projection and the whole claim is that it was rebuilt from the
+    citations instead of edited beside them.
+    """
+    client, store, comfy, project_id, lucy, sheet, warehouse = replacement_project(tmp_path)
+
+    response = replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["applied"] is True
+    assert response.json()["project"] is not None
+
+    # The projection on the *answer* and on the *bytes*, not only on the re-read: loading a
+    # manifest re-validates every Shot and would repair a stale `asset_ids` on the way in, so a
+    # test that only re-reads cannot tell a rebuilt projection from a repaired one. The browser
+    # redraws from this body and the next reader parses these bytes.
+    answered = {shot["id"]: shot for shot in response.json()["project"]["shots"]}
+    assert answered["swap_a"]["asset_ids"] == [sheet]
+    written = json.loads(store.manifest_path(project_id).read_text(encoding="utf-8"))
+    assert {shot["id"]: shot["asset_ids"] for shot in written["shots"]}["swap_a"] == [sheet]
+
+    reopened = ProjectStore(tmp_path).get(project_id)
+    shots = {shot.id: shot for shot in reopened.shots}
+    assert [(c.asset_id, c.role, c.order) for c in shots["swap_a"].citations] == [
+        (sheet, "reference", 0)
+    ]
+    # Order preserved: the warehouse stays at 0 and the replacement takes Lucy's 1.
+    assert [(c.asset_id, c.role, c.order) for c in shots["swap_b"].citations] == [
+        (warehouse, "reference", 0),
+        (sheet, "reference", 1),
+    ]
+    assert shots["untouched"].citations == [
+        AssetCitation(asset_id=warehouse, role="reference", order=0)
+    ]
+    for shot in reopened.shots:
+        assert shot.asset_ids == [
+            citation.asset_id for citation in shot.citations if citation.role == "reference"
+        ]
+    # Nothing rendered, armed, queued or approved on the applying path either.
+    assert comfy.prompts == []
+    assert [shot.status for shot in reopened.shots] == [
+        "draft", "draft", "draft", "draft", "draft", "draft", "complete"
+    ]
+
+
+def test_a_shot_that_already_cites_the_replacement_simply_loses_the_old_citation(
+    tmp_path: Path,
+):
+    """The Director's own case, in their own words: "already in N shots".
+
+    Purely subtractive. The standing citation of the replacement keeps its role *and* its
+    order — the gap the removal leaves is not closed up, because `order` sorts within a role
+    and is not a dense index.
+    """
+    client, _, _, project_id, lucy, sheet, warehouse = replacement_project(tmp_path)
+
+    replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True)
+
+    shots = {shot.id: shot for shot in ProjectStore(tmp_path).get(project_id).shots}
+    assert [(c.asset_id, c.role, c.order) for c in shots["both_a"].citations] == [
+        (sheet, "reference", 1)
+    ]
+    assert [(c.asset_id, c.role, c.order) for c in shots["both_b"].citations] == [
+        (warehouse, "reference", 1),
+        (sheet, "reference", 2),
+    ]
+    # No shot gained a citation: a merge only ever removes one.
+    assert len(shots["both_b"].citations) == 2
+
+
+def test_reference_labels_travel_with_the_citation_that_survives(tmp_path: Path):
+    """The collision rule for labels, both directions, and the swap direction beside it.
+
+    * swap — the survivor *is* the old citation, re-pointed, so its label moves onto the new id;
+    * merge onto a survivor with no label — the removed citation's label is carried, so the
+      Director's word for the subject is not lost to the sheet's internal name;
+    * merge onto a survivor that has its own label — the survivor's wins, and the removed one
+      goes with its citation. A removal that also renamed the surviving reference would change
+      what an already-authored prompt calls that picture in the reference map beneath it.
+
+    In every case the replaced asset's key is gone: a label keyed to an asset this shot no
+    longer cites is dead weight.
+    """
+    client, store, _, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    # `both_a` cites both and has no labels at all; give it only Lucy's, so the merge lands on a
+    # survivor with none. `both_b` already carries a label for the sheet, so the survivor's wins.
+    project = store.get(project_id)
+    {shot.id: shot for shot in project.shots}["both_a"].reference_labels = {lucy: "Lucy"}
+    store.save(project)
+
+    report = replace_citations(client, project_id, lucy, replacement_id=sheet).json()
+    assert {row["shot_id"]: row["carried_label"] for row in report["swaps"]} == {
+        "swap_a": "", "swap_b": "Lucy", "rendered": ""
+    }
+    assert {row["shot_id"]: row["carried_label"] for row in report["merges"]} == {
+        "both_a": "Lucy", "both_b": ""
+    }
+
+    replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True)
+
+    shots = {shot.id: shot for shot in ProjectStore(tmp_path).get(project_id).shots}
+    assert shots["swap_a"].reference_labels == {}
+    assert shots["swap_b"].reference_labels == {sheet: "Lucy"}
+    assert shots["both_a"].reference_labels == {sheet: "Lucy"}
+    assert shots["both_b"].reference_labels == {sheet: "The turnaround"}
+    assert all(lucy not in shot.reference_labels for shot in shots.values())
+
+
+def test_a_shot_whose_two_citations_hold_different_roles_is_skipped_by_name(tmp_path: Path):
+    """The differing-roles decision: a named refusal rather than a plausible guess.
+
+    Cites Lucy as a plain reference and the sheet as the first frame. Dropping the reference
+    would leave the shot with a keyframe and no plain reference — silently a different render;
+    re-pointing it would be a merge for one citation and a swap for another in one shot. Both
+    are guesses, so the shot is named and left exactly as it is.
+    """
+    client, store, _, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    project = store.get(project_id)
+    project.shots.append(
+        Shot(
+            id="mixed",
+            start=35,
+            duration=5,
+            prompt="Lucy, opening on the sheet.",
+            citations=[
+                {"asset_id": lucy, "role": "reference", "order": 0},
+                {"asset_id": sheet, "role": "first", "order": 0},
+            ],
+        )
+    )
+    store.save(project)
+
+    report = replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True).json()
+
+    skip = next(row for row in report["skips"] if row["shot_id"] == "mixed")
+    assert skip["reason"] == REPLACE_MIXED_ROLES.format(
+        shot=skip["label"],
+        replaced="Lucy",
+        replacement="Lucy multiview",
+        replaced_roles="reference",
+        replacement_roles="first",
+    )
+    mixed = {s.id: s for s in ProjectStore(tmp_path).get(project_id).shots}["mixed"]
+    assert [(c.asset_id, c.role, c.order) for c in mixed.citations] == [
+        (lucy, "reference", 0),
+        (sheet, "first", 0),
+    ]
+
+
+def test_a_lock_and_an_executing_render_are_the_only_two_skips(tmp_path: Path):
+    """The two protections that survive the Director's ruling, and nothing else.
+
+    A lock is an explicit hands-off only the Director may clear, reported in
+    `EXPANSION_LOCKED_NOTICE` verbatim. An in-flight render is the one genuine correctness
+    block: the job was submitted against the old asset and is executing now, so rewriting the
+    citation under it would leave that job's record describing a render that never happened.
+
+    The in-flight shot below reads `draft` with no `prompt_id` and is caught anyway — the
+    evidence is the *job record*, which is what `shot_render_in_flight` exists to read and what
+    still says "in flight" when a status has been walked backwards by hand.
+    """
+    client, store, _, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    project = store.get(project_id)
+    project.shots.append(
+        Shot(
+            id="flying",
+            start=35,
+            duration=5,
+            prompt="Rendering right now.",
+            citations=[{"asset_id": lucy, "role": "reference", "order": 0}],
+        )
+    )
+    project.jobs.append(
+        RenderJob(
+            id="job_flying", kind="h3", status="running",
+            target_id="flying", prompt_id="p-live",
+        )
+    )
+    store.save(project)
+
+    report = replace_citations(
+        client, project_id, lucy, replacement_id=sheet, confirm_apply=True
+    ).json()
+
+    reasons = {row["shot_id"]: row["reason"] for row in report["skips"]}
+    assert set(reasons) == {"locked", "flying"}
+    assert reasons["locked"] == EXPANSION_LOCKED_NOTICE.format(shots="SHOT 06 (locked)")
+    assert reasons["flying"] == REPLACE_ASSET_IN_FLIGHT.format(
+        shot="SHOT 08 (flying)", replaced="Lucy"
+    )
+    shots = {shot.id: shot for shot in ProjectStore(tmp_path).get(project_id).shots}
+    assert shots["locked"].asset_ids == [lucy]
+    assert shots["flying"].asset_ids == [lucy]
+    # And the rendered shot beside them was rewritten, which is the whole ruling.
+    assert shots["rendered"].asset_ids == [sheet]
+
+
+def test_a_rendered_or_approved_shot_is_replaced_and_named_rather_than_skipped(tmp_path: Path):
+    """The Director's ruling, and the report that replaces the refusal it overturned.
+
+    *"So even with takes we do want the asset for the shot replaceable, that way a re-render
+    would use the updated asset without losing previous takes."* Replacing a citation does not
+    touch the take: the file, the status, the job record and the approval snapshot are all
+    asserted unchanged here, and the citation is asserted moved. What the Director gets instead
+    of a refusal is the count, before the confirm — the consequence is real, because nothing
+    records which assets produced an existing take.
+    """
+    client, store, comfy, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    project = store.get(project_id)
+    project.shots.append(
+        Shot(
+            id="approved",
+            start=35,
+            duration=5,
+            prompt="Approved.",
+            # Cites both, so this one is an "already have" as well as an approved take — the
+            # provenance count has to search that bucket too, because a rendered shot that
+            # already cites the replacement is exactly as affected as one that does not.
+            citations=[
+                {"asset_id": lucy, "role": "reference", "order": 0},
+                {"asset_id": sheet, "role": "reference", "order": 1},
+            ],
+            status="approved",
+            approved_output="take.mp4",
+            latest_output="take.mp4",
+            prompt_id="p-old",
+            approved_start=35,
+            approved_duration=5,
+        )
+    )
+    store.save(project)
+
+    report = replace_citations(client, project_id, lucy, replacement_id=sheet).json()
+
+    # Counted apart from the skips and drawn from the shots actually being changed.
+    assert (report["rendered"], report["approved"], report["skipped"]) == (1, 1, 1)
+    assert {row["shot_id"]: row["provenance"] for row in report["swaps"]} == {
+        "swap_a": "", "swap_b": "", "rendered": "rendered",
+    }
+    assert {row["shot_id"]: row["provenance"] for row in report["merges"]} == {
+        "both_a": "", "both_b": "", "approved": "approved",
+    }
+    # Approved outranks rendered, so no shot is counted under both headings.
+    assert report["notes"] == [
+        REPLACE_ASSET_APPROVED_NOTE.format(
+            count=1, replaced="Lucy", shots="SHOT 08 (approved)"
+        ),
+        REPLACE_ASSET_RENDERED_NOTE.format(
+            count=1, replaced="Lucy", shots="SHOT 07 (rendered)"
+        ),
+    ]
+
+    assert replace_citations(
+        client, project_id, lucy, replacement_id=sheet, confirm_apply=True
+    ).status_code == 200
+
+    shots = {shot.id: shot for shot in ProjectStore(tmp_path).get(project_id).shots}
+    # The citations moved on the swap, and the approved shot lost the old one and kept its
+    # standing citation at the order it already had.
+    assert shots["rendered"].asset_ids == [sheet]
+    assert [(c.asset_id, c.role, c.order) for c in shots["approved"].citations] == [
+        (sheet, "reference", 1)
+    ]
+    # And nothing about either take did. The approval snapshot is untouched: citations are not
+    # the window, so assembly's staleness comparison reads exactly what it read before.
+    assert (shots["rendered"].status, shots["rendered"].latest_output) == ("complete", "take.mp4")
+    assert shots["rendered"].prompt_id == "p-9"
+    assert shots["approved"].approved_output == "take.mp4"
+    assert (shots["approved"].approved_start, shots["approved"].approved_duration) == (35, 5)
+    assert shots["approved"].status == "approved"
+    assert comfy.prompts == []
+
+
+def test_a_shot_with_no_take_carries_no_provenance_note(tmp_path: Path):
+    """The control. With nothing rendered anywhere, both lines are absent rather than empty."""
+    client, store, _, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    project = store.get(project_id)
+    for shot in project.shots:
+        shot.status, shot.prompt_id, shot.latest_output = "draft", "", ""
+    store.save(project)
+
+    report = replace_citations(client, project_id, lucy, replacement_id=sheet).json()
+
+    assert (report["rendered"], report["approved"]) == (0, 0)
+    assert report["notes"] == []
+    assert all(row["provenance"] == "" for row in report["swaps"] + report["merges"])
+
+
+def test_replacing_an_asset_with_itself_is_refused(tmp_path: Path):
+    """Refused, not a no-op that reports every citing shot as changed."""
+    client, store, _, project_id, lucy, _, _ = replacement_project(tmp_path)
+    before = store.get(project_id).model_dump_json()
+
+    response = replace_citations(client, project_id, lucy, replacement_id=lucy, confirm_apply=True)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == REPLACE_ASSET_WITH_ITSELF.format(name="Lucy")
+    assert ProjectStore(tmp_path).get(project_id).model_dump_json() == before
+
+
+def test_an_unknown_asset_or_replacement_404s_and_an_uncited_asset_is_refused(tmp_path: Path):
+    """The three ways in that are not a plan, each answered in its own code."""
+    client, _, _, project_id, lucy, sheet, warehouse = replacement_project(tmp_path)
+
+    missing = replace_citations(client, project_id, "asset_nope", replacement_id=sheet)
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "Asset not found"
+
+    unknown = replace_citations(client, project_id, lucy, replacement_id="asset_nope")
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == REPLACE_ASSET_UNKNOWN
+
+    # An asset nothing cites: refused with the sentence that says the delete will now go
+    # through, rather than reported as a plan over zero shots.
+    spare = upload_asset(client, project_id, "Spare", "prop", "spare.png")["id"]
+    uncited = replace_citations(client, project_id, spare, replacement_id=warehouse, confirm_apply=True)
+    assert uncited.status_code == 422
+    assert uncited.json()["detail"] == REPLACE_ASSET_UNCITED.format(name="Spare")
+    assert client.delete(f"/api/projects/{project_id}/assets/{spare}").status_code == 200
+
+
+def test_an_asset_only_protected_shots_cite_reports_rather_than_refusing(tmp_path: Path):
+    """The honest-empty rule stops at *cited*, not at *writable*.
+
+    Every citing shot being locked is the answer to "why can I still not delete it", and
+    refusing it into a 422 would hide exactly that. Reported, applied nothing, saved nothing.
+    """
+    client, store, _, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    project = store.get(project_id)
+    for shot in project.shots:
+        if any(citation.asset_id == lucy for citation in shot.citations):
+            shot.locked = True
+    store.save(project)
+    before = store.get(project_id).model_dump_json()
+
+    report = replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True)
+
+    assert report.status_code == 200
+    assert report.json()["applied"] is False
+    assert report.json()["project"] is None
+    assert (report.json()["swapped"], report.json()["merged"]) == (0, 0)
+    assert report.json()["skipped"] == 6
+    assert ProjectStore(tmp_path).get(project_id).model_dump_json() == before
+
+
+def test_a_replacement_of_another_kind_warns_and_a_slot_overflow_skips_by_name(tmp_path: Path):
+    """A kind change is reported, never refused; the *slot* ceiling it can breach is refused.
+
+    The taxonomy is the library's own and the render buckets every non-video, non-audio kind
+    into one anonymous picture series, so citing a setting where a character was is a creative
+    change and not a structural error. Moving a citation between the picture, video and audio
+    series is the structural half, and it is checked per shot against `H3_REFERENCE_LIMITS`.
+    """
+    client, store, _, project_id, lucy, _, _ = replacement_project(tmp_path)
+    project = store.get(project_id)
+    videos = [
+        Asset(id=f"asset_v{index}", name=f"Clip {index}", kind="video", path=f"v{index}.mp4")
+        for index in range(3)
+    ]
+    project.assets.extend(videos)
+    # Three video references already, plus Lucy as a picture. Swapping Lucy for a fourth video
+    # would wire four videos into three slots.
+    project.shots.append(
+        Shot(
+            id="videos",
+            start=35,
+            duration=5,
+            prompt="Three clips and Lucy.",
+            citations=[
+                *[
+                    {"asset_id": video.id, "role": "reference", "order": index}
+                    for index, video in enumerate(videos)
+                ],
+                {"asset_id": lucy, "role": "reference", "order": 3},
+            ],
+        )
+    )
+    project.assets.append(
+        Asset(id="asset_v3", name="Clip 3", kind="video", path="v3.mp4")
+    )
+    store.save(project)
+
+    report = replace_citations(client, project_id, lucy, replacement_id="asset_v3", confirm_apply=True)
+
+    assert report.status_code == 200
+    body = report.json()
+    assert body["warning"] == REPLACE_ASSET_KIND_CHANGE.format(
+        replacement="Clip 3", replacement_kind="video", replaced="Lucy", replaced_kind="character"
+    )
+    skip = next(row for row in body["skips"] if row["shot_id"] == "videos")
+    assert skip["reason"] == REPLACE_OVER_SLOT_LIMIT.format(
+        shot=skip["label"], count=4, kind="video", limit=3, replaced="Lucy", replacement="Clip 3"
+    )
+    # The over-slot shot is untouched; the ordinary swaps in the same call still happened.
+    shots = {shot.id: shot for shot in ProjectStore(tmp_path).get(project_id).shots}
+    assert shots["videos"].asset_ids[-1] == lucy
+    assert shots["swap_a"].asset_ids == ["asset_v3"]
+
+
+def test_a_citation_in_a_keyframe_role_is_replaced_in_that_role(tmp_path: Path):
+    """Role is the slot, not a fact about which asset sits in it.
+
+    A shot that opens on Lucy's face must open on the replacement's face — not gain a plain
+    reference and lose its first frame. `asset_ids` is the check that makes it visible: it
+    projects the reference role alone, so a keyframe swap must leave it exactly as it was.
+    """
+    client, store, _, project_id, lucy, sheet, warehouse = replacement_project(tmp_path)
+    project = store.get(project_id)
+    project.shots.append(
+        Shot(
+            id="keyframe",
+            start=35,
+            duration=5,
+            prompt="Opens on Lucy.",
+            citations=[
+                {"asset_id": warehouse, "role": "reference", "order": 0},
+                {"asset_id": lucy, "role": "first", "order": 0},
+            ],
+        )
+    )
+    store.save(project)
+
+    report = replace_citations(
+        client, project_id, lucy, replacement_id=sheet, confirm_apply=True
+    ).json()
+
+    assert next(row for row in report["swaps"] if row["shot_id"] == "keyframe")["roles"] == [
+        "first"
+    ]
+    shot = {s.id: s for s in ProjectStore(tmp_path).get(project_id).shots}["keyframe"]
+    assert [(c.asset_id, c.role, c.order) for c in shot.citations] == [
+        (warehouse, "reference", 0),
+        (sheet, "first", 0),
+    ]
+    assert shot.asset_ids == [warehouse]
+
+
+def test_a_shot_already_over_a_slot_ceiling_is_not_skipped_for_a_replacement_that_fits(
+    tmp_path: Path,
+):
+    """Only an overflow this replacement *introduces* counts. `assistant_fill`'s rule for slots.
+
+    The shot below wires four videos and is over H3's three-video ceiling before anything here
+    runs — a hand-edited manifest, or a library that changed under it. Refusing today's
+    replacement for it would turn an unrelated stale defect into a permanent block on the shot,
+    and the replacement asked for does not touch the video series at all.
+    """
+    client, store, _, project_id, lucy, _, warehouse = replacement_project(tmp_path)
+    project = store.get(project_id)
+    project.assets.extend(
+        Asset(id=f"asset_w{index}", name=f"Clip {index}", kind="video", path=f"w{index}.mp4")
+        for index in range(4)
+    )
+    project.shots.append(
+        Shot(
+            id="crowded",
+            start=35,
+            duration=5,
+            prompt="Four clips and Lucy.",
+            citations=[
+                *[
+                    {"asset_id": f"asset_w{index}", "role": "reference", "order": index}
+                    for index in range(4)
+                ],
+                {"asset_id": lucy, "role": "reference", "order": 4},
+            ],
+        )
+    )
+    store.save(project)
+
+    report = replace_citations(
+        client, project_id, lucy, replacement_id=warehouse, confirm_apply=True
+    ).json()
+
+    assert [row["shot_id"] for row in report["skips"]] == ["locked"]
+    crowded = {s.id: s for s in ProjectStore(tmp_path).get(project_id).shots}["crowded"]
+    assert crowded.asset_ids[-1] == warehouse
+
+
+def test_the_delete_refusal_is_unchanged_and_the_replacement_clears_the_way_to_it(
+    tmp_path: Path,
+):
+    """The refusal the Director liked, before and after — and what makes it stop firing.
+
+    The route deliberately does not delete. It moves citations; the Director deletes. So the
+    asset is still refused while one protected shot cites it, in exactly the same words, and
+    only goes once that shot is resolved.
+    """
+    client, store, _, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    refused = client.delete(f"/api/projects/{project_id}/assets/{lucy}")
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == DELETE_ASSET_CITED.format(
+        name="Lucy",
+        shots=(
+            "SHOT 01 (swap_a), SHOT 02 (swap_b), SHOT 03 (both_a), SHOT 04 (both_b), "
+            "SHOT 06 (locked), SHOT 07 (rendered)"
+        ),
+    )
+
+    applied = replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True).json()
+    assert applied["still_cited"] == 1
+    assert "still be refused" in applied["message"]
+    # Still refused, and now naming only the one shot nothing was allowed to rewrite — the
+    # rendered shot was replaced like any other and is no longer in the way.
+    again = client.delete(f"/api/projects/{project_id}/assets/{lucy}")
+    assert again.status_code == 422
+    assert DELETE_ASSET_CITED.format(name="Lucy", shots="SHOT 06 (locked)") == (
+        again.json()["detail"]
+    )
+
+    project = store.get(project_id)
+    for shot in project.shots:
+        shot.locked = False
+    store.save(project)
+    freed = replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True).json()
+    assert freed["still_cited"] == 0
+    assert "can now be deleted" in freed["message"]
+    assert client.delete(f"/api/projects/{project_id}/assets/{lucy}").status_code == 200
+
+
+def test_a_manifest_written_before_this_feature_loads_and_replaces_unchanged(tmp_path: Path):
+    """Old manifests: a shot with `asset_ids` and no citations, and no `reference_labels` key.
+
+    Nothing new is stored on a Shot by this feature — the fields it writes all predate it — so
+    the compatibility claim is that the flat-list migration still runs and the replacement then
+    lands on the citations it produced.
+    """
+    client, store, _, project_id, lucy, sheet, _ = replacement_project(tmp_path)
+    manifest = json.loads(store.manifest_path(project_id).read_text(encoding="utf-8"))
+    manifest["shots"] = [
+        {"id": "legacy", "start": 0, "duration": 5, "prompt": "Legacy.", "asset_ids": [lucy]}
+    ]
+    store.manifest_path(project_id).write_text(json.dumps(manifest), encoding="utf-8")
+
+    applied = replace_citations(client, project_id, lucy, replacement_id=sheet, confirm_apply=True)
+
+    assert applied.status_code == 200
+    legacy = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert legacy.asset_ids == [sheet]
+    assert [(c.asset_id, c.role, c.order) for c in legacy.citations] == [(sheet, "reference", 0)]
+    assert legacy.reference_labels == {}

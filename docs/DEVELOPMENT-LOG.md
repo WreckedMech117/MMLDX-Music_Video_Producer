@@ -4,6 +4,330 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-21 — Replace an asset across every shot that cites it: reported first, applied on confirm
+
+**The report**, verbatim: *"I tried to remove HarderFaster image (Lucy) so it just had the multiview but since its tied to shots it wouldnt let me, its fine that it caught that, but a nice Replace With/Cancel option set would be nice so then i could select another image while i am here in assets and auto replace the one i am trying to remove across the affected shots."* And on the shape of it: *"the replacement should also carry reference_labels, a report would be nice and could include 'already in N shots' which would simply remove the reference its trying to replace and leave its already present reference (this is an actual occurence between HarderFaster image and its multiview in our timeline)."*
+
+**The refusal is untouched and stays.** `DELETE /assets/{id}` still refuses a cited asset by name, with the same sentence, and the Director said plainly that they want it. What was missing was the act it implies. The new `POST /assets/{id}/replace-citations` moves citations and **deletes nothing**: the Director deletes afterwards, through the route that already owns deletion and its file rules. That is deliberate — a route that sometimes deleted and sometimes did not, depending on whether a locked shot happened to be in the way, is a surprise; and an asset one locked shot still cites must still meet the refusal rather than half-vanish from a library that references it.
+
+**Report first, apply on confirm, server-enforced.** `snap_timeline_cuts`' shape, which is `populate`'s `confirm_replace` in a smaller key. Without `confirm_apply` the route does not call `store.save` and the response carries no `project` at all, so "nothing was written" is visible on the wire rather than asserted in prose. The report names three buckets and every skipped shot with its reason.
+
+**The collision rule for `reference_labels`: the label that travels is the surviving citation's own.** One sentence, two readings.
+
+* On a **swap** the survivor *is* the replaced asset's citation, re-pointed, so its label moves onto the new id and wins over anything already stored under it — the replacement was not cited by that shot, so such an entry is an orphan from a citation that no longer exists.
+* On an **already-have** merge the survivor is the standing citation of the replacement, so *its* label wins and the removed one goes with its citation. The merge is meant to be purely subtractive; a removal that also renamed the surviving reference would change what an already-authored `h3_prompt` calls that picture in the reference map beneath it.
+* The one place a removed label is carried: a merge onto a survivor that has **no** label at all. Nothing is overwritten and nothing is invented, and the Director's word for the subject ("Lucy") survives the promotion to the multiview instead of the shot falling back to the sheet's internal name — which is the very leak the citation-selection change the same day was fixing.
+
+The replaced asset's key is always removed from the map on a shot the plan rewrites: a label keyed to an asset the shot no longer cites is dead weight. A shot the plan skips is not touched at all, orphaned entries included.
+
+**The differing-roles rule: a merge is all-or-nothing per shot, and anything else is a named refusal.** A merge happens only when *every* citation of the replaced asset has a standing citation of the replacement **in the same role**. Any other shot citing both is skipped by name. The case that decides it is a shot citing the source as a plain `reference` and the sheet as its `first` keyframe: dropping the reference (the merge rule) leaves a shot with a keyframe and no plain reference, which silently changes what it renders; re-pointing it (the swap rule) leaves one asset cited twice in two roles, spending two of H3's nine picture slots on one subject — the same waste `prefer_identity_sheets` refuses to create, and not something the report's counts would show. Neither answer is knowable, so the shot is named and left exactly as it is. This project prefers a named refusal to a plausible guess.
+
+**A rendered shot is replaced, and told about — an earlier rule in this same entry was overturned the same day.** This route first shipped gating on `shot_write_refusal`, so a rendered or approved shot was skipped and could not have its references changed at all. **That rule is superseded**; the Director overruled it: *"So even with takes we do want the asset for the shot replaceable, that way a re-render would use the updated asset without losing previous takes. This helps facilitate experimentation."* The reasoning is the general rule for citations and belongs in one place: **replacing a citation does not touch the take.** The file is still on disk, `latest_output` still names it, the takes strip still lists it, `RenderJob.output_files` is unchanged, and a citation describes what a *future* render would use. `shot_write_refusal` is right about prose — an in-place prompt rewrite really does destroy the record — and its `rendered` arm does not transfer to a field that is not the prompt; `timeline.window_move_refusal` already reasons this way for windows. Blocking the swap protected nothing and forced a choice between keeping an old take and trying a better reference, which is the experimentation loop this application exists for.
+
+**Report, do not block.** `REPLACE_ASSET_RENDERED_NOTE` and `REPLACE_ASSET_APPROVED_NOTE` name those shots before the confirm, with counts (`rendered`, `approved`) that are a *subset of the changes* and never of the skips, plus a per-row `provenance` marker so a Director scanning fourteen lines can see which one has a take behind it. The consequence is real and unrecoverable, which is why it is reported at all: nothing in this application records which assets produced a take, so afterwards the take and the references beside it simply disagree with no way back. The two notes are deliberately **not** `EXPANSION_RENDERED_NOTICE` — that sentence says a shot was *left unchanged*, and these shots are changed; reusing it would be the drift the verbatim rule exists to prevent, in the other direction.
+
+**Approved shots get the same treatment and their approval is untouched.** No path here writes `approved_output`, `approved_start` or `approved_duration`. AD-13's staleness comparison is between the stored window and the live one, and citations are not the window, so assembly reads exactly what it read before — the finding recorded in the superseded version stands, it just no longer implies a refusal. Approved outranks rendered in the classification so no shot is counted under both headings, and it gets its own line because an approval is the stronger statement and the count should be visible.
+
+**Two protections remain.** `locked` — an explicit hands-off only the Director may clear, reported in `EXPANSION_LOCKED_NOTICE` **verbatim** on the frozen-matrix argument. And **in-flight**, the one genuine correctness block: the job was submitted against the old asset and is executing now, so rewriting the citation underneath it would leave that job's record describing a render that never happened. Read through `shot_render_in_flight`, the single reader of the job records, which also catches a shot whose status was walked backwards by hand. `REPLACE_ASSET_IN_FLIGHT` is a new sentence rather than a reuse, and that is argued in place: the two existing in-flight wordings name a different act ("nothing was re-opened", "its status is not yours to set"), so a citation refusal claiming either would describe something that did not happen. It keeps their staleness escape verbatim.
+
+**Refusals of the whole call**, each in its own code: an unknown asset or an unknown replacement 404s; an asset replacing **itself** is a 422 and not a no-op that would report thirty shots changed and rewrite the manifest to what it already said; an asset **no shot cites** is a 422 saying the delete will now simply go through. The honest-empty check stops at *cited*, not at *writable* — an asset every one of whose citing shots is locked still reports, because those skips are the answer to "why can I still not delete it".
+
+**A replacement of another `kind` is reported, never refused.** The taxonomy is the library's own and the render buckets every non-video, non-audio kind into one anonymous picture series (`citation_slot_kind`), so citing a setting where a character was is a creative change, not a structural error — and refusing it would block the ordinary act of replacing a rough concept `image` with the finished `character` drawn from it. The structural half *is* refused, per shot and by name: a replacement that moves a citation between the picture, video and audio series is counted against `H3_REFERENCE_LIMITS` through `reference_slot_totals` (the numbering's own count, master song included) and skips any shot it would push over. Only an overflow the replacement **introduces** counts — a shot already over a ceiling keeps its citations rather than having an unrelated stale defect turned into a permanent block, which is `assistant_fill`'s already-missing/introduced rule applied to slots.
+
+`asset_ids` is rebuilt, never edited beside the citations: each candidate is built with `Shot.model_validate`, which runs `_reconcile_citations`, `assistant_fill`'s path exactly. `mode_specification_problems` is deliberately **not** re-checked, and the reason is written into the module: a swap changes no role's count and a merge only lowers the count of a role the shot already held twice, so no minimum can go from satisfied to unsatisfied and no maximum from respected to exceeded — a branch for it would be unreachable code asserting a rule it cannot reach.
+
+**What this would do to the Director's live 30 shots** (`project_59f14d19ff10`, `asset_e25234c8ea53` → `asset_ddd5cfd922e0`, computed read-only through the shipped plan; the manifest's SHA-256 was taken before and after and is unchanged):
+
+| | shots |
+| --- | --- |
+| straight swap | **14** |
+| already cite the multiview — old citation removed, standing one untouched | **8** |
+| skipped | **0** |
+| untouched (cite neither) | 8 |
+| *of the 22 rewritten:* carry a take rendered against the old asset | **1** — named, not skipped |
+
+The 14/8/8 the brief measured is confirmed exactly, and under the ruling above **every one of the 22 citing shots is rewritten in one pass**: nothing is skipped, `still_cited` reaches 0 and the asset becomes deletable immediately. One of the 14 swaps — `SHOT 03 (shot_b51ebe410165)` — carries a rendered take and is named in the report's rendered line; no shot there is approved, locked or in flight, so no skip fires at all. Every `reference_labels` map in that project is empty, so no label decision fires either. (The first version of this entry reported 13/8/1 with that shot skipped; that is the rule the Director overturned.)
+
+**The browser half — two ways in, one affordance.** The panel appears in the asset inspector when a delete is refused, beneath the refusal's own sentence. It also appears from a **"Replace in N shot(s) with…"** button drawn beside "Attach to selected shot", the Director's second ask: *"since we already know if the asset is used in any shots we could offer a 'Replace in shots with:' button down by the 'Attach to selected shot' ... which would offer the same replacement function but without resulting in asset deletion."* Same route, same report-then-confirm, and **no DELETE is ever sent on that path** — asserted by reading the harness's recorded request methods. The button is drawn only for a cited asset, because the browser already knows the count and a button that could only answer "no shot cites this" is a control whose only outcome is a 422. With no refusal to read, the panel carries its own explanation instead. The menu never offers the asset being removed. The same button reports and then applies, and a report holding only skips does not become an apply. Every decision is a pure function in `api.js` executed under node; the panel is *run* against the stub DOM and its markup read afterwards — never grepped for in `app.js`, which is the recorded incident.
+
+**A related usability problem, observed and not fixed.** The Director: *"'Attach to selected shot' is hard to use because you cannot see the timeline from the Assets page."* True, and untouched here — redesigning that button is its own story. The new control sidesteps the same trap rather than inheriting it: its label carries the shot **count**, and its report names every affected shot by the label the timeline uses (`SHOT 03 (shot_b51e…)`), so an action taken from a panel with no timeline in view still says exactly which shots it touches, before it touches them. Worth a later story: give "Attach" the same treatment.
+
+**Tests.** 16 backend cases and 7 executed frontend cases: all four population buckets; role and order carried across, including a `first` keyframe swapped in its own role with `asset_ids` proven not to move; the three label outcomes; the differing-roles skip asserted against the server's own sentence; a lock and an in-flight render as the only two skips (the in-flight shot reads `draft` with no `prompt_id` and is caught by its *job record*); a rendered shot and an approved one both replaced, with the take, the status, the job record and the whole approval snapshot asserted unchanged and the two notes asserted verbatim; the control with nothing rendered anywhere, proving the lines absent rather than empty; self-replacement, unknown replacement, uncited asset; the kind warning and the slot-ceiling skip, plus a shot already over a ceiling proven *not* skipped; a report leaving the manifest byte-identical through a fresh `ProjectStore`; the applied projection asserted on the response body and the written bytes as well as the re-read (a load re-validates and would repair a stale projection); a pre-citations manifest loading and replacing unchanged; the delete refusal firing before, after, and stopping once nothing cites the asset; and both browser entry points driven end to end. Suite 1226 → 1274 across all three agents working this tree, ruff clean, `node --check` clean on both bundles. 39 mutations, 39 killed — each one snapshotted, anchor-count-asserted, timed out, restored and SHA-256 verified, with the on-disk bytes re-checked before every restore because two other agents were writing `app.py`, `api.js` and `app.js` at the time. One anchor matched twice and was reported as skipped rather than passing silently, which is the whole reason the count is asserted; it was narrowed and killed.
+
+**Not verified.** **No browser was driven** — the frontend claims rest on the executed stub-DOM harness, which reads real rendered markup but is not Edge. Nothing was rendered, armed, queued or approved on any path, and `comfy.prompts` is asserted empty on both the report and the apply. The live project was read only and never written. Whether the multiview actually renders better than the source is still unmeasured and is not a claim this change makes.
+
+## 2026-08-21 — How a shot picks its references: the sheet beat its source, the location was barely cited, and the label leaked into the prose
+
+**The report.** From the Director, on `project_59f14d19ff10` ("Harder Faster — Third Video"): *"the image 'HarderFaster' was used instead of the multiview generated from it, the Dusk Warehouse Bed setting was hardly referenced."*
+
+**The measurement.** Citations were written by `populate`'s `prompt_citations`, which was pure name matching: every asset whose name is ≥4 characters and appears case-insensitively in a shot's prompt got a `reference` citation. Counted read-only over that project's 30 Gemma-populated shots:
+
+| Asset | Cited |
+| --- | --- |
+| `HarderFaster` (uploaded source frame) | **22** |
+| `HarderFaster · multiview` (Krea QuadView child, `source="krea-multiview"`) | **8** |
+| `Dusk Warehouse Bed` (setting) | **5** |
+| the five later Stage Manager assets | 0 (created after populate ran — expected) |
+
+Three linked defects, and the third explains the second-worst of the first two. The sheet won its 8 **only because the model typed its internal display name into creative prose** — `"Close up on eyes of HarderFaster · multiview with flickering light reflections"` is a real stored prompt. Citation correctness depended on the model degrading its own writing. And because `"HarderFaster · multiview"` *contains* `"HarderFaster"`, each of those 8 shots cited **both** assets: two of H3's nine picture slots spent on one face.
+
+**Sheet or source — the decision, and it is not free.** The rule is now *instead of*, never *in addition to* (`models.prefer_identity_sheets`). Two reasons: the promotion exists precisely to be the identity reference, and citing both spends two of nine picture slots arguing one subject rather than pairing a subject with its context. Substitution also **collapses** — a shot naming both ends with one citation — so no caller can exceed a slot budget by applying it that would not have exceeded it already.
+
+**The risk this does not remove, stated rather than settled.** `docs/ROADMAP.md` records a live artefact where a reference sheet's four-panel layout bled into a shot's *composition* — "the face plate is visible on the left, the vertical panel bands persist" — at 4 steps with `ref_image_size="match"`, and that is **unresolved**. Preferring the sheet therefore trades a known-weaker identity reference for the stronger one *with a known composition risk*, and the answer to that risk is a render parameter, not a citation policy. Nothing here has been rendered. **No claim that the sheet renders better is supported by evidence from this change.**
+
+Only the `reference` role is re-pointed. `first`/`last`/`middle` name a concrete frame the render pins the picture to, and a four-panel contact sheet as a shot's first frame is the opposite of what those roles ask for. A sheet with no `path` (render pending or never landed) is not substituted — that would trade a real reference for nothing. Chains resolve to the newest sheet; a `parent_id` cycle stops at the first repeat.
+
+**The location.** New `Project.default_setting_id`: the Director declares which `setting` asset the video is in, through one route (`PUT /projects/{id}/default-setting`) and nothing else. It is named in the populate instruction *and* given as a citation to every new shot that named no setting of its own, bounded by the 9-picture ceiling. Deliberately **not** inferred from "the library holds exactly one setting" — the live project holds two, and picking one for the Director is the invisible attachment this is not allowed to make. Unset is a genuine no-op. It is server-owned on the generic full-project `PUT` for the fourth-time-lucky reason that route already re-adopts `consistency_prompt`, the message thread, the document locks and the recovery slots: a defaulted `str` that an older client omits arrives as `""`, and one ordinary save would clear the choice. Deleting the asset clears the pointer. **It never touches an existing plan** — declaring a location is a statement about the project, read by the next populate; a sweep over shots the Director already has is the silent bulk edit `confirm_replace` exists to forbid.
+
+**The naming leak.** Fixed on the input side rather than the matcher side, because the leak *was* the input: once citing the source means citing the sheet, the sheet has no separate identity to offer, so its name is withheld from the instruction's asset roster **and** from the project-context dump the same call is handed (`models.citable_assets`; the context trim is populate's own, not a `DIRECTOR_CONTEXT_EXCLUDE` change — that mapping withholds *fields* from every caller and this withholds *rows* from one). A name the model is never shown cannot be echoed. The name scan reads the same trimmed library, which is also what stops a prompt naming a *pending* sheet from citing a manifest row with no file behind it. The instruction's asset sentence was reworded to bound it ("by these exact names and no others … never write a name that is not on that list"); **the count-enforcement wording was not touched** and is pinned beside it. A sheet whose source has been deleted stays listed under its own name — it is then the only asset for that subject.
+
+**Both writers, not one.** The rule lives in `models.py` and is applied by `populate` and by the assistant's `fill_shots`, which is the other place a model's answer becomes citations and had the identical defect. The assistant path **says so out loud** (`ASSISTANT_IDENTITY_SHEET_NOTICE`), because there the model named an id explicitly and a silent re-point would be a change the Director could only find by diffing the manifest. It is recorded at the commit point, so a fill whose prompt was refused reports nothing.
+
+**What the new rules would produce for those same 30 shots** (computed read-only, nothing written):
+
+| | today | rule A only | rules A + B (`Dusk Warehouse Bed` declared) |
+| --- | --- | --- | --- |
+| `HarderFaster` (source) | 22 | 0 | 0 |
+| `HarderFaster · multiview` | 8 | **22** | **22** |
+| `Dusk Warehouse Bed` | 5 | 5 | **30** |
+| shots with no reference at all | 4 | 4 | **0** |
+| most pictures on any one shot | 3 | 2 | 2 |
+
+That replay runs the new pipeline over the *stored* prompts, so it is an approximation in the Director's favour and against it at once: a real re-populate would produce different prose (the model can no longer read the sheet's label), and 8 of those 22 currently spend a second slot the new rule reclaims.
+
+**Unmeasured, and it matters.** No render has tested any of this — not the sheet-vs-source identity claim, not the panel-bleed risk, not whether a location reference on all 30 shots helps or flattens the video. Whether the reworded instruction actually stops the label leak is a live-model question this change cannot answer; what is pinned is that the label is no longer reachable from either surface the model reads. The location has **no UI**: the field and its route exist and the Director must set it through the API, which is the same shape as the VRAM story's unbuilt half and should be recorded as such rather than implied to be finished.
+
+**Tests.** 16 cases: the substitution and its control (a character with no sheet); a pathless sheet, a sheet of a sheet, and a `parent_id` cycle; the location reaching every shot that named none, not doubling one that named the same location, and **not sent to a shot that named a different setting** — that last one exists because the mutation run found it missing: a shot naming the declared location is protected twice over (by the guard and then by the duplicate collapse), so removing the guard was invisible end to end, and the case it is actually for is the live project's *second* setting; the two rules composing in order, so a *promoted setting* is cited as its own sheet; three ways a location pointer stops meaning anything (unset, deleted, wrong kind, no file) as no-ops rather than crashes or fabricated citations; the 9-picture ceiling at and below the limit, with an audio citation proven not to consume it; the byte-identity pin (no promotions, no location ⇒ citations identical to the old whole-library scan, asserted against the *rule* rather than a snapshot); the roster and context trim with the count enforcement pinned undisturbed beside them; the route's four refusals and its three sibling write paths; the assistant substitution, its notice, and its silence on a refused fill. Suite 1226 → 1242 for this change alone, ruff clean, `node --check` clean on both bundles. **27/27 mutations killed**, one of them only by the test the first run's single survivor forced. Mutation-checked against a snapshot copy of the tree rather than in place, because a second agent was writing `app.py`, `models.py` and `tests/test_api.py` in the same working tree at the time — and run through the venv's interpreter directly rather than `uv run`, because a nested `uv run` blocks on the project-environment lock while that agent runs its own: a 7 s baseline took over fifteen minutes and never finished.
+
+## 2026-08-21 — The timeline could not be scrolled sideways, and the slider was the volume: both found in a real browser
+
+**A real browser was driven, before and after.** Headless Edge through `tests/e2e_support.py`'s
+`ManagedServer` (isolated port, isolated temporary data root, the run proves the listener is its
+own descendant). The Director's working project `project_59f14d19ff10` was **read only, never
+opened by any script here** — its shape (30 shots, 154.6 s, 7 sections) was rebuilt through shipped
+routes in the isolated root. Nothing was queued, no GPU time spent, `/prompt` never reached.
+
+**The Director's report**, verbatim: *"I cant scroll left or right and i see what i think is a zoom
+slider that isnt functional."* Both halves were true. Neither was what it looked like.
+
+**Defect 1: the horizontal scrollbar was laid out below the bottom of the window.** Everything the
+report suggests — a missing `overflow-x`, a content box sized to its container, a wheel handler
+eating the gesture — was *absent*. `.timeline-scroll` was already `overflow: auto`, `renderTimeline`
+already sized `#timeline-canvas` to `duration * pixelsPerSecond + 90`, and the browser measured
+`scrollWidth 2564` against `clientWidth 1125`. Setting `scrollLeft` from script scrolled correctly,
+and all four tracks moved with it. The box simply **ended 61 px past `window.innerHeight`**, with
+`.timeline-panel` and `.workspace` both `overflow: hidden`, so nothing could scroll down to the bar
+and the Director had no way to grab it. Measured at three window heights (961/761/641 px of
+viewport): the scroll box overflowed by 61, 61 and 79 px, **and the Assembly bar by 150 px** — the
+whole finishing control was off screen too, which nobody had reported.
+
+The cause was arithmetic in the stylesheet. `.timeline-layout` took `height: calc(100% - 65px)`, a
+hardcoded allowance for the heading that counted neither the snap bar above nor the assembly bar
+below, and `min-height: 500px` refused to give the shortfall back. Fixed by making
+`.timeline-panel.active` a grid of `auto auto minmax(0, 1fr) auto` so the timeline row takes what is
+actually left over: no magic number, and nothing can be laid out past the bottom edge again. Below
+860 px the media query puts the panel back to `display: block`, where the workspace scrolls and a
+`1fr` row would squeeze the tracks to nothing instead.
+
+**The Monitor row had to give ground, and that is a real trade.** `.timeline-main` gave the Monitor
+`minmax(200px, 46vh)` and the tracks the leftover; on a 961 px viewport that is 442 px of picture
+and 127 px for four tracks that occupy 313 px. The two rows now share the height in proportion
+(`minmax(120px, 1fr) 42px minmax(140px, 1.25fr)`), tracks weighted slightly heavier because they are
+what is being edited. At 1600x1100 that is a 260 px Monitor and 309 px of tracks where it was 442
+and 127. The ⛶ Monitor fullscreen button is unchanged and is the answer when the picture is the
+thing to look at. The 46 vh was itself the answer to an earlier report of this same overflow
+("a fullscreened browser cut the bottom half of the video off behind the timeline") and it overshot.
+
+**Defect 2: there is no zoom slider, and there never was.** The only `<input type="range">` in the
+Timeline panel was **`#master-volume`**, in the transport row beside the two line mutes — a volume
+control, correctly wired since it shipped, and "not functional" only in the sense that it is not a
+zoom. So a real one was added beside the existing `−`/`+` buttons rather than the volume one
+repurposed, and a contract test now asserts *both* exist so a later edit cannot resolve the
+confusion by deleting the wrong one. The slider is logarithmic over 6–64 px/s (`zoomFromSlider`), so
+one notch is the same proportional change at either end; a linear mapping spends four fifths of its
+travel above 100% zoom. `renderTimeline` writes the thumb back from `state.pixelsPerSecond`, so the
+slider, the buttons and ctrl+wheel cannot be left disagreeing.
+
+**The buttons did work** — the browser measured 100% → 195% across three presses before any change.
+What they did wrong was throw the viewport somewhere nobody asked for.
+
+**Zoom now holds an anchor, and never zero.** `zoomViewport` (pure, executed by the contract) holds
+the **playhead when the playhead is on screen, and the centre of the visible band when it is not**.
+The playhead wins while visible because it is the timeline's subject — the Monitor plays the shot
+under it, so it is the frame being judged. Scrolled away to a later section it is not on screen at
+all, and holding an off-screen second still would move everything the Director *is* reading, so
+there the middle of what is visible is the honest invariant. Measured in the browser: the centre
+second held to 0.04 s across a zoom at a 900 px offset, and an on-screen playhead held to **0.08 px**
+of screen position. Ctrl+wheel keeps its own third anchor, the pointer, because for that gesture the
+pointer is by definition the thing of interest.
+
+**The plain wheel now scrolls along the song**, the convention in every editing application the
+Director already uses, with Shift+wheel as the way back to vertical and Ctrl+wheel unchanged.
+**The first rule written here was measured wrong by the browser** and is worth recording: it was
+"hijack `deltaY` only when there is nothing to scroll vertically", which is conservative and
+defensible on paper — and at 1600x1100 the four tracks overflow their box by *four pixels*, which
+was enough to hand the wheel straight back and leave the gesture as dead as the Director found it.
+
+**The coordinate maths needed no conversion changes, which was established rather than assumed.**
+Every pixel↔second site was enumerated: the two drag handlers (`bindClip`, `bindSection`) work on
+`clientX` *deltas*, which carry no absolute origin and so cannot be wrong about scroll; the three
+absolute conversions (the canvas seek, the section double-click, ctrl+wheel's pointer anchor) read
+`#timeline-canvas`'s `getBoundingClientRect()`, whose `left` already moves with the scroll offset;
+and the render side writes `left`/`width` in canvas coordinates, which the browser offsets for free.
+The literal `90` those sites offset by is now `TIMELINE_LABEL_WIDTH` in api.js, asserted against
+`.track`'s own `grid-template-columns: 90px 1fr` by a contract test. That audit is **backed by a
+browser assertion rather than by reading**: a clip is dragged and an edge resized with the timeline
+scrolled 540 px along, and the *stored* window is read back from the server — 61.858 s → 65.708 s
+against 65.676 s asked for, and 5.155 s → 8.042 s against 8.019 s. Mutating `bindClip` to add
+`scrollLeft` into its delta fails that test, which is the point of it.
+
+**Session-only, and nothing new is persisted.** Zoom already rode `localStorage`'s `mvp-session`
+beside the panel and the selection (`applyZoom` now writes it, which the `+`/`−` handlers never did);
+the scroll offset is stored nowhere at all — it is where you happen to be looking this minute, and a
+reload restoring it would fight the playhead-following the transport already does during playback.
+**No manifest field was added or read**, so old manifests load byte-identically.
+
+**Tests.** `tests/e2e_timeline_scroll.py` — a new self-hosting browser gate in the existing idiom:
+the scrollbar band and the Assembly bar inside the window at three heights, a real wheel gesture
+moving the viewport, all four tracks moving by the same offset and a SECTIONS box holding its
+alignment to the SHOTS clip beneath it to within 1.5 px, the slider and buttons both zooming and
+agreeing, both anchor cases, and the drag/resize-at-offset guard. Six executed contract cases in
+`tests/test_frontend_contract.py` cover the slider's scale, its markup bounds against the helper, the
+anchor rule, the wheel rule and the slider's wiring through a real `renderTimeline`.
+
+**Mutation check: 19 mutations, 19 killed, no survivors.** Six CSS layout mutations (the panel
+grid removed, the `calc(100% - 65px)` allowance restored, the Monitor's 46 vh restored, the bar
+stopping wrapping, the 620 px column floor restored, and the bare-button rule unscoped so Delete
+paints like its neighbours) are caught **only** by the browser gate, which is the whole argument for
+it. One mutation adds `scrollLeft` into the drag delta and is caught by the stored-window assertion.
+Four markup mutations cover the move and the labels: an edit tool reappearing in the heading, the
+volume slider losing its visible label, an icon button losing its accessible name, and Delete losing
+its destructive class. Restores were surgical reverse-replacements
+rather than whole-file writes, because **another agent was editing api.js, app.js, styles.css and
+test_frontend_contract.py in this tree at the same time** and a whole-file restore would have
+discarded their work; each restore asserted the anchor's match count first, verified SHA-256
+afterwards, purged `__pycache__`, and every run was time-boxed with a timeout treated as killed.
+
+### The Director's two follow-ups, the same day
+
+**"The tools are up by the header instead of down just below the [view] window in that bar."** The
+edit tools and the zoom moved out of `.workspace-heading` and into `.timeline-transport`, the bar
+directly under the Monitor, next to the thing they manipulate. That puts fifteen controls and two
+sliders in one row, so the bar now **wraps** (`flex-wrap: wrap`, and `.timeline-main`'s middle track
+is `auto` instead of a fixed 42 px). Wrapping is the whole responsive strategy and it is deliberate:
+this application has a recorded defect where three controls vanished behind media queries, and every
+control on this row is one the Director reaches for mid-edit, so **nothing here may be hidden at any
+width**. `.timeline-tools` is `display: contents`, so the row wraps between individual controls
+rather than a rigid 600 px group overflowing the bar. Measured bar heights: **42 px at 1600 (one
+row), 72 at 1280, 94 at 1024, 107 at 900, 76 at 820** — and all fifteen controls hit-tested at every
+one of those widths: painted, inside the viewport, and a click at the centre landing on the control
+and not on something over it.
+
+**A pre-existing overflow was found by that width sweep.** `.timeline-layout`'s first column had a
+`620px` floor; 620 + 280 + 12 is 912, against the 750 px a 900 px-wide window leaves the panel. So
+between the 860 px breakpoint that stacks the layout and roughly 1006 px, the panel overflowed
+horizontally and `overflow: hidden` clipped what ran past — measured with the **song mute clipped out
+of reach at 900 px**. The floor is 320 px now, which clears the breakpoint with room, and it is no
+longer load-bearing: the tracks are a scrolling viewport and the bar wraps, so a narrow timeline is a
+small view of the song rather than a broken one. This was reachable before today's work; the move
+made it matter.
+
+**"Use button icons with tooltips when needed."** Split, Duplicate and Delete are icon buttons now
+(`✂`, `⧉`, `🗑`), which is what got the bar back to one row at 1600. Three rules held to. Every glyph
+carries an **`aria-label` saying exactly what its `title` says** — a tooltip is not an accessible
+name, and this stylesheet's own rule that state is never carried by colour alone applies to a glyph
+too; a contract test asserts the two strings are identical rather than merely both present. **Delete
+keeps `danger-button`**, so the destructive one still does not look like its neighbours — asserted in
+the browser by comparing painted colours (`rgb(255,107,97)` against `rgb(146,154,149)`), not by
+reading the class list. And **＋ Shot keeps its word**, because a bare `＋` is exactly what the
+zoom-in button in the same bar already says: "genuinely unambiguous" is the test for dropping a word,
+and that one is not.
+
+**Both sliders carry a visible label — `ZOOM` and `VOL`.** Two unlabelled sliders in one row is
+precisely the confusion that produced the original report. Each is a real `<label for>`, so clicking
+the word focuses the control and it is announced; each control also carries an `aria-label`
+(`Timeline zoom`, `Master song volume`) containing the abbreviation it paints, pinned exactly by a
+contract test. **Words rather than the suggested glyphs**, for a stated reason: there is no
+text-presentation glyph for a magnifier or a speaker — both would land as colour emoji in a bar that
+is monospace text-presentation throughout — and `ZOOM`/`VOL` at 9 px cost less width than an emoji
+would. `#master-volume`'s **behaviour is untouched**: still session-only, like the two line mutes.
+Its tooltip was deliberately reworded to say what it does and that it is session-only; the exact new
+sentence is pinned rather than loosened to a substring, because an exact pin is what caught the
+change in the first place.
+
+### "Clicking on either does nothing": the takes strip
+
+The Director's third report, same day: *"when looking at that Shot 03 that we have 2 takes for, i
+can see the takes in the shot info window but clicking on either does nothing instead of hot
+swapping between available shots."*
+
+**Two candidate causes, and the browser separated them before anything was changed.** The row model
+was already right — `takesStripRows` returned `Use`/`disabled: false` for the non-current take — so
+the fault was in the interaction layer, and it was either (a) *affordance*, only the small chip at
+the row's right end being live, or (b) a *stale handler*, this application's recorded defect where
+the inspector is rebuilt by a reply nobody awaited and elements go stale mid-interaction. Measured
+on a shot with two real ffmpeg-synthesized takes in an isolated ComfyUI root:
+
+- clicking the **row** left `latest_output` byte-identical, and
+- clicking the **chip** switched it correctly, first try.
+
+**So it was the affordance, and the handler was never stale.** That mattered to establish rather
+than assume: cause (b) would have implicated every other control in that panel and called for a
+delegation rewrite, and none of that was warranted. `renderShotInspector` binds immediately after
+its own `innerHTML` write and rebinds on every rebuild, which is correct; **no change was made
+there**, and the browser test now proves it by tearing the panel down (select another shot, come
+back, let both readiness replies land) and clicking the row afterwards.
+
+**The whole row is the control now.** A real `<button type="button">` spanning the row, so focus,
+Enter and Space come from the platform rather than from a `role`/`tabindex`/keydown trio this file
+would have to keep correct, and `:focus-visible` in the base stylesheet gives it a ring for free.
+The current and pending rows are the same button `disabled` — dimmed, unfocusable, no pointer
+cursor — which is the difference between *deliberately closed* and *silently inert*, and inert is
+what was being reported. Every row keeps the `.use-take` class so `row.disabled` stays the single
+place deciding which takes are selectable. Verified end to end in the browser: row click swaps and
+the **Monitor follows** (its video source names the new take), Enter on the focused row swaps back,
+the disabled row takes neither focus nor a click, and the swap still works after a full rebuild.
+
+**Each row now says which render it came from.** `Take 1 · shot_b51ebe410165-h3-reference_00001-audio.mp4`
+truncates to an ellipsis *exactly where its serial number is*, so two takes of one shot rendered as
+the same line printed twice and there was nothing to choose between. The job record already held
+what separates them: `takesStripRows` carries the **seed** and the **landing time** (`updated_at`,
+not `created_at` — when the file appeared, not when the render was queued) as raw values, and the
+panel formats the time, because a locale string is a rendering decision. A record predating those
+fields draws no line rather than an empty one or an `Invalid Date`; a seed of **0** reads as a seed,
+because 0 is one a render can genuinely have used. The full path stays in the row's tooltip. That
+was the small version of "a thumbnail or the render's settings" — **a thumbnail was not built**, and
+is logged below as the follow-up.
+
+**Found while testing this and not fixed:** the **Clips library draws each take as a `<video>`
+pointed straight at ComfyUI's `/view` endpoint** rather than through this application's own take
+route, so every card 404s whenever ComfyUI is down — which is the documented state for browser QA.
+`tests/e2e_take_swap.py` declares those entries to the console gate by name rather than filtering
+them, so the gate stays a gate. Different surface from the one under test; not touched.
+
+**Found and not fixed.** A clip dragged so that it overlaps its later neighbour has its **right
+resize handle covered** by that neighbour, which paints on top — overlaps became legal deliberately
+("overlaps assemble as layers, later-on-top", 2026-08-20) and the handle was not reconsidered then.
+Reachable today, unrelated to scrolling, and the browser test works around it by resizing a shot that
+is not the one it dragged rather than papering over it. Separately, `tests/e2e_shot_controls.py:364`
+asserts a `render-again` tooltip containing "no GPU time is spent"; `RENDER_AGAIN_HELP` has not said
+that at any point in this branch's history, including at `7218c06`, so that script fails at baseline
+and is a stale assertion rather than a regression from this work. Left for whoever owns that script.
+And **a take thumbnail is not built** — the strip distinguishes takes by seed and time, which is the
+cheap half; a poster frame per row would make the strip usable for judging rather than only for
+identifying, and that is a new surface (frame extraction, caching) rather than an edit to this one.
+
+**Tests, for both follow-ups.** `tests/e2e_take_swap.py` is a new self-hosting browser gate on port
+8770: the strip's shape, the row click, the Monitor following, the keyboard, the closed current row,
+the swap surviving a rebuild, and the two provenance lines actually differing. Three executed
+contract cases cover the row-as-button markup, the seed/time model and the open/closed styling.
+
+**Mutation total across the whole task: 26 mutations, 26 killed, no survivors.** The seven added for
+this half include the row reverting to a span-plus-chip, the current row losing its `disabled`, the
+swap not being adopted into `state.project`, `created_at` replacing `updated_at`, a seed of 0
+collapsing to unknown, and the disabled row keeping a pointer cursor. Four of the seven are
+catchable only in a browser.
+
 ## 2026-08-21 — First H3 renders against today's work: three claims tested, two held, one not shown
 
 The day's work was entirely offline- or LM-Studio-verified. Two real H3 renders on

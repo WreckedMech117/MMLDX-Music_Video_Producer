@@ -2296,6 +2296,135 @@ export function consistencyAnchorPlan(asset, draft) {
 }
 
 // -------------------------------------------------------------------------------------------
+// Replace With / Cancel: the way through the delete refusal. The Director's own ask
+// (2026-08-20) -- "a nice Replace With/Cancel option set would be nice so then i could select
+// another image while i am here in assets and auto replace the one i am trying to remove across
+// the affected shots". Every decision below is pure and executed under node; app.js owns the
+// markup and the two clicks, and the *rules* are the server's.
+// -------------------------------------------------------------------------------------------
+
+export const REPLACE_WITH_HEADING = "Replace with";
+export const REPLACE_WITH_PLACEHOLDER = "Choose an asset…";
+export const REPLACE_WITH_LABEL = "Report the replacement";
+export const REPLACE_WITH_RUNNING = "Working…";
+export const REPLACE_WITH_CANCEL = "Cancel";
+export const REPLACE_WITH_UNCHOSEN = "Pick the asset that takes over.";
+// The panel's own explanation, shown when it was opened from the Assets panel rather than from a
+// refused delete -- there is no refusal sentence to read in that case, and a panel that explained
+// nothing would be a control offering to rewrite the plan for reasons of its own.
+export const REPLACE_WITH_HELP =
+  "Every shot citing this asset is re-pointed at the one you pick, keeping each citation's role " +
+  "and position. Nothing is deleted and nothing is rendered — you see the whole list before " +
+  "anything is written.";
+export const REPLACE_WITH_NOTHING_TO_DO =
+  "Nothing can be rewritten — every shot citing this asset is listed below with its reason.";
+export const REPLACE_WITH_SWAPPED_HEADING = "Would be replaced";
+export const REPLACE_WITH_MERGED_HEADING = "Already cite the replacement";
+export const REPLACE_WITH_SKIPPED_HEADING = "Would be left alone";
+
+// The library as this menu may offer it: every asset except the one being removed.
+//
+// The exclusion is not cosmetic. The route refuses an asset replacing itself by name, so an
+// option for it is a control whose only outcome is a 422 -- and the count it would otherwise
+// report ("30 shots changed") is exactly the false reassurance the refusal exists to prevent.
+export function assetReplacementOptions(project, assetId) {
+  return (project?.assets || []).filter((asset) => asset && asset.id !== assetId);
+}
+
+// Whether any shot cites this asset, which is what the delete refusal is about. Read from the
+// project the browser already holds rather than parsed out of the refusal sentence: the sentence
+// is prose meant for a person and matching on it would make the affordance appear or vanish with
+// a wording change.
+export function assetIsCited(project, assetId) {
+  return citingShotCount(project, assetId) > 0;
+}
+
+export function citingShotCount(project, assetId) {
+  return (project?.shots || []).filter((shot) =>
+    (shot?.citations || []).some((citation) => citation?.asset_id === assetId)
+  ).length;
+}
+
+// The Assets panel's own way in, beside "Attach to selected shot". The Director's ask
+// (2026-08-20): "since we are already building the structure, when in the Assets page with an
+// asset selected - since we already know if the asset is used in any shots we could offer a
+// 'Replace in shots with:' button down by the 'Attach to selected shot' ... which would offer the
+// same replacement function but without resulting in asset deletion."
+//
+// Drawn only when the asset is actually cited, because the browser already knows, and a button
+// that could only ever answer "no shot cites this" is a control whose only outcome is the route's
+// 422. The count is in the label for the reason the "Attach to selected shot" button next to it
+// has a usability problem the Director reported: from the Assets panel the timeline is not
+// visible, so a control that acts on shots has to say how many and — through the report — which.
+export function replaceInShotsControl(project, assetId) {
+  const count = citingShotCount(project, assetId);
+  return {
+    shown: count > 0,
+    count,
+    label: `Replace in ${count} shot(s) with…`,
+  };
+}
+
+// The one decision behind the button: is it runnable, is this the report stage or the apply
+// stage, what does it say. `snapCutsControl`'s shape, and for its reason -- the two-stage
+// confirm has to be unskippable in the interface as well as on the wire, and the *same* button
+// becoming the apply is what makes a Director read the report before confirming.
+export function assetReplacementControl(replacementId, report) {
+  if (!replacementId) {
+    return { disabled: true, apply: false, label: REPLACE_WITH_LABEL, reason: REPLACE_WITH_UNCHOSEN };
+  }
+  if (report) {
+    const writes = (report.swapped || 0) + (report.merged || 0);
+    if (!writes) {
+      return {
+        disabled: true, apply: false, label: REPLACE_WITH_LABEL,
+        reason: REPLACE_WITH_NOTHING_TO_DO,
+      };
+    }
+    return {
+      disabled: false,
+      apply: true,
+      label: `Replace in ${writes} shot(s)`,
+      reason: report.message || "",
+    };
+  }
+  return { disabled: false, apply: false, label: REPLACE_WITH_LABEL, reason: "" };
+}
+
+// The report as lines to draw: every swap, every "already have", every skip **with the server's
+// own sentence**. `snapCutsReportLines`' rule verbatim -- nothing summarised and nothing
+// rationed, because a skipped shot whose reason was dropped is exactly the one that explains why
+// the delete is still refused.
+export function assetReplacementReportLines(report) {
+  if (!report) return [];
+  const lines = [];
+  const roles = (row) => (row.roles || []).join(", ") || "reference";
+  // The take-provenance sentences, first and in the server's own words. They are notes and not
+  // refusals -- those shots ARE being changed, on the Director's ruling that a citation swap does
+  // not touch a take -- so they are drawn above the lists rather than among the skips, where they
+  // would read as shots nothing happened to.
+  for (const note of report.notes || []) lines.push({ kind: "note", text: note });
+  // The per-shot half of the same fact. The grouped note carries the count and the consequence;
+  // this marks the individual row, so a Director scanning the list can see which of fourteen
+  // shots is the one with a take behind it.
+  const take = (row) => (row.provenance ? ` · has a take rendered against ${report.replaced}` : "");
+  for (const row of report.swaps || []) {
+    const carried = row.carried_label ? ` · label "${row.carried_label}" carried` : "";
+    lines.push({ kind: "swap", text: `${row.label}: ${roles(row)}${carried}${take(row)}` });
+  }
+  for (const row of report.merges || []) {
+    const carried = row.carried_label ? ` · label "${row.carried_label}" carried` : "";
+    lines.push({
+      kind: "merge",
+      text: `${row.label}: already cites ${report.replacement}, so the ${roles(row)} ` +
+        `citation of ${report.replaced} is removed${carried}${take(row)}`,
+    });
+  }
+  for (const row of report.skips || []) lines.push({ kind: "skip", text: row.reason });
+  return lines;
+}
+
+// -------------------------------------------------------------------------------------------
 // Render polling -- the client half of AD-1's transport decision. Every decision here is pure
 // and executed under node by the contract tests; app.js only owns the timer and the repaints.
 // -------------------------------------------------------------------------------------------
@@ -2641,6 +2770,14 @@ export const TAKE_PENDING_ROW = "not landed yet";
 export function takesStripRows(project, shot) {
   const files = [];
   const seen = new Set();
+  // The job each take came out of, kept beside the filename. Two takes of one shot differ only
+  // in a serial buried in a path the row has to truncate -- `…-h3-reference_00001-audio.mp4`
+  // against `…_00002-audio.mp4` -- so a Director choosing between them was choosing between two
+  // identical-looking lines (the Director's report, 2026-08-21). The job record already holds
+  // the two facts that actually tell them apart: the seed it was rendered at, and when it
+  // landed. Both are carried here as raw values; the panel formats the time, because a locale
+  // string is a rendering decision and this function is the one the contract executes.
+  const provenance = new Map();
   for (const job of project?.jobs || []) {
     if (job.kind !== "h3" || job.target_id !== shot?.id) continue;
     for (const file of job.output_files || []) {
@@ -2648,18 +2785,27 @@ export function takesStripRows(project, shot) {
       if (seen.has(takeKey(file))) continue;
       seen.add(takeKey(file));
       files.push(file);
+      provenance.set(file, job);
     }
   }
   const state = shotRenderState(shot);
   const rows = files.map((file, index) => {
     const current = Boolean(shot?.latest_output) && takeKey(shot.latest_output) === takeKey(file);
     const displaced = current && state.inFlight;
+    const job = provenance.get(file);
     return {
       file,
       pending: false,
       current,
       displaced,
       text: `Take ${index + 1} · ${file.split("/").pop()}`,
+      // Null rather than 0 when the record does not carry one: 0 is a seed a render can
+      // genuinely have used, so it may not double as "unknown".
+      seed: Number.isFinite(job?.seed) ? job.seed : null,
+      // When the take landed, not when it was queued -- `updated_at` moves when the job
+      // settles. "" when the record predates the field, which draws nothing rather than an
+      // Invalid Date.
+      at: job?.updated_at || job?.created_at || "",
       chip: current ? (displaced ? TAKE_PREVIOUS_CHIP : TAKE_CURRENT_CHIP) : TAKE_USE_CHIP,
       // Only the row the shot already points at is unusable; a displaced row is still that
       // row, and pointing the shot back at a take it is already pointing at does nothing.
@@ -2675,6 +2821,8 @@ export function takesStripRows(project, shot) {
       current: false,
       displaced: false,
       text: `Take ${files.length + 1} · ${TAKE_PENDING_ROW}`,
+      seed: null,
+      at: "",
       chip: TAKE_PENDING_CHIP,
       disabled: true,
       className: "pending",
@@ -2817,6 +2965,153 @@ export function renderSettledToast(project, job) {
   return `Render complete: ${name} is ready`;
 }
 
+// -----------------------------------------------------------------------------------------
+// The timeline's viewport: the zoom scale, and the scroll offset that makes a real plan
+// reachable.
+//
+// The Director's report, 2026-08-20: "I cant scroll left or right and i see what i think is a
+// zoom slider that isnt functional." Both halves were true and neither was what it looked
+// like. The slider is `#master-volume`, a *working* volume control sitting in the transport
+// row, taken for a zoom because the timeline had no zoom slider at all -- so one is added
+// rather than the volume one repurposed. And the tracks really were in a scrollable box; its
+// horizontal scrollbar was laid out 61px below the bottom of the window, where the panel's
+// `overflow: hidden` put it permanently out of reach. `styles.css` carries that half.
+//
+// Everything below is arithmetic on purpose: pixels and seconds, no DOM. That is what lets the
+// anchor rule be *executed* by the offline contract rather than only read -- and a scroll that
+// does not scroll is exactly the class of defect a stub DOM cannot see.
+
+// The scale bounds every zoom control clamps to. One spelling, because three controls
+// disagreeing about how far in you may go is a defect that only shows on the one you did not
+// try.
+export const TIMELINE_ZOOM_MIN = 6;
+export const TIMELINE_ZOOM_MAX = 64;
+// What the label calls 100%. The scale the timeline opens at and the divisor the percentage is
+// read against are the same number by construction.
+export const TIMELINE_ZOOM_BASE = 16;
+// One press of the +/- buttons.
+export const TIMELINE_ZOOM_STEP = 1.25;
+// The label gutter every track carries, and therefore the offset in every pixel<->second
+// conversion on this timeline. `.track { grid-template-columns: 90px 1fr }` in the stylesheet.
+export const TIMELINE_LABEL_WIDTH = 90;
+// The slider's integer travel. `<input type="range">` steps in integers, and 1000 notches over
+// a 10.7x range is finer than a pixel of thumb travel, so the control reads as continuous.
+export const TIMELINE_ZOOM_SLIDER_MAX = 1000;
+
+export function clampTimelineZoom(pixelsPerSecond) {
+  const value = Number(pixelsPerSecond);
+  if (!Number.isFinite(value)) return TIMELINE_ZOOM_BASE;
+  return Math.min(Math.max(value, TIMELINE_ZOOM_MIN), TIMELINE_ZOOM_MAX);
+}
+
+// Slider position for a scale, and the scale for a position -- a *logarithmic* pair, so one
+// notch is the same proportional change at 6 px/s as at 64. A linear mapping spends four
+// fifths of its travel above 100% and leaves the readable half of the range unpickable.
+export function zoomSliderValue(pixelsPerSecond) {
+  const span = Math.log(TIMELINE_ZOOM_MAX / TIMELINE_ZOOM_MIN);
+  const at = Math.log(clampTimelineZoom(pixelsPerSecond) / TIMELINE_ZOOM_MIN);
+  return Math.round((at / span) * TIMELINE_ZOOM_SLIDER_MAX);
+}
+
+export function zoomFromSlider(value) {
+  const raw = Number(value);
+  const position = Number.isFinite(raw)
+    ? Math.min(Math.max(raw, 0), TIMELINE_ZOOM_SLIDER_MAX)
+    : 0;
+  const span = Math.log(TIMELINE_ZOOM_MAX / TIMELINE_ZOOM_MIN);
+  return clampTimelineZoom(
+    TIMELINE_ZOOM_MIN * Math.exp((position / TIMELINE_ZOOM_SLIDER_MAX) * span)
+  );
+}
+
+export function zoomLabelText(pixelsPerSecond) {
+  return `${Math.round((clampTimelineZoom(pixelsPerSecond) / TIMELINE_ZOOM_BASE) * 100)}%`;
+}
+
+export const TIMELINE_ZOOM_ANCHORS = { playhead: "playhead", centre: "centre" };
+
+// Where the viewport should sit after a zoom. **Never zero**: re-scaling a 30-shot plan back to
+// the head of the song every time is its own defect, and the one the buttons had.
+//
+// The anchor is the playhead when the playhead is on screen, and the viewport centre otherwise.
+// The reason is what the Director is looking at. The playhead is the timeline's subject -- the
+// Monitor above plays the shot under it -- so while it is visible it is the frame being judged
+// and it must not move. Scrolled away to a later section it is not on screen at all, and holding
+// an off-screen second fixed would move everything the Director *is* reading; there the centre
+// of the visible band is the honest invariant. Ctrl+wheel keeps its own third anchor, the
+// pointer, because for that gesture the pointer is by definition the thing of interest.
+//
+// The returned `scrollLeft` has no upper clamp: assigning past the end is clamped by the
+// browser against the content it has just laid out, which is the only reading of the new width
+// that is not a guess.
+export function zoomViewport({
+  scrollLeft = 0,
+  viewportWidth = 0,
+  pixelsPerSecond = TIMELINE_ZOOM_BASE,
+  toPixelsPerSecond = TIMELINE_ZOOM_BASE,
+  playheadSeconds = 0,
+  labelWidth = TIMELINE_LABEL_WIDTH,
+} = {}) {
+  const from = clampTimelineZoom(pixelsPerSecond);
+  const to = clampTimelineZoom(toPixelsPerSecond);
+  const left = Number.isFinite(scrollLeft) ? Math.max(0, scrollLeft) : 0;
+  const width = Number.isFinite(viewportWidth) && viewportWidth > 0 ? viewportWidth : 0;
+  const playhead = Number.isFinite(playheadSeconds) ? Math.max(0, playheadSeconds) : 0;
+  const playheadX = labelWidth + playhead * from;
+  const onScreen = width > 0 && playheadX >= left && playheadX <= left + width;
+  const anchorSeconds = onScreen
+    ? playhead
+    : Math.max(0, (left + width / 2 - labelWidth) / from);
+  // How far into the viewport the anchor sits now, kept exactly there afterwards.
+  const offset = onScreen ? playheadX - left : width / 2;
+  return {
+    pixelsPerSecond: to,
+    anchor: onScreen ? TIMELINE_ZOOM_ANCHORS.playhead : TIMELINE_ZOOM_ANCHORS.centre,
+    anchorSeconds,
+    scrollLeft: Math.max(0, labelWidth + anchorSeconds * to - offset),
+  };
+}
+
+export const TIMELINE_WHEEL_ACTIONS = { zoom: "zoom", scroll: "scroll", native: "native" };
+
+// What one wheel notch over the tracks should do. **The plain wheel scrolls along the song**,
+// which is the timeline convention in every editing application the Director already uses, and
+// the direct answer to "I cant scroll left or right": the axis this panel is about is time.
+//
+// - Ctrl (or Cmd) zooms about the pointer, the gesture every editor teaches.
+// - Shift is the escape hatch back to vertical, because the plain wheel is taken. It inverts the
+//   browser's own shift-is-horizontal habit on purpose: inside a timeline, horizontal is the
+//   unmodified gesture, so the modifier has to mean the other one or vertical has no wheel at
+//   all. The four tracks are five fixed rows deep and the scrollbar is right there, so this is a
+//   fallback rather than a daily gesture.
+// - A horizontal delta -- a trackpad swipe -- is already asking for horizontal and gets it.
+// - With nothing to scroll horizontally the wheel is handed straight back to the browser, so a
+//   short plan that fits its box behaves exactly as any other page does.
+//
+// The earlier rule here was "hijack deltaY only when there is no vertical overflow", and it was
+// measured wrong in the browser: at 1600x1100 the tracks overflowed their box by *four pixels*,
+// which was enough to hand the wheel back and leave the gesture as dead as it was before.
+export function timelineWheelPlan({
+  deltaX = 0,
+  deltaY = 0,
+  ctrlKey = false,
+  metaKey = false,
+  shiftKey = false,
+  canScrollX = false,
+  canScrollY = false,
+} = {}) {
+  const still = { action: TIMELINE_WHEEL_ACTIONS.native, delta: 0, scrollX: 0, scrollY: 0 };
+  if (ctrlKey || metaKey) {
+    return { action: TIMELINE_WHEEL_ACTIONS.zoom, delta: deltaY, scrollX: 0, scrollY: 0 };
+  }
+  const move = (x, y) => ({ action: TIMELINE_WHEEL_ACTIONS.scroll, delta: 0, scrollX: x, scrollY: y });
+  if (shiftKey && deltaY) return canScrollY ? move(0, deltaY) : still;
+  if (!canScrollX) return still;
+  if (deltaX) return move(deltaX, 0);
+  if (deltaY) return move(deltaY, 0);
+  return still;
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.
@@ -2881,6 +3176,10 @@ export const api = {
   // the asset refuses while cited, the job settles its record as it cancels on ComfyUI.
   deleteProject: (id) => request(`/api/projects/${id}?confirm_delete=true`, { method: "DELETE" }),
   deleteAsset: (projectId, assetId) => request(`/api/projects/${projectId}/assets/${assetId}`, { method: "DELETE" }),
+  // The way through that refusal, and never around it: this moves citations and deletes
+  // nothing. `confirm_apply` false is a report the route refuses to save on, so the two-stage
+  // shape is the server's rule and not this function's manners.
+  replaceAssetCitations: (projectId, assetId, replacementId, confirmApply) => request(`/api/projects/${projectId}/assets/${assetId}/replace-citations`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ replacement_id: replacementId, confirm_apply: confirmApply }) }),
   cancelJob: (projectId, jobId) => request(`/api/projects/${projectId}/jobs/${jobId}`, { method: "DELETE" }),
   uploadAsset: (id, data) => request(`/api/projects/${id}/assets/upload`, { method: "POST", body: data }),
   generateMusic: (id, body) => request(`/api/projects/${id}/generate/music`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

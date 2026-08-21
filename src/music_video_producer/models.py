@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
@@ -617,6 +618,26 @@ class NumberedReference:
         return f"<{REFERENCE_TAG_NAMES[self.kind]} {self.number}>"
 
 
+def citation_slot_kind(citation: AssetCitation, asset: Asset | None) -> str:
+    """Which of H3's three media series one citation is wired into: picture, video or audio.
+
+    Factored out of `numbered_references` rather than written twice, because the per-kind
+    *ceilings* (`workflows.H3_REFERENCE_LIMITS`) are counted against the same classification the
+    numbering uses. A budget counted one way and wired another is how a shot ends up with a
+    tenth picture nobody counted.
+
+    The rule is unchanged and stated in `numbered_references`: a keyframe role names a frame and
+    a frame is a picture; a video or audio Asset is itself; **everything else is a picture** —
+    `character`, `setting`, `prop`, `style` and `image` alike — and so is a citation whose Asset
+    this project no longer holds, because nothing is known about it.
+    """
+    if citation.role in KEYFRAME_TAG_ROLES or asset is None:
+        return "picture"
+    if asset.kind in ("video", "audio"):
+        return asset.kind
+    return "picture"
+
+
 def numbered_references(project: Project, shot: Shot) -> list[NumberedReference]:
     """**The** reference numbering. Every citation this Shot holds, tagged as the payload wires it.
 
@@ -645,12 +666,7 @@ def numbered_references(project: Project, shot: Shot) -> list[NumberedReference]
     numbered: list[NumberedReference] = []
     for citation in citations_in_prompt_order(shot):
         asset = held.get(citation.asset_id)
-        if citation.role in KEYFRAME_TAG_ROLES or asset is None:
-            kind = "picture"
-        elif asset.kind in ("video", "audio"):
-            kind = asset.kind
-        else:
-            kind = "picture"
+        kind = citation_slot_kind(citation, asset)
         numbers[kind] += 1
         numbered.append(
             NumberedReference(citation=citation, asset=asset, kind=kind, number=numbers[kind])
@@ -779,6 +795,199 @@ def dangling_citations(project: Project, shot: Shot) -> list[str]:
     library = {asset.id for asset in project.assets}
     return [
         citation.asset_id for citation in shot.citations if citation.asset_id not in library
+    ]
+
+
+#: The `Asset.source` values that mark a **promoted identity sheet**: a child Asset generated from
+#: another Asset for the sole purpose of being that subject's multi-view reference.
+#:
+#: A set rather than an `== "krea-multiview"`, so a second turnaround workflow is one name added
+#: here instead of a branch added at every reader. Membership is the *promotion* that made the
+#: child, never its kind: `generate_multiview` deliberately gives the sheet its source's `kind`
+#: (a ship's sheet is a prop), so kind cannot tell a sheet from the thing it depicts.
+IDENTITY_SHEET_SOURCES = frozenset({"krea-multiview"})
+
+
+def identity_sheet_ids(project: Project) -> dict[str, str]:
+    """Map each Asset id to the promoted identity sheet that should be cited **in its place**.
+
+    The defect this answers, measured on a live 30-shot plan (2026-08-20): the uploaded source
+    frame was cited 22 times and the four-view sheet promoted from it 8, so most shots were
+    conditioned on the weaker of the two references — the single frame — while the sheet that
+    exists precisely to be the identity reference sat unused. The sheet won those 8 only because
+    the model happened to type its display name into the prose.
+
+    Absent from the map means *no substitution*, which is the whole no-op guarantee: a project
+    with no promotions returns `{}` and every caller's output is byte-for-byte what it was.
+
+    Two conditions, both necessary:
+
+    * ``source`` is one of `IDENTITY_SHEET_SOURCES` and ``parent_id`` names the Asset it was
+      promoted from. Nothing else in this application makes that promise about a child — an
+      `edit_asset` result is a *different* picture of the subject, not another view of the same
+      one — and the promotion route is where the promise is written down.
+    * ``path`` is set. A sheet whose render has not landed (or never landed) is a row in the
+      manifest with no file behind it, and substituting one would swap a real reference for
+      nothing. Emptiness is the manifest's own statement here; a file deleted out from under a
+      path is the render path's refusal to make, not this rule's — this module does no I/O.
+
+    Chains resolve to their end. A sheet promoted from a sheet is still that subject's newest
+    sheet, so citing either the source or the intermediate lands on the last one; a `parent_id`
+    cycle (which nothing here can create, and a hand-edited manifest can) stops at the first
+    repeat rather than spinning. The last promotion in manifest order wins when a source has
+    several, because manifest order is append order and the newest sheet is the current one.
+    """
+    direct: dict[str, str] = {}
+    for asset in project.assets:
+        if asset.source in IDENTITY_SHEET_SOURCES and asset.parent_id and asset.path:
+            direct[asset.parent_id] = asset.id
+    resolved: dict[str, str] = {}
+    for start in direct:
+        seen = {start}
+        current = start
+        while (following := direct.get(current)) is not None and following not in seen:
+            seen.add(following)
+            current = following
+        if current != start:
+            resolved[start] = current
+    return resolved
+
+
+def citable_assets(project: Project) -> list[Asset]:
+    """The library as a *model* should be offered it: identity sheets hidden behind their sources.
+
+    Once `prefer_identity_sheets` makes citing a source mean citing its sheet, the sheet has no
+    separate identity to offer — and offering it anyway is what produced the naming leak the
+    Director reported: `"Close up on eyes of HarderFaster · multiview with flickering light"`, an
+    internal asset label sitting in the creative prose of a shot, because citation correctness
+    depended on the model typing that label. A name the model is never shown is a name it cannot
+    write into a prompt.
+
+    A sheet whose source the library no longer holds stays listed: it is then the only Asset for
+    that subject, and hiding it would hide the subject.
+
+    Byte-identity: a project with no promotions returns `project.assets` entry for entry, in
+    order.
+    """
+    held = {asset.id for asset in project.assets}
+    hidden = {
+        asset.id
+        for asset in project.assets
+        if asset.source in IDENTITY_SHEET_SOURCES and asset.parent_id in held
+    }
+    return [asset for asset in project.assets if asset.id not in hidden]
+
+
+def prefer_identity_sheets(
+    citations: Sequence[AssetCitation], sheets: Mapping[str, str]
+) -> list[AssetCitation]:
+    """Re-point every `reference` citation at the identity sheet of what it cites.
+
+    **Instead of the source, never in addition to it**, and that is a decision with a cost on both
+    sides. H3 wires at most nine pictures (`workflows.H3_REFERENCE_LIMITS`); citing both spends two
+    of them on one subject and conditions the render on two pictures of one face, which is the same
+    subject argued twice rather than a subject and its context. Substitution can only *shrink* a
+    citation list — a shot that named both the source and its sheet collapses to one — so no caller
+    can exceed a slot budget by applying this that would not have exceeded it already.
+
+    The cost it does not remove: `docs/ROADMAP.md` records a live artefact where a reference
+    sheet's four-panel layout bled into the shot's composition ("the face plate is visible on the
+    left, the vertical panel bands persist"), at 4 steps with ``ref_image_size="match"``, and that
+    is **unresolved**. Preferring the sheet is therefore not free — it is the better identity
+    reference and the one with a known composition risk, and the answer to that risk is a render
+    parameter, not a citation policy. Every citation this writes stays visible in the inspector's
+    cited-asset rows and removable per shot.
+
+    Only the `reference` role is touched. `first`, `last` and `middle` name a concrete *frame* the
+    render pins the picture to; substituting a four-panel contact sheet for a shot's first frame
+    would make the first frame a contact sheet, which is the opposite of what the role asks for.
+
+    Duplicates collapse, keeping the first occurrence's `order` — `order` sorts within a role and
+    is not a dense index, so a gap left by a collapse changes no ordering. An empty `sheets`
+    returns the same citations, field for field.
+    """
+    kept: list[AssetCitation] = []
+    seen: set[tuple[str, str]] = set()
+    for citation in citations:
+        asset_id = (
+            sheets.get(citation.asset_id, citation.asset_id)
+            if citation.role == "reference"
+            else citation.asset_id
+        )
+        key = (asset_id, citation.role)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(
+            AssetCitation(asset_id=asset_id, role=citation.role, order=citation.order)
+        )
+    return kept
+
+
+def default_setting_asset(project: Project) -> Asset | None:
+    """The location this project declared, or `None`. **Never a guess.**
+
+    `Project.default_setting_id` is set by one explicit route and by nothing else, so `None` here
+    means the Director has not named a location — not that this function could not find one. It
+    deliberately does not fall back to "the only setting Asset in the library": a project can hold
+    several settings (the live one holds two), and picking one for the Director is exactly the
+    invisible attachment this feature is not allowed to make.
+
+    Re-validated on every read rather than trusted: the id must still name an Asset this project
+    holds, that Asset must still be a `setting`, and it must still have a file. A pointer left
+    dangling by a deletion, or aimed at a prop by a hand-edited manifest, is a no-op — this
+    codebase refuses fabricated values, and a citation of an Asset that is not there is one.
+    """
+    if not project.default_setting_id:
+        return None
+    return next(
+        (
+            asset
+            for asset in project.assets
+            if asset.id == project.default_setting_id
+            and asset.kind == "setting"
+            and asset.path
+        ),
+        None,
+    )
+
+
+def with_default_setting(
+    project: Project, citations: Sequence[AssetCitation], *, picture_limit: int
+) -> list[AssetCitation]:
+    """Give a shot the project's declared location when it has named no location of its own.
+
+    The second half of the Director's report: on a 30-shot plan whose brief specifies a location,
+    the setting Asset was cited 5 times, so 25 shots went to render with no environment reference
+    at all. Naming the location was left entirely to whether the model spelled a display name.
+
+    Three refusals to act, in order, and each is a no-op rather than a repair:
+
+    * no declared location (`default_setting_asset` is `None`) — nothing is invented;
+    * the shot already cites a `setting` Asset — adding a second location would put the shot in
+      two places, and the one it named is the one it meant. Kind is checked rather than id, so a
+      shot citing a *different* setting, or the identity sheet promoted from one (which inherits
+      the setting kind), is left alone;
+    * the picture budget is full. H3 wires `picture_limit` pictures and no more, counted through
+      `citation_slot_kind` so the count is the numbering's own, and an over-budget shot keeps the
+      citations it has rather than trading one away for the location.
+    """
+    setting = default_setting_asset(project)
+    if setting is None:
+        return list(citations)
+    held = {asset.id: asset for asset in project.assets}
+    pictures = 0
+    for citation in citations:
+        asset = held.get(citation.asset_id)
+        if asset is not None and asset.kind == "setting":
+            return list(citations)
+        if citation_slot_kind(citation, asset) == "picture":
+            pictures += 1
+    if pictures >= picture_limit:
+        return list(citations)
+    return [
+        *citations,
+        AssetCitation(asset_id=setting.id, role="reference", order=len(citations)),
     ]
 
 
@@ -937,6 +1146,20 @@ class Project(BaseModel):
     # every existing manifest loads unchanged; empty means unmarked, and everything that
     # reads sections treats absence as unknown rather than inventing boundaries.
     sections: list[SongSection] = Field(default_factory=list)
+    #: The video's location, as the Director's own declaration: the id of one `setting` Asset in
+    #: `assets`, or `""` for none. Read by `default_setting_asset`, which re-validates it on every
+    #: read, so a dangling or mis-aimed pointer is a no-op rather than a fabricated citation.
+    #:
+    #: **Server-owned, and set by `PUT /projects/{id}/default-setting` alone**, exactly as
+    #: `Asset.consistency_prompt` is — the generic full-project `PUT` re-adopts the stored value
+    #: rather than trusting a body, because a defaulted `str` that any pre-existing client simply
+    #: omits arrives as `""`, and one ordinary save would otherwise clear the Director's choice.
+    #: That hole has been found in that route three times; this field is not the fourth.
+    #:
+    #: Defaulted, so every manifest written before it existed loads unchanged and means *no
+    #: location declared* — which is a real state, and the state in which every consumer must
+    #: produce byte-identical output to what it produced before this field existed.
+    default_setting_id: str = ""
     assets: list[Asset] = Field(default_factory=list)
     shots: list[Shot] = Field(default_factory=list)
     messages: list[TreatmentMessage] = Field(default_factory=list)

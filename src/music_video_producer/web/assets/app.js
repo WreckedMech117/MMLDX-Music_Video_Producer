@@ -1,6 +1,8 @@
 import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, RESUBMIT_SEED_STRIDE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
+import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clampTimelineZoom, timelineWheelPlan, zoomFromSlider, zoomLabelText, zoomSliderValue, zoomViewport } from "./api.js";
+import { REPLACE_WITH_CANCEL, REPLACE_WITH_HEADING, REPLACE_WITH_HELP, REPLACE_WITH_MERGED_HEADING, REPLACE_WITH_PLACEHOLDER, REPLACE_WITH_RUNNING, REPLACE_WITH_SKIPPED_HEADING, REPLACE_WITH_SWAPPED_HEADING, assetIsCited, assetReplacementControl, assetReplacementOptions, assetReplacementReportLines, replaceInShotsControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -32,6 +34,28 @@ let readinessLoadRevision = 0;
 let snapToleranceSeconds = SNAP_TOLERANCE_DEFAULT;
 let snapReport = null;
 let snapInFlight = false;
+// Replace With / Cancel, offered only after a delete was refused. Module state for `snapReport`'s
+// reason exactly -- derived, never saved, never sent back. `replaceForAssetId` is which asset the
+// refusal was about, so the affordance cannot leak onto a different card when the selection moves;
+// `replaceRefusal` is the server's own refusal sentence, kept on screen so the Director can read
+// what stopped them while they choose; `replaceReport` holds the last report and is what makes the
+// button two-stage, exactly as `snapReport` does for the cuts bar.
+let replaceForAssetId = "";
+let replaceRefusal = "";
+let replaceChoiceId = "";
+let replaceReport = null;
+let replaceInFlight = false;
+
+// Everything the affordance holds, forgotten. Called by the Cancel button, by an applied
+// replacement, and by every project load -- a report about one project's shots drawn over another
+// project's library would be a claim about shots that are not on screen.
+function clearAssetReplacement() {
+  replaceForAssetId = "";
+  replaceRefusal = "";
+  replaceChoiceId = "";
+  replaceReport = null;
+  replaceInFlight = false;
+}
 // The last H3 expansion this client was refused, as `{shotId, problems, prompt}`, or null. Held
 // here for `readinessReport`'s reason -- it is derived, never saved and never sent back -- and
 // keyed to its shot, because a report drawn under a different shot's intent would be a false claim
@@ -211,6 +235,10 @@ async function loadProject(id) {
   // write windows onto shots nobody was looking at. Cleared on every load, refresh included --
   // a refresh means the plan changed, and a report about the plan before it is stale.
   snapReport = null;
+  // And the replacement report, for the same reason and with a sharper edge: it names asset ids
+  // and shot labels from the project being left, so an apply offered under another project's name
+  // would rewrite citations on shots nobody was looking at.
+  clearAssetReplacement();
   // Live percentages belong to the project being left, for readiness' reason exactly: they are
   // keyed by target id, and a number drawn under another project's name would be a claim about a
   // render nobody is looking at. Cleared on every load, refresh included -- the next poll answer
@@ -753,17 +781,51 @@ export function renderAssetInspector() {
   // a screen that puts the machine's text first teaches the opposite.
   const anchor = consistencyAnchorPlan(asset);
   const anchorHtml = anchor ? `<label>${escapeHtml(CONSISTENCY_PROMPT_LABEL)}<textarea id="asset-anchor" rows="3" placeholder="a woman in a red leather jacket and black boots">${escapeHtml(anchor.stored)}</textarea></label><p class="field-help">${escapeHtml(CONSISTENCY_PROMPT_HELP)}</p><div class="field-foot"><span id="asset-anchor-count" class="field-count${anchor.over ? " over" : ""}">${escapeHtml(anchor.count)}</span><button class="quiet-button" id="save-asset-anchor" ${anchor.savable ? "" : "disabled"}>Save anchor</button></div>` : "";
-  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${anchorHtml}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button><button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>`;
+  // Replace With / Cancel. Drawn only for the asset whose delete was actually refused, so the
+  // affordance is the answer to a refusal the Director just read rather than a permanent control
+  // offering to rewrite the plan.
+  const replaceHtml = replaceForAssetId === asset.id ? assetReplacementHtml(asset) : "";
+  // The Assets panel's own way in, beside "Attach to selected shot" and drawn only when this asset
+  // is cited. Same route, same report-then-confirm, and no deletion anywhere in the path — the
+  // Director asked for the operation "without resulting in asset deletion", which this route
+  // already is.
+  const replaceIn = replaceInShotsControl(state.project, asset.id);
+  const replaceInHtml = replaceIn.shown
+    ? `<button class="quiet-button full" id="replace-in-shots" style="margin-top:8px" title="Re-point every shot citing this asset at another one. You see the whole list before anything is written, and nothing is deleted or rendered.">${escapeHtml(replaceIn.label)}</button>`
+    : "";
+  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${anchorHtml}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button>${replaceInHtml}<button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>${replaceHtml}`;
   $("#attach-asset")?.addEventListener("click", attachSelectedAsset);
   $("#delete-asset")?.addEventListener("click", async () => {
     if (!window.confirm(`Delete ${asset.name} from the library?`)) return;
     try {
       state.project = await api.deleteAsset(state.project.id, asset.id);
       state.selectedAssetId = null;
+      clearAssetReplacement();
       renderAssets();
       toast(`${asset.name} deleted`);
-    } catch (error) { toast(error.message, "error"); }
+    } catch (error) {
+      // The Director's ask, at the exact moment they asked for it. The refusal is unchanged and
+      // still says what stopped the delete; the affordance appears beneath it so the answer is
+      // in reach "while i am here in assets". Offered only when the project on screen really does
+      // cite this asset -- `assetIsCited` reads the manifest rather than the refusal's prose, so
+      // an unrelated failure (a network error, a 404) is still just a toast.
+      toast(error.message, "error");
+      if (assetIsCited(state.project, asset.id)) {
+        clearAssetReplacement();
+        replaceForAssetId = asset.id;
+        replaceRefusal = error.message;
+        renderAssetInspector();
+      }
+    }
   });
+  $("#replace-in-shots")?.addEventListener("click", () => {
+    // No delete was attempted and none will be, so there is no refusal sentence to show — the
+    // panel explains itself instead. Otherwise this is the identical affordance.
+    clearAssetReplacement();
+    replaceForAssetId = asset.id;
+    renderAssetInspector();
+  });
+  bindAssetReplacement(asset);
   // The anchor box carries no `maxlength`, on the song context's recorded reasoning: a
   // maxlength truncates an oversized paste in the browser and drops the tail with no message,
   // while the identical text sent to the route comes back as a 422 naming its length. The
@@ -794,6 +856,86 @@ export function renderAssetInspector() {
     try { state.project = await api.analyzeAsset(state.project.id, asset.id); renderAssets(); toast("Vision inspection saved"); }
     catch (error) { toast(error.message, "error"); }
   });
+}
+
+// The Replace With / Cancel block, as markup. Every decision in it is `api.js`'s -- which assets
+// may be offered, whether the button reports or applies, and what the report's lines say -- so
+// this function chooses nothing and only draws.
+function assetReplacementHtml(asset) {
+  const control = assetReplacementControl(replaceChoiceId, replaceReport);
+  const options = assetReplacementOptions(state.project, asset.id)
+    .map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === replaceChoiceId ? "selected" : ""}>${escapeHtml(option.name)} · ${escapeHtml(option.kind)}</option>`)
+    .join("");
+  // Every line, all three lists, nothing summarised -- `renderSnapCuts`' rule: the skip reasons
+  // are the server's own sentences and they are what explains why the delete is still refused.
+  const lines = assetReplacementReportLines(replaceReport);
+  const section = (heading, kind) => {
+    const rows = lines.filter((line) => line.kind === kind);
+    return rows.length
+      ? `<div class="snap-heading">${escapeHtml(heading)} (${rows.length})</div>` +
+        rows.map((row) => `<div class="snap-${row.kind}">${escapeHtml(row.text)}</div>`).join("")
+      : "";
+  };
+  const warning = replaceReport?.warning
+    ? `<div class="snap-skip">${escapeHtml(replaceReport.warning)}</div>`
+    : "";
+  // The take-provenance notes, above the lists and unheaded: they are about shots that appear in
+  // the lists below, so a heading of their own would read as a fourth bucket.
+  const notes = lines
+    .filter((line) => line.kind === "note")
+    .map((line) => `<div class="snap-note">${escapeHtml(line.text)}</div>`)
+    .join("");
+  const report = replaceReport
+    ? `<div class="snap-report">${warning}${notes}${section(REPLACE_WITH_SWAPPED_HEADING, "swap")}${section(REPLACE_WITH_MERGED_HEADING, "merge")}${section(REPLACE_WITH_SKIPPED_HEADING, "skip")}</div>`
+    : "";
+  // The refusal when a delete was refused, the panel's own explanation when the Assets-panel
+  // button opened it. One or the other is always present: a panel that acts on shots the Director
+  // cannot see from here must say what it is going to do.
+  return `<div class="replace-panel"><div class="snap-heading">${escapeHtml(REPLACE_WITH_HEADING)}</div><p class="field-help">${escapeHtml(replaceRefusal || REPLACE_WITH_HELP)}</p><select id="replace-with" ${replaceInFlight ? "disabled" : ""}><option value="">${escapeHtml(REPLACE_WITH_PLACEHOLDER)}</option>${options}</select>${report}<div class="field-foot"><span class="snap-reason">${escapeHtml(control.reason)}</span><button class="primary-button" id="replace-run" ${control.disabled || replaceInFlight ? "disabled" : ""}>${escapeHtml(replaceInFlight ? REPLACE_WITH_RUNNING : control.label)}</button><button class="quiet-button" id="replace-cancel" ${replaceInFlight ? "disabled" : ""}>${escapeHtml(REPLACE_WITH_CANCEL)}</button></div></div>`;
+}
+
+function bindAssetReplacement(asset) {
+  $("#replace-with")?.addEventListener("change", (event) => {
+    replaceChoiceId = event.currentTarget.value;
+    // The report answered a question about a different asset. Keeping it beside a new choice
+    // would offer an apply for shots nobody asked about -- the snap bar's tolerance rule.
+    replaceReport = null;
+    renderAssetInspector();
+  });
+  $("#replace-cancel")?.addEventListener("click", () => {
+    clearAssetReplacement();
+    renderAssetInspector();
+  });
+  $("#replace-run")?.addEventListener("click", () => {
+    const control = assetReplacementControl(replaceChoiceId, replaceReport);
+    if (control.disabled) return;
+    runAssetReplacement(asset, control.apply);
+  });
+}
+
+// One click. `apply` false fetches a report and writes nothing -- the route refuses to save
+// without the flag, so the two-stage shape is the server's rule and not this function's manners.
+async function runAssetReplacement(asset, apply) {
+  if (!state.project || replaceInFlight) return;
+  replaceInFlight = true;
+  renderAssetInspector();
+  try {
+    const answer = await api.replaceAssetCitations(state.project.id, asset.id, replaceChoiceId, apply);
+    replaceInFlight = false;
+    if (apply && answer.project) {
+      state.project = answer.project;
+      clearAssetReplacement();
+      renderAssets();
+      toast(answer.message);
+      return;
+    }
+    replaceReport = answer;
+    renderAssetInspector();
+  } catch (error) {
+    replaceInFlight = false;
+    renderAssetInspector();
+    toast(error.message, "error");
+  }
 }
 
 async function createMultiview() {
@@ -920,12 +1062,34 @@ function projectDuration() {
   return Math.max(state.project?.song?.duration || 0, shotEnd, 30);
 }
 
+// The second line of a take row: what actually tells two takes of one shot apart. `takesStripRows`
+// carries the seed and the landing time as raw values and decides nothing about how they read; the
+// time is formatted here because a locale string is a rendering decision and belongs on this side.
+// A record carrying neither draws no line at all rather than an empty one or an `Invalid Date`.
+function takeProvenance(row) {
+  const parts = [];
+  if (row.seed !== null && row.seed !== undefined) parts.push(`seed ${row.seed}`);
+  if (row.at) {
+    const at = new Date(row.at);
+    if (!Number.isNaN(at.getTime())) parts.push(at.toLocaleString());
+  }
+  return parts.join(" · ");
+}
+
 function renderTimeline() {
   const duration = projectDuration();
   const trackWidth = Math.max(900, duration * state.pixelsPerSecond);
   const canvas = $("#timeline-canvas");
+  // The whole timeline is one canvas -- ruler, all four tracks, playhead -- sized to the zoomed
+  // song rather than to its container, inside one `.timeline-scroll` box. That is what makes the
+  // four tracks share a scroll offset by construction: there is only one offset in the panel to
+  // be wrong about, so a SECTIONS box cannot drift away from the SHOTS beneath it.
   canvas.style.width = `${trackWidth + 90}px`;
-  $("#zoom-label").textContent = `${Math.round(state.pixelsPerSecond / 16 * 100)}%`;
+  $("#zoom-label").textContent = zoomLabelText(state.pixelsPerSecond);
+  const zoomSlider = $("#zoom-slider");
+  // Follow the scale rather than lead it: the buttons, the slider and ctrl+wheel all write
+  // `state.pixelsPerSecond`, and the thumb reads it back here so no two of them can disagree.
+  if (zoomSlider) zoomSlider.value = String(zoomSliderValue(state.pixelsPerSecond));
   $("#timeline-duration").textContent = state.project?.song ? `${formatTime(state.project.song.duration)} master` : "No master song";
   renderRuler(duration, trackWidth);
   const track = $("#shots-track");
@@ -1005,6 +1169,32 @@ function renderTimeline() {
   renderSnapCuts();
   renderAssembly();
   updateTimelinePlayhead();
+}
+
+// The one way the two buttons and the slider change the scale, so all three behave identically.
+// `zoomViewport` decides where the viewport lands -- the playhead if it is on screen, the centre
+// of what is visible otherwise -- and the new offset is written *after* the render, against the
+// canvas the render has just widened, so the browser clamps it to real content rather than to a
+// width guessed before the fact.
+function applyZoom(next) {
+  const scroll = $("#timeline-scroll");
+  const plan = zoomViewport({
+    scrollLeft: scroll?.scrollLeft || 0,
+    viewportWidth: scroll?.clientWidth || 0,
+    pixelsPerSecond: state.pixelsPerSecond,
+    toPixelsPerSecond: next,
+    playheadSeconds: state.playhead,
+  });
+  if (plan.pixelsPerSecond === state.pixelsPerSecond) return plan;
+  state.pixelsPerSecond = plan.pixelsPerSecond;
+  renderTimeline();
+  // The scale is a working choice, not a property of the video: it lives in this browser's
+  // session storage beside the panel and the selection, and never in the manifest. The scroll
+  // offset is not stored at all -- it is where you happen to be looking this minute, and a
+  // reload that restored it would fight the playhead-following the transport already does.
+  persistSession();
+  if (scroll) scroll.scrollLeft = plan.scrollLeft;
+  return plan;
 }
 
 // Exported for the executed frontend contract, `renderSong`'s reason exactly: a source read of
@@ -1459,8 +1649,18 @@ export function renderShotInspector() {
   const strip = takesStripRows(state.project, shot);
   const videoAssets = assets.filter((asset) => asset.kind === "video");
   const takesStripHtml = strip.rows.length > 1 || videoAssets.length
-    ? `<div class="takes-strip"><span class="control-label" title="Every clip this shot's render history produced. 'Use' points the shot at that take; assembly and the Monitor follow.">Takes</span>${strip.rows.map((row) =>
-        `<div class="take-row ${row.className}"><span title="${escapeHtml(row.title)}">${escapeHtml(row.text)}</span><button class="quiet-button use-take" data-output="${escapeHtml(row.file)}" ${row.disabled ? "disabled" : ""}>${escapeHtml(row.chip)}</button></div>`
+    ? `<div class="takes-strip"><span class="control-label" title="Every clip this shot's render history produced. Click a take to point the shot at it; assembly and the Monitor follow.">Takes</span>${strip.rows.map((row) =>
+        // **The whole row is the control**, not the chip at the end of it. The Director's report,
+        // 2026-08-21: "clicking on either does nothing instead of hot swapping between available
+        // shots" — and in a browser that was exactly true of the row and exactly false of the
+        // chip, which worked. A 286px line of text that looks like a list item, with a 40px live
+        // button at the far right, reads as broken even while it works.
+        //
+        // A real `<button>`, so focus, Enter and Space come from the platform rather than from a
+        // `role`/`tabindex`/keydown trio this file would have to keep correct. `disabled` is what
+        // makes the current and pending rows *visibly* non-actionable — dimmed, unfocusable, no
+        // pointer — rather than silently inert, which is the state being fixed.
+        `<button type="button" class="take-row ${row.className} use-take" data-output="${escapeHtml(row.file)}" title="${escapeHtml(row.title)}" ${row.disabled ? "disabled" : ""}><span class="take-name">${escapeHtml(row.text)}</span>${takeProvenance(row) ? `<span class="take-meta">${escapeHtml(takeProvenance(row))}</span>` : ""}<span class="take-chip">${escapeHtml(row.chip)}</span></button>`
       ).join("")}${videoAssets.length ? `<select id="attach-clip-asset"><option value="">Attach video asset as clip…</option>${videoAssets.map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select>` : ""}</div>`
     : "";
   // The trim nudge: which slice of the over-rendered take fills the window. Decided by
@@ -1513,6 +1713,15 @@ export function renderShotInspector() {
   restoreInspectorEdit(inspector, place);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio", "shot-locked"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
   // The takes strip: switch this shot's clip among its own takes, or attach a video asset.
+  //
+  // Bound here, immediately after the `innerHTML` write above, to the nodes that write just
+  // created. The other candidate cause of the Director's report was a **stale handler** — this
+  // application has a recorded defect where the inspector is rebuilt by a reply nobody awaited and
+  // elements go stale mid-interaction — so it was checked in a browser before anything was
+  // changed, and it is **not** what was wrong: clicking the chip swapped `latest_output` on the
+  // server correctly, on a shot with two real takes, including after a rebuild. Every row now
+  // carries `.use-take`, disabled or not; a disabled button dispatches no click, so `row.disabled`
+  // stays the single place that decides which takes are selectable.
   $$(".use-take", inspector).forEach((button) => button.addEventListener("click", async () => {
     try {
       state.project = await api.selectTake(state.project.id, shot.id, { output: button.dataset.output });
@@ -2720,20 +2929,44 @@ function bindEvents() {
     if (document.fullscreenElement) document.exitFullscreen();
     else monitor.requestFullscreen?.();
   });
-  $("#zoom-in").addEventListener("click", () => { state.pixelsPerSecond = Math.min(64, state.pixelsPerSecond * 1.25); renderTimeline(); });
-  $("#zoom-out").addEventListener("click", () => { state.pixelsPerSecond = Math.max(6, state.pixelsPerSecond / 1.25); renderTimeline(); });
-  // Ctrl+wheel zooms about the pointer — the gesture every editor teaches — keeping the
-  // song second under the cursor stationary while the scale changes around it.
+  $("#zoom-in").addEventListener("click", () => applyZoom(state.pixelsPerSecond * TIMELINE_ZOOM_STEP));
+  $("#zoom-out").addEventListener("click", () => applyZoom(state.pixelsPerSecond / TIMELINE_ZOOM_STEP));
+  // The slider the Director went looking for. It writes the same scale the buttons do, through
+  // the same anchor rule, and `renderTimeline` writes the thumb back — so dragging it, pressing
+  // a button and ctrl+wheeling can never leave the three disagreeing.
+  $("#zoom-slider")?.addEventListener("input", (event) => applyZoom(zoomFromSlider(event.target.value)));
+  // The wheel over the tracks. `timelineWheelPlan` decides which of the three things one notch
+  // means — zoom, scroll across, or leave it to the browser — and takes a gesture over only when
+  // it had nothing else to do. Ctrl+wheel keeps its own pointer anchor rather than applyZoom's,
+  // because for that gesture the pointer *is* the thing of interest.
   $("#timeline-scroll").addEventListener("wheel", (event) => {
-    if (!event.ctrlKey) return;
-    event.preventDefault();
     const scroll = $("#timeline-scroll");
+    const plan = timelineWheelPlan({
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+      // A pixel of slack: sub-pixel layout widths make an exactly-fitting box report one more
+      // scroll pixel than it has, and hijacking the wheel for a scroll of 0 would be the same
+      // dead gesture in a new place.
+      canScrollX: (scroll.scrollWidth || 0) > (scroll.clientWidth || 0) + 1,
+      canScrollY: (scroll.scrollHeight || 0) > (scroll.clientHeight || 0) + 1,
+    });
+    if (plan.action === TIMELINE_WHEEL_ACTIONS.native) return;
+    event.preventDefault();
+    if (plan.action === TIMELINE_WHEEL_ACTIONS.scroll) {
+      if (plan.scrollX) scroll.scrollLeft += plan.scrollX;
+      if (plan.scrollY) scroll.scrollTop += plan.scrollY;
+      return;
+    }
     const pointerX = event.clientX - scroll.getBoundingClientRect().left + scroll.scrollLeft;
-    const anchorSeconds = (pointerX - 90) / state.pixelsPerSecond;
-    const factor = event.deltaY < 0 ? 1.2 : 1 / 1.2;
-    state.pixelsPerSecond = clamp(state.pixelsPerSecond * factor, 6, 64);
+    const anchorSeconds = (pointerX - TIMELINE_LABEL_WIDTH) / state.pixelsPerSecond;
+    const factor = plan.delta < 0 ? 1.2 : 1 / 1.2;
+    state.pixelsPerSecond = clampTimelineZoom(state.pixelsPerSecond * factor);
     renderTimeline();
-    scroll.scrollLeft = Math.max(0, 90 + anchorSeconds * state.pixelsPerSecond - (event.clientX - scroll.getBoundingClientRect().left));
+    persistSession();
+    scroll.scrollLeft = Math.max(0, TIMELINE_LABEL_WIDTH + anchorSeconds * state.pixelsPerSecond - (event.clientX - scroll.getBoundingClientRect().left));
   }, { passive: false });
   $("#section-track").addEventListener("dblclick", (event) => {
     if (!requireProject()) return;
@@ -2945,7 +3178,7 @@ async function refreshJobs() {
 async function init() {
   bindEvents();
   const session = restoreSession();
-  if (Number.isFinite(session.pixelsPerSecond)) state.pixelsPerSecond = Math.min(64, Math.max(6, session.pixelsPerSecond));
+  if (Number.isFinite(session.pixelsPerSecond)) state.pixelsPerSecond = clampTimelineZoom(session.pixelsPerSecond);
   await Promise.all([loadHealth(), loadVramEject(), api.workflows().catch(() => [])]);
   try { await loadProjects(); } catch (error) { toast(error.message, "error"); }
   if (session.panel) document.querySelector(`[data-panel="${session.panel}"]`)?.click();

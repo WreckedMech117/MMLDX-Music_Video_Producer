@@ -252,15 +252,21 @@ Keep optional `PathchSageAttentionKJ` nodes bypassed unless a compatible `sageat
 ### Self-hosting browser QA (no server to start)
 
 ```bash
-uv run --with selenium python tests/e2e_shot_controls.py   # default port 8767
-uv run --with selenium python tests/e2e_song_context.py    # default port 8768
+uv run --with selenium python tests/e2e_shot_controls.py    # default port 8767
+uv run --with selenium python tests/e2e_song_context.py     # default port 8768
+uv run --with selenium python tests/e2e_timeline_scroll.py  # default port 8769
+uv run --with selenium python tests/e2e_take_swap.py        # default port 8770
 ```
 
-These two **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
+These four **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
 
 Prerequisites: nothing listening on the port, Microsoft Edge plus its WebDriver, and `music_video_producer` importable from this checkout's `src/`. **ComfyUI does not need to be running** and no language-model host is needed. Neither script spends GPU time or reaches `/prompt`.
 
 Why they start their own server rather than accepting a URL: on 2026-08-17 a health check passed against an hour-old process still bound to the port, and a live check was one step from reporting a working feature broken on the strength of stale code. `tests/e2e_support.py`'s `ManagedServer` refuses a bound port **by name and start time**, verifies the listener is its own descendant (the `uv` trampoline means the real `python run.py` is a grandchild, so teardown is `taskkill /F /T` and then proves the port came free), and proves the responder writes into a data root this run created seconds ago. **A health check that only proves something is listening proves nothing about what.** Exit code 2 means refused before any assertion ran.
+
+`e2e_timeline_scroll.py` rebuilds the Director's own plan's *shape* through routes — 30 shots over a 154.6 s song in 7 sections, enough to overflow any viewport — and gates the Timeline panel's viewport: that the scroll box's horizontal scrollbar and the Assembly bar are inside the window at 1600×1100/950/820, that a real wheel gesture moves the viewport along the song, that all four tracks move by the same offset and a SECTIONS box holds its alignment to the SHOTS clip beneath it, that the zoom slider and the `−`/`+` buttons both zoom and agree, that zoom holds the playhead (or the viewport centre) instead of jumping to zero, and — the regression guard for the coordinate maths — that a clip dragged and resized **at a non-zero scroll offset** stores the window that was dragged. Since the tools moved into the transport bar it also hit-tests **all fifteen controls in that bar at 1600/1280/1024/900/820 px** — the bar wraps rather than hiding anything — and asserts both sliders carry a visible label and every icon-only button an `aria-label` identical to its tooltip. It queues nothing and asserts `jobs` is empty at the end. **Read `project_59f14d19ff10` for its shape only; it never opens it.**
+
+`e2e_take_swap.py` gates switching a shot between its own takes from the shot inspector, on a shot with **two real takes** synthesized locally by ffmpeg into an isolated `MVP_COMFY_ROOT` it owns. It clicks the take **row** — not the chip, which already worked — and reads `latest_output` back from the server, then checks that the Monitor followed, that Enter on the focused row swaps too, that the current row takes neither focus nor a click, and that the swap **still works after the inspector has been torn down and rebuilt** (the recorded stale-element failure mode in that panel). It declares two console errors by name: the Clips library points each take's `<video>` straight at ComfyUI's `/view`, which 404s whenever ComfyUI is down.
 
 `e2e_shot_controls.py` seeds five shots and four assets through shipped routes and drives mark-ready/mark-draft, render-again and the multiview promote control — asserting each is rendered, hit-testable at its centre, correctly labelled, and that a disabled button the browser honours changes nothing server-side. It never clicks promote, and asserts `jobs` is empty at the end. `e2e_song_context.py` drives the lyrics/style editor, its counters, save, the per-field restores, the clearing confirmation through the browser's real dialog, and the VRAM eject toggle — writing `machine-preferences.json` inside its own root, so your stored choice is untouched. It causes exactly one deliberate 422 (the oversized sheet), declared to the console gate by name.
 

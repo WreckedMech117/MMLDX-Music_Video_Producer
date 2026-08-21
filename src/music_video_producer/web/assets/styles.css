@@ -242,13 +242,38 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .meta-list { display: grid; grid-template-columns: 72px 1fr; gap: 7px; margin: 13px 0; color: var(--muted); font-size: 11px; }
 .meta-list b { color: var(--dim); text-transform: uppercase; }
 .timeline-panel { padding-bottom: 14px; overflow: hidden; }
+/* The Director's report, 2026-08-20: "I cant scroll left or right." The tracks were already in a
+   scrollable box; its horizontal scrollbar was simply *below the bottom of the window*. The panel
+   holds four stacked things -- heading, snap bar, the timeline itself, the assembly bar -- and
+   `.timeline-layout` claimed `calc(100% - 65px)`, a hardcoded allowance for the heading alone that
+   counted neither the snap bar nor the assembly bar. Its `min-height: 500px` then refused to give
+   the shortfall back. Measured at 1600x1100: the scroll box ended 61px past the viewport and the
+   assembly bar 150px past it, with `overflow: hidden` here and on `.workspace` leaving no way to
+   reach either. So the panel is a grid and the timeline row takes what is left over -- no magic
+   number, and nothing can be laid out past the bottom edge again. */
+.timeline-panel.active { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
 .timeline-tools .divider { height: 22px; border-left: 1px solid var(--line); margin: 0 4px; }
-.timeline-layout { display: grid; grid-template-columns: minmax(620px, 1fr) 280px; gap: 12px; height: calc(100% - 65px); min-height: 500px; }
-/* The Monitor row breathes with the viewport (the Director's report, 2026-08-20: a
-   fullscreened browser cut the bottom half of the video off behind the timeline) and the
-   scroll row owns the leftover, min-height 0 so grid never lets the tracks blow out over
-   the Monitor. Fullscreening the Monitor itself is the ⛶ button. */
-.timeline-main { display: grid; grid-template-rows: minmax(200px, 46vh) 42px minmax(0, 1fr); min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+/* The zoom slider, beside the two buttons it agrees with. Logarithmic in `zoomFromSlider`, so a
+   notch is the same proportional change at either end of the 6-64 px/s range. */
+#zoom-slider { width: 108px; accent-color: var(--acid); }
+/* The first column's floor was 620px, and 620 + 280 + 12 is 912 — more than the 750px a 900px-wide
+   window leaves this panel. Between the 860px breakpoint that stacks the layout and roughly 1006px,
+   where 620 finally fits, the panel therefore overflowed horizontally and `overflow: hidden` clipped
+   whatever ran past the edge; measured 2026-08-21 with the song mute in the transport bar clipped
+   out of reach at 900px. 320 clears the breakpoint with room (320 + 280 + 12 = 612 against 735), and
+   the floor is not load-bearing the way it was: the tracks are a scrolling viewport now and the bar
+   under the Monitor wraps, so a narrow timeline is a small view of the song rather than a broken
+   one. Below 860px the layout stacks and this floor stops applying. */
+.timeline-layout { display: grid; grid-template-columns: minmax(320px, 1fr) 280px; gap: 12px; height: 100%; min-height: 0; }
+/* The Monitor row and the track row **share** the leftover height, in proportion, rather than the
+   Monitor taking a fixed 46vh and the tracks living on what survived. 46vh was the answer to an
+   earlier report of the same underlying bug (2026-08-20: a fullscreened browser cut the bottom
+   half of the video off behind the timeline) and it overshot: on a 961px viewport it spent 442px
+   on the picture and left the four tracks 127px, which is less than the 313px they occupy — so the
+   horizontal scrollbar at the foot of them was the first thing to go. Two `fr` rows degrade
+   together at any height instead, tracks weighted slightly heavier because they are what is being
+   edited, and the ⛶ button is still there when the picture is the thing to look at. */
+.timeline-main { display: grid; grid-template-rows: minmax(120px, 1fr) auto minmax(140px, 1.25fr); min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
 .monitor-fullscreen { position: absolute; right: 10px; bottom: 10px; z-index: 2; width: 34px; height: 30px; border: 1px solid var(--line-strong); border-radius: 4px; background: #000a; color: var(--ink); cursor: pointer; opacity: 0; transition: opacity .15s; }
 .timeline-monitor:hover .monitor-fullscreen { opacity: 1; }
 .timeline-monitor:fullscreen { background: #000; }
@@ -264,10 +289,49 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .monitor-note:empty { display: none; }
 .timeline-monitor.showing-take video { display: block; }
 .timeline-monitor:not(.showing-take) video { display: none; }
-.timeline-transport { display: flex; align-items: center; gap: 9px; padding: 0 10px; border-bottom: 1px solid var(--line); color: var(--muted); font: 11px Consolas, monospace; }
-.timeline-transport button { border: 0; background: transparent; color: var(--ink); min-width: 28px; height: 30px; }
+/* The bar under the Monitor. It carries the transport, the edit tools, the zoom, the line mutes and
+   the master volume — the Director's report, 2026-08-21, that the tools were "up by the Director
+   Timeline header instead of down just below the [view] window in that bar".
+   **It wraps, and that is the whole responsive strategy.** Every control on this row is one the
+   Director reaches for mid-edit, so none of them may be hidden by a media query — this application
+   has a recorded defect where exactly that took three controls off the screen. Wrapping trades
+   height, which the row can have (`.timeline-main`'s middle track is `auto`), for reachability,
+   which it cannot do without. */
+.timeline-transport { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px; min-height: 42px; padding: 5px 10px; border-bottom: 1px solid var(--line); color: var(--muted); font: 11px Consolas, monospace; }
+/* Direct children only. The edit tools live in a `.timeline-tools` group inside this bar and are
+   `.quiet-button`/`.danger-button`, which have borders and a background on purpose; an unscoped
+   descendant selector stripped all four back to plain text. */
+.timeline-transport > button { border: 0; background: transparent; color: var(--ink); min-width: 28px; height: 30px; }
+.timeline-transport .divider { height: 20px; border-left: 1px solid var(--line); margin: 0 1px; }
+/* `display: contents` so the four edit buttons and the zoom cluster are flex items of the *bar*,
+   not of a group inside it. That is what lets the row wrap between individual controls at a narrow
+   width instead of a rigid 600px group overflowing the bar it sits in. The element stays in the
+   markup as the tools' name and as what the contract test looks for. */
+.timeline-transport .timeline-tools { display: contents; }
+.timeline-transport .quiet-button, .timeline-transport .danger-button { min-height: 28px; padding: 0 9px; font-size: 11px; }
+/* An icon button. Square, so a row of them reads as a toolbar, and the glyph is sized up because
+   `font-size: 11px` above is set for words. It carries its meaning in `aria-label` and `title`,
+   never in the glyph alone — the same rule this stylesheet applies to colour. `.danger-button`
+   keeps its red on top of this, so the destructive one is still not one of the others. */
+.icon-tool { width: 30px; padding: 0; font-size: 14px; line-height: 1; }
+/* A slider with a name on it. Two unlabelled sliders in one row is precisely the confusion that
+   produced "i see what i think is a zoom slider that isnt functional" — the Director was looking at
+   the volume. The label is a real `<label for>`, so clicking the word focuses the control and a
+   screen reader announces it, and it is small monospace caps like the rest of this bar. */
+.slider-field { display: inline-flex; align-items: center; gap: 5px; }
+.slider-field > label { display: inline; margin: 0; color: var(--dim); font: 9px Consolas, monospace; letter-spacing: .08em; }
+.slider-field input[type="range"] { height: 22px; padding: 0; }
 .timeline-spacer { flex: 1; }
-.timeline-scroll { position: relative; overflow: auto; }
+/* The one box the whole timeline scrolls in: four tracks, one ruler and one playhead share it, so
+   they share a scroll offset and can never drift out of alignment with each other. The scrollbars
+   are drawn explicitly because the platform's own are hairline-thin on this palette, and a
+   scrollbar nobody can see is the same defect as one nobody can reach. */
+.timeline-scroll { position: relative; overflow: auto; scrollbar-color: #4d5555 #141616; }
+.timeline-scroll::-webkit-scrollbar { width: 12px; height: 12px; }
+.timeline-scroll::-webkit-scrollbar-track { background: #141616; }
+.timeline-scroll::-webkit-scrollbar-thumb { background: #4d5555; border: 2px solid #141616; border-radius: 6px; }
+.timeline-scroll::-webkit-scrollbar-thumb:hover { background: #67732f; }
+.timeline-scroll::-webkit-scrollbar-corner { background: #141616; }
 .timeline-canvas { position: relative; min-width: 100%; width: 1200px; }
 .timeline-ruler { height: 28px; margin-left: 90px; border-bottom: 1px solid var(--line); background: repeating-linear-gradient(90deg, var(--line) 0 1px, transparent 1px 80px); }
 .ruler-label { position: absolute; top: 7px; color: var(--dim); font: 9px Consolas, monospace; transform: translateX(3px); }
@@ -294,14 +358,33 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .clip-card { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
 .clip-card video { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; }
 .clip-card footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 6px 8px; font-size: 10px; color: var(--muted); }
-.take-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; }
-.take-row span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.take-row.current span { color: var(--acid); }
+/* A take row is a **button**, the whole row of it. The Director's report, 2026-08-21: "i can see
+   the takes in the shot info window but clicking on either does nothing" — and in a browser that
+   was exactly true. The row was a `<span>` of text with a 40px live chip at its right end, so a
+   286px line that looks like a list item did nothing when clicked, which reads as broken even
+   though the chip beside it worked. Being a real `<button>` brings focus, Enter and Space with it,
+   and `:disabled` is what makes the current and pending rows read as deliberately closed rather
+   than as more inert text. */
+.take-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 1px 8px; width: 100%; padding: 6px 9px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-1); color: var(--ink); font: 11px Consolas, monospace; text-align: left; }
+.take-row .take-name { grid-column: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* What actually tells two takes of one shot apart: the seed and when the take landed. The
+   filename above it truncates to an ellipsis exactly where its serial number is, which is how two
+   takes came to look like one line printed twice. Full path stays in the row's tooltip. */
+.take-row .take-meta { grid-column: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--dim); font-size: 10px; }
+.take-row .take-chip { grid-column: 2; grid-row: 1 / span 2; align-self: center; padding: 3px 9px; border: 1px solid var(--line-strong); border-radius: 3px; color: var(--muted); font-size: 10px; }
+.take-row:not(:disabled):hover { border-color: var(--acid); background: #1b1f19; }
+.take-row:not(:disabled):hover .take-chip { border-color: var(--acid); color: var(--acid); }
+/* The one this shot already points at, and the one still rendering: dimmed, unfocusable, no
+   pointer. Non-actionable on purpose and saying so, rather than looking live and doing nothing —
+   which is the defect this row is the fix for. */
+.take-row:disabled { cursor: default; background: transparent; color: var(--muted); }
+.take-row.current .take-name { color: var(--acid); }
+.take-row.current .take-chip { border-color: var(--acid); color: var(--acid); }
 /* A take a newer render is about to displace, and the take that is coming. The rows say
    `Previous` and `Rendering` in their own words; these only make the words easier to find. */
-.take-row.displaced span, .take-row.pending span { color: var(--amber); }
+.take-row.displaced .take-name, .take-row.pending .take-name { color: var(--amber); }
+.take-row.displaced .take-chip, .take-row.pending .take-chip { border-color: var(--amber); color: var(--amber); }
 .take-row.pending { opacity: .8; }
-.take-row .use-take { flex: none; padding: 3px 10px; }
 .refs-track .track-content { overflow: visible; }
 .shot-clip { position: absolute; top: 12px; height: 82px; min-width: 40px; border: 1px solid #67732f; border-radius: 5px; background: #232919; color: var(--ink); overflow: hidden; user-select: none; }
 .shot-clip.selected { border-color: var(--acid); box-shadow: inset 0 -3px var(--acid); }
@@ -415,6 +498,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .snap-heading { color: var(--dim); font: 9px Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; margin-top: 6px; }
 .snap-move { color: var(--ink); font-family: Consolas, monospace; }
 .snap-skip { color: var(--muted); }
+/* Replace With / Cancel, in the asset inspector. Reuses the snap report's shell so the two
+   report-then-confirm surfaces in this application look like one idea; a swap reads as a
+   change and an "already have" reads as the subtraction it is. */
+.replace-panel { display: grid; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.snap-swap { color: var(--ink); font-family: Consolas, monospace; }
+.snap-merge { color: var(--muted); font-family: Consolas, monospace; }
+/* A take-provenance note: not a refusal — those shots are being changed — so it is set apart from
+   the lists rather than styled as a skip. Weight and a rule, never colour alone. */
+.snap-note { color: var(--ink); border-left: 2px solid var(--acid); padding-left: 8px; margin: 4px 0; }
 .queue-layout { display: grid; grid-template-columns: 1fr 300px; gap: 12px; }
 .queue-table, .finish-stack { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
 .queue-header, .job-row { display: grid; grid-template-columns: 1.4fr 1fr .7fr .6fr 1.2fr; gap: 10px; align-items: center; min-height: 48px; padding: 0 14px; border-bottom: 1px solid var(--line); }
@@ -495,6 +587,12 @@ dialog p { color: var(--muted); line-height: 1.5; }
      `.timeline-layout` to one column and lets the workspace scroll, so the panel simply stacks
      under the timeline. */
   .timeline-layout .shot-inspector { min-height: 320px; }
+  /* Back to a block below 860px. The panel-as-grid above exists to fit the timeline *inside* a
+     panel that cannot scroll; here the panel scrolls (see the two rules below), the layout is one
+     stacked column, and a `minmax(0, 1fr)` row would squeeze the tracks to nothing instead of
+     letting the workspace carry them. */
+  .timeline-panel.active { display: block; }
+  .timeline-layout { min-height: 500px; }
   .workspace { overflow: auto; }
   .panel { overflow: visible; }
 }
