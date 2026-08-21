@@ -3281,6 +3281,48 @@ def test_every_shot_sourced_submission_is_behind_the_readiness_gate():
     assert "Not submitted: no prompt on" in readiness_refusal(["shot_x"])
 
 
+def test_every_submitting_route_saves_its_job_record_before_it_submits():
+    """The Director's 2026-08-21 ruling, pinned at every call site including the next one.
+
+    The defect: these routes submitted the graph and *then* saved the job record. Once
+    `ProjectStore.save` gained its lost-update refusal, a save race therefore answered 409 for
+    a graph already queued — the GPU rendered, the take landed on disk, and nothing recorded
+    it. Reversed, the race refuses before a byte reaches ComfyUI, which is the cheap direction
+    to fail. The stated cost is an orphan if the process dies in the window, which is why the
+    record goes out carrying `PENDING_SUBMISSION_PROMPT_ID` rather than an empty id: the
+    reconciler settles it, where an empty id would read as local ffmpeg work.
+
+    Enumerated off the live app, exactly like the readiness gate above and for the same reason
+    — a submitting route added tomorrow is held to this the moment it exists, rather than when
+    somebody remembers to add it to a list.
+    """
+    for name, (source, _signature) in sorted(app_py_submitting_routes().items()):
+        # Comments dropped first: every one of these routes explains the ordering in a comment
+        # that quotes both `store.save` and `comfy.submit`, and an ordering assertion matching
+        # prose rather than code would be measuring its own explanation.
+        code = "\n".join(
+            line for line in source.splitlines() if not line.strip().startswith("#")
+        )
+        submit = code.index("comfy.submit")
+        assert "store.save(" in code, name
+        assert code.index("store.save(") < submit, (
+            f"{name} submits before it saves; a save race there costs GPU time"
+        )
+        # And what it saved is the record, in the state that survives the window.
+        assert "PENDING_SUBMISSION_PROMPT_ID" in code, name
+        assert code.index("PENDING_SUBMISSION_PROMPT_ID") < submit, name
+        # The record is *constructed* on the near side too. Building it afterwards from
+        # `submission.prompt_id` and saving a placeholder ahead of it would satisfy the two
+        # assertions above while recording nothing the reconciler could use.
+        assert code.index("RenderJob(") < submit, name
+        # The two halves that keep the window honest: a failed submission settles its record,
+        # and an accepted one adopts the real id — both strictly after the submission.
+        assert "settle_unsubmitted_jobs(" in code, name
+        assert code.index("settle_unsubmitted_jobs(") > submit, name
+        assert "accept_submission(" in code, name
+        assert code.index("accept_submission(") > submit, name
+
+
 def test_the_readiness_refusal_is_one_wording_shared_by_the_server_and_the_browser():
     """One rule refused in two places must be one sentence.
 
@@ -10747,6 +10789,320 @@ def test_the_long_window_clip_is_a_warning_and_not_a_block_anywhere():
 
 
 # --------------------------------------------------------------------------------------------
+# The window against its own take -- the Director's second yellow, 2026-08-21: "if the bounds of
+# the shots window are dragged beyond where that clip covers then the shot would turn yellow to
+# warn that the bounds was gone past."
+#
+# It composes with the band rather than inventing a second mechanism: the same `window_warnings`
+# list, the same `windowWarningsByShot` reader, the same amber, one more `kind`.
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_uncovered_take_draws_the_bands_amber_under_its_own_class_and_sentence():
+    """A second yellow the Director would have to learn as a second colour is the one thing this
+    must not be. Same amber, own class, own words -- and the words are what a screen reader gets,
+    so the class alone would be no state at all."""
+    from music_video_producer.batch import NOTE_KIND_TAKE_UNCOVERED
+
+    drawn = run_module("""
+      import { CLIP_TAKE_UNCOVERED_CLASS, NOTE_KIND_TAKE_UNCOVERED, clipWindowState,
+               windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const report = { window_warnings: [
+        { shot_ids: ['past'], labels: ['SHOT 03 (past)'], reason: 'off the end', kind: 'take_uncovered' },
+      ]};
+      console.log(JSON.stringify({
+        kind: NOTE_KIND_TAKE_UNCOVERED,
+        cls: CLIP_TAKE_UNCOVERED_CLASS,
+        byShot: windowWarningsByShot(report),
+        drawn: clipWindowState('take_uncovered'),
+        labelled: clipWindowState('take_uncovered', 'A corridor push-in.').label,
+      }));
+    """)
+    assert drawn["kind"] == NOTE_KIND_TAKE_UNCOVERED
+    assert drawn["byShot"] == {"past": "take_uncovered"}
+    assert drawn["drawn"]["className"] == drawn["cls"] == "take-uncovered"
+    assert drawn["drawn"]["note"]
+    # It says nothing was stopped, because nothing was: the Director ruled that this colours and
+    # never constrains, and a sentence that implied a refusal would undo the ruling in words.
+    assert "Nothing is stopped" in drawn["drawn"]["note"]
+    assert drawn["labelled"].startswith("A corridor push-in. — ")
+    assert drawn["drawn"]["note"] in drawn["labelled"]
+    # The same amber as the band, and the same two marks, in the stylesheet the Director sees.
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".shot-clip.take-uncovered { border-top: 2px solid var(--amber); }" in styles
+    assert ".shot-clip.take-uncovered .clip-id { color: var(--amber); }" in styles
+    assert ".plan-readiness li.take-uncovered { color: var(--amber); }" in styles
+
+
+def test_a_shot_that_is_both_long_and_uncovered_wears_the_coverage_state_and_reads_both_lines():
+    """Two notes, one clip. The clip has one border and one accessible name, so a precedence has
+    to exist and be *decided* rather than inherited from whichever check the server ran first --
+    and the readiness list still prints both sentences, because neither fact stops being true."""
+    verdicts = run_module("""
+      import { READINESS_TAKE_UNCOVERED_LABEL, READINESS_WINDOW_LONG_LABEL, clipWindowState,
+               readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const report = { window_warnings: [
+        { shot_ids: ['both'], labels: ['SHOT 01 (both)'], reason: 'past the band', kind: 'window_long' },
+        { shot_ids: ['both'], labels: ['SHOT 01 (both)'], reason: 'off the end of its take', kind: 'take_uncovered' },
+      ]};
+      // And the same pair in the other order, because a precedence that depended on list order
+      // would pass one of these two and fail the other.
+      const reversed = { window_warnings: [...report.window_warnings].reverse() };
+      console.log(JSON.stringify({
+        byShot: windowWarningsByShot(report),
+        byShotReversed: windowWarningsByShot(reversed),
+        drawn: clipWindowState(windowWarningsByShot(report).both, 'A push-in.'),
+        lines: readinessLines(report),
+        labels: [READINESS_WINDOW_LONG_LABEL, READINESS_TAKE_UNCOVERED_LABEL],
+      }));
+    """)
+    assert verdicts["byShot"] == {"both": "take_uncovered"}
+    assert verdicts["byShotReversed"] == verdicts["byShot"], (
+        "the clip's state depends on the order the server listed two notes in, which is not a "
+        "decision anyone made"
+    )
+    assert verdicts["drawn"]["className"] == "take-uncovered"
+    # Both lines, each under its own name, and neither under the other's.
+    kinds = [line["kind"] for line in verdicts["lines"]]
+    assert kinds == ["window-long", "take-uncovered"], kinds
+    long_label, uncovered_label = verdicts["labels"]
+    assert verdicts["lines"][0]["text"].startswith(long_label)
+    assert verdicts["lines"][1]["text"].startswith(uncovered_label)
+    assert uncovered_label not in verdicts["lines"][0]["text"]
+    # The server's whole sentence, passed through and never reworded here.
+    assert verdicts["lines"][1]["reason"] == "off the end of its take"
+
+
+def test_the_coverage_verdict_the_browser_reads_is_the_one_the_route_answers_with():
+    """End to end over a real report, on `test_the_window_verdict_...`'s own argument: a field
+    renamed on either side leaves every clip plain for ever with the whole suite green."""
+    from music_video_producer.batch import readiness_report
+
+    #: A take recorded for a 5 s window at 10 s: 141 frames of picture (5.875 s), beginning
+    #: 0.25 s before the window. The nudge is what a locked move-drag of +1 s writes.
+    def take(**overrides):
+        fields = {
+            "start": 10.0, "duration": 5.0, "prompt": "A corridor push-in.", "mode": "text",
+            "latest_output": "shots/x_00001.mp4", "latest_take_lead": 0.25,
+            "latest_take_start": 10.0, "latest_take_duration": 5.0, "trim_nudge": 0.0,
+        }
+        return Shot(**{**fields, **overrides})
+
+    project = Project(
+        name="Band",
+        shots=[
+            take(id="past", trim_nudge=1.0),
+            take(id="fine", start=20.0, latest_take_start=20.0, prompt="A steady mid."),
+            # No snapshot: every take rendered before 2026-08-21 and every hand-picked clip.
+            take(
+                id="legacy", start=30.0, latest_take_duration=0.0, trim_nudge=9.0,
+                prompt="An older take of the hands.",
+            ),
+        ],
+    )
+    report = readiness_report(project)
+    payload = json.loads(json.dumps(asdict(report)))
+    verdicts = run_module(
+        f"const report = {json.dumps(payload)};"
+        """
+      import { clipWindowState, readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const byShot = windowWarningsByShot(report);
+      console.log(JSON.stringify({
+        byShot,
+        past: clipWindowState(byShot.past, 'A corridor push-in.'),
+        fine: clipWindowState(byShot.fine, 'A steady mid.'),
+        legacy: clipWindowState(byShot.legacy, 'An older take.'),
+        lines: readinessLines(report).map((line) => line.text),
+      }));
+        """
+    )
+    # Only the shot whose window really left its take, and never the one that cannot be checked.
+    assert verdicts["byShot"] == {"past": "take_uncovered"}
+    assert verdicts["past"]["className"] == "take-uncovered"
+    assert verdicts["fine"] == {"className": "", "note": "", "label": "A steady mid."}
+    assert verdicts["legacy"] == {"className": "", "note": "", "label": "An older take."}
+    assert len(verdicts["lines"]) == 1, verdicts["lines"]
+    assert verdicts["lines"][0].startswith("Past the take - SHOT 01 (past): ")
+    assert "does not block submission" in verdicts["lines"][0]
+    # The server's own numbers, reaching the Director unreworded.
+    assert "5.875s of picture" in verdicts["lines"][0], verdicts["lines"][0]
+
+
+def test_the_uncovered_clip_is_a_warning_and_not_a_block_anywhere():
+    """The band's negative scan, run again for the second yellow: what must not exist is a branch
+    in the client that reads this kind and shuts something. The Director was explicit that the
+    warning must never constrain -- a guard here would take away the b-roll repositioning the
+    trim nudge exists for."""
+    for source, name in ((API_JS, "api.js"), (APP_JS, "app.js")):
+        for line in source.read_text(encoding="utf-8").splitlines():
+            if "take_uncovered" not in line and "TAKE_UNCOVERED" not in line:
+                continue
+            if line.strip().startswith(("//", "//:", "*")):
+                continue
+            assert "disabled" not in line, f"{name} shuts a control from the coverage state: {line}"
+            assert "refus" not in line.lower(), f"{name} refuses from the coverage state: {line}"
+    # And no clamp was added to the move-drag on coverage grounds: the compensation is written
+    # from the window's own movement and nothing bounds it.
+    clip_drag = APP_JS.read_text(encoding="utf-8").split("function bindClip(clip) {", 1)[1]
+    move = clip_drag.split('if (mode === "move") {', 1)[1].split("\n      }", 1)[0]
+    assert "clamp(" not in without_comments(move), (
+        "the locked move-drag clamps, which stops the gesture instead of colouring it -- the "
+        "Director ruled that the warning must never constrain"
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# The music lock, beside the trim nudge. The Director's ask, 2026-08-21: "Perhaps a lock/unlock
+# from timeline toggle in the shots info panel may be useful next to that nudge input so that
+# dragging a b-roll clip would be easier (default locked)."
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_music_lock_defaults_locked_and_is_meaningless_without_a_take():
+    """Three states, executed rather than read: locked (the default), unlocked for this one shot,
+    and a shot with no take -- where the toggle is not drawn at all, because a live control that
+    does nothing is a worse answer than no control."""
+    states = run_module("""
+      import { TAKE_ANCHOR_CONTROL, TAKE_ANCHOR_HELP, TAKE_ANCHOR_LABEL, takeAnchorControl,
+               trimNudgeControl }
+        from './src/music_video_producer/web/assets/api.js';
+      const rendered = { id: 'a', latest_output: 'shots/a_00001.mp4', latest_take_lead: 0.25 };
+      const bare = { id: 'b', latest_output: '' };
+      console.log(JSON.stringify({
+        locked: takeAnchorControl(rendered),
+        lockedExplicit: takeAnchorControl(rendered, false),
+        unlocked: takeAnchorControl(rendered, true),
+        bare: takeAnchorControl(bare),
+        bareUnlocked: takeAnchorControl(bare, true),
+        absent: takeAnchorControl(),
+        // Drawn on exactly the shots the nudge row is drawn on, because it lives inside it.
+        nudgeShown: trimNudgeControl(rendered).shown,
+        nudgeBare: trimNudgeControl(bare).shown,
+        control: TAKE_ANCHOR_CONTROL, label: TAKE_ANCHOR_LABEL, help: TAKE_ANCHOR_HELP,
+      }));
+    """)
+    # Default locked, which is the Director's own word for it.
+    assert states["locked"]["held"] is True
+    assert states["lockedExplicit"] == states["locked"]
+    assert states["locked"]["shown"] is True
+    # Unlocked for this shot: the take travels with the window again, which is what a b-roll
+    # reposition wants.
+    assert states["unlocked"] == {**states["locked"], "held": False}
+    # No take, no lock -- in either direction, and with no arguments at all.
+    assert states["bare"]["shown"] is False and states["bare"]["held"] is False
+    assert states["bareUnlocked"]["held"] is False
+    assert states["absent"]["shown"] is False and states["absent"]["held"] is False
+    assert states["nudgeShown"] is True and states["nudgeBare"] is False
+    # The label names the state a tick means, and the help names both states and says plainly
+    # that this is not the shot lock two rows above it.
+    assert states["label"] == "Locked to the music"
+    assert "Unlocked" in states["help"] and "b-roll" in states["help"]
+    assert "not the shot lock" in states["help"]
+    assert "session only" in states["help"]
+
+
+def test_the_lock_is_session_state_and_never_a_field_on_the_shot():
+    """The persistence decision, asserted rather than described. A per-shot persisted flag means a
+    new model field, and this repository's recorded guard hole is the generic full-project `PUT`
+    writing every defaulted field back -- so a new field earns its keep or it is not added. This
+    one would not: what is durable about a b-roll clip is where it sits, and where it sits is
+    `start`/`trim_nudge`, which are persisted fields this gesture already writes.
+
+    It also fails closed. A persisted unlock would sit on a lip-sync shot for ever and let a drag
+    months later pull its take off the words it was rendered against -- the exact failure the
+    Director asked for this to prevent."""
+    models = Path("src/music_video_producer/models.py").read_text(encoding="utf-8")
+    for spelling in ("take_anchor", "timeline_lock", "unlocked_from_music", "music_lock"):
+        assert spelling not in models, f"the music lock became a model field ({spelling})"
+    app = APP_JS.read_text(encoding="utf-8")
+    # Held as a set of ids in the browser, and never put on a shot object that a save would carry.
+    assert "const unlockedFromMusic = new Set();" in app
+    assert "shot.take_anchor" not in app and "shot.timeline_lock" not in app
+    # Cleared when the project on screen changes, and *only* then: a refresh must not re-tick the
+    # box under a Director mid-gesture, and the ids would otherwise collide across projects.
+    load = app_js_block("async function loadProject(id) {", "\nasync function")
+    assert "unlockedFromMusic.clear();" in load
+    cleared = load.split("unlockedFromMusic.clear();", 1)[0]
+    assert "documentConsentClearedOnLoad(state.project?.id, id)" in cleared.split("\n")[-3]
+
+
+def test_a_locked_move_drag_writes_the_nudge_and_an_unlocked_one_leaves_it_alone():
+    """The gesture reassignment itself, read off the drag handler. The rule was already in this
+    file for the *left edge*; this is the same rule reaching the gesture the Director described.
+
+    Read as source because a `pointermove` handler is not reachable from node -- the behaviour is
+    driven in a real browser by `tests/e2e_timeline_edit.py`, which reads the plan back off disk
+    and checks the song second the take lands on."""
+    # Anchored inside `bindClip`, not merely on the first `mode === "move"` in the file -- the
+    # section pills have a move branch of their own, and it is not this gesture.
+    clip_drag = APP_JS.read_text(encoding="utf-8").split("function bindClip(clip) {", 1)[1]
+    move = without_comments(
+        clip_drag.split('if (mode === "move") {', 1)[1].split("\n      }", 1)[0]
+    )
+    # The window moves exactly as it always did.
+    assert "shot.start = Math.max(0, grid(original.start + snapped));" in move
+    # And the nudge follows it, by the window's *own* movement rather than by the pointer's, so a
+    # drag clamped at the head of the song does not slide the take.
+    assert (
+        "if (takeAnchor(shot).held) "
+        "shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));"
+    ) in move
+    # The same expression the left edge and the playhead snap write: one rule, three gestures.
+    #
+    # `exactSeconds` and never `grid`, which is a defect a browser measured on 2026-08-21: the
+    # window steps to the frame grid, so a window that did not start on the grid moves by an
+    # off-grid amount, and re-gridding the compensation rounds it to a different number than the
+    # window moved by. A 1.608 s move of a shot starting at 32.517 s wrote a 1.625 s nudge and put
+    # the take 17 ms off the music -- with every offline assertion in this file passing.
+    compensation = "shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));"
+    edge = without_comments(app_js_block("if (shot.latest_output) {", "\n        }"))
+    assert compensation in edge
+    snap = without_comments(app_js_block("function applyPlayheadSnap(", "\n}"))
+    assert compensation in snap
+    assert "grid(original.nudge" not in APP_JS.read_text(encoding="utf-8"), (
+        "a compensation is re-gridded somewhere, which rounds it away from the seconds the "
+        "window actually moved and puts the take off the music by up to half a frame"
+    )
+    # The toggle and the drag read one function, so the box on screen and the gesture can never
+    # disagree -- and that function is the contract-tested one, not a re-derivation.
+    anchor = without_comments(app_js_block("function takeAnchor(shot) {", "\n}"))
+    assert "takeAnchorControl(shot, unlockedFromMusic.has(shot?.id))" in anchor
+    # The release still saves a move whose only change was the nudge: `moved()` compares it.
+    up = without_comments(app_js_block("const moved = () =>", ";"))
+    assert "(shot.trim_nudge || 0) !== original.nudge" in up
+
+
+def test_the_lock_is_drawn_next_to_the_nudge_and_writes_nothing_when_toggled():
+    """"next to that nudge input" -- so it is inside the trim-nudge row, which also makes it
+    appear on exactly the shots the nudge appears on. Toggling saves nothing: it changes what the
+    *next* drag does, and the plan on disk is untouched until that drag happens."""
+    inspector = APP_JS.read_text(encoding="utf-8").split("export function renderShotInspector()", 1)[1]
+    inspector = inspector.split("\nfunction updateShotFromInspector", 1)[0]
+    assert "const anchor = takeAnchor(shot);" in inspector
+    assert 'const anchorHtml = anchor.shown' in inspector
+    # Inside the nudge row, after Reset and before the offset readout.
+    nudge_row = inspector.split('<div class="trim-nudge" id="trim-nudge">', 1)[1].split("</div>", 1)[0]
+    assert "${anchorHtml}" in nudge_row
+    assert nudge_row.index("nudge-reset") < nudge_row.index("${anchorHtml}")
+    assert nudge_row.index("${anchorHtml}") < nudge_row.index("control-reason")
+    # Bound to the id the control decided, never to a literal typed twice.
+    handler = without_comments(
+        inspector.split('$("#" + anchor.control)?.addEventListener("change"', 1)[1]
+        .split("});", 1)[0]
+    )
+    assert "unlockedFromMusic.delete(shot.id)" in handler
+    assert "unlockedFromMusic.add(shot.id)" in handler
+    assert "saveShotsSilently" not in handler, "toggling the lock wrote the plan to the server"
+    assert "renderTimeline" not in handler, (
+        "toggling the lock rebuilds the panel under the Director's own click, which is this "
+        "application's recorded way of losing the control they just pressed"
+    )
+
+
+# --------------------------------------------------------------------------------------------
 # Fill section looks: the browser half. The Director's report (2026-08-20) was made *at* the
 # section inspector — "I clicked on a Section in the timeline and noticed that the shared prompt
 # wasnt pre-filled with information from the Treatment" — so the control lives there, and the
@@ -11173,3 +11529,387 @@ def test_a_gesture_saved_after_another_writer_moved_the_project_records_nothing(
         "is the plan from before that writer -- pressing it would revert their work"
     )
     assert "Nothing to undo" in driven["afterForeign"]["name"], driven["afterForeign"]
+
+
+# ------------------------------------------------------------------------------------------------
+# The seed's randomize toggle, and the Assets panel's subtabs (the Director's asks, 2026-08-20).
+# ------------------------------------------------------------------------------------------------
+
+
+def test_a_queued_retake_moves_its_seed_by_exactly_one_rule():
+    """`nextRenderSeed` is the only place a retake's seed moves, so the two sources cannot fight.
+
+    There are two of them now: the server's own RESUBMIT_SEED_STRIDE, which the lone-click
+    render-again has applied since 2026-08-19, and the Director's randomize toggle. Applying both
+    would put an invisible drift on the one value the Director has just asked to own; applying
+    neither would resubmit at the same seed and prompt, which reproduces the identical take and
+    reads as "nothing was replaced".
+
+    Driven with an injected `random`, so the edges are exercised rather than sampled.
+    """
+    from music_video_producer.app import RESUBMIT_SEED_STRIDE
+
+    moved = run_module("""
+      import { RANDOM_SEED_MAX, RANDOM_SEED_MIN, RESUBMIT_SEED_STRIDE, nextRenderSeed, randomSeed }
+        from './src/music_video_producer/web/assets/api.js';
+      const at = (value) => () => value;
+      console.log(JSON.stringify({
+        min: RANDOM_SEED_MIN,
+        max: RANDOM_SEED_MAX,
+        stride: RESUBMIT_SEED_STRIDE,
+        // Randomize off: the stride, exactly as before this toggle existed.
+        fixed: nextRenderSeed({ seed: 7 }, false, at(0.5)),
+        fixedFromZero: nextRenderSeed({ seed: 0 }, false, at(0.5)),
+        fixedMissing: nextRenderSeed({}, false, at(0.5)),
+        // Randomize on: a roll INSTEAD of the stride, never as well as it.
+        rolledLow: nextRenderSeed({ seed: 7 }, true, at(0)),
+        rolledHigh: nextRenderSeed({ seed: 7 }, true, at(0.9999999999)),
+        rolledMid: nextRenderSeed({ seed: 7 }, true, at(0.5)),
+        // A roll that lands on the seed already stored is nudged on: the gesture's whole point
+        // is a DIFFERENT take.
+        collision: nextRenderSeed({ seed: 50000 }, true, at(0.5)),
+        collisionAtCeiling: nextRenderSeed({ seed: RANDOM_SEED_MAX }, true, at(0.9999999999)),
+        // The roll itself, at both ends and past them.
+        rollFloor: randomSeed(at(0)),
+        rollCeiling: randomSeed(at(0.9999999999)),
+        rollOverflow: randomSeed(at(1)),
+      }));
+    """)
+
+    assert moved["stride"] == RESUBMIT_SEED_STRIDE
+    assert moved["min"] == 1 and moved["max"] == 99999
+
+    # Randomize off is byte-for-byte the behaviour that shipped: the server's own stride.
+    assert moved["fixed"] == 7 + RESUBMIT_SEED_STRIDE
+    assert moved["fixedFromZero"] == RESUBMIT_SEED_STRIDE
+    assert moved["fixedMissing"] == RESUBMIT_SEED_STRIDE
+
+    # Randomize on replaces the stride rather than adding to it -- every one of these is inside
+    # the Director's 1-99999, and none of them is `seed + 101`.
+    for case in ("rolledLow", "rolledHigh", "rolledMid", "collision", "collisionAtCeiling"):
+        assert 1 <= moved[case] <= 99999, (case, moved[case])
+        assert moved[case] != 7 + RESUBMIT_SEED_STRIDE, case
+    assert moved["rolledLow"] == 1
+    assert moved["rolledHigh"] == 99999
+    assert moved["rolledMid"] == 50000
+
+    # ...and never the number already stored.
+    assert moved["collision"] == 50001
+    assert moved["collisionAtCeiling"] == 1
+
+    # The roll is clamped into the bounds at both ends, including the `Math.random() === 1` that
+    # the specification forbids and no engine promises never to hand back.
+    assert moved["rollFloor"] == 1
+    assert moved["rollCeiling"] == 99999
+    assert moved["rollOverflow"] == 99999
+
+
+def test_randomize_rolls_once_holds_across_redraws_and_is_cleared_by_a_hand_typed_seed():
+    """The toggle's whole behaviour, executed: roll on tick, hold, re-roll only on Render again.
+
+    The Director asked for a number that "would RNG a number and hold it unless regenerate gets hit
+    later with randomize still checked", so the three claims worth executing are that ticking
+    writes a seed, that redrawing the panel does not write another one, and that typing a number by
+    hand takes the toggle back off -- typing a specific seed is a statement that you want that seed.
+    """
+    driven = run_workspace(r"""
+      // A fixed roll, so the assertions are about the rule rather than about luck.
+      Math.random = () => 0.5;
+      const project = () => ({
+        id: 'p1', assets: [], jobs: [], song: null, messages: [],
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+                  mode: 'text', asset_ids: [], citations: [], reference_labels: {},
+                  use_song_audio: false, seed: 12, status: 'complete', prompt_id: 'p-1',
+                  latest_output: '', approved_output: '', locked: false }],
+      });
+      state.project = project();
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      const before = at('#shot-inspector').innerHTML;
+
+      // Tick it. One roll, written through the ordinary silent shot save.
+      requests.length = 0;
+      fire('#shot-seed-randomize:change', { target: { checked: true } });
+      await flush();
+      const afterTick = {
+        seed: state.project.shots[0].seed,
+        html: at('#shot-inspector').innerHTML,
+        writes: requests.filter((item) => item.method === 'PUT').length,
+      };
+
+      // Redraw the panel the way every unawaited reply in this application does. It must not roll
+      // again: "hold it" is the Director's own word.
+      requests.length = 0;
+      app.renderShotInspector();
+      app.renderShotInspector();
+      const afterRedraw = {
+        seed: state.project.shots[0].seed,
+        html: at('#shot-inspector').innerHTML,
+        writes: requests.filter((item) => item.method === 'PUT').length,
+      };
+
+      // Type a seed by hand. That clears the toggle, in the same gesture.
+      at('#shot-seed').value = '4242';
+      fire('#shot-seed:change', {});
+      await flush();
+      const afterTyping = {
+        seed: state.project.shots[0].seed,
+        html: at('#shot-inspector').innerHTML,
+      };
+
+      // Unticking writes nothing and keeps the number: it becomes an ordinary fixed seed.
+      fire('#shot-seed-randomize:change', { target: { checked: true } });
+      await flush();
+      const rolledAgain = state.project.shots[0].seed;
+      requests.length = 0;
+      fire('#shot-seed-randomize:change', { target: { checked: false } });
+      await flush();
+      // Read after a redraw, deliberately: unticking re-renders nothing (the browser has already
+      // cleared the box the Director clicked), so the markup still on screen is the markup from
+      // before the click. What has to be true is that the NEXT rebuild draws it off.
+      const untickedWrites = requests.filter((item) => item.method === 'PUT').length;
+      app.renderShotInspector();
+      const afterUntick = {
+        seed: state.project.shots[0].seed,
+        writes: untickedWrites,
+        html: at('#shot-inspector').innerHTML,
+      };
+
+      const ticked = (html) => /id="shot-seed-randomize"[^>]*\schecked/.test(html);
+      console.log(JSON.stringify({
+        beforeTicked: ticked(before),
+        afterTick: { ...afterTick, ticked: ticked(afterTick.html) },
+        afterRedraw: { ...afterRedraw, ticked: ticked(afterRedraw.html) },
+        afterTyping: { ...afterTyping, ticked: ticked(afterTyping.html) },
+        rolledAgain,
+        afterUntick: { ...afterUntick, ticked: ticked(afterUntick.html) },
+        shortBox: /class="seed-field"/.test(afterTick.html),
+        label: afterTick.html.includes('Randomize on Render again'),
+      }));
+    """)
+
+    # It ships off. Nothing rolls a seed until the Director asks for one.
+    assert driven["beforeTicked"] is False
+
+    # Ticking rolls once, inside the Director's bounds, and saves it -- so the number on screen is
+    # the number a render would use, rather than a promise about a future one.
+    assert driven["afterTick"]["seed"] == 50000
+    assert driven["afterTick"]["ticked"] is True
+    assert driven["afterTick"]["writes"] == 1
+
+    # It holds. Two redraws, no roll, no write.
+    assert driven["afterRedraw"]["seed"] == 50000
+    assert driven["afterRedraw"]["ticked"] is True
+    assert driven["afterRedraw"]["writes"] == 0
+
+    # Typing a number by hand takes the toggle off, and the typed number stands.
+    assert driven["afterTyping"]["seed"] == 4242
+    assert driven["afterTyping"]["ticked"] is False, (
+        "a hand-typed seed left the randomizer armed, so the next Render again would throw the "
+        "Director's own number away"
+    )
+
+    # Unticking is not an undo: the rolled number stays, as an ordinary fixed seed, and nothing
+    # is written.
+    assert driven["rolledAgain"] == 50000
+    assert driven["afterUntick"]["seed"] == 50000
+    assert driven["afterUntick"]["ticked"] is False
+    assert driven["afterUntick"]["writes"] == 0
+
+    # The box is the shortened one, and the label names the moment it re-rolls rather than
+    # leaving it to be guessed.
+    assert driven["shortBox"] is True
+    assert driven["label"] is True
+
+
+def test_the_randomize_help_names_the_re_roll_moment_and_the_two_gestures_that_are_not_it():
+    """A toggle whose re-roll moment has to be guessed is worse than a button.
+
+    So the help text has to name the gesture that re-rolls in the inspector's own word for it, and
+    the two nearby gestures that do not -- Mark ready queues nothing, and Generate All strides on
+    the server without reading this box at all.
+    """
+    help_text = run_module("""
+      import { RANDOM_SEED_HELP, RANDOM_SEED_LABEL, RANDOM_SEED_CONTROL, RENDER_AGAIN_LABEL,
+        MARK_READY_LABEL } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        help: RANDOM_SEED_HELP, label: RANDOM_SEED_LABEL, control: RANDOM_SEED_CONTROL,
+        renderAgain: RENDER_AGAIN_LABEL, markReady: MARK_READY_LABEL,
+      }));
+    """)
+
+    assert help_text["control"] == "shot-seed-randomize"
+    # The label alone answers "when does this re-roll", without a hover.
+    assert help_text["renderAgain"] in help_text["label"], help_text["label"]
+    assert "1-99999" in help_text["help"].replace("–", "-")
+    assert help_text["renderAgain"] in help_text["help"]
+    assert help_text["markReady"].split(" to ")[0] in help_text["help"]
+    assert "Generate All" in help_text["help"]
+    # And it says which of the two answers to "does this stick" is true.
+    assert "not saved into the project" in help_text["help"]
+
+
+def test_the_asset_subtabs_cover_every_asset_kind_the_model_allows():
+    """An asset under no tab is one a Director can neither cite, replace nor delete from here.
+
+    `models.AssetKind` has seven members and the Director named four subtabs, so this is the guard
+    that the three they did not name -- `image`, `audio`, `video` -- landed somewhere rather than
+    being dropped, and that a kind added later cannot go invisible by omission.
+    """
+    tabs = run_module("""
+      import { ASSET_TABS, ASSET_TAB_DEFAULT, assetTab }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        tabs: ASSET_TABS.map((tab) => ({ id: tab.id, label: tab.label, kinds: tab.kinds })),
+        fallback: assetTab('a-tab-that-was-removed').id,
+        byDefault: assetTab(undefined).id,
+        declaredDefault: ASSET_TAB_DEFAULT,
+      }));
+    """)
+
+    ids = [tab["id"] for tab in tabs["tabs"]]
+    # The Director's four, the clips as their own subtab, and All kept because it is the strip's
+    # existing behaviour.
+    assert ids == ["all", "character", "setting", "prop", "style", "media", "clips"], ids
+
+    covered = set()
+    for tab in tabs["tabs"]:
+        if tab["id"] == "all":
+            assert tab["kinds"] is None, "the All tab must not be a hand-maintained kind list"
+            continue
+        covered.update(tab["kinds"] or [])
+    assert covered == set(get_args(AssetKind)), (
+        "these asset kinds appear under no subtab, so an asset of that kind is invisible and "
+        f"undeletable from the Assets panel: {sorted(set(get_args(AssetKind)) - covered)}"
+    )
+    # No kind is claimed by two tabs, or the same asset is drawn under two headings.
+    listed = [kind for tab in tabs["tabs"] if tab["kinds"] for kind in tab["kinds"]]
+    assert len(listed) == len(set(listed)), listed
+    # The clips tab is not an asset view at all, and says so by carrying no kinds.
+    assert dict(zip(ids, [tab["kinds"] for tab in tabs["tabs"]]))["clips"] == []
+
+    # An unknown stored tab lands on a real one rather than emptying the panel.
+    assert tabs["fallback"] == tabs["declaredDefault"] == "all"
+    assert tabs["byDefault"] == "all"
+
+
+def test_each_asset_subtab_filters_its_own_kinds_and_says_so_when_it_is_empty():
+    """Decided once, so the grid and the message under it cannot disagree about the count."""
+    sorted_out = run_module("""
+      import { ASSET_TABS, assetsForTab, assetTabEmpty }
+        from './src/music_video_producer/web/assets/api.js';
+      const assets = [
+        { id: 'a1', kind: 'character', name: 'Lucy' },
+        { id: 'a2', kind: 'setting', name: 'Corridor' },
+        { id: 'a3', kind: 'prop', name: 'Red guitar' },
+        { id: 'a4', kind: 'style', name: 'Grain plate' },
+        { id: 'a5', kind: 'image', name: 'Reference still' },
+        { id: 'a6', kind: 'audio', name: 'Room tone' },
+        { id: 'a7', kind: 'video', name: 'Stock plate' },
+      ];
+      const per = {};
+      for (const tab of ASSET_TABS) per[tab.id] = assetsForTab(assets, tab.id).map((a) => a.id);
+      console.log(JSON.stringify({
+        per,
+        searched: assetsForTab(assets, 'all', 'RED').map((a) => a.id),
+        searchedOffTab: assetsForTab(assets, 'character', 'red').map((a) => a.id),
+        emptyOnEmptyProject: Object.fromEntries(
+          ASSET_TABS.map((tab) => [tab.id, assetTabEmpty(tab.id)])),
+        emptySearch: assetTabEmpty('prop', 'zzz'),
+      }));
+    """)
+
+    per = sorted_out["per"]
+    assert per["all"] == ["a1", "a2", "a3", "a4", "a5", "a6", "a7"]
+    assert per["character"] == ["a1"]
+    assert per["setting"] == ["a2"]
+    assert per["prop"] == ["a3"]
+    assert per["style"] == ["a4"]
+    # The three kinds the Director did not name, together, under one honest heading.
+    assert per["media"] == ["a5", "a6", "a7"]
+    # The clips tab shows no assets at all: it is the take library.
+    assert per["clips"] == []
+
+    # The search box is case-insensitive and applies within the tab, not across it.
+    assert sorted_out["searched"] == ["a3"]
+    assert sorted_out["searchedOffTab"] == []
+
+    # Every tab says something specific when it is empty. "No matching assets" under a tab a
+    # Director deliberately opened reads as a panel that failed to load.
+    messages = sorted_out["emptyOnEmptyProject"]
+    titles = {tab: message["title"] for tab, message in messages.items()}
+    assert len(set(titles.values())) == len(titles), titles
+    for tab, message in messages.items():
+        assert message["title"] and message["hint"], tab
+    assert titles["clips"] == "No clips yet"
+    assert "H3 take" in messages["clips"]["hint"]
+    assert titles["character"] == "No characters yet"
+    assert titles["media"] == "No media yet"
+    # A search that matched nothing says so, and says how to get back.
+    assert "zzz" in sorted_out["emptySearch"]["title"]
+    assert "search" in sorted_out["emptySearch"]["hint"].lower()
+
+
+def test_the_assets_panel_shows_exactly_one_pane_per_subtab():
+    """The Director's report, executed: "the generated clips are eating up all the room".
+
+    They were drawn *under* the asset grid, in the same scrolling panel, so thirty-three takes
+    pushed the sorted sections out of view. What has to be true now is that exactly one of the two
+    panes is on screen at a time -- a claim about the running panel, which is why `renderAssets` is
+    executed here rather than read.
+    """
+    panes = run_workspace("""
+      state.project = {
+        id: 'p1', song: null, messages: [], shots: [{ id: 'shot_a', start: 0, duration: 5 }],
+        assets: [
+          { id: 'a1', kind: 'character', name: 'Lucy', source: 'flux', path: '', prompt_id: '' },
+          { id: 'a2', kind: 'image', name: 'Reference still', source: 'upload',
+            path: 'media/x.png', prompt_id: '' },
+        ],
+        jobs: [
+          { id: 'j1', kind: 'h3', status: 'complete', target_id: 'shot_a', seed: 3,
+            output_files: ['out/shot_a-h3_00001-audio.mp4'] },
+        ],
+      };
+      const show = (tab) => {
+        state.assetTab = tab;
+        app.renderAssets();
+        return {
+          gridHidden: at('#asset-grid').hidden === true,
+          clipsHidden: at('#clips-library').hidden === true,
+          grid: at('#asset-grid').innerHTML,
+          clips: at('#clips-library').innerHTML,
+        };
+      };
+      console.log(JSON.stringify({
+        all: show('all'),
+        characters: show('character'),
+        props: show('prop'),
+        media: show('media'),
+        clips: show('clips'),
+      }));
+    """)
+
+    # Every asset tab shows the grid and hides the clips; the clips tab does the opposite. Exactly
+    # one, on every tab -- neither both (the report) nor neither (a blank panel).
+    for tab in ("all", "characters", "props", "media"):
+        assert panes[tab]["gridHidden"] is False, tab
+        assert panes[tab]["clipsHidden"] is True, (
+            f"the clips library is still on screen under the {tab} tab, which is the Director's "
+            "report unfixed"
+        )
+    assert panes["clips"]["gridHidden"] is True
+    assert panes["clips"]["clipsHidden"] is False
+
+    # ...and the panes really hold what their tab promises.
+    assert "Lucy" in panes["all"]["grid"] and "Reference still" in panes["all"]["grid"]
+    assert "Lucy" in panes["characters"]["grid"]
+    assert "Reference still" not in panes["characters"]["grid"]
+    assert "Reference still" in panes["media"]["grid"]
+    assert "Lucy" not in panes["media"]["grid"]
+    # An empty tab says so honestly rather than looking broken.
+    assert "No props yet" in panes["props"]["grid"]
+    # The clips pane is built whichever tab is showing -- `hidden` decides what is seen, so the
+    # count on the tab and the rows behind it are always the same list.
+    assert "shot_a-h3_00001-audio.mp4" in panes["all"]["clips"]
+    assert "Generated clips" in panes["clips"]["clips"]

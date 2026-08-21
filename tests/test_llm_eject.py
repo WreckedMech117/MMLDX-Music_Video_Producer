@@ -927,3 +927,77 @@ async def test_what_the_eject_did_is_reported_as_residency_and_never_as_a_vram_f
     assert last["resident_after"] == []
     # Nothing in the payload is or could become a free-VRAM figure.
     assert set(last) == {"status", "detail", "resident_before", "resident_after"}
+
+
+# --------------------------------------------------------------------------------------
+# The eject and the record-first ordering (the Director's 2026-08-21 ruling)
+#
+# Submission routes now save their job record *before* `comfy.submit`. The eject lives
+# inside `submit`, so its position relative to the graph has not moved — and the pair below
+# is what says so from both sides: it still fires for a submission that happens, and it does
+# not fire for one that never does. A hook lifted into the routes to "eject earlier" would
+# pass the first of these and fail the second, releasing the Director's model for a render
+# that was refused before it started.
+# --------------------------------------------------------------------------------------
+
+
+def h3_shot_app(tmp_path: Path, ejector):
+    """`submitting_app` plus one saved Shot the H3 route will submit."""
+    from music_video_producer.models import Project, Shot
+
+    app, client, submitted = submitting_app(tmp_path, ejector)
+    project = app.state.store.create(Project(name="Eject ordering"))
+    project.shots = [
+        Shot(start=3, duration=5, prompt="A singer turns toward camera", status="ready")
+    ]
+    app.state.store.save(project)
+    return app, client, submitted, project
+
+
+async def test_the_eject_still_fires_before_a_submission_the_record_was_saved_for(
+    tmp_path: Path,
+):
+    """The record moved ahead of the graph; the eject did not move behind it."""
+    host = Host(listing("qwen"), listing())
+    unloader = FakeUnloader()
+    app, client, submitted, project = h3_shot_app(tmp_path, make_ejector(host, unloader))
+
+    response = client.post(
+        f"/api/projects/{project.id}/shots/{project.shots[0].id}/generate/h3", json={}
+    )
+
+    assert response.status_code == 202, response.text
+    assert len(unloader.calls) == 1, "the model was not released before the render"
+    assert submitted == ["/prompt"]
+    # And the record the route saved first carries the id ComfyUI actually answered with.
+    assert app.state.store.get(project.id).jobs[0].prompt_id == "prompt-1"
+
+
+async def test_a_save_race_before_the_submit_never_reaches_the_eject(tmp_path: Path):
+    """The eject must not fire for a submission that never happens.
+
+    Releasing the Director's language model is not free — it is the thing they have to reload
+    afterwards — so it may only be spent on a render that is actually going out. The route now
+    refuses ahead of `comfy.submit`, and because the hook lives inside `submit` the refusal
+    reaches it first: nothing is unloaded, and the host is not even probed.
+    """
+    from music_video_producer.store import ProjectChangedDuringSave
+
+    host = Host(listing("qwen"), listing())
+    unloader = FakeUnloader()
+    app, client, submitted, project = h3_shot_app(tmp_path, make_ejector(host, unloader))
+
+    def refuse(_project):
+        raise ProjectChangedDuringSave("another save landed first")
+
+    app.state.store.save = refuse
+
+    response = client.post(
+        f"/api/projects/{project.id}/shots/{project.shots[0].id}/generate/h3", json={}
+    )
+
+    assert response.status_code == 409
+    assert submitted == [], "a graph was submitted for a record that could not be saved"
+    assert unloader.calls == [], "the model was released for a render that never started"
+    assert host.requests == [], "the language-model host was probed for nothing"
+    assert app.state.ejector.last_outcome is None

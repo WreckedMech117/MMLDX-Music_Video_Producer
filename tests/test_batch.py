@@ -9,23 +9,29 @@ from typing import get_args
 
 from music_video_producer.batch import (
     JOB_LOST_WITH_QUEUE,
+    JOB_NEVER_SUBMITTED,
     JOB_SUPERSEDED,
     MISSING_TICKS_LIMIT,
     NEAR_DUPLICATE_OVERLAP,
     NOTE_KIND_PROMPT,
     NOTE_KIND_SAMENESS,
+    NOTE_KIND_TAKE_UNCOVERED,
     NOTE_KIND_WINDOW_LONG,
     NOTE_KIND_WINDOW_SHORT,
+    PENDING_SUBMISSION_PROMPT_ID,
     PLACEHOLDER_PROMPT,
     PLAN_WITHOUT_SHOTS,
     READINESS_REFUSAL,
     REFUSAL_NAME_LIMIT,
     SHOT_WINDOW_ABOVE_BAND,
+    SHOT_WINDOW_BEFORE_TAKE,
     SHOT_WINDOW_BELOW_BAND,
+    SHOT_WINDOW_PAST_TAKE,
     SHOT_WITH_PLACEHOLDER_PROMPT,
     SHOT_WITHOUT_PROMPT,
     SHOTS_LACK_VARIANCE,
     SHOTS_SHARE_ONE_PROMPT,
+    TAKE_COVERAGE_TOLERANCE_SECONDS,
     TERMINAL_JOB_STATUSES,
     VARIANCE_WARNING_LIMIT,
     AssetRenderState,
@@ -33,6 +39,7 @@ from music_video_producer.batch import (
     SongRenderState,
     _overlap,
     _words,
+    accept_submission,
     prompt_is_missing,
     prompt_rejection,
     queue_locations,
@@ -43,6 +50,7 @@ from music_video_producer.batch import (
     render_status_report,
     shot_label,
     supersede_target_jobs,
+    take_coverage_note,
     window_band_note,
 )
 from music_video_producer.comfy import ComfyError, HistoryResult
@@ -513,6 +521,154 @@ def test_the_band_is_reported_even_when_the_pairwise_pass_is_skipped():
     assert [note.kind for note in report.window_warnings] == [NOTE_KIND_WINDOW_SHORT]
 
 
+# --- The window against its own take (2026-08-21) -----------------------------------------
+#
+# The Director's second yellow: "if the bounds of the shots window are dragged beyond where that
+# clip covers then the shot would turn yellow to warn that the bounds was gone past. The user
+# could then readjust or regenerate to fit the newly wanted shot timeframe. This should help
+# prevent lipsync clips from being dragged away from where it actually matches up with the music."
+#
+# It warns and never blocks, on the band's terms exactly, and it is answered only for a take that
+# recorded its own window — a take without one cannot be checked by anything on the manifest.
+
+
+def rendered(duration: float = 5.0, *, lead: float = 0.25, nudge: float = 0.0) -> Shot:
+    """One shot with a take that recorded its window, as the H3 route writes it at submission."""
+    return Shot(
+        id="shot_0",
+        start=10.0,
+        duration=duration,
+        prompt="A singer turns toward camera",
+        latest_output="shots/shot_0-h3_00001.mp4",
+        latest_take_lead=lead,
+        latest_take_start=10.0,
+        latest_take_duration=5.0,
+        trim_nudge=nudge,
+    )
+
+
+def test_a_window_still_inside_its_take_says_nothing():
+    """The take is `over_render_frames(5.0) / 24` = 5.875 s of picture and the cut sits 0.25 s in,
+    so a 5 s window has 0.625 s of tail to spare. Nothing is reported, at rest or nudged inside
+    the buffer."""
+    assert take_coverage_note(rendered()) == ("", "")
+    assert take_coverage_note(rendered(nudge=0.5)) == ("", "")
+    assert take_coverage_note(rendered(nudge=-0.25)) == ("", "")
+
+
+def test_a_window_dragged_off_the_end_of_its_take_warns_with_every_number():
+    """The overrun end. `needed` and `take` are both named because the Director's two fixes —
+    readjust, or regenerate — need to know by how much and against what."""
+    shot = rendered(nudge=1.0)
+
+    kind, reason = take_coverage_note(shot)
+
+    # `over_render_frames(5.0)` is 141 frames: 5.5 s of margin snapped up the 17k+5 grid.
+    take = 141 / 24
+    assert kind == NOTE_KIND_TAKE_UNCOVERED
+    assert reason == SHOT_WINDOW_PAST_TAKE.format(
+        past=1.25 + 5.0 - take, take=take, needed=1.25 + 5.0, offset=1.25, duration=5.0
+    )
+    assert "does not block submission" in reason
+    # And it is a warning: nothing about `ready` moves, exactly as the band does not move it.
+    project = Project(name="Coverage", shots=[shot])
+    report = readiness_report(project)
+    assert report.ready is True
+    assert report.blocking == []
+    assert [note.kind for note in report.window_warnings] == [NOTE_KIND_TAKE_UNCOVERED]
+    assert report.window_warnings[0].shot_ids == ["shot_0"]
+    assert report.window_warnings[0].labels == [shot_label(project, shot)]
+
+
+def test_a_window_dragged_back_before_its_take_begins_warns_from_the_other_end():
+    """Reachable only because the locked move-drag compensates `trim_nudge` and is deliberately
+    **not** clamped — the Director's ruling is that this colours and never constrains. The nudge
+    buttons still floor at the recorded lead; a drag does not."""
+    kind, reason = take_coverage_note(rendered(nudge=-1.0))
+
+    assert kind == NOTE_KIND_TAKE_UNCOVERED
+    assert reason == SHOT_WINDOW_BEFORE_TAKE.format(behind=0.75)
+    assert "does not block submission" in reason
+
+
+def test_the_coverage_check_is_asserted_at_its_own_edges_and_not_in_the_middle():
+    """Half a frame of tolerance each way, because both sides are manifest floats and one is a
+    division. A threshold asserted in the middle of its range passes for any threshold."""
+    take = 141 / 24  # 5.875 s of picture for a 5 s window
+    # The exact fit: the window ends on the take's last frame.
+    assert take_coverage_note(rendered(nudge=take - 5.0 - 0.25)) == ("", "")
+    # Inside the tolerance, and just outside it.
+    assert take_coverage_note(
+        rendered(nudge=take - 5.0 - 0.25 + TAKE_COVERAGE_TOLERANCE_SECONDS / 2)
+    ) == ("", "")
+    assert take_coverage_note(
+        rendered(nudge=take - 5.0 - 0.25 + TAKE_COVERAGE_TOLERANCE_SECONDS * 2)
+    )[0] == NOTE_KIND_TAKE_UNCOVERED
+    # The same pair at the front edge, where the offset reaches zero.
+    assert take_coverage_note(rendered(nudge=-0.25)) == ("", "")
+    assert take_coverage_note(
+        rendered(nudge=-0.25 - TAKE_COVERAGE_TOLERANCE_SECONDS / 2)
+    ) == ("", "")
+    assert take_coverage_note(
+        rendered(nudge=-0.25 - TAKE_COVERAGE_TOLERANCE_SECONDS * 2)
+    )[0] == NOTE_KIND_TAKE_UNCOVERED
+
+
+def test_a_take_that_never_recorded_a_window_is_never_warned_about():
+    """`latest_take_duration` of 0 is "never snapshotted": every take rendered before 2026-08-21,
+    including the 33 in the Director's own project, and every hand-picked clip, whose bookkeeping
+    `select_shot_clip` clears. The only window such a take has on the manifest is the *live* one,
+    which is a fact about the plan rather than about the file — checking against it would report a
+    shot as uncovered precisely because it had been edited. Silence, never a guess."""
+    legacy = rendered(nudge=9.0)
+    legacy.latest_take_duration = 0.0
+
+    assert take_coverage_note(legacy) == ("", "")
+    assert readiness_report(Project(name="Legacy", shots=[legacy])).window_warnings == []
+    # And a shot with no take at all, which is every shot before its first render.
+    unrendered = rendered(nudge=9.0)
+    unrendered.latest_output = ""
+    assert take_coverage_note(unrendered) == ("", "")
+
+
+def test_a_long_window_over_a_take_it_has_outgrown_reports_both_facts():
+    """Two notes for one shot, which is why nothing server-side keys this list by shot id. The
+    band's note comes first — it is decided first — and the client's own precedence picks which
+    one the clip's single accessible name carries."""
+    shot = rendered(duration=20.0)
+
+    report = readiness_report(Project(name="Both", shots=[shot]))
+
+    assert [note.kind for note in report.window_warnings] == [
+        NOTE_KIND_WINDOW_LONG,
+        NOTE_KIND_TAKE_UNCOVERED,
+    ]
+    assert [note.shot_ids for note in report.window_warnings] == [["shot_0"], ["shot_0"]]
+    assert report.ready is True
+
+
+def test_the_coverage_note_is_reported_when_the_pairwise_pass_is_skipped_too():
+    """The submission route's hot path skips sameness and keeps every window note, for the band's
+    reason: this is per-shot and costs one comparison."""
+    report = readiness_report(
+        Project(name="Coverage", shots=[rendered(nudge=1.0)]), include_warnings=False
+    )
+
+    assert report.warnings_computed is False
+    assert [note.kind for note in report.window_warnings] == [NOTE_KIND_TAKE_UNCOVERED]
+
+
+def test_the_coverage_check_writes_nothing_back_onto_the_shot():
+    """AD-5's rule, asserted for the new note as it is for the report as a whole: derived, never
+    persisted. A stored coverage flag would go stale on the very next drag."""
+    project = Project(name="Coverage", shots=[rendered(nudge=1.0)])
+    before = project.model_dump(mode="json")
+
+    readiness_report(project)
+
+    assert project.model_dump(mode="json") == before
+
+
 def test_timeline_does_not_import_batch_so_the_window_math_stays_a_pure_leaf():
     """The dependency runs one way: `batch` may read `timeline`, never the reverse.
 
@@ -781,6 +937,121 @@ async def test_a_vanished_prompt_keeps_its_status_until_absence_persists():
     await reconcile_render_jobs(fresh, reborn)
     assert fresh.jobs[1].missing_ticks == 0
     assert fresh.jobs[1].status == "queued"
+
+
+# --- The record-first ordering: what the pending window costs, and who heals it ----------
+
+
+def pending_submission_plan() -> Project:
+    """One shot and the record saved for it, in the window before the graph was accepted.
+
+    Exactly what `generate_h3` writes on the near side of the Director's 2026-08-21 ordering,
+    and exactly what a crash between the save and the submit would leave behind: a job whose
+    `prompt_id` is the sentinel, and a Shot the acceptance never got to touch.
+    """
+    return Project(
+        name="Pending",
+        shots=[Shot(id="shot_a", start=0, duration=5, prompt="A corridor", status="ready")],
+        jobs=[
+            RenderJob(
+                id="job_pending",
+                kind="h3",
+                status="queued",
+                prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+                target_id="shot_a",
+            )
+        ],
+    )
+
+
+async def test_an_orphaned_pre_submit_record_settles_and_says_it_was_never_submitted():
+    """The Director's ruling assumed reconciliation heals this. It does — verified here.
+
+    The accepted cost of saving the record before submitting is that a crash in between leaves
+    a record for a graph ComfyUI never heard of. The claim was that the existing machinery
+    already covers it, and it does, with no new rule: the sentinel is a non-empty prompt id, so
+    `reconcilable_jobs` counts the record and the poll keeps asking; ComfyUI's queue never holds
+    that string and its history answers `known=False` for it; and `MISSING_TICKS_LIMIT` unknown
+    ticks settle it exactly as they settle a prompt that died with the queue — job terminal,
+    the shot released from its in-flight status, nothing left pinning render-status "active".
+
+    What the sentinel changes is only the sentence. `JOB_LOST_WITH_QUEUE` says ComfyUI "no
+    longer knows this prompt", which was never true of a record whose graph was never sent, so
+    this one settles in `JOB_NEVER_SUBMITTED`'s words instead.
+    """
+    project = pending_submission_plan()
+    comfy = ScriptedComfy()
+
+    for _ in range(MISSING_TICKS_LIMIT - 1):
+        outcome = await reconcile_render_jobs(project, comfy)
+        assert outcome.changed is True
+        # Counted, never invented: an absent tick is also what a ComfyUI restart looks like.
+        assert project.jobs[0].status == "queued"
+    # The lookup really is the ordinary one — no branch anywhere exempts the sentinel from it.
+    assert comfy.history_calls == [PENDING_SUBMISSION_PROMPT_ID] * (MISSING_TICKS_LIMIT - 1)
+
+    outcome = await reconcile_render_jobs(project, comfy)
+
+    assert outcome.changed is True
+    assert project.jobs[0].status == "error"
+    assert project.jobs[0].error == JOB_NEVER_SUBMITTED
+    assert project.jobs[0].error != JOB_LOST_WITH_QUEUE
+    # Settled means settled: nothing polls for it and nothing counts the project busy.
+    assert reconcilable_jobs(project) == []
+
+
+async def test_a_record_whose_prompt_id_is_real_still_settles_in_the_queue_s_words():
+    """The other side of that branch, so the new sentence cannot quietly take both cases."""
+    project = pending_submission_plan()
+    project.jobs[0].prompt_id = "prompt-real"
+
+    for _ in range(MISSING_TICKS_LIMIT):
+        await reconcile_render_jobs(project, ScriptedComfy())
+
+    assert project.jobs[0].error == JOB_LOST_WITH_QUEUE
+
+
+async def test_accept_submission_reopens_a_record_the_reconciler_settled_mid_submission():
+    """The window is wider than the settle, so the acceptance has to be able to undo it.
+
+    The eject before a submission is allowed twenty seconds and the `/prompt` call thirty;
+    three ticks of the browser's two-second poll is six. So a slow-but-successful submission
+    can find its own record already settled as never submitted — a verdict that was right on
+    the evidence and is wrong the moment ComfyUI answers with a prompt id. A record left
+    `error` carrying a live prompt id is never reconciled again, which is precisely the
+    orphaned take this ordering exists to prevent.
+    """
+    project = pending_submission_plan()
+    for _ in range(MISSING_TICKS_LIMIT):
+        await reconcile_render_jobs(project, ScriptedComfy())
+    assert project.jobs[0].status == "error"
+
+    accept_submission(project.jobs[0], "prompt-real")
+
+    assert project.jobs[0].prompt_id == "prompt-real"
+    assert project.jobs[0].status == "queued"
+    assert project.jobs[0].error == ""
+    assert project.jobs[0].missing_ticks == 0
+    # And it is being watched again, by the id ComfyUI actually answers for.
+    assert reconcilable_jobs(project) == [project.jobs[0]]
+
+
+def test_the_pending_marker_is_not_the_local_work_marker():
+    """The one collision the sentinel had to avoid, asserted rather than assumed.
+
+    An empty `prompt_id` means "local ffmpeg work" to `heal_orphaned_local_jobs`, to the
+    assemble route's busy check and to `api.js`'s assembly-progress branch. A pending `h3` or
+    `post` record carrying an empty id would be read as an assembly and healed to an assembly
+    error at the next startup, while `reconcilable_jobs` — which is what settles it — would
+    never look at it at all.
+    """
+    assert PENDING_SUBMISSION_PROMPT_ID
+    # Not a UUID shape either, so it can never be confused for one ComfyUI minted.
+    assert "-" in PENDING_SUBMISSION_PROMPT_ID and len(PENDING_SUBMISSION_PROMPT_ID) < 32
+    project = pending_submission_plan()
+    assert reconcilable_jobs(project) == [project.jobs[0]]
+    project.jobs[0].prompt_id = ""
+    assert reconcilable_jobs(project) == []
 
 
 async def test_h3_completion_moves_the_shot_and_displaces_the_stale_review():

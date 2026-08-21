@@ -55,6 +55,13 @@ _REPLACE_BACKOFF = 0.05
 #: the moment the question is asked. Keyed on `normcase(abspath(...))` rather than on the `Path`,
 #: because two `ProjectStore` objects can address one data root by different spellings and two
 #: unequal keys would be two writers that cannot see each other.
+#:
+#: The same counter is handed *out*, by `read_for_update`, as the revision token a caller passes
+#: back to `save(..., if_generation=...)`. That is the whole of the compare-and-swap this module
+#: offers, and it is free: a read takes the count it read at, a save refuses if the count moved,
+#: and neither costs a byte of disk. It is emphatically **not** `Project.updated_at` — that is the
+#: client-facing revision the `PUT` routes compare, it lives inside the file, and reading it costs
+#: a parse. This one is a fact about the process, with exactly the scope `_MANIFEST_LOCK` has.
 _MANIFEST_WRITES: dict[str, int] = {}
 
 
@@ -165,7 +172,7 @@ class ProjectStore:
             self.save(project)
         return project
 
-    def save(self, project: Project) -> Project:
+    def save(self, project: Project, *, if_generation: int | None = None) -> Project:
         """Write the whole manifest atomically, or raise. A return is a landed manifest.
 
         Two failures reach the caller, and both mean nothing of this project was written:
@@ -174,6 +181,17 @@ class ProjectStore:
         complete manifest inside that retry. The second is recoverable and says how: re-read,
         re-apply, save again. Do not swallow it into a success — its whole purpose is that the
         caller who was told 200 keeps what it wrote.
+
+        `if_generation` turns this from "last writer wins" into a compare-and-swap, and is the
+        answer to the *other* lost update — the one the backoff guard above cannot see. That
+        guard fires only when a foreign handle forces a replace to back off and somebody writes
+        during the wait. An ordinary read, mutate, save has no contention on the replace at all:
+        it simply lays a manifest read seconds ago over a newer one and raises nothing. That is
+        tolerable for a route the Director triggered by clicking — they see the result and can
+        act — and intolerable for a background loop, so a background loop passes the generation
+        it read at (`read_for_update`) and is refused, in the same exception and with the same
+        remedy, when the manifest moved underneath it. Omitted, the behaviour is exactly what it
+        always was, which is what every user-initiated route still wants.
         """
         directory = self.project_dir(project.id)
         directory.mkdir(parents=True, exist_ok=True)
@@ -184,6 +202,15 @@ class ProjectStore:
         # The serialisation above is deliberately outside the lock — it touches no file and is
         # the expensive half. Only the bytes hitting the disk are serialised.
         with _MANIFEST_LOCK:
+            # Checked inside the lock and before the temp file, so it is genuinely atomic with
+            # the replace it guards — a writer cannot slip between the comparison and the write,
+            # because every writer in this process takes this lock to land its bytes.
+            if if_generation is not None:
+                if _MANIFEST_WRITES.get(_write_key(target), 0) != if_generation:
+                    raise ProjectChangedDuringSave(
+                        f"{target.parent.name} was written after this caller read it; re-read "
+                        "the project and re-apply the change"
+                    )
             with NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False) as temp:
                 temp.write(payload)
                 temp.flush()
@@ -193,14 +220,28 @@ class ProjectStore:
         return project
 
     def get(self, project_id: str) -> Project:
+        return self.read_for_update(project_id)[0]
+
+    def read_for_update(self, project_id: str) -> tuple[Project, int]:
+        """The project, and the write generation it was read at — `save`'s `if_generation`.
+
+        For a caller that intends to write back what it read and cannot afford to lose whatever
+        landed in between. The two halves are taken under one acquisition of the lock, which is
+        what makes the token honest: a save that lands between them would otherwise be invisible
+        to a comparison made afterwards. Costs one dictionary lookup over `get`.
+
+        The token's scope is `_MANIFEST_LOCK`'s scope — this process. A second application
+        instance on the same data root is not serialised by either, and is not made safe by this.
+        """
         path = self.manifest_path(project_id)
         with _MANIFEST_LOCK:
             if not path.exists():
                 raise ProjectNotFound(project_id)
             payload = path.read_text(encoding="utf-8")
+            generation = _MANIFEST_WRITES.get(_write_key(path), 0)
         # Parsed after the lock is released: validation is pure CPU on bytes already in hand,
         # and a reader holding the lock through it would block the writes for no gain.
-        return Project.model_validate_json(payload)
+        return Project.model_validate_json(payload), generation
 
     def list(self) -> list[Project]:
         projects: list[Project] = []

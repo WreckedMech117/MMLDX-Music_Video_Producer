@@ -269,11 +269,14 @@
           </aside>
           <div class="library-panel">
             <div class="library-toolbar">
-              <div class="segmented" id="asset-filters"><button class="active" data-filter="all">All</button><button data-filter="character">Characters</button><button data-filter="setting">Settings</button><button data-filter="prop">Props</button><button data-filter="style">Style</button></div>
+              <!-- The tab strip is built by `renderAssetTabs` from api.js's ASSET_TABS, not
+                   written out here: the tab set has to stay pinned to `models.AssetKind`, and a
+                   list of buttons in a template is a list nothing can check. -->
+              <div class="segmented" id="asset-filters" role="tablist" aria-label="Asset library sections"></div>
               <input id="asset-search" type="search" placeholder="Search library">
             </div>
-            <div class="asset-grid" id="asset-grid"><div class="library-empty"><strong>No assets yet</strong><span>Generate a character or setting with Flux, or upload existing media.</span></div></div>
-            <div id="clips-library"></div>
+            <div class="asset-grid" id="asset-grid" role="tabpanel"><div class="library-empty"><strong>No assets yet</strong><span>Generate a character or setting with Flux, or upload existing media.</span></div></div>
+            <div class="clips-library" id="clips-library" role="tabpanel" hidden></div>
           </div>
           <aside class="inspector" id="asset-inspector">
             <span class="eyebrow">Inspector</span><h2>Select an asset</h2><p>Review provenance, generate multiview references, and attach approved assets to shots.</p>

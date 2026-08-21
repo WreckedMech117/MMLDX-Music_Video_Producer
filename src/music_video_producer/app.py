@@ -44,9 +44,12 @@ from .assembly import (
 )
 from .asset_replacement import ReplacementChange, asset_replacement_plan
 from .batch import (
+    JOB_NEVER_SUBMITTED,
+    PENDING_SUBMISSION_PROMPT_ID,
     TERMINAL_JOB_STATUSES,
     ReadinessReport,
     RenderStatusReport,
+    accept_submission,
     apply_job_history,
     batch_targets,
     prompt_is_missing,
@@ -4570,6 +4573,44 @@ def create_app(
         except ProjectNotFound as error:
             raise HTTPException(status_code=404, detail="Project not found") from error
 
+    def settle_unsubmitted_jobs(project: Project, *jobs: RenderJob) -> None:
+        """Close the records whose graphs were never accepted, and write the manifest.
+
+        The other half of the record-first ordering (the Director's 2026-08-21 ruling). Every
+        submission route now saves its `RenderJob` *before* `comfy.submit`, so a submission
+        that fails leaves a record behind — and a record left `queued` on a prompt that was
+        never queued is a phantom: `reconcilable_jobs` counts it, the poll keeps asking about
+        it, `shot_render_in_flight` refuses the next render, and assembly and asset fill go on
+        reporting the project busy. Settled here instead, in `JOB_NEVER_SUBMITTED`'s words —
+        the same sentence the reconciler uses for the orphan this cannot reach, the one where
+        the process died between the two steps.
+
+        Nothing of the *target* is touched, because nothing of the target was written: the
+        pre-submission save carries the job record and only the job record, so a Shot whose
+        submission failed is still `ready` with its old take, an Asset that would have been
+        created does not exist, and the Song was not replaced. That is what "leaves no phantom
+        in-flight shot" means here — there is no state to restore.
+
+        **A save race here is swallowed, not raised.** The caller is on its way to a 502 that
+        names why the submission failed, which is the fact the Director needs; converting it
+        into a 409 about the manifest would report the wrong failure. What is left behind when
+        this save is refused is a record still carrying `PENDING_SUBMISSION_PROMPT_ID`, which
+        the reconciler settles with this same sentence after three unknown ticks.
+        """
+        for job in jobs:
+            job.status = "error"
+            job.error = JOB_NEVER_SUBMITTED
+            job.missing_ticks = 0
+        try:
+            store.save(project)
+        except ProjectChangedDuringSave:
+            logger.warning(
+                "Could not settle %d unsubmitted job record(s) on project %s; the reconciler "
+                "will settle them from the pending prompt id",
+                len(jobs),
+                project.id,
+            )
+
     def resolve_asset_path(project_id: str, asset: Asset) -> Path:
         root = (
             store.media_dir(project_id).resolve()
@@ -5505,10 +5546,29 @@ def create_app(
             seed=request.seed,
             prefix=prefix,
         )
+        # The record first, then the graph (the Director's 2026-08-21 ruling). A save that
+        # loses a race refuses here, before a single byte reaches ComfyUI, so the refusal
+        # costs no GPU time — where a save refused *after* the submit answered 409 for a
+        # prompt already on the card and lost the only record of it.
+        job = RenderJob(
+            kind="music",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id="song",
+            seed=request.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        # **The Song is replaced only once the graph is accepted**, and that is the one thing
+        # this route deliberately does *not* move ahead of the submission. Replacing it is
+        # destructive — it is why `_require_song_replacement_confirmation` exists — and doing
+        # it for a graph ComfyUI then refused would trade a lost job record for a lost song,
+        # which is the expensive direction the ruling exists to avoid.
         project.song = Song(
             title=request.title,
             source="generated",
@@ -5517,13 +5577,6 @@ def create_app(
             caption=request.caption,
             prompt_id=submission.prompt_id,
         )
-        job = RenderJob(
-            kind="music",
-            prompt_id=submission.prompt_id,
-            target_id="song",
-            seed=request.seed,
-        )
-        project.jobs.append(job)
         # **Deliberately NOT superseded**, and the music routes are the one place a leftover
         # record is left standing on purpose. Every music job shares `target_id="song"` and
         # this route has no per-target in-flight refusal, so two live records here is the
@@ -5579,10 +5632,24 @@ def create_app(
                 )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+        # The record first, then the graph, for `generate_music`'s reason and by the same
+        # rule: a save race refuses before any GPU time is spent.
+        job = RenderJob(
+            kind="music",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id="song",
+            seed=request.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        # And the Song is replaced only once the graph is accepted, for `generate_music`'s
+        # reason: the replacement is the destructive act the confirmation gate guards.
         project.song = Song(
             title=request.title,
             source="generated",
@@ -5591,13 +5658,6 @@ def create_app(
             caption=request.idea,
             prompt_id=submission.prompt_id,
         )
-        job = RenderJob(
-            kind="music",
-            prompt_id=submission.prompt_id,
-            target_id="song",
-            seed=request.seed,
-        )
-        project.jobs.append(job)
         # Not superseded either, for `generate_music`'s reason and by the same argument: a
         # song planned here and a song generated there are both `kind="music"` on
         # `target_id="song"`, and neither may lose its record of where its audio landed.
@@ -5628,19 +5688,27 @@ def create_app(
             seed=request.seed,
             prefix=prefix,
         )
-        try:
-            submission = await comfy.submit(payload)
-        except ComfyError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-        asset.prompt_id = submission.prompt_id
-        project.assets.append(asset)
+        # The record first, then the graph (the Director's 2026-08-21 ruling): a save that
+        # loses a race refuses before any GPU time is spent. The Asset itself is appended only
+        # once the graph is accepted — an asset with no path and no prompt id renders as an
+        # empty library row, and a submission that failed must leave nothing behind for the
+        # Director to delete by hand.
         job = RenderJob(
             kind="flux",
-            prompt_id=submission.prompt_id,
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
             target_id=asset.id,
             seed=request.seed,
         )
         project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        asset.prompt_id = submission.prompt_id
+        project.assets.append(asset)
         store.save(project)
         return job
 
@@ -5712,18 +5780,27 @@ def create_app(
                 seed=request.seed,
                 prefix=f"music-video-producer/{project_id}/assets/{child.id}-multiview",
             )
-            submission = await comfy.submit(payload)
         except ComfyError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
-        child.prompt_id = submission.prompt_id
-        project.assets.append(child)
+        # The record first, then the graph, for `generate_flux`'s reason. The upload above
+        # stays outside it: it puts a file in ComfyUI's input directory and costs no GPU
+        # time, and its own failure is the same 502 it always was, with nothing recorded.
         job = RenderJob(
             kind="multiview",
-            prompt_id=submission.prompt_id,
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
             target_id=child.id,
             seed=request.seed,
         )
         project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        child.prompt_id = submission.prompt_id
+        project.assets.append(child)
         store.save(project)
         return job
 
@@ -5809,19 +5886,24 @@ def create_app(
             )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        try:
-            submission = await comfy.submit(payload)
-        except ComfyError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-        child.prompt_id = submission.prompt_id
-        project.assets.append(child)
+        # The record first, then the graph, for `generate_flux`'s reason, and the child asset
+        # appended only once the graph is accepted for the same one.
         job = RenderJob(
             kind="edit",
-            prompt_id=submission.prompt_id,
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
             target_id=child.id,
             seed=request.seed,
         )
         project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        child.prompt_id = submission.prompt_id
+        project.assets.append(child)
         store.save(project)
         return job
 
@@ -5874,6 +5956,11 @@ def create_app(
         if reconcilable_jobs(project):
             raise HTTPException(status_code=409, detail=ASSET_FILL_RENDERS_OPEN_REFUSAL)
         submitted: list[AssetFillSubmission] = []
+        # Every record first, then every graph (the Director's 2026-08-21 ruling). One save
+        # covers the whole batch rather than one per proposal: the property the ruling is
+        # about is that a save race is answered *before* any GPU time is spent, and a batch
+        # whose records could not be written spends none at all.
+        pending: list[tuple[Asset, dict[str, Any], RenderJob]] = []
         for index, proposal in enumerate(proposals):
             asset = Asset(
                 name=proposal.name,
@@ -5892,23 +5979,31 @@ def create_app(
                 seed=index,
                 prefix=f"music-video-producer/{project_id}/assets/{asset.id}",
             )
-            try:
-                submission = await comfy.submit(payload)
-            except ComfyError as error:
-                # Partial batches are reported honestly: what queued is queued, and the
-                # failure names itself; nothing already submitted is rolled back.
-                if submitted:
-                    store.save(project)
-                raise HTTPException(status_code=502, detail=str(error)) from error
-            asset.prompt_id = submission.prompt_id
-            project.assets.append(asset)
             job = RenderJob(
                 kind="flux",
-                prompt_id=submission.prompt_id,
+                prompt_id=PENDING_SUBMISSION_PROMPT_ID,
                 target_id=asset.id,
                 seed=index,
             )
             project.jobs.append(job)
+            pending.append((asset, payload, job))
+        store.save(project)
+        for index, (asset, payload, job) in enumerate(pending):
+            try:
+                submission = await comfy.submit(payload)
+            except ComfyError as error:
+                # Partial batches are reported honestly: what queued is queued, and the
+                # failure names itself; nothing already submitted is rolled back. The records
+                # for the graphs that never went out — this one and every one after it — are
+                # settled rather than left open, which is also what writes the accepted half
+                # of the batch to disk.
+                settle_unsubmitted_jobs(
+                    project, *(entry[2] for entry in pending[index:])
+                )
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            accept_submission(job, submission.prompt_id)
+            asset.prompt_id = submission.prompt_id
+            project.assets.append(asset)
             submitted.append(
                 AssetFillSubmission(
                     asset_id=asset.id, name=asset.name, kind=asset.kind, job_id=job.id
@@ -6486,10 +6581,36 @@ def create_app(
             # the client as a 500 instead of a refusal naming the limit.
             except ValueError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
+        # **The record first, then the graph** — the Director's 2026-08-21 ruling, and the
+        # defect it closes: this route submitted and *then* saved, so once `ProjectStore.save`
+        # gained its lost-update refusal a save race answered 409 for a graph already queued.
+        # The GPU rendered, the take landed on disk, and nothing recorded it — no job, no
+        # `latest_output`, no way for the application to find the file. Reversed, a save race
+        # refuses here, before a byte reaches ComfyUI, which is the cheap direction to fail.
+        #
+        # The stated cost, accepted with the ruling: a record now briefly exists for a graph
+        # that is not queued yet, so a crash in that window leaves an orphan. It carries
+        # `PENDING_SUBMISSION_PROMPT_ID` rather than an empty id precisely so the reconciler
+        # can settle it — see that constant, and `JOB_NEVER_SUBMITTED` for what it settles as.
+        #
+        # Only the job record goes in this save. Everything below is what the *acceptance*
+        # means for the Shot, and none of it may be written for a submission that never
+        # happened — the record itself is the in-flight marker in the meantime, because
+        # `shot_render_in_flight` reads the job records as well as `Shot.status`.
+        job = RenderJob(
+            kind="h3",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id=shot.id,
+            seed=shot.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
         shot.status = "queued"
         shot.prompt_id = submission.prompt_id
         # The take this job produces begins `take_lead` seconds before the shot's window
@@ -6505,13 +6626,6 @@ def create_app(
         # `Shot.latest_take_start`.
         shot.latest_take_start = shot.start
         shot.latest_take_duration = shot.duration
-        job = RenderJob(
-            kind="h3",
-            prompt_id=submission.prompt_id,
-            target_id=shot.id,
-            seed=shot.seed,
-        )
-        project.jobs.append(job)
         # Job-record hygiene, after the accept and not a gate. Every refusal above stands —
         # in particular the `status != "ready"` one, which is what normally makes a second
         # render for a live shot impossible. It stopped being enough when a whole-manifest write
@@ -6741,20 +6855,27 @@ def create_app(
             )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        try:
-            submission = await comfy.submit(payload)
-        except ComfyError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-        # The whole write. The Shot itself is untouched: see this route's docstring.
+        # The whole write, and it happens **before** the graph goes out — the Director's
+        # 2026-08-21 ruling, for `generate_h3`'s reason: a save race then refuses before any
+        # GPU time is spent, where a save refused after the submit answered 409 for a prompt
+        # already accepted and lost the only record of the enhancement. The Shot itself is
+        # untouched either way: see this route's docstring.
         job = RenderJob(
             kind="ltx",
-            prompt_id=submission.prompt_id,
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
             target_id=shot.id,
             # The seed the graph fixes, recorded so the job says what was sampled rather than
             # defaulting to a 0 that happens to match.
             seed=LTX25_ENHANCE_SEED,
         )
         project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
         store.save(project)
         return job
 
@@ -6977,19 +7098,31 @@ def create_app(
             song_duration=project.song.duration,
             take_lead=shot.latest_take_lead,
         )
-        try:
-            submission = await comfy.submit(payload)
-        except ComfyError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-        # The whole write. The Shot itself is untouched: see this route's docstring.
+        # The whole write, and it happens **before** the graph goes out — the Director's
+        # 2026-08-21 ruling, and this is the route that found the defect: a save refused after
+        # the submit answered 409 for a graph already queued, and the restored file landed on
+        # disk with no record of it anywhere. The Shot itself is untouched either way: see
+        # this route's docstring.
+        #
+        # `prompt_id` is `PENDING_SUBMISSION_PROMPT_ID` in the window and deliberately **not**
+        # the empty string, which on a `kind="post"` record already means something else
+        # entirely — local ffmpeg work, which the assemble route's busy check, startup healing
+        # and `api.js`'s progress branch all key on. See that constant.
         job = RenderJob(
             kind="post",
-            prompt_id=submission.prompt_id,
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
             target_id=shot.id,
             # No sampling happens here, so there is no seed. Left at the model's 0 rather than
             # borrowed from the shot, which would record a number nothing used.
         )
         project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
         store.save(project)
         matched = (
             abs(lengths["requested_picture_seconds"] - lengths["audio_seconds"])

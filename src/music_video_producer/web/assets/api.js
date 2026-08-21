@@ -1278,6 +1278,10 @@ export const READINESS_SAMENESS_LABEL = "Near-duplicate";
 //: saying so.
 export const READINESS_WINDOW_LONG_LABEL = "Long window";
 export const READINESS_WINDOW_SHORT_LABEL = "Short window";
+//: The third, and it is about the take rather than about the band: this window has been moved or
+//: stretched off the picture its own take holds. Named for what a Director sees rather than for
+//: the arithmetic -- the clip's bounds have gone past what the clip covers.
+export const READINESS_TAKE_UNCOVERED_LABEL = "Past the take";
 
 // ------------------------------------------------------------------------------------------
 // The shot-length band, as the *server* judges it. `batch.NOTE_KIND_WINDOW_SHORT` and
@@ -1302,40 +1306,92 @@ export const READINESS_WINDOW_SHORT_LABEL = "Short window";
 
 export const NOTE_KIND_WINDOW_SHORT = "window_short";
 export const NOTE_KIND_WINDOW_LONG = "window_long";
+//: `batch.NOTE_KIND_TAKE_UNCOVERED`, and the Director's second yellow (2026-08-21): "if the
+//: bounds of the shots window are dragged beyond where that clip covers then the shot would turn
+//: yellow to warn that the bounds was gone past." Read exactly as the band's two are -- the
+//: server decides it, from the window it recorded at submission, and nothing here re-derives it.
+//: A client-side coverage check would need the take's own window, and the *live* window is not
+//: it: a shot that has been edited since its render is precisely the case this reports on.
+export const NOTE_KIND_TAKE_UNCOVERED = "take_uncovered";
 
 function windowNoteKind(note) {
-  return note?.kind === NOTE_KIND_WINDOW_LONG ? NOTE_KIND_WINDOW_LONG : NOTE_KIND_WINDOW_SHORT;
+  if (note?.kind === NOTE_KIND_WINDOW_LONG) return NOTE_KIND_WINDOW_LONG;
+  if (note?.kind === NOTE_KIND_TAKE_UNCOVERED) return NOTE_KIND_TAKE_UNCOVERED;
+  return NOTE_KIND_WINDOW_SHORT;
 }
 
-// Which shots the report says are outside the band, and on which side. `{ shotId: kind }`, empty
-// for a report that has not been fetched or that found nothing.
+//: Which of two window states a clip wears when the report has both to say about it. A shot can
+//: carry two notes now -- a long window over a take it has outgrown is both -- and a clip has one
+//: border and one accessible name. Higher wins.
+//:
+//: Uncovered outranks the band, and the ranking is the Director's own reading of the two. The
+//: band is a standing property of the plan: a 20 s shot has been 20 s since it was written, and
+//: the sentence about it will be just as true tomorrow. Uncovered is a thing that has just
+//: *happened* to this take under a gesture the Director made a second ago, and it is the one they
+//: can undo. The unranked list order would have made the answer depend on which check the server
+//: ran first, which is not a decision anyone made.
+const WINDOW_KIND_RANK = {
+  [NOTE_KIND_WINDOW_SHORT]: 0,
+  [NOTE_KIND_WINDOW_LONG]: 1,
+  [NOTE_KIND_TAKE_UNCOVERED]: 2,
+};
+
+// Which shots the report says have something wrong with their window, and what. `{ shotId: kind }`,
+// empty for a report that has not been fetched or that found nothing. Every note is still printed
+// in full by `readinessLines`; this is only what the *clip* can wear.
 export function windowWarningsByShot(report) {
   const found = {};
   for (const note of report?.window_warnings || []) {
-    for (const shotId of note?.shot_ids || []) found[shotId] = windowNoteKind(note);
+    const kind = windowNoteKind(note);
+    for (const shotId of note?.shot_ids || []) {
+      const standing = found[shotId];
+      if (standing === undefined || WINDOW_KIND_RANK[kind] > WINDOW_KIND_RANK[standing]) {
+        found[shotId] = kind;
+      }
+    }
   }
   return found;
 }
 
 //: The class a clip carries for its window state, and the sentence appended to its accessible
-//: name. Only the long end draws anything: state is never carried by colour alone here either,
-//: so the class comes with words, and the short end comes with neither.
+//: name. Two of the three states draw: the long band and a take the window has left. The short
+//: end draws neither class nor words, because it is not a problem. State is never carried by
+//: colour alone here either, so a class always comes with a sentence.
 export const CLIP_WINDOW_LONG_CLASS = "window-long";
 export const CLIP_WINDOW_LONG_NOTE =
   "Longer than the range H3 is trained for. It still submits and renders; expect motion and " +
   "lipsync to drift late in the take.";
+//: The same amber, a different class, because the class names the state and this is not the band.
+export const CLIP_TAKE_UNCOVERED_CLASS = "take-uncovered";
+//: Short, because it is a clip's title and its accessible name -- the readiness list carries the
+//: server's whole sentence with the numbers in it. It names the fix in the Director's own pair,
+//: "readjust or regenerate", and it does not say the gesture was stopped, because it was not.
+export const CLIP_TAKE_UNCOVERED_NOTE =
+  "The window has been moved or stretched past the picture this take holds. Nothing is stopped: " +
+  "re-cut it back over the take, or render the shot again for the window it has now.";
+
+//: One entry per state that draws anything. A table rather than a chain of `if`s so that adding a
+//: state cannot silently keep a class while losing its sentence -- the two live in one place and
+//: are read together.
+const CLIP_WINDOW_STATES = {
+  [NOTE_KIND_WINDOW_LONG]: { className: CLIP_WINDOW_LONG_CLASS, note: CLIP_WINDOW_LONG_NOTE },
+  [NOTE_KIND_TAKE_UNCOVERED]: {
+    className: CLIP_TAKE_UNCOVERED_CLASS, note: CLIP_TAKE_UNCOVERED_NOTE,
+  },
+};
 
 // `label` is the clip's whole accessible name: `shotPromptCell`'s label with this state's
 // sentence folded in, or that label untouched when there is no state. Returned from here rather
 // than joined in the template, on `shotPromptCell`'s own argument -- the timeline's markup is a
 // thin applier of decisions made in this file, and a ternary in the template is a second place
-// the two signals could come apart. A clip inside the band is byte for byte what it was.
+// the two signals could come apart. A clip with nothing to say is byte for byte what it was.
 export function clipWindowState(kind, label = "") {
-  if (kind !== NOTE_KIND_WINDOW_LONG) return { className: "", note: "", label };
+  const drawn = CLIP_WINDOW_STATES[kind];
+  if (!drawn) return { className: "", note: "", label };
   return {
-    className: CLIP_WINDOW_LONG_CLASS,
-    note: CLIP_WINDOW_LONG_NOTE,
-    label: label ? `${label} — ${CLIP_WINDOW_LONG_NOTE}` : CLIP_WINDOW_LONG_NOTE,
+    className: drawn.className,
+    note: drawn.note,
+    label: label ? `${label} — ${drawn.note}` : drawn.note,
   };
 }
 
@@ -1351,6 +1407,20 @@ export function clipWindowState(kind, label = "") {
 // The reason is passed through rather than reworded: it is the one sentence the server wrote for
 // this exact case, and a second wording here is how the browser starts describing a rule the
 // server no longer has. A note that names no Shot -- the empty plan -- names none here either.
+//: The readiness list's own class and heading for each window kind, keyed by the server's kind so
+//: the two can never be paired up wrongly. The classes are the stylesheet's, and only the ones
+//: that colour have a rule -- `window-short` deliberately has none.
+const WINDOW_LINE_KINDS = {
+  [NOTE_KIND_WINDOW_LONG]: "window-long",
+  [NOTE_KIND_WINDOW_SHORT]: "window-short",
+  [NOTE_KIND_TAKE_UNCOVERED]: "take-uncovered",
+};
+const WINDOW_LINE_LABELS = {
+  [NOTE_KIND_WINDOW_LONG]: READINESS_WINDOW_LONG_LABEL,
+  [NOTE_KIND_WINDOW_SHORT]: READINESS_WINDOW_SHORT_LABEL,
+  [NOTE_KIND_TAKE_UNCOVERED]: READINESS_TAKE_UNCOVERED_LABEL,
+};
+
 export function readinessLines(report) {
   const render = (kind, label) => (note) => {
     const shotIds = note?.shot_ids || [];
@@ -1365,12 +1435,14 @@ export function readinessLines(report) {
     // exactly one thing to every reader it already has -- `READINESS_SAMENESS_LABEL` and
     // `readinessSummary`'s "N near-duplicate pairs" -- so a window note posted into it would
     // reach the Director under a name that is not what it says, counted as a pair it is not.
-    ...(report?.window_warnings || []).map((note) => render(
-      windowNoteKind(note) === NOTE_KIND_WINDOW_LONG ? "window-long" : "window-short",
-      windowNoteKind(note) === NOTE_KIND_WINDOW_LONG
-        ? READINESS_WINDOW_LONG_LABEL
-        : READINESS_WINDOW_SHORT_LABEL,
-    )(note)),
+    //
+    // Each of the three window kinds under its own name and its own list-marker class, decided
+    // from the note's `kind` in one place: a line that read "Long window" over a coverage
+    // sentence would be describing a rule the server does not have.
+    ...(report?.window_warnings || []).map((note) => {
+      const kind = windowNoteKind(note);
+      return render(WINDOW_LINE_KINDS[kind], WINDOW_LINE_LABELS[kind])(note);
+    }),
   ];
 }
 
@@ -1495,6 +1567,62 @@ export function shotLabel(project, shotId) {
 
 export function renderAgainNotice(project, shotId) {
   return RENDER_AGAIN_PREVIOUS_TAKE.replace("{shot}", shotLabel(project, shotId));
+}
+
+// -- The seed's randomize toggle (the Director's ask, 2026-08-20) ------------------------------
+//
+// "we should shorten that box a bit and add a randomize toggle (1-99999) which would RNG a number
+// and hold it unless regenerate gets hit later with randomize still checked."
+//
+// The bounds are the Director's own numbers, inclusive at both ends. `0` is deliberately outside
+// them even though the seed field accepts it: 0 is the value populate and the Flux form leave
+// behind for "nobody chose", and a randomizer that can return it would make "random" and "unset"
+// indistinguishable on the one field where they have to be told apart.
+export const RANDOM_SEED_MIN = 1;
+export const RANDOM_SEED_MAX = 99999;
+
+//: The toggle's own control id and the two sentences it is drawn with. The label names the moment
+//: it re-rolls, in the inspector's own word for that button ("Render again"), because a toggle
+//: whose re-roll moment has to be guessed is worse than a button: the Director cannot tell a seed
+//: that held from one that moved without reading the number back afterwards.
+export const RANDOM_SEED_CONTROL = "shot-seed-randomize";
+export const RANDOM_SEED_LABEL = "Randomize on Render again";
+export const RANDOM_SEED_HELP =
+  "Ticking this rolls a seed in 1–99999 now and holds it. It re-rolls at one moment only: when " +
+  "Render again queues a take. It does not re-roll on Mark ready, on selecting another shot, or " +
+  "on a redraw. Typing a seed by hand clears this toggle — a number you typed is a number you " +
+  "chose. It is a working mode for this session, not a property of the shot: it is not saved " +
+  "into the project and it is off again after a reload. Generate All has its own +" +
+  `${RESUBMIT_SEED_STRIDE} step on the server and does not read this box.`;
+
+// One roll, inside the Director's bounds. `random` is injected so the contract tests can drive the
+// edges rather than sample and hope; every caller in the application uses the default.
+export function randomSeed(random = Math.random) {
+  const span = RANDOM_SEED_MAX - RANDOM_SEED_MIN + 1;
+  const roll = Math.floor(Number(random()) * span);
+  return RANDOM_SEED_MIN + Math.min(Math.max(roll, 0), span - 1);
+}
+
+// What the seed becomes when a re-render is actually queued -- the single place the two sources of
+// seed movement are chosen between, so they cannot both fire.
+//
+// Without randomize this is the server's own RESUBMIT_SEED_STRIDE, unchanged: a resubmission at the
+// same seed and prompt reproduces the identical take, which reads as "nothing was replaced", and
+// that stride is what the inspector's Render again has always applied.
+//
+// With randomize it is a fresh roll *instead of* the stride, never as well as it. Adding a stride
+// to a random number would be a second, invisible source of drift on a value the Director has just
+// asked to own; and rolling on top of the stride would make the stride's guarantee unreachable.
+//
+// A roll that lands on the number already stored is nudged one step on. One take in 99999 is rare
+// enough to be reported as a bug rather than as luck, and the whole point of the gesture is a
+// *different* take -- the same reason the stride exists.
+export function nextRenderSeed(shot, randomize, random = Math.random) {
+  const current = Math.max(0, Number(shot?.seed) || 0);
+  if (!randomize) return current + RESUBMIT_SEED_STRIDE;
+  const rolled = randomSeed(random);
+  if (rolled !== current) return rolled;
+  return rolled === RANDOM_SEED_MAX ? RANDOM_SEED_MIN : rolled + 1;
 }
 
 // The Shot statuses the commit control is drawn for at all: app.py's MARK_READY_STATUSES, asserted
@@ -2306,6 +2434,104 @@ export function multiviewPlan(asset) {
   // `path` is empty until the source render lands. The button is shown but shut, which says
   // "this can be promoted, once it exists" — omitting it would say the wrong thing.
   return { prompt, ready: Boolean(asset.path) };
+}
+
+// -- The Assets panel's subtabs (the Director's ask, 2026-08-20) -------------------------------
+//
+// "in Assets the generated clips are eating up all the room and hiding the sorted asset sections
+// and should be their own subtab along with CHaracters/Settings/Props/Style."
+//
+// The panel's filter strip becomes the panel's tab strip: one tab owns the library area at a time,
+// so the clips can no longer push the sorted sections off the bottom of it.
+//
+// `kinds` is the set of `models.AssetKind` values a tab shows. `null` means every kind — the All
+// tab, kept because it is the strip's existing behaviour and the only view that sorts a whole
+// library by nothing. `models.AssetKind` has SEVEN members and the Director named four, so the
+// three unnamed ones (`image`, `audio`, `video`) get the Media tab rather than being dropped:
+// `image` is what every upload defaults to, and an asset that appears under no tab is one a
+// Director can neither cite, replace nor delete from this screen. A contract test asserts the
+// union of the kinds below is exactly `models.AssetKind`, so a kind added later cannot go
+// invisible by omission.
+//
+// `clips` carries no kinds at all and is not an asset view: it is the take library, drawn from job
+// history, and it is on this strip because that is where the Director asked for it.
+export const ASSET_TABS = [
+  { id: "all", label: "All", kinds: null },
+  { id: "character", label: "Characters", kinds: ["character"], noun: "characters", singular: "Character" },
+  { id: "setting", label: "Settings", kinds: ["setting"], noun: "settings", singular: "Setting" },
+  { id: "prop", label: "Props", kinds: ["prop"], noun: "props", singular: "Prop" },
+  { id: "style", label: "Style", kinds: ["style"], noun: "style references", singular: "Style reference" },
+  {
+    id: "media",
+    label: "Media",
+    kinds: ["image", "audio", "video"],
+    title:
+      "Uploaded and modified images, audio and video — every asset kind without a tab of its " +
+      "own. An upload with no type chosen lands here.",
+  },
+  {
+    id: "clips",
+    label: "Clips",
+    kinds: [],
+    title: "Every completed H3 take this project has rendered. Not assets — takes.",
+  },
+];
+
+//: The tab a Director lands on, and the fallback for a stored value no tab answers to.
+export const ASSET_TAB_DEFAULT = "all";
+
+export function assetTab(tabId) {
+  return ASSET_TABS.find((tab) => tab.id === tabId)
+    || ASSET_TABS.find((tab) => tab.id === ASSET_TAB_DEFAULT);
+}
+
+// Which assets this tab shows, after the search box. One function so the grid and the tab's own
+// empty message cannot disagree about whether there is anything to draw.
+export function assetsForTab(assets, tabId, query = "") {
+  const tab = assetTab(tabId);
+  const wanted = String(query || "").trim().toLowerCase();
+  return (assets || []).filter((asset) => {
+    if (tab.kinds !== null && !tab.kinds.includes(asset?.kind)) return false;
+    return !wanted || String(asset?.name || "").toLowerCase().includes(wanted);
+  });
+}
+
+// What an empty tab says. Every tab says something specific, because "No matching assets" under a
+// tab a Director deliberately opened reads as a broken panel rather than as an honest count — and
+// the Clips tab, which is not an asset view at all, would be describing the wrong thing entirely.
+export function assetTabEmpty(tabId, query = "") {
+  const tab = assetTab(tabId);
+  const wanted = String(query || "").trim();
+  if (wanted && tab.id !== "clips") {
+    return {
+      title: `No ${tab.noun || "assets"} match “${wanted}”`,
+      hint: "Clear the search box to see everything on this tab.",
+    };
+  }
+  if (tab.id === "clips") {
+    return {
+      title: "No clips yet",
+      hint:
+        "Every completed H3 take in this project appears here, newest first. Render a shot and "
+        + "its take lands on this tab.",
+    };
+  }
+  if (tab.id === "all") {
+    return {
+      title: "No assets yet",
+      hint: "Generate a character or setting with Flux, or upload existing media.",
+    };
+  }
+  if (tab.id === "media") {
+    return {
+      title: "No media yet",
+      hint: "Uploaded images, audio and video land here — as does anything uploaded without a type.",
+    };
+  }
+  return {
+    title: `No ${tab.noun} yet`,
+    hint: `Generate one with Flux, or upload existing media and set its type to ${tab.singular}.`,
+  };
 }
 
 // Section boxes snap to the edges of the shots below them (the Director's design:
@@ -3267,6 +3493,62 @@ export function trimNudgeControl(shot) {
     nudge,
     offset: lead + nudge,
     minNudge: -lead,
+  };
+}
+
+// ------------------------------------------------------------------------------------------
+// Whether a move-drag on the timeline carries this shot's take with it. The Director's ask,
+// 2026-08-21:
+//
+//     "when I said Trim nudge I was talking specifically about the section in the Shots info
+//     panel that lets us nudge the clip along the timeline. When dragging in the timeline
+//     though it would just move the window over the clip but keep the clip aligned where it
+//     belongs with the music. Perhaps a lock/unlock from timeline toggle in the shots info
+//     panel may be useful next to that nudge input so that dragging a b-roll clip would be
+//     easier (default locked)."
+//
+// Both behaviours already existed and were on the wrong gestures: the *left edge* of a rendered
+// clip has moved `start` with `trim_nudge` compensating since 2026-08-20 -- which is exactly
+// "the window moves over the take" -- while the whole-clip move wrote `start` alone, carrying
+// the take with it. This makes the move behave like the edge by default, and the toggle is what
+// puts the old behaviour back for one shot when the Director wants it.
+//
+// **Session state, per shot, never persisted and never sent.** Held in `app.js` as a set of shot
+// ids, on the precedent of the two line mutes, the snap magnet and the seed randomize toggle --
+// and decided that way for a sharper reason of its own. What is durable about a b-roll clip is
+// where it sits, and where it sits is `start`/`trim_nudge`, which are persisted fields this
+// gesture writes. The unlock itself is a working mode -- "let me drag this one freely" -- and a
+// *persisted* unlock would be a trap: it would sit on a lip-sync shot for ever, silently letting
+// a drag months later pull the take off the words it was rendered against, which is the exact
+// failure the Director asked for this to prevent. Session-only fails closed, every time.
+//
+// Per shot rather than one flag for the workspace, which is where this differs from the seed
+// randomizer: unlocking is dangerous on the *next* shot, so it must not leak to it.
+export const TAKE_ANCHOR_CONTROL = "take-anchor";
+export const TAKE_ANCHOR_LABEL = "Locked to the music";
+//: Says what each state does, and says plainly that this is not the shot lock two rows above it
+//: -- two controls with "lock" in the name, one of which refuses sweeps and one of which changes
+//: what a drag does, is exactly the pair a Director would otherwise have to find out by trying.
+export const TAKE_ANCHOR_HELP =
+  "Locked: dragging this clip along the timeline slides its window over the take, and the take " +
+  "goes on playing against the same seconds of the song — a lip-sync take stays on its own " +
+  "words. Unlocked: the take travels with the window, which is what you want when repositioning " +
+  "b-roll. Either way nothing is prevented; a window dragged off what its take covers turns " +
+  "amber. This is not the shot lock above, and it lasts for this session only.";
+
+// The toggle's whole decision, and the drag's. `held` is the one rule both read: a shot with no
+// take has nothing to hold still, so the move behaves exactly as it did before this existed.
+//
+// `shown` is `trimNudgeControl`'s own -- the toggle is drawn inside the trim-nudge row, so a shot
+// with no take shows neither, which is the honest answer for a control that would do nothing.
+export function takeAnchorControl(shot, unlocked = false) {
+  const shown = Boolean(shot?.latest_output);
+  return {
+    shown,
+    held: shown && !unlocked,
+    control: TAKE_ANCHOR_CONTROL,
+    label: TAKE_ANCHOR_LABEL,
+    help: TAKE_ANCHOR_HELP,
   };
 }
 

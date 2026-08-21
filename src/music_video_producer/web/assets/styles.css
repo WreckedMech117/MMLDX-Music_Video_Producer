@@ -214,19 +214,51 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .document-scoped.active { display: flex; }
 .lock-toggle { display: flex; align-items: center; gap: 6px; margin: 0 4px 0 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .lock-toggle input { width: 13px; height: 13px; accent-color: var(--acid); }
+/* The shot inspector's seed and its randomize toggle, on one line. The Director's ask,
+   2026-08-20: "we should shorten that box a bit and add a randomize toggle (1-99999)". The box
+   is sized to the five digits the randomizer can produce plus the number input's own spinner,
+   rather than to the width of the panel; the room it gives up carries the toggle, whose label
+   names the moment it re-rolls. `align-items: end` lines both up on the input's baseline, and
+   the toggle's padding centres it against the 38px box rather than sitting it on the floor. */
+.seed-row { display: flex; align-items: end; gap: 12px; margin-bottom: 12px; }
+.seed-row .seed-field { flex: 0 0 116px; margin-bottom: 0; }
+.seed-row .seed-randomize { flex: 1 1 auto; margin: 0; padding-bottom: 12px; text-transform: none; letter-spacing: .02em; line-height: 1.3; }
+.seed-row .seed-randomize input { flex: none; }
 .asset-layout { display: grid; grid-template-columns: 310px minmax(420px, 1fr) 270px; gap: 12px; height: calc(100% - 82px); min-height: 580px; }
 .generator-panel, .library-panel, .inspector, .shot-inspector { min-height: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
 .generator-panel { overflow: auto; padding: 15px; }
 .pipeline-hint { margin: 15px 0 0; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; line-height: 1.5; }
 .library-panel { display: grid; grid-template-rows: auto 1fr; overflow: hidden; }
-.library-toolbar { display: flex; justify-content: space-between; gap: 12px; padding: 11px; border-bottom: 1px solid var(--line); }
-.segmented { display: flex; }
+/* The panel's subtabs and the search box. The strip carries seven tabs now (the Director's ask,
+   2026-08-20, to give the clips their own subtab "along with CHaracters/Settings/Props/Style").
+
+   `flex-wrap` is defensive and is declared as such: browser QA measures the strip at 1600, 1100,
+   950 and 820 CSS px -- across both breakpoints below -- and at every one of them seven tabs and
+   a 180px search box still share a line with no label cut off, so nothing here has been shown to
+   need it. It guards a window narrower than any width this stylesheet describes, where the
+   alternative is a strip that shrinks its buttons until their labels are clipped. */
+.library-toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; padding: 11px; border-bottom: 1px solid var(--line); }
+.segmented { display: flex; flex-wrap: wrap; }
 .segmented button { min-height: 34px; border: 1px solid var(--line); border-right: 0; padding: 0 10px; background: transparent; color: var(--muted); font-size: 11px; }
 .segmented button:first-child { border-radius: 5px 0 0 5px; }
 .segmented button:last-child { border-right: 1px solid var(--line); border-radius: 0 5px 5px 0; }
 .segmented button.active { background: var(--surface-3); color: var(--acid); }
 .library-toolbar input { width: 180px; }
 .asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); align-content: start; gap: 10px; overflow: auto; padding: 12px; }
+/* The clips library, which used to be drawn *under* the asset grid inside this same scrolling
+   panel -- the Director's report, 2026-08-20: the clips "are eating up all the room and hiding
+   the sorted asset sections". Thirty-three takes did exactly that: `.library-panel` is
+   `auto 1fr`, so the clips took an implicit third row and squeezed the grid above them. Now both
+   panes take the same row and the active tab shows exactly one of them. No `grid-row` is needed
+   to say so: a `display: none` element is not a grid item at all, so whichever pane is showing
+   auto-places into the `1fr` row on its own. Pinning a row here would look like the guarantee
+   and be inert -- the `[hidden]` rules below are the guarantee.
+
+   Those rules are load-bearing, not belt-and-braces: `display: grid`/`block` here beats the user
+   agent's `[hidden] { display: none }`, so without them `hidden` would set an attribute that
+   paints nothing -- both panes on screen and the report unfixed. */
+.clips-library { display: block; overflow: auto; padding: 12px; }
+.asset-grid[hidden], .clips-library[hidden] { display: none; }
 .asset-card { min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-1); overflow: hidden; text-align: left; }
 .asset-card:hover, .asset-card.selected { border-color: var(--acid); }
 .asset-thumb { aspect-ratio: 1.25; display: grid; place-content: center; overflow: hidden; color: var(--dim); background: #0d0f0f; font: 11px Consolas, monospace; }
@@ -357,7 +389,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .shots-track { min-height: 110px; }
 .refs-track { min-height: 52px; }
 .takes-strip { display: grid; gap: 5px; margin: 8px 0; padding: 9px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
-.clips-heading { margin: 16px 2px 8px; font: 11px Consolas, monospace; letter-spacing: .08em; color: var(--muted); }
+.clips-heading { margin: 2px 2px 10px; font: 11px Consolas, monospace; letter-spacing: .08em; color: var(--muted); }
 .batch-progress { padding: 8px 12px; margin-bottom: 6px; border: 1px solid var(--line-strong); border-left: 3px solid #4aa3c7; border-radius: var(--radius); font: 11px Consolas, monospace; color: var(--ink); background: var(--surface-0); }
 .job-row.linked { cursor: pointer; }
 .job-row.linked:hover { background: #ffffff0a; }
@@ -423,6 +455,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    is legitimate, and colouring one would say "wrong" about something that is fine. */
 .shot-clip.window-long { border-top: 2px solid var(--amber); }
 .shot-clip.window-long .clip-id { color: var(--amber); }
+/* The Director's second yellow (2026-08-21): "if the bounds of the shots window are dragged
+   beyond where that clip covers then the shot would turn yellow to warn that the bounds was gone
+   past." The same amber and the same two marks as the band above, because it is the same request
+   answered about a different fact -- a Director does not learn two colours for one word. A
+   separate class because the class names the state, and this one is about the take rather than
+   about the length H3 is trained for; a clip that is both wears whichever `windowWarningsByShot`
+   ranks higher, and the readiness list prints both sentences either way. */
+.shot-clip.take-uncovered { border-top: 2px solid var(--amber); }
+.shot-clip.take-uncovered .clip-id { color: var(--amber); }
 .shot-clip .clip-id { display: block; padding: 7px 9px 3px; color: var(--acid); font: 9px Consolas, monospace; }
 /* The word for a render in flight, on the clip itself. The left-bar hue above says the same
    thing and is the second, redundant signal -- this is the one that survives the colour being
@@ -493,6 +534,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    than a problem, and painting it as a warning would be the opposite of what it says. */
 .plan-readiness li.window-long { color: var(--amber); }
 .plan-readiness li.window-short { color: var(--muted); }
+/* And the coverage line, in the clip's own amber for the clip's own reason. */
+.plan-readiness li.take-uncovered { color: var(--amber); }
 .mix-take-audio-line { display: block; margin: 8px 0 0; font-size: 12px; color: var(--muted); }
 .replace-existing-line { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .timeline-transport .muted-line { color: var(--red); text-decoration: line-through; }
@@ -505,6 +548,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .trim-nudge { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; padding: 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-1); }
 .trim-nudge .control-label { font: 10px/1.2 Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; color: var(--acid); }
 .trim-nudge #nudge-value { font: 12px Consolas, monospace; min-width: 58px; text-align: center; }
+/* The music lock sits on the nudge row's first line, pushed to its right-hand end: the Director
+   asked for it "next to that nudge input", and the row's own `flex-wrap` puts the reason
+   underneath both. `text-transform` is undone from `.lock-toggle` because this label is a
+   sentence about a state rather than a control name. */
+.trim-nudge .take-anchor { margin-left: auto; text-transform: none; letter-spacing: .02em; }
 .trim-nudge .control-reason { flex-basis: 100%; color: var(--muted); font-size: 11px; }
 .assembly-bar { margin-top: 12px; display: grid; gap: 10px; }
 .assembly-controls { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }

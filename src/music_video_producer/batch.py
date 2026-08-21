@@ -43,6 +43,7 @@ __all__ = [
     "NEAR_DUPLICATE_OVERLAP",
     "NOTE_KIND_PROMPT",
     "NOTE_KIND_SAMENESS",
+    "NOTE_KIND_TAKE_UNCOVERED",
     "NOTE_KIND_WINDOW_LONG",
     "NOTE_KIND_WINDOW_SHORT",
     "PLACEHOLDER_PROMPT",
@@ -64,6 +65,7 @@ __all__ = [
     "render_status_report",
     "shot_label",
     "supersede_target_jobs",
+    "take_coverage_note",
     "window_band_note",
 ]
 
@@ -198,6 +200,50 @@ NOTE_KIND_PROMPT = "prompt"
 NOTE_KIND_SAMENESS = "sameness"
 NOTE_KIND_WINDOW_SHORT = "window_short"
 NOTE_KIND_WINDOW_LONG = "window_long"
+#: The third window state, and the Director's second yellow (2026-08-21): "if the bounds of the
+#: shots window are dragged beyond where that clip covers then the shot would turn yellow to warn
+#: that the bounds was gone past. The user could then readjust or regenerate to fit the newly
+#: wanted shot timeframe." A *different* fact from the band — the band is about the length H3 is
+#: trained for and is decidable before anything is rendered; this one is about the take that
+#: exists, and can only be asked of a shot that has one — so it is its own kind, drawn in the same
+#: amber and never folded into `window_long`.
+NOTE_KIND_TAKE_UNCOVERED = "take_uncovered"
+
+#: How far a window may sit outside its take before it is reported: half a frame at H3's rate.
+#: Both sides of the comparison are manifest floats and one of them is a division, so an exact
+#: `>` would report a shot as uncovered on the last bit of a number nobody touched. Deliberately
+#: not imported from `assembly` — that module measures a *file* with ffprobe and this one reads a
+#: recorded window, and the two are allowed to be judged at different moments with different
+#: evidence. The number is the same because half a frame means the same thing in both places.
+TAKE_COVERAGE_TOLERANCE_SECONDS = 1 / (2 * H3_FPS)
+
+#: The window has been dragged back past the take's first frame: the cut asks for picture from
+#: before the take begins. Reachable because a locked move-drag compensates `trim_nudge` and is
+#: deliberately **not clamped** — the Director's ruling is that the warning must never constrain
+#: the gesture ("still gives us the ability to nudge the actual position of a clip if we need
+#: to"), so this is what happens instead of a stop.
+#:
+#: Every number the fix needs is named, and both fixes are named, because "readjust or regenerate"
+#: is the Director's own pair of remedies. It says it does not block submission for the same
+#: reason the band's two sentences do: a Director who reads a warning as a gate stops working.
+SHOT_WINDOW_BEFORE_TAKE = (
+    "This shot's window now starts {behind:.3f}s before its take does: the cut reaches back past "
+    "the take's own first frame, and those seconds were never rendered. Drag the window forward "
+    "over the take, ease the trim nudge forward, or render the shot again for the window it has "
+    "now. This does not block submission."
+)
+#: And the other end: the window runs off the back of the take. The take's length is the length
+#: the render *asked H3 for* — `over_render_frames` of the window recorded at submission — and is
+#: named as such rather than measured, because this module never opens a video file. Assembly
+#: measures the real one with ffprobe and judges it there; a note that claimed to have measured
+#: would be claiming evidence it does not hold.
+SHOT_WINDOW_PAST_TAKE = (
+    "This shot's window runs {past:.3f}s past the end of its take. The take was rendered for "
+    "{take:.3f}s of picture, and the window asks for {needed:.3f}s of it — {offset:.3f}s of "
+    "offset plus a {duration:.3f}s window. Drag the window back over the take, ease the trim "
+    "nudge back, or render the shot again for the window it has now. This does not block "
+    "submission."
+)
 
 # The one refusal wording, used by every path that can submit a Shot: the single-Shot route and
 # the whole-batch client check. `api.js`'s READINESS_REFUSAL is the frontend half and a contract
@@ -279,8 +325,10 @@ class ReadinessReport:
     says whether the pairwise pass ran at all: a caller that only needs the blocking answer skips
     it, and an empty `warnings` list must not then be read as "this plan has no duplicates".
 
-    `window_warnings` is the shot-length band (`SHOT_WINDOW_BELOW_BAND`,
-    `SHOT_WINDOW_ABOVE_BAND`), and it is a **third list rather than more entries in
+    `window_warnings` is everything warned about a shot's *window*: the shot-length band
+    (`SHOT_WINDOW_BELOW_BAND`, `SHOT_WINDOW_ABOVE_BAND`) and, for a shot whose take carries a
+    window snapshot, whether that window still sits inside the take (`take_coverage_note`). It is
+    a **third list rather than more entries in
     `warnings`** for one concrete reason: `warnings` has exactly one meaning to every reader it
     already has. `api.js` labels every note in it `READINESS_SAMENESS_LABEL` ("Near-duplicate")
     and `readinessSummary` counts its length as "N near-duplicate pairs" — so a window note
@@ -288,6 +336,11 @@ class ReadinessReport:
     says, and counted as a pair it is not. One list, one kind of note. It is computed
     unconditionally, unlike sameness: it is per-shot rather than pairwise, so it costs one
     comparison per shot and there is nothing for an `include_warnings=False` caller to save.
+
+    A shot can carry **two** notes in this list — a long window over a take it has outgrown is
+    both — which is why nothing keys this list by shot id. The client's `windowWarningsByShot`
+    reduces it to the one state a clip can wear and says which wins; every note is still printed,
+    in full, in the readiness list.
     """
 
     ready: bool = False
@@ -373,6 +426,54 @@ def window_band_note(shot: Shot) -> tuple[str, str]:
             frames=frames,
             rendered=rendered,
             buffer=rendered - shot.duration,
+        )
+    return "", ""
+
+
+def take_coverage_note(shot: Shot) -> tuple[str, str]:
+    """Whether this shot's window still sits inside the picture its take holds.
+
+    ``(kind, sentence)``, or ``("", "")`` — `window_band_note`'s shape, and a warning on the same
+    terms: it never blocks, and the sentence says so. The Director's ask of 2026-08-21, in full:
+
+        "if the bounds of the shots window are dragged beyond where that clip covers then the
+        shot would turn yellow to warn that the bounds was gone past. The user could then
+        readjust or regenerate to fit the newly wanted shot timeframe. This should help prevent
+        lipsync clips from being dragged away from where it actually matches up with the music."
+
+    **Answered only when the take was snapshotted.** `latest_take_duration` is 0 for every take
+    rendered before the snapshot existed (2026-08-21 — including all 33 in the Director's own
+    project) and for every hand-picked clip, whose bookkeeping `select_shot_clip` clears. Those
+    takes cannot be coverage-checked by anything on the manifest: the only window there is the
+    *live* one, which is a fact about the plan rather than about the file, and a check run against
+    it would report a shot as uncovered precisely because it had been edited — which is the state
+    this is supposed to be able to tell apart. Silence, deliberately, and never a guess: the same
+    ruling `RESTORE_AUDIO_UNDESCRIBED_TAKE` records for the same pair of fields.
+
+    The take's length is `over_render_frames(latest_take_duration) / H3_FPS`: the count the
+    submission asked H3 for, computed from the window it asked for it with — the one function the
+    payload builders and the submission route both compute their length with, so the picture named
+    here is the picture that was requested. It is not a measurement, and the sentence does not
+    claim to be one; `assembly` measures the file itself and refuses there.
+
+    The offset is `latest_take_lead + trim_nudge` — `api.effectiveOffset`'s number and assembly's,
+    read off the Shot and never recomputed, because a pre-margin take and a post-margin one are
+    indistinguishable by arithmetic on their lengths.
+    """
+    if not shot.latest_output or shot.latest_take_duration <= 0:
+        return "", ""
+    take_seconds = over_render_frames(shot.latest_take_duration) / H3_FPS
+    offset = shot.latest_take_lead + shot.trim_nudge
+    if offset < -TAKE_COVERAGE_TOLERANCE_SECONDS:
+        return NOTE_KIND_TAKE_UNCOVERED, SHOT_WINDOW_BEFORE_TAKE.format(behind=-offset)
+    needed = offset + shot.duration
+    if needed > take_seconds + TAKE_COVERAGE_TOLERANCE_SECONDS:
+        return NOTE_KIND_TAKE_UNCOVERED, SHOT_WINDOW_PAST_TAKE.format(
+            past=needed - take_seconds,
+            take=take_seconds,
+            needed=needed,
+            offset=offset,
+            duration=shot.duration,
         )
     return "", ""
 
@@ -473,6 +574,22 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
                     kind=band_kind,
                 )
             )
+        # The take-coverage note rides in the same list as the band's, drawn in the same amber by
+        # the same reader. A second list, or a second colour, would be a second mechanism for one
+        # sentence a Director reads the same way: "this window is a problem and you may carry on".
+        # After the band's note for this shot, so a shot that is both long and uncovered reads in
+        # the order the two facts were decided; the client's own precedence decides which one the
+        # clip's single accessible name carries.
+        coverage_kind, coverage_reason = take_coverage_note(shot)
+        if coverage_kind:
+            window_warnings.append(
+                ReadinessNote(
+                    shot_ids=[shot.id],
+                    labels=[shot_label(project, shot)],
+                    reason=coverage_reason,
+                    kind=coverage_kind,
+                )
+            )
         rejection = prompt_rejection(shot.prompt)
         if rejection:
             blocking.append(
@@ -546,6 +663,66 @@ JOB_LOST_WITH_QUEUE = (
     "ComfyUI no longer knows this prompt — its queue was cleared, restarted, or crashed "
     "before the render ran. Nothing was produced. Render again re-opens the shot."
 )
+
+#: What `prompt_id` holds between a job record being saved and its graph being accepted by
+#: ComfyUI. The Director's 2026-08-21 ruling put the record first — a save that loses a race
+#: then refuses *before* any GPU time is spent — which means a record briefly exists for a
+#: prompt that has no id yet, and something has to go in the field.
+#:
+#: **Not the empty string**, which this application already spends on a different meaning:
+#: an empty `prompt_id` is the *local-work* marker (`heal_orphaned_local_jobs`, the assemble
+#: route's busy check, `api.js`'s assembly-progress branch), and it is deliberately excluded
+#: from `reconcilable_jobs` because nothing on ComfyUI can answer for it. An `h3` or `post`
+#: record carrying an empty id would therefore be read as an ffmpeg job — reconciled by
+#: nobody and, for `kind="post"`, healed to an assembly error at the next startup.
+#:
+#: A non-empty sentinel gets the opposite and correct treatment for free, with no new rule
+#: anywhere: the record is reconcilable, so the poll keeps watching it and the shot reads as
+#: in flight; ComfyUI's queue never contains this string and its history answers `known=False`
+#: for it, so an orphan — a crash between the save and the submit — is settled by the existing
+#: three-unknown-tick rule exactly as a prompt that died with the queue is. Deliberately not a
+#: UUID shape, so it can never be mistaken for one ComfyUI minted, and `ComfyClient.cancel` is
+#: safe against it (a delete of an id in no bucket is a no-op and no `/interrupt` follows).
+PENDING_SUBMISSION_PROMPT_ID = "pending-submission"
+
+#: What a record says once its graph was never accepted. Two callers, one sentence: the
+#: submission routes settle their own record when `comfy.submit` raises, and the reconciler
+#: settles one still carrying `PENDING_SUBMISSION_PROMPT_ID` after `MISSING_TICKS_LIMIT`
+#: unknown ticks — the case where the process died between the save and the submit.
+#:
+#: Separate from `JOB_LOST_WITH_QUEUE` because that sentence claims something about ComfyUI
+#: ("no longer knows this prompt") which was never true here: ComfyUI never knew it at all,
+#: and there was no queue for it to be cleared from. The consequence the Director acts on is
+#: identical, so the last two sentences are.
+JOB_NEVER_SUBMITTED = (
+    "The record for this render was saved and its graph was then never accepted by ComfyUI, "
+    "so no prompt was ever queued. Nothing was produced. Render again re-opens the shot."
+)
+
+
+def accept_submission(job: RenderJob, prompt_id: str) -> None:
+    """Write the accepted prompt id onto a record that was saved before the graph went out.
+
+    The second half of the record-first ordering, and every field it touches is one the
+    pending window could have left wrong:
+
+    * `prompt_id` stops being the sentinel and becomes the thing ComfyUI answers for;
+    * `status` returns to `queued`, and `error` and `missing_ticks` are cleared, because the
+      reconciler may have reached this record while the submission was still in progress and
+      settled it as never submitted. That verdict was right on the evidence it had and is
+      wrong now — the graph *was* accepted — and the window is wide enough to matter: the
+      pre-submission VRAM eject is allowed twenty seconds and the `/prompt` call thirty, while
+      three ticks of the browser's poll is six. A record left `error` with a live prompt id is
+      never reconciled again, which is the orphaned take this whole ordering exists to prevent.
+
+    Nothing else moves. What the acceptance implies for the *target* — a Shot's status, an
+    Asset's `prompt_id`, the Song being replaced — stays at each route, because each of those
+    is a different promise and one of them is destructive.
+    """
+    job.prompt_id = prompt_id
+    job.status = "queued"
+    job.error = ""
+    job.missing_ticks = 0
 
 
 def reconcilable_jobs(project: Project) -> list[RenderJob]:
@@ -687,6 +864,12 @@ async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconcili
     a job left "queued" forever pins render-status at "active" and blocks the shot's
     re-open. `MISSING_TICKS_LIMIT` consecutive unknown ticks settle it as that error, with
     the counter reset whenever ComfyUI answers (met three times live on 2026-08-19/20).
+
+    That same rule is what heals a record saved before its graph went out and orphaned by a
+    crash in between (the Director's 2026-08-21 ordering). No branch here exempts it: the
+    sentinel is an ordinary non-empty prompt id that ComfyUI has never heard of, so it is
+    looked up and counted exactly like any other. Only the sentence it settles into differs —
+    see `PENDING_SUBMISSION_PROMPT_ID` and `JOB_NEVER_SUBMITTED`.
     """
     open_jobs = reconcilable_jobs(project)
     if not open_jobs:
@@ -715,7 +898,15 @@ async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconcili
             changed = True
             if job.missing_ticks >= MISSING_TICKS_LIMIT:
                 job.status = "error"
-                job.error = JOB_LOST_WITH_QUEUE
+                # A record still carrying the pre-submission sentinel is not a prompt that
+                # died with the queue — ComfyUI never had it — so it is settled in the
+                # sentence that says so. Same terminal state, same consequence, an
+                # explanation that is true. See `PENDING_SUBMISSION_PROMPT_ID`.
+                job.error = (
+                    JOB_NEVER_SUBMITTED
+                    if job.prompt_id == PENDING_SUBMISSION_PROMPT_ID
+                    else JOB_LOST_WITH_QUEUE
+                )
                 shot = next(
                     (item for item in project.shots if item.id == job.target_id), None
                 )

@@ -5,7 +5,11 @@ export const state = {
   activePanel: "song",
   selectedAssetId: null,
   selectedShotId: null,
-  assetFilter: "all",
+  // Which subtab of the Assets panel owns the library area: an `ASSET_TABS` id. Session state,
+  // never persisted and never sent -- it is where a Director is looking, not a fact about the
+  // project. Was `assetFilter` while the strip only filtered the one grid; it now also decides
+  // whether the clips library or the asset grid is on screen at all.
+  assetTab: "all",
   waveform: null,
   audioBuffer: null,
   // The candidate import's own measurement, tied to the File it came from. Kept apart

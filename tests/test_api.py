@@ -104,9 +104,13 @@ from music_video_producer.asset_replacement import (
     REPLACE_OVER_SLOT_LIMIT,
 )
 from music_video_producer.batch import (
+    JOB_NEVER_SUBMITTED,
     JOB_SUPERSEDED,
+    MISSING_TICKS_LIMIT,
+    PENDING_SUBMISSION_PROMPT_ID,
     PLACEHOLDER_PROMPT,
     readiness_refusal,
+    reconcilable_jobs,
     shot_label,
 )
 from music_video_producer.comfy import ComfyError
@@ -1793,7 +1797,57 @@ def test_flux_and_multiview_reject_a_seed_past_the_64_bit_ceiling(tmp_path: Path
     assert comfy.prompts == []
 
 
-def test_songplanner_comfy_outage_leaves_project_unchanged(tmp_path: Path):
+def test_a_music_outage_does_not_destroy_the_song_it_was_going_to_replace(tmp_path: Path):
+    """The one write the record-first ordering deliberately leaves **after** the accept.
+
+    `project.song = Song(...)` throws away the Director's current song — its title, its
+    duration, its lyric sheet and the path to its audio — which is precisely why
+    `_require_song_replacement_confirmation` guards this route. Moving it ahead of the
+    submission along with the job record would trade a lost job record for a lost song on
+    every ComfyUI outage: the expensive direction, and the opposite of what the ruling is for.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Keep the song"))
+    project.song = Song(
+        title="The imported master",
+        source="imported",
+        path="media/songs/master.flac",
+        duration=180.0,
+        lyrics="A line the Director typed",
+    )
+    store.save(project)
+    comfy.submit_error = True
+
+    response = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={
+            "title": "Replacement",
+            "caption": "a caption",
+            "lyrics": "new words",
+            "confirm_song_replacement": True,
+        },
+    )
+
+    assert response.status_code == 502
+    saved = store.get(project.id)
+    assert saved.song.title == "The imported master"
+    assert saved.song.source == "imported"
+    assert saved.song.path == "media/songs/master.flac"
+    assert saved.song.lyrics == "A line the Director typed"
+    # And the record that *did* go first is settled rather than left open.
+    assert [(job.kind, job.status, job.error) for job in saved.jobs] == [
+        ("music", "error", JOB_NEVER_SUBMITTED)
+    ]
+
+
+def test_songplanner_comfy_outage_leaves_no_song_and_settles_its_record(tmp_path: Path):
+    """The outage answer, since the record is now written before the graph goes out.
+
+    The half that must not move: the Song is **not** replaced by a graph ComfyUI refused —
+    replacing it is the destructive act `_require_song_replacement_confirmation` guards, so it
+    waits for the accept even though the record does not. What is new is the record itself: it
+    exists, and it is settled rather than left claiming a render that never started.
+    """
     client, store, comfy = make_client(tmp_path)
     project = store.create(Project(name="Down"))
     comfy.submit_error = True
@@ -1806,8 +1860,12 @@ def test_songplanner_comfy_outage_leaves_project_unchanged(tmp_path: Path):
     assert response.status_code == 502
     assert "unreachable" in response.json()["detail"]
     saved = store.get(project.id)
-    assert saved.jobs == []
     assert saved.song is None
+    assert [(job.kind, job.status, job.error) for job in saved.jobs] == [
+        ("music", "error", JOB_NEVER_SUBMITTED)
+    ]
+    # Settled, so nothing goes on polling for it and nothing counts the project as busy.
+    assert reconcilable_jobs(saved) == []
 
 
 def test_completed_songplanner_job_reconciles_song_path(tmp_path: Path):
@@ -8940,8 +8998,15 @@ def test_enhancing_an_unknown_shot_is_a_404_and_a_downstream_failure_is_a_502(tm
     failed = enhance(client, project)
 
     assert failed.status_code == 502
-    # Nothing was recorded for a submission that never happened.
-    assert store.get(project.id).jobs == []
+    # The record is written before the graph goes out, so one exists — and it says the graph
+    # was never accepted rather than claiming a render that never started.
+    saved = store.get(project.id)
+    assert [(job.kind, job.status, job.error) for job in saved.jobs] == [
+        ("ltx", "error", JOB_NEVER_SUBMITTED)
+    ]
+    # And nothing is left in flight: a second enhancement is not refused by a phantom.
+    assert reconcilable_jobs(saved) == []
+    assert enhance(client, project).status_code == 502
 
 
 def test_the_enhancement_route_takes_no_body_and_exposes_no_sampling_controls(tmp_path: Path):
@@ -16735,3 +16800,268 @@ def test_startup_healing_survives_a_save_race_on_one_project(tmp_path: Path, mon
     assert healed == 0, "a job that could not be written must not be counted as healed"
     # Still open on disk, and still healable by the next boot that manages to write.
     assert ProjectStore(tmp_path).get(project.id).jobs[0].status == "running"
+
+
+# --------------------------------------------------------------------------------------------
+# The record goes first, then the graph (the Director's 2026-08-21 ruling). What that buys, and
+# what it costs.
+# --------------------------------------------------------------------------------------------
+
+
+def h3_ready_project(store: ProjectStore, name: str = "Record first") -> Project:
+    """One Shot the H3 route will submit, saved through the store rather than a route."""
+    project = store.create(Project(name=name))
+    project.shots = [
+        Shot(start=3, duration=5, prompt="A singer turns toward camera", status="ready", seed=17)
+    ]
+    store.save(project)
+    return store.get(project.id)
+
+
+def generate_h3(client, project, shot=None):
+    shot_id = (shot or project.shots[0]).id
+    return client.post(f"/api/projects/{project.id}/shots/{shot_id}/generate/h3", json={})
+
+
+def test_a_save_race_before_the_submit_refuses_and_spends_no_gpu_time(
+    tmp_path: Path, monkeypatch
+):
+    """The headline of the ruling, on all three routes the defect was found on.
+
+    The order used to be submit-then-save, so once `ProjectStore.save` gained its lost-update
+    refusal a save race answered **409 for a graph already queued**: the GPU rendered, the take
+    landed on disk, and nothing recorded it — no job, no `latest_output`, no way for the
+    application to find the file. Reversed, the same race refuses before a single byte reaches
+    ComfyUI, which is the cheap direction to fail.
+
+    `comfy.prompts` is the whole assertion. The status code was already 409 before this change;
+    what is new is that nothing was submitted to be 409'd about.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = h3_ready_project(store)
+    calls = refusing_save(store, monkeypatch)
+
+    response = generate_h3(client, project)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == SAVE_RACE_REFUSAL
+    assert calls == [project.id], "the route never reached the save this test is about"
+    assert comfy.prompts == [], "a graph was submitted for a record that could not be saved"
+
+    # The same property on the two sibling routes, each with its own fixture.
+    client, store, comfy = make_client(tmp_path / "enhance")
+    enhanced = enhanced_shot_project(store, tmp_path / "enhance")
+    refusing_save(store, monkeypatch)
+    assert enhance(client, enhanced).status_code == 409
+    assert comfy.prompts == []
+
+    client, store, comfy = make_client(tmp_path / "restore")
+    restorable = restorable_project(store, tmp_path / "restore")
+    refusing_save(store, monkeypatch)
+    assert restore_audio(client, restorable).status_code == 409
+    assert comfy.prompts == []
+
+
+def test_the_job_record_is_on_disk_before_the_graph_is_submitted(tmp_path: Path):
+    """Ordering, asserted as ordering rather than inferred from the end state.
+
+    The transport reads the manifest at the instant the graph is handed to it and *then* fails
+    the submission, so what it saw is the manifest as it stood before ComfyUI was told anything.
+    A route that still submitted first would show an empty job list here and pass every
+    end-state assertion in the file.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = h3_ready_project(store)
+    seen: list[list[dict]] = []
+
+    async def recording_submit(prompt, client_id=None):
+        seen.append(
+            [
+                {"kind": job.kind, "status": job.status, "prompt_id": job.prompt_id}
+                for job in store.get(project.id).jobs
+            ]
+        )
+        raise ComfyError("ComfyUI is unreachable")
+
+    comfy.submit = recording_submit
+
+    assert generate_h3(client, project).status_code == 502
+
+    assert seen == [
+        [{"kind": "h3", "status": "queued", "prompt_id": PENDING_SUBMISSION_PROMPT_ID}]
+    ]
+
+
+def test_a_submission_that_fails_settles_its_record_and_leaves_no_phantom(tmp_path: Path):
+    """The cost of going first, paid honestly: the record must not claim a render.
+
+    A record left `queued` on a prompt that was never queued is a phantom with teeth —
+    `reconcilable_jobs` counts it, so the poll never stops, assembly and asset fill go on
+    refusing, and `shot_render_in_flight` refuses the Director's next attempt at the very shot
+    they are trying to render. Settled instead, and nothing of the Shot moved at all, because
+    the pre-submission save carries the job record and only the job record.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = h3_ready_project(store)
+    comfy.submit_error = True
+
+    assert generate_h3(client, project).status_code == 502
+
+    saved = store.get(project.id)
+    assert [(job.kind, job.status, job.error) for job in saved.jobs] == [
+        ("h3", "error", JOB_NEVER_SUBMITTED)
+    ]
+    assert reconcilable_jobs(saved) == []
+    # No phantom in-flight shot: the acceptance never happened, so none of what it means was
+    # written — the shot is exactly as the Director left it.
+    shot = saved.shots[0]
+    assert shot.status == "ready"
+    assert shot.prompt_id == ""
+    assert (shot.latest_take_lead, shot.latest_take_start, shot.latest_take_duration) == (
+        0.0,
+        0.0,
+        0.0,
+    )
+
+    # And the next attempt is not refused by the wreckage of the last one.
+    comfy.submit_error = False
+    retried = generate_h3(client, store.get(project.id))
+    assert retried.status_code == 202
+    assert store.get(project.id).shots[0].status == "queued"
+    assert len(comfy.prompts) == 1
+
+
+def test_a_submission_failure_is_reported_even_when_settling_its_record_races(
+    tmp_path: Path, monkeypatch
+):
+    """Two failures at once must not become the wrong one.
+
+    The record was saved, the submission failed, and the save that would settle the record
+    loses a race of its own. The fact the Director needs is the submission failure — ComfyUI is
+    unreachable — so the 409 about the manifest is swallowed rather than raised on top of it.
+    Nothing is lost by that: the record is left carrying the sentinel, which is precisely the
+    state the reconciler settles, in the same words this save was trying to write.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = h3_ready_project(store)
+    comfy.submit_error = True
+    landed = store.save
+    calls = {"n": 0}
+
+    def only_the_first(project_to_save):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return landed(project_to_save)
+        raise ProjectChangedDuringSave("another save landed first")
+
+    monkeypatch.setattr(store, "save", only_the_first)
+
+    response = generate_h3(client, project)
+
+    assert response.status_code == 502
+    assert "unreachable" in response.json()["detail"]
+    assert calls["n"] == 2, "the settling save was never attempted"
+    saved = store.get(project.id)
+    assert saved.jobs[0].prompt_id == PENDING_SUBMISSION_PROMPT_ID
+    assert saved.jobs[0].status == "queued"
+
+
+def test_an_orphaned_pre_submit_record_reconciles_through_the_poll(tmp_path: Path):
+    """The ruling's own assumption, driven end to end through the endpoint that heals it.
+
+    A crash between the save and the submit leaves a record for a graph ComfyUI never heard of.
+    `tests/test_batch.py` proves the reconciler's verdict; this proves the route the Director
+    actually runs reaches it — the poll counts the record as open, asks ComfyUI about the
+    sentinel, and settles it after three unknown ticks, releasing the shot.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Orphaned"))
+    project.shots = [Shot(id="shot_a", start=0, duration=5, prompt="A corridor", status="queued")]
+    project.jobs = [
+        RenderJob(
+            kind="h3",
+            status="queued",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id="shot_a",
+        )
+    ]
+    store.save(project)
+
+    async def unknown_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "queued",
+                "outputs": [],
+                "error": "",
+                "known": False,
+            },
+        )()
+
+    comfy.history = unknown_history
+
+    for _ in range(MISSING_TICKS_LIMIT):
+        report = client.get(f"/api/projects/{project.id}/render-status")
+        assert report.status_code == 200
+
+    settled = store.get(project.id)
+    assert settled.jobs[0].status == "error"
+    assert settled.jobs[0].error == JOB_NEVER_SUBMITTED
+    assert settled.shots[0].status == "error"
+    # The poll releases, which is what "settled" has to mean to the browser.
+    assert report.json()["active"] is False
+
+
+def test_a_partly_submitted_asset_fill_settles_only_the_graphs_that_never_went_out(
+    tmp_path: Path, monkeypatch
+):
+    """The loop route, held to the same rule with one save for the whole batch.
+
+    Every record is written before any graph goes out, so a save race costs no GPU time here
+    either. When a submission fails partway the honest report is unchanged — what queued is
+    queued and nothing is rolled back — and the records for the graphs that never went out are
+    settled rather than left open for the poll to chase forever.
+    """
+    director = StageManagingDirector(assets=[
+        ("character", "Lead", "A tall singer in a dark warehouse."),
+        ("setting", "Mezzanine", "A dark warehouse mezzanine, moonlight shafts."),
+        ("prop", "Microphone", "A vintage chrome standing microphone."),
+    ])
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = store.create(Project(name="Fill"))
+
+    # First: the race, which is what the ordering is for. The batch's records are written
+    # before any of its graphs go out, so a refused save spends no GPU time on any of them.
+    with monkeypatch.context() as refusing:
+        refusing_save(store, refusing)
+        raced = fill_assets(client, project.id, count=3)
+    assert raced.status_code == 409
+    assert raced.json()["detail"] == SAVE_RACE_REFUSAL
+    assert comfy.prompts == []
+
+    calls = {"n": 0}
+    real_submit = comfy.submit
+
+    async def failing_after_one(prompt, client_id=None):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ComfyError("ComfyUI is unreachable")
+        return await real_submit(prompt)
+
+    comfy.submit = failing_after_one
+
+    response = fill_assets(client, project.id, count=3)
+
+    assert response.status_code == 502
+    saved = store.get(project.id)
+    # One graph went out, so one record is live and one asset exists.
+    assert [(job.status, job.prompt_id) for job in saved.jobs] == [
+        ("queued", "p-101"),
+        ("error", PENDING_SUBMISSION_PROMPT_ID),
+        ("error", PENDING_SUBMISSION_PROMPT_ID),
+    ]
+    assert [job.error for job in saved.jobs[1:]] == [JOB_NEVER_SUBMITTED] * 2
+    assert len(saved.assets) == 1
+    assert len(reconcilable_jobs(saved)) == 1

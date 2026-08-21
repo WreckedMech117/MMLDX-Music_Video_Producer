@@ -1,5 +1,5 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, RESUBMIT_SEED_STRIDE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
-import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
 // Fill section looks: the Director's empty shared prompt, read out of the Treatment.
@@ -255,7 +255,16 @@ async function loadProject(id) {
   // of the project already on screen -- the queue refresh, both generate paths, multiview, the
   // queue-ready loop -- and unticking the box there revokes consent the Director gave seconds ago
   // in the project they are still looking at, with nothing on screen to explain it.
-  if (documentConsentClearedOnLoad(state.project?.id, id)) clearDocumentConsent(applyDocumentsControl());
+  //
+  // The music lock is cleared on the same test and for a sister reason. Every unlock belongs to
+  // the project it was made in, ids collide across projects, and a *refresh* must not re-lock a
+  // shot the Director unlocked a second ago -- a queue poll re-ticking the box mid-gesture would
+  // be the control fighting them. `documentConsentClearedOnLoad` is the executed answer to "is
+  // this a different project"; a hand-written `!==` beside it would be a second copy of one rule.
+  if (documentConsentClearedOnLoad(state.project?.id, id)) {
+    clearDocumentConsent(applyDocumentsControl());
+    unlockedFromMusic.clear();
+  }
   // Whatever readiness this client held belongs to the project being left, and the revision bump
   // discards an answer still in flight for it. A readiness report drawn under another project's
   // name would name Shots that are not on screen and count a plan nobody is looking at.
@@ -737,13 +746,53 @@ function assetImageUrl(asset) {
   return comfyOutputUrl(comfyUrl, asset.path);
 }
 
-function renderAssets() {
+// The panel's tab strip, built from api.js's ASSET_TABS rather than written into index.html, so
+// the tabs and the kinds they cover are one list a contract test can pin to `models.AssetKind`.
+// Called from `renderAssets`, which is what carries the active mark from tab to tab; the click
+// handler is bound once, in `bindEvents`, by delegation off the strip itself.
+function renderAssetTabs() {
+  const strip = $("#asset-filters");
+  if (!strip) return;
+  const clips = clipLibraryRows().length;
+  // Built once, then updated in place. Rewriting the strip's `innerHTML` on every render would
+  // destroy the button the Director just pressed -- the press itself calls `renderAssets` -- taking
+  // its keyboard focus with it. That is the shape of the defect found in this codebase on
+  // 2026-08-21, where a `dblclick` never fired because `pointerdown` re-rendered every clip.
+  if ($$("button[data-filter]", strip).length !== ASSET_TABS.length) {
+    strip.innerHTML = ASSET_TABS.map((tab) =>
+      `<button type="button" role="tab" data-filter="${tab.id}"${tab.title ? ` title="${escapeHtml(tab.title)}"` : ""}></button>`).join("");
+  }
+  $$("button[data-filter]", strip).forEach((button, index) => {
+    const tab = ASSET_TABS[index];
+    const active = tab.id === state.assetTab;
+    // The Clips tab carries its own count, because "are there any" is the question that sent the
+    // Director looking for this list in the first place. The asset tabs do not: their contents are
+    // one click away and a count on every tab is a row of numbers nobody reads.
+    button.textContent = tab.id === "clips" && clips ? `${tab.label} ${clips}` : tab.label;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+}
+
+// Exported for the executed frontend contract, on `renderShotInspector`'s precedent: which of the
+// two panes is on screen is a fact about the running panel, and the Director's report was that
+// both were -- a claim no source read can settle.
+export function renderAssets() {
   const assets = state.project?.assets || [];
-  const query = $("#asset-search")?.value?.toLowerCase() || "";
-  const filtered = assets.filter((asset) => (state.assetFilter === "all" || asset.kind === state.assetFilter) && (!query || asset.name.toLowerCase().includes(query)));
+  const query = $("#asset-search")?.value || "";
+  const tab = assetTab(state.assetTab);
+  const filtered = assetsForTab(assets, tab.id, query);
   const grid = $("#asset-grid");
+  renderAssetTabs();
+  // One tab owns the library area at a time. This is the whole of the Director's report: the
+  // clips list used to be drawn *below* the grid, inside a panel whose rows are `auto 1fr`, so
+  // thirty-three takes took the room the sorted sections were supposed to be shown in.
+  const onClips = tab.id === "clips";
+  grid.hidden = onClips;
+  $("#clips-library").hidden = !onClips;
   if (!filtered.length) {
-    grid.innerHTML = `<div class="library-empty"><strong>No matching assets</strong><span>Generate a character or setting with Flux, or upload existing media.</span></div>`;
+    const empty = assetTabEmpty(tab.id, query);
+    grid.innerHTML = `<div class="library-empty"><strong>${escapeHtml(empty.title)}</strong><span>${escapeHtml(empty.hint)}</span></div>`;
   } else {
     grid.innerHTML = filtered.map((asset) => {
       const url = assetImageUrl(asset);
@@ -771,10 +820,11 @@ function renderAssets() {
 // Director's ask (2026-08-20): "There is also no section in Assets for all of the clips
 // generated for this project." Rows are derived from the job history (where take
 // provenance lives), play in place, and jump to the producing shot on the timeline.
-function renderClipsLibrary() {
-  const region = $("#clips-library");
-  if (!region) return;
-  const comfyUrl = state.health?.comfy?.url || "http://127.0.0.1:8188";
+//
+// Split out from the drawing below so the tab strip can count the takes without building the
+// markup for them: a count drawn from a second, similar-looking loop is a count that can drift
+// from the list it labels.
+function clipLibraryRows() {
   const rows = [];
   const seen = new Set();
   for (const job of [...(state.project?.jobs || [])].reverse()) {
@@ -787,7 +837,25 @@ function renderClipsLibrary() {
       rows.push({ file, shotId: job.target_id });
     }
   }
-  if (!rows.length) { region.innerHTML = ""; return; }
+  return rows;
+}
+
+// The Clips tab's contents. Its own tab since the Director's report (2026-08-20) that the clips
+// "are eating up all the room and hiding the sorted asset sections" — this used to be drawn
+// underneath the asset grid, in the same scroll area, which is exactly what it was doing.
+// Nothing about a row changed: hover still plays it, Open shot still jumps to the timeline.
+function renderClipsLibrary() {
+  const region = $("#clips-library");
+  if (!region) return;
+  const comfyUrl = state.health?.comfy?.url || "http://127.0.0.1:8188";
+  const rows = clipLibraryRows();
+  if (!rows.length) {
+    // An empty tab says so, rather than rendering nothing and reading as a panel that failed to
+    // load. Drawn whether or not this tab is the visible one; `hidden` decides that.
+    const empty = assetTabEmpty("clips");
+    region.innerHTML = `<div class="library-empty"><strong>${escapeHtml(empty.title)}</strong><span>${escapeHtml(empty.hint)}</span></div>`;
+    return;
+  }
   region.innerHTML = `<h3 class="clips-heading">Generated clips · ${rows.length}</h3><div class="clips-grid">${rows.map((row) =>
     `<div class="clip-card"><video preload="metadata" muted src="${escapeHtml(comfyOutputUrl(comfyUrl, row.file))}" title="${escapeHtml(row.file)}"></video><footer><span>${escapeHtml(shotLabel(state.project, row.shotId))}</span><button class="quiet-button clip-jump" data-shot-id="${escapeHtml(row.shotId)}">Open shot</button></footer></div>`
   ).join("")}</div>`;
@@ -1482,6 +1550,22 @@ function renderReferences() {
 // clicks in a row are one double-click and one press rather than two overlapping ones.
 let lastEdgePress = null;
 
+// Which shots the Director has unlocked from the music for this session, by id. Empty means every
+// shot is locked, which is the default the Director asked for ("default locked").
+//
+// Session state, never persisted and never sent: `takeAnchorControl` carries the whole argument,
+// including why this is per shot rather than one flag for the workspace. Cleared when the project
+// on screen changes, not on every refresh -- a background poll re-ticking a box the Director had
+// just unticked would be the control fighting them.
+const unlockedFromMusic = new Set();
+
+// Whether a move-drag on this shot slides the window over a take that stays where it was
+// performed. One reader for the toggle and the drag, so the box on screen and the gesture can
+// never disagree; the rule itself is `takeAnchorControl`'s.
+function takeAnchor(shot) {
+  return takeAnchorControl(shot, unlockedFromMusic.has(shot?.id));
+}
+
 // Whether the song is running right now, read from the master element rather than from a flag.
 // A moving playhead is not something an edge can be lined up against, which is why the snap is
 // off while it plays.
@@ -1601,7 +1685,37 @@ function bindClip(clip) {
       const snapped = grid(delta);
       travelled = Math.max(travelled, Math.abs(moveEvent.clientX - startX));
       magnetised = null;
-      if (mode === "move") shot.start = Math.max(0, grid(original.start + snapped));
+      if (mode === "move") {
+        shot.start = Math.max(0, grid(original.start + snapped));
+        // The Director's ask, 2026-08-21: "When dragging in the timeline though it would just
+        // move the window over the clip but keep the clip aligned where it belongs with the
+        // music." Which is the rule the *left edge* below has followed since 2026-08-20, applied
+        // to the gesture that always wanted it: the window moves, the nudge follows it by exactly
+        // the same seconds, and `start - lead - nudge` -- the song second the take's first frame
+        // plays at -- comes out unchanged. Unlocked, or on a shot with no take, nothing is
+        // written and the move is byte for byte the one this file made before.
+        //
+        // Measured as `shot.start - original.start` rather than as the raw delta, so the clamp at
+        // 0 s above is accounted for: a drag that ran into the head of the song moved the window
+        // less than the pointer moved, and compensating by the pointer would slide the take.
+        //
+        // **Deliberately not floored at the take's first frame.** The left edge clamps there and
+        // keeps its clamp; this gesture must not, because the Director's ruling is that the
+        // coverage warning colours and never constrains -- "still gives us the ability to nudge
+        // the actual position of a clip if we need to". A window dragged off its take is a real,
+        // representable state that the readiness report turns amber (`take_uncovered`) and
+        // assembly refuses with the numbers; a clamp here would silently stop the drag instead.
+        //
+        // `exactSeconds`, not `grid` -- `applyPlayheadSnap`'s spelling, and the reason is a real
+        // desync a browser measured on 2026-08-21. The window is stepped to the frame grid, but a
+        // window that did not *start* on the grid moves by an off-grid amount, so re-gridding the
+        // compensation rounds it to a different number than the window moved by: a 1.608 s move of
+        // a shot starting at 32.517 s wrote a 1.625 s nudge and pulled the take 17 ms off the
+        // music. The compensation is not its own gesture; it is exactly what the window did, with
+        // float noise trimmed. The left edge below carried the same defect and is corrected with
+        // it, which is what makes the two gestures one rule.
+        if (takeAnchor(shot).held) shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));
+      }
       if (mode === "left") {
         const end = original.start + original.duration;
         const pull = magnet(original.start + delta);
@@ -1613,10 +1727,15 @@ function bindClip(clip) {
           // (nudge follows start), so the same take frame stays at the same song second —
           // and the floor is the recorded lead: the cut can never reach before the take
           // begins.
+          //
+          // `exactSeconds` rather than `grid` since 2026-08-21: re-gridding the compensation
+          // rounded it away from the seconds the window had actually moved whenever the window
+          // did not start on the frame grid, which put the take up to half a frame out. See the
+          // move branch above, where a browser measured it.
           const lead = shot.latest_take_lead || 0;
           const floor = original.start - Math.max(0, lead + original.nudge);
           shot.start = clamp(want, Math.max(0, floor), end - .5);
-          shot.trim_nudge = grid(original.nudge + (shot.start - original.start));
+          shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));
         } else {
           shot.start = clamp(want, 0, end - .5);
         }
@@ -1764,6 +1883,24 @@ function shotCitationRows(shot, assets) {
     return `<div class="citation-row${asset ? "" : " citation-missing"}"><span class="citation-name">${escapeHtml(tag)}: ${escapeHtml(asset ? asset.name : citation.asset_id)}</span><select class="citation-role" data-id="${citation.asset_id}">${roles}</select><button class="quiet-button remove-ref" data-id="${citation.asset_id}">×</button></div>`;
   }).join("");
 }
+
+// Whether the next queued retake rolls a fresh seed. Session-wide and session-only, on the
+// precedent of the two line mutes and the snap magnet: never persisted, never sent, never in the
+// manifest.
+//
+// Deliberately NOT a field on the Shot. A per-shot persisted flag is a new model field, and this
+// application's repeat offender is the generic full-project PUT writing every defaulted field back
+// -- so a new field earns its keep or it is not added. This one would not: what is durable about
+// randomizing is the *number*, and the number is already a persisted per-shot field that this
+// toggle writes. The flag itself is a working mode -- "I want different takes right now" -- which
+// is a fact about the session in front of the screen, not about the shot. Session-wide rather than
+// per-shot for the same reason: a Director sweeping ten shots with Render again asked for
+// randomness once, not ten times.
+//
+// The consequence, stated because it is visible: ticking rolls a seed for the *selected* shot
+// only. Moving to another shot leaves the box ticked and that shot's stored seed untouched until
+// its own Render again queues -- which is what `RANDOM_SEED_LABEL` says on the control.
+let randomizeSeed = false;
 
 // Exported for the executed frontend contract, on the `renderSong` precedent: the render-again
 // control is drawn, enabled and bound in here, and a test that only read this source could not
@@ -1968,9 +2105,18 @@ export function renderShotInspector() {
   const takeAudioHtml = takeAudio.shown
     ? `<label class="mix-take-audio-line" title="Accept this take's own audio into the video: the Monitor plays it over the master song and assembly mixes the same slice under the song. Off means only the master song comes through for this clip."><input type="checkbox" id="mix-take-audio" ${takeAudio.checked ? "checked" : ""}> Mix this take's audio under the song</label>`
     : "";
+  // The lock, beside the nudge because the Director put it there ("next to that nudge input").
+  // Drawn inside the trim-nudge row and therefore shown on exactly the shots the nudge is shown
+  // on: a shot with no take has nothing to hold still, and a live toggle that did nothing would
+  // be a worse answer than no toggle. `takeAnchorControl` decides both, and the drag reads the
+  // same function -- see `takeAnchor`.
+  const anchor = takeAnchor(shot);
+  const anchorHtml = anchor.shown
+    ? `<label class="lock-toggle take-anchor" title="${escapeHtml(anchor.help)}"><input id="${anchor.control}" type="checkbox" ${anchor.held ? "checked" : ""}>${escapeHtml(anchor.label)}</label>`
+    : "";
   const nudgeState = trimNudgeControl(shot);
   const nudgeHtml = nudgeState.shown
-    ? `<div class="trim-nudge" id="trim-nudge"><span class="control-label" title="The take is rendered longer than the shot's window. The offset is where in the take the window starts: the recorded sync lead plus your nudge. The Monitor previews the same slice assembly will cut.">Trim nudge</span><button class="quiet-button" id="nudge-back" title="One frame earlier">−1f</button><span id="nudge-value">${escapeHtml(nudgeState.nudge.toFixed(3))}s</span><button class="quiet-button" id="nudge-forward" title="One frame later">+1f</button><button class="quiet-button" id="nudge-reset" title="Back to the recorded sync lead" ${nudgeState.nudge === 0 ? "disabled" : ""}>Reset</button><span class="control-reason">cut at ${escapeHtml(nudgeState.offset.toFixed(3))}s into the take (lead ${escapeHtml(nudgeState.lead.toFixed(3))}s)</span></div>`
+    ? `<div class="trim-nudge" id="trim-nudge"><span class="control-label" title="The take is rendered longer than the shot's window. The offset is where in the take the window starts: the recorded sync lead plus your nudge. The Monitor previews the same slice assembly will cut.">Trim nudge</span><button class="quiet-button" id="nudge-back" title="One frame earlier">−1f</button><span id="nudge-value">${escapeHtml(nudgeState.nudge.toFixed(3))}s</span><button class="quiet-button" id="nudge-forward" title="One frame later">+1f</button><button class="quiet-button" id="nudge-reset" title="Back to the recorded sync lead" ${nudgeState.nudge === 0 ? "disabled" : ""}>Reset</button>${anchorHtml}<span class="control-reason">cut at ${escapeHtml(nudgeState.offset.toFixed(3))}s into the take (lead ${escapeHtml(nudgeState.lead.toFixed(3))}s)</span></div>`
     : "";
   // Whether this shot's take may be approved or the approval cleared, decided by
   // `approvalControl`, which the contract tests execute for every state. Nothing about that
@@ -2000,13 +2146,47 @@ export function renderShotInspector() {
   // the field's own editor, not a re-derivation — but the guard cannot tell prose apart,
   // so the editor reads the field in the one spelling the guard does not police.
   const lockChecked = shot["locked"] ? "checked" : "";
+  // The seed and its randomize toggle, on one line. The Director's ask, 2026-08-20: "we should
+  // shorten that box a bit and add a randomize toggle (1-99999)". The box is sized to the five
+  // digits the randomizer can produce instead of to the panel, and the room it gives up carries
+  // the toggle -- whose label names the one moment it re-rolls, because a toggle whose re-roll
+  // moment has to be guessed is worse than a button.
+  //
+  // `randomizeSeed` is a session working mode, not a field on the Shot: see its declaration.
+  const seedHtml = `<div class="seed-row"><label class="seed-field">Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label class="lock-toggle seed-randomize" title="${escapeHtml(RANDOM_SEED_HELP)}"><input id="${RANDOM_SEED_CONTROL}" type="checkbox" ${randomizeSeed ? "checked" : ""}>${escapeHtml(RANDOM_SEED_LABEL)}</label></div>`;
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}<label>Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label><label class="check-row" title="A lock is a deliberate hands-off: sweeps, fills, re-renders and clip swaps all refuse a locked shot until you unlock it here."><input id="shot-locked" type="checkbox" ${lockChecked}> Lock this shot</label>${takeHtml}${takesStripHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}${flagHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}${seedHtml}<label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label><label class="check-row" title="A lock is a deliberate hands-off: sweeps, fills, re-renders and clip swaps all refuse a locked shot until you unlock it here."><input id="shot-locked" type="checkbox" ${lockChecked}> Lock this shot</label>${takeHtml}${takesStripHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}${flagHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
   restoreInspectorEdit(inspector, place);
-  ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-seed", "shot-song-audio", "shot-locked"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
+  ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-song-audio", "shot-locked"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
+  // The seed is bound apart from the list above for one reason: typing a number by hand is a
+  // statement that you want *that* number, so it clears the randomize toggle. Nothing else in this
+  // panel has a side effect on another control, and folding it into the shared handler would mean
+  // deciding which element fired from inside a function that is deliberately field-agnostic.
+  //
+  // Order matters: the flag is cleared before the write, so the rebuild `updateShotFromInspector`
+  // triggers draws the box unticked in the same gesture that typed the number.
+  $("#shot-seed").addEventListener("change", () => {
+    randomizeSeed = false;
+    updateShotFromInspector();
+  });
+  // Ticking rolls once, now, and holds -- the Director's word. It writes the shot's own seed
+  // through the ordinary silent save, so the number on screen is the number a render will use;
+  // a toggle that only promised a future number would leave the field lying about what is stored.
+  //
+  // Unticking writes nothing at all. The number that was rolled stays exactly where it is and
+  // becomes an ordinary fixed seed, because deleting a value the Director may be about to compare
+  // against is not something a checkbox should do.
+  $("#" + RANDOM_SEED_CONTROL).addEventListener("change", (event) => {
+    randomizeSeed = Boolean(event.target.checked);
+    if (!randomizeSeed) return;
+    shot.seed = randomSeed();
+    state.dirty = true;
+    saveShotsSilently();
+    renderTimeline();
+  });
   // The takes strip: switch this shot's clip among its own takes, or attach a video asset.
   //
   // Bound here, immediately after the `innerHTML` write above, to the nodes that write just
@@ -2167,7 +2347,17 @@ export function renderShotInspector() {
         return;
       }
       const fresh = state.project.shots.find((item) => item.id === shot.id);
-      if (fresh) fresh.seed = (fresh.seed || 0) + RESUBMIT_SEED_STRIDE;
+      // The one place a queued retake's seed moves, and the one place the two sources of that
+      // movement are chosen between. `nextRenderSeed` returns the stride when randomize is off --
+      // byte-for-byte what this line did before -- and a fresh 1–99999 roll instead of it when the
+      // toggle is on. Never both: a random number with a stride added to it would drift under the
+      // Director on the one value they have just asked to own.
+      //
+      // This is also why randomize re-rolls *here* rather than on Mark ready or on selection: this
+      // is the gesture that spends GPU time, and it is the only one whose whole point is a
+      // different take. Cancelling the dialog above returns before this line, so the old contract
+      // holds unchanged -- re-opened, seed untouched, nothing queued.
+      if (fresh) fresh.seed = nextRenderSeed(fresh, randomizeSeed);
       // Through the one blessed shot saver, then awaited settled, because the render reads
       // the seed from the store: a stride still on the wire at submission renders the
       // identical take.
@@ -2203,6 +2393,14 @@ export function renderShotInspector() {
     shot.mix_take_audio = event.target.checked;
     saveShotsSilently();
     renderTimeline();
+  });
+  // The lock. It writes nothing: it changes what the *next* drag on this clip does, and the plan
+  // on disk is untouched until that drag happens. Nothing is re-rendered either -- the browser has
+  // already drawn the tick, and rebuilding the panel under the Director's own click is this
+  // application's recorded way of losing the control they just pressed.
+  $("#" + anchor.control)?.addEventListener("change", (event) => {
+    if (event.target.checked) unlockedFromMusic.delete(shot.id);
+    else unlockedFromMusic.add(shot.id);
   });
   $("#nudge-back")?.addEventListener("click", () => applyNudge(nudgeState.nudge - 1 / 24));
   $("#nudge-forward")?.addEventListener("click", () => applyNudge(nudgeState.nudge + 1 / 24));
@@ -3329,7 +3527,23 @@ function bindEvents() {
     catch (error) { toast(error.message, "error"); }
     event.target.value = "";
   });
-  $$("#asset-filters button").forEach((button) => button.addEventListener("click", () => { state.assetFilter = button.dataset.filter; $$("#asset-filters button").forEach((item) => item.classList.toggle("active", item === button)); renderAssets(); }));
+  // Delegated off the strip, once, rather than bound per button. `renderAssetTabs` builds the
+  // buttons and a tab click calls it again, so a per-button handler would be one `innerHTML`
+  // write away from being bound to nothing -- and this application has a recorded defect of
+  // exactly that shape (a `dblclick` listener that never fired because `pointerdown` re-rendered
+  // every clip). Delegation makes the strip's own rebuild rule something the handler survives
+  // rather than something it depends on. The strip is also drawn before any project loads, so
+  // this binds to a node that is always there.
+  //
+  // Only the tab changes here. `state.selectedAssetId` and `state.selectedShotId` are deliberately
+  // untouched: the inspector on the right keeps the selected asset -- and with it "Attach to
+  // selected shot" -- alive across a tab change, including on the Clips tab.
+  $("#asset-filters").addEventListener("click", (event) => {
+    const button = event.target?.closest?.("button[data-filter]");
+    if (!button) return;
+    state.assetTab = button.dataset.filter;
+    renderAssets();
+  });
   $("#asset-search").addEventListener("input", renderAssets);
   $$(".document-tabs button").forEach((button) => button.addEventListener("click", () => {
     $$(".document-tabs button").forEach((item) => item.classList.toggle("active", item === button));

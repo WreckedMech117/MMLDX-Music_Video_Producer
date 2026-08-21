@@ -51,6 +51,11 @@ What is asserted, in order:
     resolves and the words the readiness report supplies, and it warns without blocking.
 11. **Expand All Prompts** is on the cuts bar, wired to the whole-plan sweep, and states what it
     will cost before it spends anything.
+12. **The music lock and the second yellow** (2026-08-21). The lock is beside the trim nudge and
+    starts ticked; a locked move-drag leaves the take on the same second of the song and an
+    unlocked one moves it, both read back as `start - lead - nudge` off the manifest; a window
+    dragged off the picture its take holds turns amber without shutting anything; and a take that
+    recorded no window of its own is never warned about.
 
 **No GPU time and no model time is spent.** Nothing here reaches `/prompt`; the one control that
 could spend model time is deliberately driven only as far as its own confirmation and then
@@ -91,7 +96,11 @@ from e2e_support import (
     wait_for_readiness,
     wait_for_toast,
 )
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -132,6 +141,44 @@ SHOTS = [
     {"id": "shot_12", "start": 57.6, "duration": 2.39},       # 0.01 s of song after
 ]
 SHOT_COUNT = len(SHOTS)
+
+#: The shot section 12 gives a take to, and the take's own bookkeeping, written exactly as the H3
+#: submission route writes it: the lead it was rendered with, and the window it was rendered for.
+#: `latest_output` names a file that does not exist and does not need to -- nothing in this section
+#: plays it, and every decision under test is made from these four numbers.
+#:
+#: The recorded window is **9 s while the live one is 5 s**, which is a shot whose window the
+#: Director shortened after its render -- the ordinary reason the snapshot exists at all. It is
+#: also what gives this section room to work: `over_render_frames(9.0)` is 243 frames, so the take
+#: holds 10.125 s of picture and a 1.5 s drag stays well inside it. A take rendered for the *live*
+#: 5 s window holds 5.875 s and would leave 0.625 s of headroom, so every drag big enough to
+#: measure would be an uncovered one and this section could not tell the two states apart.
+TAKE_SHOT = "shot_07"
+#: What that take holds, in seconds of picture: `over_render_frames(9.0) / H3_FPS`. Named because
+#: two assertions read it -- the readiness sentence quotes it, and the drag in 12c has to be big
+#: enough to leave it.
+TAKE_PICTURE_SECONDS = 243 / 24
+TAKE_FIELDS = {
+    "latest_output": "music-video-producer/qa/shots/shot_07-h3_00001.mp4",
+    "latest_take_lead": 0.25,
+    "latest_take_start": 32.517,
+    "latest_take_duration": 9.0,
+    "trim_nudge": 0.0,
+    "status": "complete",
+}
+#: And a take that recorded no window of its own -- `latest_take_duration` 0. Every take rendered
+#: before 2026-08-21 is one of these, including the 33 in the Director's real project, and so is
+#: every hand-picked clip. It carries a nudge no coverage could survive, precisely so that the
+#: silence about it is an assertion rather than an accident of the numbers.
+LEGACY_SHOT = "shot_09"
+LEGACY_TAKE_FIELDS = {
+    "latest_output": "music-video-producer/qa/shots/shot_09-h3_00001.mp4",
+    "latest_take_lead": 0.25,
+    "latest_take_start": 0.0,
+    "latest_take_duration": 0.0,
+    "trim_nudge": 9.0,
+    "status": "complete",
+}
 
 #: Everything the browser knows about one clip's two handles and about the playhead, in screen
 #: coordinates. Only a layout engine can answer any of it.
@@ -521,6 +568,62 @@ def scrub_to(driver, seconds: float) -> float:
 def select_clip(driver, shot_id: str) -> None:
     clip_for(driver, shot_id).click()
     settle(driver, "#shots-track")
+
+
+def stable_click(driver, selector: str, what: str, tries: int = 10) -> None:
+    """Click a control, re-finding it if the workspace redraws underneath the click.
+
+    `e2e_section_looks.stable_click`, brought here for the same reason and copied rather than
+    imported because these harnesses are deliberately standalone scripts. Not a retry hiding a
+    race -- it *is* the race, and it is the application's design: `loadProject` fires the readiness
+    GET without awaiting it, and the reply calls `renderTimeline`, which rebuilds the cuts bar
+    wholesale. An element found a moment earlier is gone by the time the driver points at it, which
+    is what made this run fail on the sweep button twice in three attempts on 2026-08-21 -- a flake
+    in the script, never in the application.
+    """
+    last: Exception | None = None
+    for _ in range(tries):
+        try:
+            driver.find_element(By.CSS_SELECTOR, selector).click()
+            return
+        except (StaleElementReferenceException, NoSuchElementException) as error:
+            last = error
+            time.sleep(0.25)
+    raise AssertionError(f"{what} could not be clicked: {last}")
+
+
+def take_state(server: ManagedServer, project_id: str, shot_id: str) -> dict:
+    """One shot's window, its take bookkeeping, and the song second its take begins at.
+
+    `anchor` is `start - latest_take_lead - trim_nudge`: the second of the song the take's first
+    frame plays at, which is `timeline.over_render_window`'s own invariant read backwards. It is
+    the number the whole lock is about -- a locked drag leaves it alone and an unlocked one moves
+    it -- and it is computed here from the stored manifest rather than asked of the browser.
+    """
+    shot = next(
+        item for item in manifest(server, project_id)["shots"] if item["id"] == shot_id
+    )
+    lead = float(shot.get("latest_take_lead") or 0)
+    nudge = float(shot.get("trim_nudge") or 0)
+    return {
+        "start": round(float(shot["start"]), 6),
+        "duration": round(float(shot["duration"]), 6),
+        "latest_take_lead": lead,
+        "trim_nudge": round(nudge, 6),
+        "anchor": round(float(shot["start"]) - lead - nudge, 6),
+    }
+
+
+def take_anchor_second(server: ManagedServer, project_id: str, shot_id: str) -> dict:
+    """`take_state` under the name the assertions read it by. One reader, two spellings would be
+    two readers."""
+    return take_state(server, project_id, shot_id)
+
+
+def shot_label_in(text: str, shot_id: str) -> bool:
+    """Whether the readiness list names this shot at all. The labels carry the raw id in
+    brackets (`shot_label`), so the id is the honest thing to look for."""
+    return f"({shot_id})" in text
 
 
 def main() -> None:
@@ -1349,7 +1452,7 @@ def main() -> None:
             driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
             settle(driver, "#shots-track", quiet_ms=300)
             sent_before = resource_hits(driver, "/shots/expand-prompts")
-            driver.find_element(By.ID, "timeline-expand-prompts").click()
+            stable_click(driver, "#timeline-expand-prompts", "Expand All Prompts")
             asked = ""
             try:
                 alert = wait.until(EC.alert_is_present())
@@ -1369,6 +1472,200 @@ def main() -> None:
                 "facts": sweep_facts, "asked": asked, "requests_sent": 0,
             }
 
+            # --- 12. The music lock, and the second yellow ------------------------------------
+            #
+            # The Director's ask, 2026-08-21: "When dragging in the timeline though it would just
+            # move the window over the clip but keep the clip aligned where it belongs with the
+            # music. Perhaps a lock/unlock from timeline toggle in the shots info panel may be
+            # useful next to that nudge input so that dragging a b-roll clip would be easier
+            # (default locked)." And, on the warning: "if the bounds of the shots window are
+            # dragged beyond where that clip covers then the shot would turn yellow."
+            #
+            # Every assertion here is the *song second the take's first frame plays at* --
+            # `start - lead - nudge` -- read off the stored manifest. That number is what "the
+            # clip stays where it belongs with the music" means, and it is the only thing that
+            # tells a locked drag from an unlocked one: both move `start`.
+            #
+            # No render is submitted. The take is written onto the plan through `PUT /shots`
+            # exactly as the H3 route writes it at submission, which is what makes this section
+            # cost no GPU time at all.
+            take_plan = [
+                {**shot,
+                 "prompt": f"{shot['id']}: the corridor, pushing in.", "mode": "text",
+                 "status": "draft",
+                 **(TAKE_FIELDS if shot["id"] == TAKE_SHOT else {}),
+                 **(LEGACY_TAKE_FIELDS if shot["id"] == LEGACY_SHOT else {})}
+                for shot in SHOTS
+            ]
+            put_json(f"{server.base_url}/api/projects/{project_id}/shots", {"shots": take_plan})
+            driver.refresh()
+            select_project(driver, wait, project_id)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            wait.until(
+                lambda browser: len(
+                    browser.find_elements(By.CSS_SELECTOR, "#shots-track .shot-clip")
+                ) == SHOT_COUNT
+            )
+            wait_for_readiness(driver, wait, f"{SHOT_COUNT} shots have a prompt")
+            settle(driver, "#shots-track")
+
+            # The control, where the Director asked for it: inside the trim-nudge row, ticked.
+            select_clip(driver, TAKE_SHOT)
+            anchor = driver.find_element(By.ID, "take-anchor")
+            anchor_facts = visible_and_clickable(driver, anchor, "the music lock")
+            assert anchor.get_property("checked") is True, (
+                "the music lock does not default to locked, which is the Director's own word"
+            )
+            assert driver.execute_script(
+                "return document.getElementById('trim-nudge')"
+                ".contains(document.getElementById('take-anchor'));"
+            ), "the music lock is on screen but not beside the trim nudge the Director named"
+            anchor_help = driver.execute_script(
+                "return document.getElementById('take-anchor').closest('label')"
+                ".getAttribute('title');"
+            )
+            assert "not the shot lock" in anchor_help, anchor_help
+
+            # And a shot with no take shows neither the nudge nor the lock: there is nothing to
+            # hold still, and a live control that does nothing is worse than no control.
+            select_clip(driver, "shot_04")
+            assert not driver.find_elements(By.ID, "take-anchor"), (
+                "a shot with no take draws the music lock, which would do nothing at all"
+            )
+            assert not driver.find_elements(By.ID, "trim-nudge")
+
+            # --- 12a. Locked: the window moves, the take does not -----------------------------
+            select_clip(driver, TAKE_SHOT)
+            before = take_anchor_second(server, project_id, TAKE_SHOT)
+            was = shots_writes(driver)
+            travel = int(1.5 * geometry(driver, TAKE_SHOT)["pixelsPerSecond"])
+            ActionChains(driver).click_and_hold(
+                clip_for(driver, TAKE_SHOT)
+            ).move_by_offset(travel, 0).release().perform()
+            await_shots_write(driver, was, "the locked move drag")
+            locked = take_state(server, project_id, TAKE_SHOT)
+            assert locked["start"] > before["start"], (
+                "the locked drag did not move the window at all", before, locked
+            )
+            assert locked["trim_nudge"] != before["trim_nudge"], (
+                ("the locked drag moved the window without moving the cut into the take, so "
+                 "the take travelled with it"), before, locked
+            )
+            # The whole point, in one number: the take's first frame still plays at the same
+            # second of the song. And the nudge moved by exactly what the window moved by.
+            assert abs(locked["anchor"] - before["anchor"]) < 1e-6, (
+                "a locked drag pulled the take off the music", before, locked
+            )
+            assert abs(
+                (locked["start"] - before["start"]) - (locked["trim_nudge"] - before["trim_nudge"])
+            ) < 1e-6, (before, locked)
+
+            # --- 12b. Unlocked: the take travels with the window ------------------------------
+            unlock = driver.find_element(By.ID, "take-anchor")
+            unlock.click()
+            assert unlock.get_property("checked") is False
+            writes_after_toggle = shots_writes(driver)
+            settle(driver, "#shots-track", quiet_ms=300)
+            assert shots_writes(driver) == writes_after_toggle, (
+                "toggling the lock wrote the plan to the server; it changes what the next drag "
+                "does and nothing else"
+            )
+            was = shots_writes(driver)
+            ActionChains(driver).click_and_hold(
+                clip_for(driver, TAKE_SHOT)
+            ).move_by_offset(-travel, 0).release().perform()
+            await_shots_write(driver, was, "the unlocked move drag")
+            unlocked = take_state(server, project_id, TAKE_SHOT)
+            assert unlocked["start"] < locked["start"], (
+                "the unlocked drag did not move the window", locked, unlocked
+            )
+            assert unlocked["trim_nudge"] == locked["trim_nudge"], (
+                "the unlocked drag still compensated the nudge, so unlocking did nothing",
+                locked, unlocked,
+            )
+            assert abs(unlocked["anchor"] - locked["anchor"]) > 1e-6, (
+                ("an unlocked drag left the take on the same song second, which is the "
+                 "locked behaviour"), locked, unlocked,
+            )
+            result["music_lock"] = {
+                "control": anchor_facts,
+                "travel_px": travel,
+                "before": before,
+                "locked_drag": locked,
+                "unlocked_drag": unlocked,
+                "writes_on_toggle": 0,
+            }
+
+            # --- 12c. Dragged off what the take covers, it turns yellow -----------------------
+            #
+            # Locked again, and dragged far enough that the window asks for picture past the end
+            # of the take. The verdict is the *server's* -- the readiness report's
+            # `window_warnings` -- and nothing in the browser re-derives it.
+            driver.find_element(By.ID, "take-anchor").click()
+            assert driver.find_element(By.ID, "take-anchor").get_property("checked") is True
+            plain = driver.execute_script(CLIP_STATE, TAKE_SHOT)
+            assert "take-uncovered" not in plain["className"], plain
+            was = shots_writes(driver)
+            # Far enough that the window asks for more picture than the take holds: it is already
+            # 1.5 s in from 12a, and the take runs out 4.875 s past the window's own start.
+            ActionChains(driver).click_and_hold(
+                clip_for(driver, TAKE_SHOT)
+            ).move_by_offset(int(5 * geometry(driver, TAKE_SHOT)["pixelsPerSecond"]), 0)\
+                .release().perform()
+            await_shots_write(driver, was, "the drag off the end of the take")
+            wait.until(
+                lambda browser: "take-uncovered" in browser.execute_script(
+                    CLIP_STATE, TAKE_SHOT
+                )["className"],
+                "the clip did not turn amber after its window was dragged off its take",
+            )
+            uncovered = driver.execute_script(CLIP_STATE, TAKE_SHOT)
+            assert uncovered["borderTopColor"] != plain["borderTopColor"], uncovered
+            assert "past the picture this take holds" in uncovered["ariaLabel"], uncovered
+            assert uncovered["ariaLabel"] == uncovered["title"], uncovered
+            # It warns and never blocks -- and the drag itself was never constrained, which is
+            # the Director's non-negotiable: the window really did move where it was dragged.
+            for control in ("split-shot", "duplicate-shot", "delete-shot", "add-shot"):
+                assert not driver.find_element(By.ID, control).get_property("disabled"), (
+                    f"#{control} went shut because a window left its take, which is a refusal "
+                    "the Director ruled against"
+                )
+            dragged_off = take_state(server, project_id, TAKE_SHOT)
+            assert dragged_off["start"] > unlocked["start"], dragged_off
+            readiness_text = driver.find_element(By.ID, "plan-readiness").get_attribute(
+                "textContent"
+            )
+            assert "Past the take" in readiness_text, readiness_text
+            assert "does not block submission" in readiness_text, readiness_text
+            # The server's own numbers reach the Director unreworded -- including the take's own
+            # length, which is the picture its *recorded* window asked H3 for and not the live
+            # window's. A client re-deriving this from the plan would print 5.875s here.
+            assert f"{TAKE_PICTURE_SECONDS:.3f}s of picture" in readiness_text, readiness_text
+
+            # And the take that cannot be checked is never warned about, however far its window
+            # sits from where its picture would be: `latest_take_duration` of 0 is "never
+            # snapshotted", which is every take rendered before 2026-08-21 -- including the 33 in
+            # the Director's own project -- and every hand-picked clip.
+            legacy = driver.execute_script(CLIP_STATE, LEGACY_SHOT)
+            assert "take-uncovered" not in legacy["className"], (
+                ("a take that recorded no window of its own was coverage-checked against "
+                 "the live one, which is a guess this application does not make"), legacy,
+            )
+            assert shot_label_in(readiness_text, LEGACY_SHOT) is False, readiness_text
+            result["take_uncovered"] = {
+                "plain": plain, "uncovered": uncovered, "legacy": legacy,
+                "dragged_to": dragged_off,
+                "readiness": readiness_text[:600],
+            }
+
+            # The plan is put back the way the seed left it, so the final contiguity recorded
+            # below describes the Director's own shape rather than this section's drags.
+            put_json(
+                f"{server.base_url}/api/projects/{project_id}/shots",
+                {"shots": [{**shot, "prompt": f"{shot['id']}: the corridor, pushing in.",
+                            "mode": "text", "status": "draft"} for shot in SHOTS]},
+            )
+
             # Nothing anywhere in this run queued anything.
             assert not get_json(f"{server.base_url}/api/projects/{project_id}")["jobs"], (
                 "this script queued something, and it is supposed to spend no GPU time at all"
@@ -1383,7 +1680,16 @@ def main() -> None:
 
             # The 409 this run drove the undo into on purpose is logged by the browser as a
             # failed resource. Separated out rather than filtered away: anything unlisted fails.
-            console_gate(driver, NAME, result, expected=["409"])
+            #
+            # And the take previews section 12 asks for: it writes a take onto two shots without
+            # rendering one -- which is the whole reason this run spends no GPU time -- so the
+            # `<video>` the inspector draws asks for a file that was never made and is answered
+            # 404. Listed by shot rather than by status code, so an unexpected 404 anywhere else
+            # still fails the run.
+            console_gate(
+                driver, NAME, result,
+                expected=["409", f"shots/{TAKE_SHOT}/take", f"shots/{LEGACY_SHOT}/take"],
+            )
             report(NAME, result)
         finally:
             driver.quit()
