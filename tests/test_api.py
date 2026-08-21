@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import wave
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from typing import get_args
@@ -13,20 +14,26 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from music_video_producer import models
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
+    APPROVAL_FIELDS,
     APPROVE_IN_FLIGHT_REFUSAL,
     APPROVE_NO_TAKE_REFUSAL,
     CHAT_EMPTY_MESSAGE,
+    CONSISTENCY_PROMPT_LIMIT,
+    CONSISTENCY_PROMPT_TOO_LONG,
     DIRECTOR_CONTEXT_EXCLUDE,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
+    ENHANCE_IN_FLIGHT_REFUSAL,
     ENHANCE_PREFIX_SUFFIX,
     EXPAND_PROMPTS_WITHOUT_SHOTS,
     EXPANSION_ATTEMPTS,
     EXPANSION_REJECTED_EMPTY_NOTICE,
+    GENERIC_WRITE_APPROVAL_REFUSAL,
     H3_ADAPTERS,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
     MARK_READY_APPROVED_REFUSAL,
@@ -34,10 +41,13 @@ from music_video_producer.app import (
     MARK_READY_LOCKED_REFUSAL,
     MARK_READY_STATUSES,
     MULTIVIEW_SUBJECTS,
+    REFERENCE_BOUNDS_REFUSAL,
+    REFERENCE_MAP_ROLE_TAGS,
     RENDER_AGAIN_APPROVED_REFUSAL,
     RENDER_AGAIN_IN_FLIGHT_REFUSAL,
     RENDER_AGAIN_LOCKED_REFUSAL,
     RENDER_AGAIN_STATUSES,
+    RENDER_IN_FLIGHT_STATUSES,
     RESTORE_AUDIO_IN_FLIGHT_REFUSAL,
     RESTORE_AUDIO_MISSING_SONG_REFUSAL,
     RESTORE_AUDIO_MISSING_TAKE_REFUSAL,
@@ -51,6 +61,7 @@ from music_video_producer.app import (
     SHOT_DIRECTOR_WITHHELD,
     SHOT_PLAN_EMPTY_NOTICE,
     SHOT_WINDOW_NOTICE,
+    SNAP_CUTS_NO_SONG,
     SONG_CAPTION_LIMIT,
     SONG_CONTEXT_FIELD_NAMES,
     SONG_CONTEXT_LABELS,
@@ -72,9 +83,16 @@ from music_video_producer.app import (
     document_first_draft_notice,
     multiview_refusal,
     prose_claims_shots,
+    reference_map_tag_lines,
     reference_prompt,
+    reference_slot_counts,
 )
-from music_video_producer.batch import PLACEHOLDER_PROMPT, readiness_refusal, shot_label
+from music_video_producer.batch import (
+    JOB_SUPERSEDED,
+    PLACEHOLDER_PROMPT,
+    readiness_refusal,
+    shot_label,
+)
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.director import (
@@ -87,10 +105,14 @@ from music_video_producer.director import (
     ShotExpansion,
 )
 from music_video_producer.h3_expansion_prompt import (
+    APPEARANCE_ANCHOR_RULES,
+)
+from music_video_producer.h3_expansion_prompt import (
     system_prompt as h3_expansion_system_prompt,
 )
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
+    KEYFRAME_TAG_ROLES,
     LEGACY_SHOT_MODES,
     NOTICE_RAW_LIMIT,
     SHOT_MODE_SPECS,
@@ -114,10 +136,23 @@ from music_video_producer.models import (
     citations_in_role,
     dangling_citations,
     mode_specification_problems,
+    numbered_references,
     resolve_shot_mode,
+    song_audio_tag,
 )
 from music_video_producer.store import ProjectStore
-from music_video_producer.timeline import expansion_input, shot_expansion_input
+from music_video_producer.timeline import (
+    SNAP_APPROVED_REFUSAL,
+    SNAP_IN_FLIGHT_REFUSAL,
+    SNAP_LOCKED_REFUSAL,
+    SNAP_TOLERANCE_DEFAULT,
+    SNAP_TOLERANCE_MAX,
+    SNAP_TOLERANCE_OFF,
+    SNAP_UNMEASURED,
+    SNAP_WITHOUT_CUTS,
+    expansion_input,
+    shot_expansion_input,
+)
 from music_video_producer.workflows import (
     H3_ASPECT_RATIOS,
     H3_DIRECTOR_DEFAULT_HEIGHT,
@@ -3744,16 +3779,36 @@ def test_promotion_records_its_parent_and_leaves_the_source_asset_untouched(tmp_
 
 
 class PlanningDirector:
-    """A director double whose plan is chosen by the test, with the request recorded."""
+    """A director double whose plan is chosen by the test, with the request recorded.
 
-    def __init__(self, shots=None, message="Laid out.", sections=None):
-        self.shots = shots or []
-        self.sections = sections or []
+    `shots`/`sections` answer every call the same way. `script` answers the Nth call with
+    the Nth `(shots, sections)` entry instead, the last repeating forever — which is how
+    populate's count-enforcement retry is exercised offline: a short first reply followed
+    by a full one, with both requests and both temperatures on the record.
+    """
+
+    def __init__(self, shots=None, message="Laid out.", sections=None, script=None):
+        self.script = list(script) if script else [(shots or [], sections or [])]
         self.message = message
         self.requests = []
 
-    async def plan(self, *, message, project_context):
-        self.requests.append({"message": message, "context": project_context})
+    async def plan(self, *, message, project_context, temperature=None, response_schema=None):
+        # `response_schema` is recorded because it is the artefact under test for the
+        # 2026-08-20 fix: the strict schema is what LM Studio's constrained decoder is
+        # given, so which fields it marks `required` decides what the model is physically
+        # able to emit — and populate's whole `shots: []` failure was a schema that never
+        # asked for the field. A double that swallowed it would let that regress silently.
+        self.requests.append(
+            {
+                "message": message,
+                "context": project_context,
+                "temperature": temperature,
+                "response_schema": response_schema,
+            }
+        )
+        self.shots, self.sections = self.script[
+            min(len(self.requests) - 1, len(self.script) - 1)
+        ]
         shot = lambda start, duration, prompt: type(
             "PlannedShot", (), {"start": start, "duration": duration, "prompt": prompt}
         )()
@@ -3775,10 +3830,10 @@ class PlanningDirector:
         )()
 
 
-def populate(client, project_id: str, confirm: bool = True):
+def populate(client, project_id: str, confirm: bool = True, two_stage: bool = False):
     return client.post(
         f"/api/projects/{project_id}/timeline/populate",
-        json={"confirm_replace": confirm},
+        json={"confirm_replace": confirm, "two_stage": two_stage},
     )
 
 
@@ -3787,10 +3842,14 @@ def test_populate_timeline_lays_out_the_whole_song_from_the_models_shape(tmp_pat
     covering exactly the song, prompts drawn from the proposal whose span each window
     falls in, old drafts replaced, and the instruction carrying the song length and the
     asset roster by name."""
+    # Sloppy on purpose — overlapping, out of band, out of order — but long enough to
+    # satisfy the count the server now computes and enforces (60 s / 5.2 s = 12 shots).
+    # Shape is still all the route takes from it; every number below is repaired.
     director = PlanningDirector(shots=[
         (0, 3, "Open wide on the empty warehouse."),
         (10, 30, "She sings at the standing microphone."),
-        (45, 10, "Glamour angles on the canopy bed."),
+        *[(index * 5, 5, f"Cutaway {index}.") for index in range(3, 12)],
+        (55, 10, "Glamour angles on the canopy bed."),
     ])
     client, store, comfy = make_client(tmp_path, director=director)
     project = store.create(Project(name="Populate"))
@@ -3807,7 +3866,7 @@ def test_populate_timeline_lays_out_the_whole_song_from_the_models_shape(tmp_pat
     response = populate(client, project.id)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["proposed"] == 3
+    assert body["proposed"] == 12
     assert body["created"] >= 10  # 60 s at <=6 s per window (the enforced speed ceiling)
     saved = store.get(project.id)
     assert all(shot.id != "shot_old" for shot in saved.shots)
@@ -3872,6 +3931,512 @@ def test_populate_timeline_refuses_what_it_must_not_replace(tmp_path: Path):
     assert no_shots.status_code == 502
     assert "I could not decide." in no_shots.json()["detail"]
     assert hollow_store.get(hollow_project.id).shots == []
+
+
+def counted_populate_project(store, director_duration: float = 156.0, name: str = "Counted"):
+    project = store.create(Project(name=name))
+    project.song = Song(
+        title="S", source="imported", path="m.mp3", duration=director_duration
+    )
+    store.save(project)
+    return project
+
+
+def test_populate_computes_the_shot_count_itself_and_states_it_as_a_hard_constraint(
+    tmp_path: Path,
+):
+    """Phase 1.2, parts one and two: the number is arithmetic the server does, and the
+    prompt carries it as a constraint rather than as guidance.
+
+    Asserted against the recording double — the prompt handed to the model is the artefact
+    under test, and it is nowhere in the stored project. The second half of this test is
+    the guard against a retry that always fires: a compliant first reply must cost exactly
+    one call, because a second one is up to 300 s of the Director watching a button.
+    """
+    from music_video_producer.app import populate_required_shots
+    from music_video_producer.director import PLAN_TEMPERATURE
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    assert required == 30  # 156.0 / 5.2 s target window, computed here and never asked
+
+    director = PlanningDirector(
+        shots=[(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)],
+        sections=[("Verse", 0.0, 156.0, "at the standing mic")],
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration)
+
+    assert populate(client, project.id).status_code == 200
+    assert len(director.requests) == 1, "a compliant reply must not buy a retry"
+    first = director.requests[0]
+    assert first["temperature"] == PLAN_TEMPERATURE
+    sent = first["message"]
+    # Three placements, the ported pattern's three: the opening ask, the numbered hard
+    # constraints, and the closing FINAL CHECK.
+    assert f"Return EXACTLY {required} shots" in sent
+    assert f"`shots` must contain EXACTLY {required} entries" in sent
+    assert f"It must equal {required}." in sent
+    assert sent.count(str(required)) == 3
+    # The FINAL CHECK is genuinely last — a closing line the model reads past is not one.
+    assert sent.rstrip().endswith("just return the corrected list.")
+    assert "FINAL CHECK before responding" in sent
+    # And the default is the single call it always was: no structure pass ran.
+    assert "return ONLY that structure" not in sent
+    assert comfy.prompts == []
+
+
+def test_populate_requires_shots_in_the_schema_it_is_decoded_under(tmp_path: Path):
+    """The 2026-08-20 root-cause fix, at the route.
+
+    Every word above this — the count stated three times, the FINAL CHECK, the guided
+    retry — asked for a field that `DirectorResult`'s own schema marked **optional**, and
+    that schema is what reaches LM Studio's constrained decoder. A reply with no `shots`
+    was legal under the grammar it was generated with, which is why no wording fixed it:
+    measured `shots: []` on 2 of 3 answered single-call rolls with the old schema and 0 of
+    3 with `shots` required, same song, same prompt, same temperature.
+
+    `sections` rides in the required set only when the ask for it is in the text, so the
+    grammar and the words always agree about what the call owes.
+    """
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    director = PlanningDirector(
+        shots=[(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)],
+        sections=[("Verse", 0.0, 156.0, "at the standing mic")],
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Schema")
+
+    assert populate(client, project.id).status_code == 200
+    schema = director.requests[0]["response_schema"]
+    assert schema is not None, "populate must not fall back to the chat route's grammar"
+    # No sections are marked, so the ask *is* in the text and both halves are demanded.
+    assert "`sections` must not be empty" in director.requests[0]["message"]
+    assert schema["required"] == [
+        "message",
+        "treatment",
+        "style_bible",
+        "shots",
+        "sections",
+    ]
+    # Not a count floor: `minItems` is honoured by the decoder but pads with entries that
+    # fail `PlannedShot` validation, so the count stays a check in code plus a retry.
+    assert "minItems" not in schema["properties"]["shots"]
+    assert comfy.prompts == []
+
+
+def test_populate_requires_a_performance_decision_on_every_shot_it_asks_for(
+    tmp_path: Path,
+):
+    """The same root cause, one level down, found on 2026-08-20 and closed the same way.
+
+    `PlannedShot.performance` carries `= False`, so it was absent from the entry schema's
+    `required`, so the constrained decoder never had to emit it — and the instruction had
+    been asking for it in words the whole time. Measured across 15 rolls / 179 shots: one
+    model omitted the key entirely on 4 of 5 rolls (every shot silently non-performance)
+    and two set it `true` on all twelve shots of a roll, which is a coin landing on its
+    edge rather than a judgement. `PlannedSection.prompt` (`= ""`) is the third instance:
+    both populate instructions ask for "a one-sentence shared visual prompt" and the
+    grammar never did.
+
+    What this changes is what the **model** must decide, not what the route does: by the
+    time a `PlannedShot` exists, an omitted key and `false` are the same object, and the
+    second half of this test pins that the route's behaviour on silence is untouched.
+    """
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    director = PlanningDirector(
+        shots=[(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)],
+        sections=[("Verse", 0.0, 156.0, "at the standing mic")],
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Performance grammar")
+
+    assert populate(client, project.id).status_code == 200
+    schema = director.requests[0]["response_schema"]
+    assert schema["$defs"]["PlannedShot"]["required"] == [
+        "start",
+        "duration",
+        "prompt",
+        "performance",
+    ]
+    # No sections are marked, so structure is asked for in the text and its shared look is
+    # demanded in the grammar beside it.
+    assert schema["$defs"]["PlannedSection"]["required"] == [
+        "label",
+        "start",
+        "duration",
+        "prompt",
+    ]
+    # Unchanged, deliberately: this double's proposals carry no `performance` at all — the
+    # shape a provider that ignores the strict schema still produces — and the route reads
+    # `not_singing` off that silence exactly as it did before. Telling absent from false
+    # apart needs a tri-state on the schema the chat route shares and a live measurement of
+    # what `singing="unknown"` does to expansion; neither is in this change.
+    saved = store.get(project.id)
+    assert {shot.singing for shot in saved.shots} == {"not_singing"}
+    assert comfy.prompts == []
+
+
+def test_the_structure_pass_demands_each_sections_shared_look(tmp_path: Path):
+    """Stage one owes `sections`, and a section without its shared prompt is half a section.
+
+    Its instruction asks for one per block in words; this is the grammar saying the same
+    thing. `shots` stays optional at both levels — the call is told to leave the list
+    empty, so nothing about a shot may be demanded of it.
+    """
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    full = [(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)]
+    director = PlanningDirector(
+        script=[([], [("Verse", 0.0, 156.0, "at the standing mic")]), (full, [])]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Structure look")
+
+    assert populate(client, project.id, two_stage=True).status_code == 200
+    structure, shots_call = director.requests
+    assert structure["response_schema"]["$defs"]["PlannedSection"]["required"] == [
+        "label",
+        "start",
+        "duration",
+        "prompt",
+    ]
+    assert structure["response_schema"]["$defs"]["PlannedShot"]["required"] == [
+        "start",
+        "duration",
+        "prompt",
+    ]
+    # Stage two's boxes are filled by then: it owes shots, and a per-shot decision on them.
+    assert shots_call["response_schema"]["$defs"]["PlannedShot"]["required"][-1] == (
+        "performance"
+    )
+    assert comfy.prompts == []
+
+
+def test_the_populate_instruction_sets_the_performance_flag_without_dictating_prose():
+    """The prompt-hygiene half, and it is **unmeasured**.
+
+    The literal string `performance=true` was pasted into the *prompt text* of 13 of 179
+    shots across three models on 2026-08-20 — the field name leaking out of the instruction
+    and into the creative writing, where it renders. The instruction used to say "set
+    performance=true on every shot where...", which is a sentence a model can copy. It now
+    names the flag as a field of the shot object and says plainly that no prompt may
+    mention it. Whether that stops the leak is a live-run question and this test cannot
+    answer it: all it pins is that the wording changed and that nothing else did.
+
+    The count enforcement is the "nothing else": three placements of the number and the
+    FINAL CHECK, pinned verbatim here because they share a string with the wording that
+    moved, and one variable at a time means the other one must be demonstrably still.
+    """
+    from music_video_producer.app import POPULATE_FINAL_CHECK, POPULATE_INSTRUCTION
+
+    instruction = POPULATE_INSTRUCTION.format(
+        count=30, duration=156.0, assets="none yet", sections_ask="", sections_constraint=""
+    )
+    # The leak, gone: no assignment for a model to copy into prose.
+    assert "performance=true" not in instruction
+    assert "=true" not in instruction
+    # The flag is still named — structurally, as a field of the shot object — and the
+    # prohibition is explicit rather than implied.
+    assert "`performance` flag" in instruction
+    assert "no prompt may mention that flag or its value" in instruction
+    assert "true where a character sings the song on camera" in instruction
+
+    # Count enforcement, undisturbed: the opening ask, HARD CONSTRAINT 1, the FINAL CHECK.
+    assert "Return EXACTLY 30 shots." in instruction
+    assert "`shots` must contain EXACTLY 30 entries. Not fewer." in instruction
+    assert POPULATE_FINAL_CHECK.format(count=30).endswith(
+        "just return the corrected list."
+    )
+    assert "It must equal 30." in POPULATE_FINAL_CHECK.format(count=30)
+    assert instruction.count("30") == 2  # the third placement is the FINAL CHECK's
+
+
+def test_populate_stops_demanding_sections_once_the_boxes_are_known(tmp_path: Path):
+    """The required set follows the instruction. With sections marked, the ask is dropped
+    from the text — so demanding the field in the grammar would force the model to
+    fabricate structure it was never asked for just to close the object."""
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    director = PlanningDirector(
+        shots=[(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Marked")
+    project.sections = [SongSection(label="Verse", start=0.0, duration=156.0)]
+    store.save(project)
+
+    assert populate(client, project.id).status_code == 200
+    request = director.requests[0]
+    assert "`sections` must not be empty" not in request["message"]
+    assert request["response_schema"]["required"] == [
+        "message",
+        "treatment",
+        "style_bible",
+        "shots",
+    ]
+    assert comfy.prompts == []
+
+
+def test_the_structure_pass_requires_sections_and_leaves_shots_optional(tmp_path: Path):
+    """Two-stage stage one is the mirror image, and the mirror matters: it is told to leave
+    `shots` empty, so a schema that required them would contradict the instruction beside
+    it. Its own field — `sections` — is the one the grammar holds it to."""
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    full = [(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)]
+    director = PlanningDirector(
+        script=[
+            ([], [("Verse", 0.0, 156.0, "at the standing mic")]),
+            (full, []),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Two stage schema")
+
+    assert populate(client, project.id, two_stage=True).status_code == 200
+    structure, shots_call = director.requests
+    assert structure["response_schema"]["required"] == [
+        "message",
+        "treatment",
+        "style_bible",
+        "sections",
+    ]
+    assert "shots" not in structure["response_schema"]["required"]
+    # Stage two's boxes are filled by then, so it owes shots and only shots.
+    assert shots_call["response_schema"]["required"] == [
+        "message",
+        "treatment",
+        "style_bible",
+        "shots",
+    ]
+    assert comfy.prompts == []
+
+
+def test_the_retry_is_decoded_under_the_same_grammar_as_the_first_attempt(tmp_path: Path):
+    """A guided retry that dropped the required set would re-open the exact hole the retry
+    exists to close — and it is the attempt most likely to fall into it, because it is the
+    one following a reply the model already got wrong."""
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    full = [(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)]
+    director = PlanningDirector(script=[(full[:4], []), (full, [])])
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Retry schema")
+
+    assert populate(client, project.id).status_code == 200
+    first, retry = director.requests
+    assert retry["temperature"] < first["temperature"]
+    assert retry["response_schema"] == first["response_schema"]
+    assert "shots" in retry["response_schema"]["required"]
+    assert comfy.prompts == []
+
+
+def test_the_chat_route_never_borrows_populates_grammar(tmp_path: Path):
+    """The guard on the whole fix. `DirectorResult` is shared with the Director chat, where
+    a reply with no shots is a legitimate answer to a question; forcing one there would be
+    a worse bug than the empty-`shots` failure. The chat route sends no `response_schema`
+    at all, which is what makes `plan`'s default the chat contract."""
+    recorded: list[dict] = []
+
+    class ChatDirector:
+        async def plan(self, *, message, project_context, **kwargs):
+            recorded.append(kwargs)
+            return type(
+                "DirectorResult",
+                (),
+                {
+                    "message": "What is the second verse about?",
+                    "treatment": "",
+                    "style_bible": "",
+                    "shots": [],
+                    "sections": [],
+                },
+            )()
+
+    client, store, comfy = make_client(tmp_path, director=ChatDirector())
+    project = store.create(Project(name="Chat"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Tell me about verse two"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert recorded == [{}], "the chat route must send no response_schema of its own"
+    assert comfy.prompts == []
+
+
+def test_a_short_plan_buys_exactly_one_guided_retry_at_a_lower_temperature(tmp_path: Path):
+    """Parts three and four: the reply is counted rather than believed, and the one retry
+    names the shortfall in numbers — plus any field the model was told to fill and left
+    empty, which on this model family is `sections` more often than not."""
+    from music_video_producer.app import populate_required_shots
+    from music_video_producer.director import PLAN_TEMPERATURE
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    full = [(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)]
+    director = PlanningDirector(
+        script=[
+            (full[:4], []),  # short, and `sections` dropped along with it
+            (full, [("Verse", 0.0, 156.0, "at the standing mic")]),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Retried")
+
+    assert populate(client, project.id).status_code == 200
+    assert len(director.requests) == 2, "one retry, not three"
+    first, retry = director.requests
+    assert first["temperature"] == PLAN_TEMPERATURE
+    assert retry["temperature"] < first["temperature"]
+    # The failure is named, in the numbers, ahead of the request it is correcting.
+    assert "PREVIOUS ATTEMPT FAILED" in retry["message"]
+    assert "returned only 4 shot(s)" in retry["message"]
+    assert f"needs exactly {required}" in retry["message"]
+    # A dropped field is reported the same way a short count is.
+    assert "empty `sections`" in retry["message"]
+    # ...and the whole original ask still rides underneath it, FINAL CHECK included.
+    assert retry["message"].endswith(first["message"])
+
+    saved = store.get(project.id)
+    assert len(saved.shots) >= 26  # the retry's plan, tiled
+    assert {shot.status for shot in saved.shots} == {"draft"}
+    assert [section.label for section in saved.sections] == ["Verse"]
+    assert comfy.prompts == []
+
+
+def test_a_second_short_plan_refuses_loudly_and_leaves_the_timeline_alone(tmp_path: Path):
+    """The pattern's fail-loudly end: told the number, told again with the shortfall
+    spelled out, still short — so the Director gets a sentence they can act on and their
+    timeline back untouched. Re-read through a fresh `ProjectStore` because "nothing was
+    written" is a claim about the manifest on disk, not about the object the app holds."""
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    director = PlanningDirector(
+        shots=[(index * 5.0, 5.0, f"Shot {index}.") for index in range(4)]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Short twice")
+    project.shots = [Shot(id="shot_keep", start=0, duration=5, prompt="Hand-written draft")]
+    store.save(project)
+
+    response = populate(client, project.id)
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert f"asked for {required} shots" in detail
+    assert "returned 4" in detail
+    assert "nothing was replaced" in detail
+    assert "MVP_LLM_MODEL" in detail
+    assert len(director.requests) == 2, "one retry, and then it stops"
+    reread = ProjectStore(tmp_path).get(project.id)
+    assert [shot.id for shot in reread.shots] == ["shot_keep"]
+    assert reread.shots[0].prompt == "Hand-written draft"
+    assert reread.sections == []
+    assert comfy.prompts == []
+
+
+def test_two_stage_populate_asks_for_the_structure_first_and_then_only_for_shots(
+    tmp_path: Path,
+):
+    """The roadmap's split, opt-in: one small call for the song's structure, then a shots
+    call that no longer carries the structure job at all — the boxes are handed to it
+    instead. The measurement behind it is that this model family will not emit `sections`
+    beside a 32-shot layout, so the second ask has to actually get *smaller*, not just be
+    sent twice."""
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    full = [(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)]
+    director = PlanningDirector(
+        script=[
+            (
+                [],  # structure only, exactly as it was told
+                [
+                    ("Intro", 0.0, 20.0, "empty warehouse"),
+                    ("Verse", 20.0, 60.0, "at the standing mic"),
+                    ("Chorus", 80.0, 76.0, "canopy bed"),
+                ],
+            ),
+            (full, []),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Two stage")
+
+    assert populate(client, project.id, two_stage=True).status_code == 200
+    assert len(director.requests) == 2
+    structure, shots_call = director.requests
+    # Stage one is structure and nothing else — it never mentions a shot count.
+    assert "return ONLY that structure" in structure["message"]
+    assert "Leave `shots` empty" in structure["message"]
+    assert str(required) not in structure["message"]
+    # Stage two is the smaller ask: the structure request is gone, the boxes are given,
+    # and the count constraint is untouched.
+    assert "return them in `sections`" not in shots_call["message"]
+    assert "`sections` must not be empty" not in shots_call["message"]
+    assert "just laid out in the structure pass" in shots_call["message"]
+    assert "Intro 0.0-20.0s (empty warehouse)" in shots_call["message"]
+    assert f"Return EXACTLY {required} shots" in shots_call["message"]
+    # The FINAL CHECK still lands after the section map — last thing read, count included.
+    assert shots_call["message"].rstrip().endswith("just return the corrected list.")
+    # Stage one's structure is what landed, and the shots tiled inside it as drafts.
+    saved = store.get(project.id)
+    assert [section.label for section in saved.sections] == ["Intro", "Verse", "Chorus"]
+    assert {shot.status for shot in saved.shots} == {"draft"}
+    assert comfy.prompts == []
+
+
+def test_an_empty_structure_pass_is_not_retried_and_the_shots_call_covers_for_it(
+    tmp_path: Path,
+):
+    """Stage one gets one call and no retry — its premise is that a small ask succeeds, so
+    a second 300 s call re-asking a small question argues with the premise. When it comes
+    back empty the shots call asks for the structure the way it always did, and the only
+    thing lost is that one call."""
+    from music_video_producer.app import populate_required_shots
+
+    duration = 156.0
+    required = populate_required_shots(duration)
+    director = PlanningDirector(
+        script=[
+            ([], []),  # the structure pass volunteers nothing
+            (
+                [(index * 5.0, 5.0, f"Shot {index}.") for index in range(required)],
+                [("Verse", 0.0, 156.0, "at the standing mic")],
+            ),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = counted_populate_project(store, duration, name="Empty structure")
+
+    assert populate(client, project.id, two_stage=True).status_code == 200
+    assert len(director.requests) == 2, "the structure pass is never retried"
+    structure, shots_call = director.requests
+    assert "return ONLY that structure" in structure["message"]
+    assert "return them in `sections`" in shots_call["message"]
+    assert "`sections` must not be empty" in shots_call["message"]
+    assert [section.label for section in store.get(project.id).sections] == ["Verse"]
+    assert comfy.prompts == []
 
 
 def batch_plan_project(store, shots: list[Shot], name: str = "Batch") -> str:
@@ -11107,6 +11672,10 @@ def test_render_status_on_an_idle_project_asks_comfyui_nothing(tmp_path: Path):
         "shots": [],
         "assets": [],
         "song": None,
+        # Whole-shape equality on purpose, so a field added to the poll answer has to be
+        # looked at here. `progress` is empty because nothing is open: an idle project has
+        # no prompt for ComfyUI to have said anything about.
+        "progress": [],
     }
     assert comfy.queue_calls == 0
     assert comfy.history_calls == 0
@@ -11187,6 +11756,183 @@ def test_render_status_of_a_missing_project_is_404(tmp_path: Path):
 
     assert client.get("/api/projects/nope/render-status").status_code == 404
     assert comfy.queue_calls == 0
+
+
+# --------------------------------------------------------------------------------------------
+# Live render progress, on that same poll and on no route of its own.
+#
+# The percentage comes off ComfyUI's WebSocket into `app.state.render_progress`, an in-memory
+# map this process owns. These tests write into that map directly, which is exactly what the
+# listener task does; `tests/test_comfy.py` covers the socket, the parser and the reconnect
+# against the real captured frames.
+# --------------------------------------------------------------------------------------------
+
+
+def test_render_status_carries_live_progress_without_any_new_route(tmp_path: Path):
+    """AD-1's transport, unchanged. No second endpoint, no second timer, no socket in the
+    browser -- the poll the client already makes while a render is open answers this too."""
+    client, store, comfy = make_client(tmp_path)
+    comfy.queue_payload = {"queue_running": [[0, "p-101"]], "queue_pending": []}
+    project_id, job = flux_job(client, store, comfy, "Live progress")
+    client.app.state.render_progress.apply(
+        {"type": "progress", "data": {"value": 7, "max": 20, "prompt_id": job["prompt_id"]}}
+    )
+
+    report = client.get(f"/api/projects/{project_id}/render-status").json()
+
+    assert report["progress"] == [
+        {"job_id": job["id"], "prompt_id": job["prompt_id"], "percent": 35}
+    ]
+    routes = {route.path for route in client.app.routes}
+    assert not any("progress" in path for path in routes), sorted(routes)
+
+
+def test_a_progress_tick_never_writes_the_project_manifest(tmp_path: Path):
+    """**The load-bearing test.** A percentage moves several times a second. If any of that
+    reached `store.save`, `Project.updated_at` would move with it -- and `PUT /api/projects/{id}`
+    *compares* `updated_at`, so every optimistic-concurrency check the Director's own edits ride
+    on would start colliding with the progress bar. The startup healer refuses to save a project
+    it changed nothing on for exactly this reason; this is the same refusal, on the hot path."""
+    client, store, comfy = make_client(tmp_path)
+    comfy.queue_payload = {"queue_running": [[0, "p-101"]], "queue_pending": []}
+    project_id, job = flux_job(client, store, comfy, "Quiet ticks")
+
+    client.get(f"/api/projects/{project_id}/render-status")
+    settled = store.get(project_id)
+    stamp = settled.updated_at
+    written = (Path(tmp_path) / "projects" / project_id / "project.json").stat().st_mtime_ns
+
+    percents = []
+    for value in range(1, 21):
+        client.app.state.render_progress.apply(
+            {"type": "progress", "data": {"value": value, "max": 20, "prompt_id": job["prompt_id"]}}
+        )
+        report = client.get(f"/api/projects/{project_id}/render-status").json()
+        percents.append(report["progress"][0]["percent"])
+
+    assert percents == [value * 5 for value in range(1, 21)]
+    assert store.get(project_id).updated_at == stamp
+    assert (Path(tmp_path) / "projects" / project_id / "project.json").stat().st_mtime_ns == written
+    # And nothing was written onto the job record either: `progress` there is the local export's
+    # field, and a ComfyUI job must go on carrying its default.
+    assert [job.progress for job in store.get(project_id).jobs] == [0]
+
+
+def test_two_concurrent_renders_keep_their_own_percentages(tmp_path: Path):
+    """A batch of H3 renders is the normal case. Attribution is by `prompt_id`, end to end."""
+    client, store, comfy = make_client(tmp_path)
+    comfy.queue_payload = {
+        "queue_running": [[0, "prompt-a"]],
+        "queue_pending": [[1, "prompt-b"]],
+    }
+    # The default double hands every submission the same prompt id, which is the one thing this
+    # test cannot have: two jobs sharing a prompt would pass an attribution bug straight through.
+    prompt_ids = iter(["prompt-a", "prompt-b"])
+    submitted = comfy.submit
+
+    async def distinct_submit(prompt, client_id=None):
+        await submitted(prompt, client_id=client_id)
+        return type("Submission", (), {"prompt_id": next(prompt_ids), "number": 1})()
+
+    comfy.submit = distinct_submit
+    project = store.create(Project(name="Two at once"))
+    first = client.post(
+        f"/api/projects/{project.id}/generate/flux",
+        json={"name": "One", "kind": "character", "prompt": "a", "steps": 4, "seed": 1},
+    ).json()
+    second = client.post(
+        f"/api/projects/{project.id}/generate/flux",
+        json={"name": "Two", "kind": "character", "prompt": "b", "steps": 4, "seed": 2},
+    ).json()
+    tracker = client.app.state.render_progress
+    tracker.apply({"type": "progress", "data": {"value": 2, "max": 20, "prompt_id": first["prompt_id"]}})
+    tracker.apply({"type": "progress", "data": {"value": 18, "max": 20, "prompt_id": second["prompt_id"]}})
+
+    report = client.get(f"/api/projects/{project.id}/render-status").json()
+
+    assert {row["job_id"]: row["percent"] for row in report["progress"]} == {
+        first["id"]: 10,
+        second["id"]: 90,
+    }
+    assert {row["job_id"] for row in report["progress"]} == {first["id"], second["id"]}
+
+
+def test_a_silent_socket_costs_the_percentage_and_nothing_else(tmp_path: Path):
+    """The degradation contract, through the shipped route. Nothing ever reached the tracker --
+    the socket was refused, or dropped, or spoke a dialect nobody read -- and the render submits,
+    reconciles and settles exactly as it did before this feature existed. No fabricated zero."""
+    client, store, comfy = make_client(tmp_path)
+    comfy.queue_payload = {"queue_running": [[0, "p-101"]], "queue_pending": []}
+    project_id, job = flux_job(client, store, comfy, "Silent socket")
+    assert client.app.state.render_progress.snapshot() == {}
+
+    running = client.get(f"/api/projects/{project_id}/render-status").json()
+    assert running["progress"] == []
+    assert running["active"] is True
+    assert running["jobs"][0]["status"] == "running"
+
+    comfy.queue_payload = {"queue_running": [], "queue_pending": []}
+    settled = client.get(f"/api/projects/{project_id}/render-status").json()
+    assert settled["progress"] == []
+    assert settled["jobs"][0]["status"] == "complete"
+    assert store.get(project_id).jobs[0].status == "complete"
+    assert job["prompt_id"] == "p-101"
+
+
+def test_a_settled_render_stops_being_reported_even_while_the_tracker_remembers_it(
+    tmp_path: Path,
+):
+    """The tracker is a bounded cache keyed by prompt, not a job's field. Once the job is
+    terminal the number is not the browser's business, and a 100 left on a finished card would
+    outlive the render that earned it."""
+    client, store, comfy = make_client(tmp_path)
+    comfy.queue_payload = {"queue_running": [], "queue_pending": []}
+    project_id, job = flux_job(client, store, comfy, "Settled")
+    client.app.state.render_progress.apply(
+        {"type": "progress", "data": {"value": 20, "max": 20, "prompt_id": job["prompt_id"]}}
+    )
+
+    report = client.get(f"/api/projects/{project_id}/render-status").json()
+
+    assert report["jobs"][0]["status"] == "complete"
+    assert report["progress"] == []
+    assert client.app.state.render_progress.percent(job["prompt_id"]) == 100
+
+
+def test_the_app_boots_and_serves_with_comfyui_down(tmp_path: Path):
+    """The ordinary state: the Director starts ComfyUI separately, often after this. Creating the
+    app must not connect to anything, the lifespan must start the listener without waiting on it,
+    and shutdown must take it back with no task or socket left behind."""
+    settings = Settings(
+        data_root=tmp_path,
+        comfy_root=tmp_path / "comfy",
+        # A port nothing is listening on, so the listener's first connect genuinely fails.
+        comfy_url="http://127.0.0.1:9",
+    )
+    app = create_app(settings=settings, store=ProjectStore(tmp_path), director=FakeDirector())
+
+    assert app.state.progress_listener.running is False
+    with TestClient(app) as client:
+        assert app.state.progress_listener.running is True
+        created = client.post("/api/projects", json={"name": "Booted cold"})
+        assert created.status_code == 201
+        report = client.get(f"/api/projects/{created.json()['id']}/render-status").json()
+        assert report == {
+            "active": False,
+            "comfy_online": True,
+            "jobs": [],
+            "shots": [],
+            "assets": [],
+            "song": None,
+            "progress": [],
+        }
+    assert app.state.progress_listener.running is False
+    # `running` alone is not enough: a task the shutdown never cancelled can still read as
+    # not-running once the loop it belonged to is gone. The counter is the observable that says
+    # the lifespan actually called `stop` on the way out, which is what keeps the socket and the
+    # task from outliving the application.
+    assert app.state.progress_listener.stops == 1
+    assert app.state.render_progress.snapshot() == {}
 
 
 def test_a_singing_shot_is_refused_enhancement_outright(tmp_path: Path):
@@ -11783,7 +12529,13 @@ def test_populate_adopts_the_models_sections_when_none_are_marked(tmp_path: Path
     structure proposal is repaired and adopted when the Director has marked nothing,
     the shots then tile inside those sections, and marked sections are never replaced."""
     director = PlanningDirector(
-        shots=[(0, 6, "Open wide."), (30, 6, "Chorus glamour.")],
+        # Twelve, because a 60 s song's enforced count is 12; the section layer is what
+        # this test is about and a short plan would never reach it.
+        shots=[
+            (0, 6, "Open wide."),
+            *[(index * 5, 5, f"Beat {index}.") for index in range(1, 11)],
+            (55, 5, "Chorus glamour."),
+        ],
         sections=[
             ("Intro", 0, 8, ""),
             ("Verse", 8, 22, "at the standing mic"),
@@ -11868,3 +12620,1549 @@ def test_the_dp_pass_rides_the_expand_route_with_its_own_persona_and_input(tmp_p
     assert story.status_code == 200
     assert director.calls[-1]["system"] is None
     assert "song" in director.calls[-1]["input"]
+
+
+# --------------------------------------------------------------------------------------------
+# Reference-slot bounds at the route. H3's media slots are anonymous, so `<Picture 3>` on a
+# two-picture shot is not an error the sampler can report: it renders, plausibly, conditioned
+# on a slot nothing fills. The refusal has to happen before the GPU pass or not at all.
+# --------------------------------------------------------------------------------------------
+
+
+def bounded_shot(client, store, project_id: str, *, pictures: int, **fields) -> str:
+    """A ready `references` Shot citing `pictures` uploaded images, in citation order."""
+    assets = [
+        upload_asset(client, project_id, f"Reference {index}", "image", f"ref-{index}.png")
+        for index in range(pictures)
+    ]
+    return reference_shot(
+        store,
+        project_id,
+        mode="references",
+        citations=[
+            AssetCitation(asset_id=asset["id"], role="reference", order=index)
+            for index, asset in enumerate(assets)
+        ],
+        **fields,
+    )
+
+
+def test_a_prompt_citing_a_picture_slot_the_shot_does_not_have_is_refused(tmp_path: Path):
+    """Two pictures attached, `<Picture 3>` cited. Refused before ComfyUI, naming the slot."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Bounds"))
+    shot_id = bounded_shot(
+        client, store, project.id, pictures=2,
+        h3_prompt=(
+            "integrated_multimodal_description: [Shot 1] <Picture 1>, <Picture 2> and "
+            "<Picture 3> stand in the warehouse.\n"
+            "overall_soundscape: Warehouse air hums.\n"
+            "non_diegetic_music: N/A"
+        ),
+    )
+
+    response = submit_h3(client, project.id, shot_id)
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "<Picture 3> is cited" in detail
+    assert "only 2 pictures are attached" in detail
+    # Named as the timeline names it, and carrying the checker's own sentence rather than a
+    # second wording of the rule that could drift from the one the retry loop feeds back.
+    saved = store.get(project.id)
+    assert detail.startswith(
+        REFERENCE_BOUNDS_REFUSAL.split("{shot}")[0]
+        + shot_label(saved, saved.shots[0])
+    )
+    assert detail.endswith(REFERENCE_BOUNDS_REFUSAL.rsplit("{problems}", 1)[1].strip())
+    assert comfy.prompts == []
+
+
+def test_a_prompt_citing_every_attached_picture_submits(tmp_path: Path):
+    """The guard must not fire on the correct form. Same shot, the third tag renumbered."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="In bounds"))
+    shot_id = bounded_shot(
+        client, store, project.id, pictures=2,
+        h3_prompt=(
+            "integrated_multimodal_description: [Shot 1] <Picture 1> and <Picture 2> "
+            "stand in the warehouse.\n"
+            "overall_soundscape: Warehouse air hums.\n"
+            "non_diegetic_music: N/A"
+        ),
+    )
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert len(comfy.prompts) == 1
+
+
+def test_an_attached_but_unmentioned_picture_still_submits(tmp_path: Path):
+    """The weak direction never blocks. Three attached, one cited — the other two may be
+    style or lighting references with nothing useful to say in prose, and a gate that
+    refuses that gets worked around along with the true refusals."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Unmentioned"))
+    shot_id = bounded_shot(
+        client, store, project.id, pictures=3,
+        h3_prompt=(
+            "integrated_multimodal_description: [Shot 1] <Picture 1> stands alone.\n"
+            "overall_soundscape: Warehouse air hums.\n"
+            "non_diegetic_music: N/A"
+        ),
+    )
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert len(comfy.prompts) == 1
+
+
+def test_a_text_only_shot_with_no_references_is_never_refused_by_the_bounds_check(
+    tmp_path: Path,
+):
+    """Zero citations and a prompt that cites nothing: the text-to-video path must pass
+    through untouched. Its counts are all zero, which is exactly the state the under-citation
+    half has nothing to say about."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Text only"))
+    shot_id = reference_shot(store, project.id, mode="text_to_video")
+
+    assert reference_slot_counts(store.get(project.id), store.get(project.id).shots[0]) == {
+        "picture": 0, "video": 0, "audio": 0
+    }
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert len(comfy.prompts) == 1
+
+
+def test_the_bounds_check_now_covers_a_shot_citing_a_video(tmp_path: Path):
+    """The skip this fix earned the removal of (2026-08-20).
+
+    A video-citing shot used to return `None` here — check nothing — because
+    `timeline.shot_expansion_input` numbered every citation into the `<Picture N>` series while
+    the route numbered per kind, so bounding the shot would have refused the specialist for
+    writing the tag it was handed. Both now number from `models.numbered_references`, so the
+    count is trustworthy for every kind and `<Video 2>` on a one-video shot is caught before the
+    GPU pass — the same anonymous-slot argument that has always applied to pictures.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Mixed kinds"))
+    picture = upload_asset(client, project.id, "Lead", "image", "lead.png")
+    video = upload_asset(client, project.id, "Pan", "video", "pan.mp4")
+    citations = [
+        AssetCitation(asset_id=picture["id"], role="reference", order=0),
+        AssetCitation(asset_id=video["id"], role="reference", order=1),
+    ]
+    shot_id = reference_shot(
+        store, project.id, mode="references", citations=citations,
+        h3_prompt=(
+            "integrated_multimodal_description: [Shot 1] <Picture 1> walks through "
+            "<Video 2>.\n"
+            "overall_soundscape: Warehouse air hums.\n"
+            "non_diegetic_music: N/A"
+        ),
+    )
+
+    saved = store.get(project.id)
+    assert reference_slot_counts(saved, saved.shots[0]) == {
+        "picture": 1, "video": 1, "audio": 0
+    }
+    response = submit_h3(client, project.id, shot_id)
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "<Video 2> is cited" in detail
+    assert "only 1 video is attached" in detail
+    assert comfy.prompts == []
+
+    # And the tag the payload actually wires submits: this is a bound, not a ban on videos.
+    within = reference_shot(
+        store, project.id, mode="references", citations=citations,
+        h3_prompt=(
+            "integrated_multimodal_description: [Shot 1] <Picture 1> walks through "
+            "<Video 1>.\n"
+            "overall_soundscape: Warehouse air hums.\n"
+            "non_diegetic_music: N/A"
+        ),
+    )
+    assert submit_h3(client, project.id, within).status_code == 202
+    assert len(comfy.prompts) == 1
+
+
+def test_a_dangling_citation_skips_the_bounds_check_and_keeps_its_own_refusal(tmp_path: Path):
+    """The second skip. A citation whose Asset this project does not hold is dropped by
+    `reference_map_tag_lines` and 422s at the route by name, so counting it would leave the
+    count short by one and read as over-citation — the render's own refusal replaced by a
+    sentence about the prompt, which is the wrong thing to send the Director to fix.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Dangling"))
+    lead = upload_asset(client, project.id, "Lead", "image", "lead.png")
+    shot_id = reference_shot(
+        store, project.id, mode="references",
+        citations=[
+            AssetCitation(asset_id=lead["id"], role="reference", order=0),
+            AssetCitation(asset_id="asset_missing", role="reference", order=1),
+        ],
+        h3_prompt=(
+            "integrated_multimodal_description: [Shot 1] <Picture 1> and <Picture 2> stand.\n"
+            "overall_soundscape: Warehouse air hums.\n"
+            "non_diegetic_music: N/A"
+        ),
+    )
+
+    saved = store.get(project.id)
+    assert reference_slot_counts(saved, saved.shots[0]) is None
+    response = submit_h3(client, project.id, shot_id)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Unknown reference asset: asset_missing"
+    assert comfy.prompts == []
+
+
+def test_reference_slot_counts_agrees_with_the_map_the_route_builds(tmp_path: Path):
+    """The two must not drift: the counts bounded against are the slots the map numbers.
+
+    Asserted by counting the map's own tags rather than by restating the numbering, so a
+    change to either walk that moved one of them fails here.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Agreement"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Master", "duration": "30"},
+        files={"file": ("master.flac", b"fLaCfake", "audio/flac")},
+    )
+    first = upload_asset(client, project.id, "Opening frame", "image", "first.png")
+    lead = upload_asset(client, project.id, "Lead", "character", "lead.png")
+    shot_id = reference_shot(
+        store, project.id, mode="references", use_song_audio=True,
+        citations=[
+            AssetCitation(asset_id=first["id"], role="first"),
+            AssetCitation(asset_id=lead["id"], role="reference"),
+        ],
+    )
+    saved = store.get(project.id)
+    shot = next(held for held in saved.shots if held.id == shot_id)
+
+    # A `character` Asset is a picture: the route classifies everything that is not a video
+    # or an audio as one, and a count that only recognised `image` would be short by one.
+    assert reference_slot_counts(saved, shot) == {"picture": 2, "video": 0, "audio": 1}
+
+    tags = reference_map_tag_lines(saved, shot)
+    counted = {kind: 0 for kind in ("Picture", "Video", "Audio")}
+    for match in re.finditer(r"<(Picture|Video|Audio) (\d+)>", " ".join(tags)):
+        counted[match.group(1)] = max(counted[match.group(1)], int(match.group(2)))
+    assert counted == {"Picture": 2, "Video": 0, "Audio": 1}
+
+
+def _submitted_reference_tags(payload: dict) -> list[str]:
+    """Every reference tag the submitted prompt names, in the order the map wrote them."""
+    prompt = payload["mvp:condition"]["inputs"]["prompt"]
+    return re.findall(r"<(?:Picture|Video|Audio) \d+>", prompt)
+
+
+def _mixed_kinds_shot(client, store, project_id: str, **fields) -> str:
+    """A references shot citing a picture, a video, a picture and an audio, in that order."""
+    lead = upload_asset(client, project_id, "Lead vocalist", "character", "lead.png")
+    pan = upload_asset(client, project_id, "Camera pan", "video", "pan.mp4")
+    stage = upload_asset(client, project_id, "Stage", "setting", "stage.png")
+    room = upload_asset(client, project_id, "Room tone", "audio", "room.flac")
+    client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Master", "duration": "30"},
+        files={"file": ("master.flac", b"fLaCfake", "audio/flac")},
+    )
+    return reference_shot(
+        store, project_id, mode="references", use_song_audio=True,
+        asset_ids=[lead["id"], pan["id"], stage["id"], room["id"]],
+        **fields,
+    )
+
+
+def test_the_expansion_input_hands_the_specialist_the_tags_the_payload_wires(tmp_path: Path):
+    """The defect this story closed, asserted end to end and against the payload itself.
+
+    The specialist used to be told `<Picture 2>` for the slot the render wires as `<Video 1>`,
+    because `timeline.shot_expansion_input` ran its own single-series counter. Both now number
+    from `models.numbered_references`, and the assertion is deliberately *derived* — the tags
+    are read back out of the prompt ComfyUI was actually sent rather than transcribed here — so
+    the two cannot drift apart behind a stale expectation.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Mixed kinds"))
+    shot_id = _mixed_kinds_shot(client, store, project.id)
+
+    saved = store.get(project.id)
+    shot = next(held for held in saved.shots if held.id == shot_id)
+    handed = [
+        entry["tag"] for entry in shot_expansion_input(saved, shot)["shot"]["references"]
+    ]
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    wired = _submitted_reference_tags(comfy.prompts[-1])
+
+    assert handed == wired
+    # And the shape really is the mixed one, so an all-picture payload cannot pass by agreeing
+    # with an all-picture expansion: three series, numbered independently, song appended last.
+    assert wired == ["<Picture 1>", "<Video 1>", "<Picture 2>", "<Audio 1>", "<Audio 2>"]
+    # The stored-text half of the map is the same numbering, and so is the bounds count.
+    assert _submitted_reference_tags(
+        {"mvp:condition": {"inputs": {"prompt": " ".join(reference_map_tag_lines(saved, shot))}}}
+    ) == wired
+    assert reference_slot_counts(saved, shot) == {"picture": 2, "video": 1, "audio": 2}
+
+
+def test_every_reference_numbering_surface_reads_the_one_shared_walk(
+    tmp_path: Path, monkeypatch
+):
+    """The guard against the *duplication*, not against the instance of it.
+
+    The bug was two implementations of one rule, so re-pinning today's numbers would only
+    catch today's drift. Instead the shared walk itself is displaced — one extra picture slot
+    appended to whatever it returns — and every surface that names a slot must move with it:
+    the map, the bounds count, the expansion input handed to the specialist, and the payload
+    submitted to ComfyUI. A surface that reintroduced its own counter would keep the old
+    numbers and fail here, whatever those numbers happened to be.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="One walk"))
+    shot_id = bounded_shot(client, store, project.id, pictures=2, use_song_audio=True)
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Master", "duration": "30"},
+        files={"file": ("master.flac", b"fLaCfake", "audio/flac")},
+    )
+    saved = store.get(project.id)
+    shot = next(held for held in saved.shots if held.id == shot_id)
+    before = reference_slot_counts(saved, shot)
+
+    real = models.numbered_references
+
+    def displaced(project, shot):
+        entries = real(project, shot)
+        pictures = [entry for entry in entries if entry.kind == "picture"]
+        if not pictures:
+            return entries
+        return [*entries, replace(pictures[-1], number=pictures[-1].number + 1)]
+
+    # Every module that binds the name, because each one imported it by name at load time and
+    # patching only the definition would leave the importers on the real function.
+    for module in ("models", "app", "timeline"):
+        monkeypatch.setattr(
+            f"music_video_producer.{module}.numbered_references", displaced
+        )
+
+    assert reference_slot_counts(saved, shot) == {**before, "picture": before["picture"] + 1}
+    assert len(reference_map_tag_lines(saved, shot)) == 4  # three pictures, then the song
+    assert [
+        entry["tag"] for entry in shot_expansion_input(saved, shot)["shot"]["references"]
+    ] == ["<Picture 1>", "<Picture 2>", "<Picture 3>", "<Audio 1>"]
+
+    assert submit_h3(client, project.id, shot_id).status_code == 202
+    assert _submitted_reference_tags(comfy.prompts[-1]) == [
+        "<Picture 1>", "<Picture 2>", "<Picture 3>", "<Audio 1>"
+    ]
+    conditioner = comfy.prompts[-1]["mvp:condition"]["inputs"]
+    assert "ref_images.ref_image_2" in conditioner
+
+
+def test_the_keyframe_roles_the_map_writes_are_the_roles_the_walk_numbers_as_pictures():
+    """One list of keyframe roles, not two.
+
+    `models.KEYFRAME_TAG_ROLES` decides which citations number into the Picture series and
+    `app.REFERENCE_MAP_ROLE_TAGS` writes their sentences. A role added to one and not the other
+    would either write a frame's sentence under a number from the video series, or number a
+    frame as a video and describe it as an ordinary reference.
+    """
+    assert set(REFERENCE_MAP_ROLE_TAGS) == KEYFRAME_TAG_ROLES
+
+
+def test_a_keyframe_role_numbers_into_the_picture_series_whatever_it_cites():
+    """The role decides the series, before the asset's own kind is consulted.
+
+    A frame is a picture: the payload wires a keyframe into an ordinary picture slot and only
+    its tag line says which frame it is. So the role is checked *first*, and a citation in a
+    keyframe role takes a `<Picture N>` even when the asset behind it is an audio or a video —
+    a shape the submit route refuses by name (`REFERENCE_KEYFRAME_NOT_IMAGE`) rather than
+    renders. The consequence worth pinning is the one that escapes the numbering: an audio
+    cited as a frame must not consume an audio slot, or the master song would be handed
+    `<Audio 2>` for the slot the payload wires as `<Audio 1>`.
+    """
+    project = Project(
+        name="Frames",
+        assets=[
+            Asset(id="asset_room", name="Room tone", kind="audio", path="room.flac"),
+            Asset(id="asset_pan", name="Pan", kind="video", path="pan.mp4"),
+        ],
+        shots=[
+            Shot(
+                id="s1", start=0.0, duration=4.0, prompt="A frame", mode="references",
+                use_song_audio=True,
+                citations=[
+                    AssetCitation(asset_id="asset_room", role="first", order=0),
+                    AssetCitation(asset_id="asset_pan", role="last", order=1),
+                ],
+            )
+        ],
+    )
+
+    numbered = numbered_references(project, project.shots[0])
+
+    assert [entry.tag for entry in numbered] == ["<Picture 1>", "<Picture 2>"]
+    assert song_audio_tag(project, project.shots[0]) == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# The appearance anchor (`Asset.consistency_prompt`) — Calliope teardown phases 2.1 and 2.2
+# ---------------------------------------------------------------------------------------------
+
+
+def _anchor_project(tmp_path: Path):
+    """A project with one character asset, one uploaded image, and a song. No anchors yet."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Anchors"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Harder Faster", "duration": "154.6"},
+        files={"file": ("master.flac", b"fLaCfake", "audio/flac")},
+    )
+    lucy = upload_asset(client, project.id, "Lucy", "character", "lucy.png")
+    frame = upload_asset(client, project.id, "Opening frame", "image", "first.png")
+    return client, store, comfy, project.id, lucy, frame
+
+
+def set_anchor(client, project_id: str, asset_id: str, text: str):
+    return client.put(
+        f"/api/projects/{project_id}/assets/{asset_id}/consistency-prompt",
+        json={"consistency_prompt": text},
+    )
+
+
+def test_an_anchor_free_project_builds_the_byte_identical_reference_map(tmp_path: Path):
+    """The absolute constraint, asserted as bytes rather than as a shape.
+
+    Every prompt this application has ever built used the bare label, and the pinned payload
+    digests elsewhere in this file are what stop the *submitted* bytes moving. This is the
+    other half of that promise, stated where a reader can see it: with no anchor stored, the
+    map is character-for-character the map it was before the field existed — including a
+    shot that renames a picture, which is the one composition an anchor could have disturbed.
+    """
+    _, store, _, project_id, lucy, frame = _anchor_project(tmp_path)
+    shot_id = reference_shot(
+        store, project_id, mode="references", use_song_audio=True,
+        reference_labels={frame["id"]: "the doorway"},
+        citations=[
+            AssetCitation(asset_id=frame["id"], role="first"),
+            AssetCitation(asset_id=lucy["id"], role="reference"),
+        ],
+    )
+    saved = store.get(project_id)
+    shot = next(held for held in saved.shots if held.id == shot_id)
+
+    assert reference_map_tag_lines(saved, shot) == [
+        "<Picture 1> is the first frame of [Shot 1] (fully_preserved), showing the doorway",
+        "<Picture 2> is Lucy",
+        "<Audio 1> is the master song for synchronization",
+    ]
+    # And every asset really is anchor-free, so the assertion above is about the empty case
+    # rather than about a project that happens to have none of the assets it cites.
+    assert [asset.consistency_prompt for asset in saved.assets] == ["", ""]
+
+
+def test_the_anchor_rides_the_tag_line_for_a_reference_and_for_a_keyframe_role(tmp_path: Path):
+    """Where the anchor lands, in both tag shapes, and how a per-shot rename composes with it.
+
+    The rename replaces the *name* and never the anchor, and the two read as apposition — the
+    rename says who this picture is in this shot, the anchor says what she looks like in every
+    shot. Asserted on a keyframe-role picture as well as a plain reference, because the two
+    tags are built from different templates and an anchor wired into only one of them would
+    leave every first/last frame describing nobody.
+    """
+    client, store, _, project_id, lucy, frame = _anchor_project(tmp_path)
+    assert set_anchor(
+        client, project_id, lucy["id"], "a woman in a red leather jacket and black boots"
+    ).status_code == 200
+    assert set_anchor(
+        client, project_id, frame["id"], "a rain-slick loading dock at dusk"
+    ).status_code == 200
+
+    shot_id = reference_shot(
+        store, project_id, mode="references", use_song_audio=True,
+        reference_labels={lucy["id"]: "the woman upstage"},
+        citations=[
+            AssetCitation(asset_id=frame["id"], role="first"),
+            AssetCitation(asset_id=lucy["id"], role="reference"),
+        ],
+    )
+    saved = store.get(project_id)
+    shot = next(held for held in saved.shots if held.id == shot_id)
+
+    assert reference_map_tag_lines(saved, shot) == [
+        (
+            "<Picture 1> is the first frame of [Shot 1] (fully_preserved), showing "
+            "Opening frame, a rain-slick loading dock at dusk"
+        ),
+        "<Picture 2> is the woman upstage, a woman in a red leather jacket and black boots",
+        "<Audio 1> is the master song for synchronization",
+    ]
+
+
+def test_the_submitted_prompt_carries_the_anchor_and_the_media_labels_do_not(tmp_path: Path):
+    """The render, not merely the stored text: the anchor reaches ComfyUI inside the prompt.
+
+    `reference_map_tag_lines` and the submit route build the map twice, by design and by two
+    separate loops, and they are supposed to be the same sentence. An anchor wired into only
+    the stored half would leave a prompt that promises a description the render never sends.
+
+    The anchor reaches the wire **only** through the prompt. The route's `references[].label`
+    stays bare on purpose — it names a media slot for a reader, not a description — and
+    `build_h3_reference_payload` does not put it on the wire at all, so an anchor that had
+    leaked into it would show up here as a second occurrence.
+    """
+    client, store, comfy, project_id, lucy, frame = _anchor_project(tmp_path)
+    set_anchor(client, project_id, lucy["id"], "a woman in a red leather jacket")
+    set_anchor(client, project_id, frame["id"], "a rain-slick loading dock at dusk")
+    # Both tag shapes in one render: the route builds the keyframe line from its own template
+    # and the plain line from an f-string, so an anchor wired into one loop and not the other
+    # would submit a described performer standing in an undescribed frame.
+    shot_id = reference_shot(
+        store, project_id, mode="references",
+        citations=[
+            AssetCitation(asset_id=frame["id"], role="first"),
+            AssetCitation(asset_id=lucy["id"], role="reference"),
+        ],
+    )
+
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+    submitted = json.dumps(comfy.prompts[0])
+    assert (
+        "<Picture 1> is the first frame of [Shot 1] (fully_preserved), showing "
+        "Opening frame, a rain-slick loading dock at dusk"
+    ) in submitted
+    assert "<Picture 2> is Lucy, a woman in a red leather jacket" in submitted
+    assert submitted.count("a woman in a red leather jacket") == 1
+    assert submitted.count("a rain-slick loading dock at dusk") == 1
+
+
+def test_the_specialist_is_handed_the_anchor_and_the_rule_only_when_one_exists(tmp_path: Path):
+    """Phase 2.2's two halves, and the byte-identity rail under both.
+
+    The anchor reaches the expansion input as a per-reference `anchor` key, and the persona
+    rule that tells the specialist what to do with it appears in the system prompt exactly
+    when at least one such key does. A project where nobody has written an anchor gets the
+    byte-identical system prompt it always got, asserted against the module's own default.
+    """
+    director = ExpandingShotDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="Specialist"))
+    project.assets = [
+        Asset(id="asset_lucy", name="Lucy", kind="character", path="media/lucy.png"),
+    ]
+    store.save(project)
+    shot = Shot(
+        id="shot_one", start=0.0, duration=3.75, prompt="Wolf B-roll", mode="references",
+        citations=[AssetCitation(asset_id="asset_lucy", role="reference")],
+    )
+    client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": [json.loads(shot.model_dump_json())]},
+    )
+
+    client.post(f"/api/projects/{project.id}/shots/{shot.id}/expand-prompt")
+    assert "anchor" not in director.inputs[-1]["shot"]["references"][0]
+    assert director.prompts[-1] == h3_expansion_system_prompt()
+
+    set_anchor(client, project.id, "asset_lucy", "a woman in a red leather jacket")
+    client.post(f"/api/projects/{project.id}/shots/{shot.id}/expand-prompt")
+
+    assert director.inputs[-1]["shot"]["references"][0]["anchor"] == (
+        "Lucy, a woman in a red leather jacket"
+    )
+    assert APPEARANCE_ANCHOR_RULES in director.prompts[-1]
+    # The rule rides the prompt without disturbing the rules that were already there.
+    assert director.prompts[-1].startswith(h3_expansion_system_prompt())
+
+
+def test_the_anchor_survives_a_round_trip_through_a_fresh_project_store(tmp_path: Path):
+    """Persistence, proved by a second `ProjectStore` reading the file off disk.
+
+    A response body proves the route answered; only a store that never saw the write proves
+    the manifest carries it. The trim is asserted on the value the route stored rather than
+    on the value it was sent: the route trims before it measures and before it assigns.
+    """
+    client, _, _, project_id, lucy, _ = _anchor_project(tmp_path)
+    assert set_anchor(
+        client, project_id, lucy["id"], "  a woman in a red leather jacket  \n"
+    ).status_code == 200
+
+    reopened = ProjectStore(tmp_path).get(project_id)
+    stored = next(asset for asset in reopened.assets if asset.id == lucy["id"])
+    assert stored.consistency_prompt == "a woman in a red leather jacket"
+
+    # Cleared by the same door, and the clearing persists too — an anchor that could be
+    # written and not withdrawn is a field the Director cannot correct.
+    assert set_anchor(client, project_id, lucy["id"], "   ").status_code == 200
+    cleared = ProjectStore(tmp_path).get(project_id)
+    assert next(a for a in cleared.assets if a.id == lucy["id"]).consistency_prompt == ""
+
+
+def test_a_manifest_written_before_the_anchor_existed_loads_and_round_trips(tmp_path: Path):
+    """The field is defaulted, so every project already on disk opens unchanged.
+
+    Written by hand with the key genuinely absent — a manifest carrying
+    `"consistency_prompt": ""` would prove only that the current model can read its own output.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Legacy"))
+    manifest = json.loads(store.manifest_path(project.id).read_text(encoding="utf-8"))
+    manifest["assets"] = [
+        {
+            "id": "asset_old", "name": "Lucy", "kind": "character",
+            "path": "media/lucy.png", "source": "upload", "prompt": "",
+            "prompt_id": "", "created_at": "2026-08-01T00:00:00Z",
+        }
+    ]
+    assert "consistency_prompt" not in manifest["assets"][0]
+    store.manifest_path(project.id).write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = store.get(project.id)
+    assert loaded.assets[0].consistency_prompt == ""
+    assert client.get(f"/api/projects/{project.id}").status_code == 200
+    # And it round-trips: saved back, re-read, still an ordinary asset with no anchor.
+    store.save(loaded)
+    assert ProjectStore(tmp_path).get(project.id).assets[0].consistency_prompt == ""
+
+
+def test_the_dedicated_route_bounds_the_anchor_and_names_the_asset(tmp_path: Path):
+    client, store, _, project_id, lucy, _ = _anchor_project(tmp_path)
+    set_anchor(client, project_id, lucy["id"], "a woman in a red leather jacket")
+
+    refused = set_anchor(client, project_id, lucy["id"], "x" * (CONSISTENCY_PROMPT_LIMIT + 1))
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == CONSISTENCY_PROMPT_TOO_LONG.format(
+        name="Lucy", length=CONSISTENCY_PROMPT_LIMIT + 1, limit=CONSISTENCY_PROMPT_LIMIT
+    )
+    # Refused before anything was assigned: the anchor that was already there survives.
+    assert store.get(project_id).assets[0].consistency_prompt == (
+        "a woman in a red leather jacket"
+    )
+    # Exactly at the bound is accepted, so the refusal is a ceiling rather than an off-by-one.
+    assert set_anchor(
+        client, project_id, lucy["id"], "y" * CONSISTENCY_PROMPT_LIMIT
+    ).status_code == 200
+    assert set_anchor(client, project_id, "asset_nothing", "x").status_code == 404
+
+
+def test_the_generic_project_put_can_neither_blank_nor_invent_an_anchor(tmp_path: Path):
+    """The hole this route has been three times, closed by adoption rather than by trust.
+
+    Two bodies, both of which a real client sends. The first omits the key entirely, which is
+    what any client written before the field existed does and what a hand-rolled API call
+    does — and one such save would otherwise be enough to clear the Director's own text on
+    every asset in the project at once. The second *invents* one, which would let an ordinary
+    save plant a description into every prompt citing that asset without anyone deciding to.
+    """
+    client, store, _, project_id, lucy, _ = _anchor_project(tmp_path)
+    set_anchor(client, project_id, lucy["id"], "a woman in a red leather jacket")
+
+    body = json.loads(store.get(project_id).model_dump_json())
+    for asset in body["assets"]:
+        asset.pop("consistency_prompt", None)
+    body["name"] = "Renamed by an ordinary save"
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+
+    saved = store.get(project_id)
+    assert saved.name == "Renamed by an ordinary save"
+    assert saved.assets[0].consistency_prompt == "a woman in a red leather jacket"
+
+    body = json.loads(saved.model_dump_json())
+    body["assets"][1]["consistency_prompt"] = "planted by a whole-manifest save"
+    body["assets"][0]["consistency_prompt"] = ""
+    # An asset this route has never seen, arriving with an anchor already on it. The stored
+    # project holds no such id, so there is nothing to adopt — and the answer is `""` rather
+    # than "whatever the body said", because an anchor that arrived here was not written on
+    # the route that writes anchors.
+    body["assets"].append(
+        {
+            "id": "asset_invented", "name": "Smuggled", "kind": "prop",
+            "path": "media/nothing.png", "source": "upload",
+            "consistency_prompt": "planted by inventing an asset",
+        }
+    )
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+
+    saved = store.get(project_id)
+    assert saved.assets[0].consistency_prompt == "a woman in a red leather jacket"
+    assert saved.assets[1].consistency_prompt == ""
+    assert saved.assets[2].id == "asset_invented"
+    assert saved.assets[2].consistency_prompt == ""
+
+
+def test_a_multiview_sheet_inherits_its_sources_anchor_and_an_ai_mod_child_does_not(
+    tmp_path: Path,
+):
+    """The two child-asset paths, and the decision that separates them.
+
+    A multiview promotion promises the child depicts the same subject unchanged — that is
+    what a turnaround sheet *is*, and it is the asset shots actually cite, so an anchor that
+    stopped at the parent would be an anchor no render ever sees. An AI Mod is the opposite
+    act: it changes what the subject looks like, so inheriting would carry a description the
+    edit was run to invalidate. Both are asserted here because either one alone reads as an
+    accident.
+    """
+    client, store, _, project_id, lucy, _ = _anchor_project(tmp_path)
+    set_anchor(client, project_id, lucy["id"], "a woman in a red leather jacket")
+
+    assert client.post(
+        f"/api/projects/{project_id}/assets/{lucy['id']}/multiview",
+        json={"prompt": "character sheet", "seed": 0},
+    ).status_code == 202
+    sheet = store.get(project_id).assets[-1]
+    assert sheet.source == "krea-multiview" and sheet.parent_id == lucy["id"]
+    assert sheet.consistency_prompt == "a woman in a red leather jacket"
+
+    assert client.post(
+        f"/api/projects/{project_id}/assets/{lucy['id']}/edit",
+        json={"instruction": "put her in a black coat instead"},
+    ).status_code == 202
+    edited = store.get(project_id).assets[-1]
+    assert edited.source == "h3-image-edit" and edited.parent_id == lucy["id"]
+    assert edited.consistency_prompt == ""
+
+    # A copy, not a link: correcting the sheet leaves the source alone, and correcting the
+    # source does not silently rewrite what every shot citing the sheet is conditioned with.
+    set_anchor(client, project_id, sheet.id, "a turnaround sheet of a woman in a red leather jacket")
+    reopened = ProjectStore(tmp_path).get(project_id)
+    assert reopened.assets[0].consistency_prompt == "a woman in a red leather jacket"
+    assert next(a for a in reopened.assets if a.id == sheet.id).consistency_prompt == (
+        "a turnaround sheet of a woman in a red leather jacket"
+    )
+
+
+def test_no_creation_path_and_no_model_can_write_an_anchor(tmp_path: Path):
+    """The rest of the sibling write paths, each asserted for what it does to the field.
+
+    Upload and Flux generation both create assets and neither can carry an anchor: nothing
+    infers one from a generation prompt, which is the whole point of the field being the
+    Director's. The vision inspection writes `vision` and only `vision` — it may *suggest* on
+    screen and must never write here. And the two model-facing schemas carry no such property
+    at all, which is the recorded rule for a mechanical field: a local model that silently
+    drops or settles one is a measured failure mode, so a model never sets one.
+    """
+    client, store, _, project_id, lucy, _ = _anchor_project(tmp_path)
+    set_anchor(client, project_id, lucy["id"], "a woman in a red leather jacket")
+
+    uploaded = upload_asset(client, project_id, "Alley", "setting", "alley.png")
+    assert store.get(project_id).assets[-1].consistency_prompt == ""
+    assert uploaded["consistency_prompt"] == ""
+
+    assert client.post(
+        f"/api/projects/{project_id}/generate/flux",
+        json={
+            "name": "Neon sign", "kind": "prop", "seed": 1,
+            "prompt": "a neon sign, a woman in a red leather jacket beneath it",
+            # Sent as if a client tried to set one directly; the request model has no such
+            # field, so it is dropped rather than stored.
+            "consistency_prompt": "smuggled in through the generator",
+        },
+    ).status_code == 202
+    assert store.get(project_id).assets[-1].consistency_prompt == ""
+
+    # Vision inspection: the record lands, the anchor does not move.
+    assert client.post(
+        f"/api/projects/{project_id}/assets/{lucy['id']}/analyze"
+    ).status_code == 200
+    inspected = store.get(project_id).assets[0]
+    assert inspected.vision is not None
+    assert inspected.consistency_prompt == "a woman in a red leather jacket"
+
+    # Neither model-facing schema can name the field.
+    from music_video_producer.director import AssetProposal, assistant_tools
+
+    assert "consistency_prompt" not in AssetProposal.model_json_schema()["properties"]
+    assert "consistency_prompt" not in json.dumps(assistant_tools())
+
+    # Deletion removes the asset and its anchor together; nothing else is disturbed.
+    assert client.delete(
+        f"/api/projects/{project_id}/assets/{uploaded['id']}"
+    ).status_code == 200
+    remaining = store.get(project_id)
+    assert [asset.id for asset in remaining.assets].count(uploaded["id"]) == 0
+    assert remaining.assets[0].consistency_prompt == "a woman in a red leather jacket"
+
+
+# --- The narrow gate on the two generic writes (2026-08-20) -----------------------------
+#
+# `PUT /api/projects/{id}` and `PUT /api/projects/{id}/shots` are the normal save path for
+# every edit in the interface, so the whole engineering problem is refusing the harmful shape
+# without touching the ordinary one. Both gates compare the incoming Shot against the stored
+# Shot and refuse only a *difference*; the round-trip test below is the one that says the
+# change is shippable, and it is deliberately first.
+
+
+def gated_project(store: ProjectStore, name: str, *shots: Shot) -> Project:
+    """A saved project with exactly the Shots given. Written through the store on purpose:
+    the routes under test are the ones being gated, so the fixture may not use them."""
+    project = store.create(Project(name=name))
+    project.shots = list(shots)
+    store.save(project)
+    return store.get(project.id)
+
+
+def test_an_unchanged_round_trip_through_both_generic_writes_leaves_every_shot_field_alone(
+    tmp_path: Path,
+):
+    """The shippability claim, and the reason the gate compares rather than forbids.
+
+    A whole-manifest save round-trips `status` and all three approval fields on every Shot,
+    including Shots that are in flight and Shots that are approved. If the gate refused their
+    presence rather than their movement, this request -- which is what the interface sends on
+    every drag, every prompt edit and every timeline change -- would 409. So it is asserted
+    field by field, on every Shot, through a *fresh* `ProjectStore`, on both routes.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = gated_project(
+        store,
+        "Round trip",
+        Shot(id="shot_draft", start=0, duration=5, prompt="A corridor", status="draft"),
+        Shot(id="shot_ready", start=5, duration=5, prompt="A stairwell", status="ready"),
+        Shot(
+            id="shot_queued", start=10, duration=5, prompt="A rooftop", status="queued",
+            prompt_id="p-1",
+        ),
+        Shot(id="shot_running", start=15, duration=5, prompt="A tunnel", status="running"),
+        Shot(
+            id="shot_done", start=20, duration=5, prompt="A doorway", status="complete",
+            latest_output="takes/done_00001.mp4",
+        ),
+        Shot(id="shot_error", start=25, duration=5, prompt="A window", status="error"),
+        Shot(
+            id="shot_approved", start=30, duration=5, prompt="A mirror", status="approved",
+            latest_output="takes/approved_00001.mp4",
+            approved_output="takes/approved_00001.mp4",
+            approved_start=30, approved_duration=5,
+        ),
+    )
+    before = [shot.model_dump() for shot in ProjectStore(tmp_path).get(project.id).shots]
+
+    whole = client.put(f"/api/projects/{project.id}", json=project.model_dump(mode="json"))
+    assert whole.status_code == 200, whole.text
+    listed = client.put(
+        f"/api/projects/{project.id}/shots",
+        json={"shots": [shot.model_dump(mode="json") for shot in store.get(project.id).shots]},
+    )
+    assert listed.status_code == 200, listed.text
+
+    after = [shot.model_dump() for shot in ProjectStore(tmp_path).get(project.id).shots]
+    assert after == before
+    assert comfy.prompts == []
+
+
+def test_the_generic_writes_refuse_exactly_the_moves_out_of_flight(tmp_path: Path):
+    """The whole `ShotStatus` state space, both routes, with the manifest checked after each.
+
+    Enumerated from the type rather than listed, so a status added later is swept here instead
+    of falling through. The rule asserted is the one the gate implements and no wider: a move
+    is refused exactly when the stored status is in flight and the incoming one is not.
+    `draft -> ready` is legitimate arming and stays 200; `queued -> running` never leaves the
+    in-flight set and loses nothing; `complete -> draft` is a Director tidying up.
+    """
+    client, store, comfy = make_client(tmp_path)
+    space = get_args(ShotStatus)
+    # Pinned so a new status cannot appear without this sweep being read.
+    assert set(space) == {
+        "draft", "ready", "queued", "running", "complete", "error", "approved"
+    }, space
+
+    for was in space:
+        for target in space:
+            refused = was in RENDER_IN_FLIGHT_STATUSES and target not in RENDER_IN_FLIGHT_STATUSES
+            expected = 409 if refused else 200
+            for route in ("", "/shots"):
+                project = gated_project(
+                    store,
+                    f"{was}->{target}{route}",
+                    Shot(id="shot_one", start=0, duration=5, prompt="A corridor", status=was),
+                )
+                body = project.model_dump(mode="json")
+                body["shots"][0]["status"] = target
+                payload = body if route == "" else {"shots": body["shots"]}
+                response = client.put(f"/api/projects/{project.id}{route}", json=payload)
+
+                assert response.status_code == expected, (was, target, route, response.text)
+                landed = ProjectStore(tmp_path).get(project.id).shots[0]
+                if refused:
+                    assert response.json()["detail"] == MARK_READY_IN_FLIGHT_REFUSAL.format(
+                        shot="SHOT 01 (shot_one)"
+                    )
+                    # Untouched, not partially applied.
+                    assert landed.status == was, (was, target, route)
+                else:
+                    assert landed.status == target, (was, target, route)
+    assert comfy.prompts == []
+
+
+def test_the_generic_writes_refuse_every_approval_change_and_save_an_unchanged_one(
+    tmp_path: Path,
+):
+    """All three fields of one approval, each moved on its own, on both routes.
+
+    Each field separately because they are written together and could be gated apart: the
+    window snapshot is what makes an approval's staleness decidable, so a save able to move
+    `approved_start` alone could re-point a standing approval at a window nobody approved.
+    Clearing is refused as well as forging -- a client that has never heard of the fields sends
+    them empty, and that is the likelier accident of the two.
+    """
+    client, store, comfy = make_client(tmp_path)
+    approved = Shot(
+        id="shot_one", start=0, duration=5, prompt="A corridor", status="approved",
+        latest_output="takes/one_00001.mp4", approved_output="takes/one_00001.mp4",
+        approved_start=0, approved_duration=5,
+    )
+    changes: list[dict[str, object]] = [
+        {"approved_output": "takes/forged.mp4"},
+        {"approved_output": ""},
+        {"approved_start": 2.5},
+        {"approved_duration": 0},
+    ]
+    assert {field for change in changes for field in change} == set(APPROVAL_FIELDS)
+
+    for index, change in enumerate(changes):
+        for route in ("", "/shots"):
+            project = gated_project(store, f"approval-{index}{route}", approved.model_copy())
+            body = project.model_dump(mode="json")
+            body["shots"][0].update(change)
+            payload = body if route == "" else {"shots": body["shots"]}
+            response = client.put(f"/api/projects/{project.id}{route}", json=payload)
+
+            assert response.status_code == 409, (change, route, response.text)
+            assert response.json()["detail"] == GENERIC_WRITE_APPROVAL_REFUSAL.format(
+                shot="SHOT 01 (shot_one)"
+            )
+            landed = ProjectStore(tmp_path).get(project.id).shots[0]
+            assert landed.approved_output == "takes/one_00001.mp4"
+            assert (landed.approved_start, landed.approved_duration) == (0, 5)
+
+    # A Shot the stored project does not hold is compared against the field's own default, so a
+    # brand-new Shot cannot arrive already approved -- which is how a duplicated Shot used to
+    # carry the original's decision.
+    project = gated_project(store, "new shot", approved.model_copy())
+    body = project.model_dump(mode="json")
+    fresh = body["shots"][0] | {"id": "shot_two", "start": 10}
+    planted = client.put(
+        f"/api/projects/{project.id}/shots", json={"shots": [body["shots"][0], fresh]}
+    )
+    assert planted.status_code == 409, planted.text
+    assert len(ProjectStore(tmp_path).get(project.id).shots) == 1
+
+    # And the same new Shot without an approval is an ordinary add, exactly as today.
+    added = client.put(
+        f"/api/projects/{project.id}/shots",
+        json={
+            "shots": [
+                body["shots"][0],
+                fresh | {"approved_output": "", "approved_start": 0, "approved_duration": 0},
+            ]
+        },
+    )
+    assert added.status_code == 200, added.text
+    assert len(ProjectStore(tmp_path).get(project.id).shots) == 2
+    assert comfy.prompts == []
+
+
+def test_a_body_that_omits_the_gated_fields_behaves_exactly_as_it_did(tmp_path: Path):
+    """The stale-client shape, which is the one the sibling-write-path rule is about.
+
+    A `Shot` binds every field with a default, so a client that predates them sends nothing and
+    the route sees `status="draft"` and an empty approval. On a drafted Shot that is a no-op and
+    still saves. On an approved Shot it is the silent withdrawal the gate exists to stop, and on
+    an in-flight Shot it is the walk-back -- both now refused, with nothing written.
+    """
+    client, store, comfy = make_client(tmp_path)
+    bare = {"id": "shot_one", "start": 0, "duration": 5, "prompt": "A corridor"}
+
+    drafted = gated_project(
+        store, "Bare draft", Shot(**bare, status="draft")  # type: ignore[arg-type]
+    )
+    saved = client.put(f"/api/projects/{drafted.id}/shots", json={"shots": [bare]})
+    assert saved.status_code == 200, saved.text
+    assert ProjectStore(tmp_path).get(drafted.id).shots[0].status == "draft"
+
+    live = gated_project(
+        store, "Bare in flight", Shot(**bare, status="running")  # type: ignore[arg-type]
+    )
+    walked = client.put(f"/api/projects/{live.id}/shots", json={"shots": [bare]})
+    assert walked.status_code == 409, walked.text
+    assert ProjectStore(tmp_path).get(live.id).shots[0].status == "running"
+
+    decided = gated_project(
+        store,
+        "Bare approval",
+        Shot(**bare, status="approved", approved_output="takes/one.mp4"),  # type: ignore[arg-type]
+    )
+    withdrawn = client.put(f"/api/projects/{decided.id}/shots", json={"shots": [bare]})
+    assert withdrawn.status_code == 409, withdrawn.text
+    assert ProjectStore(tmp_path).get(decided.id).shots[0].approved_output == "takes/one.mp4"
+    assert comfy.prompts == []
+
+
+def test_the_dedicated_routes_still_move_status_and_approval_through_the_gate(tmp_path: Path):
+    """The sanctioned paths, walked end to end, because a gate that closed them would be a
+    regression and not a fix. Nothing here binds a body that names `status` or an approval
+    field: each of these routes resolves the value from the server's own manifest."""
+    client, store, comfy = make_client(tmp_path)
+    project = gated_project(
+        store,
+        "Sanctioned",
+        Shot(id="shot_one", start=0, duration=5, prompt="A corridor", mode="text", status="draft"),
+    )
+
+    assert mark_ready(client, project.id, "shot_one").status_code == 200
+    assert store.get(project.id).shots[0].status == "ready"
+    assert mark_draft(client, project.id, "shot_one").status_code == 200
+    assert store.get(project.id).shots[0].status == "draft"
+    assert mark_ready(client, project.id, "shot_one").status_code == 200
+
+    submitted = client.post(f"/api/projects/{project.id}/shots/shot_one/generate/h3", json={})
+    assert submitted.status_code == 202, submitted.text
+    assert store.get(project.id).shots[0].status == "queued"
+    land_take(client, comfy, project.id, submitted.json()["id"], "shot_one-h3_00001.mp4")
+    assert store.get(project.id).shots[0].status == "complete"
+
+    assert approve(client, project.id, "shot_one").status_code == 200
+    settled = ProjectStore(tmp_path).get(project.id).shots[0]
+    assert settled.status == "approved"
+    assert settled.approved_output == settled.latest_output
+    assert (settled.approved_start, settled.approved_duration) == (0, 5)
+
+    assert unapprove(client, project.id, "shot_one").status_code == 200
+    cleared = ProjectStore(tmp_path).get(project.id).shots[0]
+    assert cleared.status == "complete"
+    assert cleared.approved_output == ""
+    assert (cleared.approved_start, cleared.approved_duration) == (0, 0)
+
+    assert render_again(client, project.id, "shot_one").status_code == 200
+    assert ProjectStore(tmp_path).get(project.id).shots[0].status == "ready"
+    assert len(comfy.prompts) == 1
+
+
+# --- Supersede on resubmit (Phase 1.3) --------------------------------------------------
+#
+# Reachability first, because it decides what these tests are worth. `generate_h3` is the
+# only submission route whose per-target guard is a *Shot status* rather than a read of the
+# job records: `shot.status != "ready"` is what normally makes a second render impossible
+# while the first is open. Two shipped writes used to replace `Shot.status` wholesale with no
+# in-flight check -- `PUT /api/projects/{id}` and `PUT /api/projects/{id}/shots` -- so a
+# client holding a snapshot taken before the submission put the shot back to `ready` under a
+# live job and the route then accepted. **That is closed (2026-08-20):** both generic writes
+# now refuse a body that moves a Shot out of `queued`/`running`, and the helper below pins the
+# refusal at the exact site the hole was demonstrated.
+#
+# These tests are worth what remains reachable, which is not nothing. A manifest can read
+# `ready` under a live job for reasons no route is responsible for -- one edited by hand on
+# disk, one restored from a backup, one saved by an older build before the gate existed -- and
+# `apply_job_history` adopts by `target_id` whatever produced the state. Supersession is
+# therefore kept and exercised, with the state now produced through the store, which is the
+# only writer left that can reach it.
+#
+# The other routes' guards read the job records themselves (`shot_render_in_flight` and its
+# two siblings), and every non-terminal status is an in-flight status, so their 409s cannot
+# be walked past. The refusal sweep below pins that.
+
+
+def rearmed_under_a_live_job(client: TestClient, store: ProjectStore, project_id: str):
+    """Put the shot back to `ready` under its live job, and pin that the shipped write refuses.
+
+    Both halves in one helper because they are one fact about this state: `PUT .../shots` used
+    to produce it and no longer does, so the same call that used to be the reachability proof
+    is now the closure proof -- 409, and the stored status still `queued` afterwards. The state
+    the supersession tests need is then written through the store, which is what a hand-edited
+    or older manifest amounts to.
+    """
+    stored = store.get(project_id)
+    shots = [shot.model_dump(mode="json") for shot in stored.shots]
+    for shot in shots:
+        shot["status"] = "ready"
+        shot["prompt_id"] = ""
+    refused = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == MARK_READY_IN_FLIGHT_REFUSAL.format(
+        shot=shot_label(stored, stored.shots[0])
+    )
+    # The refusal wrote nothing: read back through a fresh store, not the handle above.
+    assert ProjectStore(store.data_root).get(project_id).shots[0].status == "queued"
+    for shot in stored.shots:
+        shot.status = "ready"
+        shot.prompt_id = ""
+    store.save(stored)
+
+
+def test_a_resubmitted_shot_supersedes_its_stale_job_and_leaves_the_new_one_alone(tmp_path: Path):
+    """The leftover record is settled and named; the new one is untouched and still open.
+
+    Without this the older record stays non-terminal forever -- pinning `active` true, and so
+    refusing assembly and asset fill -- and if its prompt does answer, `apply_job_history`
+    adopts by `target_id` and moves `latest_output` back onto the older take.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Resubmit"))
+    project.shots = [
+        Shot(id="shot_a", start=0, duration=5, prompt="A corridor", mode="text", status="ready"),
+        Shot(id="shot_b", start=10, duration=5, prompt="A stairwell", mode="text", status="ready"),
+    ]
+    store.save(project)
+
+    first = client.post(f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={}).json()
+    bystander = client.post(
+        f"/api/projects/{project.id}/shots/shot_b/generate/h3", json={}
+    ).json()
+    assert store.get(project.id).shots[0].status == "queued"
+
+    rearmed_under_a_live_job(client, store, project.id)
+    second = client.post(f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={})
+
+    assert second.status_code == 202
+    second_id = second.json()["id"]
+    # Persistence proven through a *fresh* store, not the handle the route wrote through.
+    saved = {job.id: job for job in ProjectStore(tmp_path).get(project.id).jobs}
+    assert saved[first["id"]].status == "cancelled"
+    assert saved[first["id"]].error == JOB_SUPERSEDED
+    assert saved[first["id"]].superseded_by == second_id
+    # Its prompt id survives, so the file an executing ComfyUI prompt still writes is traceable.
+    assert saved[first["id"]].prompt_id == "p-101"
+    assert saved[second_id].status == "queued"
+    assert saved[second_id].superseded_by == ""
+    # The other shot's live render is a different target and is not collateral.
+    assert saved[bystander["id"]].status == "queued"
+    assert saved[bystander["id"]].superseded_by == ""
+    # Nothing was cancelled on ComfyUI: this is record hygiene, and ComfyUI is user-managed.
+    assert comfy.cancelled == []
+
+
+def test_supersession_stops_a_late_answer_overwriting_the_newer_take(tmp_path: Path):
+    """The harm, demonstrated: the stale prompt finishes last and must not win the pointer."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Late answer"))
+    project.shots = [
+        Shot(id="shot_a", start=0, duration=5, prompt="A corridor", mode="text", status="ready")
+    ]
+    store.save(project)
+    first = client.post(f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={}).json()
+
+    async def second_submission(prompt, client_id=None):
+        comfy.prompts.append(prompt)
+        return type("Submission", (), {"prompt_id": "p-202", "number": 2})()
+
+    comfy.submit = second_submission
+    rearmed_under_a_live_job(client, store, project.id)
+    client.post(f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={})
+
+    # The newer render lands.
+    comfy.history = completed_history_for(
+        [{"subfolder": "music-video-producer/p/shots", "filename": "new_00002_.mp4"}]
+    )
+    client.get(f"/api/projects/{project.id}/render-status")
+    assert ProjectStore(tmp_path).get(project.id).shots[0].latest_output.endswith("new_00002_.mp4")
+
+    # Then the older prompt answers. Its record is settled, so no tick asks about it and the
+    # pointer does not move back.
+    comfy.history = completed_history_for(
+        [{"subfolder": "music-video-producer/p/shots", "filename": "old_00001_.mp4"}]
+    )
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{first['id']}")
+
+    assert refreshed.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.shots[0].latest_output.endswith("new_00002_.mp4")
+    assert saved.shots[0].status == "complete"
+    # The stated cost, asserted rather than glossed: the settled record never learns where
+    # its own file landed. It is on disk under the shot's prefix and this record names the
+    # prompt that wrote it, but the takes strip -- which reads `output_files` -- will not
+    # list it. See `batch.supersede_target_jobs`.
+    assert next(job for job in saved.jobs if job.id == first["id"]).output_files == []
+
+
+def test_every_in_flight_refusal_still_fires_after_supersession_exists(tmp_path: Path):
+    """Supersession is hygiene for what gets past the guards, never a loosening of one.
+
+    Every per-target refusal, driven on a shot with a live render job.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Refusals"))
+    project.shots = [
+        Shot(
+            id="shot_a", start=0, duration=5, prompt="A corridor", mode="text", status="ready",
+            singing="not_singing", latest_output="takes/one.mp4",
+        )
+    ]
+    store.save(project)
+    client.post(f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={})
+    submissions = len(comfy.prompts)
+    stored = store.get(project.id)
+    label = shot_label(stored, stored.shots[0])
+
+    # `generate_h3` itself, through its own status gate -- the guard supersession leaves alone.
+    again = client.post(f"/api/projects/{project.id}/shots/shot_a/generate/h3", json={})
+    assert again.status_code == 422
+    assert again.json()["detail"] == "Shot must be ready before H3 submission"
+
+    # Render again: 409, read off the job record whatever the status says.
+    render_again = client.post(f"/api/projects/{project.id}/shots/shot_a/render-again")
+    assert render_again.status_code == 409
+    assert render_again.json()["detail"] == RENDER_AGAIN_IN_FLIGHT_REFUSAL.format(shot=label)
+
+    # Mark ready: 409, and the same code for the same live render.
+    mark = client.post(f"/api/projects/{project.id}/shots/shot_a/mark-ready")
+    assert mark.status_code == 409
+    assert mark.json()["detail"] == MARK_READY_IN_FLIGHT_REFUSAL.format(shot=label)
+
+    # Approve: 409, because the take on screen is about to be displaced.
+    approve = client.post(f"/api/projects/{project.id}/shots/shot_a/approve")
+    assert approve.status_code == 409
+    assert approve.json()["detail"] == APPROVE_IN_FLIGHT_REFUSAL.format(shot=label)
+
+    # Enhance and restore-audio: 409 on the live *render*, ahead of any take question.
+    enhance = client.post(f"/api/projects/{project.id}/shots/shot_a/enhance/ltx25")
+    assert enhance.status_code == 409
+    assert enhance.json()["detail"] == ENHANCE_IN_FLIGHT_REFUSAL.format(shot=label)
+    restore = client.post(f"/api/projects/{project.id}/shots/shot_a/restore-song-audio")
+    assert restore.status_code == 409
+    assert restore.json()["detail"] == RESTORE_AUDIO_IN_FLIGHT_REFUSAL.format(shot=label)
+
+    # Not one of those refusals spent a submission, and none of them settled the live job.
+    assert len(comfy.prompts) == submissions
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert [job.status for job in saved.jobs] == ["queued"]
+    assert saved.jobs[0].superseded_by == ""
+
+
+# ------------------------------------------------------------------------------------------
+# Snap cuts to phrase boundaries: the route's half. Report by default, apply on confirm.
+# `timeline.snap_cut_plan` owns every decision and `tests/test_timeline.py` owns its cases;
+# what is asserted here is the wire — what is written and when, which protections the route
+# builds from the project's own records, and that no path spends a GPU second.
+# ------------------------------------------------------------------------------------------
+
+
+def snap_client(tmp_path: Path, *, spans, shots, duration=24.0, jobs=None):
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(
+        Project(
+            name="Snap",
+            song=Song(
+                title="Measured",
+                path="measured.flac",
+                source="imported",
+                duration=duration,
+                # The words and the merged spans describe the same voice — one word per span —
+                # which is what a real `align-lyrics` write produces and what `vocal_gaps`,
+                # reading the words first, needs a fixture to be honest about.
+                lyric_words=[("word", start, end) for start, end in spans],
+                vocal_spans=spans,
+            ),
+            shots=shots,
+            jobs=jobs or [],
+        )
+    )
+    return client, comfy, project
+
+
+SNAP_SPANS = [(0.5, 7.0), (8.0, 13.0), (14.0, 19.5), (21.0, 23.5)]
+
+
+def snap_shots(**middle):
+    return [
+        Shot(id="s0", start=0.0, duration=6.0),
+        Shot(id="s1", start=6.0, duration=6.0, **middle),
+        Shot(id="s2", start=12.0, duration=12.0),
+    ]
+
+
+def test_snap_cuts_reports_without_writing_and_applies_only_on_confirm(tmp_path: Path):
+    """`populate`'s confirm shape, enforced by the server rather than trusted to the browser.
+
+    The report is a read: it does not call `store.save`, it answers with no project at all —
+    which is how "nothing was written" reaches the client as a fact rather than a promise —
+    and a **fresh `ProjectStore`** over the same data root still holds the plan as it was.
+    The confirmed call then writes exactly the windows the report described.
+    """
+    client, comfy, project = snap_client(
+        tmp_path, spans=SNAP_SPANS, shots=snap_shots()
+    )
+    before = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+
+    report = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts", json={"tolerance": 1.5}
+    )
+
+    assert report.status_code == 200
+    body = report.json()
+    assert body["applied"] is False
+    assert body["project"] is None
+    assert body["moved"] == 2
+    assert body["moved"] + body["skipped"] == 2
+    assert [move["proposed"] for move in body["moves"]] == [7.15, 13.15]
+    # Nothing was written, read back through a store this request never touched.
+    assert ProjectStore(tmp_path).get(project.id).model_dump(mode="json") == before
+
+    applied = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 1.5, "confirm_apply": True},
+    )
+
+    assert applied.status_code == 200
+    assert applied.json()["applied"] is True
+    assert applied.json()["moved"] == 2
+    # Read back through a fresh store: the windows survived the round trip to disk.
+    reread = ProjectStore(tmp_path).get(project.id)
+    assert [(shot.id, shot.start, shot.duration) for shot in reread.shots] == [
+        ("s0", 0.0, 7.15),
+        ("s1", 7.15, 6.0),
+        ("s2", 13.15, 10.85),
+    ]
+    # Contiguous, and covering exactly what it covered before.
+    assert reread.shots[0].start == 0.0
+    assert reread.shots[-1].end == pytest.approx(24.0, abs=1e-9)
+    for previous, current in zip(reread.shots, reread.shots[1:]):
+        assert previous.end == pytest.approx(current.start, abs=1e-9)
+    # Nothing rendered on either path. This route spends no GPU second at all.
+    assert comfy.prompts == []
+    assert reread.jobs == []
+
+
+def test_the_snap_report_says_how_long_the_gap_each_cut_found_was(tmp_path: Path):
+    """The Director's framing, 2026-08-20, carried onto the wire.
+
+    "A 1 second gap may just be an extended shot where a 4 second gap would be great for a
+    b-roll or non singing character shot." Two cuts here find exactly those two gaps, and the
+    report distinguishes them: without `gap` the two moves read identically and the difference
+    — which is the whole editorial signal — is invisible to the client. Nothing on this route
+    suggests what to do about a long gap; it reports the length and stops.
+    """
+    client, comfy, project = snap_client(
+        tmp_path,
+        spans=[(0.5, 7.0), (8.0, 13.0), (17.0, 23.5)],
+        shots=snap_shots(),
+    )
+
+    report = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts", json={"tolerance": 1.5}
+    )
+
+    assert report.status_code == 200
+    moves = report.json()["moves"]
+    assert [(move["proposed"], move["gap"]) for move in moves] == [(7.15, 1.0), (13.15, 4.0)]
+    assert comfy.prompts == []
+
+
+def test_snap_cuts_changes_only_the_window_and_leaves_every_other_shot_field_alone(
+    tmp_path: Path,
+):
+    """A cut move is a window move. Prompts, modes, citations, seeds, singing marks and take
+    provenance are all somebody else's decisions and none of them are this route's to touch."""
+    shots = [
+        Shot(id="s0", start=0.0, duration=6.0, prompt="Wide on the pier", seed=11,
+             singing="singing", use_song_audio=True, h3_prompt="[Shot 1] ...",
+             latest_output="takes/s0.mp4", status="complete"),
+        Shot(id="s1", start=6.0, duration=6.0, prompt="Close on her face", seed=12),
+        Shot(id="s2", start=12.0, duration=12.0, prompt="The corridor", seed=13),
+    ]
+    client, comfy, project = snap_client(tmp_path, spans=SNAP_SPANS, shots=shots)
+    before = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+
+    client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 1.5, "confirm_apply": True},
+    )
+
+    after = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+    for old, new in zip(before["shots"], after["shots"]):
+        moved = {"start", "duration", "end"}
+        assert {key: value for key, value in old.items() if key not in moved} == {
+            key: value for key, value in new.items() if key not in moved
+        }
+    assert comfy.prompts == []
+
+
+def test_snap_cuts_refuses_a_locked_shots_cuts_by_name(tmp_path: Path):
+    client, comfy, project = snap_client(
+        tmp_path, spans=SNAP_SPANS, shots=snap_shots(locked=True)
+    )
+
+    response = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 1.5, "confirm_apply": True},
+    )
+
+    body = response.json()
+    assert body["moved"] == 0
+    assert body["skipped"] == 2
+    assert {skip["reason"] for skip in body["skips"]} == {
+        SNAP_LOCKED_REFUSAL.format(shot="SHOT 02 (s1)")
+    }
+    assert [(shot.id, shot.start, shot.duration) for shot in ProjectStore(tmp_path).get(
+        project.id
+    ).shots] == [("s0", 0.0, 6.0), ("s1", 6.0, 6.0), ("s2", 12.0, 12.0)]
+    assert comfy.prompts == []
+
+
+def test_snap_cuts_refuses_an_approved_shots_cuts_and_leaves_assembly_able_to_run(
+    tmp_path: Path,
+):
+    """AD-13, end to end. The approval's window snapshot must still equal the live window
+    afterwards, because that exact equality is what `assembly_refusals` reads."""
+    client, comfy, project = snap_client(
+        tmp_path,
+        spans=SNAP_SPANS,
+        shots=snap_shots(
+            status="approved", approved_output="takes/s1.mp4",
+            approved_start=6.0, approved_duration=6.0,
+        ),
+    )
+
+    response = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 1.5, "confirm_apply": True},
+    )
+
+    body = response.json()
+    assert body["moved"] == 0
+    assert {skip["reason"] for skip in body["skips"]} == {
+        SNAP_APPROVED_REFUSAL.format(shot="SHOT 02 (s1)")
+    }
+    approved = next(shot for shot in ProjectStore(tmp_path).get(project.id).shots
+                    if shot.id == "s1")
+    assert (approved.approved_start, approved.approved_duration) == (
+        approved.start, approved.duration
+    )
+    assert comfy.prompts == []
+
+
+def test_snap_cuts_refuses_the_cuts_of_a_shot_whose_render_is_in_flight(tmp_path: Path):
+    """The in-flight set is built here, from the project's own job records, through
+    `shot_render_in_flight` — the one reader of them. A second walk over `project.jobs` is the
+    guard hole this codebase keeps finding, so the route calls the existing function."""
+    client, comfy, project = snap_client(
+        tmp_path,
+        spans=SNAP_SPANS,
+        shots=snap_shots(),
+        jobs=[RenderJob(id="job_1", kind="h3", status="queued", prompt_id="p-1",
+                        target_id="s1")],
+    )
+
+    response = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 1.5, "confirm_apply": True},
+    )
+
+    body = response.json()
+    assert body["moved"] == 0
+    assert {skip["reason"] for skip in body["skips"]} == {
+        SNAP_IN_FLIGHT_REFUSAL.format(shot="SHOT 02 (s1)")
+    }
+    assert [(shot.start, shot.duration) for shot in ProjectStore(tmp_path).get(
+        project.id
+    ).shots] == [(0.0, 6.0), (6.0, 6.0), (12.0, 12.0)]
+    assert comfy.prompts == []
+
+
+def test_snap_cuts_refuses_a_song_that_has_never_been_heard(tmp_path: Path):
+    """The absent-analysis branch, as a sentence that says what to do rather than a crash or a
+    fabricated boundary. `Song.vocal_spans` empty is unmeasured, not silent."""
+    client, comfy, project = snap_client(
+        tmp_path, spans=[], shots=snap_shots()
+    )
+
+    response = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts", json={"tolerance": 1.5}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == SNAP_UNMEASURED
+    assert "Analyze structure" in response.json()["detail"]
+    # And the confirmed call is refused identically — nothing gets written by asking twice.
+    assert client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 1.5, "confirm_apply": True},
+    ).status_code == 422
+    assert comfy.prompts == []
+
+
+def test_snap_cuts_refuses_a_project_with_no_song_and_a_plan_with_no_cut(tmp_path: Path):
+    client, store, _comfy = make_client(tmp_path)
+    songless = store.create(Project(name="No song", shots=snap_shots()))
+
+    assert client.post(
+        f"/api/projects/{songless.id}/timeline/snap-cuts", json={}
+    ).json()["detail"] == SNAP_CUTS_NO_SONG
+
+    client, _comfy, single = snap_client(
+        tmp_path, spans=SNAP_SPANS, shots=[Shot(id="only", start=0.0, duration=24.0)]
+    )
+    response = client.post(f"/api/projects/{single.id}/timeline/snap-cuts", json={})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == SNAP_WITHOUT_CUTS.format(count=1)
+
+
+def test_snap_cuts_at_tolerance_zero_writes_nothing_and_says_it_is_off(tmp_path: Path):
+    """0 is admissible on the wire and is the feature switched off. A confirmed call at 0 is
+    still a no-op: there are no moves, so there is nothing to apply and nothing is saved."""
+    client, _comfy, project = snap_client(
+        tmp_path, spans=SNAP_SPANS, shots=snap_shots()
+    )
+    before = ProjectStore(tmp_path).get(project.id).model_dump(mode="json")
+
+    response = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 0, "confirm_apply": True},
+    )
+
+    body = response.json()
+    assert body["status"] == "off"
+    assert body["applied"] is False
+    assert body["project"] is None
+    assert body["moved"] == 0 and body["skipped"] == 0
+    assert body["message"] == SNAP_TOLERANCE_OFF
+    assert ProjectStore(tmp_path).get(project.id).model_dump(mode="json") == before
+
+
+def test_snap_cuts_bounds_the_tolerance_in_the_schema(tmp_path: Path):
+    """A control offering a tolerance the schema refuses is a control whose only outcome is a
+    422, so the browser's bound and this one are held together by a contract test. Here, the
+    bound itself: past `SNAP_TOLERANCE_MAX`, "snap the cut" has stopped describing what would
+    happen to the plan."""
+    client, _comfy, project = snap_client(
+        tmp_path, spans=SNAP_SPANS, shots=snap_shots()
+    )
+
+    assert client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": SNAP_TOLERANCE_MAX + 0.1},
+    ).status_code == 422
+    assert client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts", json={"tolerance": -0.1}
+    ).status_code == 422
+    # The default is the one the browser shows, and it is a real request on its own.
+    assert client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts", json={}
+    ).json()["tolerance"] == SNAP_TOLERANCE_DEFAULT
+
+
+def test_snap_cuts_refuses_a_plan_that_is_not_a_contiguous_tiling(tmp_path: Path):
+    """Two shots that do not share a boundary do not share a cut. Refused by name, and the
+    sentence points at the same defect assembly refuses the plan for."""
+    client, _comfy, project = snap_client(
+        tmp_path,
+        spans=SNAP_SPANS,
+        shots=[
+            Shot(id="s0", start=0.0, duration=6.0),
+            Shot(id="s1", start=7.0, duration=17.0),
+        ],
+    )
+
+    response = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts", json={"tolerance": 1.5}
+    )
+
+    assert response.status_code == 422
+    assert "not a contiguous tiling" in response.json()["detail"]
+    assert "SHOT 01 (s0)" in response.json()["detail"]

@@ -186,6 +186,40 @@ KEYFRAME_REFERENCE_RULES = """One or more of this shot's pictures is marked "fir
 - A picture marked "last frame" is the clip's exact closing frame. Say so in the final shot the same way: the shot ends on <Picture N>, with that picture's actual tag, and write the action converging onto that exact image.
 - Pictures marked "reference" stay ordinary references; give them no frame-anchor clause."""
 
+#: Appearance anchors — the Calliope teardown's phase 2.2, and the cheap layer under our image
+#: references. The reference sheet tells the sampler what a character looks like; nothing told
+#: the *writer*, so the prose it produced described whoever it imagined and the two fought.
+#:
+#: Appended only when this shot's payload actually carries an `anchor` on some reference
+#: (`app.attempt_expansion` reads that off `shot_expansion_input`), so a project with no stored
+#: anchors gets the byte-identical system prompt it always got — `KEYFRAME_REFERENCE_RULES`'
+#: rule, for its reason: the guidance rides exactly where the data does.
+#:
+#: **This rule lives here and in no second place, deliberately.** It is a rule about the text of
+#: the rendered prompt, and this is the only persona that writes one — `assistant_prompt.py`
+#: writes plain-prose *intent* and gets the anchor as an ordinary asset description, and
+#: `director.EXPANSION_SYSTEM_PROMPT` writes intents too. Three copies of one sentence is three
+#: places to iterate it and two places to forget.
+#:
+#: A prescription with an example rather than a prohibition, which is this machine's measured
+#: pattern three times over (2026-08-18): this model copies examples and copies the forbidden
+#: strings out of prohibitions. The one prohibition here — invent nothing — is paired with the
+#: positive instruction that replaces it, so there is somewhere for the model to go.
+#:
+#: Not measured. The wording is a first draft against no output at all; see
+#: `docs/DEVELOPMENT-LOG.md`.
+APPEARANCE_ANCHOR_RULES = """Some references carry an anchor: the director's own words for what
+that subject looks like, which outrank anything you would infer from the shot's intent.
+
+- The FIRST time a subject with an anchor is mentioned in this prompt, write its anchor with
+  it, as apposition: "MIA, a teenage girl with a chestnut ponytail and yellow rain jacket,
+  steps off the kerb". Later mentions in the same prompt use the name alone.
+- Use the anchor's own words. Do not reword it, shorten it, or improve it.
+- Never invent appearance details for anybody: no hair, no clothing, no age, no build, no face
+  that the anchor did not give you. If a subject has no anchor, describe no appearance for it
+  at all — write what it DOES and where the camera is, and let the reference picture carry what
+  it looks like. Saying nothing is correct; guessing is the failure this rule exists to stop."""
+
 #: What not to do with the output, which is a real failure mode for local models.
 OUTPUT_RULES = f"""Return only the prompt. No preamble, no explanation, no code fence, no
 commentary after it. Do not repeat the intent back. Do not write anything before
@@ -194,7 +228,10 @@ case that line comes first, followed by one blank line."""
 
 
 def system_prompt(
-    *, expect_instruction: bool = False, keyframe_references: bool = False
+    *,
+    expect_instruction: bool = False,
+    keyframe_references: bool = False,
+    appearance_anchors: bool = False,
 ) -> str:
     """Assemble the specialist's system prompt.
 
@@ -207,12 +244,19 @@ def system_prompt(
     `first` or `last` role — the keyframe-inside-references shape, and the only shape
     that gets `KEYFRAME_REFERENCE_RULES`. Passed for the same reason, and defaulting
     off so every shot without the shape gets the byte-identical prompt it always got.
+
+    ``appearance_anchors`` is for a shot whose payload actually names an anchor on one of
+    its references. Same shape, same reason, same default: a project where nobody has
+    written an anchor never sees `APPEARANCE_ANCHOR_RULES`, and its specialist prompt is
+    byte-for-byte the one it had before the field existed.
     """
     parts = [ROLE, STRUCTURE, SEMANTIC_RULES, SINGING_RULES, LYRIC_RULES, OUTPUT_RULES]
     if keyframe_references:
         # Before OUTPUT_RULES would read more naturally, but appending keeps the shared
         # prefix bytes untouched; the rules are order-independent statements either way.
         parts.append(KEYFRAME_REFERENCE_RULES)
+    if appearance_anchors:
+        parts.append(APPEARANCE_ANCHOR_RULES)
     if expect_instruction:
         parts.append(
             "This shot's mode uses keyframe references, so the prompt must open with "

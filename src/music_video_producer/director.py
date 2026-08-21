@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from base64 import b64encode
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from typing import Any, Literal
 
 import httpx
@@ -20,6 +22,11 @@ from .models import AssetRole, ShotMode, SingingState
 #: of 900 tokens thinking and returned nothing, and all 6000 of a 6000-token budget the
 #: same way. It answered cleanly at 4000 with thinking disabled.
 H3_EXPANSION_MAX_TOKENS = 4000
+
+#: The sampling temperature every planning call has always used, now named because one
+#: caller deliberately departs from it. Changing this changes the chat route too.
+PLAN_TEMPERATURE = 0.7
+
 
 class DirectorUnavailable(RuntimeError):
     pass
@@ -58,11 +65,19 @@ class PlannedShot(BaseModel):
     start: float = Field(ge=0)
     duration: float = Field(gt=0, le=30)
     prompt: str = Field(min_length=1)
-    # Whether a character sings the song on camera in this shot. Safe to ask of the model
-    # here — unlike the assistant's tool calls, this rides `response_format: json_schema
-    # strict`, where the constrained decoder *forces* every key to be emitted, so the
-    # boolean-dropout disease the fill workaround exists for cannot occur on this path
-    # (the run-2 audit's observation). Populate maps it onto `singing`/`use_song_audio`.
+    # Whether a character sings the song on camera in this shot. Populate maps it onto
+    # `singing`/`use_song_audio`.
+    #
+    # The default is `False` and that default is **not** a statement about the shot: it is
+    # what Pydantic gives a key nobody sent. The comment that used to sit here said the
+    # constrained decoder "forces every key to be emitted" and was measurably wrong — a
+    # field carrying a default is not in `required`, so the grammar never asks for it and
+    # a decoder that omits it is correct. Measured 2026-08-20, 15 rolls / 179 shots across
+    # three models: one model omitted the key on 4 of 5 rolls (every shot silently
+    # non-performance), and two set it `true` on all twelve shots of a roll — an
+    # all-or-nothing tell rather than a judgement. `director_result_schema` promotes it
+    # into `PlannedShot.required` for every caller that demands a shot list, so the model
+    # has to make the decision per shot instead of falling through this default.
     performance: bool = False
 
 
@@ -87,6 +102,184 @@ class DirectorResult(BaseModel):
     # Populated only when the caller asks for structure (Populate Timeline); the chat
     # route ignores it, and the default keeps every existing chat reply validating.
     sections: list[PlannedSection] = Field(default_factory=list)
+
+
+#: The name the planning schema goes on the wire under. One name for every variant below,
+#: because it is a label for the provider's logs and not a contract: three call sites and
+#: two tests already pin `director_result`, and renaming it per variant would make the wire
+#: shape of a *required set* look like a different kind of answer.
+DIRECTOR_RESULT_SCHEMA_NAME = "director_result"
+
+
+def _promoted(schema: dict[str, Any], require: Sequence[str]) -> list[str]:
+    """``schema``'s ``required`` list with ``require`` folded in, in *property* order.
+
+    Property order rather than call order, so a `required` list does not drift with the
+    order a caller happened to name its fields in — that would be a wire payload changing
+    for no reason. Already-required names are never duplicated.
+
+    An unknown name raises rather than being ignored. A promotion that silently does
+    nothing is precisely the failure this whole module is repairing: `shots` was asked for
+    in words for three measured runs while the grammar never mentioned it, and a typo here
+    would reproduce that shape exactly — a caller that believes it required a field, a
+    decoder that was never told, and nothing anywhere that says so.
+    """
+    properties = schema.get("properties", {})
+    unknown = sorted(name for name in require if name not in properties)
+    if unknown:
+        raise ValueError(
+            f"{schema.get('title', 'schema')} has no field(s) {', '.join(unknown)} to require"
+        )
+    already = schema.get("required", [])
+    return [name for name in properties if name in already or name in require]
+
+
+def _entry_schema(schema: dict[str, Any], prop: str) -> dict[str, Any]:
+    """The object schema of one entry of ``schema``'s ``prop`` array, resolved through `$defs`.
+
+    Raises for anything that is not an array of objects, for `_promoted`'s reason: naming a
+    scalar field here can only be a mistake, and the mistake must not present as a promotion
+    that quietly did nothing.
+    """
+    items = schema.get("properties", {}).get(prop, {}).get("items")
+    reference = items.get("$ref", "") if isinstance(items, dict) else ""
+    if not reference:
+        raise ValueError(f"{prop!r} is not an array of objects with their own schema")
+    return schema["$defs"][reference.rsplit("/", 1)[-1]]
+
+
+def constrained_schema(
+    model: type[BaseModel],
+    *,
+    require: Sequence[str] = (),
+    require_each: Mapping[str, Sequence[str]] | None = None,
+    min_items: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """``model``'s JSON schema with a caller's required set promoted into the grammar.
+
+    Every `response_format: json_schema strict` body in this module whose caller has a
+    requirement goes through here — `ShotExpansion` does not, because every field on it is
+    required already, which is what a model written without defaults gets for free, and the
+    chat route does not, because it requires nothing and its grammar must stay the model's
+    own. The reason for the rest is one root cause that has now recurred twice. A Pydantic
+    field with **any** default is absent from ``model_json_schema()["required"]``; that
+    schema is what reaches LM Studio's *constrained decoder*; so a field the caller cannot
+    proceed without is one the model is free — and correct — to omit, no matter how firmly
+    the prompt asks for it.
+    First measured on `DirectorResult.shots` (empty on 2 of 3 rolls, 0 of 17 combined asks
+    delivered both halves), then on `PlannedShot.performance` (a whole model omitting the
+    key on 4 of 5 rolls, 15 rolls / 179 shots, 2026-08-20).
+
+    Three axes, because that is what the measured call sites need and nothing more:
+
+    * ``require`` promotes top-level fields.
+    * ``require_each`` promotes fields on the *entries* of an array property —
+      ``{"shots": ("performance",)}`` — which is where a per-item decision like
+      "is this shot a performance" actually lives.
+    * ``min_items`` sets ``minItems`` on an array. Measured, not assumed: the decoder
+      honours it (twelve shots on 4 of 4 calls against ``minItems: 12``) and it is also a
+      loaded gun, because the same probe showed numeric bounds are *not* enforced — the
+      padding entries carried ``duration: 0`` and ``duration: 1200``, and 3 of those 4
+      replies failed `PlannedShot` validation whole. Length is grammar; plausibility is
+      not, and an unparseable reply is a 502 where a short one is a guided retry.
+
+    What this deliberately does **not** do is make the Pydantic field required. The wire
+    grammar and the parse contract are different questions: a provider that ignores strict
+    schemas, or the schema-free retry `_completion` falls back to, must still produce a
+    result the caller can validate. Tightening the model would turn a degraded answer into
+    an exception, which is a worse failure than the one being fixed.
+
+    The schema is deep-copied before anything is touched, so no variant can leak into the
+    next caller's — the chat route inheriting populate's grammar from whichever call ran
+    first is exactly the kind of bug this function must not introduce.
+    """
+    schema = deepcopy(model.model_json_schema())
+    schema["required"] = _promoted(schema, require)
+    for prop, fields in (require_each or {}).items():
+        if not fields:
+            continue
+        entry = _entry_schema(schema, prop)
+        entry["required"] = _promoted(entry, fields)
+    for prop, minimum in (min_items or {}).items():
+        if minimum > 0:
+            schema["properties"][prop]["minItems"] = minimum
+    return schema
+
+
+#: The per-shot decision a caller that demands a shot list also demands *per shot*.
+#:
+#: Tied to `shots` being required rather than exposed as its own parameter, because the two
+#: are one question: the only caller that cannot proceed without a shot list is Populate,
+#: and Populate maps `performance` onto `singing` for every shot it writes. A caller that is
+#: merely *offered* shots — the chat route — is offered them with `performance` optional,
+#: exactly as it always was.
+PLANNED_SHOT_DECISIONS = ("performance",)
+
+#: The same, one level down, for a section: `prompt` is the section's shared visual look,
+#: which both populate instructions ask for in words ("a one-sentence shared visual prompt")
+#: and which `PlannedSection.prompt = ""` kept out of the grammar. An omitted one lands as a
+#: section box with no look, and the look is what the shots inside it are told to carry.
+PLANNED_SECTION_DECISIONS = ("prompt",)
+
+
+def director_result_schema(
+    *, require: Sequence[str] = (), min_shots: int = 0
+) -> dict[str, Any]:
+    """`DirectorResult`'s JSON schema with ``require`` promoted into ``required``.
+
+    This exists because of a measured, three-run failure that nobody's prompt wording could
+    have fixed. `shots` and `sections` both carry ``default_factory=list``, so Pydantic does
+    not mark them required, so ``model_json_schema()["required"]`` is
+    ``["message", "treatment", "style_bible"]`` — and that schema is what rides
+    ``response_format: json_schema strict`` to LM Studio's constrained decoder. A reply
+    containing no ``shots`` at all was therefore *correct* against the grammar it was
+    decoded under. Populate measured `shots: []` on 1 of 3 single-call rolls (run 2), both
+    halves delivered on 0 of 9 rolls across two runs, and 8 of 8 empty on a second model.
+    The schema never asked for the field.
+
+    A builder rather than a second `BaseModel`, and the reason is that the two populate
+    stages want **different** required sets: the structure stage cannot proceed without
+    `sections` and must not be forced to invent shots, and the shots stage is the exact
+    mirror. Dedicated models would mean one subclass per required set — each re-declaring
+    fields whose only difference is a default — and the parse target would still be
+    `DirectorResult`, because that is what the route validates and merges. Deriving from
+    `model_json_schema()` also means a field added to `DirectorResult` reaches the wire
+    without anyone editing a hand-written schema, which is the failure this whole function
+    is repairing in a different guise.
+
+    What must **not** happen here is `DirectorResult.shots` becoming required globally. The
+    chat route (`plan`'s default) shares this model, and a Director asking a question has
+    every right to an answer with no shot list; forcing one would be a worse bug than the
+    one being fixed. So the default of ``require`` is empty and the default schema is
+    byte-identical to what has always been sent.
+
+    ``min_shots`` sets ``minItems`` on the shots array. Measured against LM Studio on
+    2026-08-20, not assumed: the constrained decoder **honours it** — a request asking in
+    words for two shots against ``minItems: 12`` came back with twelve on 4 of 4 calls. It
+    is a real count guarantee and it is also a loaded gun, because the same probe showed the
+    decoder does *not* enforce numeric bounds (`exclusiveMinimum`, `maximum`): the padding
+    entries carried ``duration: 0`` and ``duration: 1200``, and **3 of those 4 replies
+    failed `PlannedShot` validation whole**. Length is grammar; plausibility is not, and an
+    unparseable reply is a 502 where a short one is a guided retry. Left at 0 by default for
+    that reason, and callers that set it are choosing a hard floor over a parseable answer.
+
+    Requiring `shots` or `sections` also requires the *per-entry* decisions on them
+    (`PLANNED_SHOT_DECISIONS`, `PLANNED_SECTION_DECISIONS`), because the same hole runs one
+    level down and was found there on 2026-08-20: `PlannedShot.performance` and
+    `PlannedSection.prompt` both carry defaults, so both were absent from their entry
+    schema's ``required``, so both were asked for in the instruction and never in the
+    grammar. The chat route requires neither array and is therefore byte-identical to what
+    it has always sent, entries included.
+    """
+    return constrained_schema(
+        DirectorResult,
+        require=require,
+        require_each={
+            "shots": PLANNED_SHOT_DECISIONS if "shots" in require else (),
+            "sections": PLANNED_SECTION_DECISIONS if "sections" in require else (),
+        },
+        min_items={"shots": min_shots},
+    )
 
 
 class ExpandedShot(BaseModel):
@@ -520,6 +713,71 @@ def document_rejection(candidate: str, existing: str) -> str:
     return ""
 
 
+#: One fenced block of a markdown reply, with its optional language tag dropped and its closing
+#: fence optional — a reply that was cut off mid-fence still has usable content in front of the
+#: truncation. Non-greedy, so the *first* complete block is matched rather than everything
+#: between the first fence and the last one.
+_CODE_FENCE = re.compile(r"```[A-Za-z0-9_+.-]*[ \t]*\r?\n?(.*?)(?:```|\Z)", re.DOTALL)
+
+
+def extract_json(text: str) -> Any:
+    """Decode the JSON value in one model reply, which is not always the whole reply.
+
+    A ladder, tried in order, because each rung costs something the rung above it does not and
+    only the first rung is what a well-behaved provider needs:
+
+    1. ``json.loads`` on the stripped text. This is the happy path and it is byte-identical to
+       what this module did before the ladder existed: a reply that is exactly one JSON object —
+       which is what `response_format: json_schema strict` produces — never reaches rung 2.
+    2. The contents of a markdown code fence. Tried *before* the scan below and not merely
+       instead of it: when a model writes prose that quotes a JSON fragment and then answers
+       inside a fence, the fence is the only thing that says which of the two is the answer.
+    3. A balanced scan. `json.JSONDecoder().raw_decode` is pointed at each ``{`` and ``[`` in
+       turn and the first offset that decodes wins. It is a real parser, so a brace inside a
+       string value — an H3 prompt is full of them — cannot end the value early, and chatter on
+       either side of the object is simply not part of what it consumed.
+
+    Rung 3 is the one the recorded 2026-08-19 regression needs. `enable_thinking: false` stopped
+    taking effect that day and the loaded model began reasoning *in `message.content`* before
+    answering, so the payload is ``<paragraphs of reasoning> {"real": "json"}`` and `json.loads`
+    refuses the whole string over chatter that is sitting beside a perfectly good object.
+
+    Nothing decodes and the first failure is re-raised unchanged: callers catch
+    `json.JSONDecodeError`/`ValueError` and translate it into a `DirectorError`, and inventing a
+    new message here would only make a genuinely unparseable reply report itself differently.
+    Pure and I/O-free.
+    """
+    if not isinstance(text, str):
+        # `_content` already refuses non-strings for its own documented reason; this is here so
+        # that a *different* caller cannot turn one into an `AttributeError` on `.strip()`, which
+        # is outside every caught tuple. `TypeError` is inside all of them.
+        raise TypeError("the reply carried no message content")
+
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except ValueError as error:
+        first_failure = error
+
+    for fenced in _CODE_FENCE.findall(stripped):
+        try:
+            return json.loads(fenced.strip())
+        except ValueError:
+            continue
+
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(stripped):
+        if character not in "{[":
+            continue
+        try:
+            value, _end = decoder.raw_decode(stripped, index)
+        except ValueError:
+            continue
+        return value
+
+    raise first_failure
+
+
 class DirectorClient:
     def __init__(
         self,
@@ -559,6 +817,13 @@ class DirectorClient:
         """
         return self._in_flight > 0
 
+    @staticmethod
+    def _is_unloaded_model(response: httpx.Response) -> bool:
+        """True for the one 400 whose cause LM Studio names: the configured id is not loaded."""
+        return response.status_code == 400 and (
+            "Failed to load model" in response.text or "Model is unloaded" in response.text
+        )
+
     async def _completion(
         self, *, body: dict[str, Any], headers: dict[str, str]
     ) -> httpx.Response:
@@ -572,7 +837,19 @@ class DirectorClient:
         `body` is copied rather than mutated for the retry, so a caller's request body is not
         silently rewritten to an instance id that will not exist on the next call.
 
-        The whole method is counted as in-flight, retry included, because `busy` exists to
+        A second, independent fallback follows it: an *unexplained* 400 against a body that
+        carried `response_format` is retried once with that key removed. Some
+        OpenAI-compatible servers reject the key outright, and a request the server will not
+        even accept is worth one schema-free attempt — `extract_json` is what makes the
+        unconstrained reply usable. It is a fallback and never the default: the strict
+        `json_schema` reaches LM Studio's constrained decoder, which is stronger than anything
+        parsing can recover, and dropping it by choice would give that up on the setup this
+        project actually runs on. "Unexplained" is load-bearing: a 400 that already said
+        "Model is unloaded" has a known cause that has just been handled, so re-sending it
+        without the schema would be a third request that fails for the reason the second one
+        did — and would bury the provider's own refusal under a different one.
+
+        The whole method is counted as in-flight, retries included, because `busy` exists to
         keep the VRAM eject away from a live call — and the retry is when the call is at its
         most fragile. `finally` rather than a decrement on the happy path: an exception that
         left the counter raised would wedge the eject off permanently for the life of the
@@ -580,12 +857,11 @@ class DirectorClient:
         """
         self._in_flight += 1
         try:
+            sent = body
             response = await self._client.post(
-                f"{self.base_url}/chat/completions", headers=headers, json=body
+                f"{self.base_url}/chat/completions", headers=headers, json=sent
             )
-            if response.status_code == 400 and (
-                "Failed to load model" in response.text or "Model is unloaded" in response.text
-            ):
+            if self._is_unloaded_model(response):
                 models = await self._client.get(f"{self.base_url}/models", headers=headers)
                 models.raise_for_status()
                 # Shape-checked rather than assumed. `/models` is whatever the configured
@@ -606,11 +882,21 @@ class DirectorClient:
                     "",
                 )
                 if loaded:
+                    # Carried forward rather than discarded, so the schema-free retry below —
+                    # if it is needed at all — still addresses the loaded instance.
+                    sent = {**sent, "model": loaded}
                     response = await self._client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json={**body, "model": loaded},
+                        f"{self.base_url}/chat/completions", headers=headers, json=sent
                     )
+            if (
+                response.status_code == 400
+                and "response_format" in sent
+                and not self._is_unloaded_model(response)
+            ):
+                sent = {key: value for key, value in sent.items() if key != "response_format"}
+                response = await self._client.post(
+                    f"{self.base_url}/chat/completions", headers=headers, json=sent
+                )
             return response
         finally:
             self._in_flight -= 1
@@ -639,7 +925,29 @@ class DirectorClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    async def plan(self, *, message: str, project_context: dict[str, Any]) -> DirectorResult:
+    async def plan(
+        self,
+        *,
+        message: str,
+        project_context: dict[str, Any],
+        temperature: float = PLAN_TEMPERATURE,
+        response_schema: dict[str, Any] | None = None,
+    ) -> DirectorResult:
+        """One planning call. `temperature` is a parameter rather than a constant because a
+        *guided retry* is a different kind of ask than a first attempt: the caller has
+        already told the model exactly what was wrong, so sampling variety is no longer the
+        point and obedience is. Populate Timeline lowers it on its one retry; every other
+        caller takes the default and is byte-identical to what it always sent.
+
+        `response_schema` is the same idea one level down: the strict schema reaches LM
+        Studio's *constrained decoder*, so which fields it marks required decides what the
+        model is physically able to emit — not what it is asked for. `None` sends
+        `DirectorResult`'s own schema, which requires neither `shots` nor `sections` and is
+        exactly right for the chat route, where a Director's question deserves an answer
+        without an invented shot list. Callers that cannot proceed without a field pass
+        `director_result_schema(require=...)`; see its docstring for the measurement.
+        Whatever the schema demands, the reply is still validated as a `DirectorResult`, so
+        a caller never has to handle a second result type."""
         if not self.base_url or not self.model:
             raise DirectorUnavailable(
                 "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
@@ -656,19 +964,23 @@ class DirectorClient:
                     ),
                 },
             ],
-            "temperature": 0.7,
+            "temperature": temperature,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "director_result",
+                    "name": DIRECTOR_RESULT_SCHEMA_NAME,
                     "strict": True,
-                    "schema": DirectorResult.model_json_schema(),
+                    "schema": (
+                        DirectorResult.model_json_schema()
+                        if response_schema is None
+                        else response_schema
+                    ),
                 },
             },
         }
         try:
             response = await self._completion(body=body, headers=headers)
-            return DirectorResult.model_validate(json.loads(self._content(response)))
+            return DirectorResult.model_validate(extract_json(self._content(response)))
         except (
             httpx.HTTPError,
             KeyError,
@@ -718,13 +1030,19 @@ class DirectorClient:
                 "json_schema": {
                     "name": "stage_manager_result",
                     "strict": True,
-                    "schema": StageManagerResult.model_json_schema(),
+                    # `assets` is the entire answer — an empty one is a 502 at the route —
+                    # and `default_factory=list` kept it out of `required`, which is the
+                    # `shots` hole in a second schema. The words above ask for proposals;
+                    # this is the grammar agreeing with them.
+                    "schema": constrained_schema(
+                        StageManagerResult, require=("assets",)
+                    ),
                 },
             },
         }
         try:
             response = await self._completion(body=body, headers=headers)
-            return StageManagerResult.model_validate(json.loads(self._content(response)))
+            return StageManagerResult.model_validate(extract_json(self._content(response)))
         except (
             httpx.HTTPError,
             KeyError,
@@ -776,7 +1094,7 @@ class DirectorClient:
         }
         try:
             response = await self._completion(body=body, headers=headers)
-            return ShotExpansion.model_validate(json.loads(self._content(response)))
+            return ShotExpansion.model_validate(extract_json(self._content(response)))
         except (
             httpx.HTTPError,
             KeyError,
@@ -996,13 +1314,30 @@ class DirectorClient:
                 "json_schema": {
                     "name": "vision_inspection",
                     "strict": True,
-                    "schema": VisionInspection.model_json_schema(),
+                    # Every observation list is named in the system prompt above and every
+                    # one of them carried `default_factory=list`, so the grammar asked for
+                    # none of them: an inspection that never considered risks recorded
+                    # itself as an inspection that found none, and the inspector panel
+                    # renders that as "Risks: None". Requiring the keys costs an empty
+                    # array on the wire and buys the difference between "looked, nothing
+                    # there" and "never looked". The lists may still be empty — that is a
+                    # finding; silence is not.
+                    "schema": constrained_schema(
+                        VisionInspection,
+                        require=(
+                            "identity",
+                            "environment",
+                            "continuity_cues",
+                            "prompt_cues",
+                            "risks",
+                        ),
+                    ),
                 },
             },
         }
         try:
             response = await self._completion(body=body, headers=headers)
-            return VisionInspection.model_validate(json.loads(self._content(response)))
+            return VisionInspection.model_validate(extract_json(self._content(response)))
         except (
             httpx.HTTPError,
             KeyError,

@@ -18,11 +18,12 @@ dependency runs one way so the window math stays a pure leaf.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .comfy import ComfyError, HistoryResult
 from .models import Project, RenderJob, Shot, ShotStatus, shot_label
@@ -37,6 +38,7 @@ __all__ = [
     "PLACEHOLDER_PROMPT",
     "READINESS_REFUSAL",
     "TERMINAL_JOB_STATUSES",
+    "JobProgress",
     "ReadinessNote",
     "ReadinessReport",
     "RenderReconciliation",
@@ -51,6 +53,7 @@ __all__ = [
     "reconcile_render_jobs",
     "render_status_report",
     "shot_label",
+    "supersede_target_jobs",
 ]
 
 #: Token overlap above which two prompts are reported as lacking variance. Jaccard —
@@ -568,6 +571,69 @@ async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconcili
     return RenderReconciliation(changed=changed, comfy_online=True)
 
 
+#: What a leftover job record says once a newer render has taken its target. Written as what
+#: happened to the *record*, not as a claim about ComfyUI: nothing here interrupts a prompt —
+#: ComfyUI is user-managed — so an older prompt already executing goes on executing, and its
+#: file lands beside the new one under the same prefix. The record keeps its `prompt_id` so
+#: that file is still traceable; what it loses is the ability to write itself onto the target.
+JOB_SUPERSEDED = (
+    "Superseded by a newer render for the same target. This record was still open when the "
+    "newer job was accepted, so nothing would ever have settled it — and a late answer to it "
+    "would have overwritten the newer render's result. Watch the newer job instead."
+)
+
+
+def supersede_target_jobs(
+    project: Project, *, kinds: frozenset[str] | set[str], target_id: str, keep_job_id: str
+) -> list[RenderJob]:
+    """Settle every unsettled job of these kinds already pointing at ``target_id``.
+
+    Job-record hygiene for the states that get *past* the routes' in-flight refusals, and
+    deliberately not a second opinion about whether a submission is allowed: every 409 stays
+    exactly where it is, and this runs only after one has already been passed and a new job
+    accepted. Today `generate_h3` is the one caller, because it is the one submission route
+    whose per-target guard is a *Shot status* — which a whole-manifest write can walk
+    backwards underneath a live job — rather than a read of the job records themselves.
+
+    Two live records for one target is not a cosmetic untidiness. The older one is
+    non-terminal, so `reconcilable_jobs` keeps reporting the project active and every gate
+    that counts open renders — assembly, asset fill — keeps refusing; and if its prompt does
+    answer later, `apply_job_history` adopts that answer onto the same target, moving
+    `latest_output` back to the older take and dropping the newer take's `latest_review`
+    with it. Settling the record closes both.
+
+    ``cancelled`` rather than a status of its own: it is already terminal on both sides of the
+    transport (`TERMINAL_JOB_STATUSES`, and `api.js`'s mirror of it), so the poll releases and
+    the queue panel renders it with no client change at all. `superseded_by` is what keeps it
+    distinguishable from a hand cancellation afterwards. `missing_ticks` is zeroed because the
+    counter only ever meant "how close is this to being settled", and it is settled.
+
+    **The stated cost.** A settled record is never reconciled again, so if its prompt was
+    still executing on ComfyUI its `output_files` stays empty: the file lands on disk under
+    the shot's own prefix but is not listed on the record, and the takes strip — which reads
+    `output_files` — will not show it. That is why this is not applied to the music routes,
+    where an older job's `output_files` is the only place an orphaned take is recoverable
+    from and where the newer result is already protected by `Song.prompt_id`. Nothing here
+    interrupts ComfyUI to make the cost go away; ComfyUI is user-managed.
+
+    Returns the records it changed, so a caller can report or log them; the caller saves.
+    """
+    superseded: list[RenderJob] = []
+    for job in project.jobs:
+        if (
+            job.id != keep_job_id
+            and job.kind in kinds
+            and job.target_id == target_id
+            and job.status not in TERMINAL_JOB_STATUSES
+        ):
+            job.status = "cancelled"
+            job.error = JOB_SUPERSEDED
+            job.superseded_by = keep_job_id
+            job.missing_ticks = 0
+            superseded.append(job)
+    return superseded
+
+
 class ShotRenderState(BaseModel):
     """One Shot's render-facing facts — the fields a completion moves, and nothing else.
 
@@ -601,6 +667,26 @@ class SongRenderState(BaseModel):
     prompt_id: str = ""
 
 
+class JobProgress(BaseModel):
+    """How far one open ComfyUI render has got, as a percentage nobody stored.
+
+    A row exists **only** when ComfyUI has actually said something about that prompt on its
+    WebSocket. Absence is the answer for "unknown" — a socket that never connected, a prompt
+    still waiting its turn in the queue, a build whose messages `comfy.progress_from_message`
+    does not recognise — and `percent: 0` is the different, real answer "this render has
+    started and no step of it is done yet". Neither is ever invented: an interpolated number
+    on a render that is actually stuck is worse than no number at all, which is the same
+    reason `timeline.song_section` returns nothing rather than guessing a section.
+
+    `prompt_id` rides along because it is the *only* thing attribution is done by; `job_id` is
+    what the browser joins on, since that is what its own job list is keyed by.
+    """
+
+    job_id: str
+    prompt_id: str
+    percent: int = Field(ge=0, le=100)
+
+
 class RenderStatusReport(BaseModel):
     """AD-1's fixed poll answer: the jobs, plus the states their completions move.
 
@@ -608,6 +694,12 @@ class RenderStatusReport(BaseModel):
     if it is true. `comfy_online` is the degraded-tick flag; the jobs and states alongside it
     are then simply the project as last known, so a ComfyUI restart never blanks a queue
     panel that was painted from real answers.
+
+    `progress` is the one field here that is not read off the manifest, because it is the one
+    fact that must never be written to it: see `JobProgress` and `comfy.ProgressTracker`. It
+    rides this existing poll rather than a route or a socket of its own — the browser already
+    asks this question every two seconds while, and only while, a render is open, so live
+    percentages cost exactly zero additional requests and an idle project still makes none.
     """
 
     active: bool
@@ -616,16 +708,35 @@ class RenderStatusReport(BaseModel):
     shots: list[ShotRenderState]
     assets: list[AssetRenderState]
     song: SongRenderState | None = None
+    progress: list[JobProgress] = Field(default_factory=list)
 
 
 def render_status_report(
-    project: Project, *, comfy_online: bool = True
+    project: Project, *, comfy_online: bool = True, progress: Mapping[str, int] | None = None
 ) -> RenderStatusReport:
-    """The poll answer for this project as it stands. Pure — reconcile first, then report."""
+    """The poll answer for this project as it stands. Pure — reconcile first, then report.
+
+    `progress` is the live `prompt_id → percent` map the WebSocket listener holds in memory,
+    passed in rather than read from a module global so this stays a pure function of its
+    arguments. Only *open* jobs are reported: a settled job's leftover percentage would
+    contradict its own terminal status, and a percentage for a prompt this project never
+    submitted belongs to somebody else's render.
+    """
+    live = progress or {}
+    reported: list[JobProgress] = []
+    for job in reconcilable_jobs(project):
+        percent = live.get(job.prompt_id)
+        if job.prompt_id and percent is not None:
+            reported.append(
+                JobProgress(
+                    job_id=job.id, prompt_id=job.prompt_id, percent=max(0, min(100, percent))
+                )
+            )
     return RenderStatusReport(
         active=bool(reconcilable_jobs(project)),
         comfy_online=comfy_online,
         jobs=project.jobs,
+        progress=reported,
         shots=[
             ShotRenderState(
                 shot_id=shot.id, status=shot.status, latest_output=shot.latest_output

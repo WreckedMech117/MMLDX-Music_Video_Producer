@@ -1,5 +1,6 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, RESUBMIT_SEED_STRIDE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
-import { ASSEMBLE_RUNNING, assemblyControl, effectiveOffset, latestAssemblyExport, monitorState, takeAudioControl, trimNudgeControl } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, RESUBMIT_SEED_STRIDE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
+import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -21,6 +22,16 @@ let waveformLoadRevision = 0;
 // data: it is derived, never saved, and never sent back.
 let readinessReport = null;
 let readinessLoadRevision = 0;
+// Snap cuts to phrase boundaries: the tolerance box, the two-stage button and the server's own
+// report. Module state for `readinessReport`'s reason -- derived, never saved, never sent back --
+// and declared up here beside it because `loadProject` clears it, which is far above the render
+// that draws it. `snapReport` is the last report the server answered with, and holding it is what
+// makes the control two-stage: while it is set and holds moves, the same button applies rather
+// than re-reports. It is cleared by a project load, by a tolerance change (the report answered a
+// different question) and by the apply that consumes it.
+let snapToleranceSeconds = SNAP_TOLERANCE_DEFAULT;
+let snapReport = null;
+let snapInFlight = false;
 // The last H3 expansion this client was refused, as `{shotId, problems, prompt}`, or null. Held
 // here for `readinessReport`'s reason -- it is derived, never saved and never sent back -- and
 // keyed to its shot, because a report drawn under a different shot's intent would be a false claim
@@ -195,6 +206,16 @@ async function loadProject(id) {
   // name would name Shots that are not on screen and count a plan nobody is looking at.
   readinessReport = null;
   readinessLoadRevision += 1;
+  // The snap report describes one plan at one tolerance, so it belongs to the project being
+  // left for exactly readiness' reason: an apply offered under another project's name would
+  // write windows onto shots nobody was looking at. Cleared on every load, refresh included --
+  // a refresh means the plan changed, and a report about the plan before it is stale.
+  snapReport = null;
+  // Live percentages belong to the project being left, for readiness' reason exactly: they are
+  // keyed by target id, and a number drawn under another project's name would be a claim about a
+  // render nobody is looking at. Cleared on every load, refresh included -- the next poll answer
+  // rebuilds it whole, and until then the surfaces show what they show with nothing known.
+  state.renderProgress = {};
   // Ahead of the no-project branch too, and for the same reason: the Song context editors are
   // seeded from the project on screen, so a sheet left dirty from the project being left would
   // otherwise stay in the boxes under the next project's name -- or under no project at all.
@@ -652,7 +673,16 @@ function renderAssets() {
   } else {
     grid.innerHTML = filtered.map((asset) => {
       const url = assetImageUrl(asset);
-      return `<button class="asset-card ${asset.id === state.selectedAssetId ? "selected" : ""}" data-asset-id="${asset.id}" draggable="true"><div class="asset-thumb">${url ? `<img src="${url}" alt="">` : asset.prompt_id ? "RENDERING" : "NO PREVIEW"}</div><footer><strong>${escapeHtml(asset.name)}</strong><span>${asset.kind} · ${asset.source}</span></footer></button>`;
+      // How far the Flux / multiview / AI-Mod render on this card has got, when ComfyUI has
+      // said. `renderingFlag` composes with the RENDERING word rather than replacing it, and
+      // returns that word alone when nothing is known -- so a card with no progress socket
+      // reads exactly as it read before. The percentage is text, never a bar or a hue: this
+      // stylesheet's rule is that colour is never the only signal, and the same rule refuses
+      // a signal that is only a shape.
+      const thumb = url
+        ? `<img src="${url}" alt="">`
+        : asset.prompt_id ? escapeHtml(renderingFlag(state.renderProgress?.[asset.id])) : "NO PREVIEW";
+      return `<button class="asset-card ${asset.id === state.selectedAssetId ? "selected" : ""}" data-asset-id="${asset.id}" draggable="true"><div class="asset-thumb">${thumb}</div><footer><strong>${escapeHtml(asset.name)}</strong><span>${asset.kind} · ${asset.source}</span></footer></button>`;
     }).join("");
   }
   $$(".asset-card", grid).forEach((card) => {
@@ -717,7 +747,13 @@ export function renderAssetInspector() {
   // AI Mod, decided by `aiModPlan` (contract-tested) exactly as promotion is decided by
   // `multiviewPlan`: shown for anything image-kinded, shut until the image exists.
   const mod = aiModPlan(asset);
-  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button><button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>`;
+  // The appearance anchor, decided by `consistencyAnchorPlan` (contract-tested) the same way
+  // the two buttons above are decided by their own pure functions. Drawn ABOVE the read-only
+  // generation prompt deliberately: the anchor outranks it everywhere both are consumed, and
+  // a screen that puts the machine's text first teaches the opposite.
+  const anchor = consistencyAnchorPlan(asset);
+  const anchorHtml = anchor ? `<label>${escapeHtml(CONSISTENCY_PROMPT_LABEL)}<textarea id="asset-anchor" rows="3" placeholder="a woman in a red leather jacket and black boots">${escapeHtml(anchor.stored)}</textarea></label><p class="field-help">${escapeHtml(CONSISTENCY_PROMPT_HELP)}</p><div class="field-foot"><span id="asset-anchor-count" class="field-count${anchor.over ? " over" : ""}">${escapeHtml(anchor.count)}</span><button class="quiet-button" id="save-asset-anchor" ${anchor.savable ? "" : "disabled"}>Save anchor</button></div>` : "";
+  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${anchorHtml}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button><button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>`;
   $("#attach-asset")?.addEventListener("click", attachSelectedAsset);
   $("#delete-asset")?.addEventListener("click", async () => {
     if (!window.confirm(`Delete ${asset.name} from the library?`)) return;
@@ -726,6 +762,30 @@ export function renderAssetInspector() {
       state.selectedAssetId = null;
       renderAssets();
       toast(`${asset.name} deleted`);
+    } catch (error) { toast(error.message, "error"); }
+  });
+  // The anchor box carries no `maxlength`, on the song context's recorded reasoning: a
+  // maxlength truncates an oversized paste in the browser and drops the tail with no message,
+  // while the identical text sent to the route comes back as a 422 naming its length. The
+  // count and the route's refusal are the only two things that speak about the bound, and
+  // `consistencyAnchorPlan` is what makes them say the same thing.
+  //
+  // Typing repaints the count and the button and nothing else — `renderAssets()` here would
+  // rebuild the inspector and throw away what is being typed.
+  $("#asset-anchor")?.addEventListener("input", () => {
+    const typed = consistencyAnchorPlan(asset, $("#asset-anchor").value);
+    const count = $("#asset-anchor-count");
+    count.textContent = typed.count;
+    count.classList.toggle("over", typed.over);
+    $("#save-asset-anchor").disabled = !typed.savable;
+  });
+  $("#save-asset-anchor")?.addEventListener("click", async () => {
+    const typed = consistencyAnchorPlan(asset, $("#asset-anchor").value);
+    if (!typed.savable) return;
+    try {
+      state.project = await api.saveConsistencyPrompt(state.project.id, asset.id, typed.draft.trim());
+      renderAssets();
+      toast(typed.draft.trim() ? `Appearance anchor saved for ${asset.name}` : `Appearance anchor cleared for ${asset.name}`);
     } catch (error) { toast(error.message, "error"); }
   });
   $("#create-multiview")?.addEventListener("click", createMultiview);
@@ -885,14 +945,31 @@ function renderTimeline() {
     [...(state.project?.shots || [])].sort((a, b) => a.start - b.start).map((shot, rank) => [shot.id, rank + 1])
   );
   track.innerHTML = (state.project?.shots || []).map((shot) => {
-    const cell = shotPromptCell(shot);
+    // The live percentage for this shot's H3 render, or nothing at all. It reaches three of the
+    // clip's signals -- the RENDERING word, the title, and the accessible name -- and reaches
+    // none of them when it is unknown, which is what keeps a socketless render's clip identical
+    // to the one this file drew yesterday.
+    const percent = state.renderProgress?.[shot.id];
+    const cell = shotPromptCell(shot, percent);
+    // Render state in words on the clip itself, applied and never re-decided here. The status
+    // classes below are a border hue, and a hue is not a signal on its own -- this stylesheet
+    // says so about every other state it draws. `RENDERING` is the word; `cell.label` already
+    // carries the sentence, so the accessible name says it too, which is the only one of the
+    // three a screen reader announces.
+    //
+    // `render.flag` is still the gate -- a clip with no render in flight carries no state span,
+    // exactly as before -- and `renderingFlag` writes the word, which is the same
+    // `SHOT_RENDERING_FLAG` constant `shotRenderState` puts in `render.flag`, with the live
+    // percentage appended when there is one.
+    const render = shotRenderState(shot);
     const marks = [
       `status-${shot.status || "draft"}`,
       shot.approved_output || shot.status === "approved" ? "approved" : "",
       shot.flagged ? "flagged" : "",
       shot.locked ? "locked" : "",
+      render.inFlight ? "rendering" : "",
     ].filter(Boolean).join(" ");
-    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(cell.label)}" aria-label="${escapeHtml(cell.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span><span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
+    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(cell.label)}" aria-label="${escapeHtml(cell.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
   }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
@@ -925,16 +1002,122 @@ function renderTimeline() {
       `<span class="vocal-span" style="left:${from * state.pixelsPerSecond}px;width:${Math.max(2, (to - from) * state.pixelsPerSecond)}px"></span>`
     ).join("");
   }
+  renderSnapCuts();
   renderAssembly();
   updateTimelinePlayhead();
+}
+
+// Exported for the executed frontend contract, `renderSong`'s reason exactly: a source read of
+// this function would pass just as happily if nothing ever called it, and the guarantees that
+// matter here -- that the report is drawn in full, and that the button turns into an apply only
+// once a report holding moves exists -- are properties of the markup it produces.
+export function renderSnapCuts() {
+  const bar = $("#snap-bar");
+  if (!bar) return;
+  if (!state.project) { bar.innerHTML = ""; snapReport = null; return; }
+  const control = snapCutsControl(state.project, snapToleranceSeconds, snapReport);
+  const disabled = control.disabled || snapInFlight;
+  const label = snapInFlight ? SNAP_CUTS_RUNNING : control.label;
+  const tolerance = `<label class="snap-tolerance" title="${escapeHtml(SNAP_CUTS_TOLERANCE_HELP)}">${escapeHtml(SNAP_CUTS_TOLERANCE_LABEL)} <input type="number" id="snap-tolerance" value="${snapToleranceSeconds}" min="0" max="${SNAP_TOLERANCE_MAX}" step="${SNAP_TOLERANCE_STEP}" ${snapInFlight ? "disabled" : ""}> s</label>`;
+  // Every line, both lists, nothing summarised: the skip reasons are the server's own sentences
+  // and they are the half of this feature a Director has to be able to read.
+  const lines = snapCutsReportLines(snapReport);
+  const moved = lines.filter((line) => line.kind === "move");
+  const stayed = lines.filter((line) => line.kind === "skip");
+  const section = (heading, rows) => rows.length
+    ? `<div class="snap-heading">${escapeHtml(heading)} (${rows.length})</div>` +
+      rows.map((row) => `<div class="snap-${row.kind}">${escapeHtml(row.text)}</div>`).join("")
+    : "";
+  const report = snapReport
+    ? `<div class="snap-report">${section(SNAP_CUTS_MOVED_HEADING, moved)}${section(SNAP_CUTS_SKIPPED_HEADING, stayed)}</div>`
+    : "";
+  const dismiss = snapReport
+    ? `<button class="quiet-button" id="snap-dismiss" ${snapInFlight ? "disabled" : ""}>${escapeHtml(SNAP_CUTS_DISMISS_LABEL)}</button>`
+    : "";
+  bar.innerHTML = `<div class="snap-controls"><span class="eyebrow">Cuts</span>${tolerance}<button class="quiet-button" id="snap-cuts" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button>${dismiss}<span class="snap-reason">${escapeHtml(control.reason)}</span></div>${report}`;
+  const box = $("#snap-tolerance", bar);
+  if (box) {
+    box.addEventListener("change", (event) => {
+      snapToleranceSeconds = snapTolerance(event.currentTarget.value);
+      // The report answered the old question. Keeping it on screen beside a new tolerance
+      // would offer an apply for moves nobody asked for at this setting.
+      snapReport = null;
+      renderSnapCuts();
+    });
+  }
+  const discard = $("#snap-dismiss", bar);
+  if (discard) discard.addEventListener("click", () => { snapReport = null; renderSnapCuts(); });
+  const button = $("#snap-cuts", bar);
+  if (button) button.addEventListener("click", () => runSnapCuts(control.apply));
+}
+
+// One click. `apply` false fetches a report and writes nothing -- the route refuses to save
+// without the flag, so the two-stage shape is the server's rule and not this function's manners.
+async function runSnapCuts(apply) {
+  if (snapInFlight || !state.project) return;
+  const projectId = state.project.id;
+  const tolerance = snapToleranceSeconds;
+  snapInFlight = true;
+  renderSnapCuts();
+  try {
+    const report = await api.snapCuts(projectId, tolerance, apply);
+    if (state.project?.id !== projectId) return;
+    if (report.applied && report.project) {
+      state.project = report.project;
+      snapReport = null;
+      renderAll();
+      toast(SNAP_CUTS_APPLIED_TOAST.replace("{moved}", String(report.moved)).replace("{skipped}", String(report.skipped)));
+      return;
+    }
+    snapReport = report;
+  } catch (error) {
+    snapReport = null;
+    toast(String(error?.message || error), "error");
+  } finally {
+    snapInFlight = false;
+    if (state.project?.id === projectId) renderSnapCuts();
+  }
 }
 
 // Whether an assemble request is currently open, and the last multi-line refusal the server
 // answered one with. Both module state for `readinessReport`'s reason -- derived, never saved,
 // never sent back -- and the report is cleared by the next attempt or a successful export,
 // because the plan it described stops being the plan on screen.
+// The chosen export preset is module state for the same reason: it is a property of the click
+// about to happen, not of the project, and nothing on the server remembers it between exports.
+// It resets to the default on reload, which is the safe direction -- `draft` is what the button
+// has always produced.
 let assemblyInFlight = false;
 let assemblyRefusalReport = "";
+let assemblyPreset = EXPORT_PRESET_DEFAULT;
+let assemblyPercent = null;
+let assemblyProgressTimer = 0;
+
+// The assemble request is synchronous and can be held open for minutes, and the AD-1 poll
+// deliberately never fetches during it (a local job has no prompt id, so there is nothing on
+// ComfyUI to reconcile). This is the one tick that reads the job's own `progress`, and it
+// exists only while the request is open: started by the click, cleared in the same `finally`.
+function watchAssemblyProgress(projectId) {
+  if (assemblyProgressTimer) return;
+  assemblyProgressTimer = setInterval(async () => {
+    try {
+      const fresh = await api.project(projectId);
+      const percent = assemblyProgress(fresh);
+      if (percent === null || percent === assemblyPercent) return;
+      assemblyPercent = percent;
+      renderAssembly();
+    } catch {
+      // A failed tick is not an assembly failure -- the request itself is the answer, and a
+      // bar that cannot refresh is worth strictly less than an export that is still running.
+    }
+  }, RENDER_POLL_INTERVAL_MS);
+}
+
+function stopAssemblyProgress() {
+  if (assemblyProgressTimer) clearInterval(assemblyProgressTimer);
+  assemblyProgressTimer = 0;
+  assemblyPercent = null;
+}
 
 function renderAssembly() {
   const bar = $("#assembly-bar");
@@ -942,7 +1125,10 @@ function renderAssembly() {
   if (!state.project) { bar.innerHTML = ""; return; }
   const control = assemblyControl(state.project);
   const disabled = control.disabled || assemblyInFlight;
-  const label = assemblyInFlight ? ASSEMBLE_RUNNING : control.label;
+  const running = assemblyPercent === null ? ASSEMBLE_RUNNING : `${ASSEMBLE_RUNNING} ${assemblyPercent}%`;
+  const label = assemblyInFlight ? running : control.label;
+  const presetHelp = (EXPORT_PRESETS.find((preset) => preset.value === assemblyPreset) || EXPORT_PRESETS[0]).help;
+  const presets = `<label class="assembly-preset" title="${escapeHtml(presetHelp)}">Preset <select id="assembly-preset" ${assemblyInFlight ? "disabled" : ""}>${EXPORT_PRESETS.map((preset) => `<option value="${preset.value}" ${preset.value === assemblyPreset ? "selected" : ""}>${escapeHtml(preset.label)}</option>`).join("")}</select></label>`;
   const exported = latestAssemblyExport(state.project);
   // The refusal report is the server's own words, one reason per line -- rendered whole
   // because rationing it is exactly what the comprehensive 422 exists to prevent.
@@ -952,25 +1138,37 @@ function renderAssembly() {
   const player = exported
     ? `<div class="assembly-export"><span class="eyebrow">Latest export</span><video controls preload="metadata" src="${exported.url}"></video><a href="${exported.url}" target="_blank" rel="noopener">${escapeHtml(exported.path)}</a></div>`
     : "";
-  bar.innerHTML = `<div class="assembly-controls"><span class="eyebrow">Assembly</span><button class="primary-button" id="assemble-button" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button><span class="assembly-reason">${escapeHtml(control.reason)}</span></div>${report}${player}`;
+  bar.innerHTML = `<div class="assembly-controls"><span class="eyebrow">Assembly</span>${presets}<button class="primary-button" id="assemble-button" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button><span class="assembly-reason">${escapeHtml(control.reason)}</span></div>${report}${player}`;
+  const select = $("#assembly-preset", bar);
+  if (select) {
+    select.addEventListener("change", (event) => {
+      assemblyPreset = event.currentTarget.value;
+      renderAssembly();
+    });
+  }
   const button = $("#assemble-button", bar);
   if (button) {
     button.addEventListener("click", async () => {
       if (assemblyInFlight) return;
+      const projectId = state.project.id;
+      const preset = assemblyPreset;
       assemblyInFlight = true;
       assemblyRefusalReport = "";
+      assemblyPercent = null;
       renderAssembly();
+      watchAssemblyProgress(projectId);
       try {
-        const result = await api.assemble(state.project.id);
+        const result = await api.assemble(projectId, preset);
         // The reply is the settled job plus measurements, not the project -- re-fetch so the
         // job list, the export reader and every other panel redraw from one server truth.
-        state.project = await api.project(state.project.id);
-        toast(`Assembled ${result.clip_count} shots into ${result.export} (${result.duration_seconds.toFixed(2)}s)`);
+        state.project = await api.project(projectId);
+        toast(`Assembled ${result.clip_count} shots into ${result.export} (${result.preset}, ${result.duration_seconds.toFixed(2)}s)`);
       } catch (error) {
         assemblyRefusalReport = String(error?.message || error);
         toast("Assembly refused — see the report under the button", "error");
       } finally {
         assemblyInFlight = false;
+        stopAssemblyProgress();
         renderJobs();
         renderTimeline();
       }
@@ -1254,26 +1452,16 @@ export function renderShotInspector() {
   // `project.jobs`, which is where take provenance has lived all along; the server's
   // select-take route verifies against the same records. (The Director's asks,
   // 2026-08-20: switch a shot's clip between takes; attach a video from files/assets.)
-  const takeFiles = [];
-  const seenTakes = new Set();
-  for (const job of state.project?.jobs || []) {
-    if (job.kind !== "h3" || job.target_id !== shot.id) continue;
-    for (const file of job.output_files || []) {
-      if (!file.endsWith(".mp4")) continue;
-      const key = file.replace("-audio.mp4", ".mp4");
-      if (seenTakes.has(key)) continue;
-      seenTakes.add(key);
-      takeFiles.push(file);
-    }
-  }
-  const takeKey = (file) => (file || "").replace("-audio.mp4", ".mp4");
+  //
+  // Every row is decided by `takesStripRows` and applied here, `shotPromptCell`'s rule: the row
+  // that claimed a displaced take was `Current` was a ternary written inside this template
+  // literal, and the strip's whole job is to make one true claim per row.
+  const strip = takesStripRows(state.project, shot);
   const videoAssets = assets.filter((asset) => asset.kind === "video");
-  const takesStripHtml = takeFiles.length > 1 || videoAssets.length
-    ? `<div class="takes-strip"><span class="control-label" title="Every clip this shot's render history produced. 'Use' points the shot at that take; assembly and the Monitor follow.">Takes</span>${takeFiles.map((file, index) => {
-        const current = takeKey(shot.latest_output) === takeKey(file);
-        const name = file.split("/").pop();
-        return `<div class="take-row ${current ? "current" : ""}"><span title="${escapeHtml(file)}">Take ${index + 1} · ${escapeHtml(name)}</span><button class="quiet-button use-take" data-output="${escapeHtml(file)}" ${current ? "disabled" : ""}>${current ? "Current" : "Use"}</button></div>`;
-      }).join("")}${videoAssets.length ? `<select id="attach-clip-asset"><option value="">Attach video asset as clip…</option>${videoAssets.map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select>` : ""}</div>`
+  const takesStripHtml = strip.rows.length > 1 || videoAssets.length
+    ? `<div class="takes-strip"><span class="control-label" title="Every clip this shot's render history produced. 'Use' points the shot at that take; assembly and the Monitor follow.">Takes</span>${strip.rows.map((row) =>
+        `<div class="take-row ${row.className}"><span title="${escapeHtml(row.title)}">${escapeHtml(row.text)}</span><button class="quiet-button use-take" data-output="${escapeHtml(row.file)}" ${row.disabled ? "disabled" : ""}>${escapeHtml(row.chip)}</button></div>`
+      ).join("")}${videoAssets.length ? `<select id="attach-clip-asset"><option value="">Attach video asset as clip…</option>${videoAssets.map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select>` : ""}</div>`
     : "";
   // The trim nudge: which slice of the over-rendered take fills the window. Decided by
   // `trimNudgeControl` (contract-tested); frame-stepped here because a frame is the unit
@@ -1628,9 +1816,22 @@ export async function pollRenderStatus() {
     // flight. Dropping it loses nothing: the reconciliation is saved on the server.
     if (state.project?.id !== projectId || shotWriteInFlight) return;
     const changed = applyRenderStatus(state.project, report);
-    if (changed.assets) renderAssets();
+    // Live percentages, rebuilt whole from each answer and held beside the project rather than
+    // folded into it -- `applyRenderStatus` deliberately never sees them. The project object is
+    // what the full-project PUT sends back, so a percentage patched onto `project.jobs` would be
+    // written into the manifest by the Director's next save; keeping it out here is what makes
+    // "no manifest write on a progress tick" true on the client as well as on the server.
+    //
+    // Rebuilt whole rather than merged, so a render that settles takes its number away with it
+    // instead of leaving a stale one on the card. Repainting is gated on the map actually
+    // moving: a tick that learned nothing repaints nothing, which is the same rule every other
+    // branch here follows.
+    const progress = renderProgressByTarget(report);
+    const progressMoved = JSON.stringify(progress) !== JSON.stringify(state.renderProgress || {});
+    state.renderProgress = progress;
+    if (changed.assets || progressMoved) renderAssets();
     if (changed.song) renderSong();
-    if (changed.shots) renderTimeline();
+    if (changed.shots || progressMoved) renderTimeline();
     // `renderJobs` re-runs `syncRenderPolling`, which is how the loop stops itself on the tick
     // that settles the last open job. The explicit call covers a tick that changed nothing
     // visible but should still stand the timer down -- a job settled by the manual refresh.
@@ -1995,19 +2196,31 @@ function syncMonitor() {
   // One decision function owns what this moment shows -- the same offset rule assembly
   // cuts by, so the preview and the export cannot disagree about which slice plays.
   const view = monitorState(state.project, state.playhead);
+  // The one text layer the Monitor had is the overlay, and `.showing-take` display:none's it --
+  // so while a take was on screen the Monitor could say nothing at all, and a previous take with
+  // a newer render in flight played in sync, framed exactly like a settled one. The note is a
+  // second layer that survives a picture: it carries `view.label` whenever there is a picture and
+  // something to say about it, and is empty (and so invisible) otherwise.
+  const note = $("#monitor-note");
+  const say = (text) => { if (note) note.textContent = text; };
   if (videoLineMuted) {
     frame.classList.remove("showing-take");
     $("#monitor-overlay").textContent = "Video line muted";
+    say("");
     if (!video.paused) video.pause();
     return;
   }
-  if (view.kind !== "take") {
+  if (!monitorShowsTake(view)) {
     frame.classList.remove("showing-take");
     $("#monitor-overlay").textContent = view.label;
+    say("");
     if (!video.paused) video.pause();
     return;
   }
   frame.classList.add("showing-take");
+  // A displaced take keeps playing -- it is the only evidence there is, and `latest_output` still
+  // points at it -- and says so in words over the picture.
+  say(view.label);
   // The acceptance flag, previewed: an accepted clip's own audio plays over the master,
   // exactly the mix assembly writes.
   video.muted = view.muted;
@@ -2477,7 +2690,14 @@ function bindEvents() {
     const shot = { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start, duration: Math.min(5, Math.max(.5, projectDuration() - start)), prompt: PLACEHOLDER_PROMPT, mode: null, asset_ids: [], citations: [], singing: "unknown", seed: 0, status: "draft", prompt_id: "", approved_output: "", locked: false };
     shots.push(shot); state.selectedShotId = shot.id; saveShotsSilently(); renderTimeline();
   });
-  $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + shot.duration; copy.status = "draft"; state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently(); renderTimeline(); });
+  // Duplicate copies the plan and nothing else. It used to clone the whole Shot and reset
+  // `status`, which left the copy owning the original's take: the same `latest_output` played in
+  // the Monitor, the same approval read back from the panel, and a Shot nobody had rendered
+  // claimed a take. `newShotFromPlan` builds from the classified plan fields instead of
+  // subtracting from a clone, so an unclassified field is absent from the copy rather than
+  // inherited by it. The original is untouched -- its take, its approval and its pointer all
+  // stay exactly where they were.
+  $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + shot.duration }); state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently(); renderTimeline(); });
   $("#delete-shot").addEventListener("click", () => {
     const shot = selectedShot();
     if (!shot) return;
@@ -2490,7 +2710,11 @@ function bindEvents() {
     state.selectedShotId = state.project.shots[0]?.id || null;
     saveShotsSilently(); renderTimeline();
   });
-  $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = structuredClone(shot); copy.id = `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`; copy.start = shot.start + half; copy.duration = half; shot.duration = half; state.project.shots.push(copy); saveShotsSilently(); renderTimeline(); });
+  // The split's second half is a new Shot on the same terms as a duplicate: it has rendered
+  // nothing, so it carries the plan and no take. The first half keeps everything it had --
+  // narrowing a window is not a reason to touch a pointer, and the take it names is still the
+  // last thing this Shot rendered.
+  $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + half, duration: half }); shot.duration = half; state.project.shots.push(copy); saveShotsSilently(); renderTimeline(); });
   $("#monitor-fullscreen")?.addEventListener("click", () => {
     const monitor = $("#timeline-monitor");
     if (document.fullscreenElement) document.exitFullscreen();

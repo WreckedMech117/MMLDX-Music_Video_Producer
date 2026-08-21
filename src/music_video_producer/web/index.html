@@ -286,6 +286,14 @@
           <div><span class="eyebrow">Music-aware edit</span><h1 id="timeline-heading">Director timeline</h1></div>
           <div class="timeline-tools"><button class="quiet-button" id="add-shot">＋ Shot</button><button class="quiet-button" id="split-shot">Split</button><button class="quiet-button" id="duplicate-shot">Duplicate</button><button class="danger-button" id="delete-shot">Delete</button><span class="divider"></span><button class="quiet-button" id="zoom-out">−</button><span id="zoom-label">100%</span><button class="quiet-button" id="zoom-in">＋</button></div>
         </div>
+        <!-- Snap cuts to phrase boundaries (the Director's ruling on "vocal transition points
+             between shots"). Empty in the markup and drawn whole by app.js's renderSnapCuts
+             from api.js's snapCutsControl and snapCutsReportLines, exactly as the assembly bar
+             below is: the tolerance box, the two-stage button, and the server's own report of
+             what would move and what would stay. The report is rendered in full and never
+             summarised — a skipped cut whose reason was rationed away is the one that
+             mattered. Nothing on this bar renders, arms or queues anything. -->
+        <div class="snap-bar" id="snap-bar" aria-live="polite"></div>
         <div class="timeline-layout">
           <div class="timeline-main">
             <!-- The Monitor: the timeline's program viewer. The master audio element is the
@@ -296,6 +304,12 @@
             <div class="timeline-monitor" id="timeline-monitor">
               <video id="monitor-video" muted playsinline preload="auto"></video>
               <div class="monitor-overlay" id="monitor-overlay">No shot under the playhead</div>
+              <!-- What the overlay structurally cannot say: the overlay is hidden the moment a
+                   take is on screen, so a previous take with a newer render in flight played in
+                   sync and framed exactly like a settled one, with nothing saying so. This layer
+                   survives a picture and is empty (and so invisible) when there is nothing to
+                   say. Written by syncMonitor from monitorState's label. -->
+              <p class="monitor-note" id="monitor-note"></p>
               <button id="monitor-fullscreen" class="monitor-fullscreen" title="Fullscreen the Monitor (Esc to leave)">⛶</button>
             </div>
             <div class="timeline-transport"><button id="timeline-start" disabled title="Jump to start">│◀</button><button id="timeline-play" disabled title="Play master audio">▶</button><span id="timeline-time">00:00:00</span><div class="timeline-spacer"></div><!-- The two line mutes from the Director's workflow: audition controls, session-only,
@@ -319,7 +333,11 @@
         <!-- Assembly (FR-22): the finishing lane's main act, at the foot of the timeline it
              assembles. The cheap readiness facts (approvals, song, open renders) come from
              api.js's assemblyControl; the plan-shaped refusals — gaps, stale windows — are the
-             server's own multi-line 422 report, rendered verbatim rather than re-derived. -->
+             server's own multi-line 422 report, rendered verbatim rather than re-derived.
+             The bar's contents — the Draft/Master preset select, the button and its running
+             percentage — are drawn by app.js's renderAssembly from api.js's EXPORT_PRESETS,
+             so the choices offered are the same list the route's Literal accepts and cannot
+             drift into a select offering a preset the server refuses. -->
         <div class="assembly-bar" id="assembly-bar" aria-live="polite"></div>
       </section>
 

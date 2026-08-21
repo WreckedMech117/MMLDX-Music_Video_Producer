@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import math
 import re
 import shutil
 import subprocess
 import tempfile
 from collections import Counter
+from collections.abc import AsyncIterator, Callable, Container
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -20,17 +23,22 @@ from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
 from .assembly import (
     ASSEMBLY_FPS,
+    DEFAULT_EXPORT_PRESET,
+    EXPORT_PRESETS,
     AudioOverlay,
     ClipWindow,
+    ExportProgress,
     assembly_plan,
     assembly_refusals,
     concat_args,
     concat_manifest,
+    parse_progress_us,
     probe_duration_args,
     probe_streams_args,
     probe_take_args,
     trim_args,
     verification_problems,
+    with_progress,
 )
 from .batch import (
     TERMINAL_JOB_STATUSES,
@@ -46,20 +54,23 @@ from .batch import (
     reconcile_render_jobs,
     render_status_report,
     shot_label,
+    supersede_target_jobs,
 )
-from .comfy import ComfyClient, ComfyError
+from .comfy import ComfyClient, ComfyError, ComfyProgressListener, ProgressTracker
 from .config import Settings
 from .director import (
+    PLAN_TEMPERATURE,
     DirectorBudgetExhausted,
     DirectorClient,
     DirectorError,
     DirectorUnavailable,
+    director_result_schema,
     document_rejection,
 )
 from .dp_prompt import DP_SYSTEM_PROMPT, dp_input
 from .h3_expansion_prompt import system_prompt as h3_system_prompt
 from .h3_prompt import check as h3_check
-from .h3_prompt import normalize_audio_fields
+from .h3_prompt import check_reference_bounds, normalize_audio_fields
 from .models import (
     ASSET_ROLE_LABELS,
     SHOT_MODE_SPECS,
@@ -75,11 +86,12 @@ from .models import (
     SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
-    citations_in_prompt_order,
     citations_in_role,
     dangling_citations,
     mode_specification_problems,
     new_id,
+    numbered_references,
+    reference_slot_totals,
     resolve_shot_mode,
     song_audio_tag,
 )
@@ -90,8 +102,11 @@ from .timeline import (
     H3_MAX_SHOT_SECONDS,
     H3_MIN_SHOT_SECONDS,
     MIN_SINGING_VOCAL_SECONDS,
+    SNAP_TOLERANCE_DEFAULT,
+    SNAP_TOLERANCE_MAX,
     TimelineError,
     align_lyric_blocks,
+    anchored_label,
     assistant_input,
     build_director_timeline,
     expansion_input,
@@ -105,6 +120,7 @@ from .timeline import (
     repair_sections,
     shot_expansion_input,
     shot_vocal_overlap,
+    snap_cut_plan,
     song_section,
 )
 from .transcription import merge_vocal_spans, transcribe_song_words
@@ -132,6 +148,8 @@ from .workflows import (
     image_edit_prompt,
     song_audio_window,
 )
+
+logger = logging.getLogger(__name__)
 
 # The one wording for what a Song change costs, shared by every route that changes or
 # removes a project's Song. The Song is the timing spine: `Shot.start`/`Shot.duration`
@@ -521,41 +539,78 @@ def reference_map_tag_lines(project: Project, shot: Shot) -> list[str]:
     """The submit walk's tag sentences, computed outside the submit route.
 
     Byte-for-byte the lines `generate_h3`'s reference branch builds — same
-    `citations_in_prompt_order` walk, same per-kind numbering, same role wording, same
+    `models.numbered_references` walk, same per-kind numbering, same role wording, same
     master-song line last — so a prompt stored ahead of submission names exactly the
-    slots the payload will fill. A citation whose asset is missing is skipped here where
-    the route 422s: this function writes text, and the render is where a dangling
-    citation must stop the world.
+    slots the payload will fill. A citation whose asset is missing writes no line here
+    where the route 422s: this function writes text, and the render is where a dangling
+    citation must stop the world. It still consumes its *number* from the shared walk, so
+    the tags that do get written are the tags the specialist was handed.
+
+    Each label carries the Asset's stored appearance anchor when it has one, so the map
+    reads `<Picture 1> is Lucy, a woman in a red leather jacket and black boots` rather
+    than a bare name that tells the sampler nothing about the person it is holding fixed.
+    `timeline.anchored_label` is the one composition — including how a per-shot rename and
+    an anchor compose — and an asset with no anchor returns the bare label unchanged, so
+    an anchor-free project's map is byte-for-byte the map it has always been.
     """
     tags: list[str] = []
-    numbers = {"picture": 0, "video": 0, "audio": 0}
-    for citation in citations_in_prompt_order(shot):
-        asset = next((item for item in project.assets if item.id == citation.asset_id), None)
+    for numbered in numbered_references(project, shot):
+        asset = numbered.asset
         if asset is None:
             continue
-        label = shot.reference_labels.get(asset.id, asset.name)
-        if citation.role in REFERENCE_MAP_ROLE_TAGS:
-            numbers["picture"] += 1
+        label = anchored_label(asset, shot.reference_labels.get(asset.id, asset.name))
+        if numbered.citation.role in REFERENCE_MAP_ROLE_TAGS:
             tags.append(
-                REFERENCE_MAP_ROLE_TAGS[citation.role].format(
-                    number=numbers["picture"], label=label
+                REFERENCE_MAP_ROLE_TAGS[numbered.citation.role].format(
+                    number=numbered.number, label=label
                 )
             )
             continue
-        kind = (
-            "video"
-            if asset.kind == "video"
-            else "audio"
-            if asset.kind == "audio"
-            else "picture"
-        )
-        numbers[kind] += 1
-        tag_name = {"picture": "Picture", "video": "Video", "audio": "Audio"}[kind]
-        tags.append(f"<{tag_name} {numbers[kind]}> is {label}")
+        tags.append(f"{numbered.tag} is {label}")
     if shot.use_song_audio:
-        numbers["audio"] += 1
-        tags.append(f"<Audio {numbers['audio']}> is the master song for synchronization")
+        tags.append(
+            f"<Audio {song_audio_tag(project, shot)}> is the master song for synchronization"
+        )
     return tags
+
+
+#: What one shot's reference-bounds refusal says. The problems are the checker's own sentences —
+#: one wording for the rule, in `h3_prompt.check_reference_bounds`, rather than a second copy here
+#: that can drift from the one the expansion retry loop feeds back to the model.
+REFERENCE_BOUNDS_REFUSAL = (
+    "Not submitted: {shot} cites a reference slot it does not have. {problems} Nothing was sent "
+    "to ComfyUI, because a render conditioned on a slot nothing fills comes back plausible and "
+    "wrong rather than failing. Attach the media or renumber the tag, then submit again."
+)
+
+
+def reference_slot_counts(project: Project, shot: Shot) -> dict[str, int] | None:
+    """How many slots of each kind this Shot's render will wire, or `None` when that is unknowable.
+
+    `models.reference_slot_totals` is the answer, and it is the numbering itself rather than a
+    second count of it: the same `numbered_references` walk that writes the tags in
+    `reference_map_tag_lines` above, in the submit route's own loop, and in the expansion input the
+    specialist is handed. Anything not a video or an audio is a picture, which is the route's own
+    classification: `character`, `setting`, `prop`, `style` and `image` Assets all travel as
+    pictures.
+
+    **`None` — skip — is returned for a Shot citing an Asset this project does not hold**, and for
+    nothing else. A dangling citation is dropped by `reference_map_tag_lines` and 422s at the route
+    by name, so a count that included it would read as over-citation and replace the render's own
+    "Unknown reference asset" refusal with a sentence about the prompt — the wrong thing to send
+    the Director to fix.
+
+    A Shot citing a video or an audio **used to skip here too**, and no longer does. That skip was
+    honest about a real disagreement: `timeline.shot_expansion_input` numbered *every* citation into
+    the `<Picture N>` series while this walk and the route numbered per kind, so bounding a
+    video-citing shot would have refused the specialist for writing the tag it was handed. The two
+    numberings are now one function (`models.numbered_references`, 2026-08-20), so the count is
+    trustworthy for every kind and the check covers what it was skipping.
+    """
+    held = {asset.id for asset in project.assets}
+    if any(citation.asset_id not in held for citation in shot.citations):
+        return None
+    return reference_slot_totals(project, shot)
 
 
 def song_audio_prose(project: Project, shot: Shot) -> str:
@@ -1359,8 +1414,11 @@ def shot_render_in_flight(project: Project, shot: Shot) -> bool:
     Both signals are read, because they can disagree and the disagreement is the dangerous case.
     `Shot.status` is the half that is right when no job record was ever written; the job records
     are the durable half, keyed by `target_id`, and they are what still says "in flight" when the
-    status has been walked backwards by hand through the generic shots write — which is precisely
-    how a Shot can read `complete` on screen while ComfyUI is still working on it.
+    status has been walked backwards by hand — which is precisely how a Shot can read `complete`
+    on screen while ComfyUI is still working on it. The generic writes were that hand until
+    2026-08-20; `_require_in_flight_status_kept` closed them, and what is left is a manifest
+    edited on disk, restored from a backup, or saved by a build older than the gate. This still
+    reads both signals for exactly those.
 
     Job status only ever moves when `read_job` is asked, so a job that finished while nobody was
     polling still reads `queued` here and this returns True. That is the safe direction to be
@@ -1527,10 +1585,11 @@ RESTORE_AUDIO_LENGTH_TOLERANCE = 0.5 / 24
 def shot_is_approved(shot: Shot) -> bool:
     """Whether somebody has made the editorial decision this Shot's refusals key on.
 
-    Both signals, because they are settable independently through the generic shots write and a
-    Shot carrying either is a Shot somebody has decided about: `approved_output` is the decision
-    AGENTS.md names, and the `approved` status is reachable by hand and must not be a state
-    nothing can clear. One definition, read by `render_again_refusal`'s approval arm and by the
+    Both signals, because they are set independently — `approved_output` by the approve route and
+    the `approved` status by a manifest that predates `_require_approval_unchanged`, or one edited
+    off-route — and a Shot carrying either is a Shot somebody has decided about: the first is the
+    decision AGENTS.md names, and the `approved` status is reachable by hand and must not be a
+    state nothing can clear. One definition, read by `render_again_refusal`'s approval arm and by the
     un-approve route, so the set of Shots render-again refuses as approved and the set un-approve
     can rescue are the same set by construction rather than by two lists agreeing.
     """
@@ -1575,6 +1634,24 @@ APPROVE_IN_FLIGHT_REFUSAL = (
 UNAPPROVE_NOT_APPROVED_REFUSAL = (
     "{shot} carries no approval to clear: no approved take is recorded and its status is "
     "{status}. Nothing was changed."
+)
+#: The three fields one approval consists of, as a list rather than as three checks. The pair
+#: below `approved_output` is AD-13's window snapshot, written and cleared by the approve/
+#: un-approve pair in the same two writes; a gate that protected the decision and not the window
+#: it was made in would leave a save able to re-point the snapshot at a window nobody approved,
+#: which is exactly the staleness assembly refuses on.
+APPROVAL_FIELDS: tuple[str, ...] = ("approved_output", "approved_start", "approved_duration")
+
+# Why a whole-manifest save may not change an approval. The middle clause is
+# `RENDER_AGAIN_APPROVED_REFUSAL`'s and `APPROVE_NO_TAKE_REFUSAL`'s, word for word, because it is
+# the same fact about approval being restated to a save rather than a second opinion about it: an
+# approval is a decision about one piece of media, and the routes that make and withdraw it are
+# the only places that decision is expressed. The refusal names the two actions, because the
+# Director reading it is holding a client that just tried to write the field directly.
+GENERIC_WRITE_APPROVAL_REFUSAL = (
+    "This save would change {shot}'s approval. An approval is an editorial decision about one "
+    "specific take, so it is not something an ordinary save carries: approve and un-approve are "
+    "their own actions. Nothing was saved. Use them if the decision has changed."
 )
 # What each direction did, said rather than implied, on `MARK_READY_NOTICE`'s argument: the
 # approve toast has to carry the consequence -- the shot stops being re-renderable -- and the
@@ -1722,6 +1799,84 @@ def _require_song_replacement_confirmation(project: Project, confirmed: bool) ->
     if confirmed or project.song is None or not project.shots:
         return
     raise HTTPException(status_code=409, detail=SONG_REPLACEMENT_CONSEQUENCE)
+
+
+def _require_in_flight_status_kept(project: Project, shots: list[Shot]) -> None:
+    """Refuse a save that takes a Shot **out of** `queued`/`running`. See `RENDER_IN_FLIGHT_STATUSES`.
+
+    The narrow form, on `_require_song_replacement_confirmation`'s precedent: the incoming Shot is
+    compared against the stored one, so an ordinary save round-trips every status untouched and
+    only a body that *moves* one is refused. That is what makes this shippable — the two generic
+    `PUT`s are the normal save path for every edit in the interface, and a gate on the mere
+    presence of `status` would refuse every save there is.
+
+    Only one direction is refused, and it is the one with a concrete cost. `shot_render_in_flight`
+    reads `Shot.status` because it is "the half that is right when no job record was ever written";
+    a body that walks that status back to `draft` or `ready` therefore erases the one record a live
+    render left on the Shot, and the next submission sails past the check that exists to stop two
+    renders racing on one output prefix. Everything else stays exactly as it was: `draft -> ready`
+    is legitimate arming, `complete -> draft` is a Director tidying up after a take, and
+    `queued -> running` is still in flight and loses nothing.
+
+    Deliberately keyed on the *stored* status alone rather than on `shot_render_in_flight`. The job
+    records are the durable half and they survive a walked-back status regardless, so folding them
+    in here would refuse saves on projects whose every Shot is settled and whose only in-flight
+    signal is a job nobody has polled since it finished.
+
+    A Shot in the body that the stored project does not hold is a new Shot: there is no live render
+    behind it to lose, so it is not this gate's business.
+
+    The sentence is `MARK_READY_IN_FLIGHT_REFUSAL`, verbatim and with its 409, because it is
+    already the answer this application gives when a Director tries to set the status of a
+    rendering Shot -- "its status is not yours to set right now" -- and a second wording of one
+    rule is a second thing to keep true.
+    """
+    stored = {shot.id: shot for shot in project.shots}
+    for shot in shots:
+        was = stored.get(shot.id)
+        if was is None or was.status not in RENDER_IN_FLIGHT_STATUSES:
+            continue
+        if shot.status not in RENDER_IN_FLIGHT_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=MARK_READY_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, was)),
+            )
+
+
+def _require_approval_unchanged(project: Project, shots: list[Shot]) -> None:
+    """Refuse a save that changes any of `APPROVAL_FIELDS`. Approval is the approve route's.
+
+    The same narrow shape as `_require_in_flight_status_kept`, and for the same reason: an
+    approved Shot round-trips through the interface's ordinary saves constantly, so the refusal is
+    on a *difference* and never on the presence of the fields. An unchanged approval saves.
+
+    AGENTS.md's rule is that `approved_output` is an explicit editorial decision, and the approve
+    route is documented as its one writer -- "what is written is what the server resolved from its
+    own manifest ... a path accepted from a client would be a claim". These two routes were the
+    hole in that: a whole-manifest body binds a defaulted `Project`, so a client that has never
+    heard of the field sends `""` and one ordinary save silently withdraws an approval, while one
+    that invents a path plants assembly's input without any take behind it.
+
+    A Shot the stored project does not hold is compared against the field's own default rather
+    than skipped: nothing has approved a Shot that does not exist yet, so a new Shot arriving with
+    an approval is claiming a decision no route made -- which is precisely how a duplicated Shot
+    used to arrive owning the original's approval.
+
+    Nothing here assigns an approval field. The gate compares and refuses, so the source scan that
+    holds this application to two `approved_output` writes keeps reading two.
+    """
+    stored = {shot.id: shot for shot in project.shots}
+    for shot in shots:
+        was = stored.get(shot.id)
+        for field in APPROVAL_FIELDS:
+            before = getattr(was, field) if was is not None else Shot.model_fields[field].default
+            if getattr(shot, field) != before:
+                raise HTTPException(
+                    status_code=409,
+                    detail=GENERIC_WRITE_APPROVAL_REFUSAL.format(
+                        shot=shot_label(project, was if was is not None else shot)
+                    ),
+                )
 
 
 class ProjectCreate(BaseModel):
@@ -1902,6 +2057,15 @@ POPULATE_NO_SONG_REFUSAL = (
     "Populate Timeline lays shots across the song, so the project needs a song with a "
     "known length first."
 )
+#: Snap Cuts places boundaries against measured voice, so it needs the track it measures.
+#: Stated separately from the populate refusal rather than shared, because the two ask for
+#: different things: populate needs a *length* to tile, this needs a *recording* to have
+#: heard. The follow-on refusal a Director hits after supplying one is
+#: `timeline.SNAP_UNMEASURED`, which sends them to Analyze structure.
+SNAP_CUTS_NO_SONG = (
+    "Snapping cuts places them where the track is not singing, so this project needs a "
+    "master song first."
+)
 POPULATE_PROTECTED_REFUSAL = (
     "Populate Timeline replaces every shot, and {shots} carry protections (approval or a "
     "lock) that must not vanish silently. Un-approve or unlock them first — or delete "
@@ -1909,6 +2073,18 @@ POPULATE_PROTECTED_REFUSAL = (
 )
 POPULATE_NO_PLAN_REFUSAL = (
     "The Director model returned no shots to lay out. Its message: {message}"
+)
+
+#: The second-failure refusal: the model was told the number, told again with the shortfall
+#: named, and still under-delivered. Named counts and a way forward, like every other
+#: refusal here — and it says plainly that nothing was replaced, because the Director's
+#: whole timeline was the thing at risk.
+POPULATE_SHORT_PLAN_REFUSAL = (
+    "The Director model was asked for {required} shots to cover {duration:.1f} seconds and "
+    "returned {returned} — twice, the second time with the shortfall spelled out. A plan "
+    "that short would repeat each prompt across many windows, so nothing was replaced and "
+    "your timeline is as it was. Mark the song's sections first so each one is planned on "
+    "its own smaller ask, or point MVP_LLM_MODEL at a larger model and try again."
 )
 
 #: See the populate route's window_mean comment: the creator's "fastest / safest" preset,
@@ -1922,29 +2098,136 @@ POPULATE_TARGET_WINDOW_SECONDS = 5.2
 #: wants longer shots edits them deliberately, one at a time, in the timeline.
 POPULATE_MAX_WINDOW_SECONDS = 6.0
 
-#: What the model is asked for. The count guidance and the asset roster matter: a local
-#: model told nothing about length writes five shots for a three-minute song, and one
-#: told nothing about the library invents characters the project does not hold.
+def populate_required_shots(duration: float) -> int:
+    """How many shots a song of ``duration`` seconds needs — computed here, never asked.
+
+    The arithmetic is the server's because it is arithmetic: the target window is a
+    measured render-speed decision (`POPULATE_TARGET_WINDOW_SECONDS`) and dividing a
+    number by it is not a creative act. Handing the model the finished number instead of
+    "cover the song with 4–6 second shots" is the whole of the count-enforcement pattern's
+    first part — the measured failure it answers is a local model that writes five shots
+    for a three-minute song and calls the plan complete.
+
+    This is the number stated in the prompt as a hard constraint *and* the number the
+    reply is checked against, deliberately the same one: a prompt that asks for N and a
+    checker that accepts N/2 teaches the model that N was decoration.
+    """
+    return max(1, round(duration / POPULATE_TARGET_WINDOW_SECONDS))
+
+
+#: What the model is asked for. The count and the asset roster matter: a local model told
+#: nothing about length writes five shots for a three-minute song, and one told nothing
+#: about the library invents characters the project does not hold.
+#:
+#: The count appears three times on purpose — the opening sentence, the numbered hard
+#: constraints, and the FINAL CHECK line appended last (`POPULATE_FINAL_CHECK`) — because
+#: a single mention in a long instruction is what this model family demonstrably reads
+#: past. The pattern's canonical third site is the system prompt; `SYSTEM_PROMPT` is
+#: shared with the chat route, so populate's own opening sentence takes that slot rather
+#: than teaching every chat turn about shot counts.
 POPULATE_INSTRUCTION = (
-    "Lay out the complete shot plan for this music video. The song is {duration:.1f} "
-    "seconds long; cover it entirely from 0 to {duration:.1f} with contiguous shots — "
-    "no gaps, no overlaps — each between 4 and 6 seconds, about {count} shots in "
-    "total. Deliberately mix lengths inside that band: quick 4-second cuts on "
+    "Lay out the complete shot plan for this music video. Return EXACTLY {count} shots. "
+    "The song is {duration:.1f} seconds long; cover it entirely from 0 to {duration:.1f} "
+    "with contiguous shots — no gaps, no overlaps — each between 4 and 6 seconds. "
+    "Deliberately mix lengths inside that band: quick 4-second cuts on "
     "high-energy beats, 6-second holds on glamour or establishing moments; do not make "
     "every shot the same length. Follow the treatment and style bible; use the song's "
-    "lyrics to place performance moments where the words are, and set performance=true "
-    "on every shot where a character sings the song on camera. The project's assets, "
+    "lyrics to place performance moments where the words are. Every shot carries its own "
+    "`performance` flag: answer it on each shot — true where a character sings the song "
+    "on camera, false everywhere else. It is a field of the shot object and never words "
+    "in the shot: no prompt may mention that flag or its value. The project's assets, "
     "by name, are: {assets}. Refer to them by these exact names in shot prompts so "
     "each shot says which character or location it uses. Every shot's prompt is a "
     "short readable visual intent (one or two sentences): what is seen, who is in "
     "frame, how the camera behaves. Vary the camera angle and movement between "
     "adjacent shots — never repeat the same setup, framing or camera move back to "
-    "back, and not every shot needs movement at all. First divide the song into "
-    "sections by its structure (Intro, Verse, Chorus, Bridge, Outro), matching the "
-    "lyric sheet's own [Tag] blocks in order, each with start and duration in seconds "
-    "and a one-sentence shared visual prompt; return them in `sections`. Then lay the "
-    "shots out inside those sections."
+    "back, and not every shot needs movement at all.{sections_ask}\n"
+    "HARD CONSTRAINTS:\n"
+    "1. `shots` must contain EXACTLY {count} entries. Not fewer. A shorter list is a "
+    "failed answer, however good the individual shots are.\n"
+    "2. The shots must run in order and together cover 0 to {duration:.1f} seconds.\n"
+    "3. Every shot needs a non-empty `prompt`.{sections_constraint}"
 )
+
+#: The structure half of the single-call ask, factored out so it can be *dropped*. It is
+#: sent only when the section layer is still unknown at shot time. When the Director has
+#: marked the boxes, or when the sections-first stage has already filled them, asking for
+#: them again is a second job bolted onto the one that matters — which is the measured
+#: complaint the two-stage split exists to answer.
+POPULATE_SECTIONS_ASK = (
+    " First divide the song into sections by its structure (Intro, Verse, Chorus, "
+    "Bridge, Outro), matching the lyric sheet's own [Tag] blocks in order, each with "
+    "start and duration in seconds and a one-sentence shared visual prompt; return them "
+    "in `sections`. Then lay the shots out inside those sections."
+)
+POPULATE_SECTIONS_CONSTRAINT = (
+    "\n4. `sections` must not be empty — return the song's structure blocks there."
+)
+
+#: Stage one of the two-stage populate: structure only, from the lyric sheet. Deliberately
+#: a small ask with its own hard constraints and its own closing check, because small is
+#: the entire hypothesis — the roadmap's run-2 measurement is that this model family will
+#: not emit `sections` beside a 32-shot layout (three rolls, zero sections) while it
+#: volunteers them happily in smaller replies. The lyric sheet is not pasted in here: it
+#: already rides the project context this call is given, and a second copy in the request
+#: text is the "JSON in context begets JSON" degradation this codebase has been bitten by.
+POPULATE_SECTIONS_INSTRUCTION = (
+    "Divide this song into its structural sections, and return ONLY that structure. The "
+    "song is {duration:.1f} seconds long. Work from the lyric sheet's own [Tag] blocks in "
+    "order — Intro, Verse, Chorus, Bridge, Outro, and whatever else it names — one "
+    "section per block, in order, each with `start` and `duration` in seconds, together "
+    "covering 0 to {duration:.1f}, and each with a one-sentence shared visual prompt "
+    "saying how that part of the song looks. Return them in `sections`.\n"
+    "HARD CONSTRAINTS:\n"
+    "1. `sections` must not be empty.\n"
+    "2. The sections must run in order and must not overlap.\n"
+    "3. Leave `shots` empty. This call is about structure only — the shots are asked for "
+    "separately, afterwards.\n"
+    "FINAL CHECK before responding: is `sections` non-empty and in song order? If it is "
+    "not, fix it, and return only the corrected structure."
+)
+
+#: The closing line, appended after everything else so it is the last thing the model
+#: reads. Verbatim in spirit from the pattern this ports: state the number, tell it to
+#: count, tell it to fix the answer rather than explain it.
+POPULATE_FINAL_CHECK = (
+    "\nFINAL CHECK before responding: count the entries in `shots`. It must equal "
+    "{count}. If it does not, add or remove shots until it does, and do not explain — "
+    "just return the corrected list."
+)
+
+#: The guided retry, the pattern's fourth part and this codebase's `H3_RETRY_PROMPT`
+#: idiom: the failure is named in concrete numbers ahead of the request it is correcting,
+#: so the model rewrites against a stated fault instead of rerolling blind.
+POPULATE_RETRY_PREFIX = (
+    "PREVIOUS ATTEMPT FAILED and was discarded. What was wrong with it:\n{problems}\n"
+    "Answer the same request again and fix every one of those problems. Keep whatever was "
+    "already right.\n\n"
+)
+POPULATE_SHORT_COUNT_PROBLEM = (
+    "- It returned only {returned} shot(s) in `shots`. The plan needs exactly {required}."
+)
+#: Named alongside the shortfall when the model was asked for structure and emitted none.
+#: A dropped field is reported the same way a short count is — the recorded failure mode
+#: here is a model whose narration claims it set fields it silently omitted, so the check
+#: reads the reply rather than the message.
+POPULATE_MISSING_SECTIONS_PROBLEM = (
+    "- It returned an empty `sections`. The song's structure blocks (Intro, Verse, "
+    "Chorus, Bridge, Outro) were asked for and omitted entirely."
+)
+
+#: One retry, not `EXPANSION_ATTEMPTS`' four. Expansion retries one *shot* against a
+#: format checker, and a whole sweep of those runs unattended; populate is one click the
+#: Director is sitting in front of, and a single call against this project's local model
+#: is recorded at up to a 300 s timeout. Four attempts is twenty minutes of a button that
+#: looks stuck. One guided retry buys the pattern's measured benefit; the second failure
+#: is worth reporting rather than grinding at.
+POPULATE_ATTEMPTS = 2
+
+#: The retry's temperature. Lower than `PLAN_TEMPERATURE` because the retry is not asking
+#: for another creative roll — the fault has been named in numbers, and what is wanted now
+#: is obedience to a count.
+POPULATE_RETRY_TEMPERATURE = 0.2
 
 
 SECTIONS_OVERLAP_REFUSAL = (
@@ -1963,6 +2246,15 @@ class SectionListRequest(BaseModel):
 
 class PopulateTimelineRequest(BaseModel):
     confirm_replace: bool = False
+    #: Ask for the song's structure in its own call before asking for the shots
+    #: (`POPULATE_SECTIONS_INSTRUCTION`). Off by default, and that default is the honest
+    #: one: the split is the roadmap's answer to a measured single-call failure, but it has
+    #: never been run against a live model from here, and turning it on by default would
+    #: spend a second local-model call — up to 300 s — on every Director's populate on the
+    #: strength of an argument rather than a measurement. Flipping it is one word once a
+    #: live run says which way is better, and `false` is byte-for-byte the old behaviour,
+    #: so this is not a one-way door in either direction.
+    two_stage: bool = False
 
 
 class PopulateTimelineResponse(BaseModel):
@@ -1971,6 +2263,71 @@ class PopulateTimelineResponse(BaseModel):
     proposed: int
     created: int
     project: Project
+
+
+class SnapCutsRequest(BaseModel):
+    """One snap pass: how far a cut may travel, and whether this call is allowed to write.
+
+    `confirm_apply` is `populate`'s `confirm_replace` in a smaller key: the default is a
+    **report**, and only an explicit true writes. The report step is the point of the feature
+    as much as the moves are — "22 cuts moved, 3 skipped" is the moment a Director notices
+    that three is wrong (`spec-arm-a-plan`'s argument, and the roadmap keeps it on its own
+    merits). The server enforces it rather than trusting the browser to ask first.
+
+    `tolerance` is bounded by the schema, so a client cannot reach past `SNAP_TOLERANCE_MAX`
+    into a "snap" that rewrites the plan's rhythm; 0 is admissible and is the feature
+    switched off, which `snap_cut_plan` answers as a genuine no-op.
+    """
+
+    tolerance: float = Field(
+        default=SNAP_TOLERANCE_DEFAULT, ge=0, le=SNAP_TOLERANCE_MAX
+    )
+    confirm_apply: bool = False
+
+
+class SnapCutMove(BaseModel):
+    """One cut that would move, named by both shots that share it.
+
+    `gap` is how long the voiceless stretch it lands in is, carried on the wire because the
+    length is what tells a Director what kind of opportunity the cut found — a one-second
+    breath is an extended shot, four seconds is room for something else entirely. It is
+    `timeline.CutMove.gap` verbatim; nothing is decided here.
+    """
+
+    before: str
+    after: str
+    boundary: float
+    proposed: float
+    shift: float
+    gap: float
+
+
+class SnapCutSkip(BaseModel):
+    """One cut that would not move, and the sentence saying why."""
+
+    before: str
+    after: str
+    boundary: float
+    reason: str
+
+
+class SnapCutsResponse(BaseModel):
+    """The report, and — only on an applied call — the saved project.
+
+    `project` is `None` on a report, and that absence is load-bearing: it is the wire's own
+    statement that nothing was written. A client that redraws from it would be redrawing the
+    manifest it already has.
+    """
+
+    applied: bool
+    status: str
+    tolerance: float
+    moved: int
+    skipped: int
+    moves: list[SnapCutMove]
+    skips: list[SnapCutSkip]
+    message: str = ""
+    project: Project | None = None
 
 
 class GenerateBatchRequest(BaseModel):
@@ -2020,6 +2377,19 @@ class AssetEditRequest(BaseModel):
     instruction: str = Field(min_length=1)
     profile: Literal["default", "turbo"] = "default"
     seed: int = Field(default=0, ge=0, le=0xFFFFFFFFFFFFFFFF)
+
+
+class AssetConsistencyRequest(BaseModel):
+    """The appearance anchor's whole wire shape: one field, and deliberately only one.
+
+    A general "update this asset" body would put `name`, `kind`, `path` and `prompt` on the
+    wire beside it, each defaulted, and the route binding it could not tell an edit of one
+    from an omission of the other four — which is precisely the shape that made the generic
+    full-project `PUT` a data-loss hole three times over. One field means an omission and a
+    clear are the same instruction, which is what the Director means by emptying the box.
+    """
+
+    consistency_prompt: str = ""
 
 
 class TimelineRequest(BaseModel):
@@ -2114,6 +2484,108 @@ ASSEMBLY_ORPHANED_ERROR = (
 ASSEMBLY_STAGE_FAILED_ERROR = "Assembly failed at the {stage} stage: {detail}"
 
 
+def heal_orphaned_local_jobs(project: Project, live_job_ids: Container[str]) -> list[RenderJob]:
+    """Settle every local job with no process behind it. One rule, two callers.
+
+    A **local** job is one with an empty `prompt_id` — the marker `reconcilable_jobs` and the
+    frontend poll both key on, and today that is exactly the assembly job (`kind="post"`,
+    `target_id="assembly"`). Nothing on ComfyUI knows about it, so the in-process registry
+    handed in as `live_job_ids` is the only thing that can say it is still running; a
+    non-terminal local job absent from that registry is one nothing will ever settle.
+
+    A job carrying a `prompt_id` is **never** touched here, and that is the whole boundary.
+    ComfyUI is user-managed and outlives this process: a prompt submitted before a restart may
+    be executing on the Director's GPU right now, and healing it to `error` on the strength of
+    our own restart would throw away a render being paid for in GPU minutes. Those jobs are
+    the reconciler's — the queue, then history, then the three-tick settle — which asks ComfyUI
+    rather than assuming.
+
+    Called by the assemble route with the live registry, and once at startup with an empty one,
+    where "empty" is not a convenience: a process that has just started is running no
+    assemblies, so the registry *is* empty, and passing it makes the two callers the same
+    question rather than two rules that can drift. Mutates and returns what it changed; the
+    caller decides whether to save.
+    """
+    healed = [
+        job
+        for job in project.jobs
+        if job.kind == "post"
+        and not job.prompt_id
+        and job.status not in TERMINAL_JOB_STATUSES
+        and job.id not in live_job_ids
+    ]
+    for job in healed:
+        job.status = "error"
+        job.error = ASSEMBLY_ORPHANED_ERROR
+    return healed
+
+
+def heal_orphaned_local_jobs_at_startup(store: ProjectStore) -> int:
+    """Apply `heal_orphaned_local_jobs` to every readable project, once, at boot.
+
+    The gap this closes: a crash mid-export left the assembly job at `running`, and the only
+    thing that healed it was the *next assemble*. A Director reopening the project after a
+    crash therefore saw an export in progress that nothing would ever finish, and every gate
+    counting open local work went on refusing, until they happened to assemble again. Boot is
+    the honest moment for that verdict, because boot is the event that made it true.
+
+    **Startup must not be able to fail.** `ProjectStore.list` already skips a manifest it
+    cannot read or parse, so a corrupt project is invisible here rather than fatal; the
+    save is guarded per project so one unwritable directory cannot take the others down with
+    it; and the whole pass is guarded so no unforeseen store failure can stop the application
+    from serving. A project with nothing to heal is not written at all, so the common case
+    costs one read per project and no writes.
+
+    Returns how many jobs were healed, for the log line and for tests.
+    """
+    healed = 0
+    try:
+        projects = store.list()
+    # Broad on purpose: serving the application outranks this pass, so nothing the store can
+    # raise — a permission error, an exotic OS failure — may reach the caller.
+    except Exception:
+        logger.warning("Could not list projects for startup job healing", exc_info=True)
+        return 0
+    for project in projects:
+        # An empty registry, deliberately and not as a shortcut: this process has just
+        # started, so it is running no assemblies. See `heal_orphaned_local_jobs`.
+        jobs = heal_orphaned_local_jobs(project, ())
+        if not jobs:
+            continue
+        try:
+            store.save(project)
+        # Broad for the same reason, one project narrower: an unwritable project directory
+        # must not take the rest of the pass — or the boot — down with it.
+        except Exception:
+            logger.warning(
+                "Could not save healed jobs for project %s", project.id, exc_info=True
+            )
+            continue
+        healed += len(jobs)
+        logger.info(
+            "Healed %d interrupted local job(s) on project %s at startup", len(jobs), project.id
+        )
+    return healed
+
+
+class AssemblyRequest(BaseModel):
+    """The one thing an assemble request carries: which build to make.
+
+    A `Literal` for `H3Request.profile`'s reason — it puts the choices in `/openapi.json`
+    and turns an unknown preset into a 422 raised by *request validation*, which runs
+    before the route body and therefore before any ffmpeg process exists at all.
+
+    The default is `draft` because `draft` **is** the settings this application has
+    exported with since FR-22 (`assembly.DRAFT_PRESET`): every client that never learned
+    about presets — and the whole body-less history of this route — keeps getting the
+    byte-identical file it got yesterday. `master` is opt-in, and moves the encoder and
+    the delivery sample rate only — **neither preset normalizes loudness**, because the
+    export's audio track is the Director's own master song (`assembly.MASTER_PRESET`).
+    """
+
+    preset: Literal["draft", "master"] = DEFAULT_EXPORT_PRESET
+
+
 class AssemblyResponse(BaseModel):
     """What a completed assembly returns: the settled job and the measured facts.
 
@@ -2123,6 +2595,9 @@ class AssemblyResponse(BaseModel):
     """
 
     job: RenderJob
+    #: Which preset built this file — echoed rather than assumed, because "is this the
+    #: master?" is a question about a file on disk that the response is the only record of.
+    preset: str
     #: Media-relative path under the project's media dir — `exports/assembly_00001.mp4`.
     export: str
     #: The URL the existing project-media route serves it at, Range service included.
@@ -2394,6 +2869,15 @@ async def attempt_expansion(
             mode == "references"
             and any(citation.role in ("first", "last") for citation in shot.citations)
         ),
+        # Read off the payload the model is actually handed rather than off the project, so
+        # the rule and the data cannot disagree: `shot_expansion_input` emits `anchor` only
+        # for a citation whose Asset this project holds and whose anchor is non-blank, and
+        # the rule appears exactly when at least one of those keys does. A shot whose
+        # references carry no anchor gets the byte-identical system prompt it always got.
+        appearance_anchors=any(
+            "anchor" in reference
+            for reference in payload["shot"].get("references", [])
+        ),
     )
     rejected = ""
     rejected_problems: tuple[str, ...] = ()
@@ -2424,6 +2908,11 @@ async def attempt_expansion(
             # lyrics that no lyric-sheet comparison could catch (2026-08-19). Flagging it
             # makes the retry loop feed the removal back as a corrective turn.
             forbid_dialogue=shot.use_song_audio,
+            # The tags this shot was *handed* in `shot_expansion_input`, counted. A specialist
+            # citing <Picture 3> on a two-picture shot has invented a slot, and the retry loop
+            # is exactly where that gets fixed — for free, before a GPU pass, in the model's
+            # own next turn. `None` skips it; see `reference_slot_counts`.
+            reference_slots=reference_slot_counts(project, shot),
         )
         if checked.well_formed:
             return ShotExpansionOutcome(shot.id, "expanded", text=text, attempts=attempt)
@@ -2667,6 +3156,23 @@ DELETE_ASSET_CITED = (
     "{name} is cited by {shots}, and deleting it would leave those citations dangling — "
     "the render would refuse them one at a time. Remove it from those shots first."
 )
+#: How long an appearance anchor may be. It is an *anchor*, not a description: the Calliope
+#: teardown's own example is eight words ("a teenage girl with a chestnut ponytail and yellow
+#: rain jacket"), and the string is appended to every tag line of every prompt citing the asset,
+#: where a paragraph would crowd out the shot's own direction. The bound is generous enough for
+#: a sentence or two and small enough that it cannot become a second style bible; it is measured
+#: after trimming, exactly as the song-context bounds are.
+CONSISTENCY_PROMPT_LIMIT = 400
+
+#: The refusal, in `SONG_CONTEXT_TOO_LONG`'s shape and for its reason: it says what was not
+#: saved as well as what was wrong, because a 422 that only names the rule leaves the Director
+#: guessing whether their text is now half-applied.
+CONSISTENCY_PROMPT_TOO_LONG = (
+    "The appearance anchor for {name} is {length} characters, past the {limit} this "
+    "application stores for it. Nothing was saved. An anchor is a short phrase naming what "
+    "this asset looks like, carried into every prompt that cites it — shorten it and try again."
+)
+
 CANCEL_JOB_SETTLED = "This job is already {status}; there is nothing running to cancel."
 CANCEL_JOB_NOTE = (
     "Cancelled by the Director before it finished. Nothing was produced; render again "
@@ -3045,11 +3551,42 @@ def create_app(
         comfy.submit = submit_with_sage
     catalog = WorkflowCatalog(settings.workflow_root)
 
+    # Live render percentages, held in memory for as long as this process runs and written
+    # nowhere else. `progress_listener` owns one WebSocket to ComfyUI; `render_progress` is the
+    # `prompt_id → percent` map it fills and the `render-status` poll reads. Constructed here so
+    # the object always exists — every route can ask it for a percentage whether or not the
+    # socket ever connected — while the *task* is started by the lifespan below, because a task
+    # needs a running loop and `create_app` is called from plenty of places that have none.
+    render_progress = ProgressTracker()
+    progress_listener = ComfyProgressListener(settings.comfy_url, render_progress)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        """Start the progress listener for the served app, and take it with us on the way out.
+
+        `start` cannot fail: it creates a task, and the task owns every connection error. ComfyUI
+        being down at boot is the ordinary case — the Director launches it separately — and it
+        must cost the application nothing but a retry on a backoff. `stop` cancels the task and
+        closes the socket, so neither leaks past shutdown.
+
+        Deliberately the only thing in this hook. The startup work that must happen for *every*
+        caller — `heal_orphaned_local_jobs_at_startup` — stays inside `create_app` above, where
+        it runs for the many tests and scripts that never enter the app's lifespan at all.
+        """
+        progress_listener.start()
+        try:
+            yield
+        finally:
+            await progress_listener.stop()
+
     app = FastAPI(
         title="Music Video Producer",
         version="0.1.0",
         description="Standalone local-first music and music-video production studio.",
+        lifespan=lifespan,
     )
+    app.state.render_progress = render_progress
+    app.state.progress_listener = progress_listener
     app.state.settings = settings
     app.state.store = store
     app.state.comfy = comfy
@@ -3065,6 +3602,13 @@ def create_app(
     # local job whose id is not in here was orphaned by a restart and gets healed to `error`
     # at the next assemble. Held on `app.state` so tests can inspect it.
     app.state.live_assemblies = set()
+    # And once, here, for every project on disk: the restart that emptied that set is the
+    # event that orphaned the jobs, so this is the moment the verdict is honest, rather than
+    # whenever the Director next happens to assemble. Synchronous and inside `create_app`
+    # rather than on a lifespan hook, because `create_app` *is* this application's boot and a
+    # lifespan hook would not run for the many callers that never enter the app's context.
+    # It cannot raise: see `heal_orphaned_local_jobs_at_startup`. ComfyUI jobs are untouched.
+    app.state.startup_healed_jobs = heal_orphaned_local_jobs_at_startup(store)
 
     def get_project(project_id: str) -> Project:
         try:
@@ -3216,6 +3760,12 @@ def create_app(
             # it. Only reached once the gate above has let the replacement through, so a
             # refused save has cleared nothing.
             _detach_song_recovery_slots(project.song)
+        # Render state and approval are the dedicated routes', not a save's. Both gates compare
+        # the body against the stored Shot and refuse only a *difference*, so an ordinary save --
+        # which round-trips both fields on every Shot -- is untouched. After the Song gate rather
+        # than before it, so a body that changes both still gets the Song's refusal it always got.
+        _require_in_flight_status_kept(current, project.shots)
+        _require_approval_unchanged(current, project.shots)
         # The recovery slots and the document locks are server-owned, and this route binds a
         # whole client-supplied `Project` whose every field is defaulted. A body that simply
         # omits them — which is what any client written before they existed sends — arrives
@@ -3236,6 +3786,21 @@ def create_app(
         # the project to undifferentiated prose. The recovery slots were the first case of this;
         # a body that merely *omits* what it does not know about is the shape of all of them.
         project.messages = current.messages
+        # Every Asset's appearance anchor is server-owned here, for the third time this exact
+        # hole has been found in this exact route. `consistency_prompt` is a defaulted `str`,
+        # so a body that simply omits it — which is what every client written before it
+        # existed sends, and what any hand-rolled API call sends — arrives as `""` and one
+        # ordinary save would blank the Director's own text on every asset at once. Adopting
+        # the stored value by id means this route cannot write the field in either direction:
+        # the dedicated `PUT .../consistency-prompt` is its one writer, which is also what
+        # keeps it out of reach of anything a model can call.
+        #
+        # An asset in the body that the stored project does not hold gets `""` rather than
+        # whatever it carried, by the same rule: an anchor that arrived on this route was not
+        # set by the Director on the route that sets anchors.
+        stored_anchors = {asset.id: asset.consistency_prompt for asset in current.assets}
+        for asset in project.assets:
+            asset.consistency_prompt = stored_anchors.get(asset.id, "")
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -3248,6 +3813,11 @@ def create_app(
                 status_code=409,
                 detail="Project changed since it was loaded; refresh before replacing it",
             )
+        # The same two gates the whole-project `PUT` carries, on the same argument. This route is
+        # the *narrower* sibling and has been the guard hole at least as often, because a client
+        # that only wants to move a clip still sends every field of every Shot back.
+        _require_in_flight_status_kept(project, request.shots)
+        _require_approval_unchanged(project, request.shots)
         project.shots = request.shots
         return store.save(project)
 
@@ -3565,6 +4135,46 @@ def create_app(
         shutil.rmtree(store.project_dir(project_id))
         return {"deleted": project_id}
 
+    @app.put(
+        "/api/projects/{project_id}/assets/{asset_id}/consistency-prompt",
+        response_model=Project,
+    )
+    def replace_consistency_prompt(
+        project_id: str, asset_id: str, request: AssetConsistencyRequest
+    ) -> Project:
+        """Set this Asset's appearance anchor — the Director's own words, and the only writer.
+
+        The anchor wins over the generation prompt and over the vision summary everywhere a
+        description of this asset is consumed (`timeline._asset_description` writes that
+        ordering down), so it must never be written by anything that guesses. **Nothing in
+        this application infers one**: no route derives it from `Asset.prompt`, the vision
+        inspection route writes `vision` and only `vision`, no tool schema exposes it to a
+        model, and the generic full-project `PUT` re-adopts the stored value rather than
+        trusting a body. This route is the one door.
+
+        Written onto the *stored* Asset rather than a rebuilt one, `replace_song_context`'s
+        rule: there is no construction site here where `path`, `source` or `prompt_id` could
+        be defaulted away by an edit that was only ever about one string.
+
+        An empty body clears the anchor, which is what emptying the box means. Trimmed at the
+        edges and bounded by `CONSISTENCY_PROMPT_LIMIT`, measured after trimming; the refusal
+        happens before anything is assigned, so a rejected anchor leaves the asset untouched.
+        """
+        project = get_project(project_id)
+        asset = next((item for item in project.assets if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        anchor = request.consistency_prompt.strip()
+        if len(anchor) > CONSISTENCY_PROMPT_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=CONSISTENCY_PROMPT_TOO_LONG.format(
+                    name=asset.name, length=len(anchor), limit=CONSISTENCY_PROMPT_LIMIT
+                ),
+            )
+        asset.consistency_prompt = anchor
+        return store.save(project)
+
     @app.delete("/api/projects/{project_id}/assets/{asset_id}", response_model=Project)
     def delete_asset(project_id: str, asset_id: str) -> Project:
         """Remove one asset from the library — refused by name while any shot cites it.
@@ -3708,6 +4318,20 @@ def create_app(
             seed=request.seed,
         )
         project.jobs.append(job)
+        # **Deliberately NOT superseded**, and the music routes are the one place a leftover
+        # record is left standing on purpose. Every music job shares `target_id="song"` and
+        # this route has no per-target in-flight refusal, so two live records here is the
+        # easiest state in the application to reach — but the older one cannot do the harm
+        # supersession exists to prevent: `apply_job_history` gates song adoption on
+        # `Song.prompt_id`, which the assignment above has just replaced, so a late answer to
+        # it can never be pasted onto the Song that is now the project's.
+        #
+        # What it *can* still do is record where its audio landed. Settling it would stop it
+        # being reconciled at all, and its `output_files` — the one place an orphaned take is
+        # recoverable from, which
+        # `test_a_completing_music_job_matches_the_song_by_prompt_id_not_by_source` pins —
+        # would stay empty forever. That is a real loss traded for cleanup the three-tick
+        # settle already performs. See `batch.supersede_target_jobs`.
         store.save(project)
         return job
 
@@ -3768,6 +4392,9 @@ def create_app(
             seed=request.seed,
         )
         project.jobs.append(job)
+        # Not superseded either, for `generate_music`'s reason and by the same argument: a
+        # song planned here and a song generated there are both `kind="music"` on
+        # `target_id="song"`, and neither may lose its record of where its audio landed.
         store.save(project)
         return job
 
@@ -3860,6 +4487,18 @@ def create_app(
                 source="krea-multiview",
                 parent_id=source.id,
                 prompt=request.prompt,
+                # **The sheet inherits its source's appearance anchor.** A multiview
+                # promotion is the one child relationship in this application that promises
+                # the child depicts *the same subject unchanged* — that is what a turnaround
+                # sheet is, and `kind` is already inherited on that reasoning. The sheet is
+                # then the asset shots actually cite, so an anchor that stopped at the parent
+                # would be an anchor no render ever sees. It is a copy and not a link: the
+                # Director may correct one without the other, and a link would make editing
+                # a source silently rewrite what every shot citing the sheet is conditioned
+                # with.
+                #
+                # Contrast `edit_asset` below, which deliberately does not inherit.
+                consistency_prompt=source.consistency_prompt,
             )
             payload = build_multiview_payload(
                 image_name=image_name,
@@ -3941,6 +4580,18 @@ def create_app(
             source="h3-image-edit",
             parent_id=source.id,
             prompt=prompt,
+            # **An edit does NOT inherit the source's appearance anchor**, and that is the
+            # opposite decision to `generate_multiview` above on purpose. An anchor is an
+            # assertion about what a subject looks like; an AI Mod is the act of changing
+            # what it looks like ("put her in the black coat instead"). Copying the anchor
+            # onto the child would carry a description the edit was run to invalidate, and
+            # would carry it *silently* into every tag line and expansion citing the new
+            # asset — the exact "plausible and wrong" failure this codebase keeps refusing.
+            #
+            # So the child starts with no anchor, which means "no anchor stored" and produces
+            # the bare label everywhere, and the Director writes one for the edited look if
+            # they want one. Nothing is lost: the source keeps its own, and this route never
+            # touches the source.
         )
         try:
             payload = build_h3_image_edit_payload(
@@ -4221,6 +4872,35 @@ def create_app(
                     shot=shot_label(project, shot), problems=" ".join(problems)
                 ),
             )
+        # Then whether the prompt cites a reference slot this shot does not have. Before the
+        # payload and before ComfyUI, for the reason every other refusal on this route is: H3's
+        # media slots are anonymous, so `<Picture 3>` on a two-picture shot is not an error the
+        # sampler can report — it renders, plausibly, conditioned on nothing. Only the blocking
+        # half runs here; an attached-but-unmentioned picture is a warning and reaches the
+        # Director through the expansion's advisory list, never as a refusal.
+        #
+        # The text checked is what the submission actually sends: the stored expansion when there
+        # is one, the intent when there is not. The fallback's reference map is built from these
+        # same counts, so it can only ever cite slots that exist — which is why checking the
+        # intent rather than the assembled `Reference map: …` string loses nothing.
+        #
+        # `None` from `reference_slot_counts` means the count is not trustworthy for this shot and
+        # the check is skipped entirely; see that function for the two cases.
+        if (slots := reference_slot_counts(project, shot)) is not None:
+            blocking = [
+                problem.message
+                for problem in check_reference_bounds(
+                    shot.h3_prompt if shot.h3_prompt.strip() else shot.prompt, slots=slots
+                )
+                if problem.fatal
+            ]
+            if blocking:
+                raise HTTPException(
+                    status_code=422,
+                    detail=REFERENCE_BOUNDS_REFUSAL.format(
+                        shot=shot_label(project, shot), problems=" ".join(blocking)
+                    ),
+                )
         # The sync-correct offset of the take the submission below will produce — nonzero
         # only when the reference branch extends a song-audio window ahead of the shot.
         # Written onto the Shot with `prompt_id` at submission; see `Shot.latest_take_lead`.
@@ -4228,32 +4908,39 @@ def create_app(
         if spec.adapter == "h3-reference":
             references: list[dict[str, Any]] = []
             tags: list[str] = []
-            numbers = {"picture": 0, "video": 0, "audio": 0}
-            # Every citation this mode declares, in `citations_in_prompt_order`'s walk — which for
-            # a reference-only Shot is the reference-role citations in order, which the model
-            # guarantees is `asset_ids` in order for every Shot that has ever been saved — see
-            # `Shot._reconcile_citations`. Read from the citations rather than from the flat list
-            # because the citations are the truth: a Shot whose wolf has been given the
-            # middle-frame role must stop sending it as reference picture three, and `asset_ids`
-            # is the projection that stops naming it.
+            # Every citation this mode declares, numbered by `models.numbered_references` — which
+            # walks `citations_in_prompt_order`, which for a reference-only Shot is the
+            # reference-role citations in order, which the model guarantees is `asset_ids` in order
+            # for every Shot that has ever been saved — see `Shot._reconcile_citations`. Read from
+            # the citations rather than from the flat list because the citations are the truth: a
+            # Shot whose wolf has been given the middle-frame role must stop sending it as
+            # reference picture three, and `asset_ids` is the projection that stops naming it.
             #
             # One walk numbers the tags *and* appends the media, deliberately: the payload fills
             # its per-kind slots in list order, so `<Picture N>` in the map is the Nth picture
-            # appended here and nothing else. `shot_expansion_input` numbers the specialist's tags
-            # from the same function, which is what keeps the three numberings — map, expansion,
-            # slots — one numbering. The `mode_specification_problems` gate above has already
-            # refused any role this mode does not declare, so only `reference`, `first` and `last`
-            # can reach this loop.
-            for citation in citations_in_prompt_order(shot):
-                asset = next(
-                    (item for item in project.assets if item.id == citation.asset_id), None
-                )
+            # appended here and nothing else. `reference_map_tag_lines`, `reference_slot_counts`
+            # and `shot_expansion_input` call that same function, which is what keeps the four
+            # numberings — map, slots, expansion, payload — one numbering. The
+            # `mode_specification_problems` gate above has already refused any role this mode does
+            # not declare, so only `reference`, `first` and `last` can reach this loop.
+            for numbered in numbered_references(project, shot):
+                citation = numbered.citation
+                asset = numbered.asset
                 if not asset:
                     raise HTTPException(
                         status_code=422,
                         detail=f"Unknown reference asset: {citation.asset_id}",
                     )
                 label = shot.reference_labels.get(asset.id, asset.name)
+                # The prose half of the label: the same name, carrying the Asset's stored
+                # appearance anchor when it has one. `reference_map_tag_lines` composes it
+                # identically and the two must stay byte-for-byte the same sentence — the
+                # stored expansion and the submitted map are supposed to name the same slots.
+                #
+                # The anchor rides the *tag line only*, never `references[].label` below. That
+                # label names a media slot for a ComfyUI-side reader; the tag line is the prose
+                # the sampler is conditioned on, and only the second one is a description.
+                tag_label = anchored_label(asset, label)
                 if citation.role in REFERENCE_MAP_ROLE_TAGS:
                     # A keyframe riding the reference graph, per the guide's §2.2.2: the picture
                     # travels as an ordinary reference slot — no new node input, no graph change —
@@ -4270,7 +4957,6 @@ def create_app(
                                 kind=asset.kind,
                             ),
                         )
-                    numbers["picture"] += 1
                     references.append(
                         {
                             "kind": "picture",
@@ -4280,23 +4966,18 @@ def create_app(
                     )
                     tags.append(
                         REFERENCE_MAP_ROLE_TAGS[citation.role].format(
-                            number=numbers["picture"], label=label
+                            number=numbered.number, label=tag_label
                         )
                     )
                     continue
-                kind = (
-                    "video"
-                    if asset.kind == "video"
-                    else "audio"
-                    if asset.kind == "audio"
-                    else "picture"
-                )
                 references.append(
-                    {"kind": kind, "file": str(resolve_asset_path(project_id, asset)), "label": label}
+                    {
+                        "kind": numbered.kind,
+                        "file": str(resolve_asset_path(project_id, asset)),
+                        "label": label,
+                    }
                 )
-                numbers[kind] += 1
-                tag_name = {"picture": "Picture", "video": "Video", "audio": "Audio"}[kind]
-                tags.append(f"<{tag_name} {numbers[kind]}> is {label}")
+                tags.append(f"{numbered.tag} is {tag_label}")
             if shot.use_song_audio:
                 if not project.song or not project.song.path:
                     raise HTTPException(status_code=422, detail="A completed project song is required")
@@ -4353,8 +5034,12 @@ def create_app(
                         "trim": {"start": trim_start, "end": trim_end},
                     }
                 )
-                numbers["audio"] += 1
-                tags.append(f"<Audio {numbers['audio']}> is the master song for synchronization")
+                # One past every cited audio, from `song_audio_tag` — the same number the
+                # expansion input tells the specialist and `reference_map_tag_lines` writes.
+                tags.append(
+                    f"<Audio {song_audio_tag(project, shot)}> is the master song "
+                    "for synchronization"
+                )
             try:
                 payload = build_h3_reference_payload(
                     prompt=reference_prompt(
@@ -4606,6 +5291,19 @@ def create_app(
             seed=shot.seed,
         )
         project.jobs.append(job)
+        # Job-record hygiene, after the accept and not a gate. Every refusal above stands —
+        # in particular the `status != "ready"` one, which is what normally makes a second
+        # render for a live shot impossible. It stopped being enough when a whole-manifest write
+        # walked the status back underneath a live job; both generic writes now refuse that
+        # (`_require_in_flight_status_kept`, 2026-08-20), so no shipped route produces the state
+        # any more. It is still reachable by a manifest edited on disk, restored from a backup,
+        # or saved by a build older than the gate, and in that state the older record is not
+        # merely untidy: `apply_job_history` adopts by `target_id`, so a
+        # late answer to it would move `latest_output` back onto the older take and drop the
+        # newer one's review with it. See `batch.supersede_target_jobs`.
+        supersede_target_jobs(
+            project, kinds={"h3"}, target_id=shot.id, keep_job_id=job.id
+        )
         store.save(project)
         return job
 
@@ -5389,13 +6087,28 @@ def create_app(
         shot.approved_duration = 0
         return store.save(project)
 
-    async def run_tool(args: list[str]) -> tuple[int, str, str]:
+    async def run_tool(
+        args: list[str], on_progress: Callable[[int], None] | None = None
+    ) -> tuple[int, str, str]:
         """One ffmpeg/ffprobe invocation, event loop left free. Returns (rc, stdout, stderr).
 
         `vram.py`'s subprocess pattern: `create_subprocess_exec` (never a shell), stdin
         closed, both streams captured. A missing binary reads as a failed run with the
         absence in stderr rather than a 500 — ffmpeg not being on PATH is an environment
         fact the job's error field should carry in words.
+
+        With `on_progress`, stdout is read a line at a time — that is `-progress pipe:1`'s
+        channel, and reading it after the process exits would report nothing until there is
+        nothing left to report — **while a concurrent task drains stderr**. That task is the
+        whole point of the second branch: ffmpeg writes diagnostics to stderr throughout,
+        the pipe holds ~64 KB, and a parent that reads one pipe to completion before
+        touching the other deadlocks a long export against a full buffer with neither side
+        able to move. `communicate()` does this drain for the no-progress branch already,
+        which is why that branch is left exactly as it was.
+
+        `on_progress` receives elapsed *output microseconds*, and is called only for lines
+        that carry one; `parse_progress_us` refuses everything else, so a garbled or partial
+        line costs a callback, not the export.
         """
         try:
             process = await asyncio.create_subprocess_exec(
@@ -5406,23 +6119,43 @@ def create_app(
             )
         except FileNotFoundError:
             return 127, "", f"{args[0]} is not installed or not on PATH"
-        out, err = await process.communicate()
+        if on_progress is None:
+            out_bytes, err_bytes = await process.communicate()
+            out = out_bytes.decode("utf-8", "replace")
+            err = err_bytes.decode("utf-8", "replace")
+        else:
+            assert process.stdout is not None and process.stderr is not None
+            draining = asyncio.create_task(process.stderr.read())
+            lines: list[str] = []
+            while True:
+                raw = await process.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace")
+                lines.append(line)
+                microseconds = parse_progress_us(line)
+                if microseconds is not None:
+                    on_progress(microseconds)
+            err = (await draining).decode("utf-8", "replace")
+            await process.wait()
+            out = "".join(lines)
         code = process.returncode if process.returncode is not None else -1
-        return (
-            code,
-            out.decode("utf-8", "replace").strip(),
-            err.decode("utf-8", "replace").strip(),
-        )
+        return code, out.strip(), err.strip()
 
     @app.post("/api/projects/{project_id}/assemble", response_model=AssemblyResponse)
-    async def assemble_project(project_id: str) -> AssemblyResponse:
-        """Every approved take, trimmed to its window, joined to the master song. No body.
+    async def assemble_project(
+        project_id: str, request: AssemblyRequest | None = None
+    ) -> AssemblyResponse:
+        """Every approved take, trimmed to its window, joined to the master song.
 
         FR-22 through AD-9: local ffmpeg, never ComfyUI — `comfy.prompts` stays empty on
-        every path through here, refusal or success. No body for the approve route's
-        reason: every input is the manifest's, and the export is evidence assembled from
-        evidence — `approved_output` paths the server wrote from its own job records, a
-        song path the manifest records, windows the approve route snapshotted.
+        every path through here, refusal or success. The body carries **one** field, and
+        that is the whole of it: which preset to build. Everything else is the manifest's
+        for the approve route's reason — the export is evidence assembled from evidence:
+        `approved_output` paths the server wrote from its own job records, a song path the
+        manifest records, windows the approve route snapshotted. The body is optional and
+        defaults to `draft`, so the body-less request this route shipped with still means
+        exactly what it always meant.
 
         The order of refusals: state conflicts first (409 — the same request succeeds once
         the conflict clears), then the song (without a measured song duration the plan
@@ -5443,22 +6176,19 @@ def create_app(
         every job write, and only the job is patched on the fresh read — a Director
         editing shots mid-assembly loses nothing, and the export honestly reflects the
         plan as validated when the run began, which `job.inputs` records (FR-24 adapted).
+
+        The request being held open is also why the job carries `progress`: the AD-1 poll
+        deliberately ignores an empty-`prompt_id` job, so nothing else in the application
+        can say how far a multi-minute export has got. ffmpeg's own `-progress` clock is
+        written onto the job as it runs, and the Assembly bar reads it back.
         """
+        preset = EXPORT_PRESETS[(request or AssemblyRequest()).preset]
         project = get_project(project_id)
         # Heal orphans before judging "busy": a local job left `running` by a crash has no
-        # process behind it and nothing else will ever settle it.
-        healed = False
-        for job in project.jobs:
-            if (
-                job.kind == "post"
-                and not job.prompt_id
-                and job.status not in TERMINAL_JOB_STATUSES
-                and job.id not in app.state.live_assemblies
-            ):
-                job.status = "error"
-                job.error = ASSEMBLY_ORPHANED_ERROR
-                healed = True
-        if healed:
+        # process behind it and nothing else will ever settle it. The same rule startup
+        # applies, called with the live registry rather than an empty one — one function, so
+        # the two moments cannot come to different verdicts about one job record.
+        if heal_orphaned_local_jobs(project, app.state.live_assemblies):
             project = store.save(project)
         if any(
             job.kind == "post"
@@ -5602,25 +6332,58 @@ def create_app(
             settle(patch)
             return HTTPException(status_code=502, detail=message)
 
+        progress = ExportProgress(total_seconds=song_seconds)
+        reported = -1
+
+        def report(percent: int) -> None:
+            """Write a changed percent onto the job, and only a changed one.
+
+            Every save is a whole-manifest write with an fsync behind it, and ffmpeg
+            reports several times a second; throttling to whole-percent movement caps the
+            entire bar at 101 writes however long the export runs. `ExportProgress` is
+            already monotonic, so this cannot write a number that goes backwards either.
+            """
+            nonlocal reported
+            if percent == reported:
+                return
+            reported = percent
+
+            def patch(recorded: RenderJob) -> None:
+                recorded.progress = percent
+
+            settle(patch)
+
         try:
             intermediates: list[Path] = []
+            trimmed_seconds = 0.0
             for index, (clip, frames) in enumerate(
                 zip(plan.clips, plan.frames, strict=True)
             ):
                 dest = workdir / f"clip_{index:03d}.mp4"
                 rc, _out, err = await run_tool(
-                    trim_args(
-                        clip.source,
-                        dest,
-                        frames,
-                        plan.width,
-                        plan.height,
-                        offset=clip.offset,
-                    )
+                    with_progress(
+                        trim_args(
+                            clip.source,
+                            dest,
+                            frames,
+                            plan.width,
+                            plan.height,
+                            offset=clip.offset,
+                            preset=preset,
+                        )
+                    ),
+                    # `at` is a default argument, so the clip's own start on the timeline
+                    # is bound when the callback is made rather than read when it fires:
+                    # each trim restarts ffmpeg's clock at zero, and a reading has to be
+                    # placed at the clip it came from.
+                    on_progress=lambda microseconds, at=trimmed_seconds: report(
+                        progress.trim(at, microseconds)
+                    ),
                 )
                 if rc != 0 or not dest.is_file():
                     raise failed(f"trim ({clip.label})", err)
                 intermediates.append(dest)
+                trimmed_seconds += frames / ASSEMBLY_FPS
             list_file = workdir / "clips.txt"
             list_file.write_text(concat_manifest(intermediates), encoding="utf-8")
             candidate = workdir / export_name
@@ -5642,7 +6405,10 @@ def create_app(
                     )
                 elapsed_frames += frames
             rc, _out, err = await run_tool(
-                concat_args(list_file, song_path, candidate, overlays)
+                with_progress(
+                    concat_args(list_file, song_path, candidate, overlays, preset=preset)
+                ),
+                on_progress=lambda microseconds: report(progress.join(microseconds)),
             )
             if rc != 0 or not candidate.is_file():
                 raise failed("concat", err)
@@ -5669,10 +6435,15 @@ def create_app(
         def complete(recorded: RenderJob) -> None:
             recorded.status = "complete"
             recorded.output_files = [export_relative]
+            # 100 stated rather than inferred: ffmpeg's last reading is against a clock
+            # that can stop a few milliseconds short of the file it just wrote, and a
+            # finished export reading 99 % is a bar that never lands.
+            recorded.progress = 100
 
         settled = settle(complete)
         return AssemblyResponse(
             job=settled or job,
+            preset=preset.name,
             export=export_relative,
             export_url=f"/api/projects/{project_id}/media/{export_relative}",
             duration_seconds=measured,
@@ -5719,7 +6490,16 @@ def create_app(
         The model's answer is treated as *shape*, never as arithmetic: its shots carry the
         story (prompts, relative lengths, order), and `populate_windows` repairs the
         geometry into what assembly will later demand — contiguous from 0 to the song's
-        end, every window inside H3's reliable 4–15 s range. Each tiled window draws its
+        end, every window inside H3's reliable 4–15 s range.
+
+        The one number the model is *held* to is how many shots it returns, and that is a
+        judgement about shape, not arithmetic: the geometry is repaired either way, but a
+        four-shot answer to a three-minute song leaves each prompt smeared across a dozen
+        windows, which is a plan in name only. `populate_required_shots` computes the
+        count here, the instruction states it three times over as a hard constraint, the
+        reply is counted rather than believed, and a short one buys exactly one guided
+        retry at a lower temperature with the shortfall named in numbers. Each tiled
+        window draws its
         prompt from the proposal whose proportional span of the song contains it
         (`proposal_for_position`), so a count repair cannot orphan a window from the
         story. The shots land as ordinary drafts — mode, citations, singing and
@@ -5753,49 +6533,168 @@ def create_app(
         if not request.confirm_replace:
             raise HTTPException(status_code=422, detail=POPULATE_CONFIRM_REFUSAL)
         duration = project.song.duration
-        # The target window populate steers the model toward, and thereby the plan's
-        # typical shot length. NOT the midpoint of H3's 4–15 s training range: the
-        # creator's own preset table calls 5.17 s (124 frames) "fastest / safest", and
-        # the first live batch measured why — 124-frame renders take ~2–6 min while the
-        # 221-frame windows a 9.5 s mean produced took 2.2 HOURS each on this card
-        # (2026-08-19). ~5 s cuts also edit better for music video than 9 s holds.
-        window_mean = POPULATE_TARGET_WINDOW_SECONDS
         assets = (
             "; ".join(f"{asset.name} ({asset.kind})" for asset in project.assets)
             or "none yet"
         )
+        # The count comes from `POPULATE_TARGET_WINDOW_SECONDS`, the target window populate
+        # steers the model toward and thereby the plan's typical shot length. NOT the
+        # midpoint of H3's 4–15 s training range: the creator's own preset table calls
+        # 5.17 s (124 frames) "fastest / safest", and the first live batch measured why —
+        # 124-frame renders take ~2–6 min while the 221-frame windows a 9.5 s mean produced
+        # took 2.2 HOURS each on this card (2026-08-19). ~5 s cuts also edit better for
+        # music video than 9 s holds.
+        required = populate_required_shots(duration)
+        context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+        # Stage one of the two-stage populate, opt-in and skipped entirely when the
+        # Director has already marked the boxes: structure first, on its own, from the
+        # lyric sheet. It gets exactly one call and no retry — its whole premise is that a
+        # small ask succeeds where the combined one did not, so spending a second 300 s
+        # call to re-ask a small question would be arguing with the premise. If it comes
+        # back empty, `wants_sections` stays true below and the shots call asks for the
+        # structure the way it always has; nothing is lost but the one call.
+        staged_sections: list[SongSection] = []
+        if request.two_stage and not project.sections:
+            try:
+                structure = await director.plan(
+                    message=POPULATE_SECTIONS_INSTRUCTION.format(duration=duration),
+                    project_context=context,
+                    # This stage's *whole* output is `sections`, so that is what its
+                    # schema requires — and `shots` is pointedly left optional, because
+                    # HARD CONSTRAINT 3 asks this call to leave it empty and a schema
+                    # that demanded it would be arguing with the instruction beside it.
+                    # See `director_result_schema` for why the required set is the fix.
+                    response_schema=director_result_schema(require=("sections",)),
+                )
+            except DirectorUnavailable as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except DirectorError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            staged_sections = [
+                SongSection(label=label, start=start, duration=length, prompt=prompt)
+                for label, start, length, prompt in repair_sections(
+                    [
+                        (item.label, item.start, item.duration, item.prompt)
+                        for item in structure.sections
+                    ],
+                    duration,
+                )
+            ]
+        # Structure is only *asked for and demanded back* in the shots call when it is
+        # still unknown. Boxes the Director marked, or boxes stage one just produced, make
+        # the ask a second job bolted onto the one that matters — and an empty `sections`
+        # in the reply is then not an omission, so naming it in a retry would be noise.
+        known_sections = staged_sections or project.sections
+        wants_sections = not known_sections
         instruction = POPULATE_INSTRUCTION.format(
             duration=duration,
-            count=max(1, round(duration / window_mean)),
+            count=required,
             assets=assets,
+            sections_ask=POPULATE_SECTIONS_ASK if wants_sections else "",
+            sections_constraint=POPULATE_SECTIONS_CONSTRAINT if wants_sections else "",
         )
-        if project.sections:
+        if known_sections:
             section_map = "; ".join(
                 f"{section.label} {section.start:.1f}-{section.end:.1f}s"
                 + (f" ({section.prompt})" if section.prompt else "")
-                for section in project.sections
+                for section in known_sections
+            )
+            origin = (
+                "marked by the director"
+                if project.sections
+                else "just laid out in the structure pass"
             )
             instruction += (
-                " The song's sections, marked by the director, are: "
+                # Newline, not a leading space, and it is load-bearing: this branch runs
+                # only when `known_sections` is truthy, which is exactly when
+                # `sections_constraint` is empty — so a space glued the section map onto
+                # the end of "3. Every shot needs a non-empty `prompt`." and it read as a
+                # continuation of that constraint. Both neighbouring fragments
+                # (POPULATE_SECTIONS_CONSTRAINT, POPULATE_FINAL_CHECK) open with "\n";
+                # this one was the outlier. Found by the 2026-08-20 live run.
+                f"\nThe song's sections, {origin}, are: "
                 f"{section_map}. Shots must respect these boundaries — every shot sits "
                 "inside one section and takes that section's character."
             )
-        context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
-        try:
-            result = await director.plan(message=instruction, project_context=context)
-        except DirectorUnavailable as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
-        except DirectorError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-        proposals = sorted(
-            (shot for shot in result.shots if shot.prompt.strip()),
-            key=lambda shot: shot.start,
-        )
+        # Last, after the section map, so the count is the final thing the model reads.
+        instruction += POPULATE_FINAL_CHECK.format(count=required)
+        # The pattern's third and fourth parts: verify in code, then one guided retry with
+        # the fault named. Only the *count* buys the retry. A dropped `sections` rides
+        # along in the corrective feedback when a retry is being spent anyway, but does
+        # not trigger one on its own: sections are scaffolding the Director drags, this
+        # model family drops them on most rolls (the roadmap's run-2 measurement), and a
+        # check that fires on most rolls is a check that doubles every populate's cost.
+        attempt_message = instruction
+        result = None
+        proposals: list[Any] = []
+        for attempt in range(1, POPULATE_ATTEMPTS + 1):
+            try:
+                result = await director.plan(
+                    message=attempt_message,
+                    project_context=context,
+                    temperature=(
+                        PLAN_TEMPERATURE if attempt == 1 else POPULATE_RETRY_TEMPERATURE
+                    ),
+                    # The shots call cannot proceed without `shots`, so the grammar it is
+                    # decoded under must say so. Everything above this line — the count
+                    # stated three times, the final check, the guided retry — asks in
+                    # *words* for a field the schema did not require, and the constrained
+                    # decoder was free to close the object without it. That is the whole
+                    # of the measured `shots: []` failure.
+                    #
+                    # The required set follows the instruction rather than being fixed:
+                    # `sections` is demanded back only when `wants_sections` put the ask
+                    # and HARD CONSTRAINT 4 in the text above, so the grammar and the
+                    # words always agree about what this call owes. When the boxes are
+                    # already known the ask is dropped, and requiring a field nobody asked
+                    # for would make the model fabricate structure to close the object.
+                    #
+                    # Requiring both was measured, not assumed (2026-08-20, N=3 per arm):
+                    # the combined ask delivered shots *and* sections on 0 of 9 rolls
+                    # across runs 1–2 and on 3 of 3 with both fields required, at no cost
+                    # in shots or wall clock.
+                    response_schema=director_result_schema(
+                        require=("shots", "sections") if wants_sections else ("shots",)
+                    ),
+                )
+            except DirectorUnavailable as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except DirectorError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            proposals = sorted(
+                (shot for shot in result.shots if shot.prompt.strip()),
+                key=lambda shot: shot.start,
+            )
+            if len(proposals) >= required or attempt == POPULATE_ATTEMPTS:
+                break
+            # Read off the reply, never off `result.message`: the recorded failure mode is
+            # a model that narrates fields it did not emit.
+            problems = [
+                POPULATE_SHORT_COUNT_PROBLEM.format(
+                    returned=len(proposals), required=required
+                )
+            ]
+            if wants_sections and not result.sections:
+                problems.append(POPULATE_MISSING_SECTIONS_PROBLEM)
+            attempt_message = (
+                POPULATE_RETRY_PREFIX.format(problems="\n".join(problems)) + instruction
+            )
         if not proposals:
             raise HTTPException(
                 status_code=502,
                 detail=POPULATE_NO_PLAN_REFUSAL.format(
-                    message=(result.message or "").strip()[:300] or "(empty)"
+                    message=((result.message if result else "") or "").strip()[:300]
+                    or "(empty)"
+                ),
+            )
+        if len(proposals) < required:
+            # Loudly, and with nothing written: the destructive replace below has not
+            # happened yet, and a half-length plan laid over the Director's timeline would
+            # be worse than no plan at all.
+            raise HTTPException(
+                status_code=502,
+                detail=POPULATE_SHORT_PLAN_REFUSAL.format(
+                    required=required, duration=duration, returned=len(proposals)
                 ),
             )
         # Re-read after the await — the model can hold this open for minutes — and
@@ -5811,11 +6710,15 @@ def create_app(
                 detail="The project changed while the model was planning (a render or a "
                 "protection appeared). Nothing was replaced; try again.",
             )
-        # Sections come from the Director's own boxes when marked, else from the model's
-        # structure proposal (repaired: sorted, clamped, overlaps truncated) — Populate
-        # fills the section layer too, per the Director's design, and the boxes land on
-        # the track for dragging afterward.
-        if not project.sections and result.sections:
+        # Sections come from the Director's own boxes when marked, else from stage one's
+        # structure pass, else from whatever structure the shots call happened to volunteer
+        # (repaired: sorted, clamped, overlaps truncated) — Populate fills the section
+        # layer too, per the Director's design, and the boxes land on the track for
+        # dragging afterward. Stage one's list is carried across the re-read rather than
+        # re-derived: the fresh project is the one being written, and it has never seen it.
+        if not project.sections and staged_sections:
+            project.sections = staged_sections
+        elif not project.sections and result.sections:
             project.sections = [
                 SongSection(label=label, start=start, duration=length, prompt=prompt)
                 for label, start, length, prompt in repair_sections(
@@ -5861,11 +6764,21 @@ def create_app(
         # The mechanical fills the first run needed a hand-run script for, now populate's
         # own act (the run-2 audit's items 4 and 5):
         #
-        # * `performance` comes from the model — safe on this path, because the strict
-        #   json_schema's constrained decoder forces every key to be emitted, unlike the
-        #   tool-call path where this model family drops booleans — and maps onto
-        #   `singing`/`use_song_audio`. `resolve_shot_mode` then routes performance shots
-        #   to references automatically, so no mode needs writing.
+        # * `performance` comes from the model and maps onto `singing`/`use_song_audio`.
+        #   `resolve_shot_mode` then routes performance shots to references automatically,
+        #   so no mode needs writing. This used to say the strict json_schema's decoder
+        #   "forces every key to be emitted"; it does not, and did not — a field with a
+        #   default is not in `required`, so the decoder was free to omit it, and on
+        #   2026-08-20 one model omitted it on 4 of 5 rolls and every shot came through
+        #   here silently non-performance. `director_result_schema` now promotes
+        #   `performance` into `PlannedShot.required` whenever `shots` is required, which
+        #   is what makes the model decide per shot rather than fall through a default.
+        #   Note what that does *not* change: absent and `false` are indistinguishable by
+        #   the time a `PlannedShot` exists, so the line below still reads `not_singing`
+        #   off silence on any path where the grammar is not enforced (the schema-free
+        #   retry in `_completion`, a provider that ignores strict). Telling those apart
+        #   needs a tri-state on the shared chat schema and a live measurement of what
+        #   `singing="unknown"` does to expansion; neither was in this change.
         # * citations come from the prompt itself: the instruction commands exact asset
         #   names, so any asset whose name appears in a shot's prompt is cited as a
         #   reference. Deterministic, reviewable in the inspector, reversible per shot.
@@ -5929,6 +6842,95 @@ def create_app(
         return PopulateTimelineResponse(
             proposed=len(proposals), created=len(saved.shots), project=saved
         )
+
+    @app.post(
+        "/api/projects/{project_id}/timeline/snap-cuts",
+        response_model=SnapCutsResponse,
+    )
+    def snap_timeline_cuts(
+        project_id: str, request: SnapCutsRequest
+    ) -> SnapCutsResponse:
+        """Move each shot cut to the nearest moment the track leaves voiceless.
+
+        The Director's ruling on the roadmap's long-open "vocal transition points between
+        shots" item (2026-08-20): **cut placement is the lever.** Two adjacent references
+        shots each perform their own window of the song, so the mouth on A's last frame and
+        the mouth on B's first frame come from two calls that never saw each other. Placing
+        the cut where nobody is singing removes the mismatch instead of masking it, and costs
+        no GPU and no re-render.
+
+        Report first, apply on confirm — `populate`'s `confirm_replace` shape, enforced here
+        rather than trusted to the browser. Without `confirm_apply` this route **does not
+        call `store.save`**, and the response carries no project at all, so "nothing was
+        written" is visible on the wire rather than asserted in prose.
+
+        Every decision is `timeline.snap_cut_plan`'s; this route's only additions are the
+        project lookup, the in-flight set (the job records are the evidence, and
+        `shot_render_in_flight` is the one reader of them), the honest-empty refusals, and
+        the write. Nothing here renders, arms, queues or approves: the shots' windows move
+        and every other field on every shot is untouched.
+        """
+        project = get_project(project_id)
+        if not project.song or project.song.duration <= 0:
+            raise HTTPException(status_code=422, detail=SNAP_CUTS_NO_SONG)
+        rendering = frozenset(
+            shot.id for shot in project.shots if shot_render_in_flight(project, shot)
+        )
+        try:
+            plan = snap_cut_plan(
+                project, tolerance=request.tolerance, rendering=rendering
+            )
+        except TimelineError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        # The two honest-empty branches refuse rather than report, because there is nothing
+        # to report: no cut was examined. `unmeasured` is the one the codebase's absent-
+        # analysis convention is about — an empty `Song.vocal_spans` means *unmeasured, not
+        # silent* (`shot_vocal_overlap`), so the alternative to this sentence would be
+        # placing every cut in the plan against a silence nobody heard.
+        if plan.status in ("unmeasured", "no_cuts"):
+            raise HTTPException(status_code=422, detail=plan.message)
+        response = SnapCutsResponse(
+            applied=False,
+            status=plan.status,
+            tolerance=plan.tolerance,
+            moved=len(plan.moves),
+            skipped=len(plan.skips),
+            moves=[
+                SnapCutMove(
+                    before=move.before_label,
+                    after=move.after_label,
+                    boundary=move.boundary,
+                    proposed=move.proposed,
+                    shift=move.shift,
+                    gap=move.gap,
+                )
+                for move in plan.moves
+            ],
+            skips=[
+                SnapCutSkip(
+                    before=skip.before_label,
+                    after=skip.after_label,
+                    boundary=skip.boundary,
+                    reason=skip.reason,
+                )
+                for skip in plan.skips
+            ],
+            message=plan.message,
+        )
+        if not request.confirm_apply or not plan.moves:
+            return response
+        # Applied by shot id from the plan's own `windows`, which is the whole tiling —
+        # unchanged shots included — so the contiguity `snap_cut_plan` builds structurally is
+        # the contiguity that lands in the manifest, rather than being re-derived here from
+        # the moves and given a second chance to drift.
+        by_id = {shot.id: shot for shot in project.shots}
+        for shot_id, start, duration in plan.windows:
+            shot = by_id[shot_id]
+            shot.start = start
+            shot.duration = duration
+        response.project = store.save(project)
+        response.applied = True
+        return response
 
     @app.post("/api/projects/{project_id}/director/chat", response_model=Project)
     async def director_chat(project_id: str, request: DirectorRequest) -> Project:
@@ -6336,6 +7338,10 @@ def create_app(
                     duration=shot.duration,
                     expect_instruction=mode in H3_KEYFRAME_MODES,
                     forbid_dialogue=shot.use_song_audio,
+                    # The under-citation half of the reference bounds surfaces here and only
+                    # here: it is advisory, so it rides along with an applied answer rather
+                    # than refusing one.
+                    reference_slots=reference_slot_counts(project, shot),
                 ).problems
             ]
 
@@ -6782,12 +7788,23 @@ def create_app(
         the manifest is rewritten only when something actually moved, and a dead ComfyUI is a
         200 with `comfy_online: false` rather than a 502 — a poll loop must never turn a
         ComfyUI restart into a toast every two seconds.
+
+        Live percentages ride this same answer. The listener's map is *read* here and nothing
+        more: no request is made for it, no branch depends on it, and — the point — it is never
+        folded into the project, so `outcome.changed` is exactly what it was before and a tick
+        that learned only "the sampler is on step 7" still writes no manifest. A percentage that
+        moved `updated_at` twice a second would collide with every optimistic-concurrency check
+        the Director's own edits ride on.
         """
         project = get_project(project_id)
         outcome = await reconcile_render_jobs(project, comfy)
         if outcome.changed:
             store.save(project)
-        return render_status_report(project, comfy_online=outcome.comfy_online)
+        return render_status_report(
+            project,
+            comfy_online=outcome.comfy_online,
+            progress=render_progress.snapshot(),
+        )
 
     @app.get("/api/projects/{project_id}/jobs/{job_id}", response_model=RenderJob)
     async def read_job(project_id: str, job_id: str) -> RenderJob:

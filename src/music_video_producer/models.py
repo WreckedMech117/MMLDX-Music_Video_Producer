@@ -8,6 +8,14 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
+# The one mapping of kind → tag name, imported rather than re-spelled. `h3_prompt` is a leaf
+# module — it imports nothing from this package, by design, because it describes MiniMax's prompt
+# format and not this application's data — so this direction is the only one that cannot become a
+# cycle. **Nothing may ever import `models` from `h3_prompt`.** The names live there because that
+# is where the *checker* reads them, and the writer below must use the same three or a tag could
+# be written under a name the bounds check never counts.
+from .h3_prompt import REFERENCE_TAG_NAMES
+
 SongSource = Literal["imported", "generated"]
 AssetKind = Literal["character", "setting", "prop", "style", "image", "audio", "video"]
 ShotStatus = Literal["draft", "ready", "queued", "running", "complete", "error", "approved"]
@@ -119,6 +127,23 @@ class Asset(BaseModel):
     parent_id: str | None = None
     prompt: str = ""
     prompt_id: str = ""
+    #: The Director's own appearance anchor for this asset — a short stored phrase naming what
+    #: it looks like ("a woman in a red leather jacket and black boots"), carried into every
+    #: place a description of this asset is consumed: the reference map's tag lines, the H3
+    #: expansion specialist's per-reference block, and the assistant's asset library.
+    #:
+    #: **It is user-owned, and it wins.** Where an asset has both a `prompt` (what was asked
+    #: for) and a `vision` summary (what a model saw), this is what the Director says is true,
+    #: and it outranks both — `timeline._asset_description` is the one place that ordering is
+    #: written down. Nothing in this codebase infers it: no route derives it from `prompt`, no
+    #: vision inspection writes it, and no tool schema exposes it to a model. It is set by an
+    #: explicit `PUT` and by nothing else, which is the recorded rule for a mechanical field
+    #: (2026-08-19: a local model silently omitted the boolean fields it claimed to have set).
+    #:
+    #: Empty is the default and means *no anchor stored*, not "this asset looks like nothing".
+    #: Every consumer must produce byte-identical output for an empty anchor — that is what
+    #: makes the field safe to add to a manifest full of existing work.
+    consistency_prompt: str = ""
     vision: VisionInspectionRecord | None = None
     created_at: datetime = Field(default_factory=now_utc)
 
@@ -463,6 +488,71 @@ class Shot(BaseModel):
         return self.start + self.duration
 
 
+#: What a Shot made from another Shot inherits: the plan, and only the plan.
+#:
+#: Duplicate `structuredClone`d a Shot and reset `status` alone, so the copy arrived owning the
+#: original's take — it played that take in the Monitor, offered it in the takes strip, and read
+#: as approved where the original was. A brand-new Shot has rendered nothing and must not claim
+#: otherwise; and a copy carrying `prompt_id`/`latest_output`/`approved_output` also reads as
+#: `shot_render_provenance`, so the automated writers refuse to touch it for a render nobody ran.
+#:
+#: The three sets below partition `Shot.model_fields` exactly (with `id`, which is minted fresh),
+#: and `tests/test_frontend_contract.py` asserts that partition against the model itself: a field
+#: added to `Shot` and classified by nobody fails the suite instead of riding into every copy.
+#: This is the one classification; the client mirrors `SHOT_PLAN_CONTENT_FIELDS` to do the copy
+#: and the same test holds the two lists identical.
+SHOT_PLAN_CONTENT_FIELDS = frozenset(
+    {
+        "start",
+        "duration",
+        "prompt",
+        "h3_prompt",
+        "mode",
+        "asset_ids",
+        "citations",
+        "reference_labels",
+        "singing",
+        "use_song_audio",
+        "seed",
+    }
+)
+
+#: What names a take, a render, or a decision about one — never inherited.
+#:
+#: `status` is here because every value but the default describes a render; a new Shot is a
+#: `draft`, which is what `Shot.status`'s own default already says. `trim_nudge` and
+#: `latest_take_lead` select a slice of one specific file, and on a Shot with no file the pair
+#: would silently cut a future take at an offset nobody chose. `mix_take_audio` accepts *this
+#: take's* audio into the mix. `latest_review` is a vision report about a take that is not the
+#: copy's. `flagged` is AD-5's re-render mark — "a shot whose take fell short" — and inheriting
+#: it enlarges the flagged batch scope, which is GPU minutes spent on a shot nobody flagged.
+SHOT_TAKE_PROVENANCE_FIELDS = frozenset(
+    {
+        "status",
+        "prompt_id",
+        "latest_output",
+        "latest_review",
+        "approved_output",
+        "approved_start",
+        "approved_duration",
+        "latest_take_lead",
+        "trim_nudge",
+        "mix_take_audio",
+        "flagged",
+    }
+)
+
+#: Neither plan nor provenance: a hands-off the Director placed on *one* Shot.
+#:
+#: `shot_write_refusal` already keeps these apart — "a lock is a decision the Director made and
+#: provenance is a fact about media" — so `locked` is classified as what it is rather than filed
+#: under a heading that does not fit it. It is not inherited either: the copy exists to be worked
+#: on, and one that arrived locked would be refused by the sweeps, fills and re-renders the
+#: Director reaches for next, giving a reason they never set on it. Unlocked is the cheap,
+#: visible state; an inherited lock is invisible protection nobody asked for.
+SHOT_UNINHERITED_DECISION_FIELDS = frozenset({"locked"})
+
+
 def citations_in_role(shot: Shot, role: AssetRole) -> list[AssetCitation]:
     """This Shot's citations in one role, ordered.
 
@@ -479,12 +569,13 @@ def citations_in_role(shot: Shot, role: AssetRole) -> list[AssetCitation]:
 def citations_in_prompt_order(shot: Shot) -> list[AssetCitation]:
     """Every citation this Shot holds, in the one order a prompt may number them.
 
-    **This is the single definition of that order**, and both prompt channels read it: the
-    reference render numbers its `<Picture N>` tags and appends its media in this walk, and
-    `timeline.shot_expansion_input` hands the expansion specialist the same tags from the same
-    walk. The two must agree byte for byte, because the tag a prompt declares as "the first
-    frame" points at whichever anonymous media slot holds the same number — a numbering that
-    drifted between the two would render, plausibly, with the wrong picture pinned.
+    **This is the single definition of that order**, and every prompt channel reads it through
+    `numbered_references` below, which is the single definition of the *numbering* laid over it:
+    the reference render numbers its tags and appends its media in this walk, and
+    `timeline.shot_expansion_input` hands the expansion specialist the tags that walk assigned.
+    They must agree byte for byte, because the tag a prompt declares as "the first frame" points
+    at whichever anonymous media slot holds the same number — a numbering that drifted between the
+    two would render, plausibly, with the wrong picture pinned.
 
     Keyed on `(role, order)` — exactly the sort `shot_expansion_input` has always used — with a
     **stable** sort, so a reference-only Shot's sequence is `citations_in_role(shot,
@@ -496,22 +587,105 @@ def citations_in_prompt_order(shot: Shot) -> list[AssetCitation]:
     return sorted(shot.citations, key=lambda citation: (citation.role, citation.order))
 
 
+#: The citation roles whose tag names a concrete *frame*, and which therefore number into the
+#: Picture series whatever the cited Asset turns out to be. `app.REFERENCE_MAP_ROLE_TAGS` writes
+#: the sentence for each of these, and the submit route refuses a video or an audio cited in one
+#: of them (`REFERENCE_KEYFRAME_NOT_IMAGE`) before anything is numbered — so a keyframe slot is a
+#: picture slot by construction. A test pins this set equal to that mapping's keys, because a role
+#: added to one and not the other would number a frame into a series no payload fills.
+KEYFRAME_TAG_ROLES = frozenset({"first", "last"})
+
+
+@dataclass(frozen=True, slots=True)
+class NumberedReference:
+    """One of a Shot's citations, carrying the tag the render will wire it into.
+
+    `asset` is `None` for a citation whose Asset this project does not hold. Such a citation is
+    still *numbered* — the render refuses it by name and never reaches a payload, but the two
+    prompt surfaces have to agree about what the surviving tags are called, and a walk that
+    silently dropped it would number them one way here and another way there.
+    """
+
+    citation: AssetCitation
+    asset: Asset | None
+    kind: str
+    number: int
+
+    @property
+    def tag(self) -> str:
+        """`<Picture 2>`, `<Video 1>`, `<Audio 3>` — what a prompt names this slot by."""
+        return f"<{REFERENCE_TAG_NAMES[self.kind]} {self.number}>"
+
+
+def numbered_references(project: Project, shot: Shot) -> list[NumberedReference]:
+    """**The** reference numbering. Every citation this Shot holds, tagged as the payload wires it.
+
+    One rule, read by every surface that names a slot: `app.reference_map_tag_lines`, the submit
+    route's own walk, `app.reference_slot_counts` and `timeline.shot_expansion_input`. It is one
+    function because it was four, and two of them drifted: the expansion input numbered *every*
+    citation into the `<Picture N>` series while the route numbered per kind, so a shot citing a
+    video handed its specialist `<Picture 2>` for a slot the payload wires as `<Video 1>` — a
+    prompt naming a slot that does not hold what it claims, rendered plausibly and wrongly because
+    H3's media slots are anonymous (found 2026-08-20, fixed by deleting the second implementation).
+
+    Three counters, never one. H3 wires pictures, videos and audios into three separate per-kind
+    slot lists, so `<Picture 2>` and `<Video 2>` are different slots and neither is "the second
+    reference" — see `h3_prompt.REFERENCE_TAG_NAMES`.
+
+    The walk is `citations_in_prompt_order`, which is the single definition of the order a prompt
+    may number citations in, and the same walk the payload appends its media by. Kind is the
+    route's own classification: a keyframe role is a picture (see `KEYFRAME_TAG_ROLES`), then
+    videos and audios are themselves, and **everything else is a picture** — `character`,
+    `setting`, `prop`, `style` and `image` Assets all travel as pictures, and so does a citation
+    whose Asset is missing, because nothing is known about it and the picture series is where this
+    builder has always put it.
+    """
+    held = {asset.id: asset for asset in project.assets}
+    numbers = dict.fromkeys(REFERENCE_TAG_NAMES, 0)
+    numbered: list[NumberedReference] = []
+    for citation in citations_in_prompt_order(shot):
+        asset = held.get(citation.asset_id)
+        if citation.role in KEYFRAME_TAG_ROLES or asset is None:
+            kind = "picture"
+        elif asset.kind in ("video", "audio"):
+            kind = asset.kind
+        else:
+            kind = "picture"
+        numbers[kind] += 1
+        numbered.append(
+            NumberedReference(citation=citation, asset=asset, kind=kind, number=numbers[kind])
+        )
+    return numbered
+
+
 def song_audio_tag(project: Project, shot: Shot) -> int:
     """The `<Audio N>` number the master song holds in this Shot's reference payload.
 
     The render appends the song *after* every cited asset, so its number is one past the
     audio assets the Shot cites — today always 1, since Shots cite only pictures, but
     counted rather than assumed so a future audio citation cannot silently shift the tag
-    the expansion and the normalized `non_diegetic_music` field both point at. Same walk
-    as `citations_in_prompt_order`, same reason: one numbering, everywhere.
+    the expansion and the normalized `non_diegetic_music` field both point at. Counted off
+    `numbered_references`, so "which citations are audios" is decided once, in the same
+    place the cited audios get their own numbers: one numbering, everywhere.
     """
-    assets = {asset.id: asset.kind for asset in project.assets}
-    cited_audio = sum(
-        1
-        for citation in citations_in_prompt_order(shot)
-        if assets.get(citation.asset_id) == "audio"
-    )
-    return cited_audio + 1
+    return sum(1 for entry in numbered_references(project, shot) if entry.kind == "audio") + 1
+
+
+def reference_slot_totals(project: Project, shot: Shot) -> dict[str, int]:
+    """How many slots of each kind this Shot's render wires, master song included.
+
+    The counts `h3_prompt.check_reference_bounds` bounds a prompt against, and they are taken
+    from the numbering itself rather than counted a second time: the bound is "`<Picture N>` is
+    valid exactly when `N <= totals['picture']`", so the total has to *be* the highest number the
+    walk assigned or the check would be bounding against a different rule than the one that wrote
+    the tags. The master song's slot is `song_audio_tag`'s number for the same reason.
+    """
+    totals = dict.fromkeys(REFERENCE_TAG_NAMES, 0)
+    for entry in numbered_references(project, shot):
+        totals[entry.kind] = max(totals[entry.kind], entry.number)
+    if shot.use_song_audio:
+        totals["audio"] = song_audio_tag(project, shot)
+    return totals
 
 
 def resolve_shot_mode(shot: Shot) -> ShotMode:
@@ -711,6 +885,13 @@ class RenderJob(BaseModel):
     # inputs are the submitted graph, which `prompt_id` already names.
     inputs: list[str] = Field(default_factory=list)
     error: str = ""
+    #: Percent complete, 0-100, for the local work that can actually measure itself: assembly
+    #: reads ffmpeg's own `-progress` clock and writes it here as the export runs (AD-9). A
+    #: ComfyUI job never sets it — its progress lives on the ComfyUI queue, which the
+    #: reconciler reads instead — so 0 on a `flux`/`h3` job means "not reported", not "not
+    #: started". Defaulted, so every manifest written before this field existed loads
+    #: unchanged and round-trips through `store.py` with one more key and no other change.
+    progress: int = Field(default=0, ge=0, le=100)
     #: Consecutive reconcile ticks on which ComfyUI knew nothing about this job's prompt —
     #: absent from the queue AND from history. Reset to 0 the moment either answers. At
     #: `batch.MISSING_TICKS_LIMIT` the reconciler settles the job as its prompt having died
@@ -719,6 +900,15 @@ class RenderJob(BaseModel):
     #: rather than an immediate verdict because one absent tick is also what the seconds of
     #: a ComfyUI restart look like, and inventing an error there would be a lie.
     missing_ticks: int = 0
+    #: The id of the job that replaced this one for the same target, or "" — which is what
+    #: every job carries and what every manifest written before this field existed loads as.
+    #: Written only by `batch.supersede_target_jobs`, when a new render is accepted for a
+    #: target that still had an unsettled record: the leftover is settled as `cancelled` and
+    #: this names its successor, so a settled-by-supersession job stays distinguishable from
+    #: one the Director cancelled by hand and from one that failed. Nothing reads it for a
+    #: decision — it is provenance — and its `prompt_id` is deliberately left in place, so the
+    #: file an already-executing ComfyUI prompt still writes remains traceable to this record.
+    superseded_by: str = ""
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
 

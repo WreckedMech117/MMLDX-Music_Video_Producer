@@ -47,7 +47,22 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - `source`: upload, Flux, Krea multiview, or a later workflow adapter
 - optional `parent_id` linking a multiview sheet to its source character
 - `prompt`, `prompt_id`, `created_at`
+- `consistency_prompt`: the **appearance anchor** — see below
 - optional structured vision inspection: summary, visible identity/environment details, continuity cues, prompt cues, risks, model, and analysis time
+
+### The appearance anchor (`Asset.consistency_prompt`)
+
+One short phrase per asset naming what it looks like — "a woman in a red leather jacket and black boots" — carried into every place a description of that asset is consumed: the reference map's tag lines (`<Picture 1> is Lucy, a woman in a red leather jacket`), the H3 expansion specialist's per-reference block, and the assistant's asset library. Bounded at `CONSISTENCY_PROMPT_LIMIT` 400 characters, measured after trimming.
+
+**It is user-owned and it wins.** Where an asset has both a `prompt` (what was asked for) and a `vision` summary (what a model saw), the anchor is what the Director says is true and outranks both; `timeline._asset_description` is the one place that ordering is written down. **Nothing infers one.** No route derives it from `prompt`, the vision inspection writes `vision` and only `vision`, and neither model-facing schema (`FillShotsArguments`, `AssetProposal`) carries the property — the recorded rule for a mechanical field, after a local model twice omitted booleans it claimed to have set.
+
+`PUT /api/projects/{id}/assets/{asset_id}/consistency-prompt` is its **only** writer. In particular the generic full-project `PUT` re-adopts the stored value per asset id and writes `""` for an id the stored project does not hold, so an ordinary whole-manifest save can neither blank an anchor nor invent one. That is the same server-owned treatment the document recovery slots, the document locks and the message thread already get on that route, and for the same recorded reason: the body is a whole `Project` whose every field is defaulted, so a client that merely *omits* a field is indistinguishable from one that cleared it.
+
+Empty means **no anchor stored**, not "this looks like nothing", and every consumer produces byte-identical output for it — which is what makes the field safe to add to a manifest full of existing work. Whitespace-only collapses to empty; the stored text is whitespace-collapsed when composed, because the anchor travels inside one-line prompt sentences where a line break reads as a shot boundary to the H3 specialist.
+
+A per-shot `Shot.reference_labels` rename and an anchor compose as apposition — `the woman upstage, a woman in a red leather jacket`. The rename says who this picture is *in this shot*; the anchor says what she looks like in every shot. A rename meant to replace the appearance too is expressed by clearing the anchor, which is a decision about the asset rather than about one shot.
+
+Child assets: a **Krea multiview sheet inherits** its source's anchor (the promotion's whole promise is that the child depicts the same subject unchanged, and the sheet is the asset shots actually cite), by copy rather than by link. An **AI Mod edit does not** — an edit is the act of changing what the subject looks like, so inheriting would carry a description the edit was run to invalidate.
 
 ## Shot
 
@@ -83,6 +98,8 @@ Shot timing is measured in seconds against the master song. Director compilation
 **`None` means undeclared, and that is deliberate.** A `Shot.mode` field already existed as a dropdown position nobody read, carrying legacy strings. Reading those as declarations would have changed what existing shots render, so they resolve to *undeclared* instead, and the new vocabulary deliberately shares no spelling with them (`"reference"` became `"references"`) so the two can never be confused. An undeclared shot resolves the way it always behaved — citations present means references, absent means text-only — and renders a byte-identical payload, pinned by digests taken from the previous commit.
 
 **Roles live on the citation, never on the asset.** The same library asset is a reference in one shot and a middle frame in another; the wolf is not "a middle frame", it is a middle frame *in this shot*. Putting the role on the asset would force a duplicate per part and make a plan unrevisable. `citations` is the truth and `asset_ids` is its projection onto the reference role, kept in agreement by a model validator in both directions — so a legacy manifest migrates on read without being rewritten, and re-roling an asset to `middle` stops it being sent as a reference picture.
+
+**One reference numbering, in one function.** `models.numbered_references` lays the tags over `citations_in_prompt_order`'s walk and is the only thing that assigns them: the stored reference map, the payload submitted to ComfyUI, the bounds count and the expansion input handed to the specialist all read it. Three counters, never one — H3 wires pictures, videos and audios into three separate per-kind slot lists, so `<Picture 2>` and `<Video 2>` are different slots and neither is "the second reference" — with keyframe roles numbering into the Picture series (a frame is a picture) and the master song taking the slot after every cited audio. It is one function because it was two: the expansion input ran its own single-series counter, so a shot citing a video told its specialist `<Picture 2>` for the slot the payload wires as `<Video 1>`, and H3's slots are anonymous enough that the take would have come back plausible and wrong (found and fixed 2026-08-20). A citation whose asset the project does not hold is still numbered, so the surviving tags do not shift; the render refuses it by name.
 
 **`singing` is tri-state on purpose.** It is a `Literal`, not `bool | None`, so `if not shot.singing` cannot quietly mean "not singing". `unknown` is not `not_singing`: the LTX enhancer moves lip position, so a wrong default in either direction is worse than an honest absence. **Nothing infers it** — a test greps all of `src/` for any assignment that would. It is a property of the *performance*, not of the mode, because a references shot may or may not be a singing shot.
 
@@ -121,9 +138,10 @@ Messages saved before 2026-08-17 carry no `notices` and still have the old inlin
 - `output_files[]` — an assembly records its export here, media-relative (`exports/assembly_00001.mp4`)
 - `inputs[]` — FR-24 adapted for local work: what the job consumed, as `"<shot_id>=<approved_output>"` pairs, so an export is rebuildable from its record. Empty for every ComfyUI job, whose inputs are the submitted graph `prompt_id` already names
 - exact `error`
+- `superseded_by` — the id of the job that replaced this one for the same target, or empty. Written only when a new render is accepted for a target that still had an unsettled record (`batch.supersede_target_jobs`): the leftover settles as `cancelled` and this names its successor, which is what tells a superseded record from one the Director cancelled by hand. Provenance only — nothing reads it for a decision — and the superseded record keeps its `prompt_id`, so a file an already-executing ComfyUI prompt still writes stays traceable to it
 - timestamps
 
-A `running` local job whose process died with the application — a restart's leftover — is healed to `error` by the next assemble rather than blocking forever; the in-process registry of live assemblies is the one truth about "still running" for jobs no ComfyUI history can settle.
+A `running` local job whose process died with the application — a restart's leftover — is healed to `error` **at application startup and again at the next assemble**, by one rule called at both moments, rather than blocking forever; the in-process registry of live assemblies is the one truth about "still running" for jobs no ComfyUI history can settle, and boot passes the empty registry a just-started process actually has. A job carrying a `prompt_id` is never healed this way: ComfyUI is user-managed and may still be executing it, so it stays the reconciler's.
 
 ## Provenance rule
 

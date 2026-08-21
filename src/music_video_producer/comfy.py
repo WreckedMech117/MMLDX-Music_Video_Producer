@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import contextlib
+import json
 import logging
+import math
+import os
+import struct
+import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -196,3 +205,500 @@ class ComfyClient:
         subfolder = quote(str(item.get("subfolder", "")))
         media_type = quote(str(item.get("type", "output")))
         return f"{self.base_url}/view?filename={filename}&subfolder={subfolder}&type={media_type}"
+
+
+# ----------------------------------------------------------------------------------------------
+# Live render progress.
+#
+# ComfyUI's HTTP surface can say *whether* a prompt is queued or running and nothing about how
+# far through it is: `/prompt` returns a queue count, `/queue` returns membership, and
+# `/internal/progress` is a 404 on 0.33.1. The only per-step channel this build has is the
+# WebSocket at `/ws`, so this half of the module opens one, reads it, and holds the answer in
+# memory for the AD-1 poll to pick up.
+#
+# **Three properties, each load-bearing:**
+#
+# * *Nothing here is persisted.* A percentage is derived state that is stale the moment it is
+#   read, and writing one into the manifest would bump `Project.updated_at` twice a second —
+#   which `PUT /api/projects/{id}` compares, so every tick would arm an optimistic-concurrency
+#   collision against whatever the Director is editing. See `ProgressTracker`.
+# * *Nothing here can break a render.* The socket is an enhancement bolted beside the existing
+#   transport, never in front of it. It is never awaited by a submission, never consulted by the
+#   reconciler, and every failure it can have — refused, dropped, upgraded to a shape nobody
+#   recognises — degrades to "no percentage is shown" and to nothing else.
+# * *Nothing here touches ComfyUI's lifecycle.* It connects, reads, and reconnects. It never
+#   submits, interrupts, or clears anything; ComfyUI is user-managed.
+# ----------------------------------------------------------------------------------------------
+
+#: Frames larger than this end the connection rather than being buffered. ComfyUI's JSON status
+#: messages are kilobytes; only a binary preview image could approach this, and a listener that
+#: can be made to allocate a gigabyte by a malformed length field is a listener that can take the
+#: application down. The reconnect that follows costs a second.
+MAX_WS_FRAME_BYTES = 8 * 1024 * 1024
+
+
+class WebSocketClosed(RuntimeError):
+    """The ComfyUI progress socket ended, cleanly or otherwise. Never fatal to anything."""
+
+
+def progress_from_message(message: Any) -> tuple[str, int] | None:
+    """One ComfyUI WebSocket message → ``(prompt_id, percent)``, or ``None`` for everything else.
+
+    Pure, and deliberately forgiving: this reads a *foreign* wire format from a component the
+    Director upgrades independently of this application, so an unrecognised message, a missing
+    field, a string where a number was expected, or a shape from some future build is answered
+    with ``None`` — never an exception. A progress reader that can raise inside a socket loop is
+    a progress reader that can take the socket down and lose the percentages it exists to carry.
+
+    **The shapes, as observed live against ComfyUI 0.33.1** (see the 2026-08-20 development-log
+    entry, which quotes captured messages):
+
+    * ``{"type": "progress_state", "data": {"prompt_id": "...", "nodes": {"<id>": {"value": 3.0,
+      "max": 20.0, "state": "running", ...}}}}`` — the build's primary channel, emitted by
+      `comfy_execution/progress.py`'s `WebUIProgressHandler` on every node start, step and
+      finish. ``nodes`` holds every *non-pending* node, so the sampler's step counter arrives
+      alongside the one-unit nodes around it.
+    * ``{"type": "progress", "data": {"value": 3, "max": 20, "prompt_id": "...", "node": "31"}}``
+      — the older single-node form. 0.33.1 does not emit it; it is read anyway so that a
+      downgrade, or a custom node that still sends it, keeps working.
+
+    The live capture also recorded ``status`` and, from an installed custom node,
+    ``crystools.monitor`` once a second. Neither carries a fraction. Nor do ``executing``,
+    ``executed``, ``execution_start``, ``execution_cached``, ``execution_success``,
+    ``execution_error`` or ``feature_flags``, and all of them are ignored here. The job's
+    *settlement* is `/queue` and `/history`'s business, exactly as it was before this socket
+    existed; nothing in this module decides a job's status.
+
+    **Only nodes that count steps are counted** — the ones reporting ``max > 1``. Everything else
+    is skipped, and a message with no such node returns ``None``, which the interface draws as
+    *unknown* rather than as a number.
+
+    That rule comes straight off the capture, and the alternative was measured to be wrong. The
+    observed Flux graph is fourteen nodes; ComfyUI reports each one as ``0/1`` then ``1/1`` as it
+    is walked, and reports a node only once it has *started*. Averaging over the whole reported
+    map therefore reads ``1/1 = 100%`` on the very first message — which is exactly what the
+    first implementation of this function did, and the live run showed it pinned at 100% for
+    twenty-five of the render's twenty-six seconds. A denominator that only exists once the work
+    has begun cannot measure the work.
+
+    What it can measure is a step counter, and one node in each of this application's graphs has
+    one: the sampler, which is also where nearly all of the time goes (in the capture, node 15
+    ran ten steps across roughly the last twenty-four seconds of a twenty-six second render). So
+    the answer is ``Σvalue / Σmax`` across the step-counting nodes, and *unknown* while models are
+    still loading — because at that point nothing has said anything a percentage could be made of,
+    and inventing one is the thing this feature must not do.
+
+    **The stated cost.** A graph with two sequential samplers would read 100% when the first one
+    finished, and `ProgressTracker`'s monotonic floor would hold it there while the second ran.
+    Every adapter in `workflows.py` builds exactly one sampling node, so nothing this application
+    submits behaves that way; the render is still plainly marked RENDERING throughout, and the
+    job's real status comes from `/queue` as it always did.
+    """
+    if not isinstance(message, dict):
+        return None
+    data = message.get("data")
+    if not isinstance(data, dict):
+        return None
+    kind = message.get("type")
+    if kind == "progress_state":
+        prompt_id = data.get("prompt_id")
+        nodes = data.get("nodes")
+        if not isinstance(prompt_id, str) or not prompt_id or not isinstance(nodes, dict):
+            return None
+        done = 0.0
+        total = 0.0
+        for state in nodes.values():
+            if not isinstance(state, dict):
+                continue
+            fraction = _node_fraction(state.get("value"), state.get("max"))
+            if fraction is None:
+                continue
+            node_done, node_total = fraction
+            done += node_done
+            total += node_total
+        if total <= 0:
+            return None
+        return prompt_id, _percent(done, total)
+    if kind == "progress":
+        prompt_id = data.get("prompt_id")
+        if not isinstance(prompt_id, str) or not prompt_id:
+            return None
+        fraction = _node_fraction(data.get("value"), data.get("max"))
+        if fraction is None:
+            return None
+        done, total = fraction
+        return prompt_id, _percent(done, total)
+    return None
+
+
+def _node_fraction(value: Any, maximum: Any) -> tuple[float, float] | None:
+    """``(done, total)`` for one step-counting node, or ``None`` when it counts no steps.
+
+    `bool` is excluded explicitly: it is an `int` in Python, and a `True` that arrived where a
+    step count belongs would silently count as one completed step.
+
+    ``max <= 1`` is the "not a step counter" case and the reason this returns ``None`` for most
+    of a graph: ComfyUI gives every ordinary node a one-unit bar it fills the instant it starts.
+    Counting those is what made the first live run read 100% while the render had barely begun.
+    """
+    if isinstance(value, bool) or isinstance(maximum, bool):
+        return None
+    if not isinstance(value, (int, float)) or not isinstance(maximum, (int, float)):
+        return None
+    total = float(maximum)
+    done = float(value)
+    # NaN and the infinities are refused outright: `math.isfinite` is the only check that
+    # catches a JSON `Infinity` before it becomes a percentage of nothing.
+    if not math.isfinite(total) or not math.isfinite(done) or total <= 1:
+        return None
+    return min(max(done, 0.0), total), total
+
+
+def _percent(done: float, total: float) -> int:
+    """The rounded percentage, with no clamp of its own — deliberately.
+
+    A clamp here would be unreachable code, and unreachable code is a guard nobody can test:
+    `_node_fraction` has already bounded every contribution into ``0 <= done <= total``, so the
+    sum obeys the same bounds and the ratio cannot leave ``[0, 1]``. Clamping in both places was
+    measured by mutation: with the per-node clamp present, removing this one changed nothing any
+    test could see. The per-node clamp is the one that matters, because it is what stops a single
+    node reporting past its own maximum from inflating the whole prompt's figure.
+    """
+    return round(100.0 * done / total)
+
+
+class ProgressTracker:
+    """Live percentages, keyed by ``prompt_id``, held **only** in this process's memory.
+
+    Not a model field, not a manifest key, not a row anywhere. `RenderJob.progress` exists and is
+    written by the local ffmpeg export (AD-9) — that one is a persisted number because an export
+    is this application's own work and the record is its only witness. A ComfyUI percentage is
+    not: it changes several times a second, it is meaningless the instant the render settles, and
+    persisting it would make `store.save` — and therefore `Project.updated_at`, which
+    `PUT /api/projects/{id}` compares — move on a timer. The startup healer already refuses to
+    save a project it changed nothing on for exactly this reason.
+
+    Attribution is by ``prompt_id`` and by nothing else, so a batch of concurrent renders keeps
+    one entry each and no job can ever read another's number.
+
+    Monotonic per prompt: a reported percentage never moves backwards. The denominator genuinely
+    grows as ComfyUI starts more nodes (see `progress_from_message`), so a raw reading can dip;
+    a bar that goes backwards reads as a bug, and the floor is still a true statement about work
+    already done.
+
+    Bounded: `capacity` entries, oldest evicted first. A long session submits an unbounded number
+    of prompts and this map must not grow with it.
+    """
+
+    def __init__(self, capacity: int = 64) -> None:
+        self.capacity = max(1, capacity)
+        self._percent: OrderedDict[str, int] = OrderedDict()
+
+    def apply(self, message: Any) -> str | None:
+        """Fold one WebSocket message in. Returns the prompt it moved, or ``None``."""
+        parsed = progress_from_message(message)
+        if parsed is None:
+            return None
+        prompt_id, percent = parsed
+        held = self._percent.get(prompt_id)
+        if held is not None and percent < held:
+            percent = held
+        self._percent[prompt_id] = percent
+        self._percent.move_to_end(prompt_id)
+        while len(self._percent) > self.capacity:
+            self._percent.popitem(last=False)
+        return prompt_id
+
+    def percent(self, prompt_id: str) -> int | None:
+        """This prompt's percentage, or ``None`` — which means *unknown*, not zero.
+
+        The distinction is the whole honesty of the feature. ``0`` is "ComfyUI has reported this
+        render and no step of it is done"; ``None`` is "nobody has said anything" — a socket that
+        never connected, a prompt still waiting in the queue, a build whose messages this module
+        does not recognise. The interface shows the plain RENDERING word for ``None`` and a real
+        ``0%`` for zero, and never invents a number for either.
+        """
+        return self._percent.get(prompt_id)
+
+    def snapshot(self) -> dict[str, int]:
+        return dict(self._percent)
+
+    def forget(self, prompt_id: str) -> None:
+        self._percent.pop(prompt_id, None)
+
+    def clear(self) -> None:
+        self._percent.clear()
+
+
+class ComfyWebSocket:
+    """A minimal RFC 6455 client, read-only, over `asyncio.open_connection`.
+
+    Hand-rolled rather than added as a dependency. This application ships with four runtime
+    packages and a frontend with none; `httpx` — already here — does not speak WebSocket, and the
+    alternative was pulling `websockets` in for one read loop against one localhost service. What
+    is actually needed is small and closed: connect, read text frames, answer a ping, close. It
+    sends no application data at all, so the masking path exists only for the control frames a
+    conforming client must mask.
+    """
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._reader = reader
+        self._writer = writer
+
+    @classmethod
+    async def connect(
+        cls, base_url: str, *, client_id: str, timeout: float = 10.0
+    ) -> ComfyWebSocket:
+        parts = urlsplit(base_url)
+        secure = parts.scheme in ("https", "wss")
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port or (443 if secure else 80)
+        path = f"{parts.path.rstrip('/')}/ws?clientId={quote(client_id)}"
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=secure or None), timeout=timeout
+        )
+        socket = cls(reader, writer)
+        try:
+            await asyncio.wait_for(socket._handshake(host, port, path), timeout=timeout)
+        except BaseException:
+            await socket.close()
+            raise
+        return socket
+
+    async def _handshake(self, host: str, port: int, path: str) -> None:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        self._writer.write(request.encode("ascii"))
+        await self._writer.drain()
+        status = await self._reader.readline()
+        if b" 101" not in status:
+            raise WebSocketClosed(
+                f"ComfyUI did not upgrade the progress socket: {status.decode('latin-1').strip()!r}"
+            )
+        while True:
+            line = await self._reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+
+    async def receive(self) -> str | None:
+        """The next text message, or ``None`` for a frame that carries no text.
+
+        ``None`` rather than a filtered loop so the caller still sees that the connection is
+        alive — a binary preview frame is traffic, and traffic is what tells the reconnect logic
+        the socket is healthy. Raises `WebSocketClosed` when the peer goes away.
+        """
+        payload = bytearray()
+        message_opcode = 0
+        while True:
+            fin, opcode, chunk = await self._read_frame()
+            if opcode == 0x8:
+                raise WebSocketClosed("ComfyUI closed the progress socket")
+            if opcode == 0x9:
+                await self._send_frame(0xA, chunk)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                message_opcode = opcode
+                payload = bytearray(chunk)
+            elif opcode == 0x0:
+                payload += chunk
+            else:
+                raise WebSocketClosed(f"Unknown WebSocket opcode {opcode:#x}")
+            if not fin:
+                continue
+            if message_opcode != 0x1:
+                return None
+            try:
+                return payload.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+
+    async def _read_frame(self) -> tuple[bool, int, bytes]:
+        header = await self._readexactly(2)
+        first, second = header[0], header[1]
+        fin = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", await self._readexactly(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", await self._readexactly(8))[0]
+        if length > MAX_WS_FRAME_BYTES:
+            raise WebSocketClosed(f"Refusing a {length}-byte WebSocket frame")
+        mask = await self._readexactly(4) if masked else b""
+        payload = await self._readexactly(length) if length else b""
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        return fin, opcode, payload
+
+    async def _readexactly(self, count: int) -> bytes:
+        try:
+            return await self._reader.readexactly(count)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as error:
+            raise WebSocketClosed(f"ComfyUI progress socket ended: {error!r}") from error
+
+    async def _send_frame(self, opcode: int, payload: bytes = b"") -> None:
+        mask = os.urandom(4)
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", length)
+        header += mask
+        header += bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self._writer.write(bytes(header))
+        await self._writer.drain()
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._send_frame(0x8)
+        with contextlib.suppress(Exception):
+            self._writer.close()
+        with contextlib.suppress(Exception):
+            await self._writer.wait_closed()
+
+
+class ComfyProgressListener:
+    """Keeps one socket open to ComfyUI and folds what it says into a `ProgressTracker`.
+
+    **Every failure mode is the same failure mode: no percentage.** ComfyUI down at boot — a very
+    ordinary state, since the Director starts it separately — is a connect error, a backoff, and
+    a retry; a restart mid-render is a drop and a reconnect; an unrecognised message is dropped by
+    `progress_from_message`. Nothing here is awaited by a submission and nothing here can raise
+    into one. The reconciler goes on reading `/queue` and `/history`, jobs settle, outputs land.
+
+    The backoff never spins hot: it doubles from `min_backoff` to `max_backoff` and resets only
+    when a connection actually delivered a message, so a socket that accepts and instantly drops
+    backs off exactly like one that refuses.
+
+    No `client_id` is sent with submissions, deliberately. ComfyUI targets execution messages at
+    the submitting client's socket when a prompt carried a `client_id` and **broadcasts them to
+    every socket when it did not** (`server.py`'s `send_json`, `sid=None`). Every submission this
+    application makes omits it, so these messages are broadcast — which is why this listener sees
+    them without one byte of any submission changing, and why the Director's own ComfyUI browser
+    tab goes on showing the same progress it always did. Claiming the client id would have taken
+    that away from them to gain nothing.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        tracker: ProgressTracker | None = None,
+        *,
+        client_id: str | None = None,
+        connect: Callable[[], Awaitable[Any]] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        min_backoff: float = 1.0,
+        max_backoff: float = 30.0,
+        connect_timeout: float = 10.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.tracker = tracker or ProgressTracker()
+        self.client_id = client_id or f"mvp-{uuid.uuid4().hex[:12]}"
+        self.min_backoff = min_backoff
+        self.max_backoff = max_backoff
+        self.connect_timeout = connect_timeout
+        self._connect = connect
+        self._sleep = sleep or asyncio.sleep
+        self._task: asyncio.Task[None] | None = None
+        self._socket: Any = None
+        #: Connection attempts and delivered messages, for the log line and for the tests that
+        #: prove a refused socket backs off instead of spinning. `stops` counts completed calls
+        #: to `stop`, which is the only observable an app-shutdown test has: the lifespan hook
+        #: leaves nothing else behind, and a hook that silently stopped calling it would
+        #: otherwise leak a task past shutdown with every assertion still green.
+        self.attempts = 0
+        self.messages = 0
+        self.stops = 0
+
+    def ingest(self, raw: Any) -> str | None:
+        """One raw frame → the tracker. Text is decoded as JSON; anything else is dropped."""
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return None
+        return self.tracker.apply(raw)
+
+    async def open(self) -> Any:
+        if self._connect is not None:
+            return await self._connect()
+        return await ComfyWebSocket.connect(
+            self.base_url, client_id=self.client_id, timeout=self.connect_timeout
+        )
+
+    @property
+    def running(self) -> bool:
+        """Whether a listening task is currently alive. Nothing decides anything on this — it is
+        for the shutdown test and for a log line."""
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        """Begin listening. Idempotent, and it cannot fail — the first connect is the task's."""
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self.run(), name="comfy-progress")
+
+    async def stop(self) -> None:
+        """Cancel the task and close the socket. Leaks neither across an app shutdown."""
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        socket, self._socket = self._socket, None
+        if socket is not None:
+            with contextlib.suppress(Exception):
+                await socket.close()
+        self.stops += 1
+
+    async def run(self) -> None:
+        backoff = self.min_backoff
+        while True:
+            self.attempts += 1
+            try:
+                socket = await self.open()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - every reachability failure is the same
+                logger.debug("ComfyUI progress socket unavailable: %r", error)
+                await self._sleep(backoff)
+                backoff = min(backoff * 2, self.max_backoff)
+                continue
+            self._socket = socket
+            try:
+                while True:
+                    raw = await socket.receive()
+                    self.messages += 1
+                    backoff = self.min_backoff
+                    if raw is not None:
+                        self.ingest(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - a dropped socket is not this app's error
+                logger.debug("ComfyUI progress socket closed: %r", error)
+            finally:
+                self._socket = None
+                with contextlib.suppress(Exception):
+                    await socket.close()
+            await self._sleep(backoff)
+            backoff = min(backoff * 2, self.max_backoff)

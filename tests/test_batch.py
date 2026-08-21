@@ -9,6 +9,7 @@ from typing import get_args
 
 from music_video_producer.batch import (
     JOB_LOST_WITH_QUEUE,
+    JOB_SUPERSEDED,
     MISSING_TICKS_LIMIT,
     NEAR_DUPLICATE_OVERLAP,
     PLACEHOLDER_PROMPT,
@@ -35,6 +36,7 @@ from music_video_producer.batch import (
     reconcile_render_jobs,
     render_status_report,
     shot_label,
+    supersede_target_jobs,
 )
 from music_video_producer.comfy import ComfyError, HistoryResult
 from music_video_producer.models import (
@@ -744,3 +746,201 @@ def test_the_status_report_is_the_fixed_shape_and_carries_no_editable_field():
         job.status = "complete"
     assert render_status_report(project).active is False
     assert render_status_report(Project(name="No song")).song is None
+
+
+# --- Live progress on the poll answer ----------------------------------------------------
+
+
+def test_the_report_carries_a_live_percentage_for_each_open_job_that_has_one():
+    """The Director's ask, on the one answer the browser already polls: how far along is it.
+
+    Attribution is by `prompt_id` and the row is keyed by `job_id`, so a batch of concurrent
+    renders lands one row each with no chance of crossing. A job ComfyUI has said nothing about
+    gets no row at all -- absence is how "unknown" is spelled, and it is what makes the surfaces
+    fall back to exactly what they drew before this existed.
+    """
+    project = render_plan()
+    report = render_status_report(project, progress={"prompt-flux": 35, "prompt-h3": 80})
+
+    assert {row.job_id: row.percent for row in report.progress} == {
+        "job_flux": 35,
+        "job_h3": 80,
+    }
+    assert {row.prompt_id for row in report.progress} == {"prompt-flux", "prompt-h3"}
+    # The music job is open too, and nothing has been said about it: no row, not a zero.
+    assert "job_music" not in {row.job_id for row in report.progress}
+
+
+def test_no_progress_at_all_is_an_empty_list_and_never_an_invented_zero():
+    """The socket is down, or ComfyUI is. Every other field of the report is unchanged, and the
+    percentage is simply absent -- a fabricated number is worse than none."""
+    project = render_plan()
+
+    assert render_status_report(project).progress == []
+    assert render_status_report(project, progress={}).progress == []
+    assert render_status_report(project, comfy_online=False).progress == []
+    # ...and the rest of the answer is exactly what it was without the argument.
+    assert render_status_report(project).model_dump(
+        exclude={"progress"}
+    ) == render_status_report(project, progress={"prompt-flux": 50}).model_dump(
+        exclude={"progress"}
+    )
+
+
+def test_a_reported_zero_reaches_the_report_where_an_absent_one_does_not():
+    project = render_plan()
+    report = render_status_report(project, progress={"prompt-flux": 0})
+
+    assert [(row.job_id, row.percent) for row in report.progress] == [("job_flux", 0)]
+
+
+def test_a_settled_job_keeps_no_percentage_and_a_stranger_prompt_is_never_adopted():
+    """Two ways a number could be wrong: left over from a render that finished, or belonging to
+    somebody else's prompt entirely -- the socket is broadcast, so other clients' renders are on
+    it too. Neither is reported."""
+    project = render_plan()
+    for job in project.jobs:
+        job.status = "complete"
+
+    assert render_status_report(project, progress={"prompt-flux": 60}).progress == []
+
+    project.jobs[0].status = "queued"
+    report = render_status_report(
+        project, progress={"prompt-flux": 60, "somebody-elses-prompt": 90}
+    )
+    assert [(row.job_id, row.percent) for row in report.progress] == [("job_flux", 60)]
+
+
+def test_a_percentage_out_of_range_is_clamped_rather_than_refused():
+    """The model would reject anything outside 0-100 outright, and a poll answer that 500s
+    because a number was odd is a worse failure than a clamped number."""
+    project = render_plan()
+    report = render_status_report(
+        project, progress={"prompt-flux": 140, "prompt-h3": -20}
+    )
+
+    assert {row.job_id: row.percent for row in report.progress} == {
+        "job_flux": 100,
+        "job_h3": 0,
+    }
+
+
+def test_reporting_progress_writes_nothing_onto_the_project():
+    """The load-bearing one. `render_status_report` is pure, and a percentage must not become a
+    field on a job, a shot or the manifest -- see `comfy.ProgressTracker` for why."""
+    project = render_plan()
+    before = project.model_dump_json()
+
+    render_status_report(project, progress={"prompt-flux": 35, "prompt-h3": 80})
+
+    assert project.model_dump_json() == before
+    # `RenderJob.progress` is the local ffmpeg export's persisted field (AD-9). No ComfyUI job
+    # ever writes it, and a live percentage passing through this function must not start.
+    assert [job.progress for job in project.jobs] == [0, 0, 0, 0]
+
+
+# --- Supersession: the leftover record, and only it -------------------------------------
+
+
+def superseding_plan() -> Project:
+    """One shot with a stale open job, the new job that replaced it, and four bystanders.
+
+    Every bystander differs from the stale record in exactly one way -- a different target,
+    a different kind, an already-terminal status -- so a rule that widened along any one of
+    those axes has something here to break.
+    """
+    return Project(
+        name="Supersede",
+        shots=[Shot(id="shot_a", start=0, duration=5, prompt="A corridor")],
+        jobs=[
+            RenderJob(id="job_stale", kind="h3", status="queued", prompt_id="p-1",
+                      target_id="shot_a", missing_ticks=2),
+            RenderJob(id="job_other_shot", kind="h3", status="running", prompt_id="p-2",
+                      target_id="shot_b"),
+            RenderJob(id="job_other_kind", kind="ltx", status="queued", prompt_id="p-3",
+                      target_id="shot_a"),
+            RenderJob(id="job_settled", kind="h3", status="complete", prompt_id="p-4",
+                      target_id="shot_a", output_files=["takes/old.mp4"]),
+            RenderJob(id="job_new", kind="h3", status="queued", prompt_id="p-5",
+                      target_id="shot_a"),
+        ],
+    )
+
+
+def test_supersede_settles_exactly_the_stale_record_and_leaves_the_new_one_open():
+    project = superseding_plan()
+    # Snapshot the bystanders before the call rather than rebuilding the plan afterwards:
+    # `RenderJob.created_at`/`updated_at` default to the clock, so two constructions differ
+    # whenever the clock ticks between them. That made this assertion fail about one run in
+    # five for a reason that had nothing to do with supersession.
+    before = {job.id: job.model_copy(deep=True) for job in project.jobs}
+
+    changed = supersede_target_jobs(
+        project, kinds={"h3"}, target_id="shot_a", keep_job_id="job_new"
+    )
+
+    assert [job.id for job in changed] == ["job_stale"]
+    jobs = {job.id: job for job in project.jobs}
+    # The stale record: settled, distinguishable, and still naming its prompt.
+    assert jobs["job_stale"].status == "cancelled"
+    assert jobs["job_stale"].error == JOB_SUPERSEDED
+    assert jobs["job_stale"].superseded_by == "job_new"
+    assert jobs["job_stale"].prompt_id == "p-1"
+    # The counter meant "how close is this to being settled", and it is settled.
+    assert jobs["job_stale"].missing_ticks == 0
+    # The new job is untouched -- not settled, not marked, still the one to watch.
+    assert jobs["job_new"].status == "queued"
+    assert jobs["job_new"].superseded_by == ""
+    assert jobs["job_new"].error == ""
+    # Every bystander is byte-identical to how it arrived.
+    for job_id in ("job_other_shot", "job_other_kind", "job_settled"):
+        assert jobs[job_id] == before[job_id]
+
+
+def test_supersession_releases_the_poll_and_is_a_no_op_the_second_time():
+    """`active` is the browser's whole polling contract, and a settled record leaves it."""
+    project = superseding_plan()
+    assert {job.id for job in reconcilable_jobs(project)} == {
+        "job_stale", "job_other_shot", "job_other_kind", "job_new"
+    }
+
+    supersede_target_jobs(project, kinds={"h3"}, target_id="shot_a", keep_job_id="job_new")
+
+    assert "job_stale" not in {job.id for job in reconcilable_jobs(project)}
+    # Idempotent for the same submission: `cancelled` is terminal, so repeating the call finds
+    # nothing left to settle and cannot re-point a `superseded_by` that already names a job.
+    assert supersede_target_jobs(
+        project, kinds={"h3"}, target_id="shot_a", keep_job_id="job_new"
+    ) == []
+    assert next(job for job in project.jobs if job.id == "job_stale").superseded_by == "job_new"
+
+    # A *third* render supersedes the second, and names itself -- the chain does not collapse
+    # onto the first successor.
+    project.jobs.append(
+        RenderJob(id="job_third", kind="h3", status="queued", prompt_id="p-6", target_id="shot_a")
+    )
+    changed = supersede_target_jobs(
+        project, kinds={"h3"}, target_id="shot_a", keep_job_id="job_third"
+    )
+    assert [job.id for job in changed] == ["job_new"]
+    assert next(job for job in project.jobs if job.id == "job_new").superseded_by == "job_third"
+    assert next(job for job in project.jobs if job.id == "job_stale").superseded_by == "job_new"
+
+
+def test_a_superseded_record_is_distinguishable_from_a_hand_cancellation():
+    """Both are `cancelled`; only one names a successor. That is the whole distinction."""
+    project = superseding_plan()
+    by_hand = next(job for job in project.jobs if job.id == "job_other_shot")
+    by_hand.status = "cancelled"
+    by_hand.error = "Cancelled by the Director before it finished."
+
+    supersede_target_jobs(project, kinds={"h3"}, target_id="shot_a", keep_job_id="job_new")
+
+    assert by_hand.superseded_by == ""
+    assert next(job for job in project.jobs if job.id == "job_stale").superseded_by == "job_new"
+
+
+def test_supersession_defaults_to_absent_on_every_manifest_written_before_it():
+    """The field is defaulted, so a job record that predates it loads unchanged."""
+    assert RenderJob(kind="h3").superseded_by == ""
+    assert RenderJob.model_validate_json('{"kind": "h3"}').superseded_by == ""

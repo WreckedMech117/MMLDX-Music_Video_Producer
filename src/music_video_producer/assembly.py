@@ -341,13 +341,86 @@ def assembly_plan(
 
 
 # ------------------------------------------------------------------------------------------
+# Export presets (Phase 4.2). Two named builds of the same plan — one to review a cut with,
+# one to deliver — and nothing else about assembly changes between them: the same clips, the
+# same cumulative grid, the same trim rule, the same verification.
+# ------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ExportPreset:
+    """One build's encoder settings. Everything a preset can move lives here and nowhere
+    else, so "what does `master` actually do differently" is one object rather than a grep."""
+
+    name: str
+    #: libx264's speed/efficiency dial, applied at the *trim* stage — which is where the
+    #: only video encode happens, because the join stream-copies (`-c:v copy`).
+    x264_preset: str
+    crf: str
+    #: Filters appended to the export's audio, in order. Empty for `draft`, which is what
+    #: keeps its join argv byte-identical to the one this application has always built.
+    audio_filters: tuple[str, ...] = ()
+
+
+#: `draft` is **exactly what this application has shipped since FR-22** — veryfast/CRF 18 on
+#: the trims, no audio filter on the join — and it is the default for precisely that reason:
+#: an "Assemble" click that names no preset must keep producing the byte-identical file it
+#: produced yesterday. It is also already cheap (veryfast is the second-fastest x264 preset),
+#: so "draft is at least as fast as today's export" holds by identity rather than by promise.
+DRAFT_PRESET = ExportPreset(name="draft", x264_preset="veryfast", crf="18")
+
+#: **`master` normalizes no loudness, by the Director's ruling of 2026-08-20.** It used to
+#: carry `loudnorm=I=-16:TP=-1.5:LRA=11`, the broadcast/podcast convention Calliope ships —
+#: and that is the wrong instrument here. The export's audio track *is* the Director's master
+#: song: either supplied already mastered or produced by MiniMax Music 3. Re-normalizing it
+#: re-masters someone's finished work, and -16 LUFS audibly pulls a modern music master down
+#: — measured on this machine, a -8.50 LUFS source came out of the old master preset at
+#: -16.20 LUFS, a 7.7 LU haircut nobody asked for. The song's own levels are the delivery.
+#:
+#: The sample-rate conform stays, on its own merits rather than by inheritance. Its original
+#: reason is gone: `loudnorm` ran internally at 192 kHz and handed that on, AAC caps at
+#: 96 kHz, and a 44.1 kHz song therefore *used* to deliver at 96 kHz — reproduced, and it no
+#: longer happens (44.1 kHz in, 44.1 kHz out, with no filter at all). What remains is the
+#: source this application actually takes: a Director-supplied master can be any rate, and a
+#: 192 kHz one still lands at 96 kHz through AAC's ceiling — also reproduced. This makes the
+#: delivery rate deterministic at the one rate video delivery expects, and it is level-
+#: transparent, which is the property the ruling cares about: a clean tone measured -27.15
+#: LUFS before and -27.15 LUFS after. Sample-rate conversion is not mastering.
+MASTER_SAMPLE_RATE = "aresample=48000"
+
+#: `master` is the delivery build: a slower x264 preset and a lower CRF for the picture (both
+#: land at the trim stage, the only encode), `-movflags +faststart` — which the join has
+#: always carried, for both presets — and the 48 kHz conform above on the audio. Nothing here
+#: touches the song's level.
+MASTER_PRESET = ExportPreset(
+    name="master",
+    x264_preset="slow",
+    crf="16",
+    audio_filters=(MASTER_SAMPLE_RATE,),
+)
+
+#: Name → preset. The route's `Literal` is asserted against these keys, so a preset added
+#: here and not offered on the wire fails loudly rather than becoming unreachable.
+EXPORT_PRESETS: dict[str, ExportPreset] = {
+    preset.name: preset for preset in (DRAFT_PRESET, MASTER_PRESET)
+}
+DEFAULT_EXPORT_PRESET = DRAFT_PRESET.name
+
+
+# ------------------------------------------------------------------------------------------
 # ffmpeg argv construction — pure, and pinned by tests, because a flag drifting here is a
 # render defect that no Python test would otherwise see.
 # ------------------------------------------------------------------------------------------
 
 
 def trim_args(
-    source: Path, dest: Path, frames: int, width: int, height: int, offset: float = 0.0
+    source: Path,
+    dest: Path,
+    frames: int,
+    width: int,
+    height: int,
+    offset: float = 0.0,
+    preset: ExportPreset = DRAFT_PRESET,
 ) -> list[str]:
     """One take → one normalized intermediate: exact frame count, target geometry, no audio.
 
@@ -359,6 +432,11 @@ def trim_args(
     the margin, and the window is the slice from the offset. The filter chain scales
     aspect-preserved, pads to center, conforms the rate and pins yuv420p so every
     intermediate is concat-identical.
+
+    The preset moves two literals and nothing else — the x264 speed dial and the CRF. This
+    is where the export's only video encode happens (the join copies), so it is where a
+    delivery build is decided. Omitted, it is `draft`, whose two values are the two this
+    function has always written.
     """
     skip = round(offset * ASSEMBLY_FPS)
     stages = (
@@ -386,9 +464,9 @@ def trim_args(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        preset.x264_preset,
         "-crf",
-        "18",
+        preset.crf,
         dest.as_posix(),
     ]
 
@@ -423,6 +501,7 @@ def concat_args(
     song: Path,
     dest: Path,
     overlays: list[AudioOverlay] | None = None,
+    preset: ExportPreset = DRAFT_PRESET,
 ) -> list[str]:
     """All intermediates → the export, master song plus any *accepted* take audio.
 
@@ -439,7 +518,15 @@ def concat_args(
     level untouched — mixing under the song must never duck the song
     (spec-take-audio-mix, the Director's own wording). `duration=first` ends the mix at
     the song, exactly as `-shortest` already ends the container.
+
+    The preset's audio filters ride the *end* of whichever audio path this builds — `-af`
+    when the song is the only source, the tail of the mix graph when it is not — so what
+    they see is the finished programme and not one contributor to it. A preset with no
+    audio filters writes no `-af` and no trailing separator on the graph, which is what
+    keeps `draft` byte-identical to the argv it always built; `master` carries only the
+    48 kHz delivery conform, and **neither preset touches the song's loudness**.
     """
+    audio_chain = ",".join(preset.audio_filters)
     if not overlays:
         return [
             "ffmpeg",
@@ -458,6 +545,7 @@ def concat_args(
             "0:v:0",
             "-map",
             "1:a:0",
+            *(["-af", audio_chain] if audio_chain else []),
             "-c:v",
             "copy",
             "-c:a",
@@ -487,7 +575,9 @@ def concat_args(
     graph = (
         ";".join(chains)
         + f";[1:a]{''.join(labels)}amix=inputs={len(overlays) + 1}"
-        + ":duration=first:normalize=0[mix]"
+        + ":duration=first:normalize=0"
+        + (f",{audio_chain}" if audio_chain else "")
+        + "[mix]"
     )
     return [
         "ffmpeg",
@@ -520,6 +610,97 @@ def concat_args(
         "+faststart",
         dest.as_posix(),
     ]
+
+
+# ------------------------------------------------------------------------------------------
+# Progress. ffmpeg will report its own clock if asked; the alternative is a Director staring
+# at a held-open request with nothing to read. Pure here, executed by the route.
+# ------------------------------------------------------------------------------------------
+
+
+def with_progress(args: list[str]) -> list[str]:
+    """The same ffmpeg command, told to report — and only that.
+
+    `-progress pipe:1` opens a stdout channel of `key=value` lines; `-nostats` closes the
+    interactive stderr line that would otherwise carry the same information a second time
+    and, being unterminated, would not survive line reading anyway. Both are *global*
+    options, so they go in front of the inputs, and **neither writes a byte to the output
+    file** — which is what lets the pinned argv above stay the description of what this
+    application encodes while the route still runs the reporting form.
+    """
+    return [args[0], "-progress", "pipe:1", "-nostats", *args[1:]]
+
+
+def parse_progress_us(line: str) -> int | None:
+    """One `-progress` line → elapsed output microseconds, or ``None`` for anything else.
+
+    ffmpeg writes a block of `key=value` lines per interval, of which exactly one is the
+    clock. Every other key, the `N/A` this one carries before the first frame lands, a
+    blank line, and a fragment a pipe handed over mid-word are all *not a number this can
+    use*, and are ignored rather than raised: a progress reader that can kill an export is
+    worse than an export with no progress reader.
+    """
+    key, separator, value = line.strip().partition("=")
+    if not separator or key != "out_time_us":
+        return None
+    try:
+        microseconds = int(value)
+    except ValueError:
+        return None
+    return microseconds if microseconds >= 0 else None
+
+
+#: How the bar is split between assembly's two ffmpeg stages. The trims re-encode every frame
+#: of the timeline; the join stream-copies them (`-c:v copy`) and re-encodes only audio, which
+#: on the synthetic clips this is tested against runs two orders of magnitude faster. 90/10 is
+#: therefore roughly where the wall clock goes. It is a reporting weight and nothing else — no
+#: output, no verification and no refusal reads it.
+TRIM_SHARE = 0.9
+
+
+@dataclass(slots=True)
+class ExportProgress:
+    """Percent complete across a whole assembly, fed from ffmpeg's own clock.
+
+    Monotonic by construction, because the stages are not: each trim restarts the clock
+    against its own clip, so a raw reading walks backwards several times per export. Every
+    reading can only raise the number here, and 100 is a ceiling rather than an arithmetic
+    outcome — a song measured a hair shorter than the frames laid against it must not report
+    101 %, which `RenderJob.progress` would refuse outright. `total_seconds` is the export's
+    known duration; a plan with no length reports 0 rather than dividing by it.
+    """
+
+    total_seconds: float
+    percent: int = 0
+
+    def trim(self, elapsed_seconds: float, out_time_us: int) -> int:
+        """A trim's clock, placed on the timeline: the finished clips before it, plus how
+        far into this one ffmpeg has read."""
+        done = elapsed_seconds + max(0.0, out_time_us / 1_000_000)
+        return self._advance(TRIM_SHARE * self._fraction(done) * 100)
+
+    def join(self, out_time_us: int) -> int:
+        """The join's clock, which already runs against the whole export."""
+        fraction = self._fraction(max(0.0, out_time_us / 1_000_000))
+        return self._advance((TRIM_SHARE + (1 - TRIM_SHARE) * fraction) * 100)
+
+    def _fraction(self, seconds: float) -> float:
+        """A stage's own clock as a share of the export, capped at its whole.
+
+        The cap is the *only* thing bounding the reported percent, which is why it lives
+        here rather than being repeated at the write: the two stage weights sum to one, so
+        a fraction that cannot exceed 1 is a percent that cannot exceed 100. It is also
+        what stops an over-running trim — a clip whose take reads a hair long — from
+        jumping the bar to 100 while the join has not started.
+        """
+        if self.total_seconds <= 0:
+            return 0.0
+        return min(1.0, seconds / self.total_seconds)
+
+    def _advance(self, value: float) -> int:
+        """Monotonicity, and nothing else — see `_fraction` for the ceiling."""
+        self.percent = max(self.percent, int(value))
+        return self.percent
 
 
 def probe_duration_args(path: Path) -> list[str]:

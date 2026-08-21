@@ -993,6 +993,162 @@ export function shotPromptHelp(shot) {
   return rejection ? `${rejection} ${READINESS_REMEDY}.` : "";
 }
 
+// ------------------------------------------------------------------------------------------
+// Making one Shot from another: Duplicate, and the second half of a Split.
+//
+// Both handlers `structuredClone`d the source Shot and reset `status` alone, so the new Shot
+// arrived owning the original's take -- it played that take in the Monitor, offered it in the
+// takes strip, and read as approved wherever the original did. Nothing had rendered it. The
+// copy also read as `shot_render_provenance` on the server, so the automated writers refused
+// to touch it, citing a render nobody ran.
+//
+// So a new Shot is *built from the plan*, never subtracted from a clone: a field nobody
+// classified is then absent from the copy rather than silently inherited by it. The
+// classification itself is `models.SHOT_PLAN_CONTENT_FIELDS` and its two companions -- one
+// place, partitioned against `Shot.model_fields` and pinned to this list by a contract test, so
+// a field added to the model and classified by nobody fails the suite.
+// ------------------------------------------------------------------------------------------
+
+// Mirrors `models.SHOT_PLAN_CONTENT_FIELDS`. Every other Shot field is take provenance (a
+// render, a file, an approval, a review, a slice of one take) or the Director's hands-off on
+// one Shot -- see the model for why each lands where it does.
+export const SHOT_PLAN_CONTENT_FIELDS = [
+  "start",
+  "duration",
+  "prompt",
+  "h3_prompt",
+  "mode",
+  "asset_ids",
+  "citations",
+  "reference_labels",
+  "singing",
+  "use_song_audio",
+  "seed",
+];
+
+// What a Shot nobody has rendered reads as. `Shot.status`'s own default, said out loud because
+// the copy carries it explicitly: the inspector draws the chip from this field, and an absent
+// one would render the word "undefined" over a perfectly ordinary draft.
+export const NEW_SHOT_STATUS = "draft";
+
+export function newShotFromPlan(shot, overrides = {}) {
+  const copy = { status: NEW_SHOT_STATUS };
+  for (const field of SHOT_PLAN_CONTENT_FIELDS) {
+    if (shot?.[field] !== undefined) copy[field] = structuredClone(shot[field]);
+  }
+  return { ...copy, ...overrides };
+}
+
+// ------------------------------------------------------------------------------------------
+// A render is in flight for this shot, said in words on every surface that shows its take.
+//
+// The inspector was the only place that said so: the status chip and the disabled Approve
+// button's APPROVE_IN_FLIGHT. The Monitor played the previous take framed exactly like a
+// settled one, the takes strip labelled that take `Current`, and the clip carried the state
+// as a border hue alone. Two of those are affirmative wrong claims and the third is state by
+// appearance, which this stylesheet's own rule forbids.
+//
+// The fix is to tell the truth about the state, never to change it: `latest_output` still
+// points at the previous take, it still plays, it is still what the finishing stages consume.
+// Nothing here clears a pointer -- a re-render that silently moved which take a downstream
+// stage read is a recorded provenance incident, and blanking the pointer would also take away
+// the very take the Director needs to judge whether the re-render was worth it.
+// ------------------------------------------------------------------------------------------
+
+// The word the clip carries. Upper case and terse, like NO PROMPT and PLACEHOLDER, because it
+// sits on the same small surface and is read at a glance rather than in a sentence.
+export const SHOT_RENDERING_FLAG = "RENDERING";
+// The same fact about a shot with nothing to displace: a first render, so no take is being
+// replaced and the displacement sentence would name a harm that is not happening.
+export const RENDER_IN_FLIGHT_NO_TAKE = "A render for this shot has not finished.";
+
+export function shotRenderInFlight(shot) {
+  return RENDER_IN_FLIGHT_SHOT_STATUSES.includes(String(shot?.status || ""));
+}
+
+// ------------------------------------------------------------------------------------------
+// How far that render has got -- the Director's ask (2026-08-20): "I am not so concerned with
+// time to generate as long as we can get better information to the app so i can know about what
+// % done a generation is whether displayed on the asset card or timeline Shot box."
+//
+// The number arrives on the render-status poll (`report.progress`), sourced from ComfyUI's own
+// WebSocket and held only in the server's memory -- see `comfy.ProgressTracker` for why it is
+// never persisted. These three functions are the whole of the client's decision about it, kept
+// pure and executed by the contract tests, because the one thing that must not happen here is a
+// *fabricated* percentage: a made-up number on a stuck render is worse than none, and this
+// application refuses invented values on principle.
+//
+// **Unknown is not zero.** No row for a job means nobody has said anything -- the socket never
+// connected, the prompt is still waiting its turn, the build speaks a dialect the server does
+// not read -- and every surface then shows exactly what it showed before this feature existed.
+// A row saying `0` is the different, real statement that the render started and no step is done.
+// ------------------------------------------------------------------------------------------
+
+// `null` for unknown; a clamped whole-number `"42%"` otherwise. Everything that is not a finite
+// number is unknown, so a `null`, an absent key, or a string that arrived where a number belongs
+// all degrade to showing nothing rather than to `NaN%`.
+export function renderProgressLabel(percent) {
+  const number = Number(percent);
+  if (percent === null || percent === undefined || percent === "" || !Number.isFinite(number)) {
+    return "";
+  }
+  return `${Math.max(0, Math.min(100, Math.round(number)))}%`;
+}
+
+// The word the surfaces carry, composed with the percentage rather than replaced by it. RENDERING
+// is the signal that a render is in flight and it survives with or without a number beside it --
+// which is exactly what "degrade to what is shown today" means when the socket is down.
+export function renderingFlag(percent) {
+  const label = renderProgressLabel(percent);
+  return label ? `${SHOT_RENDERING_FLAG} ${label}` : SHOT_RENDERING_FLAG;
+}
+
+// The same fact as a sentence, for the accessible name -- the only one of a clip's signals a
+// screen reader announces. Empty when unknown, so the label is byte-identical to today's.
+export function renderProgressNote(percent) {
+  const label = renderProgressLabel(percent);
+  return label ? `${label} of this render is done.` : "";
+}
+
+// The poll report -> `{ targetId: percent }`, which is what the asset grid and the timeline draw
+// from. Pure over the report alone: it joins `report.progress` (keyed by job id) to `report.jobs`
+// (which carry `target_id`), so nothing depends on the order the caller patches things in.
+//
+// Attribution is per job and therefore per prompt -- a batch of H3 renders is the normal case,
+// and two shots rendering at once must never read each other's number. Where two open jobs somehow
+// name one target, the higher percentage wins: both describe work on the same box, and the lower
+// one is the older, more finished-ago claim.
+export function renderProgressByTarget(report) {
+  const jobs = new Map((report?.jobs || []).map((job) => [job.id, job]));
+  const byTarget = {};
+  for (const entry of report?.progress || []) {
+    const job = jobs.get(entry?.job_id);
+    if (!job?.target_id) continue;
+    const percent = Number(entry?.percent);
+    if (!Number.isFinite(percent)) continue;
+    const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+    const held = byTarget[job.target_id];
+    if (held === undefined || clamped > held) byTarget[job.target_id] = clamped;
+  }
+  return byTarget;
+}
+
+// One shot's render state as the surfaces draw it: whether a render is in flight, the word for
+// it, and the sentence that says what that means for what is on screen. `displaced` is the case
+// the wrong claims lived in -- there is a take, and it is not this shot's answer any more.
+export function shotRenderState(shot) {
+  if (!shotRenderInFlight(shot)) {
+    return { inFlight: false, displaced: false, flag: "", note: "" };
+  }
+  const displaced = Boolean(shot?.latest_output);
+  return {
+    inFlight: true,
+    displaced,
+    flag: SHOT_RENDERING_FLAG,
+    note: displaced ? TAKE_DISPLACED_BY_RENDER : RENDER_IN_FLIGHT_NO_TAKE,
+  };
+}
+
 // Everything the timeline draws for one clip's prompt cell, decided here rather than in the
 // template. The template used to hold the ternaries, and swapping their arms -- stamping NO PROMPT
 // on every *written* clip and rendering the unprompted one empty -- kept every substring the suite
@@ -1000,16 +1156,26 @@ export function shotPromptHelp(shot) {
 // with the tests green. Executed by tests/test_frontend_contract.py for every state.
 //
 // `label` is the clip's title and accessible name: the help for a blocked shot, and the full
-// prompt otherwise, since the cell itself is clamped to two lines.
-export function shotPromptCell(shot) {
+// prompt otherwise, since the cell itself is clamped to two lines -- with this shot's render
+// state appended when a render is in flight. The accessible name is the only one of the clip's
+// signals a screen reader announces, so a state carried by the border hue and the RENDERING word
+// alone would not exist at all for a Director reading it that way. A settled shot's label is
+// unchanged, byte for byte: `shotRenderState` returns an empty note and the join drops it.
+// `percent` is this shot's live render percentage or nothing at all. It appends one more sentence
+// to the accessible name and changes not a byte otherwise -- an unknown percentage, which is what
+// every caller passes when the progress socket is down, leaves the label exactly as it was.
+export function shotPromptCell(shot, percent) {
+  const state = shotRenderState(shot);
+  const progress = state.inFlight ? renderProgressNote(percent) : "";
+  const withState = (label) => [label, state.note, progress].filter(Boolean).join(" ");
   const prompt = String(shot?.prompt ?? "");
   const rejection = promptRejection(shot);
-  if (!rejection) return { blocked: false, text: prompt, className: "", label: prompt };
+  if (!rejection) return { blocked: false, text: prompt, className: "", label: withState(prompt) };
   return {
     blocked: true,
     text: rejection === SHOT_WITH_PLACEHOLDER_PROMPT ? SHOT_WITH_PLACEHOLDER_FLAG : SHOT_WITHOUT_PROMPT_FLAG,
     className: "no-prompt",
-    label: shotPromptHelp(shot),
+    label: withState(shotPromptHelp(shot)),
   };
 }
 
@@ -1339,8 +1505,16 @@ export const UNAPPROVE_HELP =
 // Drawn as a disabled control carrying the reason rather than as no control at all, for the
 // render-again control's reason: the take on screen is real and "why can I not approve it" is a
 // question the panel should answer where it is asked.
+//
+// Its first sentence is the whole fact the Monitor, the takes strip and the clip also have to
+// state, so it is a constant of its own and this refusal is built from it: four surfaces
+// describing one state in four wordings is how a Director ends up believing they are four
+// states. Spelled out here rather than templated, so the concatenation below stays legible as
+// the server's sentence.
+export const TAKE_DISPLACED_BY_RENDER =
+  "A render for this shot has not finished, so the take on screen is about to be displaced.";
 export const APPROVE_IN_FLIGHT =
-  "A render for this shot has not finished, so the take on screen is about to be displaced. " +
+  `${TAKE_DISPLACED_BY_RENDER} ` +
   "Approving it now would leave the decision attached to whichever file lands next. Wait for " +
   "it, or refresh the render queue if it has already finished and this project has not been " +
   "told yet.";
@@ -1374,7 +1548,9 @@ export function approvalControl(shot) {
   if (!shot?.latest_output) {
     return { shown: false, disabled: true, action: "", label: APPROVE_LABEL, title: "", reason: "" };
   }
-  if (RENDER_IN_FLIGHT_SHOT_STATUSES.includes(status)) {
+  // The same predicate the Monitor, the takes strip and the clip decide from: one reading of
+  // "a render is in flight", so a surface cannot be honest while another is not.
+  if (shotRenderInFlight(shot)) {
     return { shown: true, disabled: true, action: "approve", label: APPROVE_LABEL, title: APPROVE_IN_FLIGHT, reason: APPROVE_IN_FLIGHT };
   }
   return { shown: true, disabled: false, action: "approve", label: APPROVE_LABEL, title: APPROVE_HELP, reason: "" };
@@ -2061,6 +2237,64 @@ export function aiModPlan(asset) {
   return { ready: Boolean(asset.path) };
 }
 
+// ------------------------------------------------------------------------------------------
+// The appearance anchor (`Asset.consistency_prompt`). One user-owned phrase per asset that
+// wins over the generation prompt and the vision summary everywhere a description of that
+// asset is consumed -- the reference map's tag lines, the H3 specialist's per-reference block,
+// the assistant's library. Written only by `PUT .../consistency-prompt`; nothing infers one.
+// ------------------------------------------------------------------------------------------
+
+// `app.CONSISTENCY_PROMPT_LIMIT`. A contract test holds the two together, for the reason the
+// song-context bound already learned the hard way: a client that shortens a paste silently and
+// a route that refuses the same text with a 422 are two different rules wearing one number.
+export const CONSISTENCY_PROMPT_LIMIT = 400;
+
+export const CONSISTENCY_PROMPT_LABEL = "Appearance anchor";
+
+// Said on screen because the field is unlike every other box in this inspector: it is the one
+// text the Director writes that OUTRANKS what the machine produced, and it reaches prompts the
+// Director never opens. A box whose only explanation is its name gets filled in with a second
+// generation prompt.
+export const CONSISTENCY_PROMPT_HELP =
+  "Your words for what this looks like — carried into every prompt that cites it, and it wins " +
+  "over the generation prompt and the vision summary. Short is better: \"a woman in a red " +
+  "leather jacket and black boots\". Leave it empty and nothing is added anywhere.";
+
+// The one decision behind the anchor editor: may this asset carry one, what does it hold, and
+// can what is in the box be saved.
+//
+// Offered for every kind except `audio`, and that exclusion is the whole rule rather than a
+// list of blessed kinds: an anchor says what something LOOKS like, a sound has no appearance,
+// and every other kind -- character, setting, prop, style, image, video -- reaches a prompt as
+// a picture or a clip whose tag line the anchor rides. A list of allowed kinds would silently
+// omit whichever kind is added next; the exclusion fails the safe way.
+//
+// `draft` is what is in the box right now, and defaults to the stored value so a plan built for
+// a freshly selected asset reports the truth. `changed` is what makes the save button mean
+// something -- saving an unchanged anchor is a write that spends a manifest save to do nothing.
+// Compared on the trimmed values, because the route trims before it stores: whitespace typed
+// after the last word is not an edit.
+export function consistencyAnchorPlan(asset, draft) {
+  if (!asset || asset.kind === "audio") return null;
+  const stored = String(asset.consistency_prompt ?? "");
+  const text = String(draft ?? stored);
+  const length = text.trim().length;
+  const over = length > CONSISTENCY_PROMPT_LIMIT;
+  const changed = text.trim() !== stored.trim();
+  const counted = `${length.toLocaleString("en-US")} / ${CONSISTENCY_PROMPT_LIMIT.toLocaleString("en-US")}`;
+  return {
+    stored,
+    draft: text,
+    length,
+    over,
+    changed,
+    // Savable only when it is both a real change and inside the bound, so the button cannot
+    // send a request the route is certain to refuse.
+    savable: changed && !over,
+    count: over ? `${counted} — too long to save` : counted,
+  };
+}
+
 // -------------------------------------------------------------------------------------------
 // Render polling -- the client half of AD-1's transport decision. Every decision here is pure
 // and executed under node by the contract tests; app.js only owns the timer and the repaints.
@@ -2106,6 +2340,45 @@ export const ASSEMBLE_RENDERS_OPEN =
   "Renders are still in flight; assemble when the queue settles.";
 export const ASSEMBLE_RUNNING = "Assembling…";
 
+// The two export presets, mirroring `assembly.EXPORT_PRESETS`. `draft` is first and is the
+// default because it *is* what this application has always exported: choosing nothing keeps
+// producing the file the button always produced. The server holds the same two names in a
+// Literal, so an unknown one is a 422 before ffmpeg exists; a contract test holds the pair
+// together, because a select offering a preset the route refuses is a dead control.
+export const EXPORT_PRESETS = [
+  {
+    value: "draft",
+    label: "Draft",
+    help:
+      "Fast review build — the settings this application has always exported with " +
+      "(x264 veryfast, CRF 18). Your song's own levels and sample rate, untouched.",
+  },
+  {
+    value: "master",
+    label: "Master",
+    help:
+      "Delivery build — slower x264 at a lower CRF, faststart, and a 48 kHz audio " +
+      "conform. Your song's own levels are preserved. Slower to encode.",
+  },
+];
+export const EXPORT_PRESET_DEFAULT = "draft";
+
+// How far the running export has got, or null when nothing local is running. Read from the
+// job records for `latestAssemblyExport`'s reason -- the export is the job -- and keyed on
+// the same `post` + empty-prompt_id marker AD-9 uses everywhere else. `hasActiveRenderJobs`
+// deliberately ignores exactly these jobs (nothing on ComfyUI to reconcile), so this is the
+// only reader of local progress there is.
+export function assemblyProgress(project) {
+  const jobs = project?.jobs || [];
+  for (let index = jobs.length - 1; index >= 0; index -= 1) {
+    const job = jobs[index];
+    if (job.kind === "post" && !job.prompt_id && !TERMINAL_JOB_STATUSES.includes(job.status)) {
+      return Math.max(0, Math.min(100, Number(job.progress) || 0));
+    }
+  }
+  return null;
+}
+
 export function assemblyControl(project) {
   const shots = project?.shots || [];
   const refuse = (reason) => ({ disabled: true, label: ASSEMBLE_LABEL, title: reason, reason });
@@ -2121,6 +2394,139 @@ export function assemblyControl(project) {
   }
   if (hasActiveRenderJobs(project)) return refuse(ASSEMBLE_RENDERS_OPEN);
   return { disabled: false, label: ASSEMBLE_LABEL, title: ASSEMBLE_HELP, reason: "" };
+}
+
+// ------------------------------------------------------------------------------------------
+// Snap cuts to phrase boundaries. The Director's ruling on the roadmap's "vocal transition
+// points between shots" item: a cut placed where nobody is singing has no mouth to mismatch
+// across it. Two shots share a cut, so moving one is a single move that changes both windows.
+//
+// Everything decided here is *cheap and local*: whether the button can run at all (a song, a
+// measurement, two shots, a non-zero tolerance) and how a returned report reads. The plan
+// itself -- which cuts move, which are refused and in whose words -- is the server's, rendered
+// verbatim, for `assemblyControl`'s reason: a second implementation of a refusal is a refusal
+// that can disagree with the one that matters.
+//
+// Report first, apply on confirm. The button is a two-stage control: it fetches a report, the
+// report is drawn in full, and only the second click sends `confirm_apply`. That shape is
+// `populate`'s and `spec-arm-a-plan`'s -- "22 cuts moved, 3 skipped" is the moment a Director
+// notices that three is wrong, and a report rationed into a confirm dialog cannot show it.
+// ------------------------------------------------------------------------------------------
+
+// `timeline.SNAP_TOLERANCE_DEFAULT` and `SNAP_TOLERANCE_MAX`. A contract test holds each
+// against the Python constant, because a box offering a tolerance the request schema refuses
+// is a control whose only outcome is a 422.
+export const SNAP_TOLERANCE_DEFAULT = 0.75;
+export const SNAP_TOLERANCE_MAX = 3;
+export const SNAP_TOLERANCE_STEP = 0.05;
+
+export const SNAP_CUTS_LABEL = "Snap cuts";
+export const SNAP_CUTS_APPLY_LABEL = "Apply {moved} move(s)";
+export const SNAP_CUTS_DISMISS_LABEL = "Discard report";
+export const SNAP_CUTS_RUNNING = "Measuring…";
+export const SNAP_CUTS_HELP =
+  "Move each cut to the nearest moment the track is not singing, within the tolerance. " +
+  "Reports what would move first and writes nothing until you confirm. Locked, approved and " +
+  "rendering shots are never moved. Nothing is rendered and no take is touched.";
+export const SNAP_CUTS_APPLY_HELP =
+  "Write the windows above. Only the shot start and duration change; every other field on " +
+  "every shot is left alone, and nothing is rendered.";
+export const SNAP_CUTS_TOLERANCE_LABEL = "Snap ±";
+export const SNAP_CUTS_TOLERANCE_HELP =
+  "How far one cut may travel, in seconds. 0 switches snapping off entirely.";
+
+// The cheap refusals, each a fact the browser already holds. They mirror the server's own
+// sentences in intent rather than in bytes: these decide whether the button is *drawn shut*,
+// and the server's are what a Director reads if one is sent anyway.
+export const SNAP_CUTS_NO_SONG = "Snapping cuts needs a master song to measure against.";
+export const SNAP_CUTS_UNMEASURED =
+  "This track has not been heard yet, so where the singing is is unknown. Run Analyze " +
+  "structure on the Song first.";
+export const SNAP_CUTS_WITHOUT_CUTS =
+  "A cut is the boundary two shots share, and this plan has fewer than two shots.";
+export const SNAP_CUTS_TOLERANCE_OFF =
+  "Tolerance is 0, so snapping is off. Raise it to let a cut move.";
+
+export const SNAP_CUTS_SUMMARY = "{moved} cut(s) would move, {skipped} would stay.";
+export const SNAP_CUTS_APPLIED_TOAST = "{moved} cut(s) moved, {skipped} stayed.";
+export const SNAP_CUTS_NOTHING_TO_MOVE =
+  "No cut can move within this tolerance. Nothing was written.";
+export const SNAP_CUTS_MOVED_HEADING = "Would move";
+export const SNAP_CUTS_SKIPPED_HEADING = "Would stay";
+
+// The tolerance the box should hold, as a number the request body can carry. `clampToBounds`
+// keeps a cleared box cleared for the form's sake; this one always answers a number, because
+// the request needs one -- an empty box means the default rather than an empty key.
+export function snapTolerance(raw) {
+  if (raw === "" || raw === null || raw === undefined) return SNAP_TOLERANCE_DEFAULT;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return SNAP_TOLERANCE_DEFAULT;
+  return Math.min(Math.max(value, 0), SNAP_TOLERANCE_MAX);
+}
+
+// Whether the button can run, and what it says. `report` is the last report this project
+// answered with, or null; a report holding moves turns the same button into the apply half,
+// which is what makes the confirm step unskippable in the interface as well as on the wire.
+export function snapCutsControl(project, tolerance, report = null) {
+  const shots = project?.shots || [];
+  const refuse = (reason) => ({
+    disabled: true, apply: false, label: SNAP_CUTS_LABEL, title: reason, reason,
+  });
+  if (!project?.song?.path) return refuse(SNAP_CUTS_NO_SONG);
+  // Either measurement counts, in `timeline.vocal_gaps`' own order: the words are what cut
+  // placement reads and the merged spans are its fallback, so a button drawn shut on the
+  // spans alone would refuse a song the server can plan against.
+  if (!(project?.song?.lyric_words || []).length
+    && !(project?.song?.vocal_spans || []).length) return refuse(SNAP_CUTS_UNMEASURED);
+  if (shots.length < 2) return refuse(SNAP_CUTS_WITHOUT_CUTS);
+  if (!(snapTolerance(tolerance) > 0)) return refuse(SNAP_CUTS_TOLERANCE_OFF);
+  if (report && report.moves?.length) {
+    return {
+      disabled: false,
+      apply: true,
+      label: SNAP_CUTS_APPLY_LABEL.replace("{moved}", String(report.moves.length)),
+      title: SNAP_CUTS_APPLY_HELP,
+      reason: SNAP_CUTS_SUMMARY
+        .replace("{moved}", String(report.moves.length))
+        .replace("{skipped}", String(report.skips?.length || 0)),
+    };
+  }
+  return {
+    disabled: false,
+    apply: false,
+    label: SNAP_CUTS_LABEL,
+    title: SNAP_CUTS_HELP,
+    reason: report ? SNAP_CUTS_NOTHING_TO_MOVE : "",
+  };
+}
+
+// The report as lines to draw: every move, then every skip **with the server's own sentence**.
+// Both lists in full and neither summarised -- a skipped cut whose reason was rationed away is
+// exactly the one a Director needed to see.
+export function snapCutsReportLines(report) {
+  if (!report) return [];
+  const seconds = (value) => `${Number(value).toFixed(3)}s`;
+  const signed = (value) => `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(3)}s`;
+  const lines = [];
+  for (const move of report.moves || []) {
+    // How long the gap is, appended to the line that already exists. The Director's reason
+    // (2026-08-20): "a 1 second gap may just be an extended shot where a 4 second gap would be
+    // great for a b-roll or non singing character shot" -- the length is what separates the
+    // two, and it is unreadable from the boundary alone. Drawn only when the server sent a
+    // number, so a report from before the field existed loses the clause rather than printing
+    // `NaNs`. Nothing here suggests a shot type; the number is the whole addition.
+    const gap = Number(move.gap);
+    const found = Number.isFinite(gap) && gap > 0 ? ` in a ${seconds(gap)} gap` : "";
+    lines.push({
+      kind: "move",
+      text: `${move.before} → ${move.after}: ${seconds(move.boundary)} → ` +
+        `${seconds(move.proposed)} (${signed(move.shift)})${found}`,
+    });
+  }
+  for (const skip of report.skips || []) {
+    lines.push({ kind: "skip", text: skip.reason });
+  }
+  return lines;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -2171,19 +2577,111 @@ export function monitorShotAt(project, seconds) {
 // conditioned on and a nudged one previews the nudged slice assembly will cut. `muted`
 // is the acceptance flag inverted: an accepted clip's own audio plays over the master in
 // preview, exactly as assembly will mix it -- one decision on both sides.
+//
+// A take with a render in flight is its own kind. It plays exactly as a settled take does --
+// same file, same slice, same mix -- because it is the only evidence the Director has and
+// `latest_output` still points at it; what changes is that the view now carries the sentence
+// saying so, and `monitorShowsTake` keeps both kinds on screen. The alternative, deciding a
+// take was too stale to show, would blank the picture and lose the very comparison the
+// re-render is being judged by.
 export function monitorState(project, seconds) {
   const shot = monitorShotAt(project, seconds);
   if (!shot) return { kind: "gap", shot: null, takeTime: 0, label: "No shot under the playhead", muted: true };
   if (!shot.latest_output) {
     return { kind: "no-take", shot, takeTime: 0, label: "This shot has no rendered take yet", muted: true };
   }
-  return {
+  const view = {
     kind: "take",
     shot,
     takeTime: Math.max(0, seconds - shot.start + effectiveOffset(shot)),
     label: "",
     muted: !shot.mix_take_audio,
   };
+  if (!shotRenderInFlight(shot)) return view;
+  return { ...view, kind: MONITOR_PREVIOUS_TAKE, label: TAKE_DISPLACED_BY_RENDER };
+}
+
+// The kind of a take the Monitor shows while a newer render is in flight, and the two kinds
+// that put a picture on the screen. Named because `syncMonitor` and the stylesheet's
+// `.showing-take` both have to agree that a displaced take is still shown -- a surface that
+// tested `kind === "take"` would black out the only take there is.
+export const MONITOR_PREVIOUS_TAKE = "previous-take";
+export const MONITOR_TAKE_KINDS = ["take", MONITOR_PREVIOUS_TAKE];
+
+export function monitorShowsTake(view) {
+  return MONITOR_TAKE_KINDS.includes(view?.kind);
+}
+
+// ------------------------------------------------------------------------------------------
+// The takes strip: every clip this shot's render history produced, and which of them the shot
+// is pointing at. Decided here rather than in the inspector's template, for `shotPromptCell`'s
+// reason -- the strip's whole job is to make one claim per row, and the row that made the
+// wrong one was written as a ternary inside a template literal.
+//
+// The claim that was wrong: while a newer render was in flight, the displaced take's row read
+// `Current`, which is an affirmative statement that this is the shot's answer. It is not; it
+// is the previous take, and something else is about to take its place. The row says `Previous`
+// then, and a pending row is appended so the strip shows the take that is coming rather than
+// leaving the Director to infer it from a border colour in another panel.
+// ------------------------------------------------------------------------------------------
+
+// A take file and its `-audio` sibling are one take. The pair lands from one job and the strip
+// must not offer the same take twice.
+const takeKey = (file) => String(file || "").replace("-audio.mp4", ".mp4");
+
+// The chips a row carries where an action would be. `Use` is the only one that is a verb,
+// because it is the only row you can do anything to.
+export const TAKE_USE_CHIP = "Use";
+export const TAKE_CURRENT_CHIP = "Current";
+export const TAKE_PREVIOUS_CHIP = "Previous";
+export const TAKE_PENDING_CHIP = "Rendering";
+// The pending row's own text, in place of a filename it does not have yet.
+export const TAKE_PENDING_ROW = "not landed yet";
+
+export function takesStripRows(project, shot) {
+  const files = [];
+  const seen = new Set();
+  for (const job of project?.jobs || []) {
+    if (job.kind !== "h3" || job.target_id !== shot?.id) continue;
+    for (const file of job.output_files || []) {
+      if (!file.endsWith(".mp4")) continue;
+      if (seen.has(takeKey(file))) continue;
+      seen.add(takeKey(file));
+      files.push(file);
+    }
+  }
+  const state = shotRenderState(shot);
+  const rows = files.map((file, index) => {
+    const current = Boolean(shot?.latest_output) && takeKey(shot.latest_output) === takeKey(file);
+    const displaced = current && state.inFlight;
+    return {
+      file,
+      pending: false,
+      current,
+      displaced,
+      text: `Take ${index + 1} · ${file.split("/").pop()}`,
+      chip: current ? (displaced ? TAKE_PREVIOUS_CHIP : TAKE_CURRENT_CHIP) : TAKE_USE_CHIP,
+      // Only the row the shot already points at is unusable; a displaced row is still that
+      // row, and pointing the shot back at a take it is already pointing at does nothing.
+      disabled: current,
+      className: [current ? "current" : "", displaced ? "displaced" : ""].filter(Boolean).join(" "),
+      title: displaced ? `${file} — ${TAKE_DISPLACED_BY_RENDER}` : file,
+    };
+  });
+  if (state.inFlight) {
+    rows.push({
+      file: "",
+      pending: true,
+      current: false,
+      displaced: false,
+      text: `Take ${files.length + 1} · ${TAKE_PENDING_ROW}`,
+      chip: TAKE_PENDING_CHIP,
+      disabled: true,
+      className: "pending",
+      title: state.note,
+    });
+  }
+  return { rows, inFlight: state.inFlight, takes: files.length };
 }
 
 // The take-audio acceptance control: shown only with a take to accept, checked from the
@@ -2393,6 +2891,10 @@ export const api = {
   // sentence in the workflow's own prompting form; a full structured prompt travels verbatim.
   editAsset: (projectId, assetId, body) => request(`/api/projects/${projectId}/assets/${assetId}/edit`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   analyzeAsset: (projectId, assetId) => request(`/api/projects/${projectId}/assets/${assetId}/analyze`, { method: "POST" }),
+  // The anchor's one door. Deliberately not folded into `saveProject`: the whole-project PUT
+  // re-adopts the stored anchor and can never write this field, which is what stops an ordinary
+  // save from blanking it.
+  saveConsistencyPrompt: (projectId, assetId, consistency_prompt) => request(`/api/projects/${projectId}/assets/${assetId}/consistency-prompt`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ consistency_prompt }) }),
   analyzeLatestTake: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/analyze-latest`, { method: "POST" }),
   compileTimeline: (id, body) => request(`/api/projects/${id}/timeline/compile`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // A GET, and nothing is cached from it: readiness is derived from the prompts on every call, so
@@ -2428,6 +2930,11 @@ export const api = {
   // the button shows the warning, and the server refuses without confirm_replace in the
   // same words. Nothing is rendered by it; the shots land as drafts.
   populateTimeline: (id, confirmReplace) => request(`/api/projects/${id}/timeline/populate`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ confirm_replace: confirmReplace }) }),
+  // Report first, apply on confirm. `confirmApply` false is a read: the route does not save
+  // and answers with no project at all, which is how "nothing was written" reaches the client
+  // as a fact rather than as a promise. The flag is passed through rather than hardcoded, for
+  // `generateBatch`'s reason -- a caller that never showed the report must not claim it did.
+  snapCuts: (id, tolerance, confirmApply = false) => request(`/api/projects/${id}/timeline/snap-cuts`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ tolerance, confirm_apply: confirmApply }) }),
   // Its own route, and it carries no body: expansion is not a chat turn. The whole input the
   // model sees is derived on the server from the project itself, so there is nothing here for a
   // message to travel in — and nothing that could queue a render.
@@ -2454,10 +2961,12 @@ export const api = {
   // once per tick) and /history (only for jobs the queue no longer holds), and answers with the
   // fixed jobs+states shape `applyRenderStatus` patches in. Never a per-job fan-out from here.
   renderStatus: (id) => request(`/api/projects/${id}/render-status`),
-  // Assembly. No body: every input is the manifest's own -- approved takes, snapshotted
-  // windows, the master song. Synchronous by design; the reply carries the settled job and
-  // the measured export. Nothing is queued on ComfyUI and no GPU time is spent.
-  assemble: (id) => request(`/api/projects/${id}/assemble`, { method: "POST" }),
+  // Assembly. One field, and one only: which preset to build. Every other input is the
+  // manifest's own -- approved takes, snapshotted windows, the master song -- so there is
+  // nothing else here a stale client could assert. Synchronous by design; the reply carries
+  // the settled job, the preset it built and the measured export. Nothing is queued on
+  // ComfyUI and no GPU time is spent.
+  assemble: (id, preset = EXPORT_PRESET_DEFAULT) => request(`/api/projects/${id}/assemble`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ preset }) }),
   workflows: () => request("/api/workflows"),
   // Machine-scoped, so neither call carries a project id. The GET is what refreshes the
   // after-the-fact report; the PUT is the only thing that changes the setting, and the server

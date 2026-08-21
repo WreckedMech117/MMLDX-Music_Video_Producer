@@ -13,7 +13,7 @@ from .models import (
     Asset,
     Project,
     Shot,
-    citations_in_prompt_order,
+    numbered_references,
     resolve_shot_mode,
     shot_label,
     song_audio_tag,
@@ -565,16 +565,66 @@ def _neighbour_framing(shot: Shot | None) -> dict[str, Any] | None:
 ASSISTANT_DESCRIPTION_LIMIT = 300
 
 
+def asset_anchor(asset: Asset) -> str:
+    """This Asset's stored appearance anchor, whitespace-collapsed, or `""` when it has none.
+
+    One reader for `Asset.consistency_prompt`, because "has an anchor" has to mean the same
+    thing in the reference map, in the expansion input and in the library description — a
+    field that is blank in one of them and a single space in another would put the anchor on
+    two of the three surfaces and silently not the third.
+
+    Collapsed rather than merely stripped: the anchor is typed into a textarea and travels
+    inside one-line prompt sentences, where a pasted newline would read as a shot boundary to
+    the H3 specialist (`h3_expansion_prompt.STRUCTURE`: "a line break reads as a shot
+    boundary"). An all-whitespace value collapses to `""` and is therefore *no anchor*, which
+    is what a Director who cleared the box meant.
+    """
+    return " ".join(asset.consistency_prompt.split())
+
+
+def anchored_label(asset: Asset, label: str) -> str:
+    """``label``, carrying this Asset's appearance anchor when it has one.
+
+    The one composition, shared by `app.reference_map_tag_lines`, the submit route's own tag
+    walk and `shot_expansion_input` below, so the anchor a shot is *told* about and the anchor
+    its render is *conditioned* with can never be two different sentences.
+
+    ``label`` is whatever names the asset in the caller's context — usually `Asset.name`, and
+    for the reference map the shot's own `reference_labels` override when one is set. **A
+    per-shot rename replaces the name and never the anchor**, and the two compose as
+    apposition: `"the woman upstage, a woman in a red leather jacket and black boots"`. That
+    is the only composition that keeps both facts, and each answers a different question — the
+    rename says who this picture is *in this shot*, the anchor says what she looks like in
+    every shot. A rename that was meant to replace the appearance too is expressed by clearing
+    the anchor, which is a decision about the asset rather than about one shot.
+
+    An asset with no anchor returns ``label`` unchanged, and that identity is load-bearing:
+    every prompt this application has ever built used the bare label, and an anchor-free
+    project must go on producing those exact bytes.
+    """
+    anchor = asset_anchor(asset)
+    if not anchor:
+        return label
+    return f"{label}, {anchor}"
+
+
 def _asset_description(asset: Asset) -> str:
     """What this Asset depicts, in as few characters as the honest answer takes.
 
-    The vision inspection wins over the generation prompt when there is one, because it describes
+    **The Director's own `consistency_prompt` wins over both of the machine-written sources.**
+    It is the one description a human asserted, and the whole point of the field is that it
+    overrides whatever a generator was asked for or a vision model reported — see
+    `models.Asset.consistency_prompt`.
+
+    Failing that, the vision inspection wins over the generation prompt, because it describes
     what the picture *is* rather than what was asked for — a Flux prompt and its output disagree
     often enough that citing the prompt would tell the assistant about a shot that was never made.
-    An uploaded asset with neither has no description at all, and gets none rather than an invented
-    one: its name and kind are what is actually known about it.
+    An uploaded asset with none of the three has no description at all, and gets none rather than
+    an invented one: its name and kind are what is actually known about it.
     """
-    described = (asset.vision.summary if asset.vision else "") or asset.prompt
+    described = (
+        asset_anchor(asset) or (asset.vision.summary if asset.vision else "") or asset.prompt
+    )
     collapsed = " ".join(described.split())
     if len(collapsed) <= ASSISTANT_DESCRIPTION_LIMIT:
         return collapsed
@@ -882,25 +932,48 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
     }
     # Tags the specialist may use, numbered here rather than left to the model. The prompt
     # forbids inventing one, and a model told "you have two pictures" will still guess at their
-    # numbers; naming each tag alongside its role removes the guess entirely. Pictures are the
-    # only kind a Shot can cite today, so every role numbers into the Picture series.
+    # numbers; naming each tag alongside its role removes the guess entirely.
     #
-    # Numbered by `citations_in_prompt_order` — the same walk the reference render numbers its
-    # own tags and appends its media by. That sharing is load-bearing, not tidy: the specialist
-    # writes "<Picture 1>" into a prompt whose payload fills its anonymous slots in the render's
-    # walk, so a tag numbered here under any *other* order would declare a role for somebody
-    # else's picture, and the take would render plausibly and wrongly.
+    # Numbered by `models.numbered_references` — literally the same function the reference render
+    # numbers its own tags and appends its media by, not a second implementation of the same idea.
+    # That sharing is load-bearing, not tidy: the specialist writes "<Video 1>" into a prompt whose
+    # payload fills its anonymous slots in the render's walk, so a tag numbered here under any
+    # other rule declares a role for somebody else's media and the take renders plausibly and
+    # wrongly. This builder used to run its own counter — one series for every kind — and on a
+    # video-citing shot it disagreed with the payload for exactly that reason (2026-08-20). A
+    # picture-only shot's numbering is unchanged, which is what the pinned digests below assert.
     references: list[dict[str, Any]] = []
     if shot.citations:
-        ordered_citations = citations_in_prompt_order(shot)
-        references.extend(
-            {
-                "tag": f"<Picture {position}>",
+        for numbered in numbered_references(project, shot):
+            citation = numbered.citation
+            entry_reference: dict[str, Any] = {
+                "tag": numbered.tag,
                 "role": ASSET_ROLE_LABELS.get(citation.role, citation.role),
                 "asset_id": citation.asset_id,
             }
-            for position, citation in enumerate(ordered_citations, start=1)
-        )
+            # The Director's stored appearance anchor for this picture, named and numbered
+            # beside the tag that shows it — `<Picture 2>` and "Lucy, a woman in a red
+            # leather jacket" are the same subject, and the specialist is told to carry that
+            # phrase at her first mention rather than to invent a description from the
+            # image it cannot see. Composed by the same `anchored_label` the reference map
+            # uses, so what the specialist is handed and what the render is conditioned with
+            # are one sentence.
+            #
+            # **Present only when an anchor is actually stored**, on this payload's own
+            # absent-rather-than-empty convention: an anchor-free project's expansion input
+            # is byte-for-byte the one it has always produced, which the pinned digests
+            # assert. A citation whose Asset this project does not hold gets no key either —
+            # nothing is known about it, and the render refuses it by name.
+            asset = numbered.asset
+            if asset is not None and asset_anchor(asset):
+                entry_reference["anchor"] = anchored_label(
+                    # The shot's own rename when it has one, exactly as the reference map
+                    # resolves it, so the specialist and the render name the picture the
+                    # same way.
+                    asset,
+                    shot.reference_labels.get(asset.id, asset.name),
+                )
+            references.append(entry_reference)
     # The master song's tag, when this shot rides it — numbered by the same walk the
     # render numbers it (`song_audio_tag`), so the "<Audio 1>" the specialist writes into
     # the description is the slot the conditioner actually fills. This is the handle the
@@ -961,3 +1034,538 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
             )
         payload["song"] = song
     return payload
+
+
+# ------------------------------------------------------------------------------------------
+# Snapping cuts to phrase boundaries.
+#
+# The Director's ruling, 2026-08-20, on the roadmap's long-open "vocal transition points
+# between shots" item: **cut placement is the lever.** Each references shot performs its own
+# window of the song, so at a cut the mouth on shot A's last frame and the mouth on shot B's
+# first frame were rendered by two calls that never saw each other. Pinning keyframes and
+# crossfading both *mask* that; moving the cut to a moment the track leaves voiceless removes
+# it — there is no mouth to mismatch if nobody is singing across the boundary. It costs no
+# GPU and no re-render, which is why it was ruled the lever rather than one of the others.
+#
+# This is the first thing in the application that turns Whisper's alignment into an editing
+# decision rather than a display. Everything below is pure and I/O-free: it reads a Project
+# and answers with a proposal. Nothing here writes, and nothing here renders.
+#
+# Three geometric facts shape the whole design:
+#
+# * **A cut is shared.** Moving it changes shot A's duration and shot B's start together —
+#   one move, not two — so the plan is modelled as a list of *boundaries* and the shots are
+#   derived from it. Contiguity is then true by construction rather than by arithmetic.
+# * **The plan's outer edges never move.** The first shot's start and the last shot's end are
+#   copied through untouched, so whatever coverage the plan had of the song it still has,
+#   exactly, to the last bit of the float.
+# * **Cuts are decided left to right**, each against the boundary its left neighbour has
+#   already settled on and against its right neighbour's *original* edge. That is what makes
+#   the band check exact rather than provisional: see `snap_cut_plan`.
+# ------------------------------------------------------------------------------------------
+
+#: How far *inside* a voiceless gap a snapped cut must land, at either end of the gap.
+#:
+#: A cut placed on the exact instant a phrase stopped is not "where nobody is singing" in any
+#: useful sense — the mouth is still closing, and `transcription.transcribe_song_words` rounds
+#: Whisper's word times to the hundredth of a second with an accuracy well looser than that.
+#: 0.15 s is 3.6 frames at `H3_FPS`, and it is deliberately far below the 0.75 s rest that
+#: `transcription.merge_vocal_spans` requires before it will call two words separate spans —
+#: so every gap that merge reports can hold this clearance at *both* ends with room to spare.
+SNAP_CLEARANCE_SECONDS = 0.15
+
+#: The shortest voiceless stretch `vocal_gaps` will report as a gap at all.
+#:
+#: Exactly twice the clearance, which is the whole argument: a stretch narrower than this
+#: cannot give `SNAP_CLEARANCE_SECONDS` at both ends, so no cut can be *placed* in it on this
+#: module's own terms. `_gap_snap_target` does answer for a narrower gap — its midpoint — but
+#: that answer knowingly spends less than the clearance, and the clearance is the hard floor
+#: the tolerance is tuned around.
+#:
+#: **Not a double-guard, and it only became necessary with word-level gaps.** While
+#: `vocal_gaps` read `merge_vocal_spans`' output, every interior gap was ≥ 0.75 s by
+#: construction and this floor was unreachable. Word timings have no such floor: on the
+#: Director's own track (262 aligned words) the word-level complement holds **21** stretches
+#: under 0.30 s — the pauses *inside* a sung phrase, between one word and the next. Offered
+#: as snap targets those would be strictly worse than not moving, because each sits between
+#: two syllables and is usually nearer the cut than the real rest a few seconds away, so the
+#: nearest-gap rule would prefer it. Filtered here rather than in `snap_cut_plan` because it
+#: is a statement about what a *gap* is, not about what one caller does with one.
+SNAP_MINIMUM_GAP_SECONDS = 2 * SNAP_CLEARANCE_SECONDS
+
+#: How far a cut may travel, by default, when the Director has expressed no preference.
+#:
+#: Pinned to `merge_vocal_spans`' own 0.75 s gap, and the coupling is the argument: a cut may
+#: move at most as far as the shortest rest the measurement is willing to call a rest. A
+#: larger default would let the feature rewrite the plan's rhythm — shot lengths are a
+#: creative decision made elsewhere — in the name of a boundary fix.
+SNAP_TOLERANCE_DEFAULT = 0.75
+
+#: The largest tolerance a caller may ask for. Three seconds is already most of a
+#: `POPULATE_TARGET_WINDOW_SECONDS` window; past that, "snap the cut" has stopped describing
+#: what is happening to the plan.
+SNAP_TOLERANCE_MAX = 3.0
+
+#: How far two adjacent windows may disagree about where their shared boundary is before this
+#: module refuses to call them one cut. Half a frame, the number assembly's own
+#: `BOUNDARY_TOLERANCE_SECONDS` uses — the same number, because "the same boundary written twice" has to mean the same
+#: thing to the pass that moves cuts and to the pass that assembles them. Deliberately a
+#: literal rather than an import: `assembly` sits beside `timeline` in the graph, not below
+#: it, and `app` is the module that imports both.
+SNAP_CONTIGUITY_TOLERANCE = 1 / (2 * H3_FPS)
+
+# ------------------------------------------------------------------------------------------
+# Why one cut did not move. Every sentence names the shots as the timeline names them
+# (`shot_label`), because a bare `shot_a1b2c3d4e5f6` appears nowhere in the interface — the
+# same reason `generate_h3`'s refusal carries the label.
+#
+# The three *protection* sentences are the load-bearing half of this feature and each states
+# the concrete harm rather than merely that a flag is set, in the house shape shared by
+# `RENDER_AGAIN_LOCKED_REFUSAL`, `MARK_READY_LOCKED_REFUSAL` and `SELECT_TAKE_LOCKED`.
+# ------------------------------------------------------------------------------------------
+
+SNAP_LOCKED_REFUSAL = (
+    "{shot} is locked. A lock is a deliberate hands-off on this shot, and moving the cut at "
+    "its edge changes its window, which is exactly the kind of change it refuses. Unlock the "
+    "shot first."
+)
+#: AD-13, stated as the consequence. Approval snapshots the window (`Shot.approved_start`/
+#: `approved_duration`) and `assembly.ASSEMBLY_STALE_REFUSAL` refuses a shot whose window
+#: moved afterwards — so a silent nudge here would trade a mouth mismatch for a plan that no
+#: longer assembles. **Refused rather than auto-un-approved**: an approval is an editorial
+#: decision about one take, and `POPULATE_PROTECTED_REFUSAL` already rules that a protection
+#: which vanishes with the thing it protected was never a protection.
+SNAP_APPROVED_REFUSAL = (
+    "{shot} carries an approved take, and an approval records the window it was approved in. "
+    "Moving this cut would change that window and assembly would then refuse the shot as "
+    "stale. Un-approve the take first if the cut should move."
+)
+#: `RENDER_AGAIN_IN_FLIGHT_REFUSAL`'s argument applied to a window rather than to a second
+#: submission, including its staleness escape: job status only moves when the queue is polled.
+SNAP_IN_FLIGHT_REFUSAL = (
+    "A render for {shot} has not finished, and it was submitted for the window this cut "
+    "would change. Wait for it, or refresh the render queue if it has already finished and "
+    "this project has not been told yet."
+)
+#: Not a refusal — the good case where there was nothing to do. Reported rather than dropped,
+#: because "18 cuts already land in silence" is the sentence that tells a Director the plan is
+#: healthier than they feared.
+SNAP_ALREADY_SILENT = (
+    "The cut between {before} and {after} at {boundary:.3f}s already lands clear of every "
+    "sung phrase."
+)
+SNAP_NO_GAP_IN_TOLERANCE = (
+    "The cut between {before} and {after} at {boundary:.3f}s sits inside a sung phrase, and "
+    "the track has no voiceless gap within {tolerance:.2f}s of it. Raise the tolerance, or "
+    "move this cut by hand."
+)
+#: The band refusal, with every number the decision used. `neighbour` is whichever of the two
+#: shots the move would push out of the band, and the sentence says which end of the band.
+SNAP_OUT_OF_BAND = (
+    "The cut between {before} and {after} at {boundary:.3f}s would move to {proposed:.3f}s, "
+    "which leaves {neighbour} at {length:.3f}s — {bound} the {limit:g}s {edge} H3 renders "
+    "reliably. Left where it was."
+)
+#: The whole-plan honest-empty branches. Each is the *explicitly empty* answer this codebase
+#: requires of an absent analysis (`song_section`, `shot_vocal_overlap`): never a guessed
+#: boundary, never a fabricated silence.
+SNAP_UNMEASURED = (
+    "Nothing has been heard on this track yet, so where the singing is and is not is unknown "
+    "and no cut can be placed against it. Run Analyze structure on the Song first — it "
+    "transcribes the track once and keeps the words. Nothing was moved."
+)
+SNAP_TOLERANCE_OFF = (
+    "Tolerance is 0, so snapping is off and nothing was examined. Raise it to let a cut move."
+)
+SNAP_WITHOUT_CUTS = (
+    "A cut is the boundary two shots share, and this plan has {count} shot(s), so there is "
+    "no cut to snap."
+)
+SNAP_NOT_CONTIGUOUS = (
+    "This plan is not a contiguous tiling — {before} ends at {end:.3f}s but {after} starts at "
+    "{start:.3f}s — so the two do not share a cut to move. Close the gap (or the overlap) "
+    "first; assembly refuses the plan for the same reason."
+)
+
+
+@dataclass(slots=True, frozen=True)
+class CutMove:
+    """One cut that would move, named by both shots it belongs to.
+
+    `gap` is how long the voiceless stretch this cut lands in *is*, and it is reported for the
+    Director's own reason (2026-08-20): "a 1 second gap may just be an extended shot where a 4
+    second gap would be great for a b-roll or non singing character shot." The number is the
+    difference between two decisions this feature has already made — which gap, and where in
+    it — and it costs nothing to carry, whereas re-deriving it from the report's boundary
+    would be a second opinion about which gap was chosen. Nothing here suggests what to *do*
+    with a long gap; that is a plan for elsewhere. This is the fact the plan would need.
+    """
+
+    before_id: str
+    after_id: str
+    before_label: str
+    after_label: str
+    boundary: float
+    proposed: float
+    #: Length in seconds of the voiceless stretch `proposed` lands in. Deliberately without a
+    #: default: a move that could not say which gap it found would be a move nobody measured.
+    gap: float
+
+    @property
+    def shift(self) -> float:
+        return self.proposed - self.boundary
+
+
+@dataclass(slots=True, frozen=True)
+class CutSkip:
+    """One cut that would not move, and the sentence saying why.
+
+    Every cut that is not in `CutSnapPlan.moves` is in here — protections, already-silent
+    cuts, out-of-tolerance cuts and band refusals alike. A cut that appeared in neither list
+    would be the silent skip the report exists to prevent.
+    """
+
+    before_id: str
+    after_id: str
+    before_label: str
+    after_label: str
+    boundary: float
+    reason: str
+
+
+@dataclass(slots=True)
+class CutSnapPlan:
+    """What snapping *would* do. Nothing in here has been written anywhere.
+
+    `windows` is the **whole plan**, every shot in song order with the window it would have —
+    unchanged shots included — so applying the plan is one assignment per shot and the
+    tiling can be asserted from the proposal alone, without re-deriving it.
+
+    `status` is the honest four-way answer, and three of its values mean *nothing was
+    examined*: `"off"` (tolerance 0, the feature switched off), `"unmeasured"` (no Whisper
+    alignment on this song) and `"no_cuts"` (fewer than two shots). Only `"ready"` claims the
+    lists below were computed against a measurement.
+    """
+
+    status: str
+    tolerance: float
+    moves: list[CutMove]
+    skips: list[CutSkip]
+    windows: list[tuple[str, float, float]]
+    message: str = ""
+
+
+def vocal_gaps(song, *, start: float, end: float) -> list[tuple[float, float]] | None:
+    """The stretches of ``[start, end]`` the track is *measured* to leave voiceless.
+
+    ``None`` when nothing was measured, on `shot_vocal_overlap`'s rule exactly and for its
+    reason: a song with **neither** `Song.lyric_words` nor `Song.vocal_spans` is
+    **unmeasured, not silent**. Answering "the whole song is a gap" for an untranscribed track
+    would place every cut in the plan against a silence nobody heard, which is the fabrication
+    this codebase keeps catching. Neither list being empty is ever read as silence.
+
+    **Words first, spans as the fallback, and that choice is the feature.** `Song.vocal_spans`
+    is `transcription.merge_vocal_spans`' output, which bridges any rest shorter than 0.75 s
+    so the timeline's vocal band does not flicker on every breath — a *display* decision.
+    Cut placement is not display: the breath-sized rests that merge swallows are the cleanest
+    cuts in the song, and a cut needs only `SNAP_MINIMUM_GAP_SECONDS` of room. Measured on the
+    Director's "Harder Faster (Female Cover)" (154.6 s, 262 aligned words): the merged spans
+    leave **3** interior gaps of 0.6 s or more, the words leave **7**. Four real rests were
+    invisible to snapping purely because of a threshold about a drawn band.
+
+    Spans remain the answer when there are no words — an older manifest, or a measurement
+    written by anything but `transcribe_song_words` — and that path is unchanged.
+
+    Whichever source is read, the spans are clamped to the window, sorted and merged on the
+    way in, so overlapping, unsorted or inverted input — nothing forbids any of the three on
+    the model, and Whisper word times are guaranteed neither monotonic nor disjoint — cannot
+    produce a negative-length gap. Stretches under `SNAP_MINIMUM_GAP_SECONDS` are dropped; the
+    reasoning is that constant's.
+    """
+    if song is None:
+        return None
+    if song.lyric_words:
+        # `(word, start, end)`; the text is not read here, only the timing it carries.
+        sung = [(float(word[1]), float(word[2])) for word in song.lyric_words]
+    elif song.vocal_spans:
+        sung = [(float(span_start), float(span_end)) for span_start, span_end in song.vocal_spans]
+    else:
+        return None
+    bounded: list[list[float]] = []
+    for span_start, span_end in sorted(sung):
+        low, high = max(start, span_start), min(end, span_end)
+        if high <= low:
+            continue
+        if bounded and low <= bounded[-1][1]:
+            bounded[-1][1] = max(bounded[-1][1], high)
+        else:
+            bounded.append([low, high])
+    gaps: list[tuple[float, float]] = []
+    cursor = start
+    for low, high in bounded:
+        if low - cursor >= SNAP_MINIMUM_GAP_SECONDS - 1e-9:
+            gaps.append((cursor, low))
+        cursor = high
+    if end - cursor >= SNAP_MINIMUM_GAP_SECONDS - 1e-9:
+        gaps.append((cursor, end))
+    return gaps
+
+
+def _gap_snap_target(gap: tuple[float, float], boundary: float) -> float:
+    """Where inside one voiceless gap this cut would land.
+
+    **The rule, and it is the one editorial decision in this module.** The target is the
+    boundary pulled the *shortest* distance that puts it at least `SNAP_CLEARANCE_SECONDS`
+    inside the gap at both ends — a clamp, not a jump. For a gap too narrow to hold the
+    clearance twice, the gap's midpoint, which is the most clearance that gap can give.
+
+    Chosen over the two obvious alternatives, both of which were considered:
+
+    * **The gap's start** (the instant the phrase stopped) fixes only half the problem. Shot
+      B's head lands in silence, but shot A's tail sits hard against a word ending, at the
+      one moment Whisper's timing is least trustworthy — the mouth on A's last frame is still
+      closing a syllable. It is the *cut* that has to be voiceless, not one side of it.
+    * **The gap's midpoint always** maximises clearance, and for a short rest — `vocal_gaps`
+      reports none under `SNAP_MINIMUM_GAP_SECONDS` — that is a fine cut. It fails on the
+      long ones: an instrumental outro's midpoint can be ten seconds from the boundary, so a
+      cut that could
+      have moved 0.3 s into genuine silence would be reported as out of tolerance instead.
+      The clamp keeps the midpoint's guarantee — clearance at both ends — while asking for the
+      smallest move that earns it, which is what "the nearest point where nobody is singing"
+      says.
+
+    The clearance is a hard floor and the tolerance is the tunable, deliberately in that
+    order: a Director raising the tolerance is asking for cuts to travel further, never for
+    them to land closer to a syllable.
+    """
+    low, high = gap
+    if high - low <= 2 * SNAP_CLEARANCE_SECONDS:
+        return (low + high) / 2
+    return min(max(boundary, low + SNAP_CLEARANCE_SECONDS), high - SNAP_CLEARANCE_SECONDS)
+
+
+def window_move_refusal(
+    project: Project, shot: Shot, *, rendering: frozenset[str] = frozenset()
+) -> str:
+    """Why this Shot's window may not be moved automatically, or ``""`` when it may.
+
+    **Deliberately not `app.shot_write_refusal`.** That one gates automated writes to a
+    Shot's *prose*, and its `"rendered"` arm is a provenance argument about text: a prompt
+    beside a take must go on describing what produced it. A window is not prose. A rendered,
+    unapproved shot's window is dragged in the timeline every day of production, and gating
+    on render provenance would refuse most of a mid-production plan for a reason that does
+    not apply to it. The three protections here are the ones that are actually about windows:
+
+    * **locked** — the Director's own hands-off, `populate`'s first protection term.
+    * **approved** — AD-13. The same pair `POPULATE_PROTECTED_REFUSAL` protects
+      (`approved_output` or the `approved` status), because approval snapshots the window and
+      assembly refuses a shot whose window moved after it.
+    * **rendering** — a render already accepted for this exact window. Passed in as a set of
+      shot ids rather than read here, because the evidence is the project's job records and
+      `app.shot_render_in_flight` is the one function that reads them; a second copy of that
+      walk is the guard hole this codebase keeps finding.
+
+    The order is `populate`'s and `shot_write_refusal`'s: a lock is a decision the Director
+    made, so when several apply it is the sentence worth reading.
+    """
+    if shot.locked:
+        return SNAP_LOCKED_REFUSAL.format(shot=shot_label(project, shot))
+    if shot.approved_output or shot.status == "approved":
+        return SNAP_APPROVED_REFUSAL.format(shot=shot_label(project, shot))
+    if shot.id in rendering:
+        return SNAP_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot))
+    return ""
+
+
+def snap_cut_plan(
+    project: Project,
+    *,
+    tolerance: float = SNAP_TOLERANCE_DEFAULT,
+    rendering: frozenset[str] = frozenset(),
+    minimum: float = H3_MIN_SHOT_SECONDS,
+    maximum: float = H3_MAX_SHOT_SECONDS,
+) -> CutSnapPlan:
+    """Propose a new position for every cut in the plan. Pure, I/O-free, writes nothing.
+
+    Each cut is offered the nearest voiceless moment within ``tolerance`` seconds
+    (`_gap_snap_target` decides "nearest"), and takes it only when both shots it belongs to
+    survive every check. Everything else is reported as a skip with its reason.
+
+    **The band.** ``minimum``/``maximum`` default to `H3_MIN_SHOT_SECONDS` and
+    `H3_MAX_SHOT_SECONDS` — 4–15 s — which is the band `populate_windows` itself defaults to,
+    the band `expansion_input` flags a shot against as `outside_h3_window`, and the band
+    `build_director_timeline` warns about. `app.POPULATE_MAX_WINDOW_SECONDS` (6 s) is tighter
+    but is an *argument the populate route passes at layout time*, not an invariant on stored
+    windows: a Director may deliberately edit a shot to 9 s, and enforcing 6 s here would
+    refuse every cut in such a plan for a rule it was never held to. Both are parameters, so
+    a caller that does want the tighter ceiling asks for it.
+
+    **Why the band check is exact and not provisional.** Cuts are decided left to right. When
+    cut *i* is judged, the left edge of shot *i* is a boundary already settled, so shot *i*'s
+    final length is known here. Shot *i+1*'s right edge is still its original one — but cut
+    *i+1* will re-judge shot *i+1* against its now-settled left edge before moving, and will
+    refuse to move if that leaves it out of band. So shot *i+1* is in band whether cut *i+1*
+    moves (checked there) or stays (checked here), and every window in the result is inside
+    the band on both counts.
+
+    **Contiguity is structural.** The plan is carried as a boundary list; the returned windows
+    are consecutive differences of it, and the two outer boundaries are copied through from
+    the shots untouched. There is no arithmetic by which a gap, an overlap or an accumulated
+    rounding drift can appear — only the interior boundaries are ever assigned, and each is
+    assigned once, to a value rounded to the millisecond the rest of this module works in. A
+    shot no cut of which moved keeps its stored floats untouched to the bit, which is what
+    stops an ulp of recomputation from making an approved shot read as stale to assembly.
+
+    Raises `TimelineError` when the plan is not already a contiguous tiling, because then the
+    two shots at a "cut" do not share a boundary and there is nothing single to move.
+    """
+    ordered = ordered_shots(project)
+    unchanged = [(shot.id, shot.start, shot.duration) for shot in ordered]
+    # Tolerance 0 is the feature switched off, and off means *nothing was examined* — not a
+    # loop that happens to find no candidates. Checked before the song is read, before the
+    # plan's shape is judged, before anything: a switched-off feature that can still raise is
+    # not switched off.
+    if not (tolerance > 0):
+        return CutSnapPlan("off", 0.0, [], [], unchanged, SNAP_TOLERANCE_OFF)
+    if len(ordered) < 2:
+        return CutSnapPlan(
+            "no_cuts", tolerance, [], [], unchanged,
+            SNAP_WITHOUT_CUTS.format(count=len(ordered)),
+        )
+    for previous, current in pairwise(ordered):
+        if abs(current.start - previous.end) > SNAP_CONTIGUITY_TOLERANCE:
+            raise TimelineError(
+                SNAP_NOT_CONTIGUOUS.format(
+                    before=shot_label(project, previous),
+                    after=shot_label(project, current),
+                    end=previous.end,
+                    start=current.start,
+                )
+            )
+    gaps = vocal_gaps(project.song, start=ordered[0].start, end=ordered[-1].end)
+    if gaps is None:
+        return CutSnapPlan("unmeasured", tolerance, [], [], unchanged, SNAP_UNMEASURED)
+
+    # The plan as boundaries. `boundaries[0]` and `boundaries[-1]` are the plan's outer edges
+    # and are never assigned, so the coverage of the song is bit-identical afterwards.
+    boundaries = [shot.start for shot in ordered] + [ordered[-1].end]
+    # Which boundaries were actually assigned. Read once, at the end, to keep every untouched
+    # shot's stored floats rather than recomputing them — see the note there.
+    touched: set[int] = set()
+    moves: list[CutMove] = []
+    skips: list[CutSkip] = []
+    for index in range(len(ordered) - 1):
+        before, after = ordered[index], ordered[index + 1]
+        boundary = boundaries[index + 1]
+        names = {
+            "before_id": before.id,
+            "after_id": after.id,
+            "before_label": shot_label(project, before),
+            "after_label": shot_label(project, after),
+            "boundary": boundary,
+        }
+        labels = {"before": names["before_label"], "after": names["after_label"]}
+        # A cut belongs to two shots, so either shot's protection protects it. The first
+        # refusal wins, and `window_move_refusal` orders its own three.
+        refusal = window_move_refusal(project, before, rendering=rendering) or (
+            window_move_refusal(project, after, rendering=rendering)
+        )
+        if refusal:
+            skips.append(CutSkip(**names, reason=refusal))
+            continue
+        # A measured track with no usable gap inside the plan's window — every second of it
+        # sung, or every rest under `SNAP_MINIMUM_GAP_SECONDS`. There is nothing to be nearest
+        # to, so every cut is out of tolerance by the only honest reading. Answered per cut
+        # rather than as a whole-plan status, because the plan *was* examined: the protections
+        # above still ran and still name the shots they protected.
+        if not gaps:
+            skips.append(
+                CutSkip(
+                    **names,
+                    reason=SNAP_NO_GAP_IN_TOLERANCE.format(
+                        **labels, boundary=boundary, tolerance=tolerance
+                    ),
+                )
+            )
+            continue
+        # The *gap*, not just the target, because the report says how long it was — and the
+        # nearest gap is by definition the one whose target is nearest.
+        gap = min(
+            gaps, key=lambda candidate: abs(_gap_snap_target(candidate, boundary) - boundary)
+        )
+        target = _gap_snap_target(gap, boundary)
+        proposed = round(target, 3)
+        gap_length = round(gap[1] - gap[0], 3)
+        # "Already good" is the clamp being a no-op, rather than a second opinion about what
+        # counts as silence: a cut deep inside a gap is its own snap target, so
+        # `_gap_snap_target` is the only thing in this module that decides where silence
+        # begins. A cut sitting hard against a phrase's edge is therefore *not* already good
+        # — it is offered a move of at most `SNAP_CLEARANCE_SECONDS`.
+        if abs(proposed - boundary) <= 1e-9:
+            skips.append(
+                CutSkip(**names, reason=SNAP_ALREADY_SILENT.format(**labels, boundary=boundary))
+            )
+            continue
+        # The epsilon absorbs binary-float noise on a tolerance the Director typed as a
+        # decimal; it can admit a move a nanosecond past the bound, which nothing measures.
+        if abs(proposed - boundary) > tolerance + 1e-9:
+            skips.append(
+                CutSkip(
+                    **names,
+                    reason=SNAP_NO_GAP_IN_TOLERANCE.format(
+                        **labels, boundary=boundary, tolerance=tolerance
+                    ),
+                )
+            )
+            continue
+        left, right = boundaries[index], boundaries[index + 2]
+        # Both neighbours, each named with the length the move would give it and the bound it
+        # would break. The nearest gap is the only candidate considered: the ruling is that a
+        # move which pushes a neighbour out of the band is rejected *for that cut*, and
+        # walking on to a further gap would report a reason about a move nobody proposed.
+        out_of_band = None
+        for neighbour, length in (
+            (names["before_label"], proposed - left),
+            (names["after_label"], right - proposed),
+        ):
+            if length < minimum - 1e-9:
+                out_of_band = (neighbour, length, "under", minimum, "minimum")
+                break
+            if length > maximum + 1e-9:
+                out_of_band = (neighbour, length, "over", maximum, "maximum")
+                break
+        if out_of_band is not None:
+            neighbour, length, bound, limit, edge = out_of_band
+            skips.append(
+                CutSkip(
+                    **names,
+                    reason=SNAP_OUT_OF_BAND.format(
+                        **labels,
+                        boundary=boundary,
+                        proposed=proposed,
+                        neighbour=neighbour,
+                        length=length,
+                        bound=bound,
+                        limit=limit,
+                        edge=edge,
+                    ),
+                )
+            )
+            continue
+        boundaries[index + 1] = proposed
+        touched.add(index + 1)
+        moves.append(CutMove(**names, proposed=proposed, gap=gap_length))
+    # A shot neither of whose boundaries moved keeps its **stored floats**, not a recomputed
+    # difference of them. `start + duration` and `boundaries[k + 1]` are the same real number
+    # and can be a bit apart in IEEE-754, so recomputing every window would rewrite untouched
+    # shots by an ulp — and `assembly_refusals` compares an approved shot's window snapshot to
+    # its live window with **exact** inequality, so an ulp on an untouched approved shot is a
+    # plan that stops assembling for a move nobody made. Contiguity survives the mix because
+    # an untouched boundary was never assigned: it is still the float both its shots hold.
+    windows = [
+        (shot.id, shot.start, shot.duration)
+        if index not in touched and index + 1 not in touched
+        else (shot.id, boundaries[index], boundaries[index + 1] - boundaries[index])
+        for index, shot in enumerate(ordered)
+    ]
+    return CutSnapPlan("ready", tolerance, moves, skips, windows)

@@ -8,7 +8,10 @@ measures it within one frame of the song, the takes are byte-identical afterward
 `comfy.prompts` stayed empty the whole way.
 """
 
+import asyncio
 import json
+import math
+import struct
 import subprocess
 import wave
 from io import BytesIO
@@ -31,7 +34,7 @@ from music_video_producer.assembly import (
 )
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.models import RenderJob
+from music_video_producer.models import Project, RenderJob
 from music_video_producer.store import ProjectStore
 
 
@@ -102,13 +105,38 @@ def probe(path: Path, entries: str) -> str:
     return result.stdout.strip()
 
 
-def project_with_two_approved_takes(client, store, tmp_path: Path, *, song_seconds=8.0):
+def tone_wav_bytes(seconds: float, amplitude: float = 0.02, rate: int = 44100) -> bytes:
+    """A quiet 220 Hz sine as a WAV: a song with a *level* to normalize, which digital
+    silence does not have. Deliberately far below full scale, so a loudness pass that runs
+    has somewhere to move it and one that does not leaves it where it is."""
+    content = BytesIO()
+    with wave.open(content, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(rate)
+        frames = bytearray()
+        for index in range(int(seconds * rate)):
+            value = int(amplitude * 32767 * math.sin(2 * math.pi * 220 * index / rate))
+            frames += struct.pack("<h", value)
+        target.writeframes(bytes(frames))
+    return content.getvalue()
+
+
+def project_with_two_approved_takes(
+    client, store, tmp_path: Path, *, song_seconds=8.0, song_bytes: bytes | None = None
+):
     """A project whose plan tiles an 8 s song with two approved, on-disk, snapshotted takes."""
     project_id = client.post("/api/projects", json={"name": "Assembly"}).json()["id"]
     upload = client.post(
         f"/api/projects/{project_id}/songs/upload",
         data={"title": "Assembly Song", "duration": "0"},
-        files={"file": ("song.wav", wav_bytes(song_seconds), "audio/wav")},
+        files={
+            "file": (
+                "song.wav",
+                wav_bytes(song_seconds) if song_bytes is None else song_bytes,
+                "audio/wav",
+            )
+        },
     )
     assert upload.status_code == 200, upload.text
 
@@ -445,6 +473,30 @@ def mean_volume_db(path: Path) -> float:
     return float(match.group(1))
 
 
+def integrated_lufs(path: Path) -> float:
+    """EBU R128 integrated loudness of a file's first audio stream, in LUFS.
+
+    `loudnorm` in analysis-only form: `print_format=json` writes the measurement to stderr
+    and `-f null -` throws the audio away, so this measures without normalizing anything.
+    `input_i` is the integrated figure — the one a loudness *target* would move, and
+    therefore the one that says whether the export re-mastered the song.
+    """
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats", "-i", path.as_posix(),
+            "-map", "0:a:0", "-af", "loudnorm=print_format=json", "-f", "null", "-",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    import re as _re
+
+    match = _re.search(r'"input_i"\s*:\s*"(-?[\d.]+)"', result.stderr)
+    assert match, result.stderr[-800:]
+    return float(match.group(1))
+
+
 def test_accepted_take_audio_reaches_the_export_and_unaccepted_audio_never_does(
     tmp_path: Path,
 ):
@@ -546,3 +598,538 @@ def test_a_failed_verification_is_reported_with_numbers_and_leaves_no_export(
     assert list(exports.glob("*.mp4")) == []
     assert list(exports.glob(".work-*")) == []
     assert app.state.live_assemblies == set()
+
+
+# ------------------------------------------------------------------------------------------
+# Export presets and progress (Phase 4.2).
+# ------------------------------------------------------------------------------------------
+
+
+def test_an_unknown_preset_is_refused_before_any_ffmpeg_process_can_exist(
+    tmp_path: Path, monkeypatch
+):
+    """The `Literal` does this, and doing it there is the point: request validation runs
+    before the route body, so the refusal cannot be reached by an ffmpeg invocation however
+    the route is later rearranged. Proven by making *every* subprocess launch an exception
+    and asking for a preset that does not exist — the 422 still comes back, no job is
+    written, no export directory appears, and nothing is queued on ComfyUI."""
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    def refuse_to_run(*args, **kwargs):
+        raise AssertionError("a process was launched for an unknown preset")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse_to_run)
+
+    for unknown in ["final", "MASTER", "", "draft ", "high-quality"]:
+        response = client.post(
+            f"/api/projects/{project_id}/assemble", json={"preset": unknown}
+        )
+        assert response.status_code == 422, (unknown, response.text)
+        assert "preset" in response.text
+
+    assert store.get(project_id).jobs == []
+    assert comfy.prompts == []
+    assert not (tmp_path / "projects" / project_id / "media" / "exports").exists()
+
+
+def test_the_default_request_is_draft_and_runs_the_drafts_own_commands(
+    tmp_path: Path, monkeypatch
+):
+    """What an existing Assemble click produces, asserted at the argv the route actually
+    passes. A body-less request and an explicit `draft` both build with `DRAFT_PRESET`, and
+    the commands that reach ffmpeg carry veryfast/CRF 18 and no loudness filter anywhere."""
+    import music_video_producer.app as app_module
+    from music_video_producer.assembly import DRAFT_PRESET, MASTER_PRESET
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    presets: list[object] = []
+    commands: list[list[str]] = []
+    real_trim, real_concat = app_module.trim_args, app_module.concat_args
+
+    def record_trim(*args, preset=DRAFT_PRESET, **kwargs):
+        presets.append(preset)
+        built = real_trim(*args, preset=preset, **kwargs)
+        commands.append(built)
+        return built
+
+    def record_concat(*args, preset=DRAFT_PRESET, **kwargs):
+        presets.append(preset)
+        built = real_concat(*args, preset=preset, **kwargs)
+        commands.append(built)
+        return built
+
+    monkeypatch.setattr(app_module, "trim_args", record_trim)
+    monkeypatch.setattr(app_module, "concat_args", record_concat)
+
+    bodyless = client.post(f"/api/projects/{project_id}/assemble")
+    assert bodyless.status_code == 200, bodyless.text
+    assert bodyless.json()["preset"] == "draft"
+    assert presets == [DRAFT_PRESET, DRAFT_PRESET, DRAFT_PRESET]
+    for command in commands:
+        assert command[command.index("-c:v") + 1] in {"libx264", "copy"}
+        assert not any("loudnorm" in argument for argument in command)
+    trims = [command for command in commands if "-frames:v" in command]
+    assert len(trims) == 2
+    for trim in trims:
+        assert trim[trim.index("-preset") + 1] == "veryfast"
+        assert trim[trim.index("-crf") + 1] == "18"
+
+    presets.clear()
+    named = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert named.status_code == 200, named.text
+    assert named.json()["preset"] == "draft"
+    assert presets == [DRAFT_PRESET, DRAFT_PRESET, DRAFT_PRESET]
+
+    # And the chosen preset reaches *both* builders — the trims and the join. A route that
+    # honoured the preset only at the join would still produce a loudness-normalized file
+    # while encoding every frame of it at the draft's settings, and the export would look
+    # exactly like a master from the outside.
+    presets.clear()
+    commands.clear()
+    delivered = client.post(
+        f"/api/projects/{project_id}/assemble", json={"preset": "master"}
+    )
+    assert delivered.status_code == 200, delivered.text
+    assert delivered.json()["preset"] == "master"
+    assert presets == [MASTER_PRESET, MASTER_PRESET, MASTER_PRESET]
+    delivered_trims = [command for command in commands if "-frames:v" in command]
+    assert len(delivered_trims) == 2
+    for trim in delivered_trims:
+        assert trim[trim.index("-preset") + 1] == "slow"
+        assert trim[trim.index("-crf") + 1] == "16"
+    assert comfy.prompts == []
+
+
+def test_a_failed_stage_still_carries_ffmpegs_own_words_through_the_progress_reader(
+    tmp_path: Path, monkeypatch
+):
+    """The other half of the drain: what it reads has to reach the Director.
+
+    The progress branch reads stdout itself, so stderr is collected by a task rather than by
+    `communicate()`, and a branch that collected nothing would look perfectly healthy right
+    up until something failed — at which point the 502 and the job's `error` would say "no
+    error output" about a run ffmpeg explained in detail. Forced here by pointing a trim at a
+    file that is not there and asserting ffmpeg's own sentence comes back."""
+    import music_video_producer.app as app_module
+
+    client, store, comfy, app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    real_trim = app_module.trim_args
+
+    def broken_trim(source, dest, *args, **kwargs):
+        return real_trim(tmp_path / "nothing-here.mp4", dest, *args, **kwargs)
+
+    monkeypatch.setattr(app_module, "trim_args", broken_trim)
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "trim" in detail
+    assert "no error output" not in detail
+    assert "nothing-here.mp4" in detail  # ffmpeg's own stderr, not a summary of it
+    jobs = store.get(project_id).jobs
+    assert [job.status for job in jobs] == ["error"]
+    assert jobs[0].error == detail
+    assert comfy.prompts == []
+    assert app.state.live_assemblies == set()
+
+
+def test_the_export_reader_drains_stderr_concurrently_with_the_progress_stream():
+    """The deadlock guard, asserted on the code because its failure is a hang rather than a
+    wrong answer. ffmpeg writes diagnostics to stderr throughout a run — a 4 s trim at debug
+    verbosity produces ~60 KB, which is the order of a pipe buffer — so a parent that reads
+    stdout to exhaustion before touching stderr stops a long export dead, with neither side
+    able to move. The drain task must therefore be created *before* the stdout loop, not
+    awaited after it as a second sequential read."""
+    import inspect
+
+    import music_video_producer.app as app_module
+
+    source = inspect.getsource(app_module.create_app)
+    reader = source.split("    async def run_tool(", 1)[1].split("\n    @app.", 1)[0]
+
+    create = reader.index("asyncio.create_task(process.stderr.read())")
+    loop = reader.index("await process.stdout.readline()")
+    assert create < loop, "stderr is drained after the stdout loop, which can deadlock"
+    # And the no-progress branch keeps `communicate()`, which does the same drain itself.
+    assert "await process.communicate()" in reader
+
+
+def test_the_master_preset_exports_a_verified_file_and_preserves_the_songs_loudness(
+    tmp_path: Path,
+):
+    """The one claim worth making live, and it costs no GPU: a real master export of real
+    (synthetic) clips over a song with a measurable level.
+
+    **The Director's ruling of 2026-08-20**: the export's audio track *is* their master song,
+    so a delivery build must not re-master it. This preset used to carry
+    `loudnorm=I=-16:TP=-1.5:LRA=11` and this test used to assert the lift it produced; the
+    assertion is inverted deliberately, as a spec change. Measured on the written files, both
+    presets now land the export within a fraction of a LU of the song that went in — where
+    the old master preset would have hauled this -38 LUFS tone up to -16.
+
+    **The verification is unchanged** — the export is still within one frame of the song and
+    still carries exactly one video and one audio stream. The 48 kHz conform is the master's
+    only audio filter, and it is measured *as a rate*, not as a level: the draft, which has no
+    audio filter at all, comes out at the song's own 44.1 kHz.
+    """
+    client, store, comfy, app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(
+        client, store, tmp_path, song_bytes=tone_wav_bytes(8.0)
+    )
+    take_bytes_before = (shots_dir / "shot_a-h3_00001-audio.mp4").read_bytes()
+    song_file = tmp_path / "projects" / project_id / store.get(project_id).song.path
+    song_lufs = integrated_lufs(song_file)
+    # The tone is deliberately far below any broadcast target (it measures about -38 LUFS),
+    # so a normalizer that ran would be unmissable: the old -16 LUFS target was more than
+    # 20 LU away from where this song sits.
+    assert song_lufs < -25, song_lufs
+
+    draft = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert draft.status_code == 200, draft.text
+    draft_export = tmp_path / "projects" / project_id / "media" / draft.json()["export"]
+
+    master = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "master"})
+
+    assert master.status_code == 200, master.text
+    body = master.json()
+    assert body["preset"] == "master"
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+    assert export.is_file()
+
+    # The existing verification, re-run by hand on the master's own file.
+    song_seconds = store.get(project_id).song.duration
+    measured = float(probe(export, "format=duration"))
+    assert abs(measured - 8.0) <= 1 / 24, measured
+    assert abs(measured - song_seconds) <= 1 / 24, (measured, song_seconds)
+    assert probe(export, "stream=codec_type").splitlines() == ["video", "audio"]
+    assert (body["width"], body["height"]) == (192, 108)
+    assert body["total_frames"] == 192
+    # Delivery details: faststart is a container fact, and the conform lands 48 kHz — while
+    # the filterless draft carries the song's own rate through, which is what says the
+    # conform is a deliberate delivery choice rather than a leftover of a filter chain.
+    assert probe(export, "stream=sample_rate").splitlines()[0] == "48000"
+    assert probe(draft_export, "stream=sample_rate").splitlines()[0] == "44100"
+
+    # The ruling, measured. Tolerance is 0.5 LU: the AAC re-encode both presets have always
+    # performed moves the integrated figure by a few hundredths, and a loudness *target* of
+    # any kind would move it by whole LUs. Numbers are carried into the failure message so a
+    # regression reports how far it drifted rather than merely that it did.
+    master_lufs = integrated_lufs(export)
+    draft_lufs = integrated_lufs(draft_export)
+    assert abs(master_lufs - song_lufs) <= 0.5, (song_lufs, master_lufs)
+    assert abs(draft_lufs - song_lufs) <= 0.5, (song_lufs, draft_lufs)
+    assert abs(master_lufs - draft_lufs) <= 0.5, (draft_lufs, master_lufs)
+    # And the same claim in the cruder unit, which is immune to loudnorm's own analysis
+    # being the thing measuring it: the master is not louder than the draft.
+    assert mean_volume_db(export) < mean_volume_db(draft_export) + 1.0
+
+    # AD-9, on both new paths.
+    assert comfy.prompts == []
+    assert app.state.live_assemblies == set()
+    assert (shots_dir / "shot_a-h3_00001-audio.mp4").read_bytes() == take_bytes_before
+
+
+def test_the_export_writes_its_own_progress_onto_the_local_job(tmp_path: Path):
+    """The bar's whole data source. The route holds its request open for the length of the
+    export and the AD-1 poll deliberately ignores a job with no prompt id, so the only thing
+    that can report is the job itself — and reporting means writing *during* the run, not
+    only at the end. Every manifest write is captured and the progress values read back."""
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    seen: list[int] = []
+    real_save = store.save
+
+    def recording_save(project):
+        for job in project.jobs:
+            if job.kind == "post" and not job.prompt_id:
+                seen.append(job.progress)
+        return real_save(project)
+
+    store.save = recording_save
+    try:
+        response = client.post(f"/api/projects/{project_id}/assemble")
+    finally:
+        store.save = real_save
+
+    assert response.status_code == 200, response.text
+    assert response.json()["job"]["progress"] == 100
+    assert store.get(project_id).jobs[-1].progress == 100
+
+    # Monotonic, bounded, and it moved before the end: a bar that only ever reads 0 and then
+    # 100 is a bar that reports completion, not progress.
+    assert seen == sorted(seen), seen
+    assert max(seen) == 100 and min(seen) == 0, seen
+    assert any(0 < value < 100 for value in seen), seen
+    # Both stages reported, each inside its own share: a reading from the trims (below the
+    # 90 % they own) and a reading from the join (above it, below the settlement's 100).
+    assert any(0 < value < 90 for value in seen), seen
+    assert any(90 < value < 100 for value in seen), seen
+    # Whole-percent throttling: ffmpeg reports several times a second and every save is a
+    # whole-manifest write with an fsync behind it, so the bar is capped at one write per
+    # percentage point plus the job's own creation and settlement writes.
+    assert len(seen) <= 110, len(seen)
+    assert comfy.prompts == []
+
+
+def test_a_stalled_progress_line_cannot_break_an_export(tmp_path: Path, monkeypatch):
+    """The drain and the parser, together: ffmpeg is asked to report, the parser is fed a
+    line it cannot use for every single reading, and the export still completes and verifies.
+    A reader that raised on a line it did not understand would take the export with it."""
+    import music_video_producer.app as app_module
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    monkeypatch.setattr(app_module, "parse_progress_us", lambda line: None)
+
+    response = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+
+    assert response.status_code == 200, response.text
+    export = tmp_path / "projects" / project_id / "media" / response.json()["export"]
+    assert abs(float(probe(export, "format=duration")) - 8.0) <= 1 / 24
+    assert probe(export, "stream=codec_type").splitlines() == ["video", "audio"]
+    # Nothing was reported, and the settlement still states the finished number.
+    assert response.json()["job"]["progress"] == 100
+    assert comfy.prompts == []
+
+
+# --- Startup healing (Phase 1.3) --------------------------------------------------------
+#
+# The gap: an assembly job left `running` by a crash was healed only at the *next assemble*,
+# so a Director reopening the project after a crash saw an export in progress that nothing
+# would ever finish, and every gate counting open local work went on refusing, until they
+# happened to assemble again. Boot is the event that made the verdict true, so boot is where
+# it is now delivered -- by the same function the assemble path calls, handed the empty
+# registry a just-started process actually has.
+#
+# The boundary these tests exist to hold: a **local** job (empty `prompt_id`) cannot survive
+# a restart, because the in-process registry was the only thing that could ever settle it. A
+# **ComfyUI** job may well still be executing on the Director's GPU -- ComfyUI is
+# user-managed and outlives this process -- so healing one on the strength of our own restart
+# would throw away a render being paid for in GPU minutes. Those stay for the reconciler.
+
+
+def crashed_project(store: ProjectStore, name: str, jobs: list[RenderJob]) -> str:
+    """A manifest on disk carrying `jobs`, as a crash would have left it. No app involved."""
+    project = store.create(Project(name=name))
+    project.jobs = list(jobs)
+    store.save(project)
+    return project.id
+
+
+def test_startup_heals_an_orphaned_local_job_and_leaves_a_live_comfy_job_alone(tmp_path: Path):
+    """The whole rule in one boot: the local job settles, the ComfyUI job does not move."""
+    store = ProjectStore(tmp_path)
+    project_id = crashed_project(
+        store,
+        "Crashed mid-export",
+        [
+            RenderJob(id="job_local", kind="post", status="running", target_id="assembly",
+                      progress=42),
+            RenderJob(id="job_comfy", kind="h3", status="running", prompt_id="p-live",
+                      target_id="shot_a", missing_ticks=1),
+            RenderJob(id="job_comfy_post", kind="post", status="queued", prompt_id="p-audio",
+                      target_id="shot_a"),
+            RenderJob(id="job_local_h3", kind="h3", status="running", target_id="shot_a"),
+            RenderJob(id="job_done", kind="post", status="complete", target_id="assembly",
+                      output_files=["media/exports/one.mp4"]),
+        ],
+    )
+
+    _client, _store, comfy, app = make_client(tmp_path)
+
+    assert app.state.startup_healed_jobs == 1
+    jobs = {job.id: job for job in ProjectStore(tmp_path).get(project_id).jobs}
+    assert jobs["job_local"].status == "error"
+    assert jobs["job_local"].error == ASSEMBLY_ORPHANED_ERROR
+    # The live ComfyUI render is untouched in every field -- still open, still counting its
+    # unknown ticks, still the reconciler's to settle by asking ComfyUI.
+    assert jobs["job_comfy"].status == "running"
+    assert jobs["job_comfy"].error == ""
+    assert jobs["job_comfy"].missing_ticks == 1
+    # And so is the *audio restoration*, which is `kind="post"` like the assembly job and is
+    # told apart from it by the one marker that matters: it carries a prompt id.
+    assert jobs["job_comfy_post"].status == "queued"
+    assert jobs["job_comfy_post"].error == ""
+    # And a job of some other kind carrying no prompt id is left alone too, which is the
+    # `kind == "post"` clause carried over verbatim from the assemble path rather than
+    # widened on the way. Not because such a job is healthy -- nothing can reconcile it
+    # either -- but because the only sentence this rule knows how to write is *the
+    # assembly's*, and stamping "This assembly was interrupted" onto a shot render would be
+    # a false record of what happened. Widening this is a decision with its own wording,
+    # not a side effect of moving the rule.
+    assert jobs["job_local_h3"].status == "running"
+    assert jobs["job_local_h3"].error == ""
+    # A settled job is not re-settled.
+    assert jobs["job_done"].status == "complete"
+    assert jobs["job_done"].output_files == ["media/exports/one.mp4"]
+    # Nothing was submitted, asked or cancelled on ComfyUI on the way through boot.
+    assert comfy.prompts == []
+
+
+def test_startup_healing_and_the_assemble_paths_healing_agree_on_the_same_input(tmp_path: Path):
+    """One rule, asserted as one rule rather than as two matching transcriptions.
+
+    The same manifest is put through boot in one data root and through the assemble path's
+    heal in another, and the resulting job records are compared field for field. A second
+    opinion at either end -- a widened kind, a dropped `prompt_id` clause -- shows up here as
+    a disagreement rather than as a silent divergence nobody notices until a render is lost.
+    """
+    crash = [
+        RenderJob(id="job_local", kind="post", status="running", target_id="assembly"),
+        RenderJob(id="job_local_queued", kind="post", status="queued", target_id="assembly"),
+        RenderJob(id="job_comfy", kind="h3", status="queued", prompt_id="p-live",
+                  target_id="shot_a"),
+        RenderJob(id="job_flux", kind="flux", status="running", prompt_id="p-flux",
+                  target_id="asset_a"),
+        RenderJob(id="job_cancelled", kind="post", status="cancelled", target_id="assembly"),
+    ]
+
+    # Boot: the manifest is on disk before `create_app` runs.
+    boot_root = tmp_path / "boot"
+    boot_store = ProjectStore(boot_root)
+    boot_id = crashed_project(boot_store, "Boot", crash)
+    make_client(boot_root)
+    booted = ProjectStore(boot_root).get(boot_id).jobs
+
+    # The assemble path: the manifest is written *after* the app exists, and the route's own
+    # heal runs on the way in. It refuses afterwards (open renders), which is fine -- the
+    # heal happens before the refusal, exactly as it always has.
+    route_root = tmp_path / "route"
+    route_store = ProjectStore(route_root)
+    client, _store, _comfy, _app = make_client(route_root)
+    route_id = crashed_project(route_store, "Route", crash)
+    assert client.post(f"/api/projects/{route_id}/assemble").status_code == 409
+    routed = ProjectStore(route_root).get(route_id).jobs
+
+    def comparable(jobs):
+        return [
+            {"id": job.id, "status": job.status, "error": job.error, "kind": job.kind,
+             "prompt_id": job.prompt_id}
+            for job in jobs
+        ]
+
+    assert comparable(booted) == comparable(routed)
+    # And they agree on something, rather than agreeing by both doing nothing.
+    assert [job["status"] for job in comparable(booted)] == [
+        "error", "error", "queued", "running", "cancelled"
+    ]
+
+
+def test_startup_survives_no_projects_a_corrupt_manifest_and_a_project_with_no_jobs(
+    tmp_path: Path,
+):
+    """Boot must not be able to fail. Three shapes of nothing-to-do, one of them broken.
+
+    A manifest that cannot be parsed is invisible to `ProjectStore.list`, so it is skipped
+    rather than fatal -- and it is left exactly as it was on disk, because a startup pass
+    has no business rewriting a file it could not read.
+    """
+    # No projects at all: the directory is empty and the app still boots and serves.
+    empty_root = tmp_path / "empty"
+    client, _store, comfy, app = make_client(empty_root)
+    assert app.state.startup_healed_jobs == 0
+    assert client.get("/api/projects").status_code == 200
+
+    # A corrupt manifest beside a healthy crashed one, plus a project holding no jobs at all.
+    mixed_root = tmp_path / "mixed"
+    store = ProjectStore(mixed_root)
+    healthy_id = crashed_project(
+        store, "Healthy", [RenderJob(id="job_local", kind="post", status="running",
+                                     target_id="assembly")]
+    )
+    jobless_id = crashed_project(store, "Jobless", [])
+    broken_dir = mixed_root / "projects" / "project_deadbeefcafe"
+    (broken_dir / "media").mkdir(parents=True)
+    broken = broken_dir / "project.json"
+    broken.write_text('{"name": "Half-written', encoding="utf-8")
+    broken_bytes = broken.read_bytes()
+
+    client, _store, comfy, app = make_client(mixed_root)
+
+    # The readable crash healed; boot did not raise; the broken file is byte-identical.
+    assert app.state.startup_healed_jobs == 1
+    assert ProjectStore(mixed_root).get(healthy_id).jobs[0].status == "error"
+    assert ProjectStore(mixed_root).get(jobless_id).jobs == []
+    assert broken.read_bytes() == broken_bytes
+    assert client.get("/api/projects").status_code == 200
+    assert comfy.prompts == []
+
+
+def test_startup_does_not_rewrite_a_manifest_it_had_nothing_to_heal(tmp_path: Path):
+    """Every save is a whole-manifest write with an fsync behind it, and it bumps
+    `updated_at` -- which the optimistic-concurrency check on `PUT /projects/{id}` compares.
+    A boot that touched every project would invalidate every client's snapshot for nothing."""
+    store = ProjectStore(tmp_path)
+    project_id = crashed_project(
+        store,
+        "Untouched",
+        [RenderJob(id="job_comfy", kind="h3", status="running", prompt_id="p-live",
+                   target_id="shot_a")],
+    )
+    before = (tmp_path / "projects" / project_id / "project.json").read_bytes()
+
+    _client, _store, _comfy, app = make_client(tmp_path)
+
+    assert app.state.startup_healed_jobs == 0
+    assert (tmp_path / "projects" / project_id / "project.json").read_bytes() == before
+
+
+class RaisingListStore(ProjectStore):
+    """A store whose `list` fails outright -- a permission error, a mangled data root."""
+
+    def list(self):
+        raise RuntimeError("the projects directory could not be read")
+
+
+class RaisingSaveStore(ProjectStore):
+    """A store that reads fine and cannot write. One unwritable project, mid-pass."""
+
+    def save(self, project):
+        if project.name == "Unwritable":
+            raise OSError("read-only project directory")
+        return super().save(project)
+
+
+def test_boot_survives_a_store_that_raises_on_list_and_on_save(tmp_path: Path):
+    """The two guards that exist so startup cannot fail, each driven by a real exception.
+
+    Neither is reachable through `ProjectStore` itself -- `list` already skips a manifest it
+    cannot parse -- so they are driven through a store that raises, which is the shape a
+    permission error or a mangled data root actually has. Without them the application does
+    not start at all, which is a far worse outcome than a job left saying `running`.
+    """
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+
+    # `list` raises: the pass reports nothing healed and the app is still built and serving.
+    listing = create_app(
+        settings=settings, store=RaisingListStore(tmp_path), comfy=FakeComfy(),
+        director=object(),
+    )
+    assert listing.state.startup_healed_jobs == 0
+    # Served through a route that does not itself list projects -- this store cannot answer
+    # that question at all, and the claim here is that *boot* survived it.
+    assert TestClient(listing).get("/api/health").status_code == 200
+
+    # `save` raises for one project: the others are still healed, and boot still completes.
+    store = ProjectStore(tmp_path)
+    orphan = [RenderJob(id="job_local", kind="post", status="running", target_id="assembly")]
+    unwritable_id = crashed_project(store, "Unwritable", orphan)
+    writable_id = crashed_project(store, "Writable", orphan)
+
+    saving = create_app(
+        settings=settings, store=RaisingSaveStore(tmp_path), comfy=FakeComfy(),
+        director=object(),
+    )
+
+    assert saving.state.startup_healed_jobs == 1
+    fresh = ProjectStore(tmp_path)
+    assert fresh.get(writable_id).jobs[0].status == "error"
+    # The unwritable one is honestly still `running` on disk -- nothing pretended otherwise.
+    assert fresh.get(unwritable_id).jobs[0].status == "running"
+    assert TestClient(saving).get("/api/projects").status_code == 200

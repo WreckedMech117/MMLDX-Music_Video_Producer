@@ -15,6 +15,7 @@ from test_workflows import PANEL_COUNT_PATTERN
 
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
+    CONSISTENCY_PROMPT_LIMIT,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_RESTORE_REFUSAL,
@@ -26,6 +27,7 @@ from music_video_producer.app import (
     SONG_LYRICS_LIMIT,
     SONG_REPLACEMENT_CONSEQUENCE,
     MusicRequest,
+    SnapCutsRequest,
     SongPlannerRequest,
     _require_song_replacement_confirmation,
     create_app,
@@ -37,6 +39,9 @@ from music_video_producer.models import (
     ASSET_ROLE_LABELS,
     LEGACY_SHOT_MODES,
     SHOT_MODE_SPECS,
+    SHOT_PLAN_CONTENT_FIELDS,
+    SHOT_TAKE_PROVENANCE_FIELDS,
+    SHOT_UNINHERITED_DECISION_FIELDS,
     Asset,
     AssetCitation,
     AssetKind,
@@ -51,6 +56,7 @@ from music_video_producer.models import (
     mode_specification_problems,
     resolve_shot_mode,
 )
+from music_video_producer.timeline import SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX
 from music_video_producer.workflows import MUSIC3_MAX_DURATION_SECONDS
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
@@ -153,9 +159,21 @@ const make = (selector) => ({
   addEventListener(type, handler) { listeners.set(selector + ":" + type, handler); },
   append() {}, remove() {}, pause() {}, load() {}, click() {},
   setAttribute() {}, removeAttribute() {}, getAttribute() { return null; },
-  querySelector: () => null, querySelectorAll: () => [],
+  querySelectorAll: () => [],
   getBoundingClientRect: () => ({ left: 0, top: 0, width: 1000, height: 300 }),
   closest() { return this; },
+  // A minimal scoped `querySelector`, over the markup this element was just given. Id
+  // selectors only, which is every scoped single-element lookup in app.js. It answered `null`
+  // before, and that was the same hole `querySelectorAll` closed below: a control drawn into a
+  // bar and then bound with `$("#id", bar)` was bound to nothing in this harness, so no test
+  // could click one -- which is exactly how a two-stage report-then-confirm button would go
+  // untested. Each match resolves to the registry's own element, so a test fires it by id.
+  querySelector(selector) {
+    if (!selector.startsWith("#")) return null;
+    return String(this.innerHTML || "").includes('id="' + selector.slice(1) + '"')
+      ? at(selector)
+      : null;
+  },
   // A minimal scoped `querySelectorAll`, over the markup this element was just given. Class
   // selectors only, which is every scoped use in app.js.
   //
@@ -3638,14 +3656,29 @@ def test_the_timeline_clip_renders_only_what_the_prompt_cell_decided():
     clip = APP_JS.read_text(encoding="utf-8").split("function renderTimeline", 1)[1].split("\n}", 1)[0]
     body = without_comments(clip)
 
-    assert "const cell = shotPromptCell(shot);" in body
+    # The call now carries the shot's live render percentage, which `shotPromptCell` folds into
+    # the label it returns. The rule this test exists for is unchanged and is asserted exactly:
+    # the template makes no decision of its own, it applies one. Both arguments are looked up
+    # above the call and neither is computed inside the template string.
+    assert "const percent = state.renderProgress?.[shot.id];" in body
+    assert "const cell = shotPromptCell(shot, percent);" in body
     for drawn in ("cell.className", "escapeHtml(cell.text)"):
         assert drawn in body, drawn
     # Both the tooltip and the accessible name, from the one label.
     assert 'title="${escapeHtml(cell.label)}"' in body
     assert 'aria-label="${escapeHtml(cell.label)}"' in body
-    # No second copy of the decision, in any of its spellings.
-    for redecided in ("promptIsMissing", "SHOT_WITHOUT_PROMPT_FLAG", "Untitled shot"):
+    # The render-state word is applied the same way: one function decides it, including whether
+    # the percentage is known at all, and the template only chooses whether the span exists.
+    assert '<span class="clip-state">${escapeHtml(renderingFlag(percent))}</span>' in body
+    # No second copy of either decision, in any of its spellings. `RENDERING` spelled out here
+    # would be a template that had stopped asking `renderingFlag` what the word is -- which is
+    # also where a hand-formatted percentage would appear.
+    for redecided in (
+        "promptIsMissing",
+        "SHOT_WITHOUT_PROMPT_FLAG",
+        "Untitled shot",
+        "RENDERING",
+    ):
         assert redecided not in body, redecided
 
 
@@ -7608,3 +7641,1355 @@ def test_section_snapping_is_executed_and_the_track_is_interactive():
     assert 'id="section-delete"' in workspace
     # Selecting a shot clears the section selection and vice versa — one panel, one owner.
     assert "state.selectedSectionId = null;" in workspace
+
+
+# ------------------------------------------------------------------------------------------
+# Export presets and assembly progress (Phase 4.2). The select must offer exactly what the
+# route accepts, and the progress reader must key on the same local-job marker AD-9 uses.
+# ------------------------------------------------------------------------------------------
+
+
+def export_presets() -> dict:
+    """api.js's preset table and its default, plus what `api.assemble` puts on the wire."""
+    return run_module("""
+      const seen = [];
+      globalThis.fetch = (path, options = {}) => {
+        seen.push({ path, method: options.method, body: options.body });
+        return Promise.resolve({
+          ok: true, status: 200,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ preset: 'draft' }),
+        });
+      };
+      const { api, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT }
+        = await import('./src/music_video_producer/web/assets/api.js');
+      await api.assemble('p1');
+      await api.assemble('p1', 'master');
+      console.log(JSON.stringify({
+        presets: EXPORT_PRESETS,
+        fallback: EXPORT_PRESET_DEFAULT,
+        requests: seen,
+      }));
+    """)
+
+
+def test_the_preset_select_offers_exactly_what_the_route_accepts():
+    """A select offering a preset the server refuses is a dead control, and one missing a
+    preset the server accepts is a delivery build nobody can reach. Both halves come from
+    the same two names, so this holds them together — the client list against the route's
+    `Literal`, and the route's `Literal` against `assembly.EXPORT_PRESETS`."""
+    from music_video_producer.app import AssemblyRequest
+    from music_video_producer.assembly import DEFAULT_EXPORT_PRESET, EXPORT_PRESETS
+
+    accepted = set(get_args(AssemblyRequest.model_fields["preset"].annotation))
+    assert accepted == set(EXPORT_PRESETS)
+
+    offered = export_presets()
+    assert [preset["value"] for preset in offered["presets"]] == ["draft", "master"]
+    assert {preset["value"] for preset in offered["presets"]} == accepted
+    assert offered["fallback"] == DEFAULT_EXPORT_PRESET
+    assert AssemblyRequest().preset == DEFAULT_EXPORT_PRESET
+    # Every option says what it does; a two-word label is not enough to choose between a
+    # review build and one that changes the loudness of the delivered file.
+    for preset in offered["presets"]:
+        assert preset["label"] and len(preset["help"]) > 40
+
+
+def test_the_assemble_call_always_names_a_preset_and_defaults_to_draft():
+    """The client never sends a body-less assemble any more, and the body it does send names
+    `draft` unless told otherwise — the same default the route would have applied anyway, so
+    the two cannot disagree about what an untouched button produces."""
+    requests = export_presets()["requests"]
+
+    assert [request["path"] for request in requests] == [
+        "/api/projects/p1/assemble", "/api/projects/p1/assemble"
+    ]
+    assert [request["method"] for request in requests] == ["POST", "POST"]
+    assert json.loads(requests[0]["body"]) == {"preset": "draft"}
+    assert json.loads(requests[1]["body"]) == {"preset": "master"}
+
+
+def test_assembly_progress_reads_the_local_job_and_only_the_local_job():
+    """AD-9's marker, read the way `latestAssemblyExport` reads it: kind `post` with an empty
+    prompt id. A ComfyUI render — which `hasActiveRenderJobs` does watch — must not be
+    mistaken for an export, a settled assembly reports nothing rather than a stale number,
+    and a manifest written before the field existed reads 0 rather than NaN."""
+    percentages = run_module("""
+      import { assemblyProgress } from './src/music_video_producer/web/assets/api.js';
+      const job = (extra) => Object.assign(
+        { kind: 'post', prompt_id: '', status: 'running', progress: 0 }, extra);
+      console.log(JSON.stringify({
+        none: assemblyProgress({ jobs: [] }),
+        missing: assemblyProgress({}),
+        running: assemblyProgress({ jobs: [job({ progress: 42 })] }),
+        legacy: assemblyProgress({ jobs: [{ kind: 'post', prompt_id: '', status: 'running' }] }),
+        settled: assemblyProgress({ jobs: [job({ status: 'complete', progress: 100 })] }),
+        errored: assemblyProgress({ jobs: [job({ status: 'error', progress: 45 })] }),
+        comfy: assemblyProgress({ jobs: [{ kind: 'h3', prompt_id: 'p-1', status: 'running' }] }),
+        newest: assemblyProgress({ jobs: [job({ progress: 10 }), job({ progress: 70 })] }),
+        overflow: assemblyProgress({ jobs: [job({ progress: 900 })] }),
+        garbage: assemblyProgress({ jobs: [job({ progress: 'soon' })] }),
+      }));
+    """)
+
+    assert percentages["none"] is None
+    assert percentages["missing"] is None
+    assert percentages["running"] == 42
+    assert percentages["legacy"] == 0
+    assert percentages["settled"] is None
+    assert percentages["errored"] is None
+    assert percentages["comfy"] is None
+    assert percentages["newest"] == 70
+    assert percentages["overflow"] == 100
+    assert percentages["garbage"] == 0
+
+
+def test_the_assembly_bar_draws_the_preset_select_and_the_running_percentage():
+    """The bar is drawn entirely by `renderAssembly`, so this is where the control has to
+    appear. Read from source, because a browser is not available here: the options come from
+    api.js's table rather than a second hand-written list, the chosen preset is what the
+    click sends, and the in-flight label carries the number the poll reads back."""
+    source = APP_JS.read_text(encoding="utf-8")
+    block = source.split("function renderAssembly()", 1)[1].split("\nfunction ", 1)[0]
+
+    assert "EXPORT_PRESETS.map(" in block
+    assert 'id="assembly-preset"' in block
+    assert "assemblyPreset" in block
+    assert "api.assemble(projectId, preset)" in block
+    # The percentage rides the running label, and only when one has been read.
+    assert "assemblyPercent === null ? ASSEMBLE_RUNNING" in block
+    # The poll starts with the click and stops with it: an interval left running after a
+    # synchronous request settles would fetch the project every two seconds forever.
+    assert "watchAssemblyProgress(projectId);" in block
+    assert "stopAssemblyProgress();" in block
+    assert "assemblyProgress(fresh)" in source
+    assert "clearInterval(assemblyProgressTimer)" in source
+
+
+# ---------------------------------------------------------------------------------------------
+# The appearance anchor (`Asset.consistency_prompt`)
+# ---------------------------------------------------------------------------------------------
+
+
+def consistency_anchor_plans(kinds: list[str]) -> dict:
+    """`consistencyAnchorPlan` run for real: every Asset kind, and every draft state."""
+    return run_module(f"""
+      import {{ CONSISTENCY_PROMPT_LIMIT, consistencyAnchorPlan }}
+        from './src/music_video_producer/web/assets/api.js';
+      const kinds = {json.dumps(kinds)};
+      const offered = {{}};
+      for (const kind of kinds) {{
+        offered[kind] = consistencyAnchorPlan({{ id: 'a', kind, consistency_prompt: '' }}) !== null;
+      }}
+      const stored = {{ id: 'a', kind: 'character', consistency_prompt: 'a woman in a red leather jacket' }};
+      const bare = {{ id: 'a', kind: 'character' }};
+      console.log(JSON.stringify({{
+        limit: CONSISTENCY_PROMPT_LIMIT,
+        offered,
+        nothingSelected: consistencyAnchorPlan(null),
+        untouched: consistencyAnchorPlan(stored),
+        whitespaceOnly: consistencyAnchorPlan(stored, 'a woman in a red leather jacket   '),
+        edited: consistencyAnchorPlan(stored, 'a woman in a black coat'),
+        cleared: consistencyAnchorPlan(stored, ''),
+        overLong: consistencyAnchorPlan(stored, 'z'.repeat(CONSISTENCY_PROMPT_LIMIT + 1)),
+        atLimit: consistencyAnchorPlan(stored, 'z'.repeat(CONSISTENCY_PROMPT_LIMIT)),
+        missingField: consistencyAnchorPlan(bare),
+      }}));
+    """)
+
+
+def test_the_anchor_editor_decides_every_state_from_one_executed_rule():
+    """Executed for every kind an Asset can carry, and for every state of the box.
+
+    The rule is an exclusion rather than a list of blessed kinds, and that is asserted as
+    such: a kind added to `AssetKind` later must be offered the field automatically, because
+    the failure of a hardcoded list is a feature that is simply missing from the screen while
+    every backend test passes. Only `audio` is out, and only because a sound has no
+    appearance.
+
+    The bound is read from api.js and compared to the route's, for the reason the song-context
+    bound already learned: a client that shortens a paste and a route that refuses the same
+    text with a 422 are two rules wearing one number.
+    """
+    kinds = list(get_args(AssetKind))
+    executed = consistency_anchor_plans(kinds)
+
+    assert executed["limit"] == CONSISTENCY_PROMPT_LIMIT
+    assert {kind for kind in kinds if executed["offered"][kind]} == set(kinds) - {"audio"}
+    assert executed["nothingSelected"] is None
+
+    # A freshly selected asset reports the stored text and offers no save: writing an anchor
+    # that is already stored spends a manifest save to change nothing.
+    assert executed["untouched"]["draft"] == "a woman in a red leather jacket"
+    assert executed["untouched"]["changed"] is False
+    assert executed["untouched"]["savable"] is False
+    # Trailing whitespace is not an edit, because the route trims before it stores.
+    assert executed["whitespaceOnly"]["savable"] is False
+
+    assert executed["edited"]["savable"] is True
+    # Emptying the box is a real edit — an anchor that cannot be withdrawn is one the
+    # Director cannot correct.
+    assert executed["cleared"]["changed"] is True
+    assert executed["cleared"]["savable"] is True
+    assert executed["cleared"]["length"] == 0
+
+    # Over the bound: counted, said in words rather than only in a colour, and unsavable, so
+    # the button cannot send a request the route is certain to refuse.
+    assert executed["overLong"]["over"] is True
+    assert executed["overLong"]["savable"] is False
+    assert "too long to save" in executed["overLong"]["count"]
+    assert executed["atLimit"]["over"] is False
+    assert executed["atLimit"]["savable"] is True
+
+    # An asset loaded from a manifest written before the field existed carries no key at all.
+    assert executed["missingField"]["stored"] == ""
+    assert executed["missingField"]["savable"] is False
+
+
+def test_the_inspector_draws_the_anchor_above_the_generation_prompt_and_saves_it_alone():
+    """The render and the click are both executed; nothing here reads app.js as text.
+
+    Three things a source-reading test could not see. That the box is drawn at all and holds
+    the *stored* anchor. That it sits above the read-only generation prompt — the anchor
+    outranks it everywhere both are consumed, and a panel that puts the machine's text first
+    teaches the opposite. And that saving goes through the dedicated route: an anchor folded
+    into the whole-project PUT would be silently re-adopted by the server and lost.
+    """
+    fired = run_workspace("""
+      const arrange = (asset) => {
+        state.project = { id: 'p1', shots: [], jobs: [], assets: [asset] };
+        state.selectedAssetId = asset.id;
+        app.renderAssetInspector();
+        return at('#asset-inspector').innerHTML;
+      };
+      const character = arrange({
+        id: 'a1', kind: 'character', path: 'out/a.png', name: 'Lucy', source: 'upload',
+        prompt: 'a woman in a blue dress, studio lighting',
+        consistency_prompt: 'a woman in a red leather jacket',
+        created_at: '2026-08-20T00:00:00Z',
+      });
+      const sound = arrange({
+        id: 'a2', kind: 'audio', path: 'out/a.wav', name: 'Room tone', source: 'upload',
+        prompt: '', consistency_prompt: '', created_at: '2026-08-20T00:00:00Z',
+      });
+
+      // Typing repaints the count and the button without rebuilding the panel.
+      arrange({
+        id: 'a1', kind: 'character', path: 'out/a.png', name: 'Lucy', source: 'upload',
+        prompt: '', consistency_prompt: 'a woman in a red leather jacket',
+        created_at: '2026-08-20T00:00:00Z',
+      });
+      // The initial shut state is in the markup: the stub DOM cannot see an attribute the
+      // template wrote, only a property a handler set.
+      const before = at('#asset-inspector').innerHTML.includes('id="save-asset-anchor" disabled');
+      at('#asset-anchor').value = 'a woman in a black coat';
+      await fire('#asset-anchor:input', {});
+      const afterTyping = {
+        disabled: at('#save-asset-anchor').disabled,
+        count: at('#asset-anchor-count').textContent,
+      };
+      at('#asset-anchor').value = 'z'.repeat(1000);
+      await fire('#asset-anchor:input', {});
+      const afterOverflow = {
+        disabled: at('#save-asset-anchor').disabled,
+        count: at('#asset-anchor-count').textContent,
+      };
+
+      at('#asset-anchor').value = '  a woman in a black coat  ';
+      await fire('#asset-anchor:input', {});
+      requests.length = 0;
+      await fire('#save-asset-anchor:click', {});
+      const saved = requests.map((sent) => ({ path: sent.path, method: sent.method, body: sent.body }));
+
+      console.log(JSON.stringify({
+        drawn: character.includes('id="asset-anchor"'),
+        holdsStored: character.includes('a woman in a red leather jacket'),
+        anchorBeforeGenerationPrompt:
+          character.indexOf('id="asset-anchor"') < character.indexOf('Generation prompt'),
+        noMaxlength: !character.includes('maxlength'),
+        soundHasNoBox: !sound.includes('id="asset-anchor"'),
+        before, afterTyping, afterOverflow, saved,
+      }));
+    """, responses={
+        "/api/projects/p1/assets/a1/consistency-prompt": {
+            "body": {"id": "p1", "shots": [], "jobs": [], "assets": []},
+        },
+    })
+
+    assert fired["drawn"] is True
+    assert fired["holdsStored"] is True
+    assert fired["anchorBeforeGenerationPrompt"] is True
+    # No `maxlength`: it truncates an oversized paste silently, which is the defect the
+    # song-context boxes already recorded. The count and the route's 422 are the only two
+    # things that speak about the bound.
+    assert fired["noMaxlength"] is True
+    assert fired["soundHasNoBox"] is True
+
+    assert fired["before"] is True
+    assert fired["afterTyping"]["disabled"] is False
+    assert "too long" not in fired["afterTyping"]["count"]
+    assert fired["afterOverflow"]["disabled"] is True
+    assert "too long to save" in fired["afterOverflow"]["count"]
+
+    # One request, to the dedicated route, carrying the trimmed anchor and nothing else.
+    assert fired["saved"] == [
+        {
+            "path": "/api/projects/p1/assets/a1/consistency-prompt",
+            "method": "PUT",
+            "body": json.dumps(
+                {"consistency_prompt": "a woman in a black coat"}, separators=(",", ":")
+            ),
+        }
+    ]
+
+
+# A Shot with every field set to something that is not its default, so a copy that inherits
+# anything at all is visible field by field rather than only in the fields a fixture bothered
+# to fill. Built from the model, so a field added to `Shot` and left out of this fixture fails
+# the partition test next door rather than riding into the copy unnoticed.
+RENDERED_SHOT = {
+    "id": "shot_source",
+    "start": 12.5,
+    "duration": 4.25,
+    "prompt": "A singer turns toward camera",
+    "h3_prompt": "Shot 1: a singer turns toward camera",
+    "mode": "references",
+    "asset_ids": ["asset_wolf"],
+    "citations": [{"asset_id": "asset_wolf", "role": "reference", "order": 0}],
+    "reference_labels": {"asset_wolf": "the wolf"},
+    "singing": "singing",
+    "use_song_audio": True,
+    "seed": 4242,
+    "status": "complete",
+    "prompt_id": "comfy_prompt_1",
+    "latest_output": "shots/shot_source/take_1.mp4",
+    "latest_review": {"model": "vision", "summary": "the wolf, centre frame"},
+    "approved_output": "shots/shot_source/take_1.mp4",
+    "approved_start": 12.5,
+    "approved_duration": 4.25,
+    "latest_take_lead": 0.25,
+    "trim_nudge": -0.125,
+    "mix_take_audio": True,
+    "flagged": True,
+    "locked": True,
+}
+
+
+def test_the_monitor_says_when_a_newer_render_is_about_to_displace_the_take_on_screen():
+    """The Monitor's honesty, executed — the surface a Director actually watches.
+
+    `monitorState` decided purely from `latest_output`, and `.showing-take` display:none's the
+    overlay, which was the Monitor's only text layer. So a re-rendering shot played its previous
+    take in sync, framed identically to a settled one, with nothing on screen saying a newer
+    render was in flight — while the inspector two panels away said exactly that.
+
+    The take still plays and `latest_output` still points at it: the fix is to state the state,
+    never to change it. The settled view is pinned byte for byte, because "say more about the
+    in-flight case" must not become "say something different about every case".
+    """
+    from music_video_producer.app import APPROVE_IN_FLIGHT_REFUSAL
+
+    shots = [
+        {"id": "settled", "start": 0, "duration": 4, "latest_output": "shots/a.mp4",
+         "status": "complete", "latest_take_lead": 0.25, "trim_nudge": 0.125},
+        {"id": "rerendering", "start": 4, "duration": 4, "latest_output": "shots/b.mp4",
+         "status": "running", "latest_take_lead": 0.25, "trim_nudge": 0.125},
+        {"id": "queued", "start": 8, "duration": 4, "latest_output": "shots/c.mp4",
+         "status": "queued", "mix_take_audio": True},
+        {"id": "first-render", "start": 12, "duration": 4, "status": "running"},
+    ]
+    seen = run_module(f"""
+      import {{ MONITOR_PREVIOUS_TAKE, TAKE_DISPLACED_BY_RENDER, monitorShowsTake, monitorState }}
+        from './src/music_video_producer/web/assets/api.js';
+      const project = {{ shots: {json.dumps(shots)} }};
+      const settled = monitorState(project, 1.0);
+      const displaced = monitorState(project, 5.0);
+      console.log(JSON.stringify({{
+        sentence: TAKE_DISPLACED_BY_RENDER,
+        previousKind: MONITOR_PREVIOUS_TAKE,
+        settledJson: JSON.stringify(settled),
+        displacedJson: JSON.stringify(displaced),
+        queued: monitorState(project, 9.0),
+        firstRender: monitorState(project, 13.0),
+        shows: [settled, displaced, monitorState(project, 13.0), monitorState(project, 99)]
+          .map(monitorShowsTake),
+        // Nothing about the shot itself moved: the pointer the finishing stages read is
+        // exactly where it was.
+        pointer: project.shots[1].latest_output,
+        status: project.shots[1].status,
+      }}));
+    """)
+
+    # The settled view, pinned. Every key, every value, in order.
+    assert seen["settledJson"] == (
+        '{"kind":"take","shot":{"id":"settled","start":0,"duration":4,'
+        '"latest_output":"shots/a.mp4","status":"complete","latest_take_lead":0.25,'
+        '"trim_nudge":0.125},"takeTime":1.375,"label":"","muted":true}'
+    )
+    # The displaced view differs in exactly two of those values: the kind, and the label that
+    # was empty because a settled take has nothing to explain. The slice and the mix are the
+    # settled arithmetic untouched — the take plays exactly as it did.
+    displaced = json.loads(seen["displacedJson"])
+    settled = json.loads(seen["settledJson"])
+    assert displaced["kind"] == seen["previousKind"] != settled["kind"]
+    assert displaced["label"] == seen["sentence"]
+    assert settled["label"] == ""
+    assert displaced["takeTime"] == settled["takeTime"] == 1.375
+    assert displaced["muted"] == settled["muted"] is True
+    assert list(displaced) == list(settled)
+
+    # A queued shot is in flight exactly as a running one is, and its accepted audio still plays.
+    assert seen["queued"]["kind"] == seen["previousKind"]
+    assert seen["queued"]["muted"] is False
+    # A first render has no take to displace, so the Monitor says what it always said.
+    assert seen["firstRender"]["kind"] == "no-take"
+    # Both take kinds keep a picture on screen; nothing else does.
+    assert seen["shows"] == [True, True, False, False]
+    # The pointer and the status are read, never written.
+    assert seen["pointer"] == "shots/b.mp4"
+    assert seen["status"] == "running"
+
+    # The server's sentence, in the server's words: the refusal the inspector already shows
+    # opens with exactly this, so the Monitor and the Approve button describe one state.
+    assert APPROVE_IN_FLIGHT_REFUSAL.format(shot="this shot").startswith(seen["sentence"])
+
+    # And executed through the real wiring: a playhead move repaints the Monitor, so this is
+    # what a Director scrubbing the timeline is actually shown.
+    painted = run_workspace(f"""
+      state.project = {{ id: 'p1', shots: {json.dumps(shots)}, jobs: [], assets: [] }};
+      const frame = at('#timeline-monitor');
+      const note = at('#monitor-note');
+      const clock = at('#master-audio');
+      const paint = (seconds) => {{
+        clock.currentTime = seconds;
+        fire('#master-audio:timeupdate');
+        return {{ note: note.textContent, showing: frame.classList.contains('showing-take'),
+                  overlay: at('#monitor-overlay').textContent }};
+      }};
+      console.log(JSON.stringify({{
+        settled: paint(1.0),
+        displaced: paint(5.0),
+        firstRender: paint(13.0),
+        gap: paint(99),
+        backToSettled: paint(1.0),
+      }}));
+    """)
+
+    # A settled take: a picture and no note, exactly as before.
+    assert painted["settled"] == {"note": "", "showing": True, "overlay": ""}
+    # A displaced one: the same picture, and the sentence over it.
+    assert painted["displaced"]["showing"] is True
+    assert painted["displaced"]["note"] == seen["sentence"]
+    # The note is not sticky — it belongs to the shot under the playhead, not to the Monitor.
+    assert painted["firstRender"]["note"] == ""
+    assert painted["firstRender"]["showing"] is False
+    assert painted["gap"]["note"] == ""
+    # Back onto a settled take, the note goes with it. (The overlay keeps whatever the gap
+    # wrote — it is display:none'd behind the picture, which is the hole this note fills.)
+    assert painted["backToSettled"]["note"] == ""
+    assert painted["backToSettled"]["showing"] is True
+
+    # The layer exists in the markup, and is hidden when empty rather than drawn blank.
+    assert 'id="monitor-note"' in INDEX_HTML.read_text(encoding="utf-8")
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".monitor-note:empty { display: none; }" in styles
+    # ...and unlike the overlay, it is not hidden by the class a take on screen carries.
+    assert ".timeline-monitor.showing-take .monitor-note" not in styles
+
+
+def test_the_takes_strip_never_calls_a_displaced_take_current():
+    """The strip's rows, executed and read as markup.
+
+    `Current` beside a take a newer render is about to replace is an affirmative wrong claim,
+    not a missing signal: it says this take is the shot's answer. The row says `Previous` while
+    a render is in flight, and the take that is coming gets a row of its own rather than being
+    left to inference.
+    """
+    jobs = [
+        {"id": "job_1", "kind": "h3", "target_id": "shot_a", "status": "complete",
+         "output_files": ["shots/shot_a/take_1.mp4", "shots/shot_a/take_1-audio.mp4"]},
+        {"id": "job_2", "kind": "h3", "target_id": "shot_a", "status": "complete",
+         "output_files": ["shots/shot_a/take_2.mp4"]},
+        {"id": "job_3", "kind": "post", "target_id": "shot_a", "status": "complete",
+         "output_files": ["exports/cut.mp4"]},
+    ]
+    rows = run_module(f"""
+      import {{ TAKE_CURRENT_CHIP, TAKE_PENDING_CHIP, TAKE_PREVIOUS_CHIP, TAKE_USE_CHIP,
+        takesStripRows }} from './src/music_video_producer/web/assets/api.js';
+      const jobs = {json.dumps(jobs)};
+      const shot = (status) => ({{ id: 'shot_a', status,
+        latest_output: 'shots/shot_a/take_2.mp4' }});
+      console.log(JSON.stringify({{
+        chips: {{ current: TAKE_CURRENT_CHIP, previous: TAKE_PREVIOUS_CHIP,
+                  use: TAKE_USE_CHIP, pending: TAKE_PENDING_CHIP }},
+        settled: takesStripRows({{ jobs }}, shot('complete')),
+        running: takesStripRows({{ jobs }}, shot('running')),
+        queued: takesStripRows({{ jobs }}, shot('queued')),
+        firstRender: takesStripRows({{ jobs: [] }}, {{ id: 'shot_a', status: 'running' }}),
+        nothing: takesStripRows(undefined, undefined),
+      }}));
+    """)
+
+    chips = rows["chips"]
+    # Settled: two takes (the `-audio` sibling is the same take), the pointed-at one marked.
+    settled = rows["settled"]["rows"]
+    assert [row["chip"] for row in settled] == [chips["use"], chips["current"]]
+    assert [row["file"] for row in settled] == [
+        "shots/shot_a/take_1.mp4", "shots/shot_a/take_2.mp4",
+    ]
+    assert [row["disabled"] for row in settled] == [False, True]
+    assert rows["settled"]["inFlight"] is False
+
+    # In flight: the same two takes, and the claim withdrawn from the one being displaced.
+    for status in ("running", "queued"):
+        strip = rows[status]
+        chips_seen = [row["chip"] for row in strip["rows"]]
+        assert chips["current"] not in chips_seen, status
+        assert chips_seen == [chips["use"], chips["previous"], chips["pending"]], status
+        # The pending row names no file, because there is no file yet, and cannot be clicked.
+        pending = strip["rows"][-1]
+        assert pending["pending"] is True and pending["file"] == ""
+        assert pending["disabled"] is True
+        assert "Take 3" in pending["text"]
+        # The displaced row still points at the real take: `Use` on it would be a no-op, and
+        # nothing here has moved the shot off it.
+        assert strip["rows"][1]["file"] == "shots/shot_a/take_2.mp4"
+        assert strip["rows"][1]["current"] is True
+        assert strip["rows"][1]["displaced"] is True
+
+    # A first render has no takes at all and still shows the one that is coming.
+    assert [row["chip"] for row in rows["firstRender"]["rows"]] == [chips["pending"]]
+    assert rows["nothing"] == {"rows": [], "inFlight": False, "takes": 0}
+
+    # And the markup the panel actually writes: the strip is drawn for a single take once a
+    # render is in flight, because one take plus the pending row is two rows.
+    both = jobs + [
+        dict(job, id=f"{job['id']}_b", target_id="shot_b") for job in jobs if job["kind"] == "h3"
+    ]
+    drawn = run_workspace(f"""
+      state.project = {{ id: 'p1', jobs: {json.dumps(both)}, assets: [], shots: [
+        {{ id: 'shot_a', start: 0, duration: 4, prompt: 'a wolf', status: 'running',
+           latest_output: 'shots/shot_a/take_2.mp4' }},
+        {{ id: 'shot_b', start: 4, duration: 4, prompt: 'a wolf', status: 'complete',
+           latest_output: 'shots/shot_a/take_2.mp4' }},
+      ] }};
+      const html = (id) => {{
+        state.selectedShotId = id;
+        app.renderShotInspector();
+        return at('#shot-inspector').innerHTML;
+      }};
+      console.log(JSON.stringify({{ inFlight: html('shot_a'), settled: html('shot_b') }}));
+    """)
+
+    assert ">Current<" in drawn["settled"]
+    assert ">Previous<" not in drawn["settled"]
+    assert ">Current<" not in drawn["inFlight"]
+    assert ">Previous<" in drawn["inFlight"]
+    assert ">Rendering<" in drawn["inFlight"]
+    assert "not landed yet" in drawn["inFlight"]
+
+
+def test_the_timeline_clip_states_a_render_in_flight_in_words_and_in_its_accessible_name():
+    """The clip's render state, executed through `renderTimeline` and read as markup.
+
+    The clip carried render state as a left-border hue and nothing else — no word, and nothing
+    in `aria-label`, which is the only one of a clip's signals a screen reader announces. This
+    stylesheet's own rule is that colour is never the only signal; the `NO PROMPT` flag is the
+    precedent for how a clip states something in words.
+    """
+    shots = [
+        {"id": "shot_a", "start": 0, "duration": 4, "prompt": "a wolf at the window",
+         "status": "running", "latest_output": "shots/a.mp4"},
+        {"id": "shot_b", "start": 4, "duration": 4, "prompt": "a wolf in the snow",
+         "status": "complete", "latest_output": "shots/b.mp4"},
+        {"id": "shot_c", "start": 8, "duration": 4, "prompt": "", "status": "queued"},
+    ]
+    drawn = run_workspace(f"""
+      import {{ SHOT_RENDERING_FLAG, TAKE_DISPLACED_BY_RENDER, RENDER_IN_FLIGHT_NO_TAKE }}
+        from './src/music_video_producer/web/assets/api.js';
+      state.project = {{ id: 'p1', shots: {json.dumps(shots)}, jobs: [], assets: [] }};
+      state.selectedShotId = 'shot_b';
+      // The zoom control is the shortest path to a real `renderTimeline` from outside it.
+      fire('#zoom-in:click');
+      const track = at('#shots-track').innerHTML;
+      // One clip's whole markup, by its shot id. Clips nest no divs, so the first close ends it.
+      const clips = track.split('<div class="shot-clip').slice(1)
+        .map((part) => '<div class="shot-clip' + part.split('</div>')[0]);
+      const clip = (id) => clips.find((html) => html.includes('data-shot-id="' + id + '"'));
+      console.log(JSON.stringify({{
+        flag: SHOT_RENDERING_FLAG,
+        displacedSentence: TAKE_DISPLACED_BY_RENDER,
+        firstRenderSentence: RENDER_IN_FLIGHT_NO_TAKE,
+        rerendering: clip('shot_a'),
+        settled: clip('shot_b'),
+        firstRender: clip('shot_c'),
+      }}));
+    """)
+
+    # The word, on the clip, for both shapes of in-flight.
+    assert f'<span class="clip-state">{drawn["flag"]}</span>' in drawn["rerendering"]
+    assert f'<span class="clip-state">{drawn["flag"]}</span>' in drawn["firstRender"]
+    assert "clip-state" not in drawn["settled"]
+
+    # And the sentence in the accessible name, which is where the state exists at all for a
+    # Director who never sees the border.
+    assert f'aria-label="{drawn["displacedSentence"]}' not in drawn["settled"]
+    for name in ("aria-label", "title"):
+        assert f'{name}="a wolf at the window {drawn["displacedSentence"]}"' in drawn["rerendering"]
+        assert f'{name}="a wolf in the snow"' in drawn["settled"]
+    # A shot with nothing to displace says the fact without naming a displacement that is not
+    # happening — and keeps the NO PROMPT diagnosis it already had.
+    assert drawn["firstRenderSentence"] in drawn["firstRender"]
+    assert drawn["displacedSentence"] not in drawn["firstRender"]
+    assert "NO PROMPT" in drawn["firstRender"]
+
+    # Colour is the second signal, never the only one: the hue rules stay, and the word is what
+    # survives them being ignored.
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".shot-clip .clip-state" in styles
+    assert ".shot-clip.status-queued, .shot-clip.status-running" in styles
+
+
+def test_a_new_shot_made_from_another_carries_the_plan_and_no_take():
+    """Duplicate and Split, executed, then read field by field off the copy.
+
+    Both handlers cloned the whole Shot and reset `status`, so the copy owned the original's
+    take: it played that take in the Monitor, offered it in the takes strip, and read as
+    approved. Asserted per field rather than in bulk, so a field added to `Shot` and classified
+    by nobody fails here instead of riding into every copy from then on.
+    """
+    made = run_workspace(f"""
+      state.project = {{ id: 'p1', jobs: [], assets: [], shots: [{json.dumps(RENDERED_SHOT)}] }};
+      state.selectedShotId = 'shot_source';
+      fire('#duplicate-shot:click');
+      const duplicate = state.project.shots[1];
+      state.selectedShotId = 'shot_source';
+      fire('#split-shot:click');
+      const half = state.project.shots[2];
+      console.log(JSON.stringify({{
+        duplicate,
+        half,
+        source: state.project.shots[0],
+        ids: state.project.shots.map((shot) => shot.id),
+      }}));
+    """)
+
+    source = RENDERED_SHOT
+    # The fixture has to differ from the model's defaults in every field a copy must not carry,
+    # or "the copy holds the default" would pass on a copy that inherited everything.
+    for field in SHOT_TAKE_PROVENANCE_FIELDS | SHOT_UNINHERITED_DECISION_FIELDS:
+        default = Shot.model_fields[field].get_default(call_default_factory=True)
+        assert source[field] != default, f"the fixture leaves {field} at its default"
+
+    for made_shot, name in ((made["duplicate"], "duplicate"), (made["half"], "split half")):
+        # A new identity, never the original's.
+        assert made_shot["id"] != source["id"], name
+
+        # Plan content: present, and equal to the original's, field by field.
+        for field in sorted(SHOT_PLAN_CONTENT_FIELDS - {"start", "duration"}):
+            assert field in made_shot, f"{name} lost plan field {field}"
+            assert made_shot[field] == source[field], f"{name} changed plan field {field}"
+
+        # Take provenance: absent, or the model's own default and nothing else.
+        for field in sorted(SHOT_TAKE_PROVENANCE_FIELDS | SHOT_UNINHERITED_DECISION_FIELDS):
+            default = Shot.model_fields[field].get_default(call_default_factory=True)
+            assert made_shot.get(field, default) == default, (
+                f"{name} inherited {field} from a take it never rendered"
+            )
+
+        # The copy is a Shot the server accepts, with the model's own defaults filling the rest.
+        loaded = Shot.model_validate(made_shot)
+        for field in SHOT_TAKE_PROVENANCE_FIELDS | SHOT_UNINHERITED_DECISION_FIELDS:
+            assert getattr(loaded, field) == Shot.model_fields[field].get_default(
+                call_default_factory=True
+            ), f"{name}.{field}"
+
+    # The windows: the duplicate follows the original, the split halves it in place.
+    assert made["duplicate"]["start"] == source["start"] + source["duration"]
+    assert made["duplicate"]["duration"] == source["duration"]
+    assert made["half"]["start"] == source["start"] + source["duration"] / 2
+    assert made["half"]["duration"] == source["duration"] / 2
+
+    # And the original is untouched but for the window the split narrowed: its take, its
+    # approval and its pointer all stay exactly where they were. Nothing in this workspace
+    # clears `latest_output` or `approved_output`, and this is the assertion that says so.
+    for field in SHOT_TAKE_PROVENANCE_FIELDS | SHOT_UNINHERITED_DECISION_FIELDS:
+        assert made["source"][field] == source[field], field
+    assert made["source"]["latest_output"] == source["latest_output"]
+    assert made["source"]["approved_output"] == source["approved_output"]
+    assert made["source"]["duration"] == source["duration"] / 2
+    assert len(set(made["ids"])) == 3
+
+
+def test_the_client_and_server_agree_on_what_a_new_shot_inherits():
+    """One classification, partitioned against the model itself.
+
+    The client builds a copy from `SHOT_PLAN_CONTENT_FIELDS`, so a field the model gains and
+    nobody classifies is simply absent from every copy — which is the safe direction, and a
+    silent one. This is what makes it loud: the three sets must cover `Shot` exactly, and the
+    client's list must be the server's, so an unclassified field fails the suite.
+    """
+    listed = run_module("""
+      import { SHOT_PLAN_CONTENT_FIELDS, NEW_SHOT_STATUS }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ plan: SHOT_PLAN_CONTENT_FIELDS, status: NEW_SHOT_STATUS }));
+    """)
+
+    assert set(listed["plan"]) == set(SHOT_PLAN_CONTENT_FIELDS)
+    assert len(listed["plan"]) == len(SHOT_PLAN_CONTENT_FIELDS), "the client's list repeats a field"
+
+    # The partition, against the model and not against a copy of its field names.
+    classified = (
+        SHOT_PLAN_CONTENT_FIELDS | SHOT_TAKE_PROVENANCE_FIELDS | SHOT_UNINHERITED_DECISION_FIELDS
+    )
+    assert classified | {"id"} == set(Shot.model_fields), (
+        "a Shot field is classified by nobody — say whether a new Shot inherits it"
+    )
+    assert not SHOT_PLAN_CONTENT_FIELDS & SHOT_TAKE_PROVENANCE_FIELDS
+    assert not SHOT_PLAN_CONTENT_FIELDS & SHOT_UNINHERITED_DECISION_FIELDS
+    assert not SHOT_TAKE_PROVENANCE_FIELDS & SHOT_UNINHERITED_DECISION_FIELDS
+
+    # The status a Shot nobody has rendered carries is the model's own default, written out
+    # loud because the inspector draws its chip from the field.
+    assert listed["status"] == Shot.model_fields["status"].get_default()
+
+    # No copy path clones a Shot any more: `structuredClone(shot)` is what carried the take.
+    workspace = APP_JS.read_text(encoding="utf-8")
+    for handler in ("#duplicate-shot", "#split-shot"):
+        body = workspace.split(f'$("{handler}").addEventListener', 1)[1].split("\n", 1)[0]
+        assert "newShotFromPlan(shot" in body, handler
+        assert "structuredClone(shot)" not in body, handler
+
+
+# ------------------------------------------------------------------------------------------
+# Snap cuts to phrase boundaries: the browser half. `snapCutsControl` and `snapCutsReportLines`
+# are executed under node, and `renderSnapCuts` is *run* against the stub DOM with its markup
+# read afterwards — never grepped for identifiers. A substring assertion over `app.js` is what
+# let three UI guarantees invert with a green suite once already.
+# ------------------------------------------------------------------------------------------
+
+SNAP_PROJECT = {
+    "id": "p1",
+    "jobs": [],
+    "song": {
+        "title": "Measured",
+        "source": "imported",
+        "path": "media/songs/000-master.wav",
+        "duration": 24,
+        "vocal_spans": [[0.5, 7.0], [8.0, 13.0], [14.0, 19.5]],
+    },
+    "shots": [
+        {"id": "s0", "start": 0, "duration": 6},
+        {"id": "s1", "start": 6, "duration": 6},
+        {"id": "s2", "start": 12, "duration": 12},
+    ],
+}
+
+SNAP_REPORT = {
+    "applied": False,
+    "status": "ready",
+    "tolerance": 1.5,
+    "moved": 2,
+    "skipped": 1,
+    "moves": [
+        {"before": "SHOT 01 (s0)", "after": "SHOT 02 (s1)",
+         "boundary": 6.0, "proposed": 7.15, "shift": 1.15},
+        {"before": "SHOT 02 (s1)", "after": "SHOT 03 (s2)",
+         "boundary": 12.0, "proposed": 13.15, "shift": 1.15},
+    ],
+    "skips": [
+        {"before": "SHOT 03 (s2)", "after": "SHOT 04 (s3)", "boundary": 18.0,
+         "reason": "SHOT 03 (s2) is locked. A lock is a deliberate hands-off on this shot."},
+    ],
+    "message": "",
+    "project": None,
+}
+
+
+def test_the_snap_cuts_control_decides_its_own_refusals_and_its_two_stages():
+    """Executed, not read: every branch of `snapCutsControl` over one table of projects.
+
+    The cheap facts are the browser's — a song, a measurement, two shots, a non-zero tolerance
+    — and the two-stage half is the one that matters: with a report holding moves in hand the
+    same button becomes the apply, which is what makes the confirm step unskippable in the
+    interface as well as on the wire.
+    """
+    decisions = run_module("""
+      import { snapCutsControl, SNAP_CUTS_NO_SONG, SNAP_CUTS_UNMEASURED,
+               SNAP_CUTS_WITHOUT_CUTS, SNAP_CUTS_TOLERANCE_OFF, SNAP_CUTS_LABEL,
+               SNAP_CUTS_HELP, SNAP_CUTS_NOTHING_TO_MOVE }
+        from './src/music_video_producer/web/assets/api.js';
+      const base = __PROJECT__;
+      const report = __REPORT__;
+      const clone = (extra) => JSON.parse(JSON.stringify({ ...base, ...extra }));
+      const songless = clone({}); songless.song = null;
+      const unheard = clone({}); unheard.song.vocal_spans = [];
+      const oneShot = clone({}); oneShot.shots = [base.shots[0]];
+      console.log(JSON.stringify({
+        songless: snapCutsControl(songless, 1.5),
+        unheard: snapCutsControl(unheard, 1.5),
+        oneShot: snapCutsControl(oneShot, 1.5),
+        off: snapCutsControl(clone({}), 0),
+        offByString: snapCutsControl(clone({}), "0"),
+        ready: snapCutsControl(clone({}), 1.5),
+        withReport: snapCutsControl(clone({}), 1.5, report),
+        emptyReport: snapCutsControl(clone({}), 1.5,
+          { ...report, moves: [], moved: 0 }),
+        wording: { SNAP_CUTS_NO_SONG, SNAP_CUTS_UNMEASURED, SNAP_CUTS_WITHOUT_CUTS,
+                   SNAP_CUTS_TOLERANCE_OFF, SNAP_CUTS_LABEL, SNAP_CUTS_HELP,
+                   SNAP_CUTS_NOTHING_TO_MOVE },
+      }));
+    """.replace("__PROJECT__", json.dumps(SNAP_PROJECT)).replace("__REPORT__", json.dumps(SNAP_REPORT)))
+
+    wording = decisions["wording"]
+    for case, reason in (
+        ("songless", "SNAP_CUTS_NO_SONG"),
+        ("unheard", "SNAP_CUTS_UNMEASURED"),
+        ("oneShot", "SNAP_CUTS_WITHOUT_CUTS"),
+        ("off", "SNAP_CUTS_TOLERANCE_OFF"),
+        ("offByString", "SNAP_CUTS_TOLERANCE_OFF"),
+    ):
+        assert decisions[case]["disabled"] is True, case
+        assert decisions[case]["apply"] is False, case
+        assert decisions[case]["reason"] == wording[reason], case
+    # Runnable, and reporting rather than applying until a report exists.
+    assert decisions["ready"] == {
+        "disabled": False, "apply": False,
+        "label": wording["SNAP_CUTS_LABEL"], "title": wording["SNAP_CUTS_HELP"], "reason": "",
+    }
+    assert decisions["withReport"]["apply"] is True
+    assert decisions["withReport"]["label"] == "Apply 2 move(s)"
+    assert decisions["withReport"]["reason"] == "2 cut(s) would move, 1 would stay."
+    # A report with nothing in it does not turn the button into an apply, and says so.
+    assert decisions["emptyReport"]["apply"] is False
+    assert decisions["emptyReport"]["label"] == wording["SNAP_CUTS_LABEL"]
+    assert decisions["emptyReport"]["reason"] == wording["SNAP_CUTS_NOTHING_TO_MOVE"]
+
+
+def test_the_snap_report_lines_carry_every_move_and_every_skip_reason_verbatim():
+    """The report is the feature's other half, so nothing in it is summarised or dropped.
+
+    A skip's line is the **server's own sentence**, unedited: the refusals are decided once, in
+    Python, and a client that paraphrased one would be a second opinion that can drift from the
+    one that actually stops the write.
+    """
+    lines = run_module("""
+      import { snapCutsReportLines } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        lines: snapCutsReportLines(__REPORT__),
+        empty: snapCutsReportLines(null),
+      }));
+    """.replace("__REPORT__", json.dumps(SNAP_REPORT)))
+
+    assert lines["empty"] == []
+    assert [line["kind"] for line in lines["lines"]] == ["move", "move", "skip"]
+    assert lines["lines"][0]["text"] == (
+        "SHOT 01 (s0) → SHOT 02 (s1): 6.000s → 7.150s (+1.150s)"
+    )
+    assert lines["lines"][2]["text"] == SNAP_REPORT["skips"][0]["reason"]
+    assert len(lines["lines"]) == len(SNAP_REPORT["moves"]) + len(SNAP_REPORT["skips"])
+
+
+def test_a_move_line_says_how_long_the_gap_it_found_was():
+    """The Director's framing, 2026-08-20, drawn where the move already is.
+
+    "A 1 second gap may just be an extended shot where a 4 second gap would be great for a
+    b-roll or non singing character shot." Two moves of the *same* distance land in gaps of
+    very different sizes, and without the length the two lines are identical — so the clause
+    is the only thing separating an extended shot from a scene worth planning. It suggests
+    nothing; the number is the whole addition. A report with no `gap` (one from a server older
+    than the field) loses the clause rather than drawing `NaNs`.
+    """
+    report = json.loads(json.dumps(SNAP_REPORT))
+    report["moves"][0]["gap"] = 1.0
+    report["moves"][1]["gap"] = 4.4
+
+    lines = run_module("""
+      import { snapCutsReportLines } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        lines: snapCutsReportLines(__REPORT__),
+        gapless: snapCutsReportLines(__GAPLESS__),
+      }));
+    """.replace("__REPORT__", json.dumps(report)).replace("__GAPLESS__", json.dumps(SNAP_REPORT)))
+
+    assert lines["lines"][0]["text"] == (
+        "SHOT 01 (s0) → SHOT 02 (s1): 6.000s → 7.150s (+1.150s) in a 1.000s gap"
+    )
+    assert lines["lines"][1]["text"].endswith("in a 4.400s gap")
+    # The skip lines are still the server's own sentences, untouched by any of this.
+    assert lines["lines"][2]["text"] == SNAP_REPORT["skips"][0]["reason"]
+    assert "gap" not in lines["gapless"][0]["text"]
+
+
+def test_the_snap_button_runs_for_a_song_measured_in_words_alone():
+    """`timeline.vocal_gaps` reads `lyric_words` first, so the browser's gate must too.
+
+    A song with words and no merged spans is measured — cut placement reads exactly those
+    words — and a button drawn shut on the spans alone would refuse a plan the server would
+    happily make. Neither measurement is still unmeasured, which is the rule that has to
+    survive: two empty lists are two absences, not a silent track.
+    """
+    decisions = run_module("""
+      import { snapCutsControl, SNAP_CUTS_UNMEASURED }
+        from './src/music_video_producer/web/assets/api.js';
+      const base = __PROJECT__;
+      const clone = () => JSON.parse(JSON.stringify(base));
+      const wordsOnly = clone();
+      wordsOnly.song.vocal_spans = [];
+      wordsOnly.song.lyric_words = [["I", 0.5, 0.9], ["sing", 0.9, 1.4]];
+      const neither = clone();
+      neither.song.vocal_spans = [];
+      neither.song.lyric_words = [];
+      console.log(JSON.stringify({
+        wordsOnly: snapCutsControl(wordsOnly, 1.5),
+        neither: snapCutsControl(neither, 1.5),
+        unmeasured: SNAP_CUTS_UNMEASURED,
+      }));
+    """.replace("__PROJECT__", json.dumps(SNAP_PROJECT)))
+
+    assert decisions["wordsOnly"]["disabled"] is False
+    assert decisions["neither"]["disabled"] is True
+    assert decisions["neither"]["reason"] == decisions["unmeasured"]
+
+
+def test_the_snap_bar_draws_the_whole_report_and_only_then_offers_to_apply():
+    """The two-stage control, executed end to end against the stub DOM and read as markup.
+
+    The first click sends a report request with `confirm_apply` false; the bar then holds every
+    move line and every skip reason, and the button has become the apply. The second click is
+    the one that carries the flag. Read out of the rendered markup rather than grepped for in
+    `app.js`, because the recorded incident is exactly that: substring assertions over `app.js`
+    let three UI guarantees invert with a green suite.
+    """
+    run = run_workspace(
+        """
+      state.project = __PROJECT__;
+      app.renderSnapCuts();
+      const before = at('#snap-bar').innerHTML;
+      requests.length = 0;
+      await fire('#snap-cuts:click');
+      await flush();
+      app.renderSnapCuts();
+      const reported = at('#snap-bar').innerHTML;
+      const firstRequest = requests[0];
+      requests.length = 0;
+      await fire('#snap-cuts:click');
+      await flush();
+      console.log(JSON.stringify({
+        before, reported,
+        firstRequest,
+        secondRequest: requests[0],
+      }));
+    """.replace("__PROJECT__", json.dumps(SNAP_PROJECT)),
+        responses={"/api/projects/p1/timeline/snap-cuts": {"body": SNAP_REPORT}},
+    )
+
+    # Stage one: the button reports, and nothing about applying is on screen yet.
+    assert 'id="snap-cuts"' in run["before"]
+    assert ">Snap cuts<" in run["before"]
+    assert "snap-report" not in run["before"]
+    assert "Apply" not in run["before"]
+    assert json.loads(run["firstRequest"]["body"]) == {"tolerance": 0.75, "confirm_apply": False}
+    assert run["firstRequest"]["method"] == "POST"
+    assert run["firstRequest"]["path"] == "/api/projects/p1/timeline/snap-cuts"
+
+    # Stage two: the whole report is on screen -- both headings, every move, every skip reason.
+    assert "snap-report" in run["reported"]
+    assert "Would move (2)" in run["reported"]
+    assert "Would stay (1)" in run["reported"]
+    assert "SHOT 01 (s0) → SHOT 02 (s1): 6.000s → 7.150s (+1.150s)" in run["reported"]
+    assert "SHOT 02 (s1) → SHOT 03 (s2): 12.000s → 13.150s (+1.150s)" in run["reported"]
+    assert SNAP_REPORT["skips"][0]["reason"] in run["reported"]
+    assert ">Apply 2 move(s)<" in run["reported"]
+    assert "2 cut(s) would move, 1 would stay." in run["reported"]
+    # And a way out that is not an apply.
+    assert 'id="snap-dismiss"' in run["reported"]
+    # Only the second click carries the confirmation.
+    assert json.loads(run["secondRequest"]["body"]) == {"tolerance": 0.75, "confirm_apply": True}
+
+
+def test_the_snap_tolerance_box_is_drawn_with_the_bounds_the_request_schema_enforces():
+    """A box offering a tolerance the route refuses is a control whose only outcome is a 422."""
+    markup = run_workspace("""
+      state.project = __PROJECT__;
+      app.renderSnapCuts();
+      console.log(JSON.stringify({ bar: at('#snap-bar').innerHTML }));
+    """.replace("__PROJECT__", json.dumps(SNAP_PROJECT)))["bar"]
+
+    box = re.search(r'<input type="number" id="snap-tolerance"[^>]*>', markup)
+    assert box, markup
+    assert 'min="0"' in box.group(0)
+    assert f'max="{SNAP_TOLERANCE_MAX:g}"' in box.group(0)
+    assert f'value="{SNAP_TOLERANCE_DEFAULT:g}"' in box.group(0)
+
+
+def test_the_snap_tolerance_constants_are_the_servers_own():
+    """Held together rather than transcribed: `SnapCutsRequest` bounds the field with these two
+    numbers, and the browser draws its box from them."""
+    constants = run_module("""
+      import { SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, snapTolerance }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        default: SNAP_TOLERANCE_DEFAULT,
+        max: SNAP_TOLERANCE_MAX,
+        clamped: [snapTolerance('9'), snapTolerance('-2'), snapTolerance(''),
+                  snapTolerance('0.4'), snapTolerance('abc')],
+      }));
+    """)
+
+    assert constants["default"] == SNAP_TOLERANCE_DEFAULT
+    assert constants["max"] == SNAP_TOLERANCE_MAX
+    # An unusable box answers the default rather than an empty key: the request needs a number.
+    assert constants["clamped"] == [
+        SNAP_TOLERANCE_MAX, 0, SNAP_TOLERANCE_DEFAULT, 0.4, SNAP_TOLERANCE_DEFAULT
+    ]
+    fields = SnapCutsRequest.model_fields["tolerance"]
+    bounds = {type(item).__name__: getattr(item, "ge", getattr(item, "le", None))
+              for item in fields.metadata}
+    assert fields.default == SNAP_TOLERANCE_DEFAULT
+    assert bounds == {"Ge": 0, "Le": SNAP_TOLERANCE_MAX}
+
+
+def test_the_snap_cuts_client_calls_a_route_the_application_serves():
+    """The path is built in one place in `api.js` and served in one place in `app.py`; a typo in
+    either is a button whose only outcome is a 404."""
+    call = run_module("""
+      import { api } from './src/music_video_producer/web/assets/api.js';
+      let seen = { path: '', method: '', body: '' };
+      globalThis.fetch = (path, options = {}) => {
+        seen = { path, method: options.method || 'GET', body: options.body || '' };
+        return Promise.reject(new Error('the contract harness makes no requests'));
+      };
+      await api.snapCuts('PID', 1.5, true).catch(() => {});
+      console.log(JSON.stringify(seen));
+    """)
+
+    assert call["path"] == "/api/projects/PID/timeline/snap-cuts"
+    assert call["method"] == "POST"
+    assert json.loads(call["body"]) == {"tolerance": 1.5, "confirm_apply": True}
+    assert "/api/projects/{project_id}/timeline/snap-cuts" in {
+        route.path for route in create_app().routes
+    }
+
+
+# --------------------------------------------------------------------------------------------
+# Live render progress on the two surfaces the Director named: the asset card and the clip.
+#
+# Every one of these executes the code. The recorded incident this file exists around is three
+# UI guarantees inverting under a green suite of substring assertions over app.js source, so the
+# render functions are run against the stub DOM and the markup they produced is read back.
+# --------------------------------------------------------------------------------------------
+
+#: One render genuinely mid-flight, with a percentage on it, in the route's fixed shape.
+POLL_IN_FLIGHT = {
+    "active": True,
+    "comfy_online": True,
+    "jobs": [{
+        "id": "j1", "kind": "flux", "status": "running", "prompt_id": "pr1",
+        "target_id": "a1", "seed": 7, "output_files": [], "error": "",
+    }],
+    "shots": [],
+    "assets": [{"asset_id": "a1", "path": ""}],
+    "song": None,
+    "progress": [{"job_id": "j1", "prompt_id": "pr1", "percent": 42}],
+}
+
+
+def test_the_progress_helpers_say_nothing_at_all_when_nothing_is_known():
+    """Unknown is not zero, and neither is ever invented.
+
+    `null`, an absent key, an empty string, a `NaN` — every one of them is "nobody has said
+    anything", and every one draws the plain RENDERING word and an unchanged accessible name.
+    A real `0` is the different statement that the render started and no step is done, and it
+    is drawn as `0%`. A number that arrived out of range is clamped rather than shown raw."""
+    answers = run_module("""
+      import { renderProgressLabel, renderingFlag, renderProgressNote, SHOT_RENDERING_FLAG }
+        from './src/music_video_producer/web/assets/api.js';
+      const cases = [null, undefined, '', 'forty', NaN, Infinity, 0, 42, 42.6, -5, 140, '77'];
+      console.log(JSON.stringify({
+        word: SHOT_RENDERING_FLAG,
+        labels: cases.map((value) => renderProgressLabel(value)),
+        flags: cases.map((value) => renderingFlag(value)),
+        notes: cases.map((value) => renderProgressNote(value)),
+      }));
+    """)
+
+    assert answers["word"] == "RENDERING"
+    assert answers["labels"] == [
+        "", "", "", "", "", "", "0%", "42%", "43%", "0%", "100%", "77%",
+    ]
+    # Composed with the word, never in place of it -- so a socketless render still says RENDERING.
+    assert answers["flags"][:6] == ["RENDERING"] * 6
+    assert answers["flags"][6:] == [
+        "RENDERING 0%", "RENDERING 42%", "RENDERING 43%",
+        "RENDERING 0%", "RENDERING 100%", "RENDERING 77%",
+    ]
+    assert answers["notes"][:6] == [""] * 6
+    assert answers["notes"][6] == "0% of this render is done."
+    assert answers["notes"][7] == "42% of this render is done."
+
+
+def test_progress_is_joined_to_its_target_by_job_and_never_crosses_between_two_renders():
+    """A batch of H3 renders is the normal case: two shots rendering at once must not read each
+    other's number. The join is `report.progress` (keyed by job) to `report.jobs` (which carry
+    the target), so a row naming a job the report does not list is dropped rather than guessed."""
+    mapped = run_module("""
+      import { renderProgressByTarget } from './src/music_video_producer/web/assets/api.js';
+      const report = {
+        jobs: [
+          { id: 'j1', kind: 'h3', target_id: 'shot_a' },
+          { id: 'j2', kind: 'h3', target_id: 'shot_b' },
+          { id: 'j3', kind: 'flux', target_id: 'asset_x' },
+          { id: 'j4', kind: 'post', target_id: '' },
+        ],
+        progress: [
+          { job_id: 'j1', prompt_id: 'p1', percent: 30 },
+          { job_id: 'j2', prompt_id: 'p2', percent: 90 },
+          { job_id: 'j4', prompt_id: '', percent: 50 },
+          { job_id: 'nobody', prompt_id: 'p9', percent: 70 },
+          { job_id: 'j3', prompt_id: 'p3', percent: 'not a number' },
+        ],
+      };
+      console.log(JSON.stringify({
+        mapped: renderProgressByTarget(report),
+        empty: renderProgressByTarget({ jobs: [], progress: [] }),
+        missing: renderProgressByTarget(undefined),
+        noProgressKey: renderProgressByTarget({ jobs: [{ id: 'j1', target_id: 'shot_a' }] }),
+      }));
+    """)
+
+    assert mapped["mapped"] == {"shot_a": 30, "shot_b": 90}
+    assert mapped["empty"] == {}
+    assert mapped["missing"] == {}
+    assert mapped["noProgressKey"] == {}
+
+
+def test_the_asset_card_states_its_percentage_in_words_beside_the_rendering_flag():
+    """The Director's ask on the asset card, executed: RENDERING, and how far through it is.
+
+    Read as markup rather than asserted against a source substring. The percentage is text --
+    not a hue, not a bar -- because this stylesheet's rule is that colour is never the only
+    signal, and a signal that is only a shape is the same failure in another costume."""
+    drawn = run_workspace("""
+      state.project = __PROJECT__;
+      await flush();
+      await app.pollRenderStatus();
+      await flush();
+      console.log(JSON.stringify({
+        grid: at('#asset-grid').innerHTML,
+        held: state.renderProgress,
+      }));
+    """.replace("__PROJECT__", poll_project()),
+        responses={"/api/projects/p1/render-status": {"body": POLL_IN_FLIGHT}},
+    )
+
+    assert drawn["held"] == {"a1": 42}
+    assert "RENDERING 42%" in drawn["grid"]
+    # The card still says RENDERING, and still has no image: the percentage composes with the
+    # state, it does not replace it.
+    assert "<img src=" not in drawn["grid"]
+    assert "NO PREVIEW" not in drawn["grid"]
+
+
+def test_a_percentage_that_stops_arriving_leaves_the_card_exactly_as_it_was_before():
+    """The degradation contract on the card, driven through the moment it degrades.
+
+    The socket dropped, or ComfyUI restarted, or the answer simply stopped carrying a number.
+    The card falls back to the plain RENDERING word -- the same markup it has always drawn --
+    rather than freezing the last percentage it saw, which would be a claim about a render
+    nobody is measuring any more."""
+    drawn = run_workspace("""
+      state.project = __PROJECT__;
+      await flush();
+      await app.pollRenderStatus();
+      await flush();
+      const measured = at('#asset-grid').innerHTML;
+
+      responses.set('/api/projects/p1/render-status', { body: __SILENT__ });
+      await app.pollRenderStatus();
+      await flush();
+      console.log(JSON.stringify({
+        measured,
+        silent: at('#asset-grid').innerHTML,
+        held: state.renderProgress,
+      }));
+    """.replace("__PROJECT__", poll_project())
+       .replace("__SILENT__", json.dumps({**POLL_IN_FLIGHT, "progress": []})),
+        responses={"/api/projects/p1/render-status": {"body": POLL_IN_FLIGHT}},
+    )
+
+    assert '<div class="asset-thumb">RENDERING 42%</div>' in drawn["measured"]
+    assert drawn["held"] == {}
+    assert '<div class="asset-thumb">RENDERING</div>' in drawn["silent"]
+    assert "%" not in drawn["silent"]
+
+
+def test_the_timeline_clip_composes_the_percentage_with_the_rendering_word_and_the_name():
+    """The Director's ask on the timeline Shot box, executed through `renderTimeline`.
+
+    Composed with what today's clip already carries, never in place of it: the RENDERING word
+    stays, the displacement sentence stays, and the percentage joins both the visible flag and
+    the accessible name -- which is the only one of the clip's signals a screen reader announces,
+    so a percentage that lived only in the coloured span would not exist for a Director reading
+    it that way. A shot with no percentage is drawn exactly as it was."""
+    shots = [
+        {"id": "shot_a", "start": 0, "duration": 4, "prompt": "a wolf at the window",
+         "status": "running", "latest_output": "shots/a.mp4"},
+        {"id": "shot_b", "start": 4, "duration": 4, "prompt": "a wolf in the snow",
+         "status": "running"},
+        {"id": "shot_c", "start": 8, "duration": 4, "prompt": "a wolf in the dark",
+         "status": "complete", "latest_output": "shots/c.mp4"},
+    ]
+    drawn = run_workspace(f"""
+      import {{ TAKE_DISPLACED_BY_RENDER }} from './src/music_video_producer/web/assets/api.js';
+      state.project = {{ id: 'p1', shots: {json.dumps(shots)}, jobs: [], assets: [] }};
+      // Exactly what a poll tick leaves behind: shot_a measured, shot_b unmeasured, shot_c settled.
+      state.renderProgress = {{ shot_a: 42, shot_c: 99 }};
+      fire('#zoom-in:click');
+      const track = at('#shots-track').innerHTML;
+      const clips = track.split('<div class="shot-clip').slice(1)
+        .map((part) => '<div class="shot-clip' + part.split('</div>')[0]);
+      const clip = (id) => clips.find((html) => html.includes('data-shot-id="' + id + '"'));
+      console.log(JSON.stringify({{
+        displaced: TAKE_DISPLACED_BY_RENDER,
+        measured: clip('shot_a'),
+        unmeasured: clip('shot_b'),
+        settled: clip('shot_c'),
+      }}));
+    """)
+
+    # The word and the number, in text, on the clip.
+    assert '<span class="clip-state">RENDERING 42%</span>' in drawn["measured"]
+    # And in the accessible name, after the sentence the clip already carried.
+    for name in ("aria-label", "title"):
+        assert (
+            f'{name}="a wolf at the window {drawn["displaced"]} '
+            f'42% of this render is done."'
+        ) in drawn["measured"]
+
+    # Unmeasured: the word alone, and a name with nothing appended -- today's clip, unchanged.
+    assert '<span class="clip-state">RENDERING</span>' in drawn["unmeasured"]
+    assert "%" not in drawn["unmeasured"]
+
+    # Settled: no state span at all, and the stale 99 in the map reaches nothing. A percentage
+    # can only ever decorate a render that is actually in flight.
+    assert "clip-state" not in drawn["settled"]
+    assert "99%" not in drawn["settled"]
+    assert 'aria-label="a wolf in the dark"' in drawn["settled"]
+
+
+def test_a_poll_tick_carries_the_percentage_without_touching_the_project_it_is_holding():
+    """The client half of "no manifest write on a progress tick".
+
+    `PUT /api/projects/{id}` sends the project object back whole, so a percentage folded into
+    `project.jobs[].progress` would be saved into the manifest by the Director's next ordinary
+    save -- the generic full-project PUT is this codebase's repeat offender for exactly that.
+    The number is held beside the project, and the project is left byte-identical."""
+    carried = run_workspace("""
+      state.project = __PROJECT__;
+      await flush();
+      const before = JSON.stringify(state.project);
+      await app.pollRenderStatus();
+      await flush();
+      console.log(JSON.stringify({
+        held: state.renderProgress,
+        unchanged: JSON.stringify(state.project) === before,
+        jobProgress: state.project.jobs.map((job) => job.progress),
+      }));
+    """.replace("__PROJECT__", poll_project(jobs=[{
+            "id": "j1", "kind": "flux", "status": "running", "prompt_id": "pr1",
+            "target_id": "a1", "seed": 7, "output_files": [], "error": "", "progress": 0,
+        }])),
+        responses={"/api/projects/p1/render-status": {"body": POLL_IN_FLIGHT}},
+    )
+
+    assert carried["held"] == {"a1": 42}
+    assert carried["unchanged"] is True
+    assert carried["jobProgress"] == [0]
+
+
+def test_a_poll_tick_repaints_the_timeline_so_a_rendering_clip_shows_its_percentage():
+    """The clip's half of the delivery, driven end to end rather than by setting state by hand.
+
+    A tick that learns only "the sampler is on step seven" changes no shot and no asset, so the
+    repaint has to be triggered by the percentage having moved -- and without that trigger the
+    clip keeps yesterday's markup while the number sits unread in state. Driven through
+    `pollRenderStatus` for exactly that reason."""
+    project = {
+        "id": "p1", "name": "Poll", "song": None, "messages": [], "assets": [],
+        "shots": [{"id": "shot_a", "start": 0, "duration": 4, "prompt": "a wolf at the window",
+                   "status": "running"}],
+        "jobs": [{"id": "h1", "kind": "h3", "status": "running", "prompt_id": "ph1",
+                  "target_id": "shot_a", "seed": 3, "output_files": [], "error": ""}],
+    }
+    report = {
+        "active": True, "comfy_online": True,
+        "jobs": project["jobs"],
+        "shots": [{"shot_id": "shot_a", "status": "running", "latest_output": ""}],
+        "assets": [], "song": None,
+        "progress": [{"job_id": "h1", "prompt_id": "ph1", "percent": 65}],
+    }
+    drawn = run_workspace(f"""
+      state.project = {json.dumps(project)};
+      await flush();
+      at('#shots-track').innerHTML = '';
+      await app.pollRenderStatus();
+      await flush();
+      console.log(JSON.stringify({{
+        track: at('#shots-track').innerHTML,
+        held: state.renderProgress,
+      }}));
+    """, responses={"/api/projects/p1/render-status": {"body": report}})
+
+    assert drawn["held"] == {"shot_a": 65}
+    assert '<span class="clip-state">RENDERING 65%</span>' in drawn["track"]
+    assert "65% of this render is done." in drawn["track"]
+
+
+def test_switching_projects_clears_the_percentages_of_the_project_being_left():
+    """A percentage is keyed by target id and belongs to one project's live renders. Carried
+    across a switch it would be drawn under another project's name, which is the same class of
+    error as the readiness report and the snap report being cleared on the same path."""
+    switched = run_workspace("""
+      state.project = __PROJECT__;
+      state.renderProgress = { a1: 42 };
+      await flush();
+      const before = { ...state.renderProgress };
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      console.log(JSON.stringify({ before, after: state.renderProgress, loaded: state.project.id }));
+    """.replace("__PROJECT__", poll_project()),
+        responses={
+            "/api/projects/p2": {"body": {**json.loads(poll_project()), "id": "p2", "jobs": []}},
+            "/api/projects/p2/readiness": {"body": {"blocked": [], "warnings": []}},
+        },
+    )
+
+    assert switched["before"] == {"a1": 42}
+    assert switched["loaded"] == "p2"
+    assert switched["after"] == {}
+
+
+def test_the_percentage_is_dropped_when_the_render_settles_and_when_the_project_changes():
+    """Two ways a stale number could outlive the render that earned it. The map is rebuilt whole
+    from each answer -- never merged -- and cleared outright on a project load, so a percentage
+    can never be drawn under another project's name."""
+    dropped = run_workspace("""
+      state.project = __PROJECT__;
+      await flush();
+      await app.pollRenderStatus();
+      await flush();
+      const rendering = { ...state.renderProgress };
+
+      responses.set('/api/projects/p1/render-status', { body: __COMPLETION__ });
+      state.project.jobs[0].status = 'running';
+      await app.pollRenderStatus();
+      await flush();
+      console.log(JSON.stringify({ rendering, settled: state.renderProgress }));
+    """.replace("__PROJECT__", poll_project())
+       .replace("__COMPLETION__", json.dumps({**POLL_COMPLETION, "progress": []})),
+        responses={"/api/projects/p1/render-status": {"body": POLL_IN_FLIGHT}},
+    )
+
+    assert dropped["rendering"] == {"a1": 42}
+    assert dropped["settled"] == {}

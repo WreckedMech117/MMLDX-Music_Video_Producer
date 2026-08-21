@@ -37,6 +37,17 @@ export const state = {
   // shared by LM Studio and ComfyUI, and a project manifest carrying it would change how someone
   // else's renders behave. It lives beside `health` for that reason, not beside `project`.
   vramEject: null,
+  // Live render percentages, `{ targetId: percent }`, rebuilt from every render-status answer by
+  // `renderProgressByTarget`. An empty object is the honest starting state: nothing is known
+  // until ComfyUI says something, and an absent key is what makes the asset card and the clip
+  // draw exactly what they drew before this existed.
+  //
+  // Deliberately NOT on `state.project`. The project object is what `PUT /api/projects/{id}`
+  // sends back whole, so a percentage folded into `project.jobs[].progress` would be saved into
+  // the manifest by the next ordinary project write -- the generic full-project PUT is this
+  // codebase's repeat offender for exactly that. Kept beside `vramEject`, which is out here for
+  // the same reason: it is machine state, not project data.
+  renderProgress: {},
 };
 
 export function selectedAsset() {

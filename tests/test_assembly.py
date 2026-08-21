@@ -21,22 +21,32 @@ from music_video_producer.assembly import (
     ASSEMBLY_TAKE_MISSING_REFUSAL,
     ASSEMBLY_TOO_SHORT_REFUSAL,
     ASSEMBLY_UNAPPROVED_REFUSAL,
+    DEFAULT_EXPORT_PRESET,
+    DRAFT_PRESET,
     EXPORT_DURATION_PROBLEM,
+    EXPORT_PRESETS,
     EXPORT_STREAMS_PROBLEM,
+    MASTER_PRESET,
+    MASTER_SAMPLE_RATE,
     SONG_END_LABEL,
     SONG_START_LABEL,
+    TRIM_SHARE,
     AudioOverlay,
     ClipWindow,
+    ExportPreset,
+    ExportProgress,
     assembly_plan,
     assembly_refusals,
     clip_frames_on_grid,
     concat_args,
     concat_manifest,
+    parse_progress_us,
     probe_duration_args,
     probe_streams_args,
     probe_take_args,
     trim_args,
     verification_problems,
+    with_progress,
 )
 
 
@@ -421,3 +431,275 @@ def test_verification_reports_duration_drift_and_stream_shape_with_numbers():
 
     empty = verification_problems(10.0, 10.0, [])
     assert empty == [EXPORT_STREAMS_PROBLEM.format(streams="no streams")]
+
+
+# ------------------------------------------------------------------------------------------
+# Export presets (Phase 4.2). The default's argv is pinned twice — once as the call with no
+# preset at all, once as the explicit `draft` — because the whole claim of this change is
+# that an existing "Assemble" click keeps producing the identical file.
+# ------------------------------------------------------------------------------------------
+
+
+#: What `trim_args` built before presets existed, written out rather than derived. A test that
+#: computed this from the preset object would pass for a preset whose values had drifted.
+TODAYS_TRIM_ARGV = [
+    "ffmpeg", "-y", "-v", "error", "-i", "in.mp4",
+    "-vf",
+    (
+        "scale=1056:608:force_original_aspect_ratio=decrease,"
+        "pad=1056:608:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    ),
+    "-frames:v", "90", "-an",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+    "out.mp4",
+]
+
+#: What `concat_args` built before presets existed. Note `-movflags +faststart` and libx264:
+#: two of the three details this change was asked to take from elsewhere were already here.
+TODAYS_CONCAT_ARGV = [
+    "ffmpeg", "-y", "-v", "error",
+    "-f", "concat", "-safe", "0", "-i", "list.txt",
+    "-i", "song.mp3",
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+    "-shortest", "-movflags", "+faststart",
+    "export.mp4",
+]
+
+
+def test_the_default_preset_is_draft_and_draft_is_what_this_application_already_built():
+    """The pin. `draft` is not a new configuration — it is a name for the settings that
+    shipped, and the default, so the body-less request this route has always taken produces
+    the byte-identical command it always produced. Asserted three ways: no preset, the
+    explicit default name, and the preset object."""
+    assert DEFAULT_EXPORT_PRESET == "draft"
+    assert EXPORT_PRESETS[DEFAULT_EXPORT_PRESET] is DRAFT_PRESET
+
+    no_preset = trim_args(Path("in.mp4"), Path("out.mp4"), frames=90, width=1056, height=608)
+    assert no_preset == TODAYS_TRIM_ARGV
+    assert no_preset == trim_args(
+        Path("in.mp4"), Path("out.mp4"), frames=90, width=1056, height=608,
+        preset=EXPORT_PRESETS[DEFAULT_EXPORT_PRESET],
+    )
+
+    joined = concat_args(Path("list.txt"), Path("song.mp3"), Path("export.mp4"))
+    assert joined == TODAYS_CONCAT_ARGV
+    assert joined == concat_args(
+        Path("list.txt"), Path("song.mp3"), Path("export.mp4"), [], preset=DRAFT_PRESET
+    )
+    # The one thing `draft` must never do.
+    assert not any("loudnorm" in argument for argument in joined)
+    assert DRAFT_PRESET.audio_filters == ()
+
+
+def test_the_master_preset_moves_the_encoder_and_leaves_the_songs_loudness_alone():
+    """Delivery quality, and only where delivery quality is decided: the picture at the trim
+    stage (the join stream-copies, so a CRF there would do nothing), and on the audio nothing
+    but the 48 kHz delivery conform. `-movflags +faststart` is asserted present rather than
+    added — it always was.
+
+    **The absence of `loudnorm` is the spec, not an omission** (Director's ruling,
+    2026-08-20): the export's audio track *is* the Director's master song, and a delivery
+    build must not re-master it.
+    """
+    trimmed = trim_args(
+        Path("in.mp4"), Path("out.mp4"), frames=90, width=1056, height=608,
+        preset=MASTER_PRESET,
+    )
+    assert trimmed[trimmed.index("-c:v") + 1] == "libx264"
+    assert trimmed[trimmed.index("-preset") + 1] == "slow"
+    assert trimmed[trimmed.index("-crf") + 1] == "16"
+    # Only the encoder moved: every other argument is the draft's, in the draft's order.
+    assert [
+        argument for argument in trimmed if argument not in {"slow", "16"}
+    ] == [argument for argument in TODAYS_TRIM_ARGV if argument not in {"veryfast", "18"}]
+
+    joined = concat_args(
+        Path("list.txt"), Path("song.mp3"), Path("export.mp4"), preset=MASTER_PRESET
+    )
+    assert joined[joined.index("-af") + 1] == MASTER_SAMPLE_RATE
+    assert MASTER_SAMPLE_RATE == "aresample=48000"
+    assert "+faststart" in joined
+    assert joined[joined.index("-c:v") + 1] == "copy"
+    # The conform is the only insertion; drop it and the draft's argv is back, in order.
+    without = [
+        argument for argument in joined
+        if argument not in {"-af", MASTER_SAMPLE_RATE}
+    ]
+    assert without == TODAYS_CONCAT_ARGV
+
+    # The ruling, asserted on the preset itself and on every argument it builds, on both
+    # audio paths. A loudness filter anywhere here is a defect, whatever its target.
+    overlays = [
+        AudioOverlay(
+            source=Path("take.mp4"), offset_seconds=0.25, window_seconds=3.75,
+            delay_seconds=0.0,
+        ),
+    ]
+    mixed = concat_args(
+        Path("list.txt"), Path("song.mp3"), Path("export.mp4"), overlays,
+        preset=MASTER_PRESET,
+    )
+    assert not any("loudnorm" in filter_ for filter_ in MASTER_PRESET.audio_filters)
+    assert MASTER_PRESET.audio_filters == ("aresample=48000",)
+    for command in (joined, mixed):
+        assert not any("loudnorm" in argument for argument in command)
+        assert not any("dynaudnorm" in argument for argument in command)
+        assert not any(argument.startswith("volume=") for argument in command)
+
+
+def test_the_masters_delivery_conform_rides_the_end_of_the_mix_graph():
+    """With accepted take audio the export has no `-af` to hang a filter on, and hanging it on
+    one contributor would conform that contributor rather than the programme. It goes after
+    `amix`, last — and `normalize=0` still stands in front of it, so the song is not ducked.
+    `draft` puts nothing there at all."""
+    overlays = [
+        AudioOverlay(
+            source=Path("take.mp4"), offset_seconds=0.25, window_seconds=3.75,
+            delay_seconds=0.0,
+        ),
+    ]
+    graph_master = concat_args(
+        Path("list.txt"), Path("song.mp3"), Path("export.mp4"), overlays,
+        preset=MASTER_PRESET,
+    )
+    filters = graph_master[graph_master.index("-filter_complex") + 1]
+    assert filters.endswith(
+        f"amix=inputs=2:duration=first:normalize=0,{MASTER_SAMPLE_RATE}[mix]"
+    )
+    assert "-af" not in graph_master
+
+    graph_draft = concat_args(
+        Path("list.txt"), Path("song.mp3"), Path("export.mp4"), overlays
+    )
+    assert graph_draft[graph_draft.index("-filter_complex") + 1].endswith(
+        "amix=inputs=2:duration=first:normalize=0[mix]"
+    )
+    assert "loudnorm" not in graph_draft[graph_draft.index("-filter_complex") + 1]
+
+
+def test_a_preset_with_no_audio_filters_builds_a_clean_command_on_both_paths():
+    """The plumbing, pinned independently of which presets happen to exist today.
+
+    An empty filter tuple must produce *no* `-af` flag — not `-af ""`, which ffmpeg reads as
+    an empty filter description and refuses — and no trailing `,` on the mix graph, which
+    would leave a dangling separator before `[mix]` and fail to parse. Both are the shapes a
+    naive "always append the chain" would build, and both are only reachable through a
+    filterless preset, which is exactly what `draft` is.
+    """
+    silent = ExportPreset(name="silent", x264_preset="medium", crf="20")
+    assert silent.audio_filters == ()
+    overlays = [
+        AudioOverlay(
+            source=Path("take.mp4"), offset_seconds=0.25, window_seconds=3.75,
+            delay_seconds=0.0,
+        ),
+    ]
+    for preset in (DRAFT_PRESET, silent):
+        song_only = concat_args(
+            Path("list.txt"), Path("song.mp3"), Path("export.mp4"), preset=preset
+        )
+        assert "-af" not in song_only
+        assert "" not in song_only
+        assert song_only == TODAYS_CONCAT_ARGV
+
+        mixed = concat_args(
+            Path("list.txt"), Path("song.mp3"), Path("export.mp4"), overlays,
+            preset=preset,
+        )
+        assert "-af" not in mixed
+        graph = mixed[mixed.index("-filter_complex") + 1]
+        assert graph.endswith("amix=inputs=2:duration=first:normalize=0[mix]")
+        assert ",[mix]" not in graph
+        assert ",," not in graph
+        # And the same graph the master builds, minus exactly the conform.
+        with_conform = concat_args(
+            Path("list.txt"), Path("song.mp3"), Path("export.mp4"), overlays,
+            preset=MASTER_PRESET,
+        )
+        assert graph == with_conform[with_conform.index("-filter_complex") + 1].replace(
+            f",{MASTER_SAMPLE_RATE}", ""
+        )
+
+
+# ------------------------------------------------------------------------------------------
+# Progress reporting.
+# ------------------------------------------------------------------------------------------
+
+
+def test_with_progress_adds_only_the_two_reporting_flags_and_only_at_the_front():
+    """The flags are global options, so they must precede the inputs; and they must be the
+    *only* difference, because the argv they wrap is the pinned description of what this
+    application encodes. Neither writes to the output file."""
+    plain = concat_args(Path("list.txt"), Path("song.mp3"), Path("export.mp4"))
+    reporting = with_progress(plain)
+
+    assert reporting[:4] == ["ffmpeg", "-progress", "pipe:1", "-nostats"]
+    assert reporting[4:] == plain[1:]
+    assert len(reporting) == len(plain) + 3
+
+
+def test_a_progress_line_yields_microseconds_and_every_other_line_is_ignored():
+    """`out_time_us` is the one key with a usable clock in it. Everything else in ffmpeg's
+    block, the `N/A` this key itself carries before the first frame, and a fragment a pipe
+    handed over mid-word must all read as "nothing to report" rather than raise: a progress
+    reader that can kill an export is worse than an export with no progress reader."""
+    assert parse_progress_us("out_time_us=7916667\n") == 7916667
+    assert parse_progress_us("out_time_us=0") == 0
+    assert parse_progress_us("  out_time_us=1500000  ") == 1500000
+
+    for ignored in [
+        "out_time_us=N/A",
+        "out_time_ms=7916667",
+        "out_time=00:00:07.916667",
+        "frame=190",
+        "speed= 277x",
+        "progress=end",
+        "out_time_us",
+        "out_time_us=",
+        "out_time_us=-5",
+        "out_time_us=12.5",
+        "",
+        "   ",
+        "=7916667",
+    ]:
+        assert parse_progress_us(ignored) is None, ignored
+
+
+def test_export_progress_is_monotonic_capped_and_split_between_the_two_stages():
+    """The trims cover the timeline once and the join covers it again, so a raw reading walks
+    backwards several times per export; this reports a number that only ever rises. 100 is a
+    ceiling, not an arithmetic outcome — a song measured a hair shorter than the frames laid
+    against it must not report 101."""
+    progress = ExportProgress(total_seconds=8.0)
+
+    # First trim, four seconds of an eight-second timeline: half the trim share.
+    assert progress.trim(0.0, 2_000_000) == int(TRIM_SHARE * 25)
+    assert progress.trim(0.0, 4_000_000) == int(TRIM_SHARE * 50)
+    # Second trim restarts ffmpeg's clock at zero; placed after four seconds of finished
+    # clips, it may not walk the bar back to 0.
+    assert progress.trim(4.0, 0) == int(TRIM_SHARE * 50)
+    assert progress.trim(4.0, 4_000_000) == int(TRIM_SHARE * 100)
+    # The join's clock already runs against the whole export, and owns the last share.
+    assert progress.join(0) == int(TRIM_SHARE * 100)
+    assert progress.join(4_000_000) == 95
+    assert progress.join(8_000_000) == 100
+    # Over-run in either stage is clamped, never reported past 100, never walked back.
+    assert progress.join(99_000_000) == 100
+    assert progress.trim(0.0, 0) == 100
+
+    overshooting = ExportProgress(total_seconds=8.0)
+    assert overshooting.trim(0.0, 99_000_000) == int(TRIM_SHARE * 100)
+
+    # A plan with no measured length divides by nothing and reports the stage floor.
+    lengthless = ExportProgress(total_seconds=0.0)
+    assert lengthless.trim(0.0, 4_000_000) == 0
+    assert lengthless.percent == 0
+
+
+def test_every_named_preset_is_reachable_by_name():
+    """The dict is what the route indexes into; a preset defined and not registered would be
+    a delivery build nothing could ask for."""
+    assert set(EXPORT_PRESETS) == {"draft", "master"}
+    assert EXPORT_PRESETS["master"] is MASTER_PRESET
+    assert all(name == preset.name for name, preset in EXPORT_PRESETS.items())
