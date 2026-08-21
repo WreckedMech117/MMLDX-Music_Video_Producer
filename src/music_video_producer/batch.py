@@ -27,7 +27,13 @@ from pydantic import BaseModel, Field
 
 from .comfy import ComfyError, HistoryResult
 from .models import Project, RenderJob, Shot, ShotStatus, shot_label
-from .timeline import ordered_shots
+from .timeline import (
+    H3_FPS,
+    H3_MAX_SHOT_SECONDS,
+    H3_MIN_SHOT_SECONDS,
+    ordered_shots,
+    over_render_frames,
+)
 
 #: Re-exported, not redefined. `shot_label` moved to `models.py` when `timeline.assistant_input`
 #: needed it — `timeline` may not import this module — and every existing importer says
@@ -35,6 +41,10 @@ from .timeline import ordered_shots
 #: implementation. See `models.shot_label` for why both halves of the name are carried.
 __all__ = [
     "NEAR_DUPLICATE_OVERLAP",
+    "NOTE_KIND_PROMPT",
+    "NOTE_KIND_SAMENESS",
+    "NOTE_KIND_WINDOW_LONG",
+    "NOTE_KIND_WINDOW_SHORT",
     "PLACEHOLDER_PROMPT",
     "READINESS_REFUSAL",
     "TERMINAL_JOB_STATUSES",
@@ -54,6 +64,7 @@ __all__ = [
     "render_status_report",
     "shot_label",
     "supersede_target_jobs",
+    "window_band_note",
 ]
 
 #: Token overlap above which two prompts are reported as lacking variance. Jaccard —
@@ -117,6 +128,77 @@ SHOTS_LACK_VARIANCE = (
     "block submission."
 )
 
+# --------------------------------------------------------------------------------------------
+# Windows outside H3's trained band. **Neither of these blocks**, and they are reported here so
+# the Director reads them while planning rather than discovering them at a submission.
+#
+# Before this, a window outside 4-15 s reached exactly one surface: a `warnings` string from
+# `timeline.build_director_timeline`, which only the Compile dry run prints. The Director's own
+# project carried five hand-timed sub-4-second windows and `readiness_report` said `ready: True`
+# and nothing else about any of them.
+#
+# The two directions are genuinely different situations, so they are two sentences:
+#
+# * **Short is handled.** The Director's ruling of 2026-08-20 made a short window legitimate
+#   music-video editing — micro-cuts are an editing practice, not a mistake — and
+#   `timeline.over_render_frames` now floors every render at H3's minimum while
+#   `timeline.over_render_lead` centres the take on the window. The only cost is render time,
+#   and naming it is the whole content of the note.
+# * **Long has no such trick.** A 20 s window has to be *generated* as 20 s: there is no buffer
+#   to hide, and H3's motion and lipsync are trained for windows up to `H3_MAX_SHOT_SECONDS`.
+SHOT_WINDOW_BELOW_BAND = (
+    "This shot's window is {duration:.3f}s, under the {minimum:g}s MiniMax H3 is trained for. "
+    "It renders anyway: the take is generated at H3's minimum ({frames} frames, "
+    "{rendered:.3f}s) centred on this window, and the {buffer:.3f}s around it is invisible "
+    "buffer that the trim discards, so the exposed cut is still exactly this window. It costs "
+    "a full-length render for a short cut, and nothing else. This does not block submission."
+)
+#: **Reported and never enforced** — the Director's ruling of 2026-08-20: "I dont anticipate a
+#: shot being requested over 15 seconds, when dragging a clip past that it should turn yellow
+#: but we arent dead yet." A warning state, not a refusal.
+#:
+#: Three reasons it could not be a block anyway, and the first settles it: `generate_h3` accepts
+#: this window. The route refuses only above the *node's* 3600-frame ceiling (150 s), so a block
+#: here would make the pre-flight stricter than the gate it exists to mirror — and this module's
+#: own docstring names that as the failure it prevents, in the other direction ("three chances
+#: for the pre-flight to say yes to something the route then refuses"). A Director would simply
+#: submit shot by shot and get a 202 each time. Second, the band is a *training* range and not a
+#: hard limit: a long take degrades, and degraded is not the noise an empty prompt returns, which
+#: is what the blocking half of this report means. Third, shot length is a creative decision made
+#: elsewhere, which is exactly the argument `ReadinessReport` already records for letting
+#: sameness warn rather than gate.
+#:
+#: **The extender is named as unreachable, and the state is stated exactly.** The Director's
+#: ruling continues "we should have a video extender workflow already which may work if fed the
+#: last bit of the video we are extending", and the honest answer is *half*: the graph is built
+#: — `workflows.build_ltx25_extend_payload` reproduces the audited
+#: `ltx25-videoextender-user-export.json` node for node — but **nothing in the application calls
+#: it.** No route submits it, and `models.SHOT_MODE_SPECS["extend"]` carries `adapter=""`, so an
+#: over-long shot cannot be rendered by extension today no matter what a Director does in the
+#: interface. Saying "not built" would be as wrong as saying it works; the sentence says which
+#: half exists, because `README.md`'s honest-status convention is about exactly this distance
+#: between an adapter and a feature.
+SHOT_WINDOW_ABOVE_BAND = (
+    "This shot's window is {duration:.3f}s, past the {maximum:g}s MiniMax H3 is trained for. "
+    "A short window is covered by rendering H3's minimum and hiding the buffer around it; "
+    "there is no matching trick for a long one, because the whole {duration:.3f}s has to be "
+    "generated. It will still submit and render — expect motion and lipsync to drift late in "
+    "the take. Rendering a shorter take and extending it is the intended fix and is not "
+    "reachable: the LTX 2.5 extension graph is built and audited, but no route submits it and "
+    "the extend shot mode carries no adapter. Split the shot, or accept the drift. This does "
+    "not block submission."
+)
+
+#: What kind of thing a `ReadinessNote` is, for a reader that has to *draw* it rather than print
+#: it. The Director asked for a clip dragged past `H3_MAX_SHOT_SECONDS` to "turn yellow", and a
+#: surface cannot colour from a sentence without matching on its words — which is how a browser
+#: starts describing a rule the server no longer has. The two window kinds are separate values
+#: because the two states are separate: one is handled and one is not.
+NOTE_KIND_PROMPT = "prompt"
+NOTE_KIND_SAMENESS = "sameness"
+NOTE_KIND_WINDOW_SHORT = "window_short"
+NOTE_KIND_WINDOW_LONG = "window_long"
+
 # The one refusal wording, used by every path that can submit a Shot: the single-Shot route and
 # the whole-batch client check. `api.js`'s READINESS_REFUSAL is the frontend half and a contract
 # test asserts the two templates are identical — two hand-written refusals for one rule is how
@@ -169,11 +251,18 @@ class ReadinessNote:
     `labels` is the same Shots under the names the Director sees, positionally aligned with
     `shot_ids`. It is carried rather than recomputed client-side so that the browser and the
     server name a Shot identically without the browser reimplementing `shot_label`.
+
+    `kind` is the note's category as a value — one of the `NOTE_KIND_*` constants — for the
+    surfaces that have to *draw* a note rather than print it. `reason` is the sentence and
+    stays the only thing anyone displays; `kind` is what a clip colours from. It defaults to
+    `""` so that a note built positionally by an older caller is unchanged, and every note this
+    module builds sets it.
     """
 
     shot_ids: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     reason: str = ""
+    kind: str = ""
 
 
 @dataclass(slots=True)
@@ -189,6 +278,16 @@ class ReadinessReport:
     not listed, and is 0 when warnings were computed and none overflowed. `warnings_computed`
     says whether the pairwise pass ran at all: a caller that only needs the blocking answer skips
     it, and an empty `warnings` list must not then be read as "this plan has no duplicates".
+
+    `window_warnings` is the shot-length band (`SHOT_WINDOW_BELOW_BAND`,
+    `SHOT_WINDOW_ABOVE_BAND`), and it is a **third list rather than more entries in
+    `warnings`** for one concrete reason: `warnings` has exactly one meaning to every reader it
+    already has. `api.js` labels every note in it `READINESS_SAMENESS_LABEL` ("Near-duplicate")
+    and `readinessSummary` counts its length as "N near-duplicate pairs" — so a window note
+    posted into that list would reach the Director's screen under a name that is not what it
+    says, and counted as a pair it is not. One list, one kind of note. It is computed
+    unconditionally, unlike sameness: it is per-shot rather than pairwise, so it costs one
+    comparison per shot and there is nothing for an `include_warnings=False` caller to save.
     """
 
     ready: bool = False
@@ -198,6 +297,7 @@ class ReadinessReport:
     warnings: list[ReadinessNote] = field(default_factory=list)
     warnings_computed: bool = True
     warnings_omitted: int = 0
+    window_warnings: list[ReadinessNote] = field(default_factory=list)
 
     def blocked_ids(self) -> list[str]:
         """Every Shot id that blocks, in report order. Empty for an empty plan."""
@@ -242,6 +342,39 @@ def prompt_is_missing(shot: Shot) -> bool:
     the Shots this one exists to catch.
     """
     return bool(prompt_rejection(shot.prompt))
+
+
+def window_band_note(shot: Shot) -> tuple[str, str]:
+    """What this shot's window costs H3: ``(kind, sentence)``, or ``("", "")`` inside the band.
+
+    Shaped like `prompt_rejection` — "outside the band" and "here is what that means" are one
+    answer — and, unlike it, never a rejection: both sentences end by saying so. The band's ends
+    are asymmetric and so are the sentences; see the two constants for the argument. The kind
+    rides with the sentence for the same reason the two are one return value: a caller that got
+    the words without the category would have to re-derive the category from the words.
+
+    The short sentence carries the *numbers of this shot's own render* rather than a general
+    remark, because "it renders anyway" is a claim a Director should be able to check: the frame
+    count comes from `timeline.over_render_frames`, the one function the payload builders and the
+    submission route compute their length with, so the buffer named here is the buffer that will
+    exist. Reading the count off that function rather than restating the floor is what keeps this
+    note honest if the floor ever moves.
+    """
+    if shot.duration > H3_MAX_SHOT_SECONDS:
+        return NOTE_KIND_WINDOW_LONG, SHOT_WINDOW_ABOVE_BAND.format(
+            duration=shot.duration, maximum=H3_MAX_SHOT_SECONDS
+        )
+    if shot.duration < H3_MIN_SHOT_SECONDS:
+        frames = over_render_frames(shot.duration)
+        rendered = frames / H3_FPS
+        return NOTE_KIND_WINDOW_SHORT, SHOT_WINDOW_BELOW_BAND.format(
+            duration=shot.duration,
+            minimum=H3_MIN_SHOT_SECONDS,
+            frames=frames,
+            rendered=rendered,
+            buffer=rendered - shot.duration,
+        )
+    return "", ""
 
 
 def _words(prompt: str) -> set[str]:
@@ -304,6 +437,12 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
     Sameness is compared only between Shots that are **not** blocked. Two empty prompts are
     trivially identical, and reporting that on top of two blocks would bury the one entry that
     has to be acted on under a warning that resolves itself the moment it is.
+
+    The shot-length band (`window_band_note`) is reported for **every** shot, blocked ones
+    included, and never changes `ready`. Unlike sameness it is a fact about one shot rather than
+    a comparison between two, so a blocked shot's window is just as true as a prompted one's and
+    hiding it would make the note appear only after the prompt was written — which is the
+    late-discovery this exists to end.
     """
     shots = ordered_shots(project)
     if not shots:
@@ -311,19 +450,37 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
             ready=False,
             shot_count=0,
             ready_count=0,
-            blocking=[ReadinessNote(shot_ids=[], labels=[], reason=PLAN_WITHOUT_SHOTS)],
+            blocking=[
+                ReadinessNote(
+                    shot_ids=[], labels=[], reason=PLAN_WITHOUT_SHOTS, kind=NOTE_KIND_PROMPT
+                )
+            ],
             warnings=[],
             warnings_computed=include_warnings,
         )
 
     blocking: list[ReadinessNote] = []
     prompted: list[Shot] = []
+    window_warnings: list[ReadinessNote] = []
     for shot in shots:
+        band_kind, band_reason = window_band_note(shot)
+        if band_kind:
+            window_warnings.append(
+                ReadinessNote(
+                    shot_ids=[shot.id],
+                    labels=[shot_label(project, shot)],
+                    reason=band_reason,
+                    kind=band_kind,
+                )
+            )
         rejection = prompt_rejection(shot.prompt)
         if rejection:
             blocking.append(
                 ReadinessNote(
-                    shot_ids=[shot.id], labels=[shot_label(project, shot)], reason=rejection
+                    shot_ids=[shot.id],
+                    labels=[shot_label(project, shot)],
+                    reason=rejection,
+                    kind=NOTE_KIND_PROMPT,
                 )
             )
         else:
@@ -347,6 +504,7 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
                     shot_ids=[first.id, second.id],
                     labels=[shot_label(project, first), shot_label(project, second)],
                     reason=reason,
+                    kind=NOTE_KIND_SAMENESS,
                 )
             )
 
@@ -358,6 +516,7 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
         warnings=warnings,
         warnings_computed=include_warnings,
         warnings_omitted=omitted,
+        window_warnings=window_warnings,
     )
 
 

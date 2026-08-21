@@ -2237,3 +2237,700 @@ def audio_replace_lengths(*, duration: float) -> dict[str, float]:
         "requested_picture_seconds": frames / H3_FRAME_RATE,
         "requested_frames": float(frames),
     }
+
+
+#: The models the LTX 2.5 video-extension graph's **reachable** subgraph loads. Five files,
+#: and the fifth is the difference from every other LTX adapter here:
+#: ``LatentUpscaleModelLoader`` is an *orphan* in the enhancer and the audio-replacer exports
+#: and this one builds neither of those, but in
+#: ``workflow_templates/reference_exports/ltx25-videoextender-user-export.json`` that loader
+#: is genuinely reached — node ``16`` feeds ``LTXVLatentUpsampler`` (node ``1993:1921``),
+#: which is the whole low-res-then-upscale shape of this graph. Declared here because the
+#: reachability walk says so, not because the class name appeared in a node list; the same
+#: walk is what keeps the other two adapters from declaring it.
+LTX25_EXTEND_UNET = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
+LTX25_EXTEND_VIDEO_VAE = "ltx-2.5-video-vae-conv-bf16.safetensors"
+LTX25_EXTEND_AUDIO_VAE = "ltx-2.5-audio-vae-bf16.safetensors"
+LTX25_EXTEND_CLIP = "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
+LTX25_EXTEND_UPSCALER = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+
+#: The two sampling schedules the audited export fixes, reproduced verbatim — spacing and
+#: all — so the test that pins them against the export compares strings rather than parsed
+#: floats.
+#:
+#: **Read these as a property of the graph, not as a defect.** The base pass starts at
+#: **1.0**: full noise, eight steps, which is what generating seconds of video that do not
+#: exist yet requires. The refine pass, after the latent upscale, starts at **0.85** — for
+#: comparison ``LTX25_ENHANCE_SIGMAS`` starts at 0.909375, and *that* was measured to move
+#: lip position on a singing take. So this graph re-generates at least as hard as the
+#: enhancer does, and it does so over the reference tail as well as over the new seconds:
+#: nothing splices the source's last frames back in, they come back out of the model (see
+#: the ``mvp:head`` / ``mvp:generated`` split in ``build_ltx25_extend_payload``).
+#:
+#: The consequence, stated once here so nobody has to rediscover it: an extension suits a
+#: long b-roll cut — an establishing shot, an environment, a texture — and would visibly
+#: disturb a performance shot, because the seam second is re-generated and the new seconds
+#: are invented outright. That is a judgement for whoever asks for the extension. It is
+#: deliberately **not** encoded as a refusal, and no machinery here tries to protect
+#: lip-sync.
+LTX25_EXTEND_BASE_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+LTX25_EXTEND_REFINE_SIGMAS = "0.85, 0.7250, 0.4219, 0.0"
+
+#: The rest of the sampling the export fixes and this adapter does not offer as controls.
+#: ``cfg`` 1 through a ``CFGGuider`` and ``euler`` are the export's; the refine pass's seed is
+#: the export's second ``RandomNoise`` (node ``1993:1947``) and stays a constant because
+#: re-tuning it is not evidenced, while the base pass's seed (node ``1999``) is the one that
+#: decides what gets invented and is therefore the caller's.
+LTX25_EXTEND_CFG = 1.0
+LTX25_EXTEND_SAMPLER = "euler"
+LTX25_EXTEND_REFINE_SEED = 28
+LTX25_EXTEND_DEFAULT_SEED = 62189421302031
+
+#: The export's own negative prompt (node ``1993:1936``), carried whole. Reproduced rather
+#: than rewritten: it is part of the configuration the evidence was produced with, double
+#: space and trailing comma included, and ``tests/test_workflows.py`` compares this string to
+#: the export's byte for byte.
+LTX25_EXTEND_NEGATIVE_PROMPT = (
+    "text, subtitles, logo, still image, still video, no motion, static, frozen, blurry, "
+    "low quality, distorted, bad anatomy, oversaturated, pixelated, low resolution, grainy, "
+    "compression artifacts, jpeg artifacts, glitches, watermark, signature, copyright,  "
+    "distortedsound, saturated sound, loud sound , deformed facial features, asymmetrical "
+    "face, missing facial features, extra limbs, disfigured hands, blurry teeth, disfigured "
+    "teeth, "
+)
+
+#: The export's positive prompt is empty (node ``1992``). An extension of an existing shot has
+#: the shot itself as its conditioning; a caller with something to say about the new seconds
+#: passes it, and a caller with nothing to say sends what the evidence sent.
+LTX25_EXTEND_PROMPT = ""
+
+#: The knobs the export exposes as titled ``INTConstant`` nodes, with their values as the
+#: defaults: "Reference (in seconds) leave it at 3" (node ``2000``), "Framerate" (``1997``),
+#: "WIDTH" (``1995``) and "HEIGHT" (``1996``). "Extend video by (seconds)" (``2001``, value
+#: 10) is a required argument instead — there is no sensible default for how much video to
+#: invent.
+LTX25_EXTEND_DEFAULT_REFERENCE_SECONDS = 3
+LTX25_EXTEND_DEFAULT_FRAME_RATE = 24
+LTX25_EXTEND_DEFAULT_WIDTH = 1920
+LTX25_EXTEND_DEFAULT_HEIGHT = 1080
+
+#: Fixed values from the export that are neither models nor sampling: the longer edge the
+#: anchor frame is scaled to before ``LTXVImgToVideoInplace`` (node ``1993:1942``), the
+#: ``LTXVPreprocess`` compression (``1993:1932``), the loudness the source track is normalised
+#: to (``1993:1938``), and the half-scale the reference tail is encoded at (``1993:1933``).
+LTX25_EXTEND_ANCHOR_LONGER_EDGE = 1536
+LTX25_EXTEND_IMG_COMPRESSION = 33
+LTX25_EXTEND_LOUDNESS_LUFS = -16.0
+LTX25_EXTEND_REFERENCE_SCALE = 0.5
+
+#: The container extensions ``VHS_LoadVideoPath`` accepts, published by live ``/object_info``
+#: as ``video[1]["vhs_path_extensions"]``. The same list ``LTX25_ENHANCE_SOURCE_EXTENSIONS``
+#: and ``AUDIO_REPLACE_VIDEO_EXTENSIONS`` carry, and deliberately not an alias of either, for
+#: the reason those two already record: three adapters restate one node's list for their own
+#: reasons, and aliasing would make a divergence in one invisible in the others' audits.
+#: ``tests/preflight_ltx25_extend.py`` checks this tuple against the live schema.
+LTX25_EXTEND_SOURCE_EXTENSIONS = ("webm", "mp4", "mkv", "gif", "mov")
+
+#: Every schema ceiling a *caller's argument* can push a literal past, restated so the refusal
+#: happens here with the number named rather than arriving as an opaque 502 from ``/prompt``
+#: validation after the submission round-trip. Each is the declared bound of the input the
+#: value lands in, and ``tests/preflight_ltx25_extend.py`` reads all five back off live
+#: ``/object_info`` rather than trusting this block:
+#:
+#: * ``FRAME_RATE`` — ``VHS_LoadVideoPath.force_rate`` max, and the rate reaches three more
+#:   inputs with looser ceilings, so this is the binding one;
+#: * ``RANGE_FRAMES`` — ``GetImageRangeFromBatch.num_frames`` max, which the reference tail's
+#:   literal frame count has to sit inside;
+#: * ``MASK_SECONDS`` — ``LTXVAudioVideoMask.video_end_time`` max, the ceiling on
+#:   reference + extension;
+#: * ``DIMENSION`` — ``ImageResizeKJv2.width``/``height`` max;
+#: * ``SEED`` — ``RandomNoise.noise_seed`` max.
+LTX25_EXTEND_MAX_FRAME_RATE = 60
+LTX25_EXTEND_MAX_RANGE_FRAMES = 4096
+LTX25_EXTEND_MAX_MASK_SECONDS = 10000.0
+LTX25_EXTEND_MAX_DIMENSION = 16384
+LTX25_EXTEND_MAX_SEED = 18446744073709551615
+
+
+def _positive_integer(name: str, value: object) -> int:
+    """An ``int`` that is not a ``bool`` and is at least 1, or a refusal naming it."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        # ValueError rather than TypeError, as everywhere else in this file: every caller of
+        # every builder here treats "this argument is unusable" as one condition and turns it
+        # into one message for the Director. Splitting it by Python type would put the same
+        # refusal on two paths for no reader's benefit.
+        raise ValueError(  # noqa: TRY004
+            f"{name} must be a whole number of frames or seconds, not {value!r}"
+        )
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, not {value}")
+    return value
+
+
+def build_ltx25_extend_payload(
+    *,
+    source_video: str,
+    prefix: str,
+    extend_seconds: float,
+    reference_seconds: int = LTX25_EXTEND_DEFAULT_REFERENCE_SECONDS,
+    prompt: str = LTX25_EXTEND_PROMPT,
+    seed: int = LTX25_EXTEND_DEFAULT_SEED,
+    frame_rate: int = LTX25_EXTEND_DEFAULT_FRAME_RATE,
+    width: int = LTX25_EXTEND_DEFAULT_WIDTH,
+    height: int = LTX25_EXTEND_DEFAULT_HEIGHT,
+    include_audio: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Continue an existing video past its own end, through the LTX 2.5 extension graph.
+
+    Derived from ``workflow_templates/reference_exports/ltx25-videoextender-user-export.json``
+    — 61 nodes, **all 61 of them reachable** from its single ``VHS_VideoCombine`` (node
+    ``1994``). That is unusual here and it is why this export is the one reproduced: the
+    sibling ``ltx25-videoextender-noaudio-user-export.json`` carries 65 nodes of which only 54
+    are reachable, and the 11 orphans are its abandoned audio tail — an edit in progress rather
+    than a finished graph. It also mis-wires ``LTXVEmptyLatentAudio.frame_rate`` to the "Extend
+    video by (seconds)" constant instead of the framerate one, on both instances, which leaves
+    no honest way to build from it: transcribing reproduces the defect and correcting it
+    invents a graph nobody rendered. It saves nothing either — the silent path still loads the
+    same five model files, audio VAE included, and still runs an audio branch, just fed with
+    silence. ``docs/WORKFLOW-MAP.md`` records it as available and audited-second.
+
+    **What this graph actually does**, because "extend" undersells it:
+
+    * ``VHS_LoadVideoPath`` reads the take at a forced ``frame_rate`` and every frame is
+      stretched to ``width`` x ``height`` (``mvp:frames``);
+    * the batch is cut in two — a *head*, everything but the last ``reference_seconds``, and a
+      *tail* of ``reference_seconds * frame_rate + 1`` frames;
+    * the tail, at half scale, is what the model is conditioned on. ``LTXVAudioVideoMask``
+      marks the seconds after it as the region to invent, ``max_length="pad"`` grows the latent
+      to hold them, and eight steps from sigma 1.0 fill them in at low resolution;
+    * ``LTXVLatentUpsampler`` doubles the result, the tail's first frame is re-anchored into it
+      by ``LTXVImgToVideoInplace``, and three more steps from sigma 0.85 refine the whole thing;
+    * the output is the untouched **head** followed by the model's rendering of the **tail plus
+      the new seconds**.
+
+    That last point is the one to carry away: the reference tail is not spliced back, it is
+    re-generated. See ``LTX25_EXTEND_BASE_SIGMAS`` for how hard, and for why this is a
+    capability for long b-roll and establishing shots rather than for a performance take. It is
+    a note for the caller's judgement; nothing here refuses a shot on those grounds.
+
+    **The output length is a measurement, not a prediction.** ``format="LTXV"`` conforms the
+    loaded frame count to the node's ``8n+1`` grid before anything else happens, the mask pads
+    to a latent boundary rather than to an exact second, and a fractional ``extend_seconds`` has
+    no exact frame count to land on. What comes back is longer than what went in; how much
+    longer is an ``ffprobe`` reading of the file. Do not assume.
+
+    **The take must carry an audio track.** This graph encodes the tail of the source's own
+    audio as conditioning even when ``include_audio`` is False, so a silent source has nothing
+    to feed ``LTXVAudioVAEEncode``. It is not refused here — this builder cannot open the file —
+    but it is the one precondition a caller has to check.
+
+    ``include_audio`` decides only what reaches the **saver**. True (the export's shape) writes
+    the source's own track, loudness-normalised, with the model's invented continuation concat-
+    enated after it; the invented seconds are the model's guess at what the audio does next and
+    are not the source of anything. False drops those three nodes and the saver's optional
+    ``audio`` link, and writes picture only — which is what a cut destined for a separate sound
+    pass wants. It does **not** reproduce the no-audio export, which additionally replaces the
+    audio *conditioning* with an empty latent; saying otherwise would be the unstated
+    substitution this file's other docstrings exist to avoid.
+
+    Four departures from a node-for-node transcription, each stated because an unstated
+    substitution is the part that would mislead:
+
+    * ``VHS_LoadVideo`` -> ``VHS_LoadVideoPath``, for the reason
+      ``build_ltx25_enhance_payload`` and ``build_audio_replace_payload`` both record: the
+      export's loader takes a filename from a combo over ComfyUI's *input* directory, which
+      this installation publishes empty, while a take lives under *output*. Identical outputs
+      in identical order (``IMAGE``, ``frame_count``, ``audio``, ``video_info``).
+    * ``Power Lora Loader (rgthree)`` (node ``1988``) is **dropped rather than substituted.**
+      The enhancer had to substitute a ``LoraLoader`` because its rgthree row carried an
+      enabled detailer; this export's node carries no ``lora_*`` entry at all, so it applies
+      nothing and is a pass-through from ``UNETLoader`` to both guiders. Building it would put
+      a node in front of ComfyUI whose only effect is to be there.
+    * ``SimpleCalculatorKJ`` -> ``CM_IntBinaryOperation`` / ``CM_FloatBinaryOperation``, and
+      only twice. The export computes six numbers in graph nodes; four of them —
+      ``reference_seconds * frame_rate + 1``, that count over the frame rate, the same again
+      over the *loaded* rate, and the extension's end time — are functions of arguments this
+      builder already holds, because ``force_rate`` fixes the loaded rate to ``frame_rate``.
+      They are folded into Python literals, the way ``build_h3_image_edit_payload`` resolves
+      the export's Any Switches rather than reproducing them as plumbing, and
+      ``tests/test_workflows.py`` re-derives all four from the export's own expressions and
+      constants rather than trusting the arithmetic here. The two that survive genuinely
+      depend on the file — the head's frame count and where the reference audio starts — and
+      they move to ComfyMath's binary operations, from the same pack the export already draws
+      ``CM_IntToFloat`` from, because ``SimpleCalculatorKJ.variables`` is a
+      ``COMFY_AUTOGROW_V3`` group keyed by ``names`` with neither a ``prefix`` nor a ``max``,
+      which the shared pre-flight cannot expand — its values would ride into ComfyUI unchecked.
+    * ``ResizeImageMaskNode`` -> ``ImageScaleBy``, and ``ImpactImageInfo`` folded into the
+      ``GetImageSizeAndCount`` already in the graph. The first is the same "scale by 0.5, area"
+      the export performs, expressed on a core node instead of a ``COMFY_DYNAMICCOMBO_V3``
+      whose ``resize_type.multiplier`` sub-input the shared pre-flight cannot expand either.
+      The second is one measurement of one batch read twice: ``GetImageSizeAndCount`` publishes
+      ``width``/``height``/``count`` of the same frames ``ImpactImageInfo`` was measuring.
+    """
+    if not isinstance(source_video, str) or not source_video.strip():
+        raise ValueError("An LTX 2.5 extension needs a source video path")
+    # VHS strips surrounding whitespace and one leading/trailing quote off the path before
+    # opening it (``utils.strip_path``). The file a caller checked on disk and the file the
+    # node then opens must be the same one, so a value that would be rewritten is refused
+    # rather than silently repointed.
+    if source_video != source_video.strip().strip('"'):
+        raise ValueError(
+            f"The source video path must not be quoted or padded: VHS would rewrite "
+            f"{source_video!r} before opening it"
+        )
+    extension = source_video.rsplit(".", 1)[-1].lower() if "." in source_video else ""
+    if extension not in LTX25_EXTEND_SOURCE_EXTENSIONS:
+        raise ValueError(
+            f"LTX 2.5 extension reads {', '.join(LTX25_EXTEND_SOURCE_EXTENSIONS)}; "
+            f"{source_video} is not one of those"
+        )
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise ValueError("An LTX 2.5 extension needs an output filename prefix")
+    # ValueError on both, for the reason `_positive_integer` records.
+    if not isinstance(prompt, str):
+        raise ValueError(  # noqa: TRY004
+            f"An LTX 2.5 extension's prompt must be text, not {prompt!r}"
+        )
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(  # noqa: TRY004
+            f"An LTX 2.5 extension's seed must be a whole number, not {seed!r}"
+        )
+    if not 0 <= seed <= LTX25_EXTEND_MAX_SEED:
+        raise ValueError(
+            f"RandomNoise.noise_seed takes 0 to {LTX25_EXTEND_MAX_SEED}; {seed} is outside it"
+        )
+    rate = _positive_integer("An LTX 2.5 extension's frame rate", frame_rate)
+    if rate > LTX25_EXTEND_MAX_FRAME_RATE:
+        raise ValueError(
+            f"VHS_LoadVideoPath.force_rate tops out at {LTX25_EXTEND_MAX_FRAME_RATE} fps; "
+            f"{rate} is above it"
+        )
+    for name, value in (("width", width), ("height", height)):
+        _positive_integer(f"An LTX 2.5 extension's {name}", value)
+        if value > LTX25_EXTEND_MAX_DIMENSION:
+            raise ValueError(
+                f"ImageResizeKJv2.{name} tops out at {LTX25_EXTEND_MAX_DIMENSION}; "
+                f"{value} is above it"
+            )
+    reference = _positive_integer("An LTX 2.5 extension's reference window", reference_seconds)
+    # The export's "(a*b)+1": one frame more than the seconds asked for, which is the extra
+    # frame LTX's 8n+1 latent grid wants at the head of a conditioned window.
+    reference_frames = reference * rate + 1
+    if reference_frames > LTX25_EXTEND_MAX_RANGE_FRAMES:
+        raise ValueError(
+            f"GetImageRangeFromBatch.num_frames tops out at {LTX25_EXTEND_MAX_RANGE_FRAMES} "
+            f"frames; a {reference}s reference at {rate} fps is {reference_frames}"
+        )
+    added = _finite("An LTX 2.5 extension's added length", extend_seconds)
+    if added <= 0:
+        raise ValueError(f"An extension must add more than zero seconds, not {added:g}s")
+    # Where the reference window starts inside the padded latent, in seconds. The export
+    # computes this twice — once against the framerate constant and once against the loaded
+    # rate ``VHS_VideoInfo`` reports — and the two agree only because ``force_rate`` pins the
+    # loaded rate to the constant. Folded to one number here for the same reason.
+    reference_length = reference_frames / rate
+    end_time = added + reference_length
+    if end_time > LTX25_EXTEND_MAX_MASK_SECONDS:
+        raise ValueError(
+            f"LTXVAudioVideoMask spans at most {LTX25_EXTEND_MAX_MASK_SECONDS:g}s; a "
+            f"{reference_length:g}s reference plus {added:g}s is {end_time:g}s"
+        )
+    payload: dict[str, dict[str, Any]] = {
+        "mvp:source": {
+            "class_type": "VHS_LoadVideoPath",
+            "inputs": {
+                "video": source_video,
+                # A FLOAT input, and the export feeds it the framerate constant through a
+                # ``CM_IntToFloat``. Forcing the rate is what makes every seconds-to-frames
+                # number below computable without opening the file.
+                "force_rate": float(rate),
+                "custom_width": 0,
+                "custom_height": 0,
+                "frame_load_cap": 0,
+                "skip_first_frames": 0,
+                "select_every_nth": 1,
+                # The export's. Unlike `AUDIO_REPLACE_SOURCE_FORMAT`, "LTXV" is kept here:
+                # this *is* an LTX graph, its 8n+1 frame rule is the grid the sampler wants,
+                # and conforming to it is why the output length is measured rather than
+                # predicted.
+                "format": "LTXV",
+            },
+        },
+        "mvp:source_info": {
+            "class_type": "VHS_VideoInfo",
+            "inputs": {"video_info": ["mvp:source", 3]},
+        },
+        # Every frame at the working size. Output 1 is width, 2 is height, 3 is the count —
+        # all three read off this one node, which is the `ImpactImageInfo` fold.
+        "mvp:frames": {
+            "class_type": "ImageResizeKJv2",
+            "inputs": {
+                "width": width,
+                "height": height,
+                "upscale_method": "nearest-exact",
+                "keep_proportion": "stretch",
+                "pad_color": "0, 0, 0",
+                "crop_position": "center",
+                "divisible_by": 64,
+                "device": "cpu",
+                "image": ["mvp:source", 0],
+            },
+        },
+        "mvp:measure": {
+            "class_type": "GetImageSizeAndCount",
+            "inputs": {"image": ["mvp:frames", 0]},
+        },
+        # Two constants that could have been literals and deliberately are not.
+        #
+        # `preflight.unbounded_numeric_inputs` reports a numeric literal whose schema publishes
+        # neither `min` nor `max`, because a value on such an input rides into ComfyUI with the
+        # range check silently disabled. Both ComfyMath binary operations declare their operands
+        # as bare `{"default": 0}`, so the reference window's length would have been exactly
+        # that — twice. Routed through nodes that *do* declare a range, the numbers are checked
+        # where they are stated, and the export's own `INTConstant` is what it used for the
+        # first of them anyway. The two ceilings that matter — the range node's 4096 frames and
+        # the mask's 10000 seconds — are refused above and checked against the live schema by
+        # `tests/preflight_ltx25_extend.py`.
+        "mvp:reference_frames": {
+            "class_type": "INTConstant",
+            "inputs": {"value": reference_frames},
+        },
+        "mvp:reference_length": {
+            "class_type": "PrimitiveFloat",
+            "inputs": {"value": reference_length},
+        },
+        # How many frames come back untouched: everything the reference window does not cover.
+        # The one number here that genuinely cannot be computed without the file.
+        "mvp:head_frames": {
+            "class_type": "CM_IntBinaryOperation",
+            "inputs": {"op": "Sub", "a": ["mvp:measure", 3], "b": ["mvp:reference_frames", 0]},
+        },
+        "mvp:head": {
+            "class_type": "GetImageRangeFromBatch",
+            "inputs": {
+                "start_index": 0,
+                "num_frames": ["mvp:head_frames", 0],
+                "images": ["mvp:frames", 0],
+            },
+        },
+        # `start_index: -1` is the node's "from the end" — the tail the model is conditioned on.
+        "mvp:tail": {
+            "class_type": "GetImageRangeFromBatch",
+            "inputs": {
+                "start_index": -1,
+                "num_frames": ["mvp:reference_frames", 0],
+                "images": ["mvp:frames", 0],
+            },
+        },
+        "mvp:tail_half": {
+            "class_type": "ImageScaleBy",
+            "inputs": {
+                "upscale_method": "area",
+                "scale_by": LTX25_EXTEND_REFERENCE_SCALE,
+                "image": ["mvp:tail", 0],
+            },
+        },
+        "mvp:preprocess": {
+            "class_type": "LTXVPreprocess",
+            "inputs": {
+                "img_compression": LTX25_EXTEND_IMG_COMPRESSION,
+                "image": ["mvp:tail_half", 0],
+            },
+        },
+        "mvp:encode_reference": {
+            "class_type": "VAEEncodeTiled",
+            "inputs": {
+                "tile_size": 512,
+                "overlap": 64,
+                "temporal_size": 4096,
+                "temporal_overlap": 8,
+                "pixels": ["mvp:preprocess", 0],
+                "vae": ["mvp:video_vae", 0],
+            },
+        },
+        # The source's own track, normalised. Fed to the audio conditioning either way, and
+        # to the saver only when `include_audio`.
+        "mvp:loudness": {
+            "class_type": "NormalizeAudioLoudness",
+            "inputs": {"lufs": LTX25_EXTEND_LOUDNESS_LUFS, "audio": ["mvp:source", 2]},
+        },
+        # Output 7 of `VHS_VideoInfo` is `loaded_duration`. The second number that needs the
+        # file: where the reference window's audio begins.
+        "mvp:reference_audio_start": {
+            "class_type": "CM_FloatBinaryOperation",
+            "inputs": {"op": "Sub", "a": ["mvp:source_info", 7], "b": ["mvp:reference_length", 0]},
+        },
+        "mvp:reference_audio": {
+            "class_type": "TrimAudioDuration",
+            "inputs": {
+                "start_index": ["mvp:reference_audio_start", 0],
+                "duration": reference_length,
+                "audio": ["mvp:loudness", 0],
+            },
+        },
+        "mvp:encode_reference_audio": {
+            "class_type": "LTXVAudioVAEEncode",
+            "inputs": {"audio": ["mvp:reference_audio", 0], "audio_vae": ["mvp:audio_vae", 0]},
+        },
+        # The extension itself, expressed as a mask: keep the reference seconds, invent
+        # everything from `reference_length` to `end_time`, and `pad` the latent out to hold
+        # them rather than truncating to what the reference already covers.
+        "mvp:mask": {
+            "class_type": "LTXVAudioVideoMask",
+            "inputs": {
+                "video_fps": float(rate),
+                "video_start_time": reference_length,
+                "video_end_time": end_time,
+                "audio_start_time": reference_length,
+                "audio_end_time": end_time,
+                "max_length": "pad",
+                "existing_mask_mode": "add",
+                "video_latent": ["mvp:encode_reference", 0],
+                "audio_latent": ["mvp:encode_reference_audio", 0],
+            },
+        },
+        "mvp:base_latent": {
+            "class_type": "LTXVConcatAVLatent",
+            "inputs": {"video_latent": ["mvp:mask", 0], "audio_latent": ["mvp:mask", 1]},
+        },
+        "mvp:model": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": LTX25_EXTEND_UNET, "weight_dtype": "default"},
+        },
+        "mvp:clip": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": LTX25_EXTEND_CLIP, "type": "ltxv", "device": "default"},
+        },
+        "mvp:video_vae": {
+            "class_type": "VAELoaderKJ",
+            "inputs": {
+                "vae_name": LTX25_EXTEND_VIDEO_VAE,
+                "device": "main_device",
+                "weight_dtype": "bf16",
+            },
+        },
+        # On the CPU, as the export loads it. The audio VAE is a dependency of this graph
+        # whatever `include_audio` says: the conditioning goes through it.
+        "mvp:audio_vae": {
+            "class_type": "VAELoaderKJ",
+            "inputs": {
+                "vae_name": LTX25_EXTEND_AUDIO_VAE,
+                "device": "cpu",
+                "weight_dtype": "bf16",
+            },
+        },
+        # Reached, unlike its namesake in the enhancer and audio-replacer exports.
+        "mvp:upscaler": {
+            "class_type": "LatentUpscaleModelLoader",
+            "inputs": {"model_name": LTX25_EXTEND_UPSCALER},
+        },
+        "mvp:prompt": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": prompt, "clip": ["mvp:clip", 0]},
+        },
+        "mvp:negative": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": LTX25_EXTEND_NEGATIVE_PROMPT, "clip": ["mvp:clip", 0]},
+        },
+        "mvp:conditioning": {
+            "class_type": "LTXVConditioning",
+            "inputs": {
+                "frame_rate": float(rate),
+                "positive": ["mvp:prompt", 0],
+                "negative": ["mvp:negative", 0],
+            },
+        },
+        # One guider for both passes. The export builds two `CFGGuider` nodes with byte-identical
+        # inputs, which is the editor's habit of not sharing a wire across a group rather than a
+        # difference between the passes.
+        "mvp:guider": {
+            "class_type": "CFGGuider",
+            "inputs": {
+                "cfg": LTX25_EXTEND_CFG,
+                "model": ["mvp:model", 0],
+                "positive": ["mvp:conditioning", 0],
+                "negative": ["mvp:conditioning", 1],
+            },
+        },
+        "mvp:sampler": {
+            "class_type": "KSamplerSelect",
+            "inputs": {"sampler_name": LTX25_EXTEND_SAMPLER},
+        },
+        "mvp:base_sigmas": {
+            "class_type": "ManualSigmas",
+            "inputs": {"sigmas": LTX25_EXTEND_BASE_SIGMAS},
+        },
+        "mvp:base_noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        # Output 1 is `denoised_output`, which is what both passes of the export read.
+        "mvp:base_sample": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["mvp:base_noise", 0],
+                "guider": ["mvp:guider", 0],
+                "sampler": ["mvp:sampler", 0],
+                "sigmas": ["mvp:base_sigmas", 0],
+                "latent_image": ["mvp:base_latent", 0],
+            },
+        },
+        "mvp:base_split": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {"av_latent": ["mvp:base_sample", 1]},
+        },
+        "mvp:upsample": {
+            "class_type": "LTXVLatentUpsampler",
+            "inputs": {
+                "samples": ["mvp:base_split", 0],
+                "upscale_model": ["mvp:upscaler", 0],
+                "vae": ["mvp:video_vae", 0],
+            },
+        },
+        # The first frame of the reference tail, put back into the upscaled latent at full
+        # strength so the refine pass starts from the source's own picture rather than from
+        # the low-res pass's idea of it.
+        "mvp:anchor_frame": {
+            "class_type": "GetImageRangeFromBatch",
+            "inputs": {"start_index": 0, "num_frames": 1, "images": ["mvp:tail", 0]},
+        },
+        "mvp:anchor": {
+            "class_type": "ResizeImagesByLongerEdge",
+            "inputs": {
+                "longer_edge": LTX25_EXTEND_ANCHOR_LONGER_EDGE,
+                "images": ["mvp:anchor_frame", 0],
+            },
+        },
+        "mvp:inplace": {
+            "class_type": "LTXVImgToVideoInplace",
+            "inputs": {
+                "strength": 1.0,
+                "bypass": False,
+                "vae": ["mvp:video_vae", 0],
+                "image": ["mvp:anchor", 0],
+                "latent": ["mvp:upsample", 0],
+            },
+        },
+        "mvp:refine_latent": {
+            "class_type": "LTXVConcatAVLatent",
+            "inputs": {
+                "video_latent": ["mvp:inplace", 0],
+                "audio_latent": ["mvp:base_split", 1],
+            },
+        },
+        "mvp:refine_sigmas": {
+            "class_type": "ManualSigmas",
+            "inputs": {"sigmas": LTX25_EXTEND_REFINE_SIGMAS},
+        },
+        "mvp:refine_noise": {
+            "class_type": "RandomNoise",
+            "inputs": {"noise_seed": LTX25_EXTEND_REFINE_SEED},
+        },
+        "mvp:refine_sample": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["mvp:refine_noise", 0],
+                "guider": ["mvp:guider", 0],
+                "sampler": ["mvp:sampler", 0],
+                "sigmas": ["mvp:refine_sigmas", 0],
+                "latent_image": ["mvp:refine_latent", 0],
+            },
+        },
+        "mvp:refine_split": {
+            "class_type": "LTXVSeparateAVLatent",
+            "inputs": {"av_latent": ["mvp:refine_sample", 1]},
+        },
+        "mvp:decode": {
+            "class_type": "VAEDecodeTiled",
+            "inputs": {
+                "tile_size": 512,
+                "overlap": 64,
+                "temporal_size": 4096,
+                "temporal_overlap": 8,
+                "samples": ["mvp:refine_split", 0],
+                "vae": ["mvp:video_vae", 0],
+            },
+        },
+        # Back to the head's own frame size before the two batches meet, padded rather than
+        # stretched: the upscaled latent does not decode to exactly the working size.
+        "mvp:generated": {
+            "class_type": "ImageResizeKJv2",
+            "inputs": {
+                "width": ["mvp:measure", 1],
+                "height": ["mvp:measure", 2],
+                "upscale_method": "nearest-exact",
+                "keep_proportion": "pad_edge_pixel",
+                "pad_color": "0, 0, 0",
+                "crop_position": "center",
+                "divisible_by": 64,
+                "device": "cpu",
+                "image": ["mvp:decode", 0],
+            },
+        },
+        # The untouched head, then the model's rendering of the reference tail *and* the new
+        # seconds. The tail appears once, not twice: `mvp:head` stops where it begins.
+        "mvp:batch": {
+            "class_type": "ImageBatchMulti",
+            "inputs": {
+                "inputcount": 2,
+                "image_1": ["mvp:head", 0],
+                "image_2": ["mvp:generated", 0],
+            },
+        },
+        "mvp:output": {
+            "class_type": "ImageResizeKJv2",
+            "inputs": {
+                "width": width,
+                "height": height,
+                "upscale_method": "lanczos",
+                "keep_proportion": "stretch",
+                "pad_color": "0, 0, 0",
+                "crop_position": "center",
+                "divisible_by": 8,
+                "device": "cpu",
+                "image": ["mvp:batch", 0],
+            },
+        },
+        "mvp:save": {
+            "class_type": "VHS_VideoCombine",
+            "inputs": {
+                "frame_rate": float(rate),
+                "loop_count": 0,
+                "filename_prefix": prefix,
+                "format": "video/h264-mp4",
+                "pix_fmt": "yuv420p",
+                "crf": 19,
+                "save_metadata": True,
+                "trim_to_audio": False,
+                "pingpong": False,
+                "save_output": True,
+                "images": ["mvp:output", 0],
+            },
+        },
+    }
+    if include_audio:
+        payload["mvp:decode_audio"] = {
+            "class_type": "LTXVAudioVAEDecode",
+            "inputs": {
+                "samples": ["mvp:refine_split", 1],
+                "audio_vae": ["mvp:audio_vae", 0],
+            },
+        }
+        # Only the invented seconds. The generated track also covers the reference window, and
+        # that part is thrown away because the source's own audio for those seconds is already
+        # in `audio1`.
+        payload["mvp:generated_audio"] = {
+            "class_type": "TrimAudioDuration",
+            "inputs": {
+                "start_index": reference_length,
+                "duration": float(added),
+                "audio": ["mvp:decode_audio", 0],
+            },
+        }
+        payload["mvp:audio"] = {
+            "class_type": "AudioConcat",
+            "inputs": {
+                "direction": "after",
+                "audio1": ["mvp:loudness", 0],
+                "audio2": ["mvp:generated_audio", 0],
+            },
+        }
+        payload["mvp:save"]["inputs"]["audio"] = ["mvp:audio", 0]
+    return payload

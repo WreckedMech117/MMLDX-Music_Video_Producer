@@ -74,6 +74,7 @@ from .h3_prompt import check as h3_check
 from .h3_prompt import check_reference_bounds, normalize_audio_fields
 from .models import (
     ASSET_ROLE_LABELS,
+    NOTICE_RAW_LIMIT,
     SHOT_MODE_SPECS,
     Asset,
     AssetCitation,
@@ -87,6 +88,7 @@ from .models import (
     SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
+    assets_for_proposal,
     citable_assets,
     citations_in_role,
     dangling_citations,
@@ -102,6 +104,14 @@ from .models import (
     with_default_setting,
 )
 from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
+from .prompt_cleanup import (
+    PROMPT_CLEANUP_SYSTEM_PROMPT,
+    citation_fingerprint,
+    echoed_labels,
+    prompt_cleanup_input,
+    rewrite_rejection,
+    window_fingerprint,
+)
 from .store import ProjectNotFound, ProjectStore
 from .timeline import (
     H3_FPS,
@@ -124,6 +134,7 @@ from .timeline import (
     proposal_for_position,
     proposed_sections_from_alignment,
     repair_sections,
+    section_looks_input,
     shot_expansion_input,
     shot_vocal_overlap,
     snap_cut_plan,
@@ -1665,6 +1676,13 @@ APPROVAL_FIELDS: tuple[str, ...] = ("approved_output", "approved_start", "approv
 # approval is a decision about one piece of media, and the routes that make and withdraw it are
 # the only places that decision is expressed. The refusal names the two actions, because the
 # Director reading it is holding a client that just tried to write the field directly.
+#: The optimistic-concurrency refusal, shared by the two manifest writes that take a revision:
+#: `replace_project` and `replace_shots`. Named rather than inlined twice because the timeline's
+#: undo now says the same sentence *before* the request -- it pre-flights the same comparison so
+#: the button can explain itself rather than only failing -- and a second wording of one rule is a
+#: second thing to keep true. `api.js` carries a copy pinned to this one by a contract test.
+PROJECT_CHANGED_REFUSAL = "Project changed since it was loaded; refresh before replacing it"
+
 GENERIC_WRITE_APPROVAL_REFUSAL = (
     "This save would change {shot}'s approval. An approval is an editorial decision about one "
     "specific take, so it is not something an ordinary save carries: approve and un-approve are "
@@ -2153,10 +2171,19 @@ POPULATE_INSTRUCTION = (
     "`performance` flag: answer it on each shot — true where a character sings the song "
     "on camera, false everywhere else. It is a field of the shot object and never words "
     "in the shot: no prompt may mention that flag or its value. The project's assets, "
-    "by name, are: {assets}. Each shot's prompt names the ones that shot uses, by these "
-    "exact names and no others — they are the names of the people and places in frame, "
-    "so write them as ordinary description, and never write a name that is not on that "
-    "list. Every shot's prompt is a "
+    "by name, are: {assets}. Every shot carries its own `assets` list: put in it the "
+    "exact names of the assets that shot uses, and nothing that is not on that list. "
+    "That list is the ONLY place an asset may be named — it is what attaches the "
+    "picture to the shot, so a shot that uses one and does not list it renders without "
+    "it. The prompt itself must never contain one of those names: they are internal "
+    "library labels, not words in a script, and a prompt reading \"Extreme close up of "
+    "Crimson Lips Close-up\" or \"Blue Haze Atmosphere surrounding the Dusk Warehouse "
+    "Bed\" is a shot list written as an inventory. Describe what is in frame in your own "
+    "words — the smeared red lips, the blue haze, the dark silk of the bed — and let "
+    "`assets` say which picture it is. A shot that uses nothing from the library returns "
+    "an empty `assets` list. The one exception is a character: a character asset's name "
+    "is the performer's name, so write it in the prompt exactly as you list it in "
+    "`assets` — the prose has to say who is in frame. Every shot's prompt is a "
     "short readable visual intent (one or two sentences): what is seen, who is in "
     "frame, how the camera behaves. Vary the camera angle and movement between "
     "adjacent shots — never repeat the same setup, framing or camera move back to "
@@ -2198,8 +2225,9 @@ POPULATE_SECTIONS_CONSTRAINT = (
 #: shots). The half that does not depend on the model is `models.with_default_setting`, which
 #: gives the location to any shot that did not name one.
 POPULATE_LOCATION_LINE = (
-    "\nThe video's location is {name}. Every shot that plays there names it in its prompt, "
-    "by that exact name."
+    "\nThe video's location is {name}. Every shot that plays there lists it in its "
+    "`assets`, by that exact name, and describes the place in its own words rather than "
+    "writing that name in the prompt."
 )
 
 #: Stage one of the two-stage populate: structure only, from the lyric sheet. Deliberately
@@ -2268,6 +2296,86 @@ POPULATE_ATTEMPTS = 2
 POPULATE_RETRY_TEMPERATURE = 0.2
 
 
+#: The honest-empty refusal, `snap_timeline_cuts`' rule: nothing was examined that could
+#: change, so there is no plan to report over and a 200 saying "0 rewritten" would read as the
+#: model having been asked and having had nothing to say. Names the good news, because on this
+#: route an empty answer *is* the good news.
+CLEAN_PROMPTS_NOTHING_TO_CLEAN = (
+    "No shot's prompt names a library asset, so there is nothing to clean. The prose is "
+    "already free of asset labels and every shot keeps the citations it has."
+)
+#: The other honest empty, and it is a refusal for a different reason: there is nothing to send
+#: a model. Reached only when every echoing shot is protected, which is a state the Director
+#: fixes (unlock, or let the queue settle) rather than a report they act on.
+CLEAN_PROMPTS_ALL_PROTECTED = (
+    "Every shot whose prompt names an asset is locked or has a render in flight, so there was "
+    "nothing to send for rewriting: {shots}."
+)
+#: A shot with no echo, reported rather than omitted. It is a third of the Director's plan and
+#: "nothing happened to this shot" has to say why — the same rule `SECTION_LOOK_SKIP_*` and
+#: `ReplacementSkip` are written to. It is deliberately *not* sent to the model at all.
+CLEAN_PROMPTS_ALREADY_CLEAN = "this prompt names no asset label; left exactly as it is"
+#: The model was given this shot and answered about a different one, or about none.
+CLEAN_PROMPTS_UNANSWERED = "the model returned no rewrite for this shot"
+#: One answer emitted twice is not a second opinion to arbitrate — `fill_section_looks`' rule,
+#: first answer per id wins, and the later copy is reported rather than silently dropped.
+CLEAN_PROMPTS_DUPLICATED = (
+    "the model answered for this shot more than once; the first answer was used and the rest "
+    "discarded"
+)
+#: Counted, never written. An id that matches no shot cannot be created into one: that would
+#: invent a window, which is the one thing this pass exists not to do.
+CLEAN_PROMPTS_STRAY = "; {count} rewrite(s) addressed no shot in this project"
+#: Reported, never refused — `REPLACE_ASSET_RENDERED_NOTE`'s shape and its argument, applied to
+#: prose. The Director's ruling on citations (2026-08-20): *"even with takes we do want the
+#: asset for the shot replaceable ... This helps facilitate experimentation."* Prose is the
+#: looser coupling of the two — the prompt that produced each take is recorded on its job and
+#: in the take's own PNG metadata, so the record is not lost by editing the shot — and the
+#: label being removed is not a word H3 needed: the pictures arrive as reference images, not as
+#: names in the text. `expansion_write_refusal` already carves the same exemption for the same
+#: reason. Named here so the count is on screen before the confirm.
+CLEAN_PROMPTS_RENDERED_NOTE = (
+    "{count} shot(s) already hold a take that was rendered from the prompt as it stands: "
+    "{shots}. The takes are untouched — the files, the takes strip and the job records are "
+    "exactly as they are — and each job still records the prompt it was actually submitted "
+    "with. Only the shot's own text changes; nothing is re-rendered."
+)
+#: The same, for an editorial approval. Its own line so the number is visible: an approval is a
+#: stronger statement than a render, and `approved_output`, `approved_start` and
+#: `approved_duration` are not written on any path here, so AD-13's staleness comparison and
+#: assembly read exactly what they read before.
+CLEAN_PROMPTS_APPROVED_NOTE = (
+    "{count} shot(s) carry an approved take: {shots}. The approval is untouched and so is the "
+    "window it was made against — only the prompt's wording changes."
+)
+#: The guarantee, enforced rather than promised. Unreachable by construction: the write loop
+#: assigns `Shot.prompt` and nothing else. It exists because the Director's hand-tuned windows
+#: are the most expensive thing in this project — 33 deliberately varied edges including
+#: several micro-cuts, placed against musical timing — and "the code only assigns one field" is
+#: a claim about code, where this is a check on data. If it ever fires, nothing has been saved.
+CLEAN_PROMPTS_WINDOWS_MOVED = (
+    "Refused: the shot windows changed while the prompts were being rewritten. Nothing was "
+    "saved. This pass may only ever change a prompt's wording — the timeline's geometry is "
+    "the director's own work and is not this route's to touch."
+)
+#: The summary sentence, counts first because they are what a Director sanity-checks before
+#: reading 33 rows of diff.
+CLEAN_PROMPTS_REPORT = (
+    "{echoing} of {examined} shot(s) name an asset label. {rewritten} rewritten, {skipped} "
+    "left alone, {clean} already clean. Only the prompt text changes: windows, citations, "
+    "modes, takes and approvals are untouched."
+)
+#: Said in the report itself, not only in a log. The rewrites are model output that no live
+#: model has been run against from this route, and the Director reads this report to decide
+#: whether to apply it — so the one thing they most need to know about the wording is in the
+#: thing they are reading.
+CLEAN_PROMPTS_REVIEW_NOTE = (
+    "Read every rewrite before applying. The wording is the model's and this pass judges only "
+    "that the label is gone and the sentence was not gutted — it does not judge whether the "
+    "replacement is the right description."
+)
+
+
 SECTIONS_OVERLAP_REFUSAL = (
     "Sections may not overlap: {first} ends at {end:.2f}s but {second} starts at "
     "{start:.2f}s. Adjust the windows so each moment of the song belongs to one section."
@@ -2280,6 +2388,166 @@ class SectionListRequest(BaseModel):
     timeline invite gaps nobody chose."""
 
     sections: list[SongSection]
+
+
+#: The three honest-empty refusals of the section-look pass. Refusals rather than empty
+#: reports, `snap_timeline_cuts`' distinction: there is nothing to report because nothing was
+#: examined, and a 200 saying "0 filled" would read like the model was asked and had nothing
+#: to say. Each names the one thing to write or mark, because the fix is the Director's.
+SECTION_LOOKS_NO_SECTIONS = (
+    "This project has no sections yet, so there is nothing to fill. Mark the song's "
+    "structure first — align the lyric sheet, or drag the section boxes onto the timeline."
+)
+SECTION_LOOKS_NO_TREATMENT = (
+    "The treatment is empty, so there is nothing to read a section's look out of. A "
+    "section look is the treatment's own words for that stretch of the song; inventing "
+    "one from nothing would be worse than leaving it blank. Write the treatment first."
+)
+SECTION_LOOKS_NO_STYLE_BIBLE = (
+    "The style bible is empty. It is the fixed visual language every section's look is "
+    "written in — palette, lighting, lenses, wardrobe, locations — and without it the "
+    "looks would carry the treatment's story with no way to render it. Write it first."
+)
+
+#: What the report says when every section already carries a look the Director wrote. Not a
+#: refusal: the answer is that there is nothing *to* do, and the sentence names the consent
+#: word so the Director does not have to guess how to overrule it.
+SECTION_LOOKS_ALL_WRITTEN = (
+    "Every section already has a look. Nothing was changed — send overwrite=true to "
+    "replace what is there."
+)
+
+#: The per-section skip reasons, one sentence each, because "skipped" without a why is the
+#: report step doing nothing (`spec-arm-a-plan`'s argument, and snap-cuts' `SnapCutSkip`).
+SECTION_LOOK_SKIP_WRITTEN = (
+    "already has a look you wrote; send overwrite=true to replace it"
+)
+SECTION_LOOK_SKIP_UNDESCRIBED = "the treatment does not describe this section"
+SECTION_LOOK_SKIP_UNANSWERED = "the model returned no look for this section"
+SECTION_LOOK_SKIP_MISLABELLED = (
+    "the model addressed this section but called it {label!r}; refused rather than risk "
+    "writing another section's look here"
+)
+
+
+class SectionLooksRequest(BaseModel):
+    """One section-look pass: whether it may write, and whether it may overwrite.
+
+    Two flags rather than one, and they answer different questions. `confirm_apply` is
+    `SnapCutsRequest`'s field in the same key and for the same reason, which is `populate`'s
+    `confirm_replace` at bottom: the default is a **report**, and only an explicit true
+    writes. `overwrite` is the narrower consent — a section look is editable in the
+    inspector, so replacing a sentence the Director typed is exactly the bulk edit the
+    report-then-confirm convention exists to forbid, and confirming *this pass* is not the
+    same act as agreeing to lose that sentence. Empty looks fill on `confirm_apply` alone;
+    written ones need both, and the report names them individually either way.
+    """
+
+    confirm_apply: bool = False
+    overwrite: bool = False
+
+
+class SectionLookRow(BaseModel):
+    """One section in the report, named as the timeline names it.
+
+    `prompt` is what would be written (or was), `""` for a skip. `previous` is what the
+    section carried before, so an overwrite shows both halves of the trade in the report
+    the Director is confirming, rather than after the fact.
+    """
+
+    section_id: str
+    label: str
+    start: float
+    filled: bool
+    prompt: str = ""
+    previous: str = ""
+    reason: str = ""
+
+
+class SectionLooksResponse(BaseModel):
+    """The report, and — only on an applied call — the saved project.
+
+    `project` is `None` on a report, `SnapCutsResponse`'s rule and for its reason: the
+    absence is the wire's own statement that nothing was written.
+    """
+
+    applied: bool
+    filled: int
+    skipped: int
+    sections: list[SectionLookRow]
+    message: str = ""
+    project: Project | None = None
+
+
+class CleanPromptsRequest(BaseModel):
+    """One prose-cleanup pass, and whether it is allowed to write.
+
+    `confirm_apply` is `SnapCutsRequest`'s field in the same key and for the same reason, which
+    is `populate`'s `confirm_replace` at bottom: the default is a **report**, and only an
+    explicit true writes. Server-enforced rather than trusted to the browser, and here the
+    report is more than half the feature — every row carries the old prose and the proposed
+    prose so a human reads the diff before it lands on a hand-reviewed plan.
+
+    One flag and no second one. `SectionLooksRequest` needs `overwrite` because it would be
+    replacing a sentence the Director typed; this pass only ever replaces a sentence a *tool*
+    wrote badly, and it replaces it with the same sentence minus a library label, so there is
+    no second trade to consent to separately.
+    """
+
+    confirm_apply: bool = False
+
+
+class CleanPromptRow(BaseModel):
+    """One shot in the cleanup report, named as the timeline names it.
+
+    `before` and `after` are the whole point: this report is read by a person deciding whether
+    to apply it, so every row that would change carries both halves of the change. `after` is
+    `""` on any row that would not change, which is what makes "did this shot move" answerable
+    from the row rather than from the counts.
+
+    `labels` is what this shot echoed, so a Director who disagrees with a rewrite can see which
+    word forced it. `provenance` is `"approved"`, `"rendered"` or `""` — it changes nothing
+    about what happens to the shot and exists so the count is visible before the confirm.
+
+    `start` and `duration` ride along and are never written back. They are here so the report
+    itself is evidence that the windows did not move: the Director can read the geometry in the
+    report and in the manifest afterwards and compare.
+    """
+
+    shot_id: str
+    label: str
+    start: float
+    duration: float
+    rewritten: bool
+    labels: list[str] = Field(default_factory=list)
+    before: str = ""
+    after: str = ""
+    reason: str = ""
+    provenance: str = ""
+
+
+class CleanPromptsResponse(BaseModel):
+    """The report, and — only on an applied call — the saved project.
+
+    `project` is `None` on a report, `SnapCutsResponse`'s rule and for its reason: the absence
+    is the wire's own statement that nothing was written.
+
+    The counts are the sanity check a Director reads first and they partition the plan
+    exactly: `examined` is every shot, and `clean + rewritten + skipped == examined`.
+    """
+
+    applied: bool
+    examined: int
+    echoing: int
+    clean: int
+    rewritten: int
+    skipped: int
+    rendered: int
+    approved: int
+    notes: list[str] = Field(default_factory=list)
+    shots: list[CleanPromptRow] = Field(default_factory=list)
+    message: str = ""
+    project: Project | None = None
 
 
 class PopulateTimelineRequest(BaseModel):
@@ -3972,10 +4240,7 @@ def create_app(
         if project.id != project_id:
             raise HTTPException(status_code=422, detail="Project ID cannot be changed")
         if project.updated_at != current.updated_at:
-            raise HTTPException(
-                status_code=409,
-                detail="Project changed since it was loaded; refresh before replacing it",
-            )
+            raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
         # This is the normal save path for every edit in the UI, so it cannot be gated on
         # carrying a Song — that would refuse ordinary saves. It is gated on *changing* one:
         # a body whose Song differs from the stored Song is a replacement or a removal
@@ -4050,10 +4315,7 @@ def create_app(
         # Enforced only when sent — see `ShotListRequest.updated_at`. The wording is
         # `replace_project`'s, because it is the same rule met on the other manifest write.
         if request.updated_at is not None and request.updated_at != project.updated_at:
-            raise HTTPException(
-                status_code=409,
-                detail="Project changed since it was loaded; refresh before replacing it",
-            )
+            raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
         # The same two gates the whole-project `PUT` carries, on the same argument. This route is
         # the *narrower* sibling and has been the guard hole at least as often, because a client
         # that only wants to move a clip still sends every field of every Shot back.
@@ -6972,6 +7234,162 @@ def create_app(
         return store.save(project)
 
     @app.post(
+        "/api/projects/{project_id}/sections/fill-looks",
+        response_model=SectionLooksResponse,
+    )
+    async def fill_section_looks(
+        project_id: str, request: SectionLooksRequest
+    ) -> SectionLooksResponse:
+        """Read each marked section's shared look out of the treatment and the style bible.
+
+        The gap this closes, reported by the Director (2026-08-20): "I clicked on a Section
+        in the timeline and noticed that the shared prompt wasn't pre-filled with
+        information from the Treatment." `SongSection.prompt` is layered under every shot in
+        its section — `reference_prompt` appends it as "Section look: …", `expansion_input`
+        and `dp_input` carry it into the prose passes — and on the live project all seven
+        sections held `""`. The cause is structural, not a dropped field: those sections were
+        created by the Whisper lyric-alignment pass, so populate takes its `known_sections`
+        branch and never asks for structure at all, and the one path that would have written
+        a look (`PlannedSection.prompt`) runs only when the sections are *unknown*.
+
+        A dedicated action rather than a fill inside populate, and the choice is the
+        codebase's own convention rather than a preference:
+
+        * Populate is the destructive one. It refuses without `confirm_replace`, refuses
+          outright over a lock or an approval, and replaces the whole shot list. Bolting a
+          second model call and a bulk edit of a hand-editable field onto that button means
+          the Director cannot take one without the other.
+        * This is re-runnable and populate is not. The treatment gets rewritten — that is
+          what the treatment lane is *for* — and the looks want refreshing afterward without
+          the timeline being thrown away to get it.
+        * Report first, apply on confirm is what this codebase does for every bulk plan
+          change (`populate`'s `confirm_replace`, `snap_timeline_cuts`, asset replacement),
+          and the report is half the feature: "6 filled, 1 skipped — the treatment does not
+          describe the Bridge" is the sentence that sends the Director back to the treatment.
+
+        Sections are matched **by id, corroborated by label** — never by position. Labels
+        come from the lyric sheet's `[Tag]` blocks and repeat by design ("Verse"/"Verse 2",
+        "Chorus"/"Chorus 2"), the treatment groups them ("Verse 1 & Verse 2"), and a look
+        landing one row off would put Chorus 2's canopy bed on the Bridge — worse than
+        leaving the Bridge empty. So the model answers on the id it was handed
+        (`ExpandedShot.shot_id`'s contract) and also copies the label back; a pair that
+        disagrees is refused, an unknown id is dropped, and neither writes anything.
+
+        Nothing here renders, arms, queues or approves. It writes one string per section and
+        touches no other field on the project.
+        """
+        project = get_project(project_id)
+        if not project.sections:
+            raise HTTPException(status_code=422, detail=SECTION_LOOKS_NO_SECTIONS)
+        # The absent-analysis rule, applied to prose: an empty treatment is *unwritten*, not
+        # "no look wanted", exactly as an empty `Song.vocal_spans` is unmeasured rather than
+        # silent. Refused before the model call, so an empty project costs nothing and the
+        # sentence names which half is missing instead of a fabricated look arriving.
+        if not project.treatment.strip():
+            raise HTTPException(status_code=422, detail=SECTION_LOOKS_NO_TREATMENT)
+        if not project.style_bible.strip():
+            raise HTTPException(status_code=422, detail=SECTION_LOOKS_NO_STYLE_BIBLE)
+        ordered = sorted(project.sections, key=lambda section: section.start)
+        # Checked before spending a 300 s local-model call: with every look written and no
+        # consent to replace them, the answer is already known and the model has no question
+        # to answer. A report, not a refusal — nothing is wrong, there is simply nothing to do.
+        if not request.overwrite and all(
+            section.prompt.strip() for section in ordered
+        ):
+            return SectionLooksResponse(
+                applied=False,
+                filled=0,
+                skipped=len(ordered),
+                sections=[
+                    SectionLookRow(
+                        section_id=section.id,
+                        label=section.label,
+                        start=section.start,
+                        filled=False,
+                        previous=section.prompt,
+                        reason=SECTION_LOOK_SKIP_WRITTEN,
+                    )
+                    for section in ordered
+                ],
+                message=SECTION_LOOKS_ALL_WRITTEN,
+            )
+        try:
+            answer = await director.section_looks(
+                looks_input=section_looks_input(project)
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        # Re-read after the await — a local model can hold this open for minutes, and the
+        # Director may have marked, dragged or written a section in the meantime. The fresh
+        # project is the one being written, so it is also the one being matched against: a
+        # section deleted while the model thought simply has no row, and a look written by
+        # hand in that window is protected by the same rule as any other written look.
+        project = get_project(project_id)
+        by_id = {section.id: section for section in project.sections}
+        # First answer per id wins. A model that repeats an id is not offering a second
+        # opinion to arbitrate; it is one answer emitted twice, and letting the later copy
+        # win would make the written look depend on emission order.
+        answered: dict[str, Any] = {}
+        for look in answer.looks:
+            answered.setdefault(look.section_id, look)
+        rows: list[SectionLookRow] = []
+        pending: list[tuple[Any, str]] = []
+        for section in sorted(project.sections, key=lambda item: item.start):
+            row = SectionLookRow(
+                section_id=section.id,
+                label=section.label,
+                start=section.start,
+                filled=False,
+                previous=section.prompt,
+            )
+            look = answered.get(section.id)
+            if look is None:
+                row.reason = SECTION_LOOK_SKIP_UNANSWERED
+            elif look.label.strip().casefold() != section.label.strip().casefold():
+                # The checksum firing. Case and surrounding space are not a disagreement —
+                # "verse 2" is the Director's "Verse 2" — but anything else means the id and
+                # the name do not describe the same box, and one of the two is wrong.
+                row.reason = SECTION_LOOK_SKIP_MISLABELLED.format(label=look.label)
+            elif not look.prompt.strip():
+                # The honest empty, and the reason `SectionLook.prompt` allows one at all:
+                # the model was required to emit the key and answered "the treatment does
+                # not say". Left blank rather than filled with something plausible.
+                row.reason = SECTION_LOOK_SKIP_UNDESCRIBED
+            elif section.prompt.strip() and not request.overwrite:
+                row.reason = SECTION_LOOK_SKIP_WRITTEN
+                # Carried on the row so the report shows what the consent would buy.
+                row.prompt = look.prompt.strip()
+            else:
+                row.filled = True
+                row.prompt = look.prompt.strip()
+                pending.append((section, row.prompt))
+            rows.append(row)
+        # Ids the model invented or copied from another project are dropped in silence above
+        # (they match no section) and counted here, so the report can say so rather than the
+        # Director wondering why a look they can see in the message never landed.
+        stray = sum(1 for section_id in answered if section_id not in by_id)
+        filled = sum(1 for row in rows if row.filled)
+        summary = f"{filled} filled, {len(rows) - filled} left alone"
+        if stray:
+            summary += f"; {stray} answer(s) addressed no section in this project"
+        response = SectionLooksResponse(
+            applied=False,
+            filled=filled,
+            skipped=len(rows) - filled,
+            sections=rows,
+            message=summary,
+        )
+        if not request.confirm_apply or not pending:
+            return response
+        for section, prompt in pending:
+            section.prompt = prompt
+        response.applied = True
+        response.project = store.save(project)
+        return response
+
+    @app.post(
         "/api/projects/{project_id}/timeline/populate",
         response_model=PopulateTimelineResponse,
     )
@@ -7294,10 +7712,22 @@ def create_app(
         #   retry in `_completion`, a provider that ignores strict). Telling those apart
         #   needs a tri-state on the shared chat schema and a live measurement of what
         #   `singing="unknown"` does to expansion; neither was in this change.
-        # * citations come from the prompt itself: the instruction commands exact asset
-        #   names, so any asset whose name appears in a shot's prompt is cited as a
-        #   reference. Deterministic, reviewable in the inspector, reversible per shot.
-        #   Names under 4 characters are skipped as substring noise.
+        # * citations come from the shot's own `assets` field first and from its prose only
+        #   as a fallback (`models.assets_for_proposal`). This used to read "citations come
+        #   from the prompt itself", and that sentence was the defect: the instruction
+        #   commanded exact asset names *in the prose* because the scan was the only
+        #   mechanism, so the model had to write "Extreme close up of Crimson Lips Close-up"
+        #   to attach a picture — 24 of 30 prompts on the Director's live plan carried a
+        #   label. `PlannedShot.assets` is a structural place to name an asset, promoted into
+        #   the strict grammar by `PLANNED_SHOT_DECISIONS`, and the instruction now asks for
+        #   prose that names nothing.
+        #
+        #   The scan is kept, demoted. A model that writes a name and omits the field has
+        #   said unambiguously which picture it wants, and dropping that citation would send
+        #   the shot to render without the reference it asked for — invisible until the take
+        #   comes back wrong. An awkward sentence is reviewable; a missing reference is not.
+        #   Names under `NAME_SCAN_MIN_LENGTH` characters are still skipped as substring
+        #   noise, and an asset named both ways is cited once.
         #
         #   The scan is over `citable_assets`, not the whole library, and that is the same
         #   line the roster and the context dump are drawn on: an identity sheet is not
@@ -7316,14 +7746,19 @@ def create_app(
         library = citable_assets(project)
         sheets = identity_sheet_ids(project)
 
-        def prompt_citations(prompt_text: str) -> list[AssetCitation]:
-            lowered = prompt_text.lower()
+        def proposal_citations(proposal: Any) -> list[AssetCitation]:
+            # `getattr` for the same reason the `performance` line below uses it: `plan` is
+            # duck-typed at every call site and a double that predates this field must keep
+            # working, exactly as one that predates `performance` does. Absent is `()`, which
+            # is the byte-identical old behaviour — the prose scan alone.
             named = [
                 AssetCitation(asset_id=asset.id, role="reference", order=order)
                 for order, asset in enumerate(
-                    asset
-                    for asset in library
-                    if len(asset.name) >= 4 and asset.name.lower() in lowered
+                    assets_for_proposal(
+                        library,
+                        declared=getattr(proposal, "assets", None) or (),
+                        prose=proposal.prompt,
+                    )
                 )
             ]
             located = with_default_setting(
@@ -7360,7 +7795,7 @@ def create_app(
                     start=start,
                     duration=length,
                     prompt=proposal.prompt.strip(),
-                    citations=prompt_citations(proposal.prompt),
+                    citations=proposal_citations(proposal),
                     singing=declared_singing,
                     # Every shot rides its window of the master as reference — the
                     # Director's ruling (2026-08-19): a non-singing shot still gets its
@@ -7465,6 +7900,262 @@ def create_app(
             shot = by_id[shot_id]
             shot.start = start
             shot.duration = duration
+        response.project = store.save(project)
+        response.applied = True
+        return response
+
+    @app.post(
+        "/api/projects/{project_id}/timeline/clean-prompts",
+        response_model=CleanPromptsResponse,
+    )
+    async def clean_shot_prompts(
+        project_id: str, request: CleanPromptsRequest
+    ) -> CleanPromptsResponse:
+        """Take the asset labels out of an existing plan's prose, and change nothing else.
+
+        The Director's report on their live 33-shot plan (2026-08-21): the prompts read like an
+        inventory. "Extreme close up of Crimson Lips Close-up while HarderFaster performs" says
+        "close up of ... Close-up"; "Blue Haze Atmosphere surrounding the Dusk Warehouse Bed" is
+        two library labels and a preposition. 24 of the 33 carry a non-character asset's display
+        name. The cause is `populate`'s old citation rule, which attached a picture to a shot by
+        scanning the prose for that picture's label — so naming the asset in the sentence *was*
+        the citation mechanism. `director.PlannedShot.assets` retires that for new plans. This
+        retires it for the plan that already exists.
+
+        **The windows are sacred and this route may not touch them.** The Director: *"I have
+        done some timeline touch ups and am generally happy for now."* Those 33 edges are
+        hand-placed against musical timing and include several deliberate micro-cuts (0.5 s,
+        1.75 s, 1.83 s, 1.88 s, 2.08 s, 2.67 s); re-populating would destroy that work with no
+        way back, and re-populating is exactly what a prose fix must not become. Three things
+        make that a guarantee rather than an intention:
+
+        * the write loop assigns `Shot.prompt` and nothing else — no branch here reads or
+          writes `start`, `duration`, `citations`, `singing`, `use_song_audio`, `seed`, `mode`,
+          `status`, `locked`, `latest_output`, `approved_output` or the takes;
+        * `prompt_cleanup.window_fingerprint` is taken before the rewrites are applied and
+          compared after, and a mismatch **refuses without saving** — a check on data rather
+          than a claim about code;
+        * `prompt_cleanup.citation_fingerprint` is compared per shot across the same boundary,
+          because the citations are precisely what makes removing a name from the prose safe.
+          The ids are on the shot already; the sentence never had to carry them.
+
+        Report first, apply on confirm — `snap_timeline_cuts`' shape, `populate`'s
+        `confirm_replace` at bottom. Without `confirm_apply` this route **does not call
+        `store.save`** and the response carries no project at all, so "nothing was written" is
+        visible on the wire. Every row carries the old prose beside the proposed prose, because
+        this report exists to be read by a person before it lands.
+
+        **A shot with no echo is not sent to the model at all** and is reported as already
+        clean. Asking for a rewrite of a prompt nobody complained about is how a hand-reviewed
+        plan quietly acquires 33 changes when it needed 24.
+
+        **Two protections, and they are the existing ones in the existing words.**
+        `EXPANSION_LOCKED_NOTICE` for a lock — an explicit hands-off only the Director clears —
+        and `EXPANSION_RENDERED_NOTICE` for a render **in flight**, which is the one arm of that
+        sentence this route still honours: a job executing right now was submitted with the
+        prompt as it stands, and rewriting it underneath would leave the record describing a
+        submission that never happened.
+
+        **A rendered or approved shot is rewritten, and told about.** `shot_write_refusal` is
+        deliberately not the gate, exactly as it is not the gate for `replace_asset_citations`,
+        and the Director's ruling there transfers with room to spare: a citation change on a
+        rendered shot is fine because the take is untouched, and prose is *less* coupled to a
+        take than a citation is — the prompt each take was actually submitted with is recorded
+        on its job and in the take's own PNG metadata, so nothing is lost by editing the shot's
+        text. `expansion_write_refusal` already carves the same exemption. What survives is the
+        report: `CLEAN_PROMPTS_RENDERED_NOTE` and `CLEAN_PROMPTS_APPROVED_NOTE` name them and
+        count them before the confirm.
+
+        Nothing renders, arms, queues or approves. `comfy` is not touched on any path and no
+        `status` moves.
+        """
+        project = get_project(project_id)
+        # Detection runs over the **whole** library, not `citable_assets`. The roster rule is
+        # about what a model is offered; this is about what is already written down, and a
+        # label that reached the prose before a promotion hid its asset is still a label.
+        library = list(project.assets)
+        # Two protections and no more, read from the Shot and the job records directly rather
+        # than through `shot_write_refusal`, whose `rendered` arm this route does not honour —
+        # `replace_asset_citations`' line, for `replace_asset_citations`' reason.
+        protected: dict[str, str] = {}
+        for shot in project.shots:
+            if shot.locked:
+                protected[shot.id] = EXPANSION_LOCKED_NOTICE.format(
+                    shots=shot_label(project, shot)
+                )
+            elif shot_render_in_flight(project, shot):
+                protected[shot.id] = EXPANSION_RENDERED_NOTICE.format(
+                    shots=shot_label(project, shot)
+                )
+        echoes = {
+            shot.id: labels
+            for shot in project.shots
+            if (labels := echoed_labels(shot.prompt, library))
+        }
+        if not echoes:
+            raise HTTPException(status_code=422, detail=CLEAN_PROMPTS_NOTHING_TO_CLEAN)
+        # The selection sent to the model: echoing and not protected. Built before the call so
+        # a wholly protected plan costs no model time at all.
+        askable = {
+            shot_id: labels
+            for shot_id, labels in echoes.items()
+            if shot_id not in protected
+        }
+        if not askable:
+            raise HTTPException(
+                status_code=422,
+                detail=CLEAN_PROMPTS_ALL_PROTECTED.format(
+                    shots=", ".join(
+                        shot_label(project, shot)
+                        for shot in ordered_shots(project)
+                        if shot.id in echoes
+                    )
+                ),
+            )
+        try:
+            # `director.expand`'s wire and `ShotExpansion`'s contract, selected by system
+            # prompt — the DP pass's own idiom (`dp_prompt.DP_SYSTEM_PROMPT`), because
+            # "revised prompts addressed by shot id" is exactly this pass's output shape too.
+            # No new director method, no new schema, and every existing `expand` double keeps
+            # working.
+            answer = await director.expand(
+                expansion_input=prompt_cleanup_input(project, askable),
+                system_prompt=PROMPT_CLEANUP_SYSTEM_PROMPT,
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        # Re-read after the await — a local model can hold this open for minutes, and the
+        # Director may have locked, edited, split or deleted a shot meanwhile. The fresh
+        # project is the one being written, so it is also the one being matched and re-scanned
+        # against: a prompt edited by hand in that window is re-examined on its new text, and a
+        # lock set in that window protects.
+        project = get_project(project_id)
+        library = list(project.assets)
+        protected = {}
+        for shot in project.shots:
+            if shot.locked:
+                protected[shot.id] = EXPANSION_LOCKED_NOTICE.format(
+                    shots=shot_label(project, shot)
+                )
+            elif shot_render_in_flight(project, shot):
+                protected[shot.id] = EXPANSION_RENDERED_NOTICE.format(
+                    shots=shot_label(project, shot)
+                )
+        # First answer per id wins, and a repeat is reported rather than dropped in silence —
+        # `fill_section_looks`' rule: a model that repeats an id is not offering a second
+        # opinion to arbitrate, and letting the later copy win would make the written prose
+        # depend on emission order.
+        answered: dict[str, str] = {}
+        duplicated: set[str] = set()
+        for item in answer.shots:
+            if item.shot_id in answered:
+                duplicated.add(item.shot_id)
+                continue
+            answered[item.shot_id] = item.prompt
+        rows: list[CleanPromptRow] = []
+        pending: list[tuple[Shot, str]] = []
+        for shot in ordered_shots(project):
+            labels = echoed_labels(shot.prompt, library)
+            row = CleanPromptRow(
+                shot_id=shot.id,
+                label=shot_label(project, shot),
+                start=shot.start,
+                duration=shot.duration,
+                rewritten=False,
+                labels=labels,
+                before=shot.prompt,
+                provenance=(
+                    "approved"
+                    if shot.approved_output or shot.status == "approved"
+                    else "rendered"
+                    if shot_render_provenance(shot)
+                    else ""
+                ),
+            )
+            if not labels:
+                # Completely alone. Not sent, not rewritten, and reported so the count adds up.
+                row.reason = CLEAN_PROMPTS_ALREADY_CLEAN
+            elif reason := protected.get(shot.id, ""):
+                row.reason = reason
+            elif shot.id not in answered:
+                row.reason = CLEAN_PROMPTS_UNANSWERED
+            elif problem := rewrite_rejection(
+                answered[shot.id], original=shot.prompt, labels=labels
+            ):
+                row.reason = problem
+                # Carried so the Director can see *what* was refused, not only that something
+                # was — `EXPANSION_REJECTED_NOTICE`'s `raw` in a field of its own.
+                row.after = answered[shot.id].strip()[:NOTICE_RAW_LIMIT]
+            else:
+                row.rewritten = True
+                row.after = answered[shot.id].strip()
+                pending.append((shot, row.after))
+            if shot.id in duplicated and not row.reason:
+                row.reason = CLEAN_PROMPTS_DUPLICATED
+            rows.append(row)
+        clean = sum(1 for row in rows if not row.labels)
+        rewritten = sum(1 for row in rows if row.rewritten)
+        changed = [row for row in rows if row.rewritten]
+        notes = [
+            wording.format(
+                count=len(group), shots=", ".join(row.label for row in group)
+            )
+            for wording, group in (
+                (
+                    CLEAN_PROMPTS_APPROVED_NOTE,
+                    [row for row in changed if row.provenance == "approved"],
+                ),
+                (
+                    CLEAN_PROMPTS_RENDERED_NOTE,
+                    [row for row in changed if row.provenance == "rendered"],
+                ),
+            )
+            if group
+        ]
+        notes.append(CLEAN_PROMPTS_REVIEW_NOTE)
+        # Ids the model invented or copied from another project matched no shot above and are
+        # counted here rather than created into one — a new shot would be a new window, which
+        # is the one thing this pass exists not to do.
+        known = {shot.id for shot in project.shots}
+        stray = sum(1 for shot_id in answered if shot_id not in known)
+        summary = CLEAN_PROMPTS_REPORT.format(
+            echoing=len(rows) - clean,
+            examined=len(rows),
+            rewritten=rewritten,
+            skipped=len(rows) - clean - rewritten,
+            clean=clean,
+        )
+        if stray:
+            summary += CLEAN_PROMPTS_STRAY.format(count=stray)
+        response = CleanPromptsResponse(
+            applied=False,
+            examined=len(rows),
+            echoing=len(rows) - clean,
+            clean=clean,
+            rewritten=rewritten,
+            skipped=len(rows) - clean - rewritten,
+            rendered=sum(1 for row in changed if row.provenance == "rendered"),
+            approved=sum(1 for row in changed if row.provenance == "approved"),
+            notes=notes,
+            shots=rows,
+            message=summary,
+        )
+        if not request.confirm_apply or not pending:
+            return response
+        # The guarantee, taken on the project about to be written and checked against it after.
+        geometry = window_fingerprint(project)
+        citations = {shot.id: citation_fingerprint(shot) for shot in project.shots}
+        for shot, prose in pending:
+            shot.prompt = prose
+        if window_fingerprint(project) != geometry or any(
+            citation_fingerprint(shot) != citations[shot.id] for shot in project.shots
+        ):
+            # Nothing has been saved at this point, and nothing will be. Unreachable by
+            # construction — the loop above assigns one field — which is exactly why it is
+            # checked rather than argued.
+            raise HTTPException(status_code=500, detail=CLEAN_PROMPTS_WINDOWS_MOVED)
         response.project = store.save(project)
         response.applied = True
         return response

@@ -19,6 +19,7 @@ from music_video_producer.models import (
 from music_video_producer.timeline import (
     H3_FPS,
     H3_MAX_SHOT_SECONDS,
+    H3_MIN_RENDER_FRAMES,
     H3_MIN_SHOT_SECONDS,
     OVER_RENDER_LEAD_SECONDS,
     OVER_RENDER_SECONDS,
@@ -44,7 +45,9 @@ from music_video_producer.timeline import (
     assistant_input,
     build_director_timeline,
     expansion_input,
+    margin_frames,
     ordered_shots,
+    over_render_centred,
     over_render_frames,
     over_render_lead,
     populate_windows,
@@ -777,6 +780,221 @@ def test_an_unknown_song_length_never_shifts_the_lead():
     assert over_render_lead(
         start=50.0, duration=3.75, picture_seconds=picture, song_duration=0.0
     ) == OVER_RENDER_LEAD_SECONDS
+
+
+# --- Short windows: render the minimum, expose the window (Director, 2026-08-20) ----------
+#
+# "some may go long, some may be short … Shots still generated to the 4 second minimum and
+# they just have a bigger invisible 'buffer' while still being lined up so the exposed part
+# matches", and, the same day: "if a shot is below the minimum typical then the math would
+# just center around that clip … spanning equally both directions."
+#
+# The two halves are tested separately because they can fail separately: the floor is about
+# how much is rendered, the centring is about where the rendered part sits, and only the
+# second one can move the exposed slice off its musical position.
+
+
+def test_the_render_floor_holds_every_short_window_at_h3s_minimum():
+    """A window under H3's trained minimum renders the minimum, not its own short length.
+
+    The measured defect: a 2.083 s window asked for 73 frames — 3.042 s, under the 4 s H3 is
+    trained for — because `over_render_frames` snapped the margin to the grid with no floor
+    under it. The Director's five hand-timed windows are the live cases and they are named
+    here as such.
+    """
+    assert H3_MIN_RENDER_FRAMES == 107
+    assert H3_MIN_RENDER_FRAMES / H3_FPS >= H3_MIN_SHOT_SECONDS
+    # The Director's own project (`project_59f14d19ff10`), edited to musical timing by hand.
+    for duration in (2.083, 2.5, 2.667, 3.292, 3.708):
+        assert over_render_frames(duration) == 107, duration
+    # And every window from half a second up, not only those five.
+    for eighths in range(4, 8 * 15 + 1):
+        duration = eighths / 8
+        assert over_render_frames(duration) / H3_FPS >= H3_MIN_SHOT_SECONDS, duration
+        assert over_render_frames(duration) >= H3_MIN_RENDER_FRAMES, duration
+
+
+def test_windows_h3_could_already_render_are_unchanged_frame_for_frame():
+    """The pin. Only the short-window path may move; everything else renders what it always
+    rendered, and the floor is asserted *not* to fire rather than merely to be harmless.
+
+    The comparison is against the pre-floor arithmetic written out here — the expression this
+    function carried before 2026-08-20 — because a pin against the current implementation
+    would pin nothing at all.
+    """
+    def before_the_floor(duration: float) -> int:
+        return align_h3_frames(max(5, round((duration + OVER_RENDER_SECONDS) * H3_FPS)))
+
+    # The numbers the shipped tests above already pin, restated as the boundary they sit on.
+    assert over_render_frames(3.75) == before_the_floor(3.75) == 107
+    assert over_render_frames(4.0) == before_the_floor(4.0) == 124
+    assert over_render_frames(5.0) == before_the_floor(5.0) == 141
+    assert over_render_frames(8.0) == before_the_floor(8.0) == 209
+    assert over_render_frames(15.0) == before_the_floor(15.0) == 379
+    # 3.2917 s is the shortest window whose margin already clears the floor: (3.2917+0.5)·24
+    # rounds to 91, which snaps to 107 on its own. From there to the H3 ceiling, nothing moved.
+    for thousandths in range(3292, 15_001):
+        duration = thousandths / 1000
+        assert over_render_frames(duration) == before_the_floor(duration), duration
+        assert not over_render_centred(duration), duration
+    # Below it the two disagree, which is the whole change — and the disagreement is always
+    # upward, never a shortened take.
+    for thousandths in range(1, 3271):
+        duration = thousandths / 1000
+        assert over_render_frames(duration) > before_the_floor(duration), duration
+
+
+def test_a_short_window_centres_its_take_on_the_window():
+    """The Director's second ruling: the buffer spans "equally both directions".
+
+    A 2.083 s window at 12 s renders 4.4583 s, and the take's midpoint is the window's
+    midpoint to within the half frame the grid snap can shave — so the exposed cut sits in
+    the middle of what H3 performed rather than at its head.
+    """
+    duration, start, song = 2.083, 12.0, 154.0
+    picture = over_render_frames(duration) / H3_FPS
+    lead = over_render_lead(
+        start=start, duration=duration, picture_seconds=picture, song_duration=song
+    )
+    # 29 frames: half the 2.3753 s buffer is 28.504 frames, snapped to a whole one.
+    assert lead == 29 / H3_FPS
+    take_start, take_end = start - lead, start - lead + picture
+    assert (take_start + take_end) / 2 == pytest.approx(
+        start + duration / 2, abs=0.5 / H3_FPS
+    )
+    # Buffer on both sides, not merely somewhere: the take genuinely opens before the window
+    # and closes after it.
+    assert take_start < start and take_end > start + duration
+
+
+def test_the_centred_lead_replaces_the_quarter_second_and_never_adds_to_it():
+    """One lead, not two. The sync lead and the centring lead are the same number.
+
+    `OVER_RENDER_LEAD_SECONDS` is the *ideal* for a margin-sized render; a centred window's
+    ideal is half its buffer, and it stands in for the quarter second rather than stacking on
+    it. It is never the smaller of the two either — the shortest buffer a centred window can
+    have is 1.1875 s, so its half is 0.594 s — which is what makes the substitution safe: a
+    short shot always gets *more* sync context than the quarter second, never less.
+    """
+    song = 154.0
+    for duration in (0.5, 1.0, 2.0, 2.083, 2.5, 2.667, 3.25):
+        picture = over_render_frames(duration) / H3_FPS
+        extra = picture - duration
+        lead = over_render_lead(
+            start=60.0, duration=duration, picture_seconds=picture, song_duration=song
+        )
+        assert lead == round(extra / 2 * H3_FPS) / H3_FPS, duration
+        assert lead > OVER_RENDER_LEAD_SECONDS, duration
+        # Not the two added together, which is the arithmetic this test exists to refuse.
+        assert lead != pytest.approx(OVER_RENDER_LEAD_SECONDS + extra / 2), duration
+        # And never more than half the take, which is what adding them would eventually be.
+        assert lead <= picture / 2, duration
+    # The other side of the boundary keeps the quarter second exactly.
+    for duration in (3.292, 3.75, 4.0, 12.0):
+        picture = over_render_frames(duration) / H3_FPS
+        assert over_render_lead(
+            start=60.0, duration=duration, picture_seconds=picture, song_duration=song
+        ) == OVER_RENDER_LEAD_SECONDS, duration
+
+
+def test_the_centred_lead_is_a_whole_frame_so_the_cut_is_frame_exact():
+    """Assembly cuts with `trim=start_frame=round(lead·24)` and the Monitor seeks the same
+    frame, so a lead that is not a whole frame loses up to half a frame of alignment on every
+    short shot. The centred ideal is snapped; the quarter second is already six frames."""
+    for duration in (0.5, 1.0, 2.0, 2.083, 2.5, 2.667, 3.25):
+        picture = over_render_frames(duration) / H3_FPS
+        lead = over_render_lead(
+            start=60.0, duration=duration, picture_seconds=picture, song_duration=154.0
+        )
+        assert lead * H3_FPS == round(lead * H3_FPS), duration
+
+
+def test_a_short_window_at_the_songs_start_cannot_centre_and_keeps_its_exposure():
+    """There is no song before 0 s to grab, so the whole buffer becomes tail — and the
+    exposed slice does not move a frame for it."""
+    duration, song = 2.083, 154.0
+    picture = over_render_frames(duration) / H3_FPS
+    lead = over_render_lead(
+        start=0.0, duration=duration, picture_seconds=picture, song_duration=song
+    )
+    assert lead == 0.0
+    # The take begins exactly at the window, and the exposed slice is still song 0-2.083.
+    assert 0.0 - lead == 0.0
+    assert (0.0 - lead) + lead == 0.0
+    assert (0.0 - lead) + lead + duration == duration
+    # Part-way in, the lead is whatever room the song actually has, not the ideal.
+    partial = over_render_lead(
+        start=0.4, duration=duration, picture_seconds=picture, song_duration=song
+    )
+    assert partial == 0.4 < 29 / H3_FPS
+
+
+def test_a_short_window_at_the_songs_end_shifts_its_buffer_ahead_of_the_window():
+    """The mirror of the 0 s case: the tail has nowhere to go, so it moves to the head.
+
+    The picture is never shortened and the window never moves — the take simply ends on the
+    song's last second, with every remaining frame of buffer in front of the cut.
+    """
+    duration, song = 2.083, 154.0
+    picture = over_render_frames(duration) / H3_FPS
+    start = song - duration
+    lead = over_render_lead(
+        start=start, duration=duration, picture_seconds=picture, song_duration=song
+    )
+    assert lead == pytest.approx(picture - duration)
+    assert start - lead + picture == pytest.approx(song)
+    # Every bit of buffer is now ahead of the window, and the window is still its own seconds.
+    assert start - lead + lead == pytest.approx(start)
+
+
+def test_no_clamp_ever_moves_a_short_windows_exposed_slice():
+    """The property the whole feature stands on, swept over the song rather than sampled.
+
+    For every start from 0 to the song's end, and for every short window length: the take
+    never begins before the song, take second `lead` is the window's own start, the exposed
+    slice is the window's own seconds, and the lead never exceeds the buffer there is. A clamp
+    that dragged the exposure off its musical position would fail here whichever branch made
+    it — the assertions do not know which branch ran.
+    """
+    song = 154.0
+    for duration in (0.5, 2.083, 2.5, 3.25):
+        picture = over_render_frames(duration) / H3_FPS
+        extra = picture - duration
+        for hundredths in range(0, int((song - duration) * 100) + 1, 37):
+            start = hundredths / 100
+            lead = over_render_lead(
+                start=start, duration=duration, picture_seconds=picture, song_duration=song
+            )
+            take_start = start - lead
+            assert 0.0 <= lead <= extra, (duration, start)
+            assert take_start >= -1e-9, (duration, start)
+            # The invariant: take second `t` is song second `take_start + t`, so the slice
+            # assembly cuts at `lead` is the window, exactly, at every start.
+            assert take_start + lead == pytest.approx(start), (duration, start)
+            assert take_start + lead + duration == pytest.approx(start + duration), (
+                duration, start
+            )
+            # The tail stays inside the song unless the song has no room at all to give.
+            if lead < extra and lead < start:
+                assert take_start + picture <= song + 1e-9, (duration, start)
+
+
+def test_the_centred_boundary_is_where_the_floor_fires_and_nowhere_else():
+    """`over_render_centred` is the one place the two 2026-08-20 rulings are reconciled, so
+    the boundary is asserted rather than left to follow from whichever caller reads it.
+
+    Centring is exactly "the floor invented this buffer". A window whose own margin already
+    reaches H3's minimum keeps the shipped quarter-second rule — that band is 3.2917 s to 4 s,
+    where "below the minimum typical" and "the floor fired" disagree.
+    """
+    for duration in (0.125, 1.0, 3.25, 3.2708333333333335):
+        assert over_render_centred(duration), duration
+        assert margin_frames(duration) < H3_MIN_RENDER_FRAMES, duration
+        assert over_render_frames(duration) == H3_MIN_RENDER_FRAMES, duration
+    for duration in (3.292, 3.5, 3.75, 3.99, 4.0, 15.0):
+        assert not over_render_centred(duration), duration
+        assert margin_frames(duration) >= H3_MIN_RENDER_FRAMES, duration
+        assert over_render_frames(duration) == margin_frames(duration), duration
 
 
 # --- Populate Timeline's tiling repair (spec-populate-timeline) ---------------------------

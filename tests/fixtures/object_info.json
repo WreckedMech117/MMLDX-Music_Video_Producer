@@ -1,4 +1,69 @@
 {
+  "AudioConcat": {
+    "api_node": false,
+    "category": "audio",
+    "deprecated": false,
+    "description": "Concatenates the audio1 to audio2 in the specified direction.",
+    "dev_only": false,
+    "display_name": "Concatenate Audio",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "audio1": [
+          "AUDIO",
+          {}
+        ],
+        "audio2": [
+          "AUDIO",
+          {}
+        ],
+        "direction": [
+          "COMBO",
+          {
+            "default": "after",
+            "multiselect": false,
+            "options": [
+              "after",
+              "before"
+            ],
+            "tooltip": "Whether to append audio2 after or before audio1."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "audio1",
+        "audio2",
+        "direction"
+      ]
+    },
+    "is_input_list": false,
+    "name": "AudioConcat",
+    "output": [
+      "AUDIO"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "AUDIO"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_audio",
+    "search_aliases": [
+      "join audio",
+      "combine audio",
+      "append audio"
+    ]
+  },
   "BasicGuider": {
     "api_node": false,
     "category": "model/sampling/guiders",
@@ -349,6 +414,166 @@
       "encode prompt"
     ]
   },
+  "CM_FloatBinaryOperation": {
+    "category": "math/float",
+    "description": "",
+    "display_name": "FloatBinaryOperation",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "a": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "round": false,
+            "step": 0.001
+          }
+        ],
+        "b": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "round": false,
+            "step": 0.001
+          }
+        ],
+        "op": [
+          [
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "Mod",
+            "Pow",
+            "FloorDiv",
+            "Max",
+            "Min",
+            "Log",
+            "Atan2"
+          ]
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "op",
+        "a",
+        "b"
+      ]
+    },
+    "is_input_list": false,
+    "name": "CM_FloatBinaryOperation",
+    "output": [
+      "FLOAT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "FLOAT"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyMath",
+    "search_aliases": []
+  },
+  "CM_IntBinaryOperation": {
+    "category": "math/int",
+    "description": "",
+    "display_name": "IntBinaryOperation",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "a": [
+          "INT",
+          {
+            "default": 0
+          }
+        ],
+        "b": [
+          "INT",
+          {
+            "default": 0
+          }
+        ],
+        "op": [
+          [
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "Mod",
+            "Pow",
+            "And",
+            "Nand",
+            "Or",
+            "Nor",
+            "Xor",
+            "Xnor",
+            "Shl",
+            "Shr",
+            "Max",
+            "Min"
+          ]
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "op",
+        "a",
+        "b"
+      ]
+    },
+    "is_input_list": false,
+    "name": "CM_IntBinaryOperation",
+    "output": [
+      "INT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "INT"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyMath",
+    "search_aliases": []
+  },
+  "CM_IntToFloat": {
+    "category": "math/conversion",
+    "description": "",
+    "display_name": "IntToFloat",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "a": [
+          "INT",
+          {
+            "default": 0
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "a"
+      ]
+    },
+    "is_input_list": false,
+    "name": "CM_IntToFloat",
+    "output": [
+      "FLOAT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "FLOAT"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyMath",
+    "search_aliases": []
+  },
   "ConditioningZeroOut": {
     "category": "model/conditioning/transform",
     "description": "",
@@ -499,6 +724,110 @@
     "python_module": "comfy_extras.nodes_minimax_music",
     "search_aliases": null
   },
+  "GetImageRangeFromBatch": {
+    "category": "KJNodes/image",
+    "description": "\nReturns a range of images from a batch.\n",
+    "display_name": "Get Image or Mask Range From Batch",
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "images": [
+          "IMAGE"
+        ],
+        "masks": [
+          "MASK"
+        ]
+      },
+      "required": {
+        "num_frames": [
+          "INT",
+          {
+            "default": 1,
+            "max": 4096,
+            "min": 1,
+            "step": 1
+          }
+        ],
+        "start_index": [
+          "INT",
+          {
+            "default": 0,
+            "max": 4096,
+            "min": -1,
+            "step": 1
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "images",
+        "masks"
+      ],
+      "required": [
+        "start_index",
+        "num_frames"
+      ]
+    },
+    "is_input_list": false,
+    "name": "GetImageRangeFromBatch",
+    "output": [
+      "IMAGE",
+      "MASK"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_name": [
+      "IMAGE",
+      "MASK"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": []
+  },
+  "GetImageSizeAndCount": {
+    "category": "KJNodes/image",
+    "description": "\nReturns width, height and batch size of the image,  \nand passes it through unchanged.  \n\n",
+    "display_name": "Get Image Size & Count",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "image": [
+          "IMAGE"
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "image"
+      ]
+    },
+    "is_input_list": false,
+    "name": "GetImageSizeAndCount",
+    "output": [
+      "IMAGE",
+      "INT",
+      "INT",
+      "INT"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "image",
+      "width",
+      "height",
+      "count"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": []
+  },
   "INTConstant": {
     "category": "KJNodes/constants",
     "description": "",
@@ -538,6 +867,249 @@
       "integer",
       "value"
     ]
+  },
+  "ImageBatchMulti": {
+    "category": "KJNodes/image",
+    "description": "\nCreates an image batch from multiple images.  \nYou can set how many inputs the node has,  \nwith the **inputcount** and clicking update.\n",
+    "display_name": "Image Batch Multi",
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "image_2": [
+          "IMAGE"
+        ]
+      },
+      "required": {
+        "image_1": [
+          "IMAGE"
+        ],
+        "inputcount": [
+          "INT",
+          {
+            "default": 2,
+            "max": 1000,
+            "min": 2,
+            "step": 1
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "image_2"
+      ],
+      "required": [
+        "inputcount",
+        "image_1"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ImageBatchMulti",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "images"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": []
+  },
+  "ImageResizeKJv2": {
+    "category": "KJNodes/image",
+    "description": "\nResizes the image to the specified width and height.  \nSize can be retrieved from the input.\n\nKeep proportions keeps the aspect ratio of the image, by  \nhighest dimension.  \n",
+    "display_name": "Resize Image v2",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {
+        "unique_id": "UNIQUE_ID"
+      },
+      "optional": {
+        "device": [
+          [
+            "cpu",
+            "gpu"
+          ]
+        ],
+        "mask": [
+          "MASK"
+        ]
+      },
+      "required": {
+        "crop_position": [
+          [
+            "center",
+            "top",
+            "bottom",
+            "left",
+            "right"
+          ],
+          {
+            "default": "center"
+          }
+        ],
+        "divisible_by": [
+          "INT",
+          {
+            "default": 2,
+            "max": 512,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "height": [
+          "INT",
+          {
+            "default": 512,
+            "max": 16384,
+            "min": 0,
+            "step": 1
+          }
+        ],
+        "image": [
+          "IMAGE"
+        ],
+        "keep_proportion": [
+          [
+            "stretch",
+            "resize",
+            "pad",
+            "pad_edge",
+            "pad_edge_pixel",
+            "crop",
+            "pillarbox_blur",
+            "total_pixels"
+          ],
+          {
+            "default": false
+          }
+        ],
+        "pad_color": [
+          "STRING",
+          {
+            "default": "0, 0, 0",
+            "tooltip": "Color to use for padding."
+          }
+        ],
+        "upscale_method": [
+          [
+            "nearest-exact",
+            "bilinear",
+            "area",
+            "bicubic",
+            "lanczos",
+            "nvidia_rtx_vsr"
+          ]
+        ],
+        "width": [
+          "INT",
+          {
+            "default": 512,
+            "max": 16384,
+            "min": 0,
+            "step": 1
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "hidden": [
+        "unique_id"
+      ],
+      "optional": [
+        "mask",
+        "device"
+      ],
+      "required": [
+        "image",
+        "width",
+        "height",
+        "upscale_method",
+        "keep_proportion",
+        "pad_color",
+        "crop_position",
+        "divisible_by"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ImageResizeKJv2",
+    "output": [
+      "IMAGE",
+      "INT",
+      "INT",
+      "MASK"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "IMAGE",
+      "width",
+      "height",
+      "mask"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": []
+  },
+  "ImageScaleBy": {
+    "category": "image/upscaling",
+    "description": "",
+    "display_name": "Upscale Image By",
+    "essentials_category": "Image Tools",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "image": [
+          "IMAGE"
+        ],
+        "scale_by": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 8.0,
+            "min": 0.01,
+            "step": 0.01
+          }
+        ],
+        "upscale_method": [
+          [
+            "nearest-exact",
+            "bilinear",
+            "area",
+            "bicubic",
+            "lanczos"
+          ]
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "image",
+        "upscale_method",
+        "scale_by"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ImageScaleBy",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "IMAGE"
+    ],
+    "output_node": false,
+    "python_module": "nodes",
+    "search_aliases": []
   },
   "ImageScaleToMaxDimension": {
     "api_node": false,
@@ -711,6 +1283,47 @@
     ],
     "output_node": true,
     "python_module": "custom_nodes.ComfyUi-Scale-Image-to-Total-Pixels-Advanced",
+    "search_aliases": []
+  },
+  "ImpactImageInfo": {
+    "category": "ImpactPack/Logic/_for_test",
+    "description": "",
+    "display_name": "ImpactImageInfo",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "value": [
+          "IMAGE"
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "value"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ImpactImageInfo",
+    "output": [
+      "INT",
+      "INT",
+      "INT",
+      "INT"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "output_name": [
+      "batch",
+      "height",
+      "width",
+      "channel"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-Impact-Pack",
     "search_aliases": []
   },
   "KSampler": {
@@ -1024,6 +1637,298 @@
     "python_module": "comfy_extras.nodes_custom_sampler",
     "search_aliases": null
   },
+  "LTXVAudioVAEDecode": {
+    "api_node": false,
+    "category": "model/latent/ltxv",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "LTXV Audio VAE Decode",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "audio_vae": [
+          "VAE",
+          {
+            "display_name": "Audio VAE",
+            "tooltip": "The Audio VAE model used for decoding the latent."
+          }
+        ],
+        "samples": [
+          "LATENT",
+          {
+            "tooltip": "The latent to be decoded."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "samples",
+        "audio_vae"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVAudioVAEDecode",
+    "output": [
+      "AUDIO"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "Audio"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt_audio",
+    "search_aliases": null
+  },
+  "LTXVAudioVAEEncode": {
+    "api_node": false,
+    "category": "model/latent/ltxv",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "LTXV Audio VAE Encode",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "audio": [
+          "AUDIO",
+          {
+            "tooltip": "The audio to be encoded."
+          }
+        ],
+        "audio_vae": [
+          "VAE",
+          {
+            "display_name": "Audio VAE",
+            "tooltip": "The Audio VAE model to use for encoding."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "audio",
+        "audio_vae"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVAudioVAEEncode",
+    "output": [
+      "LATENT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "Audio Latent"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt_audio",
+    "search_aliases": null
+  },
+  "LTXVAudioVideoMask": {
+    "api_node": false,
+    "category": "KJNodes/ltxv",
+    "deprecated": false,
+    "description": "Creates noise masks for video and audio latents based on specified time ranges. New content is generated within these masked regions",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "optional": {
+        "audio_latent": [
+          "LATENT",
+          {}
+        ],
+        "existing_mask_mode": [
+          "COMBO",
+          {
+            "default": "add",
+            "multiselect": false,
+            "options": [
+              "add",
+              "subtract",
+              "overwrite"
+            ],
+            "tooltip": "How to combine with existing noise masks if present. 'add' will take the max of existing and new mask, 'overwrite' will replace with new mask. 'subtract' will set the masked region to 0 instead of 1, effectively unmasking it."
+          }
+        ],
+        "video_latent": [
+          "LATENT",
+          {}
+        ]
+      },
+      "required": {
+        "audio_end_time": [
+          "FLOAT",
+          {
+            "default": 5.0,
+            "max": 10000.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "End time in seconds for the audio mask."
+          }
+        ],
+        "audio_start_time": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "max": 10000.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "Start time in seconds for the audio mask."
+          }
+        ],
+        "max_length": [
+          "COMBO",
+          {
+            "default": "truncate",
+            "multiselect": false,
+            "options": [
+              "truncate",
+              "pad",
+              "partial"
+            ],
+            "tooltip": "'truncate': cut latent to end_time length. 'pad': extend latent to end_time. 'partial': mask range within existing latent."
+          }
+        ],
+        "video_end_time": [
+          "FLOAT",
+          {
+            "default": 5.0,
+            "max": 10000.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "End time in seconds for the video mask."
+          }
+        ],
+        "video_fps": [
+          "FLOAT",
+          {
+            "default": 25,
+            "max": 100.0,
+            "min": 0.0,
+            "step": 0.01
+          }
+        ],
+        "video_start_time": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "max": 10000.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "Start time in seconds for the video mask."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "optional": [
+        "video_latent",
+        "audio_latent",
+        "existing_mask_mode"
+      ],
+      "required": [
+        "video_fps",
+        "video_start_time",
+        "video_end_time",
+        "audio_start_time",
+        "audio_end_time",
+        "max_length"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVAudioVideoMask",
+    "output": [
+      "LATENT",
+      "LATENT"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "video_latent",
+      "audio_latent"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null
+    ],
+    "price_badge": null,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": null
+  },
+  "LTXVConcatAVLatent": {
+    "api_node": false,
+    "category": "model/latent/ltxv",
+    "deprecated": false,
+    "description": "Merge a video latent and an audio latent into a joint AV latent (any AV model, e.g. LTXV or MiniMax H3).",
+    "dev_only": false,
+    "display_name": "Concat AV Latent",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "audio_latent": [
+          "LATENT",
+          {}
+        ],
+        "video_latent": [
+          "LATENT",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "video_latent",
+        "audio_latent"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVConcatAVLatent",
+    "output": [
+      "LATENT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "latent"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt",
+    "search_aliases": null
+  },
   "LTXVConditioning": {
     "api_node": false,
     "category": "model/conditioning/ltxv",
@@ -1084,6 +1989,129 @@
     ],
     "price_badge": null,
     "python_module": "comfy_extras.nodes_lt",
+    "search_aliases": null
+  },
+  "LTXVImgToVideoInplace": {
+    "api_node": false,
+    "category": "model/conditioning/ltxv",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "bypass": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Bypass the conditioning."
+          }
+        ],
+        "image": [
+          "IMAGE",
+          {}
+        ],
+        "latent": [
+          "LATENT",
+          {}
+        ],
+        "strength": [
+          "FLOAT",
+          {
+            "default": 1.0,
+            "max": 1.0,
+            "min": 0.0
+          }
+        ],
+        "vae": [
+          "VAE",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "vae",
+        "image",
+        "latent",
+        "strength",
+        "bypass"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVImgToVideoInplace",
+    "output": [
+      "LATENT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "latent"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt",
+    "search_aliases": null
+  },
+  "LTXVLatentUpsampler": {
+    "api_node": false,
+    "category": "model/latent/ltxv",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": true,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "samples": [
+          "LATENT",
+          {}
+        ],
+        "upscale_model": [
+          "LATENT_UPSCALE_MODEL",
+          {}
+        ],
+        "vae": [
+          "VAE",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "samples",
+        "upscale_model",
+        "vae"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVLatentUpsampler",
+    "output": [
+      "LATENT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "LATENT"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt_upsampler",
     "search_aliases": null
   },
   "LTXVLoopingSampler": {
@@ -1326,6 +2354,106 @@
     "python_module": "custom_nodes.ComfyUI-LTXVideo",
     "search_aliases": []
   },
+  "LTXVPreprocess": {
+    "api_node": false,
+    "category": "video/preprocessors",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "LTXV Preprocess",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "image": [
+          "IMAGE",
+          {}
+        ],
+        "img_compression": [
+          "INT",
+          {
+            "default": 35,
+            "max": 100,
+            "min": 0,
+            "tooltip": "Amount of compression to apply on image."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "image",
+        "img_compression"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVPreprocess",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "output_image"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt",
+    "search_aliases": null
+  },
+  "LTXVSeparateAVLatent": {
+    "api_node": false,
+    "category": "model/latent/ltxv",
+    "deprecated": false,
+    "description": "Split a joint AV latent into its video and audio latents (any AV model, e.g. LTXV or MiniMax H3).",
+    "dev_only": false,
+    "display_name": "Separate AV Latent",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "av_latent": [
+          "LATENT",
+          {}
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "av_latent"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LTXVSeparateAVLatent",
+    "output": [
+      "LATENT",
+      "LATENT"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "video_latent",
+      "audio_latent"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_lt",
+    "search_aliases": null
+  },
   "LTXVSpatioTemporalTiledVAEDecode": {
     "category": "latent",
     "description": "",
@@ -1438,6 +2566,55 @@
     "output_node": false,
     "python_module": "custom_nodes.ComfyUI-LTXVideo",
     "search_aliases": []
+  },
+  "LatentUpscaleModelLoader": {
+    "api_node": false,
+    "category": "model/loaders",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "Load Latent Upscale Model",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "model_name": [
+          "COMBO",
+          {
+            "multiselect": false,
+            "options": [
+              "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+              "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+            ]
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "model_name"
+      ]
+    },
+    "is_input_list": false,
+    "name": "LatentUpscaleModelLoader",
+    "output": [
+      "LATENT_UPSCALE_MODEL"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "LATENT_UPSCALE_MODEL"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_hunyuan",
+    "search_aliases": null
   },
   "LoadAudio": {
     "api_node": false,
@@ -3073,6 +4250,49 @@
     "python_module": "custom_nodes.ComfyUI-KJNodes",
     "search_aliases": null
   },
+  "NormalizeAudioLoudness": {
+    "category": "WanVideoWrapper",
+    "description": "",
+    "display_name": "Normalize Audio Loudness",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "audio": [
+          "AUDIO"
+        ],
+        "lufs": [
+          "FLOAT",
+          {
+            "default": -23.0,
+            "max": 0.0,
+            "min": -100.0,
+            "step": 0.1,
+            "tool": "Loudness Units relative to Full Scale, higher LUFS values (closer to 0) mean louder audio. Lower LUFS values (more negative) mean quieter audio."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "audio",
+        "lufs"
+      ]
+    },
+    "is_input_list": false,
+    "name": "NormalizeAudioLoudness",
+    "output": [
+      "AUDIO"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "audio"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.ComfyUI-WanVideoWrapper",
+    "search_aliases": []
+  },
   "PathchSageAttentionKJ": {
     "category": "KJNodes/experimental",
     "description": "Experimental node for patching attention mode. This doesn't use the model patching system and thus can't be disabled without running the node again with 'disabled' option.",
@@ -3135,6 +4355,96 @@
     "python_module": "custom_nodes.ComfyUI-KJNodes",
     "search_aliases": []
   },
+  "Power Lora Loader (rgthree)": {
+    "category": "rgthree",
+    "description": "",
+    "display_name": "Power Lora Loader (rgthree)",
+    "has_intermediate_output": false,
+    "input": {
+      "hidden": {},
+      "optional": {
+        "clip": [
+          "CLIP"
+        ],
+        "model": [
+          "MODEL"
+        ]
+      },
+      "required": {}
+    },
+    "input_order": {
+      "hidden": [],
+      "optional": [
+        "model",
+        "clip"
+      ],
+      "required": []
+    },
+    "is_input_list": false,
+    "name": "Power Lora Loader (rgthree)",
+    "output": [
+      "MODEL",
+      "CLIP"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "output_name": [
+      "MODEL",
+      "CLIP"
+    ],
+    "output_node": false,
+    "python_module": "custom_nodes.rgthree-comfy",
+    "search_aliases": []
+  },
+  "PrimitiveFloat": {
+    "api_node": false,
+    "category": "utilities/primitive",
+    "deprecated": false,
+    "description": "",
+    "dev_only": false,
+    "display_name": "Float",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "value": [
+          "FLOAT",
+          {
+            "max": 9223372036854775807,
+            "min": -9223372036854775807,
+            "step": 0.1
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "value"
+      ]
+    },
+    "is_input_list": false,
+    "name": "PrimitiveFloat",
+    "output": [
+      "FLOAT"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "FLOAT"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_primitive",
+    "search_aliases": null
+  },
   "RandomNoise": {
     "api_node": false,
     "category": "model/sampling/noise",
@@ -3181,6 +4491,331 @@
     ],
     "price_badge": null,
     "python_module": "comfy_extras.nodes_custom_sampler",
+    "search_aliases": null
+  },
+  "ResizeImageMaskNode": {
+    "api_node": false,
+    "category": "image/transform",
+    "deprecated": false,
+    "description": "Resize an image or mask using various scaling methods.",
+    "dev_only": false,
+    "display_name": "Resize Image/Mask",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "input": [
+          "COMFY_MATCHTYPE_V3",
+          {
+            "template": {
+              "allowed_types": "IMAGE,MASK",
+              "template_id": "input_type"
+            }
+          }
+        ],
+        "resize_type": [
+          "COMFY_DYNAMICCOMBO_V3",
+          {
+            "options": [
+              {
+                "inputs": {
+                  "required": {
+                    "crop": [
+                      "COMBO",
+                      {
+                        "default": "center",
+                        "multiselect": false,
+                        "options": [
+                          "disabled",
+                          "center"
+                        ],
+                        "tooltip": "How to handle aspect ratio mismatch: 'disabled' stretches to fit, 'center' crops to maintain aspect ratio."
+                      }
+                    ],
+                    "height": [
+                      "INT",
+                      {
+                        "default": 512,
+                        "max": 16384,
+                        "min": 0,
+                        "step": 1,
+                        "tooltip": "Target height in pixels. Set to 0 to auto-calculate from width while preserving aspect ratio."
+                      }
+                    ],
+                    "width": [
+                      "INT",
+                      {
+                        "default": 512,
+                        "max": 16384,
+                        "min": 0,
+                        "step": 1,
+                        "tooltip": "Target width in pixels. Set to 0 to auto-calculate from height while preserving aspect ratio."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale dimensions"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "multiplier": [
+                      "FLOAT",
+                      {
+                        "default": 1.0,
+                        "max": 8.0,
+                        "min": 0.01,
+                        "step": 0.01,
+                        "tooltip": "Scale factor (e.g., 2.0 doubles size, 0.5 halves size)."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale by multiplier"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "longer_size": [
+                      "INT",
+                      {
+                        "default": 512,
+                        "max": 16384,
+                        "min": 0,
+                        "step": 1,
+                        "tooltip": "The longer edge will be resized to this value. Aspect ratio is preserved."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale longer dimension"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "shorter_size": [
+                      "INT",
+                      {
+                        "default": 512,
+                        "max": 16384,
+                        "min": 0,
+                        "step": 1,
+                        "tooltip": "The shorter edge will be resized to this value. Aspect ratio is preserved."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale shorter dimension"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "width": [
+                      "INT",
+                      {
+                        "default": 512,
+                        "max": 16384,
+                        "min": 0,
+                        "step": 1,
+                        "tooltip": "Target width in pixels. Height auto-adjusts to preserve aspect ratio."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale width"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "height": [
+                      "INT",
+                      {
+                        "default": 512,
+                        "max": 16384,
+                        "min": 0,
+                        "step": 1,
+                        "tooltip": "Target height in pixels. Width auto-adjusts to preserve aspect ratio."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale height"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "megapixels": [
+                      "FLOAT",
+                      {
+                        "default": 1.0,
+                        "max": 16.0,
+                        "min": 0.01,
+                        "step": 0.01,
+                        "tooltip": "Target total megapixels (e.g., 1.0 \u2248 1024\u00d71024). Aspect ratio is preserved."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale total pixels"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "crop": [
+                      "COMBO",
+                      {
+                        "default": "center",
+                        "multiselect": false,
+                        "options": [
+                          "disabled",
+                          "center"
+                        ],
+                        "tooltip": "How to handle aspect ratio mismatch: 'disabled' stretches to fit, 'center' crops to maintain aspect ratio."
+                      }
+                    ],
+                    "match": [
+                      "IMAGE,MASK",
+                      {
+                        "tooltip": "Resize input to match the dimensions of this reference image or mask."
+                      }
+                    ]
+                  }
+                },
+                "key": "match size"
+              },
+              {
+                "inputs": {
+                  "required": {
+                    "multiple": [
+                      "INT",
+                      {
+                        "default": 8,
+                        "max": 16384,
+                        "min": 1,
+                        "step": 1,
+                        "tooltip": "Resize so width and height are divisible by this number. Useful for latent alignment (e.g., 8 or 64)."
+                      }
+                    ]
+                  }
+                },
+                "key": "scale to multiple"
+              }
+            ],
+            "tooltip": "Select how to resize: by exact dimensions, scale factor, matching another image, etc."
+          }
+        ],
+        "scale_method": [
+          "COMBO",
+          {
+            "default": "area",
+            "multiselect": false,
+            "options": [
+              "nearest-exact",
+              "bilinear",
+              "area",
+              "bicubic",
+              "lanczos"
+            ],
+            "tooltip": "Interpolation algorithm. 'area' is best for downscaling, 'lanczos' for upscaling, 'nearest-exact' for pixel art."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "input",
+        "resize_type",
+        "scale_method"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ResizeImageMaskNode",
+    "output": [
+      "COMFY_MATCHTYPE_V3"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": [
+      "input_type"
+    ],
+    "output_name": [
+      "resized"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_post_processing",
+    "search_aliases": [
+      "resize",
+      "resize image",
+      "resize mask",
+      "scale",
+      "scale image",
+      "scale mask",
+      "image resize",
+      "change size",
+      "dimensions",
+      "shrink",
+      "enlarge"
+    ]
+  },
+  "ResizeImagesByLongerEdge": {
+    "api_node": false,
+    "category": "image/transform",
+    "deprecated": false,
+    "description": "Resize images so that the longer edge matches the specified dimension while preserving aspect ratio.",
+    "dev_only": false,
+    "display_name": "Resize Images by Longer Edge (DEPRECATED)",
+    "essentials_category": null,
+    "experimental": true,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "images": [
+          "IMAGE",
+          {
+            "tooltip": "Image to process."
+          }
+        ],
+        "longer_edge": [
+          "INT",
+          {
+            "default": 1024,
+            "max": 8192,
+            "min": 1,
+            "tooltip": "Target dimension for the longer edge."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "images",
+        "longer_edge"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ResizeImagesByLongerEdge",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "images"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      "Processed images"
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_dataset",
     "search_aliases": null
   },
   "ResolutionSelector": {
@@ -3522,6 +5157,164 @@
       "download"
     ]
   },
+  "SimpleCalculatorKJ": {
+    "api_node": false,
+    "category": "KJNodes/misc",
+    "deprecated": false,
+    "description": "\nCalculator node that evaluates a mathematical expression using inputs a and b.  \n    Supported operations: +, -, *, /, //, %, **, <<, >>, unary +/-  \n    Supported comparisons: ==, !=, <, <=, >, >=  \n    Supported logic: and, or, not  \n    Supported functions: abs(), round(), min(), max(), pow(), sqrt(), sin(), cos(), tan(), log(), log10(), exp(), floor(), ceil()  \n    Supported constants: pi, euler, True, False  \n",
+    "dev_only": false,
+    "display_name": null,
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "expression": [
+          "STRING",
+          {
+            "default": "a + b",
+            "multiline": true
+          }
+        ],
+        "variables": [
+          "COMFY_AUTOGROW_V3",
+          {
+            "template": {
+              "input": {
+                "optional": {
+                  "var": [
+                    "INT,FLOAT,BOOLEAN",
+                    {}
+                  ]
+                },
+                "required": {}
+              },
+              "min": 2,
+              "names": [
+                "a",
+                "b",
+                "c",
+                "d",
+                "e",
+                "f",
+                "g",
+                "h",
+                "i",
+                "j",
+                "k"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "expression",
+        "variables"
+      ]
+    },
+    "is_input_list": false,
+    "name": "SimpleCalculatorKJ",
+    "output": [
+      "FLOAT",
+      "INT",
+      "BOOLEAN"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "FLOAT",
+      "INT",
+      "BOOLEAN"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null,
+      null,
+      null
+    ],
+    "price_badge": null,
+    "python_module": "custom_nodes.ComfyUI-KJNodes",
+    "search_aliases": [
+      "math",
+      "arithmetic",
+      "expression",
+      "logic"
+    ]
+  },
+  "TrimAudioDuration": {
+    "api_node": false,
+    "category": "audio",
+    "deprecated": false,
+    "description": "Trim audio tensor into chosen time range.",
+    "dev_only": false,
+    "display_name": "Trim Audio Duration",
+    "essentials_category": null,
+    "experimental": false,
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "audio": [
+          "AUDIO",
+          {}
+        ],
+        "duration": [
+          "FLOAT",
+          {
+            "default": 60.0,
+            "min": 0.0,
+            "step": 0.01,
+            "tooltip": "Duration in seconds"
+          }
+        ],
+        "start_index": [
+          "FLOAT",
+          {
+            "default": 0.0,
+            "max": 18446744073709551615,
+            "min": -18446744073709551615,
+            "step": 0.01,
+            "tooltip": "Start time in seconds, can be negative to count from the end (supports sub-seconds)."
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "audio",
+        "start_index",
+        "duration"
+      ]
+    },
+    "is_input_list": false,
+    "name": "TrimAudioDuration",
+    "output": [
+      "AUDIO"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_matchtypes": null,
+    "output_name": [
+      "AUDIO"
+    ],
+    "output_node": false,
+    "output_tooltips": [
+      null
+    ],
+    "price_badge": null,
+    "python_module": "comfy_extras.nodes_audio",
+    "search_aliases": [
+      "cut audio",
+      "audio clip",
+      "shorten audio"
+    ]
+  },
   "UNETLoader": {
     "category": "model/loaders",
     "description": "",
@@ -3681,6 +5474,88 @@
     "search_aliases": [
       "latent to audio"
     ]
+  },
+  "VAEDecodeTiled": {
+    "category": "model/latent",
+    "description": "",
+    "display_name": "VAE Decode (Tiled)",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "overlap": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 64,
+            "max": 4096,
+            "min": 0,
+            "step": 32
+          }
+        ],
+        "samples": [
+          "LATENT"
+        ],
+        "temporal_overlap": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 8,
+            "max": 4096,
+            "min": 4,
+            "step": 4,
+            "tooltip": "Only used for video VAEs: Amount of frames to overlap."
+          }
+        ],
+        "temporal_size": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 64,
+            "max": 4096,
+            "min": 8,
+            "step": 4,
+            "tooltip": "Only used for video VAEs: Amount of frames to decode at a time."
+          }
+        ],
+        "tile_size": [
+          "INT",
+          {
+            "advanced": true,
+            "default": 512,
+            "max": 4096,
+            "min": 64,
+            "step": 32
+          }
+        ],
+        "vae": [
+          "VAE"
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "samples",
+        "vae",
+        "tile_size",
+        "overlap",
+        "temporal_size",
+        "temporal_overlap"
+      ]
+    },
+    "is_input_list": false,
+    "name": "VAEDecodeTiled",
+    "output": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "IMAGE"
+    ],
+    "output_node": false,
+    "python_module": "nodes",
+    "search_aliases": []
   },
   "VAEEncodeTiled": {
     "category": "model/latent",

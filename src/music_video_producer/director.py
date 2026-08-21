@@ -79,6 +79,37 @@ class PlannedShot(BaseModel):
     # into `PlannedShot.required` for every caller that demands a shot list, so the model
     # has to make the decision per shot instead of falling through this default.
     performance: bool = False
+    # Which library assets this shot uses, named **here** instead of in the prose.
+    #
+    # The defect this closes, reported by the Director on a live plan (2026-08-21): 24 of 30
+    # prompts carried an asset's display name, because a citation was only ever created when
+    # the model typed that label into the shot's creative writing. The attachment mechanism
+    # *was* the prose, so the prose read like inventory — "Extreme close up of Crimson Lips
+    # Close-up while HarderFaster performs", "Blue Haze Atmosphere surrounding the Dusk
+    # Warehouse Bed". A field the model fills structurally is somewhere to put the label that
+    # is not the sentence a renderer will read.
+    #
+    # Entries are matched against the roster the caller offered, by **id or by exact display
+    # name**, and anything matching neither is dropped rather than guessed at. Both are
+    # accepted because they are one fact seen from two sides: the roster in the populate
+    # instruction is written by name, and the project context dump beside it carries the ids,
+    # so whichever the model copies it is copying something it was shown. An unresolvable
+    # entry cannot invent an asset; it can only fail to cite one, and the prose scan
+    # (`models.assets_for_proposal`) is still there to catch exactly that case.
+    #
+    # `list` default, promoted into the grammar by `PLANNED_SHOT_DECISIONS`, and the pairing
+    # is `SectionLook.prompt`'s exactly: required means the decoder must emit the key, so the
+    # model decides about every shot, while the empty list stays expressible for a shot that
+    # genuinely uses nothing from the library. Leaving it defaulted-and-optional would
+    # reproduce the hole this module has now found six times.
+    assets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The exact names (or ids) of the project assets this shot uses. This is the "
+            "only place an asset may be named; the prompt itself must not contain these "
+            "labels. Empty when the shot uses no library asset."
+        ),
+    )
 
 
 class PlannedSection(BaseModel):
@@ -213,7 +244,15 @@ def constrained_schema(
 #: and Populate maps `performance` onto `singing` for every shot it writes. A caller that is
 #: merely *offered* shots — the chat route — is offered them with `performance` optional,
 #: exactly as it always was.
-PLANNED_SHOT_DECISIONS = ("performance",)
+#:
+#: `assets` joins it for the identical reason one level down from the identical hole: it is
+#: the structural citation field, Populate builds every shot's citations from it, and a field
+#: carrying `default_factory=list` is absent from `PlannedShot`'s `required` for free — which
+#: is the exact shape measured on `DirectorResult.shots`, `PlannedShot.performance`,
+#: `PlannedSection.prompt`, `stage_manager.assets` and `SectionLook.prompt`. Required here
+#: does not mean "cite something": the empty list is legal and is a shot that uses nothing.
+#: It means the decoder may not close a shot object without having *considered* the question.
+PLANNED_SHOT_DECISIONS = ("performance", "assets")
 
 #: The same, one level down, for a section: `prompt` is the section's shared visual look,
 #: which both populate instructions ask for in words ("a one-sentence shared visual prompt")
@@ -635,6 +674,119 @@ class StageManagerResult(BaseModel):
     assets: list[AssetProposal] = Field(default_factory=list)
 
 
+# The Treatment is already written per section — the live project's is literally an
+# **Intro:** paragraph, a **Verse 1 & Verse 2:** paragraph, a **Chorus 1 & Chorus 2:**
+# paragraph and so on — so this pass invents nothing. It *distributes* prose that exists
+# onto boxes that exist, and the two hard rules below are what stop it doing anything else:
+# address a section by the id it was given (the `ExpandedShot.shot_id` contract, for the
+# same reason — a look merged onto the wrong box is free text that fails silently), and
+# return an empty prompt rather than a plausible one for a section the treatment never
+# describes. A grouped heading is not an ambiguity to resolve: "Verse 1 & Verse 2" means
+# both verses take that look, and two sections carrying the same sentence is the correct
+# answer, not a duplicate to break.
+SECTION_LOOKS_PROMPT = """You are the creative director inside a local music-video production editor.
+The song's structure is already marked: the director has laid out the sections on the
+timeline. The treatment is already written. Your one job is to say, for each section, what
+that section looks like — the shared look every shot inside it will carry.
+
+You invent nothing. Everything you write must already be in the treatment or the style
+bible; you are distributing prose that exists onto boxes that exist.
+
+The input is a JSON object with these keys:
+- treatment: the video's plan, usually written section by section. A heading naming more
+  than one section ("Verse 1 & Verse 2") applies to every section it names.
+- style_bible: the fixed visual language — palette, lighting, lenses, wardrobe, locations.
+  It applies to the whole video, so it is context, not a section's look on its own.
+- sections: the marked sections, in song order. Each has:
+  - section_id: the section's identity. Copy it verbatim into your answer; it is how your
+    look is matched to a section. A wrong or invented id is discarded.
+  - label: the section's name, as the director marked it. Labels repeat and are numbered
+    by the director's own hand ("Verse", "Verse 2"); match the treatment's headings to
+    these labels, never to their order.
+  - start, end, duration: absolute seconds against the song.
+  - prompt: the look this section already carries, when it has one.
+
+Return exactly one JSON object with keys: message, looks.
+- message: one or two sentences on how you read the treatment onto the sections.
+- looks: one entry per section, in the same order, each with:
+  - section_id: copied verbatim from the section it answers.
+  - label: that same section's label, copied verbatim. It is checked against the id; a
+    mismatch is discarded.
+  - prompt: one or two sentences naming the setting, the camera and the mood this section
+    shares — concrete and self-contained, in the treatment's own terms. Never name a shot,
+    a lyric, a time or an asset.
+
+If the treatment does not describe a section, return that section with prompt set to the
+empty string. An empty prompt is a real answer and the honest one; a plausible sentence for
+a section nobody wrote about is the one thing you must not produce."""
+
+
+class SectionLook(BaseModel):
+    """One section's shared look, addressed to a `SongSection` **by id**.
+
+    `label` is not decoration and not redundancy: it is a checksum. The id is the address,
+    exactly as on `ExpandedShot`, but a model copying ids down a numbered list can copy the
+    right-looking one off the wrong row, and section labels repeat by design — the lyric
+    sheet's `[Tag]` blocks yield "Verse", "Verse 2", "Chorus", "Chorus 2". Carrying both
+    means the route can refuse a look whose id and label disagree instead of writing
+    Chorus 2's setting onto the Bridge, which is worse than leaving the Bridge empty.
+
+    `prompt` has a default so that ``""`` is expressible, and `SECTION_LOOK_DECISIONS`
+    promotes it into the grammar anyway — the pairing is the whole point. Required means
+    the decoder must emit the key, so the model has to *decide* about every section; the
+    empty string being legal means the decision may be "the treatment does not say".
+    """
+
+    section_id: str = Field(
+        min_length=1,
+        description="The id of the section this look is for, copied verbatim.",
+    )
+    label: str = Field(
+        min_length=1,
+        description="That section's label, copied verbatim. Checked against the id.",
+    )
+    prompt: str = Field(
+        default="",
+        description=(
+            "The section's shared look, one or two sentences. Empty when the treatment "
+            "does not describe this section."
+        ),
+    )
+
+
+class SectionLooks(BaseModel):
+    """The result of one whole-structure section-look pass."""
+
+    message: str = ""
+    looks: list[SectionLook] = Field(default_factory=list)
+
+
+#: The per-entry decision, and it is the same hole one level down that
+#: `PLANNED_SECTION_DECISIONS` names: `SectionLook.prompt` carries a default, so Pydantic
+#: leaves it out of `required`, so the constrained decoder would be free to close each entry
+#: without it — an id and a label and no look, which is what the route already has.
+SECTION_LOOK_DECISIONS = ("prompt",)
+
+#: The name the section-look schema goes on the wire under.
+SECTION_LOOKS_SCHEMA_NAME = "section_looks"
+
+
+def section_looks_schema() -> dict[str, Any]:
+    """`SectionLooks`' schema with everything the route cannot proceed without required.
+
+    `looks` is the entire answer — a reply without it is a call that did nothing — and
+    `prompt` is the field the whole feature is about. Both carry defaults, so both were
+    outside `required` for free, which is precisely the shape measured on
+    `DirectorResult.shots` and `PlannedShot.performance`. `message` is left optional: the
+    route never reads it, and a required narration field is one more thing to get wrong.
+    """
+    return constrained_schema(
+        SectionLooks,
+        require=("looks",),
+        require_each={"looks": SECTION_LOOK_DECISIONS},
+    )
+
+
 # One whole-plan pass, because per-Shot calls cannot see each other and cross-Shot variance is
 # the point: a plan of twelve shots that each independently "hold the identity" reads as twelve
 # takes of one shot. The constants to hold fixed and the axes to vary are named explicitly
@@ -1043,6 +1195,55 @@ class DirectorClient:
         try:
             response = await self._completion(body=body, headers=headers)
             return StageManagerResult.model_validate(extract_json(self._content(response)))
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            raise DirectorError(f"LLM director returned an invalid response: {error}") from error
+
+    async def section_looks(self, *, looks_input: dict[str, Any]) -> SectionLooks:
+        """One section-look pass: what does each marked section of the song look like.
+
+        `plan`'s transport, `plan`'s error translation, a different job description and a
+        different strict schema — `stage_manager`'s shape, for `stage_manager`'s reason.
+        The input is built by the caller and is deliberately *not* the project dump: this
+        pass reads the treatment, the style bible and the section boxes and nothing else,
+        so there is no asset roster for it to leak a library name out of and no shot list
+        for it to write about (`populate`'s measured naming leak, in a smaller room).
+
+        Temperature is `plan`'s: this is a creative read of prose, not a count to obey.
+        """
+        if not self.base_url or not self.model:
+            raise DirectorUnavailable(
+                "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
+            )
+        headers = self._headers()
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SECTION_LOOKS_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(looks_input, ensure_ascii=False),
+                },
+            ],
+            "temperature": PLAN_TEMPERATURE,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": SECTION_LOOKS_SCHEMA_NAME,
+                    "strict": True,
+                    "schema": section_looks_schema(),
+                },
+            },
+        }
+        try:
+            response = await self._completion(body=body, headers=headers)
+            return SectionLooks.model_validate(extract_json(self._content(response)))
         except (
             httpx.HTTPError,
             KeyError,

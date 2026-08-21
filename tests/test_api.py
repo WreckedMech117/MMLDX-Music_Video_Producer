@@ -4077,6 +4077,9 @@ def test_populate_requires_a_performance_decision_on_every_shot_it_asks_for(
         "duration",
         "prompt",
         "performance",
+        # The structural citation field, required for the same reason and against the same
+        # hole: populate builds every shot's citations from it.
+        "assets",
     ]
     # No sections are marked, so structure is asked for in the text and its shared look is
     # demanded in the grammar beside it.
@@ -4127,10 +4130,12 @@ def test_the_structure_pass_demands_each_sections_shared_look(tmp_path: Path):
         "duration",
         "prompt",
     ]
-    # Stage two's boxes are filled by then: it owes shots, and a per-shot decision on them.
-    assert shots_call["response_schema"]["$defs"]["PlannedShot"]["required"][-1] == (
-        "performance"
-    )
+    # Stage two's boxes are filled by then: it owes shots, and both per-shot decisions on
+    # them — whether the shot is a performance, and which assets it uses.
+    assert shots_call["response_schema"]["$defs"]["PlannedShot"]["required"][-2:] == [
+        "performance",
+        "assets",
+    ]
     assert comfy.prompts == []
 
 
@@ -4839,9 +4844,14 @@ def test_populate_never_shows_the_model_an_internal_sheet_label(tmp_path: Path):
         "Bass Player",
         "Dusk Warehouse Bed",
     ]
-    # The exact-name mechanism the matcher runs on is still asked for, and now bounded.
-    assert "by these exact names and no others" in request["message"]
-    assert "never write a name that is not on that list" in request["message"]
+    # The exact-name mechanism the matcher runs on is still asked for, and now bounded — but
+    # it is asked for in the shot's `assets` field rather than in its prose, which is the
+    # 2026-08-21 half of this fix. Withholding the sheet's name still matters and matters for
+    # the same reason: a name never shown cannot be echoed, into the field or into the prose.
+    assert "exact names of the assets that shot uses" in request["message"]
+    assert "nothing that is not on that list" in request["message"]
+    # And the prose is told, in the same breath, to name nothing at all.
+    assert "The prompt itself must never contain one of those names" in request["message"]
     # Count enforcement, undisturbed.
     from music_video_producer.app import populate_required_shots
 
@@ -9056,6 +9066,111 @@ def test_a_moved_shot_renders_its_new_window_with_no_stale_offset(tmp_path: Path
     assert submitted_media(comfy)[-1]["trim"] == {"start": 96.25, "end": 96.25 + 107 / 24}
 
 
+# --- Short windows, in the graph that is actually submitted (Director, 2026-08-20) --------
+#
+# The arithmetic lives in `timeline` and is tested there; these read it back off the payload
+# the route handed ComfyUI, because the defect class this guards against is the one found live
+# on 2026-08-19 — a shot conditioned on seconds of the song that were not its own. Nothing here
+# renders: the assertion is the submitted graph and the arithmetic, never audio.
+
+
+def test_a_short_song_audio_shot_hears_the_seconds_around_its_own_window(tmp_path: Path):
+    """A 2.083 s window renders 107 frames centred on itself, and hears the same span.
+
+    The whole point of the floor is that the *rendered* length and the *exposed* length come
+    apart: H3 performs 4.4583 s of song, of which the cut shows 2.083 s. If the audio window
+    were still the shot's own 2.083 s the model would be conditioned on a fifth of what it is
+    generating, and the mouth would drift for the rest — so the trim below must cover the whole
+    picture, positioned so the exposed slice is still the shot's own seconds.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=12.0, duration=2.083)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    lead = 29 / 24  # half the 2.3753 s buffer, snapped to a whole frame
+    song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
+    assert song["trim"] == {"start": 12.0 - lead, "end": 12.0 - lead + 107 / 24}
+    # The picture is the same span as the audio, in frames — the two can never diverge.
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["length"] == 107
+    assert song["trim"]["end"] - song["trim"]["start"] == pytest.approx(107 / 24)
+    # And the recorded lead is the offset that turns that span back into the shot's window.
+    recorded = ProjectStore(tmp_path).get(project.id).shots[0]
+    assert recorded.latest_take_lead == lead
+    # The proof, in the song's own seconds: the slice assembly extracts from the take —
+    # `latest_take_lead + trim_nudge` in, the window's length long — is 12.0-14.083 s of the
+    # master, which is exactly the shot. Frame-exact, because the lead is a whole frame:
+    # assembly cuts at `trim=start_frame=round(offset·24)`.
+    offset = recorded.latest_take_lead + recorded.trim_nudge
+    assert round(offset * 24) == 29
+    assert song["trim"]["start"] + round(offset * 24) / 24 == pytest.approx(12.0)
+    assert song["trim"]["start"] + round(offset * 24) / 24 + 2.083 == pytest.approx(14.083)
+    # Buffer on both sides of the cut, which is what "centred" buys: real song before the
+    # window for the mouth to arrive on, and real song after it.
+    assert song["trim"]["start"] < 12.0
+    assert song["trim"]["end"] > 12.0 + 2.083
+
+
+def test_a_short_shot_at_the_songs_start_is_conditioned_from_its_first_second(tmp_path: Path):
+    """Nothing precedes 0 s, so the take cannot centre — and the exposed slice still lands on
+    the song's own opening seconds rather than being dragged forward to make room."""
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=0.0, duration=2.083)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
+    assert song["trim"] == {"start": 0.0, "end": 107 / 24}
+    recorded = ProjectStore(tmp_path).get(project.id).shots[0]
+    assert recorded.latest_take_lead == 0.0
+    # Offset 0: the exposed slice is the take's first 2.083 s, which is the song's first
+    # 2.083 s. The whole buffer is tail.
+    assert song["trim"]["start"] + recorded.latest_take_lead == pytest.approx(0.0)
+
+
+def test_a_short_shot_at_the_songs_end_keeps_its_window_and_moves_its_buffer(tmp_path: Path):
+    """The mirror case. The tail has nowhere to go, so the buffer moves ahead of the cut and
+    the take ends on the song's last second — the window itself does not move."""
+    client, store, comfy = make_client(tmp_path)
+    project = windowed_project(store, client, start=154.0 - 2.083, duration=2.083)
+
+    assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+
+    song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
+    assert song["trim"]["end"] == pytest.approx(154.0)
+    assert song["trim"]["end"] - song["trim"]["start"] == pytest.approx(107 / 24)
+    recorded = ProjectStore(tmp_path).get(project.id).shots[0]
+    # Every frame of buffer is now the lead, and the slice at that offset is still the shot's.
+    assert recorded.latest_take_lead == pytest.approx(107 / 24 - 2.083)
+    assert song["trim"]["start"] + recorded.latest_take_lead == pytest.approx(154.0 - 2.083)
+
+
+def test_normal_windows_submit_exactly_the_graph_they_always_did(tmp_path: Path):
+    """The hard constraint: only the short-window path may change.
+
+    Every window whose margin already reached H3's minimum renders the same frame count and is
+    conditioned on the same span, with the same quarter-second lead — asserted against numbers
+    written out here rather than against the implementation.
+    """
+    client, store, comfy = make_client(tmp_path)
+    for start, duration, frames in (
+        (12.0, 3.75, 107),
+        (20.0, 4.0, 124),
+        (30.0, 5.0, 141),
+        (60.0, 8.0, 209),
+        (100.0, 15.0, 379),
+    ):
+        project = windowed_project(store, client, start=start, duration=duration)
+        assert submit_h3(client, project.id, project.shots[0].id).status_code == 202
+        song = next(item for item in submitted_media(comfy) if item["label"] == "master song")
+        assert song["trim"] == {
+            "start": start - 0.25,
+            "end": start - 0.25 + frames / 24,
+        }, duration
+        assert comfy.prompts[-1]["mvp:condition"]["inputs"]["length"] == frames, duration
+        assert ProjectStore(tmp_path).get(project.id).shots[0].latest_take_lead == 0.25
+
+
 def test_a_shot_at_zero_seconds_is_windowed_like_any_other(tmp_path: Path):
     """The 0 s shot is no longer a special case, and this asserts the *difference*.
 
@@ -13017,6 +13132,457 @@ def test_sections_route_sorts_refuses_overlap_and_reaches_the_expansion(tmp_path
     assert section["prompt"] == "on the canopy bed"
     # Lyric text never rides the expansion payload (2026-08-19, twice-measured).
     assert "lyrics" not in section
+
+
+# --------------------------------------------------------------------------------------------
+# Fill section looks. The Director's report (2026-08-20): a Section clicked in the timeline
+# had an empty shared prompt, so nothing of the Treatment reached the shots inside it. The
+# sections came from the Whisper alignment pass, which is exactly the branch populate does
+# *not* ask the model for structure on, and no other path writes `SongSection.prompt`.
+#
+# Every test below runs against a recording double. **No live model validated the prompt
+# wording**: the GPU and the model host were contended and the task forbade a live call.
+# --------------------------------------------------------------------------------------------
+
+#: The live project's treatment, verbatim (project_59f14d19ff10, read-only). It is here rather
+#: than paraphrased because the whole label-matching question is a property of *this* prose:
+#: the headings group sections ("Verse 1 & Verse 2", "Chorus 1 & Chorus 2") while the timeline
+#: numbers them the lyric sheet's way ("Verse", "Verse 2"), and a test written against tidy
+#: one-heading-per-section prose would never meet the case that matters.
+DIRECTOR_TREATMENT = (
+    "The video follows a dualistic performance structure that oscillates between raw rock "
+    "energy and dark, erotic glamour.\n\n"
+    "**Intro:** We begin with atmospheric establishing shots of the empty, moonlit "
+    "warehouse. The mood is lonely, industrial, and heavy with anticipation.\n\n"
+    "**Verse 1 & Verse 2:** The energy is driven by high-intensity performance at a vintage "
+    "chrome microphone. The camera work is aggressive - handheld, shaky, and low-angle - "
+    "capturing the character's raw power and 'animalistic' movement through the shadows of "
+    "the warehouse aisles.\n\n"
+    "**Chorus 1 & Chorus 2:** A dramatic shift in tone. The setting moves to the black "
+    "draped canopy bed. The camera transitions from handheld grit to slow, sweeping, "
+    "cinematic glides.\n\n"
+    "**Outro:** The energy dissipates into a haunting, cinematic stillness. We return to "
+    "wide shots of the empty bed and the abandoned microphone."
+)
+
+#: The live project's style bible, trimmed to the paragraphs a look is written out of.
+DIRECTOR_STYLE_BIBLE = (
+    "**Color Palette:** Deep midnight blues, charcoal blacks, oxblood red, cool white "
+    "moonlight.\n**Lighting:** Chiaroscuro; a single volumetric moonbeam through high "
+    "warehouse windows.\n**Lens & Grain:** 35mm film aesthetic with heavy cinematic grain."
+)
+
+#: The live project's seven sections: label, start, duration — the Whisper alignment's own
+#: output, ids substituted for readable ones. Note the repeats and note that the *order* of
+#: the labels is not the order of the treatment's headings: Verse, Chorus, Verse 2, Chorus 2
+#: against Intro, Verses, Choruses, Outro. Anything matching by position gets this wrong.
+DIRECTOR_SECTIONS = [
+    ("section_intro", "Intro", 0.0, 11.0),
+    ("section_v1", "Verse", 11.0, 21.54),
+    ("section_c1", "Chorus", 32.54, 23.82),
+    ("section_v2", "Verse 2", 56.36, 20.84),
+    ("section_c2", "Chorus 2", 77.2, 26.0),
+    ("section_bridge", "Bridge", 103.2, 20.9),
+    ("section_outro", "Outro", 124.1, 30.54),
+]
+
+
+class SectionLookingDirector(FakeDirector):
+    """A director double whose section looks are chosen by the test, request recorded.
+
+    Recording rather than fixed, because the *input* is half the contract: this pass is shown
+    the treatment, the style bible and the section boxes **with their ids**, and a double that
+    swallowed `looks_input` would let the ids stop being sent without a test noticing — and
+    the ids are the entire matching rule.
+
+    `looks` is a list of `(section_id, label, prompt)` triples, or a callable handed the input
+    so a test can answer the way the treatment actually reads. Triples rather than a dict
+    keyed by id so a test can send two entries for one id, or an entry for an id that does not
+    exist, which are two of the failure modes the route has to survive.
+    """
+
+    def __init__(self, looks=(), message="Read the treatment onto the sections."):
+        self.looks = looks
+        self.message = message
+        self.calls = []
+
+    async def section_looks(self, *, looks_input):
+        self.calls.append(looks_input)
+        entries = self.looks(looks_input) if callable(self.looks) else list(self.looks)
+        return type(
+            "SectionLooks",
+            (),
+            {
+                "message": self.message,
+                "looks": [
+                    type(
+                        "SectionLook",
+                        (),
+                        {"section_id": section_id, "label": label, "prompt": prompt},
+                    )()
+                    for section_id, label, prompt in entries
+                ],
+            },
+        )()
+
+
+def sectioned_project(store, director_sections=DIRECTOR_SECTIONS, **fields):
+    """A project carrying the live treatment, the live style bible and given sections."""
+    project = store.create(Project(name="Looks"))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=155.0)
+    project.treatment = fields.pop("treatment", DIRECTOR_TREATMENT)
+    project.style_bible = fields.pop("style_bible", DIRECTOR_STYLE_BIBLE)
+    project.sections = [
+        SongSection(id=section_id, label=label, start=start, duration=duration)
+        for section_id, label, start, duration in director_sections
+    ]
+    for key, value in fields.items():
+        setattr(project, key, value)
+    return store.save(project)
+
+
+def fill_looks(client, project_id: str, **body):
+    return client.post(f"/api/projects/{project_id}/sections/fill-looks", json=body)
+
+
+def test_fill_section_looks_reports_first_then_writes_and_reaches_the_prompts(tmp_path: Path):
+    """The gap closed end to end.
+
+    A report writes nothing and says so on the wire (`project` is null, the manifest is
+    unchanged); the confirmed call writes; and the look then arrives everywhere a section
+    look is consumed — the whole-plan expansion input, the per-shot expansion input, and the
+    submitted H3 text as "Section look: …". Stored is not the claim; reaching the prompts is.
+    """
+    from music_video_producer.timeline import expansion_input, shot_expansion_input
+
+    director = SectionLookingDirector(
+        looks=[
+            ("section_intro", "Intro", "The empty moonlit warehouse, wide and lonely."),
+            ("section_v1", "Verse", "Handheld and low-angle at the vintage chrome mic."),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(
+        store,
+        [("section_intro", "Intro", 0.0, 11.0), ("section_v1", "Verse", 11.0, 21.54)],
+    )
+    project.shots = [Shot(id="shot_v", start=12, duration=6, prompt="She grips the mic.")]
+    store.save(project)
+
+    report = fill_looks(client, project.id)
+    assert report.status_code == 200, report.text
+    body = report.json()
+    assert body["applied"] is False
+    # The absence *is* the statement that nothing was written.
+    assert body["project"] is None
+    assert body["filled"] == 2 and body["skipped"] == 0
+    assert [row["label"] for row in body["sections"]] == ["Intro", "Verse"]
+    assert body["sections"][0]["prompt"].startswith("The empty moonlit warehouse")
+    assert body["sections"][0]["previous"] == ""
+    # Nothing on disk moved on the report path.
+    assert [s.prompt for s in store.get(project.id).sections] == ["", ""]
+
+    applied = fill_looks(client, project.id, confirm_apply=True)
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["applied"] is True
+    assert applied.json()["project"] is not None
+
+    # Persistence through a *fresh* store, not the handle that wrote it.
+    reread = ProjectStore(tmp_path).get(project.id)
+    assert [s.prompt for s in reread.sections] == [
+        "The empty moonlit warehouse, wide and lonely.",
+        "Handheld and low-angle at the vintage chrome mic.",
+    ]
+
+    # It reaches the two expansion payloads — the whole-plan pass and the per-shot pass.
+    whole = expansion_input(reread)
+    assert whole["shots"][0]["section"]["prompt"].startswith("Handheld and low-angle")
+    one = shot_expansion_input(reread, reread.shots[0])
+    assert one["shot"]["section"]["prompt"].startswith("Handheld and low-angle")
+
+    # Nothing rendered, armed, queued or approved on any path above.
+    assert comfy.prompts == []
+
+    # And it reaches the string H3 is actually submitted, which is the claim that matters.
+    media = store.media_dir(project.id)
+    (media / "lead.png").write_bytes(b"png")
+    written = store.get(project.id)
+    written.assets = [
+        Asset(id="asset_lead", name="Lead", kind="character", path="media/lead.png")
+    ]
+    written.shots = [
+        Shot(id="shot_v", start=12, duration=6, prompt="She grips the mic.",
+             status="ready", asset_ids=["asset_lead"])
+    ]
+    store.save(written)
+    assert submit_h3(client, project.id, "shot_v").status_code == 202
+    assert comfy.prompts[-1]["mvp:condition"]["inputs"]["prompt"].endswith(
+        "Section look: Handheld and low-angle at the vintage chrome mic."
+    )
+
+
+def test_fill_section_looks_never_replaces_a_written_look_without_consent(tmp_path: Path):
+    """Rule one. A section look is editable in the inspector, so a sentence the Director
+    typed is exactly the thing a bulk fill must not quietly replace.
+
+    Confirming *this pass* is not the same act as agreeing to lose that sentence, so the two
+    flags are separate: `confirm_apply` fills the empty ones and leaves the written one with
+    its reason named in the report; `overwrite` is the second, explicit consent. The report
+    carries the proposed text and the existing text side by side, so the trade is visible
+    before it is taken rather than after.
+    """
+    from music_video_producer.app import SECTION_LOOK_SKIP_WRITTEN
+
+    director = SectionLookingDirector(
+        looks=[
+            ("section_intro", "Intro", "A model look for the intro."),
+            ("section_v1", "Verse", "A model look for the verse."),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(
+        store,
+        [("section_intro", "Intro", 0.0, 11.0), ("section_v1", "Verse", 11.0, 21.54)],
+    )
+    project.sections[0].prompt = "MY OWN INTRO LOOK, typed by hand."
+    store.save(project)
+
+    report = fill_looks(client, project.id)
+    written_row = report.json()["sections"][0]
+    assert written_row["filled"] is False
+    assert written_row["reason"] == SECTION_LOOK_SKIP_WRITTEN
+    assert written_row["previous"] == "MY OWN INTRO LOOK, typed by hand."
+    # The proposal rides the report so the Director can see what consent would buy.
+    assert written_row["prompt"] == "A model look for the intro."
+    assert report.json()["filled"] == 1
+
+    applied = fill_looks(client, project.id, confirm_apply=True)
+    assert applied.status_code == 200
+    saved = store.get(project.id)
+    assert saved.sections[0].prompt == "MY OWN INTRO LOOK, typed by hand."  # untouched
+    assert saved.sections[1].prompt == "A model look for the verse."
+
+    # The consent path: both flags, and only then does the hand-written sentence go.
+    overwritten = fill_looks(client, project.id, confirm_apply=True, overwrite=True)
+    assert overwritten.status_code == 200
+    assert overwritten.json()["filled"] == 2
+    assert store.get(project.id).sections[0].prompt == "A model look for the intro."
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_is_a_no_op_when_every_section_already_has_one(tmp_path: Path):
+    """Every look written and no consent to replace them: the answer is already known, so
+    the 300 s local-model call is not spent to arrive at it. A report, not a refusal —
+    nothing is wrong — and the sentence names the word that would overrule it."""
+    from music_video_producer.app import SECTION_LOOKS_ALL_WRITTEN
+
+    director = SectionLookingDirector(looks=[("section_intro", "Intro", "Replacement.")])
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(store, [("section_intro", "Intro", 0.0, 11.0)])
+    project.sections[0].prompt = "Already written."
+    store.save(project)
+
+    response = fill_looks(client, project.id, confirm_apply=True)
+    assert response.status_code == 200
+    assert response.json()["filled"] == 0
+    assert response.json()["applied"] is False
+    assert response.json()["message"] == SECTION_LOOKS_ALL_WRITTEN
+    assert director.calls == []  # the model was never asked
+    assert store.get(project.id).sections[0].prompt == "Already written."
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_matches_the_directors_seven_by_id_and_label(tmp_path: Path):
+    """Rule two, against the live project's real seven.
+
+    The treatment groups sections ("Verse 1 & Verse 2", "Chorus 1 & Chorus 2") while the
+    timeline numbers them the lyric sheet's way ("Verse", "Verse 2"), and the two orders do
+    not agree — the treatment reads Intro, Verses, Choruses, Outro while the timeline runs
+    Intro, Verse, Chorus, Verse 2, Chorus 2, Bridge, Outro. So the match is by the id each
+    section was handed, corroborated by its own label, never by position: getting Chorus 2's
+    canopy bed onto the Bridge would be worse than leaving the Bridge empty.
+
+    A grouped heading is not an ambiguity: both verses take the verse look, and the two
+    sections carrying the same sentence is the right answer. The Bridge is the label this
+    treatment never mentions, and it stays empty with the reason said out loud.
+    """
+    from music_video_producer.app import SECTION_LOOK_SKIP_UNDESCRIBED
+
+    verse_look = "Handheld, low-angle, aggressive at the vintage chrome microphone."
+    chorus_look = "Slow cinematic glides across the black draped canopy bed."
+
+    def read_the_treatment(looks_input):
+        """What the treatment says for each label, keyed off the input's own ids."""
+        by_label = {
+            "intro": "The empty moonlit warehouse; lonely, industrial, anticipatory.",
+            "verse": verse_look,
+            "verse 2": verse_look,
+            "chorus": chorus_look,
+            "chorus 2": chorus_look,
+            "bridge": "",  # this treatment has no Bridge paragraph
+            "outro": "Wide, still and haunting on the empty bed and abandoned microphone.",
+        }
+        return [
+            (entry["section_id"], entry["label"], by_label[entry["label"].lower()])
+            for entry in looks_input["sections"]
+        ]
+
+    director = SectionLookingDirector(looks=read_the_treatment)
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(store)
+
+    response = fill_looks(client, project.id, confirm_apply=True)
+    assert response.status_code == 200, response.text
+
+    # The input the model was shown: the two documents and the boxes with their ids, in song
+    # order, and nothing else — no shots, no assets, no lyrics to leak a name out of.
+    sent = director.calls[0]
+    assert set(sent) == {"treatment", "style_bible", "sections"}
+    # Both documents go whole — the treatment is the source the looks are read out of and
+    # the style bible is the language they are written in, and an input that dropped either
+    # would still produce looks, just invented ones.
+    assert sent["treatment"] == DIRECTOR_TREATMENT
+    assert sent["style_bible"] == DIRECTOR_STYLE_BIBLE
+    assert [entry["label"] for entry in sent["sections"]] == [
+        "Intro", "Verse", "Chorus", "Verse 2", "Chorus 2", "Bridge", "Outro",
+    ]
+    assert [entry["section_id"] for entry in sent["sections"]][:3] == [
+        "section_intro", "section_v1", "section_c1",
+    ]
+
+    saved = {section.id: section.prompt for section in store.get(project.id).sections}
+    # Both verses take the verse look and both choruses the chorus look — and, decisively,
+    # the second verse did NOT take the chorus paragraph that sits third in the treatment.
+    assert saved["section_v1"] == verse_look
+    assert saved["section_v2"] == verse_look
+    assert saved["section_c1"] == chorus_look
+    assert saved["section_c2"] == chorus_look
+    assert saved["section_intro"].startswith("The empty moonlit warehouse")
+    assert saved["section_outro"].startswith("Wide, still and haunting")
+    # The label this treatment never mentions is left empty, with the reason said out loud.
+    assert saved["section_bridge"] == ""
+    bridge = next(r for r in response.json()["sections"] if r["label"] == "Bridge")
+    assert bridge["filled"] is False and bridge["reason"] == SECTION_LOOK_SKIP_UNDESCRIBED
+    assert response.json()["filled"] == 6 and response.json()["skipped"] == 1
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_refuses_a_look_whose_id_and_label_disagree(tmp_path: Path):
+    """The checksum, and the reason the entry carries a label at all.
+
+    The id is the address, but a model copying ids down a numbered list can copy a
+    right-looking one off the wrong row — and with "Verse"/"Verse 2" and "Chorus"/"Chorus 2"
+    in play, one row off is Chorus 2's setting landing on the Bridge. So a pair that
+    disagrees writes nothing and says so; an id no section has writes nothing and is
+    counted; a section the model never answered for writes nothing. Casing and stray space
+    are not a disagreement — "chorus 2 " is the Director's "Chorus 2".
+    """
+    from music_video_producer.app import SECTION_LOOK_SKIP_UNANSWERED
+
+    director = SectionLookingDirector(
+        looks=[
+            # Right id, wrong name: the model was one row off. Refused.
+            ("section_bridge", "Chorus 2", "Slow glides across the canopy bed."),
+            # Same label, different case and spacing: the same box, accepted.
+            ("section_c2", " chorus 2 ", "The canopy bed, sweeping and glacial."),
+            # An id this project does not have: dropped, and counted in the message.
+            ("section_ghost", "Verse", "A look for a section that is not here."),
+            # Two answers for one id: the first wins, so the written text cannot depend on
+            # emission order.
+            ("section_intro", "Intro", "The first answer."),
+            ("section_intro", "Intro", "The second answer."),
+        ]
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = sectioned_project(store)
+
+    response = fill_looks(client, project.id, confirm_apply=True)
+    assert response.status_code == 200, response.text
+    rows = {row["label"]: row for row in response.json()["sections"]}
+
+    assert rows["Bridge"]["filled"] is False
+    assert "called it 'Chorus 2'" in rows["Bridge"]["reason"]
+    assert rows["Chorus 2"]["filled"] is True
+    assert rows["Verse"]["reason"] == SECTION_LOOK_SKIP_UNANSWERED
+
+    saved = {section.id: section.prompt for section in store.get(project.id).sections}
+    assert saved["section_bridge"] == ""  # the mislabelled look never landed
+    assert saved["section_c2"] == "The canopy bed, sweeping and glacial."
+    assert saved["section_intro"] == "The first answer."
+    assert saved["section_v1"] == "" and saved["section_v2"] == ""
+    assert "1 answer(s) addressed no section" in response.json()["message"]
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_refuses_absent_source_material_without_a_model_call(tmp_path: Path):
+    """Rule three, and the codebase's absent-analysis convention applied to prose.
+
+    An empty treatment is *unwritten*, not "no look wanted" — the same distinction
+    `shot_vocal_overlap` draws between a measured silence and an unmeasured song. There is
+    nothing to read a section's look out of, so the honest answer is a refusal naming the
+    document to write, not a fabricated sentence and not a 200 saying "0 filled" as though
+    the model had been asked and had nothing to say. Refused before the call, so an
+    unwritten project costs no model time at all.
+    """
+    from music_video_producer.app import (
+        SECTION_LOOKS_NO_SECTIONS,
+        SECTION_LOOKS_NO_STYLE_BIBLE,
+        SECTION_LOOKS_NO_TREATMENT,
+    )
+
+    director = SectionLookingDirector(looks=[("section_intro", "Intro", "Invented.")])
+    client, store, comfy = make_client(tmp_path, director=director)
+
+    no_sections = sectioned_project(store, [])
+    refused = fill_looks(client, no_sections.id, confirm_apply=True)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == SECTION_LOOKS_NO_SECTIONS
+
+    blank = sectioned_project(
+        store, [("section_intro", "Intro", 0.0, 11.0)], treatment="   \n "
+    )
+    refused = fill_looks(client, blank.id, confirm_apply=True)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == SECTION_LOOKS_NO_TREATMENT
+
+    bibleless = sectioned_project(
+        store, [("section_intro", "Intro", 0.0, 11.0)], style_bible=""
+    )
+    refused = fill_looks(client, bibleless.id, confirm_apply=True)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == SECTION_LOOKS_NO_STYLE_BIBLE
+
+    # Nothing asked, nothing written, nothing queued on any of the three.
+    assert director.calls == []
+    assert store.get(blank.id).sections[0].prompt == ""
+    assert comfy.prompts == []
+
+
+def test_fill_section_looks_translates_the_model_being_down(tmp_path: Path):
+    """The two director failures, at this route's own boundary: unconfigured is a 503 (the
+    host is not there), an unusable reply is a 502 (it is, and it answered badly). Neither
+    writes, which is the half worth pinning — a fill that half-landed on a 502 would leave
+    the section layer in a state nobody chose."""
+
+    class DownDirector(FakeDirector):
+        def __init__(self, error):
+            self.error = error
+
+        async def section_looks(self, *, looks_input):
+            raise self.error
+
+    from music_video_producer.director import DirectorError, DirectorUnavailable
+
+    for error, code in (
+        (DirectorUnavailable("LLM director is not configured."), 503),
+        (DirectorError("LLM director returned an invalid response: nope"), 502),
+    ):
+        client, store, comfy = make_client(tmp_path / f"root{code}", director=DownDirector(error))
+        project = sectioned_project(store, [("section_intro", "Intro", 0.0, 11.0)])
+        response = fill_looks(client, project.id, confirm_apply=True)
+        assert response.status_code == code, response.text
+        assert store.get(project.id).sections[0].prompt == ""
+        assert comfy.prompts == []
 
 
 def test_populate_adopts_the_models_sections_when_none_are_marked(tmp_path: Path):

@@ -183,6 +183,13 @@ BAR_CONTROLS = {
     "timeline-start": "the jump-to-start button",
     "timeline-play": "the play button",
     "timeline-time": "the timecode readout",
+    # The three controls the 2026-08-21 editing work added to this same row. Listed here rather
+    # than only in `tests/e2e_timeline_edit.py` because *this* script is the one that sweeps five
+    # widths, and this application has a recorded defect where three controls vanished behind a
+    # media query.
+    "undo-shots": "the Undo button",
+    "redo-shots": "the Redo button",
+    "snap-playhead": "the playhead magnet",
     "add-shot": "the add-shot button",
     "split-shot": "the split button",
     "duplicate-shot": "the duplicate button",

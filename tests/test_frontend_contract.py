@@ -2,6 +2,7 @@ import inspect
 import json
 import re
 import subprocess
+from dataclasses import asdict
 from pathlib import Path
 from typing import get_args
 
@@ -60,6 +61,12 @@ from music_video_producer.timeline import SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE
 from music_video_producer.workflows import MUSIC3_MAX_DURATION_SECONDS
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
+# `shotWriteInFlight` released in a `finally`, whether the block is one line or many. It was
+# pinned as a literal one-liner, which made "the flag is cleared even when the call throws" --
+# the property that actually matters -- indistinguishable from "the clearing is on one line".
+# Reformatting the whole-plan sweep's `finally` to fit a second control broke the assertion
+# without touching the guarantee.
+RELEASED_IN_FINALLY = re.compile(r'finally \{\s*shotWriteInFlight = "";')
 API_JS = Path("src/music_video_producer/web/assets/api.js")
 INDEX_HTML = Path("src/music_video_producer/web/index.html")
 STYLES_CSS = Path("src/music_video_producer/web/assets/styles.css")
@@ -2392,7 +2399,7 @@ def test_expansion_shuts_out_the_silent_shot_saves_that_would_revert_it():
     # Half two: no new save may be queued for the duration, so the flag goes up before the drain
     # and comes down in `finally`, where a failed or refused expansion also releases it.
     assert handler.index('shotWriteInFlight = "expansion";') < handler.index("await shotSaveChain")
-    assert 'finally { shotWriteInFlight = "";' in handler
+    assert RELEASED_IN_FINALLY.search(handler), handler
     # The flag is shared with Assistant ProducerBot, which needs exactly the same protection and
     # would otherwise get a second copy of it. Two *names* and only two, so a third path silently
     # blocking every timeline save under a name nothing explains still fails here -- which is what
@@ -2407,7 +2414,7 @@ def test_expansion_shuts_out_the_silent_shot_saves_that_would_revert_it():
     assert sorted(raisers) == ["assistant", "expansion", "expansion", "expansion"], raisers
     # Released in a `finally` by each of them, so a failed or refused write does not wedge every
     # timeline save off for the life of the page.
-    assert source.count('finally { shotWriteInFlight = "";') == len(raisers), source
+    assert len(RELEASED_IN_FINALLY.findall(source)) == len(raisers), source
 
     # The refusal lives in the one function every silent save goes through, ahead of both the
     # queueing and the dirty flags -- a save that is refused was never pending.
@@ -2432,7 +2439,20 @@ def test_expansion_shuts_out_the_silent_shot_saves_that_would_revert_it():
     assert blocked["blocked"] != blocked["assistant"]
 
     # Every timeline mutation goes through that one function rather than calling the route itself.
-    assert "api.saveShots(" not in source.replace(saver, ""), "a shot save bypasses saveShotsSilently"
+    #
+    # Two senders and exactly two. `stepHistory` -- the undo/redo write -- cannot go through
+    # `saveShotsSilently`, because it has to carry the revision the history stack is valid against
+    # rather than whatever this client last saw, and has to adopt the reply's shots rather than
+    # discard them. So it is held to the same two protections right here, which makes the
+    # exemption a narrower rule rather than a hole: the same in-flight flag, and a drained save
+    # chain before the request.
+    stepper = app_js_block("async function stepHistory")
+    assert "api.saveShots(" not in source.replace(saver, "").replace(stepper, ""), (
+        "a shot save bypasses both saveShotsSilently and the undo write"
+    )
+    assert "api.saveShots(projectId, entry.shots, undoRevision)" in stepper, stepper
+    assert "busy: shotWriteInFlight" in stepper, stepper
+    assert stepper.index("await shotSaveChain") < stepper.index("api.saveShots("), stepper
 
 
 def test_expansion_abandons_a_result_for_a_project_that_is_no_longer_loaded():
@@ -3664,9 +3684,13 @@ def test_the_timeline_clip_renders_only_what_the_prompt_cell_decided():
     assert "const cell = shotPromptCell(shot, percent);" in body
     for drawn in ("cell.className", "escapeHtml(cell.text)"):
         assert drawn in body, drawn
-    # Both the tooltip and the accessible name, from the one label.
-    assert 'title="${escapeHtml(cell.label)}"' in body
-    assert 'aria-label="${escapeHtml(cell.label)}"' in body
+    # Both the tooltip and the accessible name, from the one label -- which is now
+    # `clipWindowState`'s, because the shot-length band folds its own sentence into the same
+    # string rather than the template joining two. `band.label` *is* `cell.label` for every clip
+    # inside the band, and `clipWindowState` is executed for both arms by its own test.
+    assert "const band = clipWindowState(windowKinds[shot.id], cell.label);" in body
+    assert 'title="${escapeHtml(band.label)}"' in body
+    assert 'aria-label="${escapeHtml(band.label)}"' in body
     # The render-state word is applied the same way: one function decides it, including whether
     # the percentage is known at all, and the template only chooses whether the span exists.
     assert '<span class="clip-state">${escapeHtml(renderingFlag(percent))}</span>' in body
@@ -7082,7 +7106,7 @@ def test_the_sweep_control_is_wired_to_its_own_route_and_says_what_it_costs():
     # model calls rather than one, so every window it leaves open is open N times as long.
     assert handler.index('shotWriteInFlight = "expansion";') < handler.index("await shotSaveChain")
     assert handler.index("await shotSaveChain") < handler.index("api.expandPlanPrompts(")
-    assert 'finally { shotWriteInFlight = "";' in handler
+    assert RELEASED_IN_FINALLY.search(handler), handler
     # The reply is adopted only if the Director is still looking at the project it answers.
     assert handler.index("api.expandPlanPrompts(") < handler.index("state.project?.id !== projectId")
     assert handler.index("state.project?.id !== projectId") < handler.index("state.project = expanded")
@@ -9936,3 +9960,959 @@ def test_the_take_row_and_the_current_row_are_styled_as_open_and_closed():
         "nothing in this stylesheet gives a focused button a visible ring, and the take row is "
         "now reached by keyboard"
     )
+
+
+# ------------------------------------------------------------------------------------------
+# Direct manipulation on the SHOTS track: undo/redo, the gap-fill double-click, and snapping a
+# cut to the playhead. The Director's asks, 2026-08-21.
+#
+# Every decision is executed under node rather than read out of `app.js`. This file carries a
+# recorded incident where substring assertions let three UI guarantees invert with a green
+# suite, and every one of these is a rule whose *inverse* would still contain every string it
+# is made of. The browser half -- that the gestures are bound, reachable and land on the
+# server -- is `tests/e2e_timeline_edit.py`, which drives a real Edge.
+# ------------------------------------------------------------------------------------------
+
+#: A plan shaped like the Director's own: shots tiling a song, with the four sub-frame gaps
+#: their real project carries (0.002 s, 0.004 s, 0.014 s, 0.015 s) plus one large one.
+GAPPY_PLAN = """
+const project = {
+  id: 'p1', updated_at: 'rev-1',
+  song: { duration: 40, path: 'songs/000-x.wav' },
+  shots: [
+    { id: 's1', start: 0, duration: 5, status: 'draft' },
+    { id: 's2', start: 5.002, duration: 5, status: 'draft' },
+    { id: 's3', start: 10.016, duration: 5, status: 'draft' },
+    { id: 's4', start: 15.02, duration: 5, status: 'draft' },
+    { id: 's5', start: 22, duration: 5, status: 'draft' },
+    { id: 's6', start: 27, duration: 12.986, status: 'draft' },
+  ],
+};
+"""
+
+
+def test_the_assembly_tolerances_the_timeline_judges_contiguity_by_are_the_assemblers_own():
+    """A second, drifting copy would let the timeline call a plan contiguous that assembly then
+    refuses -- which is the worst possible place to learn the number is wrong."""
+    from music_video_producer.assembly import (
+        ASSEMBLY_FPS,
+        BOUNDARY_TOLERANCE_SECONDS,
+        COVERAGE_TOLERANCE_SECONDS,
+    )
+
+    numbers = run_module("""
+      import { ASSEMBLY_FPS, BOUNDARY_TOLERANCE_SECONDS, COVERAGE_TOLERANCE_SECONDS }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        fps: ASSEMBLY_FPS, boundary: BOUNDARY_TOLERANCE_SECONDS, coverage: COVERAGE_TOLERANCE_SECONDS,
+      }));
+    """)
+    assert numbers["fps"] == ASSEMBLY_FPS
+    assert numbers["boundary"] == pytest.approx(BOUNDARY_TOLERANCE_SECONDS)
+    assert numbers["coverage"] == pytest.approx(COVERAGE_TOLERANCE_SECONDS)
+
+
+def test_the_cut_move_refusals_are_the_snap_routes_own_sentences_in_its_own_order():
+    """Two gestures now move a cut from the client, and `timeline.cut_move_refusal` already
+    rules who may. Reworded copies would be a second thing to keep true, and the Director reads
+    whichever one happens to fire."""
+    from music_video_producer.timeline import (
+        SNAP_APPROVED_REFUSAL,
+        SNAP_IN_FLIGHT_REFUSAL,
+        SNAP_LOCKED_REFUSAL,
+    )
+
+    wordings = run_module("""
+      import { CUT_APPROVED_REFUSAL, CUT_IN_FLIGHT_REFUSAL, CUT_LOCKED_REFUSAL, cutMoveRefusal }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { shots: [
+        { id: 'a', start: 0, duration: 5, locked: true, approved_output: 'x', status: 'queued' },
+        { id: 'b', start: 5, duration: 5, approved_output: 'takes/b.mp4', status: 'queued' },
+        { id: 'c', start: 10, duration: 5, status: 'running' },
+        { id: 'd', start: 15, duration: 5, status: 'complete' },
+      ]};
+      console.log(JSON.stringify({
+        locked: CUT_LOCKED_REFUSAL, approved: CUT_APPROVED_REFUSAL, flight: CUT_IN_FLIGHT_REFUSAL,
+        order: cutMoveRefusal(project, project.shots[0]),
+        approvedShot: cutMoveRefusal(project, project.shots[1]),
+        renderingShot: cutMoveRefusal(project, project.shots[2]),
+        settled: cutMoveRefusal(project, project.shots[3]),
+        missing: cutMoveRefusal(project, null),
+      }));
+    """)
+    assert wordings["locked"] == SNAP_LOCKED_REFUSAL
+    assert wordings["approved"] == SNAP_APPROVED_REFUSAL
+    assert wordings["flight"] == SNAP_IN_FLIGHT_REFUSAL
+    # All three apply to `a`; a lock is the Director's own decision, so it is the sentence worth
+    # reading, exactly as it is on the server.
+    assert wordings["order"] == SNAP_LOCKED_REFUSAL.format(shot="SHOT 01 (a)")
+    assert wordings["approvedShot"] == SNAP_APPROVED_REFUSAL.format(shot="SHOT 02 (b)")
+    assert wordings["renderingShot"] == SNAP_IN_FLIGHT_REFUSAL.format(shot="SHOT 03 (c)")
+    # A rendered, unapproved shot's window is dragged every day of production. Gating on render
+    # provenance would refuse most of a mid-production plan, which is `cut_move_refusal`'s own
+    # ruling and has to stay true on this side too.
+    assert wordings["settled"] == ""
+    assert wordings["missing"] == ""
+
+
+def test_a_double_click_closes_a_sub_frame_gap_as_readily_as_a_large_one():
+    """The Director's plan carries 0.002 s, 0.004 s, 0.014 s and 0.015 s gaps -- residue from
+    hand-dragging edges. Every one is far inside `BOUNDARY_TOLERANCE_SECONDS`, so a rule that
+    only noticed gaps worth assembling about would decline every gap they actually have."""
+    plans = run_module(GAPPY_PLAN + """
+      import { contiguityProblems, gapFillPlan, planSeams }
+        from './src/music_video_producer/web/assets/api.js';
+      const fill = (id, edge) => gapFillPlan(project, id, edge);
+      const applied = JSON.parse(JSON.stringify(project));
+      // Every gap closed, one double-click at a time, with the plan carried forward between
+      // them: a long chain of gestures is the case a single call cannot cover.
+      for (const [id, edge] of [['s1','right'], ['s3','left'], ['s4','left'], ['s5','left'], ['s6','right']]) {
+        const step = gapFillPlan(applied, id, edge);
+        if (!step.ok) throw new Error(id + '/' + edge + ': ' + step.refusal);
+        const shot = applied.shots.find((item) => item.id === id);
+        shot.start = step.start;
+        shot.duration = step.duration;
+      }
+      console.log(JSON.stringify({
+        tiny: fill('s1', 'right'),
+        tinyLeft: fill('s2', 'left'),
+        large: fill('s5', 'left'),
+        none: fill('s6', 'left'),
+        tail: fill('s6', 'right'),
+        head: fill('s1', 'left'),
+        seamsAfter: planSeams(applied.shots, 40),
+        problemsAfter: contiguityProblems(applied.shots, 40),
+      }));
+    """)
+    # A 0.002 s gap closes, and the edge lands exactly on the neighbour rather than near it.
+    assert plans["tiny"]["ok"] is True
+    assert plans["tiny"]["gap"] == pytest.approx(0.002)
+    assert plans["tiny"]["start"] == 0
+    assert plans["tiny"]["duration"] == pytest.approx(5.002)
+    assert plans["tiny"]["neighbourId"] == "s2"
+    # The other edge of the same gap: s2's left edge runs back to meet s1's end.
+    assert plans["tinyLeft"]["ok"] is True
+    assert plans["tinyLeft"]["start"] == pytest.approx(5.0)
+    assert plans["tinyLeft"]["duration"] == pytest.approx(5.002)
+    # A large gap is the same gesture with a bigger number, not a different rule.
+    assert plans["large"]["ok"] is True
+    assert plans["large"]["gap"] == pytest.approx(1.98)
+    # An edge that already meets its neighbour has nothing to close, and says so by name.
+    assert plans["none"]["ok"] is False
+    assert "SHOT 06 (s6)" in plans["none"]["refusal"]
+    assert "no gap" in plans["none"]["refusal"]
+    # The song's own head and tail are the boundary when there is no shot there. The last clip
+    # ends at 39.986 in a 40 s song, so its right edge has 0.014 s of song to reach.
+    assert plans["tail"]["ok"] is True
+    assert plans["tail"]["gap"] == pytest.approx(0.014)
+    assert plans["tail"]["against"] == "the end of the song"
+    # The first clip already starts at 0, so there is no head gap to close.
+    assert plans["head"]["ok"] is False
+    # And the chain of five gestures leaves a plan that tiles the song exactly.
+    assert plans["problemsAfter"] == []
+    assert [round(seam["seconds"], 9) for seam in plans["seamsAfter"]] == [0, 0, 0, 0, 0, 0, 0]
+
+
+def test_the_gap_fill_never_swallows_an_overlapping_neighbour():
+    """The dangerous shape: an edge that already overlaps the next clip. Searching for "the
+    nearest neighbour that does not overlap" would skip the clip underneath and stretch to the
+    one after it -- taking a shot out of the picture without taking it out of the plan."""
+    verdicts = run_module("""
+      import { gapFillPlan } from './src/music_video_producer/web/assets/api.js';
+      const project = { song: { duration: 30 }, shots: [
+        { id: 'a', start: 0, duration: 12, status: 'draft' },
+        { id: 'b', start: 10, duration: 5, status: 'draft' },
+        { id: 'c', start: 20, duration: 10, status: 'draft' },
+      ]};
+      console.log(JSON.stringify({
+        overlapping: gapFillPlan(project, 'a', 'right'),
+        realGap: gapFillPlan(project, 'b', 'right'),
+      }));
+    """)
+    assert verdicts["overlapping"]["ok"] is False, (
+        "an already-overlapping edge was offered a stretch that would have swallowed SHOT 02"
+    )
+    assert verdicts["realGap"]["ok"] is True
+    assert verdicts["realGap"]["neighbourId"] == "c"
+    assert verdicts["realGap"]["duration"] == pytest.approx(10)
+
+
+def test_the_gap_fill_refuses_on_a_protected_shot_or_a_protected_neighbour():
+    """A cut belongs to the two shots that share it, so both are asked -- which is
+    `snap_cut_plan`'s own rule rather than a second, narrower one invented here."""
+    from music_video_producer.timeline import SNAP_APPROVED_REFUSAL, SNAP_LOCKED_REFUSAL
+
+    verdicts = run_module("""
+      import { gapFillPlan } from './src/music_video_producer/web/assets/api.js';
+      const plan = (extra) => ({ song: { duration: 30 }, shots: [
+        { id: 'a', start: 0, duration: 5, status: 'draft', ...(extra.a || {}) },
+        { id: 'b', start: 6, duration: 5, status: 'draft', ...(extra.b || {}) },
+      ]});
+      console.log(JSON.stringify({
+        open: gapFillPlan(plan({}), 'a', 'right'),
+        lockedSelf: gapFillPlan(plan({ a: { locked: true } }), 'a', 'right'),
+        approvedNeighbour: gapFillPlan(plan({ b: { approved_output: 'takes/b.mp4' } }), 'a', 'right'),
+        renderingNeighbour: gapFillPlan(plan({ b: { status: 'queued' } }), 'a', 'right'),
+      }));
+    """)
+    assert verdicts["open"]["ok"] is True
+    assert verdicts["lockedSelf"]["ok"] is False
+    assert verdicts["lockedSelf"]["refusal"] == SNAP_LOCKED_REFUSAL.format(shot="SHOT 01 (a)")
+    assert verdicts["approvedNeighbour"]["ok"] is False
+    assert verdicts["approvedNeighbour"]["refusal"] == SNAP_APPROVED_REFUSAL.format(
+        shot="SHOT 02 (b)"
+    )
+    assert verdicts["renderingNeighbour"]["ok"] is False
+
+
+def test_the_playhead_magnet_is_measured_in_pixels_so_it_feels_the_same_at_every_zoom():
+    """A tolerance in seconds would swallow a whole short shot at 6 px/s and be unreachably
+    fine at 64 px/s. It also declines while the song is playing: a moving playhead is not
+    something an edge can be lined up against."""
+    pulls = run_module("""
+      import { PLAYHEAD_SNAP_PIXELS, playheadSnap } from './src/music_video_producer/web/assets/api.js';
+      const at = (extra) => playheadSnap({ seconds: 12.3, playhead: 12, pixelsPerSecond: 16, ...extra });
+      console.log(JSON.stringify({
+        pixels: PLAYHEAD_SNAP_PIXELS,
+        near: at({}),
+        zoomedIn: at({ pixelsPerSecond: 64 }),
+        zoomedOut: at({ pixelsPerSecond: 6 }),
+        far: playheadSnap({ seconds: 13.5, playhead: 12, pixelsPerSecond: 16 }),
+        off: at({ enabled: false }),
+        playing: at({ playing: true }),
+        noScale: at({ pixelsPerSecond: 0 }),
+      }));
+    """)
+    assert pulls["pixels"] == 8
+    # 0.3 s away: inside 8 px at 16 px/s (4.8 px), outside it at 64 px/s (19.2 px).
+    assert pulls["near"] == {"snapped": True, "seconds": 12}
+    assert pulls["zoomedIn"]["snapped"] is False
+    assert pulls["zoomedIn"]["seconds"] == pytest.approx(12.3)
+    assert pulls["zoomedOut"]["snapped"] is True
+    assert pulls["far"]["snapped"] is False
+    assert pulls["off"]["snapped"] is False
+    assert pulls["playing"]["snapped"] is False, (
+        "an edge snapped to a playhead that is running, which is a moving target"
+    )
+    assert pulls["noScale"]["snapped"] is False
+
+
+def test_snapping_a_cut_moves_the_shared_boundary_and_leaves_the_plan_contiguous():
+    """The hard constraint. A shot's edge is its neighbour's edge, so both windows change --
+    the freehand drag changes one, which is how the Director's plan came to hold four sub-frame
+    gaps in the first place."""
+    moves = run_module("""
+      import { boundaryMovePlan, contiguityProblems }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { song: { duration: 30 }, shots: [
+        { id: 'a', start: 0, duration: 10, status: 'draft' },
+        { id: 'b', start: 10, duration: 10, status: 'draft' },
+        { id: 'c', start: 20, duration: 10, status: 'draft' },
+      ]};
+      const right = boundaryMovePlan(project, 'a', 'right', 12.5);
+      const applied = JSON.parse(JSON.stringify(project));
+      for (const w of right.windows) {
+        const shot = applied.shots.find((item) => item.id === w.id);
+        shot.start = w.start; shot.duration = w.duration;
+      }
+      console.log(JSON.stringify({
+        right,
+        left: boundaryMovePlan(project, 'b', 'left', 12.5),
+        after: contiguityProblems(applied.shots, 30),
+        unshared: boundaryMovePlan(
+          { shots: [{ id: 'x', start: 0, duration: 5 }, { id: 'y', start: 8, duration: 5 }] },
+          'x', 'right', 6,
+        ),
+        collapsed: boundaryMovePlan(project, 'a', 'right', 20),
+      }));
+    """)
+    assert moves["right"]["ok"] is True
+    assert moves["right"]["sharedId"] == "b"
+    assert moves["right"]["windows"] == [
+        {"id": "a", "start": 0, "duration": 12.5},
+        {"id": "b", "start": 12.5, "duration": 7.5},
+    ]
+    # Grabbing the same cut from its other side is the same move.
+    assert sorted(moves["left"]["windows"], key=lambda w: w["start"]) == sorted(
+        moves["right"]["windows"], key=lambda w: w["start"]
+    )
+    assert moves["after"] == [], "snapping a cut left a gap or an overlap in the plan"
+    # A neighbour on the far side of a real gap is not sharing this cut; that is what the
+    # double-click is for, and closing it silently here would be a second gesture in disguise.
+    assert moves["unshared"]["ok"] is True
+    assert moves["unshared"]["sharedId"] is None
+    assert len(moves["unshared"]["windows"]) == 1
+    # Zero length refuses; nothing here forbids a merely *short* window.
+    assert moves["collapsed"]["ok"] is False
+    assert "no length at all" in moves["collapsed"]["refusal"]
+
+
+def test_snapping_a_cut_never_refuses_a_window_for_being_short():
+    """Short windows are legitimate and are deliberately being made more so. A minimum-length
+    rule invented on this side would forbid, from the client, exactly what the render path is
+    being taught to allow."""
+    verdict = run_module("""
+      import { boundaryMovePlan } from './src/music_video_producer/web/assets/api.js';
+      const project = { shots: [
+        { id: 'a', start: 0, duration: 10, status: 'draft' },
+        { id: 'b', start: 10, duration: 10, status: 'draft' },
+      ]};
+      console.log(JSON.stringify({
+        short: boundaryMovePlan(project, 'a', 'right', 0.25),
+        shorterStill: boundaryMovePlan(project, 'a', 'right', 0.04),
+      }));
+    """)
+    # A quarter of a second: far under any shot-length band this application has ever had.
+    assert verdict["short"]["ok"] is True
+    assert verdict["short"]["windows"][0]["duration"] == pytest.approx(0.25)
+    assert verdict["shorterStill"]["ok"] is True
+
+
+def test_the_undo_button_says_what_it_would_undo_and_shuts_when_the_project_moved():
+    """The whole safety rule, executed. A stack that replayed over a revision it does not
+    account for is the one thing this feature must not do -- it would revert a landed render."""
+    from music_video_producer.app import PROJECT_CHANGED_REFUSAL
+
+    states = run_module("""
+      import { ASSISTANT_EDIT_BLOCKED, PROJECT_CHANGED_REFUSAL, SHOT_EXPANSION_EDIT_BLOCKED,
+               UNDO_DEPTH, undoControl, undoGestureLabel }
+        from './src/music_video_producer/web/assets/api.js';
+      const stack = [{ kind: 'move' }, { kind: 'split' }];
+      console.log(JSON.stringify({
+        refusal: PROJECT_CHANGED_REFUSAL,
+        depth: UNDO_DEPTH,
+        empty: undoControl([], { revision: 'r1', projectRevision: 'r1' }),
+        emptyRedo: undoControl([], { revision: 'r1', projectRevision: 'r1', redo: true }),
+        ready: undoControl(stack, { revision: 'r1', projectRevision: 'r1' }),
+        readyRedo: undoControl(stack, { revision: 'r1', projectRevision: 'r1', redo: true }),
+        moved: undoControl(stack, { revision: 'r1', projectRevision: 'r2' }),
+        unknown: undoControl(stack, { revision: null, projectRevision: 'r2' }),
+        expanding: undoControl(stack, { revision: 'r1', projectRevision: 'r1', busy: 'expansion' }),
+        filling: undoControl(stack, { revision: 'r1', projectRevision: 'r1', busy: 'assistant' }),
+        blocked: SHOT_EXPANSION_EDIT_BLOCKED,
+        assistantBlocked: ASSISTANT_EDIT_BLOCKED,
+        unknownGesture: undoGestureLabel('something-new'),
+      }));
+    """)
+    assert states["refusal"] == PROJECT_CHANGED_REFUSAL
+    assert states["depth"] == 40
+    assert states["empty"]["disabled"] is True
+    assert "Nothing to undo" in states["empty"]["title"]
+    assert states["emptyRedo"]["disabled"] is True
+    assert states["emptyRedo"]["title"] != states["empty"]["title"]
+    # It names the gesture. "Undo" alone does not say what comes back, which is the whole point.
+    assert states["ready"]["disabled"] is False
+    assert "the split" in states["ready"]["title"]
+    assert "Ctrl+Z" in states["ready"]["title"]
+    assert "Ctrl+Shift+Z" in states["readyRedo"]["title"]
+    # The server's own sentence, said before the request rather than only after it.
+    assert states["moved"]["disabled"] is True
+    assert states["moved"]["title"].startswith(PROJECT_CHANGED_REFUSAL)
+    # A revision nobody knows is treated as a revision that moved. Refusing is recoverable;
+    # replaying over an unknown state is not.
+    assert states["unknown"]["disabled"] is True
+    # And the two automated writes hold it shut in their own words rather than a third.
+    assert states["expanding"]["title"] == states["blocked"]
+    assert states["filling"]["title"] == states["assistantBlocked"]
+    assert states["unknownGesture"] == "the last shot edit"
+
+
+def test_the_undo_write_carries_the_stacks_revision_and_the_pre_gesture_shots():
+    """Driven end to end against the stub DOM: split a shot, let the save land, press Undo, and
+    read what went on the wire. A source read cannot tell a stack that records the state *after*
+    a gesture from one that records the state before it, and the two differ by everything."""
+    driven = run_workspace(
+        """
+        state.project = {
+          id: 'p1', updated_at: 'rev-1', name: 'x', assets: [], jobs: [], messages: [],
+          sections: [], song: { duration: 20, path: 'songs/000-x.wav' },
+          shots: [
+            { id: 's1', start: 0, duration: 10, prompt: 'one', status: 'draft', citations: [] },
+            { id: 's2', start: 10, duration: 10, prompt: 'two', status: 'draft', citations: [] },
+          ],
+        };
+        state.selectedShotId = 's1';
+        // What every project load does before a Director can click anything: draw the timeline
+        // once, which is where the history takes its baseline from the plan on screen.
+        app.syncUndoControls();
+        fire('#split-shot:click', {});
+        await flush();
+        const split = requests.filter((entry) => entry.method === 'PUT').at(-1);
+        const shotsAfterSplit = state.project.shots.length;
+        const undoBefore = { title: at('#undo-shots').title, disabled: at('#undo-shots').disabled };
+        fire('#undo-shots:click', {});
+        await flush();
+        const undone = requests.filter((entry) => entry.method === 'PUT').at(-1);
+        const redoAfter = at('#redo-shots');
+        console.log(JSON.stringify({
+          split: JSON.parse(split.body),
+          shotsAfterSplit,
+          undoTitle: undoBefore.title,
+          undoDisabled: undoBefore.disabled,
+          undo: JSON.parse(undone.body),
+          shotsAfterUndo: state.project.shots.length,
+          redoDisabled: redoAfter.disabled,
+          redoTitle: redoAfter.title,
+        }));
+        """,
+        responses={
+            # The split's own save, and the undo write after it. Each answers with the shots the
+            # route holds and a fresh revision, exactly as `PUT /shots` does.
+            "/api/projects/p1/shots": {
+                "body": {
+                    "id": "p1",
+                    "updated_at": "rev-2",
+                    "shots": [
+                        {"id": "s1", "start": 0, "duration": 10, "status": "draft"},
+                        {"id": "s2", "start": 10, "duration": 10, "status": "draft"},
+                    ],
+                }
+            },
+        },
+    )
+    # The split really happened, and it was sent whole.
+    assert driven["shotsAfterSplit"] == 3
+    assert len(driven["split"]["shots"]) == 3
+    assert driven["split"]["updated_at"] == "rev-1"
+    # The button names the gesture once the save has landed.
+    assert driven["undoDisabled"] is False
+    assert "the split" in driven["undoTitle"]
+    # And the undo carries the *pre-split* list, against the revision the save produced.
+    assert len(driven["undo"]["shots"]) == 2, driven["undo"]
+    assert [shot["duration"] for shot in driven["undo"]["shots"]] == [10, 10]
+    assert driven["undo"]["updated_at"] == "rev-2", (
+        "the undo was sent against the revision this client loaded rather than the one its own "
+        "save produced, so it would 409 on every plan that has been edited once"
+    )
+    # The reply is adopted, so the screen shows what the server holds rather than what the
+    # client hoped for -- and redo is now offered.
+    assert driven["shotsAfterUndo"] == 2
+    assert driven["redoDisabled"] is False
+    assert "the split" in driven["redoTitle"]
+
+
+def test_a_refused_save_records_nothing_to_undo():
+    """An undo of something that was never applied is the case that must not exist. The entry is
+    created when the server confirms the write and at no other moment, so a refused gesture
+    leaves the button exactly as shut as it was."""
+    driven = run_workspace(
+        """
+        state.project = {
+          id: 'p2', updated_at: 'rev-1', name: 'x', assets: [], jobs: [], messages: [],
+          sections: [], song: { duration: 20, path: 'songs/000-x.wav' },
+          shots: [
+            { id: 's1', start: 0, duration: 10, prompt: 'one', status: 'draft', citations: [] },
+            { id: 's2', start: 10, duration: 10, prompt: 'two', status: 'draft', citations: [] },
+          ],
+        };
+        state.selectedShotId = 's1';
+        // What every project load does before a Director can click anything: draw the timeline
+        // once, which is where the history takes its baseline from the plan on screen.
+        app.syncUndoControls();
+        fire('#split-shot:click', {});
+        await flush();
+        fire('#undo-shots:click', {});
+        await flush();
+        console.log(JSON.stringify({
+          shots: state.project.shots.length,
+          undoDisabled: at('#undo-shots').disabled,
+          undoTitle: at('#undo-shots').title,
+          writes: requests.filter((entry) => entry.method === 'PUT').length,
+        }));
+        """,
+        responses={
+            "/api/projects/p2/shots": {
+                "status": 409,
+                "body": {
+                    "detail": "Project changed since it was loaded; refresh before replacing it"
+                },
+            },
+        },
+    )
+    # One write went out -- the split's, which was refused. The undo click sent nothing.
+    assert driven["writes"] == 1, driven
+    assert driven["undoDisabled"] is True
+    assert "Nothing to undo" in driven["undoTitle"]
+
+
+def test_expand_all_prompts_is_offered_on_the_cuts_bar_with_the_sweeps_own_words():
+    """The Director's fourth ask: the control "up by where the Cuts and Snap Cuts stuff are".
+    A second affordance for one route -- so it shares the route, the refusal and the help, and
+    the timeline's copy is drawn by `renderSnapCuts` rather than shipped in the markup."""
+    drawn = run_workspace("""
+      const base = {
+        id: 'p3', updated_at: 'r1', name: 'x', assets: [], jobs: [], sections: [], messages: [],
+        song: { duration: 20, path: 'songs/000-x.wav', lyric_words: [], vocal_spans: [] },
+      };
+      state.project = { ...base, shots: [] };
+      app.renderSnapCuts();
+      const empty = at('#snap-bar').innerHTML;
+      state.project = { ...base, shots: [{ id: 's1', start: 0, duration: 20, status: 'draft' }] };
+      app.renderSnapCuts();
+      const planned = at('#snap-bar').innerHTML;
+      console.log(JSON.stringify({
+        selector: contract.EXPAND_ALL_PROMPTS_TIMELINE_CONTROL,
+        label: contract.EXPAND_ALL_PROMPTS_TIMELINE_LABEL,
+        help: contract.EXPAND_ALL_PROMPTS_HELP,
+        refusal: contract.EXPAND_ALL_PROMPTS_WITHOUT_SHOTS,
+        empty, planned,
+      }));
+    """)
+    # Its own id, because two elements may not share one -- the Director workspace keeps
+    # `#expand-h3-prompts` and this is a second door to the same room.
+    assert drawn["selector"] == "#timeline-expand-prompts"
+    assert drawn["selector"] != "#expand-h3-prompts"
+    for markup in (drawn["empty"], drawn["planned"]):
+        assert 'id="timeline-expand-prompts"' in markup
+        assert drawn["label"] in markup
+    # A plan with no shots draws it shut, saying the route's own sentence.
+    assert "disabled" in drawn["empty"].split('id="timeline-expand-prompts"')[1].split(">")[0]
+    assert drawn["refusal"][:40] in drawn["empty"]
+    # A plan with shots draws it live, saying what pressing it costs before the click.
+    assert "disabled" not in drawn["planned"].split('id="timeline-expand-prompts"')[1].split(">")[0]
+    assert "one call per shot" in drawn["planned"]
+
+
+def test_the_sweeps_per_shot_report_is_drawn_beside_the_button_that_raised_it():
+    """The route answers per shot on purpose: "a locked shot the sweep silently skipped is
+    indistinguishable to the Director from one it forgot". Those notices live in the Director
+    thread, which is two panels away from this button, so they are drawn here as well -- whole,
+    labelled by kind in words, and never summarised."""
+    reply = (
+        "The specialist ran once per shot.\n\n---\n"
+        "H3 prompts written for 2 shot(s): SHOT 01, SHOT 03\n\n"
+        "SHOT 02 is locked and was not touched.\n\n"
+        "SHOT 04 returned prose the format checker rejected."
+    )
+    drawn = run_module(
+        f"const reply = {json.dumps(reply)};"
+        """
+      import { expansionSweepLines } from './src/music_video_producer/web/assets/api.js';
+      const project = { messages: [
+        { id: 'm0', role: 'user', content: 'ignore me' },
+        { id: 'm1', role: 'assistant', content: reply, notices: [
+          { kind: 'change', text: 'H3 prompts written for 2 shot(s): SHOT 01, SHOT 03' },
+          { kind: 'refusal', text: 'SHOT 02 is locked and was not touched.' },
+          { kind: 'flag', text: 'SHOT 04 returned prose the format checker rejected.' },
+        ] },
+      ]};
+      console.log(JSON.stringify({ lines: expansionSweepLines(project) }));
+        """
+    )
+    assert [line["kind"] for line in drawn["lines"]] == ["change", "refusal", "flag"]
+    assert "SHOT 02 is locked" in drawn["lines"][1]["text"]
+    assert "format checker rejected" in drawn["lines"][2]["text"]
+    # And every one of them reaches the bar, in its own words and under its own label.
+    markup = run_workspace(
+        f"const reply = {json.dumps(reply)};"
+        """
+      state.project = {
+        id: 'p4', updated_at: 'r1', name: 'x', assets: [], jobs: [], sections: [],
+        song: { duration: 20, path: 'songs/000-x.wav', lyric_words: [], vocal_spans: [] },
+        shots: [{ id: 's1', start: 0, duration: 20, status: 'draft' }],
+        messages: [{ id: 'm1', role: 'assistant', content: reply, notices: [
+          { kind: 'change', text: 'H3 prompts written for 2 shot(s): SHOT 01, SHOT 03' },
+          { kind: 'refusal', text: 'SHOT 02 is locked and was not touched.' },
+          { kind: 'flag', text: 'SHOT 04 returned prose the format checker rejected.' },
+        ] }],
+      };
+      app.recordExpansionSweepReport();
+      app.renderSnapCuts();
+      console.log(JSON.stringify({ bar: at('#snap-bar').innerHTML }));
+        """
+    )
+    for sentence in (
+        "H3 prompts written for 2 shot(s): SHOT 01, SHOT 03",
+        "SHOT 02 is locked and was not touched.",
+        "SHOT 04 returned prose the format checker rejected.",
+    ):
+        assert escape_html(sentence) in markup["bar"], (
+            f"the sweep report swallowed {sentence!r}, which is the half a Director has to read"
+        )
+    for label in ("Change applied", "Safety notice", "Check this"):
+        assert label in markup["bar"], f"{label} is not on the report, so the kind is colour alone"
+
+
+def escape_html(value: str) -> str:
+    """api.js's `escapeHtml`, for asserting about markup it produced."""
+    for char, entity in (
+        ("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"), ('"', "&quot;"), ("'", "&#39;")
+    ):
+        value = value.replace(char, entity)
+    return value
+
+
+def test_the_timeline_tools_carry_undo_redo_and_the_playhead_magnet():
+    """In the bar the Director was told to look in, with an accessible name each. A tooltip is
+    not an accessible name and a glyph is not a label -- the rule that produced "i see what i
+    think is a zoom slider that isnt functional"."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    tools = re.search(r'<div class="timeline-tools">.*?</div>', markup, re.DOTALL)
+    assert tools, "the bar under the Monitor no longer has a tools group"
+    for control in ("undo-shots", "redo-shots", "snap-playhead"):
+        button = re.search(rf'<button[^>]*id="{control}"[^>]*>', tools.group(0))
+        assert button, f"#{control} is not in the bar under the Monitor"
+        assert "aria-label=" in button.group(0), button.group(0)
+    # Both history buttons ship shut: the stack is empty until a save lands, and a live-looking
+    # button before the first edit is a promise this feature deliberately does not make.
+    for control in ("undo-shots", "redo-shots"):
+        assert "disabled" in re.search(rf'<button[^>]*id="{control}"[^>]*>', markup).group(0)
+    # The magnet is a toggle, so its state is `aria-pressed` and not a class alone.
+    assert 'aria-pressed="true"' in re.search(
+        r'<button[^>]*id="snap-playhead"[^>]*>', markup
+    ).group(0)
+
+
+def test_ctrl_z_is_bound_and_is_not_swallowed_by_the_transport_keys():
+    """Guarded off editable elements by the same check the transport keys use, so Ctrl+Z inside
+    a prompt textarea is still the browser's own text undo -- and returning before the transport
+    branch, so the combination cannot fall through into a one-frame seek."""
+    handler = app_js_block('document.addEventListener?.("keydown"', "\n  });")
+
+    assert 'event.target.matches?.("input, textarea, select")' in handler
+    assert "runUndo()" in handler and "runRedo()" in handler
+    assert handler.index("runUndo()") < handler.index('event.code === "Space"'), (
+        "the undo shortcut is decided after the transport keys, so Ctrl+Z can reach a seek"
+    )
+    assert "event.shiftKey" in handler
+
+
+# ------------------------------------------------------------------------------------------
+# The shot-length band on the clip. The Director's ruling, 2026-08-20: "I dont anticipate a shot
+# being requested over 15 seconds, when dragging a clip past that it should turn yellow but we
+# arent dead yet."
+#
+# The band's constants live in `timeline.py` and the short end's floor fires well below its
+# nominal minimum, so the client reads the *server's verdict* rather than any constant: a
+# re-derived band would paint a clip yellow the server considers fine, or leave one plain that
+# it does not. These tests hold the browser to the report's own `kind`.
+# ------------------------------------------------------------------------------------------
+
+
+def test_the_clip_colours_from_the_reports_kind_and_never_from_its_own_arithmetic():
+    """`window_short` is not a problem: the render floors at H3's minimum and centres the window
+    inside it, so the exposed cut is exactly the window and a micro-cut is legitimate. Only the
+    long end draws a state, and it draws words beside the colour."""
+    from music_video_producer.batch import NOTE_KIND_WINDOW_LONG, NOTE_KIND_WINDOW_SHORT
+
+    drawn = run_module("""
+      import { CLIP_WINDOW_LONG_CLASS, NOTE_KIND_WINDOW_LONG, NOTE_KIND_WINDOW_SHORT,
+               clipWindowState, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const report = { window_warnings: [
+        { shot_ids: ['long'], labels: ['SHOT 01 (long)'], reason: 'past the band', kind: 'window_long' },
+        { shot_ids: ['short'], labels: ['SHOT 02 (short)'], reason: 'under the band', kind: 'window_short' },
+      ]};
+      console.log(JSON.stringify({
+        long: NOTE_KIND_WINDOW_LONG, short: NOTE_KIND_WINDOW_SHORT,
+        cls: CLIP_WINDOW_LONG_CLASS,
+        byShot: windowWarningsByShot(report),
+        none: windowWarningsByShot(null),
+        drawnLong: clipWindowState('window_long'),
+        drawnShort: clipWindowState('window_short'),
+        drawnUnknown: clipWindowState(undefined),
+        labelledLong: clipWindowState('window_long', 'A corridor push-in.').label,
+        labelledShort: clipWindowState('window_short', 'A micro cut.').label,
+      }));
+    """)
+    assert drawn["long"] == NOTE_KIND_WINDOW_LONG
+    assert drawn["short"] == NOTE_KIND_WINDOW_SHORT
+    assert drawn["byShot"] == {"long": "window_long", "short": "window_short"}
+    assert drawn["none"] == {}
+    # The long end: a class *and* a sentence. Colour alone carries no state here.
+    assert drawn["drawnLong"]["className"] == "window-long"
+    assert drawn["drawnLong"]["note"]
+    assert "still submits and renders" in drawn["drawnLong"]["note"]
+    # And it must not promise the extension that does not exist: the LTX graph is built and
+    # audited, and nothing in this application submits it.
+    assert "exten" not in drawn["drawnLong"]["note"].lower(), drawn["drawnLong"]["note"]
+    # The short end draws nothing at all, and leaves the clip's accessible name untouched.
+    assert drawn["drawnShort"] == {"className": "", "note": "", "label": ""}
+    assert drawn["drawnUnknown"] == {"className": "", "note": "", "label": ""}
+    assert drawn["labelledShort"] == "A micro cut."
+    assert drawn["labelledLong"].startswith("A corridor push-in. — ")
+    assert drawn["drawnLong"]["note"] in drawn["labelledLong"]
+
+
+def test_the_window_notes_are_never_drawn_as_near_duplicates_or_counted_as_pairs():
+    """`warnings` has exactly one meaning to every reader it already has -- "Near-duplicate", and
+    "N near-duplicate pairs" in the summary. A window note folded into it would reach the
+    Director under a name that is not what it says."""
+    lines = run_module("""
+      import { READINESS_SAMENESS_LABEL, READINESS_WINDOW_LONG_LABEL,
+               READINESS_WINDOW_SHORT_LABEL, readinessLines, readinessSummary }
+        from './src/music_video_producer/web/assets/api.js';
+      const report = {
+        ready: true, shot_count: 3, ready_count: 3, blocking: [],
+        warnings: [{ shot_ids: ['a', 'b'], labels: ['SHOT 01 (a)', 'SHOT 02 (b)'],
+                     reason: 'These two shots share one prompt.', kind: 'sameness' }],
+        warnings_computed: true, warnings_omitted: 0,
+        window_warnings: [
+          { shot_ids: ['c'], labels: ['SHOT 03 (c)'], reason: 'This shot is 20.000s, past the band. This does not block submission.', kind: 'window_long' },
+          { shot_ids: ['a'], labels: ['SHOT 01 (a)'], reason: 'This shot is 1.000s, under the band. This does not block submission.', kind: 'window_short' },
+        ],
+      };
+      console.log(JSON.stringify({
+        lines: readinessLines(report),
+        summary: readinessSummary(report),
+        sameness: READINESS_SAMENESS_LABEL,
+        longLabel: READINESS_WINDOW_LONG_LABEL,
+        shortLabel: READINESS_WINDOW_SHORT_LABEL,
+      }));
+    """)
+    kinds = [line["kind"] for line in lines["lines"]]
+    assert kinds == ["warning", "window-long", "window-short"], kinds
+    # Each under its own name, and the two window lines never under the sameness one.
+    assert lines["lines"][0]["text"].startswith(lines["sameness"])
+    assert lines["lines"][1]["text"].startswith(lines["longLabel"])
+    assert lines["lines"][2]["text"].startswith(lines["shortLabel"])
+    for line in lines["lines"][1:]:
+        assert lines["sameness"] not in line["text"], line["text"]
+    # The server's sentence, passed through whole -- including the half that says it is not a
+    # block, which is the half a Director needs in order to carry on.
+    assert "does not block submission" in lines["lines"][1]["reason"]
+    # And the summary still counts one pair, not three.
+    assert "1 near-duplicate pair" in lines["summary"], lines["summary"]
+    assert "3 near-duplicate" not in lines["summary"], lines["summary"]
+
+
+def test_the_window_verdict_the_browser_reads_is_the_one_the_route_answers_with():
+    """End to end over a real report: the route's payload, fed to the client's own reader. A
+    field renamed on either side is the failure this catches, and it is the failure that would
+    otherwise leave every clip plain for ever with the whole suite green."""
+    from music_video_producer.batch import readiness_report
+
+    project = Project(
+        name="Band",
+        shots=[
+            Shot(id="long", start=0, duration=20, prompt="A long corridor push-in.", mode="text"),
+            Shot(id="fine", start=20, duration=8, prompt="A steady mid on the singer.", mode="text"),
+            Shot(id="short", start=28, duration=1, prompt="A micro cut of the hands.", mode="text"),
+        ],
+    )
+    report = readiness_report(project)
+    payload = json.loads(json.dumps(asdict(report)))
+    verdicts = run_module(
+        f"const report = {json.dumps(payload)};"
+        """
+      import { clipWindowState, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const byShot = windowWarningsByShot(report);
+      console.log(JSON.stringify({
+        byShot,
+        long: clipWindowState(byShot.long, 'A long corridor push-in.'),
+        fine: clipWindowState(byShot.fine, 'A steady mid.'),
+        short: clipWindowState(byShot.short, 'A micro cut of the hands.'),
+      }));
+        """
+    )
+    assert verdicts["byShot"] == {"long": "window_long", "short": "window_short"}
+    assert verdicts["long"]["className"] == "window-long"
+    assert verdicts["fine"] == {"className": "", "note": "", "label": "A steady mid."}
+    assert verdicts["short"] == {
+        "className": "", "note": "", "label": "A micro cut of the hands."
+    }
+
+
+def test_the_long_window_clip_is_a_warning_and_not_a_block_anywhere():
+    """The Director's ruling is that this warns and never refuses. Read as a scan rather than a
+    behaviour test because it is a *negative*: what must not exist is a branch anywhere in the
+    client that reads the band and shuts something."""
+    api = API_JS.read_text(encoding="utf-8")
+    app = APP_JS.read_text(encoding="utf-8")
+    # The band's kinds are read in exactly the two places that draw: the readiness list and the
+    # clip. Nothing that decides `disabled`, a refusal or a submission may mention them.
+    for source, name in ((api, "api.js"), (app, "app.js")):
+        for line in source.splitlines():
+            if "window_long" not in line and "WINDOW_LONG" not in line:
+                continue
+            assert "disabled" not in line, f"{name} shuts a control from the window band: {line}"
+            assert "refus" not in line.lower() or line.strip().startswith("//"), (
+                f"{name} refuses something from the window band: {line}"
+            )
+    # And the styles draw the long end and deliberately leave the short end alone.
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".shot-clip.window-long" in styles
+    assert ".shot-clip.window-short" not in styles, (
+        "the short end is drawn as a state on the clip, which says 'wrong' about a window the "
+        "render handles by design"
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# Fill section looks: the browser half. The Director's report (2026-08-20) was made *at* the
+# section inspector — "I clicked on a Section in the timeline and noticed that the shared prompt
+# wasnt pre-filled with information from the Treatment" — so the control lives there, and the
+# confirm text is executed under node rather than read out of `app.js`.
+# --------------------------------------------------------------------------------------------
+
+#: A report in the shape `SectionLooksResponse` really answers with, including the two skips
+#: that carry the server's own sentences.
+SECTION_LOOKS_REPORT = {
+    "applied": False,
+    "filled": 2,
+    "skipped": 2,
+    "message": "2 filled, 2 left alone",
+    "project": None,
+    "sections": [
+        {"section_id": "section_a", "label": "Intro", "start": 0.0, "filled": True,
+         "prompt": "The empty moonlit warehouse.", "previous": "", "reason": ""},
+        {"section_id": "section_b", "label": "Verse", "start": 11.0, "filled": True,
+         "prompt": "Handheld at the chrome mic.", "previous": "", "reason": ""},
+        {"section_id": "section_c", "label": "Bridge", "start": 103.2, "filled": False,
+         "prompt": "", "previous": "",
+         "reason": "the treatment does not describe this section"},
+        {"section_id": "section_d", "label": "Outro", "start": 124.1, "filled": False,
+         "prompt": "A proposed outro look.", "previous": "My own outro look.",
+         "reason": "already has a look you wrote; send overwrite=true to replace it"},
+    ],
+}
+
+
+def test_the_section_look_confirmation_names_every_section_and_every_skip_reason():
+    """The report is the half that makes this safe, so nothing in it is summarised away.
+
+    A skipped section's line is the **server's own sentence**, unedited — `snapCutsReportLines`'
+    rule and for its reason. "The treatment does not describe this section" is what sends the
+    Director back to the treatment; swallowed, the box is just mysteriously still blank.
+    """
+    text = run_module("""
+      import { sectionLooksConfirmation } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        filled: sectionLooksConfirmation(__REPORT__),
+        empty: sectionLooksConfirmation(null),
+      }));
+    """.replace("__REPORT__", json.dumps(SECTION_LOOKS_REPORT)))
+
+    assert text["empty"] == ""
+    confirmation = text["filled"]
+    assert confirmation.startswith("2 filled, 2 left alone")
+    for row in SECTION_LOOKS_REPORT["sections"]:
+        assert row["label"] in confirmation
+        assert (row["prompt"] if row["filled"] else row["reason"]) in confirmation
+    # The proposal for a section that will NOT be written is shown as a skip, never as a line
+    # that reads like it is about to land.
+    assert "124.1s Outro: skipped — already has a look you wrote" in confirmation
+    assert confirmation.rstrip().endswith("Write these looks?")
+
+
+def test_the_fill_section_looks_control_sits_in_the_section_inspector_and_reports_first():
+    """Where the gap was reported, and in the order the server enforces.
+
+    The control is drawn in the section inspector beside the shared prompt it fills, the first
+    call carries no confirmation (a report), and the overwrite consent is a **second** question
+    — asked only when the report says a hand-written look is in the way.
+    """
+    app = APP_JS.read_text(encoding="utf-8")
+    api = API_JS.read_text(encoding="utf-8")
+    # Drawn in the same template string as the shared prompt textarea, which is the inspector.
+    inspector = next(line for line in app.splitlines() if 'id="section-prompt"' in line)
+    assert 'id="section-fill-looks"' in inspector
+    # Report first: the un-flagged call, then a confirm, then the applying call.
+    handler = app.split('#section-fill-looks")?.addEventListener')[1].split(
+        '$("#section-delete")'
+    )[0]
+    assert handler.index("api.fillSectionLooks(projectId)") < handler.index("window.confirm(")
+    assert handler.index("window.confirm(") < handler.index("confirmApply: true")
+    assert "FILL_SECTION_LOOKS_OVERWRITE_QUESTION" in handler
+    # Both flags are on the wire, and the route is the server's.
+    assert "/sections/fill-looks" in api
+    assert "confirm_apply: confirmApply, overwrite" in api
+
+
+def test_a_second_press_on_an_edge_is_only_the_same_gesture_while_the_window_is_open():
+    """Mutation testing found this branch unheld: dropping the elapsed-time check left every
+    press on an edge that had *ever* been pressed reading as a double-click, so a shot resized
+    at the start of a session would have its gap closed by the next touch on the same handle."""
+    presses = run_module("""
+      import { EDGE_DOUBLE_CLICK_MS, doubleEdgePress }
+        from './src/music_video_producer/web/assets/api.js';
+      const first = { shotId: 's1', edge: 'right', at: 1_000_000 };
+      const at = (delta, extra = {}) => doubleEdgePress(first, { ...first, at: first.at + delta, ...extra });
+      console.log(JSON.stringify({
+        window: EDGE_DOUBLE_CLICK_MS,
+        immediate: at(0),
+        inside: at(EDGE_DOUBLE_CLICK_MS - 1),
+        exactly: at(EDGE_DOUBLE_CLICK_MS),
+        justOutside: at(EDGE_DOUBLE_CLICK_MS + 1),
+        muchLater: at(120_000),
+        otherEdge: at(50, { edge: 'left' }),
+        otherShot: at(50, { shotId: 's2' }),
+        backwards: at(-50),
+        nothingBefore: doubleEdgePress(null, first),
+        notAnEdge: doubleEdgePress(first, { shotId: 's1', edge: '', at: first.at + 50 }),
+      }));
+    """)
+    assert presses["window"] == 400
+    assert presses["immediate"] is True
+    assert presses["inside"] is True
+    assert presses["exactly"] is True
+    assert presses["justOutside"] is False
+    assert presses["muchLater"] is False, (
+        "a press two minutes after the last one closed a gap nobody asked to close"
+    )
+    # A different edge, or a different shot, is a different gesture.
+    assert presses["otherEdge"] is False
+    assert presses["otherShot"] is False
+    # And nothing pathological counts: a clock that went backwards, no previous press, or a
+    # press on the body of a clip rather than on one of its handles.
+    assert presses["backwards"] is False
+    assert presses["nothingBefore"] is False
+    assert presses["notAnEdge"] is False
+
+
+def test_a_gesture_saved_after_another_writer_moved_the_project_records_nothing():
+    """Mutation testing found this branch unheld too, and it is the sharpest edge in the whole
+    design: `restores` is the plan as the *last landed save* left it, so if some other route
+    wrote in between, it is the plan before **that writer** and not before this click. Undoing
+    to it would silently revert their work. The entry is dropped rather than kept."""
+    driven = run_workspace(
+        """
+        state.project = {
+          id: 'p9', updated_at: 'rev-1', name: 'x', assets: [], jobs: [], messages: [],
+          sections: [], song: { duration: 20, path: 'songs/000-x.wav' },
+          shots: [
+            { id: 's1', start: 0, duration: 10, prompt: 'one', status: 'draft', citations: [] },
+            { id: 's2', start: 10, duration: 10, prompt: 'two', status: 'draft', citations: [] },
+          ],
+        };
+        state.selectedShotId = 's1';
+        app.syncUndoControls();
+        fire('#split-shot:click', {});
+        await flush();
+        const afterSplit = { disabled: at('#undo-shots').disabled, name: at('#undo-shots').title };
+        // Somebody else's route answered with the whole project and this client adopted it --
+        // an approve, a mark-ready, a take swap. The revision moves; the shot list this stack
+        // describes does not exist any more.
+        state.project.updated_at = 'rev-from-another-writer';
+        fire('#add-shot:click', {});
+        await flush();
+        console.log(JSON.stringify({
+          afterSplit,
+          afterForeign: { disabled: at('#undo-shots').disabled, name: at('#undo-shots').title },
+          writes: requests.filter((entry) => entry.method === 'PUT').length,
+        }));
+        """,
+        responses={
+            "/api/projects/p9/shots": {
+                "body": {
+                    "id": "p9",
+                    "updated_at": "rev-2",
+                    "shots": [
+                        {"id": "s1", "start": 0, "duration": 10, "status": "draft"},
+                        {"id": "s2", "start": 10, "duration": 10, "status": "draft"},
+                    ],
+                }
+            },
+        },
+    )
+    # The split alone is undoable, and says so.
+    assert driven["afterSplit"]["disabled"] is False
+    assert "the split" in driven["afterSplit"]["name"]
+    # Both writes went out -- nothing here refuses an edit, only the *history* is dropped.
+    assert driven["writes"] == 2, driven
+    assert driven["afterForeign"]["disabled"] is True, (
+        "an undo is offered after another writer moved the project, and the snapshot it holds "
+        "is the plan from before that writer -- pressing it would revert their work"
+    )
+    assert "Nothing to undo" in driven["afterForeign"]["name"], driven["afterForeign"]

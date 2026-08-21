@@ -1,7 +1,17 @@
 import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, RESUBMIT_SEED_STRIDE, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
+import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
+// Fill section looks: the Director's empty shared prompt, read out of the Treatment.
+import { FILL_SECTION_LOOKS_APPLIED, FILL_SECTION_LOOKS_HELP, FILL_SECTION_LOOKS_LABEL, FILL_SECTION_LOOKS_OVERWRITE_QUESTION, FILL_SECTION_LOOKS_RUNNING, sectionLooksConfirmation } from "./api.js";
 import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clampTimelineZoom, timelineWheelPlan, zoomFromSlider, zoomLabelText, zoomSliderValue, zoomViewport } from "./api.js";
+// Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
+// playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
+// two stacks, binds the gestures and does the writing.
+import { GAP_FILL_TOAST, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, boundaryMovePlan, doubleEdgePress, exactSeconds, gapFillPlan, playheadSnap, undoControl, undoGestureLabel } from "./api.js";
+// The shot-length band, as the server judges it: the report carries the verdict and the clip
+// reads it. Nothing on this side re-derives the band -- see `clipWindowState` for why.
+import { clipWindowState, windowWarningsByShot } from "./api.js";
 import { REPLACE_WITH_CANCEL, REPLACE_WITH_HEADING, REPLACE_WITH_HELP, REPLACE_WITH_MERGED_HEADING, REPLACE_WITH_PLACEHOLDER, REPLACE_WITH_RUNNING, REPLACE_WITH_SKIPPED_HEADING, REPLACE_WITH_SWAPPED_HEADING, assetIsCited, assetReplacementControl, assetReplacementOptions, assetReplacementReportLines, replaceInShotsControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
@@ -34,6 +44,18 @@ let readinessLoadRevision = 0;
 let snapToleranceSeconds = SNAP_TOLERANCE_DEFAULT;
 let snapReport = null;
 let snapInFlight = false;
+// The whole-plan H3 sweep, as the timeline's copy of its button draws it: whether one is running,
+// and the per-shot report the last one answered with. Module state for `snapReport`'s reason
+// exactly -- derived, never saved, never sent back -- and cleared by a project load, because a
+// report naming one plan's shots drawn under another plan is a claim about shots not on screen.
+let expansionSweepInFlight = false;
+let expansionSweepReport = null;
+// Whether a dragged shot edge is pulled onto the playhead when it comes within a few pixels of
+// it (the Director's ask, 2026-08-21). A working preference, not project data: it lives in this
+// browser's session storage beside the zoom and the panel, exactly as the two line mutes and the
+// master volume do, and never in the manifest -- how one Director likes to drag is not a property
+// of the video. On by default, because the request was for the behaviour and not for a switch.
+let playheadSnapOn = true;
 // Replace With / Cancel, offered only after a delete was refused. Module state for `snapReport`'s
 // reason exactly -- derived, never saved, never sent back. `replaceForAssetId` is which asset the
 // refusal was about, so the affordance cannot leak onto a different card when the selection moves;
@@ -191,6 +213,8 @@ function persistSession() {
       pixelsPerSecond: state.pixelsPerSecond,
       selectedShotId: state.selectedShotId,
       volume: $("#master-audio")?.volume ?? 1,
+      // How this Director likes to drag, never a property of the video -- see `playheadSnapOn`.
+      playheadSnap: playheadSnapOn,
     }));
   } catch { /* storage may be denied; the app works without it */ }
 }
@@ -235,6 +259,10 @@ async function loadProject(id) {
   // write windows onto shots nobody was looking at. Cleared on every load, refresh included --
   // a refresh means the plan changed, and a report about the plan before it is stale.
   snapReport = null;
+  // The sweep's per-shot report, for the snap report's reason exactly: it names one plan's shots
+  // by label, and a report drawn under another project's name would be a claim about shots that
+  // are not on screen.
+  expansionSweepReport = null;
   // And the replacement report, for the same reason and with a sharper edge: it names asset ids
   // and shot labels from the project being left, so an apply offered under another project's name
   // would rewrite citations on shots nobody was looking at.
@@ -257,6 +285,7 @@ async function loadProject(id) {
   if (!id) {
     state.project = null;
     state.audioBuffer = null;
+    clearUndoHistory();
     renderAll();
     return;
   }
@@ -274,6 +303,12 @@ async function loadProject(id) {
   state.dirty = false;
   state.documentsDirty = false;
   state.shotsDirty = false;
+  // The undo history describes one project's shot list at one revision, and this is the one
+  // place both can change. Cleared on every load, refresh included: a refresh means some other
+  // writer moved the project -- a queued render, a settled job, a Director in another tab -- and
+  // an entry taken before that would replay over it. `clearUndoHistory` re-takes the baseline
+  // from what was just loaded, so the next gesture is undoable immediately.
+  clearUndoHistory();
   renderAll();
   loadPersistedWaveform(id);
   loadReadiness(id);
@@ -1108,6 +1143,11 @@ function renderTimeline() {
   const timeOrder = new Map(
     [...(state.project?.shots || [])].sort((a, b) => a.start - b.start).map((shot, rank) => [shot.id, rank + 1])
   );
+  // The server's verdict on each shot's window length, never this client's own arithmetic. The
+  // band's constants live in `timeline.py` and the short end's floor fires well below its
+  // nominal minimum, so a check re-derived here would drift and paint the wrong clips. Only the
+  // long end draws anything -- see `clipWindowState`, and the Director's ruling behind it.
+  const windowKinds = windowWarningsByShot(readinessReport);
   track.innerHTML = (state.project?.shots || []).map((shot) => {
     // The live percentage for this shot's H3 render, or nothing at all. It reaches three of the
     // clip's signals -- the RENDERING word, the title, and the accessible name -- and reaches
@@ -1126,14 +1166,20 @@ function renderTimeline() {
     // `SHOT_RENDERING_FLAG` constant `shotRenderState` puts in `render.flag`, with the live
     // percentage appended when there is one.
     const render = shotRenderState(shot);
+    // The window band, read off the server's report rather than measured here. The hue is the
+    // Director's yellow; the sentence goes into the title and the accessible name beside it,
+    // because a state carried by colour alone does not exist for a screen reader and this
+    // application says so about every other state it draws.
+    const band = clipWindowState(windowKinds[shot.id], cell.label);
     const marks = [
       `status-${shot.status || "draft"}`,
       shot.approved_output || shot.status === "approved" ? "approved" : "",
       shot.flagged ? "flagged" : "",
       shot.locked ? "locked" : "",
       render.inFlight ? "rendering" : "",
+      band.className,
     ].filter(Boolean).join(" ");
-    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(cell.label)}" aria-label="${escapeHtml(cell.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
+    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
   }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
@@ -1156,6 +1202,11 @@ function renderTimeline() {
   // The whole-plan H3 sweep lives beside the pass-one expansion in the Director workspace, and its
   // only question is whether this plan has any shots -- which is a thing this function owns.
   syncExpansionControls();
+  // Undo and Redo, in the bar beside the tools whose gestures they step back. Repainted here for
+  // exactly `syncExpansionControls`' reason: every selection change, project load and reply
+  // already passes through this function, and a button left saying it would undo a split the
+  // Director has already undone is worse than no button.
+  syncUndoControls();
   if (state.audioBuffer) drawWaveform($("#timeline-waveform"), state.audioBuffer, "#6f7d3d");
   // The measured voice map, striped over the master row: where the track actually sings
   // (Whisper word timestamps, merged) — the Director's planning fact for "which Shots
@@ -1204,7 +1255,7 @@ function applyZoom(next) {
 export function renderSnapCuts() {
   const bar = $("#snap-bar");
   if (!bar) return;
-  if (!state.project) { bar.innerHTML = ""; snapReport = null; return; }
+  if (!state.project) { bar.innerHTML = ""; snapReport = null; expansionSweepReport = null; return; }
   const control = snapCutsControl(state.project, snapToleranceSeconds, snapReport);
   const disabled = control.disabled || snapInFlight;
   const label = snapInFlight ? SNAP_CUTS_RUNNING : control.label;
@@ -1224,7 +1275,25 @@ export function renderSnapCuts() {
   const dismiss = snapReport
     ? `<button class="quiet-button" id="snap-dismiss" ${snapInFlight ? "disabled" : ""}>${escapeHtml(SNAP_CUTS_DISMISS_LABEL)}</button>`
     : "";
-  bar.innerHTML = `<div class="snap-controls"><span class="eyebrow">Cuts</span>${tolerance}<button class="quiet-button" id="snap-cuts" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button>${dismiss}<span class="snap-reason">${escapeHtml(control.reason)}</span></div>${report}`;
+  // "Expand All Prompts", where the Director went looking for it (2026-08-21): "up by where the
+  // Cuts and Snap Cuts stuff are". The same route, the same refusal and the same help text as the
+  // button in the Director workspace -- `expandAllPromptsControl` decides for both, so a plan with
+  // no shots draws two shut buttons saying the same sentence rather than one of each.
+  const sweep = expandAllPromptsControl(state.project);
+  const sweepLabel = expansionSweepInFlight ? EXPAND_ALL_PROMPTS_RUNNING : EXPAND_ALL_PROMPTS_TIMELINE_LABEL;
+  const expand = `<button class="quiet-button" id="${EXPAND_ALL_PROMPTS_TIMELINE_CONTROL.slice(1)}" ${sweep.disabled || expansionSweepInFlight ? "disabled" : ""} title="${escapeHtml(sweep.title)}" aria-label="${escapeHtml(sweep.title)}">${escapeHtml(sweepLabel)}</button>`;
+  // Every line the route reported, whole and in its own words, each labelled for its kind. This
+  // is the half that must not be swallowed: a sweep that silently skipped four locked shots is
+  // indistinguishable from one that forgot them, which is exactly why the route answers per shot.
+  const sweepReport = expansionSweepReport?.length
+    ? `<div class="snap-report expansion-report">${expansionSweepReport.map((line) =>
+        `<div class="snap-${line.kind === "change" ? "move" : "skip"}"><strong>${escapeHtml(NOTICE_KINDS[line.kind]?.label || line.kind)}</strong> ${escapeHtml(line.text)}</div>`).join("")}<button class="quiet-button" id="expansion-dismiss">${escapeHtml(SNAP_CUTS_DISMISS_LABEL)}</button></div>`
+    : "";
+  bar.innerHTML = `<div class="snap-controls"><span class="eyebrow">Cuts</span>${tolerance}<button class="quiet-button" id="snap-cuts" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button>${dismiss}${expand}<span class="snap-reason">${escapeHtml(control.reason)}</span></div>${report}${sweepReport}`;
+  const expandButton = $(EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, bar);
+  if (expandButton) expandButton.addEventListener("click", expandPlanPrompts);
+  const forget = $("#expansion-dismiss", bar);
+  if (forget) forget.addEventListener("click", () => { expansionSweepReport = null; renderSnapCuts(); });
   const box = $("#snap-tolerance", bar);
   if (box) {
     box.addEventListener("change", (event) => {
@@ -1396,6 +1465,83 @@ function renderReferences() {
   track.innerHTML = refs.join("");
 }
 
+// The last press on a resize handle, as `{shotId, edge, at}`, or null. Module state because the
+// clip nodes it describes are destroyed and rebuilt between the two clicks of a double-click --
+// which is the whole reason it exists. Cleared by the press that completes the gesture, so three
+// clicks in a row are one double-click and one press rather than two overlapping ones.
+let lastEdgePress = null;
+
+// Whether the song is running right now, read from the master element rather than from a flag.
+// A moving playhead is not something an edge can be lined up against, which is why the snap is
+// off while it plays.
+function masterPlaying() {
+  const audio = $("#master-audio");
+  return Boolean(audio && audio.paused === false);
+}
+
+// The Director's gesture C: park the playhead on a beat, drag a cut to it, and have it land
+// exactly there. Applied on release rather than during the drag, and through `boundaryMovePlan`
+// rather than by writing one window, because a cut belongs to *two* shots -- the neighbour's edge
+// moves with it and the plan stays contiguous. Freehand dragging is untouched: it still changes
+// one window, which is the gesture that put four sub-frame gaps in the Director's plan and the
+// reason this one exists.
+function applyPlayheadSnap(shot, mode, seconds, original) {
+  // Measured against the plan as it was before the drag: the neighbour shares the *original*
+  // cut, and the shot has been mutated live by the pointermove handler.
+  shot.start = original.start;
+  shot.duration = original.duration;
+  shot.trim_nudge = original.nudge;
+  const plan = boundaryMovePlan(state.project, shot.id, mode, seconds);
+  if (!plan.ok) {
+    renderTimeline();
+    if (plan.refusal) toast(plan.refusal, "error");
+    return false;
+  }
+  const byId = new Map(state.project.shots.map((item) => [item.id, item]));
+  for (const window of plan.windows) {
+    const target = byId.get(window.id);
+    if (!target) continue;
+    target.start = window.start;
+    target.duration = window.duration;
+  }
+  // The rendered-shot rule from the freehand drag, unchanged: moving the left edge moves the cut
+  // into the take by the same amount, so the same take frame stays at the same song second.
+  if (mode === "left" && shot.latest_output) {
+    shot.trim_nudge = exactSeconds(original.nudge + (shot.start - original.start));
+  }
+  state.dirty = true;
+  saveShotsSilently("snap");
+  renderTimeline();
+  toast(PLAYHEAD_SNAP_TOAST.replace("{seconds}", seconds.toFixed(3)));
+  return true;
+}
+
+// The Director's gesture B: double-click an edge with empty song beside it and it runs out to
+// meet the neighbour. `gapFillPlan` decides everything -- which neighbour, how big the gap is,
+// and whether either shot at the resulting cut refuses to have it moved.
+//
+// The window moves and nothing else. `trim_nudge` is deliberately left alone even on a rendered
+// shot: closing a 0.002 s gap must not silently re-time a take, and a window that outgrows its
+// take is assembly's judgement to make and refuse, which it already does.
+function runGapFill(shotId, edge) {
+  if (!state.project) return;
+  const plan = gapFillPlan(state.project, shotId, edge);
+  if (!plan.ok) {
+    if (plan.refusal) toast(plan.refusal, "error");
+    return;
+  }
+  const shot = state.project.shots.find((item) => item.id === shotId);
+  if (!shot) return;
+  shot.start = plan.start;
+  shot.duration = plan.duration;
+  state.dirty = true;
+  saveShotsSilently("gapfill");
+  renderTimeline();
+  toast(GAP_FILL_TOAST
+    .replace("{shot}", shotLabel(state.project, shotId))
+    .replace("{seconds}", plan.gap.toFixed(3)));
+}
+
 function bindClip(clip) {
   clip.addEventListener("pointerdown", (event) => {
     const shot = state.project.shots.find((item) => item.id === clip.dataset.shotId);
@@ -1403,17 +1549,47 @@ function bindClip(clip) {
     state.selectedSectionId = null;
     renderTimeline();
     const mode = event.target.classList.contains("left") ? "left" : event.target.classList.contains("right") ? "right" : "move";
+    // Gesture B, decided here rather than by a `dblclick` listener. The `renderTimeline()` above
+    // has just replaced every clip node in the document, so the element the first click of a
+    // double-click landed on is gone before the second one happens and the browser dispatches no
+    // `dblclick` at all. `doubleEdgePress` says why at length; only a real browser can tell the
+    // two apart.
+    if (mode !== "move") {
+      const press = { shotId: shot.id, edge: mode, at: Date.now() };
+      const doubled = doubleEdgePress(lastEdgePress, press);
+      lastEdgePress = doubled ? null : press;
+      if (doubled) {
+        runGapFill(shot.id, mode);
+        return;
+      }
+    }
     const startX = event.clientX;
     const original = { start: shot.start, duration: shot.duration, nudge: shot.trim_nudge || 0 };
+    // Where the playhead caught this edge, or null. Read at release, which is what makes the
+    // snap a decision about where the drag *ended* rather than about every frame it crossed.
+    let magnetised = null;
     // Frame-stepped, not quarter-second: the buffer being dragged out is 6 frames deep on
     // one side, and a 0.25 s step could only ever reveal one notch of it.
     const grid = (value) => Math.round(value * 24) / 24;
+    // The playhead's pull on the edge being dragged, in seconds. `playheadSnap` decides; it
+    // measures in screen pixels, so the gesture feels the same at every zoom, and it declines
+    // while the song is playing.
+    const magnet = (edgeSeconds) => playheadSnap({
+      seconds: edgeSeconds,
+      playhead: state.playhead,
+      pixelsPerSecond: state.pixelsPerSecond,
+      enabled: playheadSnapOn && mode !== "move",
+      playing: masterPlaying(),
+    });
     const move = (moveEvent) => {
       const delta = (moveEvent.clientX - startX) / state.pixelsPerSecond;
       const snapped = grid(delta);
+      magnetised = null;
       if (mode === "move") shot.start = Math.max(0, grid(original.start + snapped));
       if (mode === "left") {
         const end = original.start + original.duration;
+        const pull = magnet(original.start + delta);
+        const want = pull.snapped ? pull.seconds : grid(original.start + snapped);
         if (shot.latest_output) {
           // The Director's ask (2026-08-20): an edge drag on a rendered shot does not
           // re-window the plan, it drags out the take's over-render buffer. Moving the
@@ -1423,14 +1599,24 @@ function bindClip(clip) {
           // begins.
           const lead = shot.latest_take_lead || 0;
           const floor = original.start - Math.max(0, lead + original.nudge);
-          shot.start = clamp(grid(original.start + snapped), Math.max(0, floor), end - .5);
+          shot.start = clamp(want, Math.max(0, floor), end - .5);
           shot.trim_nudge = grid(original.nudge + (shot.start - original.start));
         } else {
-          shot.start = clamp(grid(original.start + snapped), 0, end - .5);
+          shot.start = clamp(want, 0, end - .5);
         }
-        shot.duration = grid(end - shot.start);
+        shot.duration = exactSeconds(end - shot.start);
+        // Only when the clamp did not fight the magnet: an edge held off the playhead by the
+        // floor has not landed on it, and saying it had would move the neighbour to a cut the
+        // edge never reached.
+        if (pull.snapped && shot.start === pull.seconds) magnetised = pull.seconds;
       }
-      if (mode === "right") shot.duration = Math.max(.5, grid(original.duration + snapped));
+      if (mode === "right") {
+        const pull = magnet(original.start + original.duration + delta);
+        shot.duration = pull.snapped
+          ? Math.max(.5, exactSeconds(pull.seconds - shot.start))
+          : Math.max(.5, grid(original.duration + snapped));
+        if (pull.snapped && exactSeconds(shot.start + shot.duration) === pull.seconds) magnetised = pull.seconds;
+      }
       state.dirty = true;
       renderTimeline();
     };
@@ -1447,7 +1633,8 @@ function bindClip(clip) {
       window.removeEventListener("pointerup", up);
       const moved = shot.start !== original.start || shot.duration !== original.duration
         || (shot.trim_nudge || 0) !== original.nudge;
-      if (moved) saveShotsSilently();
+      if (moved && magnetised !== null && applyPlayheadSnap(shot, mode, magnetised, original)) return;
+      if (moved) saveShotsSilently(mode === "move" ? "move" : "resize");
       else if (mode === "move") seekMasterAudio(shot.start);
     };
     window.addEventListener("pointermove", move);
@@ -1558,7 +1745,7 @@ export function renderShotInspector() {
         const mid = item.start + item.duration / 2;
         return section.start <= mid && mid < section.start + section.duration;
       }).length;
-      inspector.innerHTML = `<span class="eyebrow">Section</span><h2>${escapeHtml(section.label)}</h2><div class="meta-list"><b>Window</b><span>${section.start.toFixed(2)}s – ${(section.start + section.duration).toFixed(2)}s (${section.duration.toFixed(2)}s)</span><b>Covers</b><span>${covered} shot${covered === 1 ? "" : "s"}</span></div><label>Label<input id="section-label" value="${escapeHtml(section.label)}"></label><label>Shared prompt — carried into every shot in this section<textarea id="section-prompt" rows="7" placeholder="What this whole section looks like: location, staging, energy. Shots inside it vary the angle and action.">${escapeHtml(section.prompt || "")}</textarea></label><button class="danger-button full" id="section-delete">Delete section</button><p class="control-reason">Drag the box to move it; drag its edges to resize. Edges snap to the shots below. The label pairs with the lyric sheet's [Tags] by order — "Verse 2" takes the second [Verse] block.</p>`;
+      inspector.innerHTML = `<span class="eyebrow">Section</span><h2>${escapeHtml(section.label)}</h2><div class="meta-list"><b>Window</b><span>${section.start.toFixed(2)}s – ${(section.start + section.duration).toFixed(2)}s (${section.duration.toFixed(2)}s)</span><b>Covers</b><span>${covered} shot${covered === 1 ? "" : "s"}</span></div><label>Label<input id="section-label" value="${escapeHtml(section.label)}"></label><label>Shared prompt — carried into every shot in this section<textarea id="section-prompt" rows="7" placeholder="What this whole section looks like: location, staging, energy. Shots inside it vary the angle and action.">${escapeHtml(section.prompt || "")}</textarea></label><button class="quiet-button full" id="section-fill-looks" title="${escapeHtml(FILL_SECTION_LOOKS_HELP)}">${escapeHtml(FILL_SECTION_LOOKS_LABEL)}</button><button class="danger-button full" id="section-delete">Delete section</button><p class="control-reason">Drag the box to move it; drag its edges to resize. Edges snap to the shots below. The label pairs with the lyric sheet's [Tags] by order — "Verse 2" takes the second [Verse] block.</p>`;
       $("#section-label")?.addEventListener("change", (event) => {
         section.label = event.target.value.trim() || section.label;
         saveSectionsSilently(); renderTimeline();
@@ -1566,6 +1753,35 @@ export function renderShotInspector() {
       $("#section-prompt")?.addEventListener("change", (event) => {
         section.prompt = event.target.value;
         saveSectionsSilently();
+      });
+      // Whole-structure, not this section alone: the looks are read off one treatment in one
+      // model call, and offering a per-section version would spend a call each to answer the
+      // same question seven times. Report, then confirm — the server enforces the same order,
+      // so a client that skipped the question could not skip the decision anyway.
+      $("#section-fill-looks")?.addEventListener("click", async () => {
+        const projectId = state.project?.id;
+        if (!projectId) return;
+        const button = $("#section-fill-looks");
+        button.disabled = true;
+        button.textContent = FILL_SECTION_LOOKS_RUNNING;
+        try {
+          const report = await api.fillSectionLooks(projectId);
+          if (state.project?.id !== projectId) return;
+          if (!report.filled) return toast(report.message, "error");
+          if (!window.confirm(sectionLooksConfirmation(report))) return;
+          // The second consent, asked only when there is something to overwrite. Declining it
+          // still writes the empty ones, which is the whole point of the flags being separate.
+          const written = report.sections.some((row) => row.previous && !row.filled);
+          const overwrite = written && window.confirm(FILL_SECTION_LOOKS_OVERWRITE_QUESTION);
+          const applied = await api.fillSectionLooks(projectId, { confirmApply: true, overwrite });
+          if (state.project?.id !== projectId) return;
+          state.project = applied.project || state.project;
+          renderAll();
+          toast(FILL_SECTION_LOOKS_APPLIED
+            .replace("{filled}", String(applied.filled))
+            .replace("{skipped}", String(applied.skipped)));
+        } catch (error) { toast(error.message, "error"); }
+        finally { renderShotInspector(); }
       });
       $("#section-delete")?.addEventListener("click", () => {
         state.project.sections = (state.project.sections || []).filter((item) => item.id !== section.id);
@@ -2250,26 +2466,53 @@ async function expandPlanPrompts() {
   if (!requireProject()) return;
   if (!state.project.shots.length) return toast(EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, "error");
   if (!state.health?.llm?.configured) return toast("Configure MVP_LLM_BASE_URL and MVP_LLM_MODEL to expand shots into H3 prompts.", "error");
-  if (!confirmDiscardingDocumentEdits(`Expand all ${state.project.shots.length} shot(s) into H3 prompts? That is one model call per shot and takes a while. No creative intent is overwritten, but the whole project comes back, so the editors are re-rendered from the text stored on the server.`)) return;
+  if (!confirmDiscardingDocumentEdits(EXPAND_ALL_PROMPTS_CONFIRM.replace("{count}", String(state.project.shots.length)))) return;
   const projectId = state.project.id;
   const button = $(EXPAND_ALL_PROMPTS_CONTROL);
-  const label = button.textContent;
-  button.disabled = true;
-  button.textContent = "Expanding…";
+  const label = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = EXPAND_ALL_PROMPTS_RUNNING; }
   shotWriteInFlight = "expansion";
+  // The timeline's own copy of this button is drawn by `renderSnapCuts` from this flag, exactly
+  // as the snap-cuts button is drawn from `snapInFlight`. A button relabelled by hand would be
+  // wiped by the next repaint; a flag the render reads cannot be.
+  expansionSweepInFlight = true;
+  expansionSweepReport = null;
+  renderSnapCuts();
   try {
     await shotSaveChain;
     const expanded = await api.expandPlanPrompts(projectId);
     if (state.project?.id !== projectId) return;
     state.project = expanded;
+    // The route's own per-shot report — what was written, what was locked, what carried render
+    // provenance, what was refused — kept for the bar that raised it. It is already in the
+    // Director thread, which is two panels away from the button the Director pressed.
+    recordExpansionSweepReport();
     // The report the panel is holding describes a single-shot call from before this sweep, and the
     // sweep has just answered for that shot again.
     lastExpansionReport = null;
     markDocumentsSaved();
+    // Every shot's `h3_prompt` has just been rewritten on the server. Nothing in the undo stack
+    // describes that plan, and a step back would replay a shot list from before it -- so the
+    // history is dropped rather than left offering one.
+    clearUndoHistory();
     renderAll();
     toast(expandAllPromptsToast(state.project));
   } catch (error) { toast(error.message, "error"); }
-  finally { shotWriteInFlight = ""; button.disabled = false; button.textContent = label; syncExpansionControls(); }
+  finally {
+    shotWriteInFlight = "";
+    expansionSweepInFlight = false;
+    if (button) { button.disabled = false; button.textContent = label; }
+    syncExpansionControls();
+    renderSnapCuts();
+  }
+}
+
+// The sweep's per-shot report, taken off the project on screen and held for the bar to draw.
+// Exported for the executed frontend contract, `renderSnapCuts`' reason exactly: what has to be
+// proven is that every one of the route's sentences reaches the screen, and that is a property of
+// the markup this produces rather than of the line that assigns it.
+export function recordExpansionSweepReport() {
+  expansionSweepReport = expansionSweepLines(state.project);
 }
 
 // The sweep control's state, repainted from the project on screen. Its own function rather than a
@@ -2285,7 +2528,154 @@ export function syncExpansionControls() {
   control.title = sweep.title;
 }
 
-function saveShotsSilently() {
+// ---- Undo/redo over the shot list -----------------------------------------------------------
+//
+// The Director lost a shot to a mis-click and had nothing to press (2026-08-21). The design and
+// its safety argument are written out beside `undoControl` in api.js; the three things this half
+// is responsible for are:
+//
+// 1. **`shotsBaseline`** -- a clone of the shot list as the server last confirmed it. It is what
+//    makes "before this gesture" recoverable for *every* save rather than only for the handlers
+//    that remembered to snapshot: the state before save N is by definition the state after save
+//    N-1, which is exactly what this holds. Set on project load and by every landed save.
+// 2. **`undoRevision`** -- the project revision the two stacks are valid against. Every landed
+//    shots save advances it, and the undo write carries it as `PUT /shots`'s concurrency token,
+//    so a server-side write this client did not make refuses the replay instead of overwriting
+//    it. The pre-flight in `undoControl` compares the same two values.
+// 3. **Dropping the history the moment the revision moves.** `syncUndoControls` compares the
+//    revision the stack is valid against with the project's own on every render, and discards
+//    the stack when they part -- which they do the instant this client adopts any other route's
+//    reply. `undoGeneration` is the companion to that: a save queued *before* a discard must not
+//    push its snapshot afterwards, because by then `restores` describes a plan from before some
+//    other writer rather than from before this click.
+let shotsBaseline = null;
+let undoStack = [];
+let redoStack = [];
+let undoRevision = null;
+let undoInFlight = false;
+// How many times the history has been discarded. A save queued before a discard must not push
+// its snapshot afterwards: `restores` is the plan as the last landed save left it, and once the
+// history has been dropped -- by a project load, by a sweep, or by the revision self-heal below
+// -- that plan is no longer "the state before this click". Mutation testing found this: the
+// revision check alone did not cover it, because the self-heal had already adopted the new
+// revision by the time the save landed, so the two agreed and a stale snapshot was recorded.
+let undoGeneration = 0;
+
+// Everything the two stacks hold, forgotten, and the baseline re-taken from what is on screen.
+// Called by every project load -- an undo offered under one project's name that restored another
+// project's shot list is the worst thing this feature could do.
+function clearUndoHistory() {
+  undoGeneration += 1;
+  undoStack = [];
+  redoStack = [];
+  undoRevision = state.project?.updated_at || null;
+  shotsBaseline = state.project ? structuredClone(state.project.shots || []) : null;
+}
+
+// Both buttons, repainted from the stacks and the revision. Called from `renderTimeline` for
+// `syncExpansionControls`' reason: every selection change, project load and reply goes through it.
+export function syncUndoControls() {
+  // Self-heal, and the other half of the server-moved rule. `updated_at` moving while this stack
+  // is standing means some other writer changed the project and this client adopted the reply --
+  // an approve, a mark-ready, a take swap, a queued render, a whole-plan sweep. Every entry below
+  // describes a plan that no longer exists, so the history is dropped here and the baseline
+  // re-taken from what is now on screen: the *next* gesture is undoable immediately, and it steps
+  // back onto the plan as that writer left it rather than as this client last saved it.
+  //
+  // This is deliberately not the whole guarantee. A writer this client never saw -- a render
+  // landing and being reconciled on the server -- moves `updated_at` without moving this copy of
+  // it, so the comparison here passes and the undo write is refused by `PUT /shots` instead, in
+  // the server's own words. Both paths refuse; neither overwrites.
+  if (state.project && undoRevision !== (state.project.updated_at || null)) clearUndoHistory();
+  const shared = { revision: undoRevision, projectRevision: state.project?.updated_at || null, busy: shotWriteInFlight };
+  for (const [selector, entries, redo] of [["#undo-shots", undoStack, false], ["#redo-shots", redoStack, true]]) {
+    const button = $(selector);
+    if (!button) continue;
+    const control = undoControl(entries, { ...shared, redo });
+    button.disabled = control.disabled || undoInFlight;
+    button.title = control.title;
+    // The accessible name says what will be undone, not merely "Undo" -- the whole point of the
+    // control is that the Director can tell what they are about to get back. A glyph is not a
+    // label, and a tooltip is not an accessible name.
+    button.setAttribute("aria-label", control.title);
+  }
+}
+
+// The magnet's switch, drawn from the flag rather than from the DOM's own class, so the button,
+// the drag handler and the stored session can never disagree about whether it is on. Pressed
+// state in words as well as in `aria-pressed`, because a toggle whose only signal is a hue is a
+// toggle nobody can read.
+function syncPlayheadSnapControl() {
+  const button = $("#snap-playhead");
+  if (!button) return;
+  button.classList.toggle("snap-on", playheadSnapOn);
+  button.setAttribute("aria-pressed", playheadSnapOn ? "true" : "false");
+  button.title = `${PLAYHEAD_SNAP_LABEL}: ${playheadSnapOn ? "on" : "off"}. ${PLAYHEAD_SNAP_HELP}`;
+  button.setAttribute("aria-label", button.title);
+}
+
+// One step back. The snapshot is sent first and adopted only from the reply: a refused undo must
+// leave the screen showing what the server actually holds, and mutating `state.project.shots`
+// before the write is how an undo that the server refused would still look as though it happened.
+//
+// Only `shots` and `updated_at` are taken from the reply. The route answers with the whole
+// project, and adopting that wholesale would re-seed the document editors from the server --
+// this application's recurring editor-wiping defect, and the reason `saveShotsSilently`
+// deliberately does not adopt its own reply either.
+async function stepHistory(from, onto, redo) {
+  if (undoInFlight || !state.project) return;
+  const control = undoControl(from, {
+    revision: undoRevision,
+    projectRevision: state.project.updated_at || null,
+    busy: shotWriteInFlight,
+    redo,
+  });
+  if (control.disabled) return toast(control.title, "error");
+  const projectId = state.project.id;
+  const entry = from[from.length - 1];
+  undoInFlight = true;
+  syncUndoControls();
+  try {
+    // Any gesture save still queued lands first, so this is a step back from the plan the server
+    // holds rather than a race with the write that put it there.
+    await shotSaveChain;
+    if (state.project?.id !== projectId) return;
+    const displaced = structuredClone(state.project.shots || []);
+    const saved = await api.saveShots(projectId, entry.shots, undoRevision);
+    if (state.project?.id !== projectId) return;
+    from.pop();
+    onto.push({ kind: entry.kind, shots: displaced });
+    state.project.shots = saved.shots;
+    state.project.updated_at = saved.updated_at;
+    shotsBaseline = structuredClone(saved.shots || []);
+    undoRevision = saved.updated_at || null;
+    if (!state.project.shots.some((shot) => shot.id === state.selectedShotId)) {
+      state.selectedShotId = state.project.shots[0]?.id || null;
+    }
+    state.shotsDirty = false;
+    state.dirty = state.documentsDirty;
+    renderTimeline();
+    loadReadiness(projectId);
+    toast(`${redo ? "Redone" : "Undone"}: ${undoGestureLabel(entry.kind)}`);
+  } catch (error) {
+    // The server's own words, verbatim. A 409 here is the design working -- something wrote the
+    // project underneath this stack -- so the history is dropped rather than left offering a
+    // replay that would refuse again.
+    toast(String(error?.message || error), "error");
+    clearUndoHistory();
+  } finally {
+    undoInFlight = false;
+    if (state.project?.id === projectId) syncUndoControls();
+  }
+}
+
+function runUndo() { return stepHistory(undoStack, redoStack, false); }
+function runRedo() { return stepHistory(redoStack, undoStack, true); }
+
+// `kind` names the gesture for the button's own sentence. It defaults to the generic edit rather
+// than to nothing, because *every* landed shots save is recorded: a stack that skipped the
+// inspector's own writes would step back over one silently the next time it was pressed.
+function saveShotsSilently(kind = "edit") {
   if (!state.project) return Promise.resolve();
   // Refused, not queued: this save carries the whole shot list as it was before the write, so
   // landing it afterwards reverts everything just written while the success toast is still on
@@ -2301,6 +2691,13 @@ function saveShotsSilently() {
   const revision = ++shotSaveRevision;
   state.shotsDirty = true;
   state.dirty = true;
+  // What the plan looked like before this write, captured at queue time and *not* re-read at
+  // send time: it is the state the last landed save left behind, and it is what an undo of this
+  // gesture puts back. Held apart from the entry itself because the entry is only created if
+  // the write lands -- an undo of something that was never applied is the one thing this
+  // feature must not offer.
+  const restores = shotsBaseline ? structuredClone(shotsBaseline) : null;
+  const bornAt = undoGeneration;
   shotSaveChain = shotSaveChain
     // The revision travels with the save and is read at SEND time, not at queue time: the
     // chain runs saves one by one, and each adopts the server's fresh `updated_at` below, so
@@ -2311,6 +2708,32 @@ function saveShotsSilently() {
     .then((saved) => {
       if (state.project?.id === projectId && saved?.updated_at) {
         state.project.updated_at = saved.updated_at;
+      }
+      if (state.project?.id === projectId) {
+        // Recorded only if the history this snapshot belongs to is still standing.
+        //
+        // `restores` is the plan as the *last landed save* left it, so it is this gesture's
+        // "before" only while nothing else has written in between. When something has -- an
+        // approve, a take swap, a whole-plan sweep, a project load -- the history is discarded
+        // where that is noticed (`syncUndoControls`' self-heal, `loadProject`, the sweep), and
+        // the generation is what makes a save queued *before* that discard drop its snapshot
+        // rather than push it afterwards.
+        //
+        // There used to be a second check here, comparing the revision this save was sent
+        // against with the one the stack was valid against. Mutation testing showed it could no
+        // longer fail: the self-heal had already adopted the new revision by the time the save
+        // landed, so the two always agreed -- and it was the *generation*, not the revision,
+        // that was catching the stale snapshot. An untested branch that cannot fire is worse
+        // than no branch.
+        if (restores && bornAt === undoGeneration) undoStack.push({ kind, shots: restores });
+        if (undoStack.length > UNDO_DEPTH) undoStack.shift();
+        // A new gesture is a new branch of history: what was undone is no longer ahead of it.
+        // Not for the undo/redo writes themselves -- those go through `stepHistory`, which
+        // moves the entry across by hand rather than coming through here at all.
+        redoStack = [];
+        shotsBaseline = structuredClone(shots);
+        undoRevision = saved?.updated_at || null;
+        syncUndoControls();
       }
       if (revision === shotSaveRevision) {
         state.shotsDirty = false;
@@ -2897,7 +3320,18 @@ function bindEvents() {
     // blocks exactly this string: a second spelling here would create Shots the timeline draws as
     // prompted and the route then refuses.
     const shot = { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start, duration: Math.min(5, Math.max(.5, projectDuration() - start)), prompt: PLACEHOLDER_PROMPT, mode: null, asset_ids: [], citations: [], singing: "unknown", seed: 0, status: "draft", prompt_id: "", approved_output: "", locked: false };
-    shots.push(shot); state.selectedShotId = shot.id; saveShotsSilently(); renderTimeline();
+    shots.push(shot); state.selectedShotId = shot.id; saveShotsSilently("add"); renderTimeline();
+  });
+  // Undo and Redo. Both go through `stepHistory`, which pre-flights the same rule `undoControl`
+  // draws the button with, so a click on a stale button says the same sentence the tooltip does
+  // rather than being silently ignored.
+  $("#undo-shots")?.addEventListener("click", runUndo);
+  $("#redo-shots")?.addEventListener("click", runRedo);
+  // The playhead magnet's switch. Session-only, like the two line mutes beside it.
+  $("#snap-playhead")?.addEventListener("click", () => {
+    playheadSnapOn = !playheadSnapOn;
+    syncPlayheadSnapControl();
+    persistSession();
   });
   // Duplicate copies the plan and nothing else. It used to clone the whole Shot and reset
   // `status`, which left the copy owning the original's take: the same `latest_output` played in
@@ -2906,7 +3340,7 @@ function bindEvents() {
   // subtracting from a clone, so an unclassified field is absent from the copy rather than
   // inherited by it. The original is untouched -- its take, its approval and its pointer all
   // stay exactly where they were.
-  $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + shot.duration }); state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently(); renderTimeline(); });
+  $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + shot.duration }); state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently("duplicate"); renderTimeline(); });
   $("#delete-shot").addEventListener("click", () => {
     const shot = selectedShot();
     if (!shot) return;
@@ -2917,13 +3351,13 @@ function bindEvents() {
     if (!window.confirm(`Delete ${name}? Its rendered takes stay on disk, but the shot leaves the plan.`)) return;
     state.project.shots = state.project.shots.filter((item) => item.id !== shot.id);
     state.selectedShotId = state.project.shots[0]?.id || null;
-    saveShotsSilently(); renderTimeline();
+    saveShotsSilently("delete"); renderTimeline();
   });
   // The split's second half is a new Shot on the same terms as a duplicate: it has rendered
   // nothing, so it carries the plan and no take. The first half keeps everything it had --
   // narrowing a window is not a reason to touch a pointer, and the take it names is still the
   // last thing this Shot rendered.
-  $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + half, duration: half }); shot.duration = half; state.project.shots.push(copy); saveShotsSilently(); renderTimeline(); });
+  $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + half, duration: half }); shot.duration = half; state.project.shots.push(copy); saveShotsSilently("split"); renderTimeline(); });
   $("#monitor-fullscreen")?.addEventListener("click", () => {
     const monitor = $("#timeline-monitor");
     if (document.fullscreenElement) document.exitFullscreen();
@@ -3021,6 +3455,15 @@ function bindEvents() {
     if (event.target.matches?.("input, textarea, select") || event.target.isContentEditable) return;
     if (!state.project) return;
     const frame = 1 / 24;
+    // Ctrl+Z / Ctrl+Shift+Z, and Ctrl+Y for the redo the rest of Windows spells that way. Ahead
+    // of the transport keys and returning, so the modifier combinations can never fall through
+    // into a seek. Guarded off editable elements by the check above, so Ctrl+Z in a prompt
+    // textarea is still the browser's own text undo and not a step back through the plan.
+    if ((event.ctrlKey || event.metaKey) && (event.key === "z" || event.key === "Z" || event.key === "y" || event.key === "Y")) {
+      event.preventDefault();
+      const redo = event.shiftKey || event.key === "y" || event.key === "Y";
+      return redo ? runRedo() : runUndo();
+    }
     if (event.code === "Space") {
       event.preventDefault();
       toggleMasterAudio();
@@ -3179,6 +3622,11 @@ async function init() {
   bindEvents();
   const session = restoreSession();
   if (Number.isFinite(session.pixelsPerSecond)) state.pixelsPerSecond = clampTimelineZoom(session.pixelsPerSecond);
+  // Only an explicit `false` turns it off. A session saved before this existed carries no key at
+  // all, and reading that as "off" would ship the feature switched off for everyone who already
+  // had a session -- which is every Director who has used this workspace.
+  if (session.playheadSnap === false) playheadSnapOn = false;
+  syncPlayheadSnapControl();
   await Promise.all([loadHealth(), loadVramEject(), api.workflows().catch(() => [])]);
   try { await loadProjects(); } catch (error) { toast(error.message, "error"); }
   if (session.panel) document.querySelector(`[data-panel="${session.panel}"]`)?.click();

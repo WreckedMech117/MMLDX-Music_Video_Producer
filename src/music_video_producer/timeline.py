@@ -59,16 +59,73 @@ OVER_RENDER_LEAD_SECONDS = 0.25
 #: The one frame rate every adapter in this application renders at.
 H3_FPS = 24
 
+#: The shortest take this application ever asks H3 for: `H3_MIN_SHOT_SECONDS` on the grid.
+#: 4.0 s is 96 frames, which snaps up to **107** — 4.4583 s. Every render, however short its
+#: window, is at least this long.
+H3_MIN_RENDER_FRAMES = align_h3_frames(round(H3_MIN_SHOT_SECONDS * H3_FPS))
+
+
+def margin_frames(duration: float) -> int:
+    """What the over-render *margin alone* asks for: ``duration + 0.5`` on the 17k+5 grid.
+
+    Separated from `over_render_frames` because two things now read it and they must read the
+    same arithmetic: the frame count itself, floored below, and `over_render_centred` — which
+    decides where the buffer sits by asking whether that floor fired at all. The grid's own
+    ``frame_count <= 5`` clamp is what answers a zero or negative duration.
+    """
+    return align_h3_frames(round((duration + OVER_RENDER_SECONDS) * H3_FPS))
+
+
+def over_render_centred(duration: float) -> bool:
+    """Whether this window's take is *centred* on it rather than merely extended past it.
+
+    True exactly when the H3 minimum floor fires — when the margin's own answer
+    (`margin_frames`) is shorter than `H3_MIN_RENDER_FRAMES`, which happens below about
+    3.271 s. That boundary, and not `H3_MIN_SHOT_SECONDS`, is the deliberate reading of the
+    Director's "if a shot is below the minimum typical then the math would just center around
+    that clip", and it is stated here because the two readings differ over a 0.73 s band:
+
+    * Below ~3.271 s the floor invents buffer the window never asked for — up to 2.4 s of it —
+      and hanging all of that off one end is what the centring ruling is *about*. Centred.
+    * From ~3.271 s to 4 s the take is already the H3 minimum by the margin's own arithmetic,
+      and the margin's rule for it is itself a Director ruling ("a bit of editable room at
+      either end … Doesnt have to be more than a half second", 2026-08-19). Re-centring those
+      would move a shipped, pinned lead — a 3.75 s shot's quarter second — for no gain, and
+      would change the submitted audio window of every such shot. Left exactly as it was.
+
+    So the rule is: **the buffer the floor invents is centred; the buffer the margin was
+    already giving is not.** Nothing at or above ~3.271 s changes by a frame or a byte.
+    """
+    return margin_frames(duration) < H3_MIN_RENDER_FRAMES
+
 
 def over_render_frames(duration: float) -> int:
     """The frames a shot of ``duration`` seconds is actually rendered for.
 
-    ``duration + OVER_RENDER_SECONDS``, snapped up to the 17k+5 grid — so the take is
-    always at least half a second longer than the window that will consume it, and never
-    exactly its length again. Every consumer of the extra length (the Monitor, the trim
+    ``duration + OVER_RENDER_SECONDS``, snapped up to the 17k+5 grid and then floored at
+    `H3_MIN_RENDER_FRAMES` — so the take is always at least half a second longer than the
+    window that will consume it, never exactly its length again, and never shorter than the
+    length H3 is trained to render. Every consumer of the extra length (the Monitor, the trim
     nudge, assembly's offset) exists because this margin does.
+
+    **The floor is the Director's ruling of 2026-08-20**, and it is the whole of what changed:
+
+        "some may go long, some may be short … some videos even use micro-cuts for fast
+        paced stuff … Shots still generated to the 4 second minimum and they just have a
+        bigger invisible 'buffer' while still being lined up so the exposed part matches."
+
+    A sub-4-second window is legitimate music-video editing, not an error, so the *rendered*
+    length is decoupled from the *exposed* length: a 2.083 s window renders 107 frames
+    (4.4583 s) and carries 2.375 s of invisible buffer that the trim discards. Where that
+    buffer sits is `over_render_lead`'s half of the ruling — centred on the window, by the
+    Director's second ruling the same day — and the exposed slice is the same seconds of the
+    song either way.
+
+    Only windows under about 3.271 s reach the floor: at 3.2708 s the margin already asks for
+    91 frames, which snaps to 107 on its own. Every window at or above that renders the frame
+    count it has always rendered, byte for byte — pinned in `tests/test_timeline.py`.
     """
-    return align_h3_frames(max(5, round((duration + OVER_RENDER_SECONDS) * H3_FPS)))
+    return max(H3_MIN_RENDER_FRAMES, margin_frames(duration))
 
 
 def populate_windows(
@@ -198,9 +255,57 @@ def over_render_lead(
     would run past the song's end, the lead grows to shift the whole window earlier
     rather than truncating the picture. A whole-song shot with no room either side gets
     lead 0 and renders with the mismatch, which is the pre-margin behaviour for that edge.
+
+    **A short window centres its take on the window instead**, by the Director's ruling of
+    2026-08-20: "if a shot is below the minimum typical then the math would just center around
+    that clip, so it would grab an appropriate size chunk for the render spanning equally both
+    directions." When `over_render_centred` is true the ideal lead is half the buffer rather
+    than a quarter second, so the take's midpoint is the window's midpoint and the exposed cut
+    sits in the middle of what H3 performed — the mouth arrives at the cut with real song
+    either side of it instead of starting cold on the first frame.
+
+    **There is one lead, not two, and they do not add.** `OVER_RENDER_LEAD_SECONDS` is the
+    *ideal* for a margin-sized render; on a centred one the ideal is ``extra / 2`` and it
+    replaces the quarter second rather than stacking on it. It is never smaller either: a
+    centred window's buffer is at least 1.1875 s (the floor at the ~3.271 s boundary), so half
+    of it is at least 0.594 s — always more sync context than the quarter second it stands in
+    for. One number is computed, one number is recorded in ``latest_take_lead``, and one number
+    is what assembly cuts at.
+
+    The ideal is snapped to the 24 fps grid because that is how it is spent: assembly cuts
+    with ``trim=start_frame=round(lead·24)`` and the Monitor seeks the same frame, so a lead
+    of 1.1875 s (28.5 frames) is a lead the picture cannot honour, and the half frame comes
+    off the exposed slice's alignment. Snapped, ``round(lead·24)`` is exact and the frame at
+    that offset is the window's first second to the sample. Only the centred ideal is snapped;
+    the quarter second is already six whole frames, and the overflow branch below must go on
+    producing the unsnapped numbers it always has.
+
+    **Clamping never moves the exposed slice**, which is the property the whole feature stands
+    on. Every branch answers a lead ``L``, the audio window sent is ``[start - L, start - L +
+    R)``, and the invariant that follows does not mention ``R`` or how ``L`` was chosen:
+
+        take second ``t`` is song second ``start - L + t``
+
+    — so take second ``L`` is song second ``start``, and the slice assembly cuts,
+    ``[L + nudge, L + nudge + duration)``, is song seconds ``[start + nudge, start + nudge +
+    duration)``. Three clamps can shorten ``L`` and none of them touch that:
+
+    * **a shot at 0.0 s cannot centre** — ``min(…, start)`` answers 0, the take begins exactly
+      at the window and the whole buffer is tail. There is no song before 0 s to grab, so the
+      alternative would be conditioning on silence that does not exist;
+    * **a shot at the song's end** hits the overflow branch, which grows the lead until the
+      tail lands on the last second; a short window there can end up with its whole buffer
+      ahead of it, which is the mirror of the 0 s case;
+    * **``extra``** caps both, so the take can never begin before the window minus its own
+      buffer.
+
+    In each case the buffer moves and the exposure does not.
     """
     extra = max(0.0, picture_seconds - duration)
-    lead = min(OVER_RENDER_LEAD_SECONDS, extra, start)
+    ideal = OVER_RENDER_LEAD_SECONDS
+    if over_render_centred(duration):
+        ideal = round(extra / 2 * H3_FPS) / H3_FPS
+    lead = min(ideal, extra, start)
     if song_duration > 0:
         overflow = (start - lead + picture_seconds) - song_duration
         if overflow > 0:
@@ -352,6 +457,40 @@ def section_lyrics(project: Project, section) -> str:
     )
     matching = [text for tag, text in blocks if family(tag) == wanted]
     return matching[ordinal] if ordinal < len(matching) else ""
+
+
+def section_looks_input(project: Project) -> dict[str, Any]:
+    """What the section-look pass is shown: the treatment, the style bible, the boxes.
+
+    Deliberately three keys and no more. `expansion_input` hands the model the whole plan
+    because a prompt has to sit among its neighbours; this pass is answering "what does the
+    Intro look like" out of prose that is already organised by section, and every extra key
+    is another thing for it to write into a look that must not contain one — populate's
+    measured leak was an internal asset label ending up in creative prose, and the cheapest
+    guard against a name being echoed is a name never shown. No shots, no assets, no lyrics.
+
+    Sections go out **in song order with their ids**, and both halves matter. The id is the
+    address the answer comes back on (`ExpandedShot.shot_id`'s contract), and the order is
+    what lets a treatment heading like "Verse 1 & Verse 2" be read against a list where the
+    director's own numbering — "Verse", then "Verse 2" — is visible. The existing `prompt`
+    rides along so a re-run can see what a section already carries.
+    """
+    ordered = sorted(project.sections, key=lambda section: section.start)
+    return {
+        "treatment": project.treatment,
+        "style_bible": project.style_bible,
+        "sections": [
+            {
+                "section_id": section.id,
+                "label": section.label,
+                "start": round(section.start, 3),
+                "end": round(section.end, 3),
+                "duration": round(section.duration, 3),
+                "prompt": section.prompt,
+            }
+            for section in ordered
+        ],
+    }
 
 
 def _lyric_tokens(text: str) -> list[str]:

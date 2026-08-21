@@ -12,10 +12,16 @@ from music_video_producer.batch import (
     JOB_SUPERSEDED,
     MISSING_TICKS_LIMIT,
     NEAR_DUPLICATE_OVERLAP,
+    NOTE_KIND_PROMPT,
+    NOTE_KIND_SAMENESS,
+    NOTE_KIND_WINDOW_LONG,
+    NOTE_KIND_WINDOW_SHORT,
     PLACEHOLDER_PROMPT,
     PLAN_WITHOUT_SHOTS,
     READINESS_REFUSAL,
     REFUSAL_NAME_LIMIT,
+    SHOT_WINDOW_ABOVE_BAND,
+    SHOT_WINDOW_BELOW_BAND,
     SHOT_WITH_PLACEHOLDER_PROMPT,
     SHOT_WITHOUT_PROMPT,
     SHOTS_LACK_VARIANCE,
@@ -37,9 +43,11 @@ from music_video_producer.batch import (
     render_status_report,
     shot_label,
     supersede_target_jobs,
+    window_band_note,
 )
 from music_video_producer.comfy import ComfyError, HistoryResult
 from music_video_producer.models import (
+    SHOT_MODE_SPECS,
     Asset,
     JobStatus,
     Project,
@@ -381,6 +389,128 @@ def test_readiness_is_derived_and_writes_nothing_back_onto_the_project():
 
     assert project.model_dump(mode="json") == before
     assert not any(field.startswith("ready") for field in Shot.model_fields)
+
+
+# --- The shot-length band, reported before the Director discovers it (2026-08-20) ---------
+#
+# Until this, a window outside 4-15 s reached exactly one surface: a `warnings` string from
+# `timeline.build_director_timeline`, printed only by the Compile dry run. The Director's own
+# project carried five hand-timed sub-4-second windows and this report said `ready: True` and
+# nothing else about any of them.
+
+
+def test_a_short_window_warns_with_its_own_render_numbers_and_still_reports_ready():
+    """Short is legitimate music-video editing now, so it warns and never blocks.
+
+    The note carries this shot's own frame count and buffer, because "it renders anyway" is a
+    claim a Director should be able to check against the take that arrives.
+    """
+    project = plan("A singer turns toward camera")
+    project.shots[0].duration = 2.083
+
+    report = readiness_report(project)
+
+    assert report.ready is True
+    assert report.blocking == []
+    assert [note.shot_ids for note in report.window_warnings] == [["shot_0"]]
+    note = report.window_warnings[0]
+    assert note.kind == NOTE_KIND_WINDOW_SHORT
+    assert note.reason == SHOT_WINDOW_BELOW_BAND.format(
+        duration=2.083, minimum=4.0, frames=107, rendered=107 / 24, buffer=107 / 24 - 2.083
+    )
+    assert "107 frames" in note.reason and "does not block submission" in note.reason
+
+
+def test_a_long_window_warns_and_says_the_extender_is_out_of_reach():
+    """The Director's ruling: "when dragging a clip past that it should turn yellow but we
+    arent dead yet". A warning state, not a refusal — and the intended fix they name, the
+    video extender, is built as a payload builder and reachable from nowhere, so the sentence
+    must claim neither that it works nor that it does not exist.
+    """
+    project = plan("A singer turns toward camera")
+    project.shots[0].duration = 20.0
+
+    report = readiness_report(project)
+
+    assert report.ready is True
+    assert report.blocking == []
+    note = report.window_warnings[0]
+    assert note.kind == NOTE_KIND_WINDOW_LONG
+    assert note.reason == SHOT_WINDOW_ABOVE_BAND.format(duration=20.0, maximum=15.0)
+    assert "not reachable" in note.reason and "does not block submission" in note.reason
+    # Both halves of that claim are true of this repository, not merely written in it: the
+    # builder exists, and nothing calls it.
+    assert "def build_ltx25_extend_payload" in Path(
+        "src/music_video_producer/workflows.py"
+    ).read_text(encoding="utf-8")
+    assert "build_ltx25_extend_payload" not in Path(
+        "src/music_video_producer/app.py"
+    ).read_text(encoding="utf-8")
+    assert SHOT_MODE_SPECS["extend"].adapter == ""
+
+
+def test_a_window_inside_the_band_says_nothing_at_all():
+    """Both ends, and the two boundaries themselves, which are inclusive."""
+    project = plan("A singer turns toward camera")
+    for duration in (4.0, 5.0, 15.0):
+        project.shots[0].duration = duration
+        assert readiness_report(project).window_warnings == [], duration
+        assert window_band_note(project.shots[0]) == ("", ""), duration
+    # And just outside each of them, so the comparison is asserted at the edge rather than in
+    # the middle where any threshold would pass.
+    for duration, kind in ((3.999, NOTE_KIND_WINDOW_SHORT), (15.001, NOTE_KIND_WINDOW_LONG)):
+        project.shots[0].duration = duration
+        assert window_band_note(project.shots[0])[0] == kind, duration
+
+
+def test_the_band_is_reported_for_a_blocked_shot_too_and_never_moves_ready():
+    """A window is a fact about one shot, unlike sameness, so a blocked shot's is just as
+    true — and hiding it would make the note appear only after the prompt was written, which
+    is the late discovery this exists to end."""
+    project = plan("", "A singer turns toward camera")
+    project.shots[0].duration = 2.0
+    project.shots[1].duration = 20.0
+
+    report = readiness_report(project)
+
+    assert report.ready is False  # the empty prompt, and only the empty prompt
+    assert [note.reason for note in report.blocking] == [SHOT_WITHOUT_PROMPT]
+    assert [note.kind for note in report.window_warnings] == [
+        NOTE_KIND_WINDOW_SHORT,
+        NOTE_KIND_WINDOW_LONG,
+    ]
+    assert [note.shot_ids for note in report.window_warnings] == [["shot_0"], ["shot_1"]]
+
+
+def test_window_notes_stay_out_of_the_sameness_list_that_the_browser_labels():
+    """`api.js` labels every note in `warnings` "Near-duplicate" and counts the list as pairs,
+    so a window note posted there would reach the Director under a name that is not what it
+    says. One list, one kind of note — and the kinds are values, so a clip can colour from
+    them without matching on the sentence."""
+    project = plan("A singer turns toward camera", "A singer turns toward camera")
+    project.shots[0].duration = 2.0
+
+    report = readiness_report(project)
+
+    assert [note.kind for note in report.warnings] == [NOTE_KIND_SAMENESS]
+    assert [note.kind for note in report.window_warnings] == [NOTE_KIND_WINDOW_SHORT]
+    assert all(len(note.shot_ids) == 2 for note in report.warnings)
+    # The blocking half carries its kind too, so no note anywhere is uncategorised.
+    assert readiness_report(plan("")).blocking[0].kind == NOTE_KIND_PROMPT
+    assert readiness_report(Project(name="Empty")).blocking[0].kind == NOTE_KIND_PROMPT
+
+
+def test_the_band_is_reported_even_when_the_pairwise_pass_is_skipped():
+    """`include_warnings=False` is the submission route's hot path and skips *sameness*, which
+    is pairwise. The band is per-shot and costs one comparison, so there is nothing to save and
+    the Director's own project would otherwise be told about its windows only on some calls."""
+    project = plan("A singer turns toward camera")
+    project.shots[0].duration = 2.0
+
+    report = readiness_report(project, include_warnings=False)
+
+    assert report.warnings_computed is False and report.warnings == []
+    assert [note.kind for note in report.window_warnings] == [NOTE_KIND_WINDOW_SHORT]
 
 
 def test_timeline_does_not_import_batch_so_the_window_math_stays_a_pure_leaf():

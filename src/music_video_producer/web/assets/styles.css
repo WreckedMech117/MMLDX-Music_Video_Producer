@@ -314,6 +314,15 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    never in the glyph alone — the same rule this stylesheet applies to colour. `.danger-button`
    keeps its red on top of this, so the destructive one is still not one of the others. */
 .icon-tool { width: 30px; padding: 0; font-size: 14px; line-height: 1; }
+/* The playhead magnet's toggle, pressed. State is never carried by colour alone here either: the
+   button's `aria-pressed` and its accessible name both say on or off in words, and this is the
+   third signal rather than the only one. Wider than `.icon-tool` because its glyph is two
+   characters — an edge meeting a marker. */
+#snap-playhead { width: auto; padding: 0 8px; letter-spacing: -1px; }
+#snap-playhead.snap-on { color: var(--acid); border-color: var(--acid); }
+/* Undo and Redo. Ordinary icon tools; the disabled state is the stylesheet's own, and everything
+   that distinguishes "nothing to undo" from "undo the split" is in the accessible name. */
+#undo-shots, #redo-shots { font-size: 15px; }
 /* A slider with a name on it. Two unlabelled sliders in one row is precisely the confusion that
    produced "i see what i think is a zoom slider that isnt functional" — the Director was looking at
    the volume. The label is a real `<label for>`, so clicking the word focuses the control and a
@@ -403,6 +412,17 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .shot-clip.approved { border-left-color: #d4f75e; background: #262e1c; }
 .shot-clip.flagged { border-top: 2px solid #c78a3a; }
 .shot-clip.locked .clip-id::after { content: " 🔒"; }
+/* The Director's yellow: "I dont anticipate a shot being requested over 15 seconds, when dragging
+   a clip past that it should turn yellow but we arent dead yet" (2026-08-20). A *warning* state
+   and nothing else -- the shot stays editable, submittable and armable, and no refusal anywhere
+   reads this class. The hue is the second signal, not the only one: app.js appends the reason to
+   the clip's title and to its accessible name, which is the one a screen reader announces.
+
+   There is deliberately no rule for the short end. A window under H3's minimum renders at the
+   minimum with the buffer trimmed away, so the exposed cut is exactly the window -- a micro-cut
+   is legitimate, and colouring one would say "wrong" about something that is fine. */
+.shot-clip.window-long { border-top: 2px solid var(--amber); }
+.shot-clip.window-long .clip-id { color: var(--amber); }
 .shot-clip .clip-id { display: block; padding: 7px 9px 3px; color: var(--acid); font: 9px Consolas, monospace; }
 /* The word for a render in flight, on the clip itself. The left-bar hue above says the same
    thing and is the second, redundant signal -- this is the one that survives the colour being
@@ -468,6 +488,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .plan-readiness ul { display: grid; gap: 6px; margin: 9px 0 0; padding-left: 18px; }
 .plan-readiness li.blocking { color: var(--red); }
 .plan-readiness li.warning { color: var(--amber); }
+/* The window band's two lines. Amber for the long end, which is the state the Director asked to
+   see; muted for the short end, because the server's own sentence there explains a cost rather
+   than a problem, and painting it as a warning would be the opposite of what it says. */
+.plan-readiness li.window-long { color: var(--amber); }
+.plan-readiness li.window-short { color: var(--muted); }
 .mix-take-audio-line { display: block; margin: 8px 0 0; font-size: 12px; color: var(--muted); }
 .replace-existing-line { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .timeline-transport .muted-line { color: var(--red); text-decoration: line-through; }
@@ -498,6 +523,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .snap-heading { color: var(--dim); font: 9px Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; margin-top: 6px; }
 .snap-move { color: var(--ink); font-family: Consolas, monospace; }
 .snap-skip { color: var(--muted); }
+/* The H3 sweep's per-shot report, in the same bar and in the same shell as the cuts report: two
+   report surfaces in one place that looked like two different ideas would be worse than either.
+   Each line leads with its kind in words (Change applied / Safety notice / Check this) because
+   the left edge alone is colour, and colour alone carries no state in this application. */
+.expansion-report { border-left-color: var(--acid); gap: 6px; }
+.expansion-report strong { color: var(--dim); font: 9px Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.expansion-report button { justify-self: start; margin-top: 4px; }
 /* Replace With / Cancel, in the asset inspector. Reuses the snap report's shell so the two
    report-then-confirm surfaces in this application look like one idea; a swap reads as a
    change and an "already have" reads as the subtraction it is. */

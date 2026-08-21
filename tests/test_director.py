@@ -11,6 +11,7 @@ from music_video_producer.director import (
     DirectorResult,
     DirectorUnavailable,
     ExpandedShot,
+    SectionLooks,
     ShotExpansion,
     StageManagerResult,
     VisionInspection,
@@ -1039,6 +1040,7 @@ MINIMAL_REPLIES = {
     "stage_manager_result": {"message": "m", "assets": []},
     "vision_inspection": {"summary": "s"},
     "shot_expansion": {"message": "m", "shots": []},
+    "section_looks": {"message": "m", "looks": []},
 }
 
 
@@ -1075,6 +1077,7 @@ async def sent_strict_schemas() -> dict[str, dict]:
     await director.stage_manager(project_context={}, count=2)
     await director.expand(expansion_input={"shots": []})
     await director.inspect_image(image=b"x", mime_type="image/png", purpose="p")
+    await director.section_looks(looks_input={"sections": []})
     return sent
 
 
@@ -1101,6 +1104,7 @@ async def test_every_constrained_decoder_schema_declares_exactly_what_its_caller
         "stage_manager_result",
         "shot_expansion",
         "vision_inspection",
+        "section_looks",
     }
 
     # ---- director_result, chat use: nothing is required beyond the prose fields. -------
@@ -1125,6 +1129,9 @@ async def test_every_constrained_decoder_schema_declares_exactly_what_its_caller
     # `singing`, so an omitted key wrote `not_singing` across the whole plan by accident.
     # `PlannedSection.prompt` — the section's shared look, which the shots inside it are
     # told to carry; omitted, the section lands blank.
+    # `PlannedShot.assets` — the structural citation field. Populate builds every shot's
+    # citations from it, so a decoder free to close a shot object without it is a decoder
+    # free to send the plan back to the prose scan it was written to replace.
     populate = director_result_schema(require=("shots", "sections"))
     assert populate["required"] == [
         "message",
@@ -1138,12 +1145,14 @@ async def test_every_constrained_decoder_schema_declares_exactly_what_its_caller
         "duration",
         "prompt",
         "performance",
+        "assets",
     }
     assert populate["$defs"]["PlannedShot"]["required"] == [
         "start",
         "duration",
         "prompt",
         "performance",
+        "assets",
     ]
     assert set(populate["$defs"]["PlannedSection"]["properties"]) == {
         "label",
@@ -1199,6 +1208,28 @@ async def test_every_constrained_decoder_schema_declares_exactly_what_its_caller
         "risks",
     ]
 
+    # ---- section_looks: the answer, and the per-section decision inside it. -------------
+    # `looks` is the whole payload — a reply without it filled nothing — and `prompt` is the
+    # field the feature exists to write; both carried defaults and were therefore outside
+    # `required` for free, the third instance of the same hole. `message` stays optional
+    # because the route never reads it. Note what `prompt` being required does *not* mean:
+    # it has no `minLength`, so `""` is still a legal answer, and that is deliberate — the
+    # decoder must make the model decide about every section, and "the treatment does not
+    # describe this one" has to remain sayable or the alternative is an invented look.
+    looks = sent["section_looks"]
+    assert set(looks["properties"]) == {"message", "looks"}
+    assert looks["required"] == ["looks"]
+    assert set(looks["$defs"]["SectionLook"]["properties"]) == {
+        "section_id",
+        "label",
+        "prompt",
+    }
+    assert looks["$defs"]["SectionLook"]["required"] == ["section_id", "label", "prompt"]
+    assert "minLength" not in looks["$defs"]["SectionLook"]["properties"]["prompt"]
+    # And the model's own schema is the counter-example it was built against: without the
+    # promotion, the field the caller cannot proceed without is the one the decoder may omit.
+    assert "prompt" not in SectionLooks.model_json_schema()["$defs"]["SectionLook"]["required"]
+
 
 def test_a_promoted_field_the_schema_does_not_have_raises_instead_of_doing_nothing():
     """The guard on the guard.
@@ -1228,7 +1259,13 @@ def test_no_callers_required_set_can_leak_into_another():
     get an object that validates.
     """
     hardened = director_result_schema(require=("shots", "sections"), min_shots=12)
-    assert hardened["$defs"]["PlannedShot"]["required"][-1] == "performance"
+    assert hardened["$defs"]["PlannedShot"]["required"] == [
+        "start",
+        "duration",
+        "prompt",
+        "performance",
+        "assets",
+    ]
 
     assert DirectorResult.model_json_schema()["$defs"]["PlannedShot"]["required"] == [
         "start",

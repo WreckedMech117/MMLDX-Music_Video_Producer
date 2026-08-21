@@ -14,6 +14,7 @@ import preflight
 import preflight_audio_replace
 import preflight_h3_ultra
 import preflight_ltx25_enhance
+import preflight_ltx25_extend
 import preflight_songplanner
 import pytest
 
@@ -23,6 +24,7 @@ import pytest
 from music_video_producer import workflows as workflows_module
 from music_video_producer.app import SongPlannerRequest
 from music_video_producer.timeline import (
+    H3_MIN_RENDER_FRAMES,
     OVER_RENDER_SECONDS,
     align_h3_frames,
     over_render_frames,
@@ -82,6 +84,7 @@ from music_video_producer.workflows import (
     build_h3_keyframe_payload,
     build_h3_reference_payload,
     build_ltx25_enhance_payload,
+    build_ltx25_extend_payload,
     build_multiview_payload,
     build_music3_payload,
     build_songplanner_invented_payload,
@@ -208,6 +211,10 @@ def every_builder_payload() -> list[tuple[str, dict]]:
             "ltx25-enhance",
             build_ltx25_enhance_payload(source_video="J:/comfy/output/take_00001.mp4", prefix="p"),
         ),
+        # Both shapes of the extension adapter: `include_audio` decides whether the audio
+        # decode, trim and concat are built at all, so the two are different graphs rather
+        # than one graph with a different number in it.
+        *preflight_ltx25_extend.audit_payloads(),
         (
             # Also one shape: this builder has no sampling to vary and no model to swap.
             "audio-replace",
@@ -283,18 +290,32 @@ def every_builder_payload() -> list[tuple[str, dict]]:
 # for substituting them. `LatentUpscaleModelLoader` stays on this list for a second reason now:
 # it is an orphan in the AudioReplacer export as well, so nothing audited puts it in front of
 # the live schema from either graph.
+#
+# `preflight_ltx25_extend.py --record` removed ten, and the tenth is the one worth naming:
+# `LatentUpscaleModelLoader` is off this list at last. It stayed on it through two adapters
+# because it is an *orphan* in both of their exports — and it is genuinely reached in the
+# video-extension export, where it feeds `LTXVLatentUpsampler`. The same reachability walk that
+# kept it out of those payloads is what puts it into this one, which is the whole argument for
+# deriving dependencies rather than pattern-matching a class name. The other nine —
+# `ImageResizeKJv2`, `PrimitiveFloat`, `VAEDecodeTiled` and the six `LTXV*` audio and latent
+# classes — were uncovered only because the *unaudited* combined LTX export used them; the
+# extension adapter submits all nine, so they are range-checked offline everywhere they appear.
+# Five more classes joined the fixture through `extra_classes` without any payload submitting
+# them: `SimpleCalculatorKJ`, `ResizeImageMaskNode`, `ImpactImageInfo`, `CM_IntToFloat` and
+# `Power Lora Loader (rgthree)` are the nodes that adapter *replaced*, recorded because the
+# claim it makes — that each was replaced for its schema shape and not for being missing — is
+# checked against their schemas.
 UNRECORDED_CLASSES = frozenset({
     "ComfyMathExpression",
     "DualCLIPLoader", "EmptySD3LatentImage", "FluxGuidance", "FrameInterpolate",
-    "FrameInterpolationModelLoader", "GetImageSize", "ImageResizeKJv2",
-    "Krea2EditGroundedEncode", "Krea2EditModelPatch", "LTXVAudioVAEDecode", "LTXVAudioVAEEncode",
-    "LTXVConcatAVLatent", "LTXVImgToVideoInplace", "LTXVLatentUpsampler",
-    "LTXVSeparateAVLatent", "LatentUpscaleModelLoader", "LoadImage",
+    "FrameInterpolationModelLoader", "GetImageSize",
+    "Krea2EditGroundedEncode", "Krea2EditModelPatch",
+    "LoadImage",
     "MathExpression|pysssss",
-    "ModelSamplingFlux", "PrimitiveFloat",
+    "ModelSamplingFlux",
     "PrimitiveStringMultiline", "RTXVideoSuperResolution",
     "SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel",
-    "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask", "VAEDecodeTiled",
+    "SeedVR2VideoUpscaler", "SetLatentNoiseMask", "SolidMask",
     "VAEEncode", "VHS_LoadImagePath", "easy cleanGpuUsed",
     "easy clearCacheAll",
 })
@@ -2199,6 +2220,13 @@ def test_the_keyframe_length_is_the_exports_own_expression_on_the_shared_grid():
     string — the export's own arithmetic, not a local restatement — must agree with what
     the builder sends and with `timeline.align_h3_frames`, for every window shape that
     matters: the floor, exact grid points, and either side of one.
+
+    The export's expression is the **grid snap** and has never carried a shot-length policy,
+    so since the Director's 2026-08-20 minimum-length floor the two agree at the grid and the
+    builder takes the larger of that and `H3_MIN_RENDER_FRAMES`. That is asserted as such —
+    the snap still has to be the export's, digit for digit, and the floor is named as the one
+    thing on top of it — rather than by dropping the short durations, which would stop
+    checking the two arithmetics exactly where they are easiest to get wrong.
     """
     export = keyframe_export()
     expression_node = next(
@@ -2206,20 +2234,29 @@ def test_the_keyframe_length_is_the_exports_own_expression_on_the_shared_grid():
     )
     expression = expression_node["inputs"]["expression"]
 
+    floored = 0
     for duration in (5 / 24, 0.5, 3.75, 5, 5.1, 8, 12.34, 149.0):
         # The audited export's own arithmetic, evaluated with no builtins and no inputs
         # but `a` — restating the formula locally is exactly what this test must not do.
         # Evaluated at `duration + OVER_RENDER_SECONDS`: the builder deliberately feeds
         # the grid the over-rendered length (the Director's margin ruling), and the
         # export's snap arithmetic must agree with it *at that input*.
-        expected = eval(
+        snapped = eval(
             expression,
             {"__builtins__": {}},
             {"a": duration + OVER_RENDER_SECONDS, "max": max, "round": round},
         )
+        expected = max(H3_MIN_RENDER_FRAMES, snapped)
+        floored += expected != snapped
         payload = keyframe_payload(duration=duration)
         assert payload["mvp:condition"]["inputs"]["length"] == expected, duration
         assert over_render_frames(duration) == expected, duration
+        # The grid itself, unfloored, is still the export's own number.
+        assert align_h3_frames(max(5, round((duration + OVER_RENDER_SECONDS) * 24))) == snapped
+    # Both sides of the floor are covered by the durations above: 5/24 s and 0.5 s reach it,
+    # 3.75 s and up do not. A change that made every case one or the other would leave half
+    # this test asserting nothing.
+    assert floored == 2
 
 
 def test_the_keyframe_payload_is_the_reachable_subgraph_minus_the_stated_drops():
@@ -2556,10 +2593,15 @@ def test_h3_reference_frame_alignment_agrees_with_the_timeline_helper():
     properties below still hold it to something.
     """
     checked = 0
+    short = 0
     for eighths in range(1, 1200):
         duration = eighths / 8  # 0.125 s to 149.875 s, every eighth of a second
         requested = max(5, round((duration + OVER_RENDER_SECONDS) * H3_FRAME_RATE))
-        expected = align_h3_frames(requested)
+        snapped = align_h3_frames(requested)
+        # The Director's 2026-08-20 minimum-length floor sits on top of the grid: a window
+        # too short for H3's trained minimum is rendered at that minimum anyway and exposes
+        # a slice of the take. The grid arithmetic below is unchanged and still checked.
+        expected = max(H3_MIN_RENDER_FRAMES, snapped)
         if expected > H3_REFERENCE_MAX_FRAMES:
             continue
         payload = h3_reference_payload(h3_references("picture", 1), duration=duration)
@@ -2571,11 +2613,21 @@ def test_h3_reference_frame_alignment_agrees_with_the_timeline_helper():
         # lesser than the window**, always at least the margin longer (less the half-frame
         # rounding can shave).
         assert length >= 5 and (length - 5) % 17 == 0, duration
-        assert requested <= length < requested + 17, duration
+        if snapped < H3_MIN_RENDER_FRAMES:
+            # The floored branch: the take is H3's minimum and is strictly longer than the
+            # margin alone asked for. That surplus is the invisible buffer.
+            assert length == H3_MIN_RENDER_FRAMES > requested, duration
+            short += 1
+        else:
+            assert requested <= length < requested + 17, duration
         assert length / H3_FRAME_RATE > duration, duration
         assert length >= (duration + OVER_RENDER_SECONDS) * H3_FRAME_RATE - 0.5, duration
         checked += 1
     assert checked > 1100, checked
+    # Every eighth-second window up to 3.25 s is floored and 3.375 s upward is not, so the
+    # branch above is exercised on both sides rather than only on the one this loop happens
+    # to start in.
+    assert short == 26, short
 
 
 def test_h3_reference_limits_and_wiring_match_the_recorded_node_schema():
@@ -4010,6 +4062,11 @@ def test_nothing_in_the_enhancement_path_claims_the_frame_count_is_preserved():
         REPO_ROOT / "src/music_video_producer/workflows.py",
         REPO_ROOT / "src/music_video_producer/app.py",
         REPO_ROOT / "tests/preflight_ltx25_enhance.py",
+        # The extension path inherits the same "Never": its output is *longer* than its input
+        # and by how much is an ffprobe reading, so no file on either path may assert a frame
+        # count relationship. `workflows.py` and this file are already on the list and carry
+        # both adapters.
+        REPO_ROOT / "tests/preflight_ltx25_extend.py",
         REPO_ROOT / "tests/test_api.py",
         Path(__file__),
     ]
@@ -4506,3 +4563,659 @@ def test_nothing_on_the_restore_path_claims_the_frame_count_is_preserved():
     # And what the route reports is named as a *request*, never as a measurement.
     assert "requested_picture_seconds" in audio_replace_lengths(duration=3.75)
     assert "picture_seconds" not in audio_replace_lengths(duration=3.75)
+
+
+# --- LTX 2.5 video extension ---------------------------------------------------------------
+#
+# The audited evidence for the extension adapter, its single output node, and the digests that
+# say neither file has moved under the tests that read them. Both, because the *sibling* is
+# load-bearing here in a way no other adapter's is: the no-audio export is the counter-example
+# the reachability argument is made against, so it has to be as immutable as the one built.
+LTX25_EXTENDER_EXPORT = REFERENCE_EXPORTS / "ltx25-videoextender-user-export.json"
+LTX25_EXTENDER_EXPORT_SHA256 = (
+    "d73e8713c40d46473dfb29928dd471f0f30cc33d078ad38d5375d54020a1b218"
+)
+LTX25_EXTENDER_NOAUDIO_EXPORT = REFERENCE_EXPORTS / "ltx25-videoextender-noaudio-user-export.json"
+LTX25_EXTENDER_NOAUDIO_EXPORT_SHA256 = (
+    "22f3463edce14acacb35ada20b752f655e73a9e4877790967860b019190d5c17"
+)
+LTX25_EXTENDER_OUTPUT_NODE = "1994"
+
+# The node classes the adapter does not build, and what stands in for each. `None` means the
+# class is dropped outright rather than replaced. Declared as data so the census comparison
+# below can hold every other class to equality: a substitution that grew an entry would
+# otherwise disappear into a looser assertion. Each is justified in
+# `build_ltx25_extend_payload`.
+LTX25_EXTEND_SUBSTITUTIONS = {
+    "VHS_LoadVideo": "VHS_LoadVideoPath",
+    "SimpleCalculatorKJ": "CM_IntBinaryOperation",
+    "ResizeImageMaskNode": "ImageScaleBy",
+    # Dropped rather than replaced: the rgthree loader carries no enabled row and applies
+    # nothing, `ImpactImageInfo` measures a batch `GetImageSizeAndCount` already measures, and
+    # `CM_IntToFloat` only widened integers the adapter now folds.
+    "ImpactImageInfo": None,
+    "Power Lora Loader (rgthree)": None,
+    "CM_IntToFloat": None,
+}
+
+# Classes the payload builds that the export never names. `CM_FloatBinaryOperation` is the
+# float half of the calculator substitution and `PrimitiveFloat` carries the one value whose
+# consuming input publishes no range; both are justified in `build_ltx25_extend_payload`.
+LTX25_EXTEND_ADDITIONS = {"CM_FloatBinaryOperation", "PrimitiveFloat"}
+
+# The four expressions the export computes in `SimpleCalculatorKJ` nodes that the adapter folds
+# into Python. Mapped rather than evaluated, so an expression the export changes to something
+# this test never modelled fails by name instead of being silently re-evaluated.
+LTX25_EXTEND_EXPRESSIONS = {
+    "(a*b)+1": lambda a, b: a * b + 1,
+    "a/b": lambda a, b: a / b,
+    "a+b": lambda a, b: a + b,
+    "a-b": lambda a, b: a - b,
+}
+
+
+def ltx25_extender_export() -> dict:
+    return json.loads(LTX25_EXTENDER_EXPORT.read_text(encoding="utf-8"))
+
+
+def ltx25_extend_payload(**overrides) -> dict:
+    arguments = {
+        "source_video": "J:/comfy/output/music-video-producer/p/shots/s-h3-reference_00001.mp4",
+        "prefix": "music-video-producer/p/shots/s-ltx25-extend",
+        "extend_seconds": 10,
+    }
+    return build_ltx25_extend_payload(**{**arguments, **overrides})
+
+
+def test_the_videoextender_exports_are_not_mutated():
+    """Both files are immutable audited evidence; every claim below reads them."""
+    for path, digest in (
+        (LTX25_EXTENDER_EXPORT, LTX25_EXTENDER_EXPORT_SHA256),
+        (LTX25_EXTENDER_NOAUDIO_EXPORT, LTX25_EXTENDER_NOAUDIO_EXPORT_SHA256),
+    ):
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
+
+
+def test_the_audio_extender_export_is_wholly_reachable_and_its_sibling_is_not():
+    """The reason this export is the one reproduced, asserted rather than asserted *about*.
+
+    61 nodes, 61 reachable: nothing about which nodes to build is a judgement call. The no-audio
+    sibling carries 65 and reaches 54, and its eleven orphans are its abandoned audio tail —
+    an edit in progress. An adapter derived from that file would have to decide what its author
+    meant, which is exactly the decision this project refuses to make on the Director's behalf.
+    """
+    export = ltx25_extender_export()
+    sibling = json.loads(LTX25_EXTENDER_NOAUDIO_EXPORT.read_text(encoding="utf-8"))
+
+    reachable = reachable_node_ids(export, [LTX25_EXTENDER_OUTPUT_NODE])
+    sibling_reachable = reachable_node_ids(sibling, [LTX25_EXTENDER_OUTPUT_NODE])
+
+    assert len(export) == 61
+    assert reachable == set(export)
+    assert len(sibling) == 65
+    assert len(sibling_reachable) == 54
+    orphans = set(sibling) - sibling_reachable
+    assert len(orphans) == 11
+    # Every orphan is on the audio side, which is what makes them a half-finished edit rather
+    # than an unrelated leftover.
+    assert {sibling[node_id]["class_type"] for node_id in orphans} <= {
+        "AudioConcat",
+        "CM_IntToFloat",
+        "LTXVAudioVAEDecode",
+        "LTXVEmptyLatentAudio",
+        "SimpleCalculatorKJ",
+        "TrimAudioDuration",
+        "VHS_VideoInfo",
+    }
+
+
+def test_the_latent_upscaler_is_reached_here_and_orphaned_in_the_other_two_ltx_exports():
+    """The finding that makes reachability a walk rather than a remembered fact.
+
+    `LatentUpscaleModelLoader` sits in the enhancer export, the audio-replacer export and this
+    one. In the first two it is an orphan, and both adapters are right to leave its model file
+    out of their dependency lists. In this one it feeds `LTXVLatentUpsampler`, and leaving it
+    out by analogy would drop a model the graph loads. Same class name, opposite answers, and
+    only the walk can tell them apart.
+    """
+    reached = {}
+    for path, output_node in (
+        (LTX25_EXTENDER_EXPORT, LTX25_EXTENDER_OUTPUT_NODE),
+        (LTX25_ENHANCER_EXPORT, LTX25_ENHANCER_OUTPUT_NODE),
+        (AUDIOREPLACER_EXPORT, AUDIOREPLACER_OUTPUT_NODE),
+    ):
+        export = json.loads(path.read_text(encoding="utf-8"))
+        reachable = reachable_node_ids(export, [output_node])
+        classes = {export[node_id]["class_type"] for node_id in reachable}
+        assert "LatentUpscaleModelLoader" in {
+            node["class_type"] for node in export.values()
+        }, path
+        reached[path.name] = "LatentUpscaleModelLoader" in classes
+
+    assert reached[LTX25_EXTENDER_EXPORT.name] is True
+    assert reached[LTX25_ENHANCER_EXPORT.name] is False
+    assert reached[AUDIOREPLACER_EXPORT.name] is False
+    # And the adapters agree with their own graphs.
+    assert "LatentUpscaleModelLoader" in {
+        node["class_type"] for node in ltx25_extend_payload().values()
+    }
+    assert "LatentUpscaleModelLoader" not in {
+        node["class_type"] for node in ltx25_enhance_payload().values()
+    }
+
+
+def test_the_extend_payload_builds_the_reachable_classes_it_does_not_substitute():
+    """The payload is the reachable subgraph, substitutions declared and nothing else changed.
+
+    Held to equality on both sides: a class the export reaches and the payload neither builds
+    nor declares a substitution for is a dependency quietly dropped, and a class the payload
+    builds that the export never names is a graph this project invented.
+    """
+    export = ltx25_extender_export()
+    reachable = reachable_node_ids(export, [LTX25_EXTENDER_OUTPUT_NODE])
+    export_classes = {export[node_id]["class_type"] for node_id in reachable}
+    payload_classes = {node["class_type"] for node in ltx25_extend_payload().values()}
+
+    substituted = set(LTX25_EXTEND_SUBSTITUTIONS)
+    assert substituted <= export_classes, sorted(substituted - export_classes)
+    # Everything the export reaches is either built under its own name or declared substituted,
+    # and nothing the payload builds is unaccounted for on the other side.
+    assert export_classes - payload_classes == substituted
+    replacements = {
+        stand_in for stand_in in LTX25_EXTEND_SUBSTITUTIONS.values() if stand_in is not None
+    }
+    assert payload_classes - export_classes == replacements | LTX25_EXTEND_ADDITIONS
+    # And the audit derives the same set from the same two files rather than from this table.
+    assert preflight_ltx25_extend.substituted_classes() == substituted
+
+
+def test_the_extend_payload_declares_only_the_models_the_reachable_subgraph_loads():
+    """Five files, derived from the export rather than retyped, and the audio VAE among them.
+
+    The audio VAE is a dependency whichever way `include_audio` goes: the conditioning tail is
+    encoded through it before any decision about the saver is made.
+    """
+    export = ltx25_extender_export()
+    reachable = reachable_node_ids(export, [LTX25_EXTENDER_OUTPUT_NODE])
+    expected = {
+        filename
+        for node_id in reachable
+        for value in export[node_id]["inputs"].values()
+        for filename in preflight_ltx25_extend.nested_model_files(value)
+    }
+
+    for payload in (ltx25_extend_payload(), ltx25_extend_payload(include_audio=False)):
+        loaded = {
+            value
+            for node in payload.values()
+            for value in node["inputs"].values()
+            if isinstance(value, str) and value.endswith(preflight_ltx25_extend.MODEL_SUFFIXES)
+        }
+        assert loaded == expected
+        assert len(loaded) == 5
+        assert "ltx-2.5-audio-vae-bf16.safetensors" in loaded
+        assert "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors" in loaded
+
+
+def test_the_extend_payload_reproduces_the_exports_fixed_sampling():
+    """Both schedules, the cfg, the sampler, the refine seed and the negative prompt.
+
+    Read out of the export by chain-walk rather than compared against numbers retyped in this
+    test: a constant that drifts in the adapter has to fail against the file, not against a
+    copy of itself. The sigma strings are compared verbatim — spacing included — because the
+    export's `0.7250` and `0.4219` are what the evidence carries.
+    """
+    export = ltx25_extender_export()
+    payload = ltx25_extend_payload()
+
+    sigmas = {
+        node["inputs"]["sigmas"]
+        for node in export.values()
+        if node["class_type"] == "ManualSigmas"
+    }
+    assert sigmas == {
+        payload["mvp:base_sigmas"]["inputs"]["sigmas"],
+        payload["mvp:refine_sigmas"]["inputs"]["sigmas"],
+    }
+    # The base pass starts from full noise and the refine pass from 0.85 -- a characteristic of
+    # the graph, recorded so a quiet retune is visible.
+    assert payload["mvp:base_sigmas"]["inputs"]["sigmas"].startswith("1.0,")
+    assert payload["mvp:refine_sigmas"]["inputs"]["sigmas"].startswith("0.85,")
+
+    assert {
+        node["inputs"]["cfg"] for node in export.values() if node["class_type"] == "CFGGuider"
+    } == {payload["mvp:guider"]["inputs"]["cfg"]}
+    assert {
+        node["inputs"]["sampler_name"]
+        for node in export.values()
+        if node["class_type"] == "KSamplerSelect"
+    } == {payload["mvp:sampler"]["inputs"]["sampler_name"]}
+    # Two `RandomNoise` nodes in the export; the refine pass's is reproduced as a constant and
+    # the base pass's is the caller's, so only the first has to match.
+    seeds = {
+        node["inputs"]["noise_seed"]
+        for node in export.values()
+        if node["class_type"] == "RandomNoise"
+    }
+    assert payload["mvp:refine_noise"]["inputs"]["noise_seed"] in seeds
+    assert ltx25_extend_payload(seed=7)["mvp:base_noise"]["inputs"]["noise_seed"] == 7
+
+    negatives = {
+        node["inputs"]["text"]
+        for node in export.values()
+        if node["class_type"] == "CLIPTextEncode"
+    }
+    assert payload["mvp:negative"]["inputs"]["text"] in negatives
+    assert payload["mvp:prompt"]["inputs"]["text"] == ""
+
+
+def resolve_export_number(export: dict, node_id: str, output: int = 0):
+    """One number out of the export's own constant-and-calculator chain.
+
+    Walks `INTConstant`, `SimpleCalculatorKJ` and `VHS_VideoInfo` exactly as ComfyUI would,
+    with the one substitution the adapter's folding rests on: the loaded frame rate a
+    `VHS_VideoInfo` reports is whatever `force_rate` was set to, and `force_rate` is the
+    framerate constant. `SimpleCalculatorKJ` output 1 is its INT.
+    """
+    node = export[node_id]
+    class_type = node["class_type"]
+    if class_type == "INTConstant":
+        return node["inputs"]["value"]
+    if class_type == "CM_IntToFloat":
+        return float(resolve_export_number(export, *node["inputs"]["a"]))
+    if class_type == "VHS_VideoInfo":
+        # Output 5 is `loaded_fps`, and only that one is resolvable without the file.
+        assert output == 5, f"{node_id} output {output} needs the source video"
+        rate = next(
+            other["inputs"]["value"]
+            for other in export.values()
+            if other["class_type"] == "INTConstant"
+            and other.get("_meta", {}).get("title") == "Framerate"
+        )
+        return float(rate)
+    assert class_type == "SimpleCalculatorKJ", f"{node_id} is a {class_type}"
+    expression = node["inputs"]["expression"].replace(" ", "")
+    assert expression in LTX25_EXTEND_EXPRESSIONS, expression
+    operands = [
+        resolve_export_number(export, *node["inputs"][f"variables.{name}"]) for name in "ab"
+    ]
+    value = LTX25_EXTEND_EXPRESSIONS[expression](*operands)
+    return int(value) if output == 1 else value
+
+
+def test_the_extend_payloads_folded_arithmetic_matches_the_exports_own_expressions():
+    """The four numbers the adapter computes in Python instead of in graph nodes.
+
+    `build_ltx25_extend_payload` folds them because `force_rate` pins the loaded rate to the
+    framerate argument, which makes each a function of what the caller already passed. This
+    re-derives all four from the export's expressions and constants and compares — so the
+    folding is checked against the evidence rather than against a comment claiming it is safe.
+    """
+    export = ltx25_extender_export()
+    reference_seconds = export["2000"]["inputs"]["value"]
+    extend_seconds = export["2001"]["inputs"]["value"]
+    frame_rate = export["1997"]["inputs"]["value"]
+    assert (reference_seconds, extend_seconds, frame_rate) == (3, 10, 24)
+
+    reference_frames = resolve_export_number(export, "1993:1946", 1)
+    reference_length = resolve_export_number(export, "1993:1948")
+    overlap = resolve_export_number(export, "1993:1940")
+    end_time = resolve_export_number(export, "1993:1937")
+    assert reference_frames == 73
+    # The export computes the same length twice, once against the constant rate and once
+    # against the rate the loader reports. Folding them into one number is only correct while
+    # they agree, which is what `force_rate` guarantees and this asserts.
+    assert reference_length == overlap
+
+    payload = ltx25_extend_payload(
+        reference_seconds=reference_seconds,
+        extend_seconds=extend_seconds,
+        frame_rate=frame_rate,
+    )
+    assert payload["mvp:reference_frames"]["inputs"]["value"] == reference_frames
+    assert payload["mvp:reference_length"]["inputs"]["value"] == reference_length
+    assert payload["mvp:mask"]["inputs"]["video_start_time"] == reference_length
+    assert payload["mvp:mask"]["inputs"]["audio_start_time"] == reference_length
+    assert payload["mvp:mask"]["inputs"]["video_end_time"] == end_time
+    assert payload["mvp:mask"]["inputs"]["audio_end_time"] == end_time
+    assert payload["mvp:reference_audio"]["inputs"]["duration"] == overlap
+    assert payload["mvp:generated_audio"]["inputs"]["start_index"] == overlap
+    assert payload["mvp:generated_audio"]["inputs"]["duration"] == float(extend_seconds)
+    # And the loader really does force the rate, without which none of the above holds.
+    assert payload["mvp:source"]["inputs"]["force_rate"] == float(frame_rate)
+
+    # The same derivation at settings the export never carried, by editing the export's own
+    # constants and re-running its own expressions. Checked at a different frame rate on
+    # purpose: at 24 fps a rate the adapter hardcoded and a rate it read from the argument
+    # produce identical numbers, so the export's own values cannot tell the two apart.
+    for reference, extend, rate in ((3, 10, 30), (2, 7.5, 16), (5, 1, 48)):
+        variant = copy.deepcopy(export)
+        variant["2000"]["inputs"]["value"] = reference
+        variant["2001"]["inputs"]["value"] = extend
+        variant["1997"]["inputs"]["value"] = rate
+        built = ltx25_extend_payload(
+            reference_seconds=reference, extend_seconds=extend, frame_rate=rate
+        )
+        assert built["mvp:reference_frames"]["inputs"]["value"] == resolve_export_number(
+            variant, "1993:1946", 1
+        ), (reference, rate)
+        assert built["mvp:reference_length"]["inputs"]["value"] == resolve_export_number(
+            variant, "1993:1948"
+        ), (reference, rate)
+        assert built["mvp:reference_length"]["inputs"]["value"] == resolve_export_number(
+            variant, "1993:1940"
+        ), (reference, rate)
+        assert built["mvp:mask"]["inputs"]["video_end_time"] == resolve_export_number(
+            variant, "1993:1937"
+        ), (reference, extend, rate)
+        assert built["mvp:source"]["inputs"]["force_rate"] == float(rate)
+        assert built["mvp:mask"]["inputs"]["video_fps"] == float(rate)
+        assert built["mvp:conditioning"]["inputs"]["frame_rate"] == float(rate)
+        assert built["mvp:save"]["inputs"]["frame_rate"] == float(rate)
+
+
+def test_the_extend_payload_returns_the_head_untouched_and_the_tail_regenerated():
+    """The split that decides what survives the extension, wired the way the export wires it.
+
+    The head is `count - reference_frames` frames straight off the loader; the tail is the last
+    `reference_frames` and goes through the model. So the seam second comes back out of the
+    sampler rather than being spliced -- the property `LTX25_EXTEND_BASE_SIGMAS` describes,
+    checked here rather than left as prose.
+    """
+    payload = ltx25_extend_payload()
+
+    assert payload["mvp:head"]["inputs"]["start_index"] == 0
+    assert payload["mvp:head"]["inputs"]["num_frames"] == ["mvp:head_frames", 0]
+    assert payload["mvp:head_frames"]["inputs"] == {
+        "op": "Sub",
+        "a": ["mvp:measure", 3],
+        "b": ["mvp:reference_frames", 0],
+    }
+    assert payload["mvp:tail"]["inputs"]["start_index"] == -1
+    assert payload["mvp:tail"]["inputs"]["num_frames"] == ["mvp:reference_frames", 0]
+    # The head comes from the loader's own frames; the second half of the batch comes from the
+    # decode. Nothing splices the tail back in.
+    assert payload["mvp:batch"]["inputs"]["image_1"] == ["mvp:head", 0]
+    assert payload["mvp:batch"]["inputs"]["image_2"] == ["mvp:generated", 0]
+    assert payload["mvp:generated"]["inputs"]["image"] == ["mvp:decode", 0]
+    assert payload["mvp:decode"]["inputs"]["samples"] == ["mvp:refine_split", 0]
+    # The mask keeps the reference seconds and pads out to hold the new ones.
+    assert payload["mvp:mask"]["inputs"]["max_length"] == "pad"
+    # And nothing caps or decimates the loaded frames, which would make the head's length a
+    # thing this application chose rather than a thing it measured. `force_rate` is the one
+    # deliberate exception -- the export forces it, and the folded arithmetic depends on it.
+    assert payload["mvp:source"]["inputs"]["frame_load_cap"] == 0
+    assert payload["mvp:source"]["inputs"]["select_every_nth"] == 1
+    assert payload["mvp:source"]["inputs"]["skip_first_frames"] == 0
+
+
+def test_include_audio_drops_only_the_output_chain_and_never_the_conditioning():
+    """The one control that changes the graph's shape, held to exactly what it claims.
+
+    False removes the decode/trim/concat and the saver's optional link. It does **not** touch
+    the audio *conditioning*, and it does not turn this into the no-audio export, which feeds
+    an empty latent instead -- a claim `build_ltx25_extend_payload` makes and this pins.
+    """
+    with_audio = ltx25_extend_payload()
+    without = ltx25_extend_payload(include_audio=False)
+
+    assert set(with_audio) - set(without) == {
+        "mvp:audio",
+        "mvp:decode_audio",
+        "mvp:generated_audio",
+    }
+    assert set(without) - set(with_audio) == set()
+    assert with_audio["mvp:save"]["inputs"]["audio"] == ["mvp:audio", 0]
+    assert "audio" not in without["mvp:save"]["inputs"]
+    # The conditioning is identical on both, audio VAE included.
+    for name in (
+        "mvp:loudness",
+        "mvp:reference_audio",
+        "mvp:reference_audio_start",
+        "mvp:encode_reference_audio",
+        "mvp:audio_vae",
+        "mvp:mask",
+    ):
+        assert without[name] == with_audio[name], name
+    assert "LTXVEmptyLatentAudio" not in {node["class_type"] for node in without.values()}
+    # Neither shape leaves an unreachable node behind, which is the defect this project spends
+    # a reachability walk to keep out of other people's exports.
+    for payload in (with_audio, without):
+        assert reachable_node_ids(payload, ["mvp:save"]) == set(payload)
+
+
+def test_the_extend_payload_refuses_what_the_schema_would_reject():
+    """Every restated ceiling and every shape refusal, each naming its own number.
+
+    A value outside a declared range is rejected by `/prompt` validation before a node runs,
+    and reaches the Director as an opaque 502 after the submission round-trip. Refusing here
+    costs nothing and says which number was wrong.
+    """
+    for message, overrides in (
+        ("source video path", {"source_video": ""}),
+        ("quoted or padded", {"source_video": '"J:/comfy/output/take_00001.mp4"'}),
+        ("is not one of those", {"source_video": "J:/comfy/output/take_00001.avi"}),
+        ("filename prefix", {"prefix": "  "}),
+        ("prompt must be text", {"prompt": 3}),
+        ("seed must be a whole number", {"seed": 1.5}),
+        ("RandomNoise.noise_seed", {"seed": -1}),
+        ("RandomNoise.noise_seed", {"seed": preflight_ltx25_extend.LTX25_EXTEND_MAX_SEED + 1}),
+        ("frame rate", {"frame_rate": 0}),
+        ("force_rate tops out", {"frame_rate": 61}),
+        ("width", {"width": 0}),
+        ("ImageResizeKJv2.height tops out", {"height": 16385}),
+        ("reference window", {"reference_seconds": 0}),
+        ("num_frames tops out", {"reference_seconds": 200}),
+        ("more than zero seconds", {"extend_seconds": 0}),
+        ("must be a finite number", {"extend_seconds": float("nan")}),
+        ("LTXVAudioVideoMask spans at most", {"extend_seconds": 10_001}),
+    ):
+        with pytest.raises(ValueError, match=re.escape(message)):
+            ltx25_extend_payload(**overrides)
+    # A capitalised extension is the same container.
+    assert ltx25_extend_payload(source_video="J:/comfy/output/TAKE.MP4")
+
+
+def test_the_extend_payloads_validate_against_the_recorded_object_info():
+    """Both audited variants, whole, against the recorded schema."""
+    object_info = recorded_object_info()
+
+    for label, payload in preflight_ltx25_extend.audit_payloads():
+        assert preflight.validate(label, payload, object_info) == [], label
+        # Every numeric literal resolves a bound, so no range check is passing vacuously.
+        assert preflight.unbounded_numeric_inputs(label, payload, object_info) == [], label
+
+
+def test_the_extend_audit_wires_every_check_it_defines():
+    """A check defined and not wired still passes its unit test while auditing nothing."""
+    defined = {
+        name
+        for name in dir(preflight_ltx25_extend)
+        if name.startswith("check_") and callable(getattr(preflight_ltx25_extend, name))
+    }
+
+    assert {check.__name__ for check in preflight_ltx25_extend.CHECKS} == defined
+
+
+def test_every_restated_extend_ceiling_has_a_row_in_the_audit():
+    """A constant added to the adapter without a row here is a ceiling checked against nothing."""
+    restated = {
+        name
+        for name in dir(workflows_module)
+        if name.startswith("LTX25_EXTEND_MAX_")
+    }
+
+    assert {name for name, *_ in preflight_ltx25_extend.DECLARED_LIMITS} == restated
+
+
+def test_each_extend_check_passes_the_recorded_schema_and_names_a_moved_one():
+    """Every check is clean against the fixture, and every check *finds* its own mutation.
+
+    The second half is the point. These audits were shown to be gutable while still printing
+    OK, so each check is driven against a schema mutated in exactly the way it exists to catch
+    -- a blanked check would pass the first half and fail here.
+    """
+    object_info = recorded_object_info()
+    for check in preflight_ltx25_extend.CHECKS:
+        assert check(object_info) == [], check.__name__
+
+    # A model file that left its loader's options.
+    moved = copy.deepcopy(object_info)
+    moved["VAELoaderKJ"]["input"]["required"]["vae_name"][0] = ["something-else.safetensors"]
+    assert any(
+        "ltx-2.5-audio-vae-bf16.safetensors" in problem
+        for problem in preflight_ltx25_extend.check_model_files(moved)
+    )
+
+    # A container list that stopped matching the node's.
+    moved = copy.deepcopy(object_info)
+    moved["VHS_LoadVideoPath"]["input"]["required"]["video"][1]["vhs_path_extensions"] = ["mp4"]
+    assert preflight_ltx25_extend.check_source_extensions(moved) != []
+    # And one that vanished entirely, which would otherwise check the adapter against nothing.
+    moved["VHS_LoadVideoPath"]["input"]["required"]["video"][1].pop("vhs_path_extensions")
+    assert preflight_ltx25_extend.check_source_extensions(moved) != []
+
+    # A ceiling that moved, and a ceiling that disappeared.
+    for mutate in (
+        lambda spec: spec[1].__setitem__("max", 30),
+        lambda spec: spec[1].pop("max"),
+    ):
+        moved = copy.deepcopy(object_info)
+        mutate(moved["VHS_LoadVideoPath"]["input"]["required"]["force_rate"])
+        problems = preflight_ltx25_extend.check_declared_limits(moved)
+        assert any("LTX25_EXTEND_MAX_FRAME_RATE" in problem for problem in problems), problems
+
+    # A substituted class that is not installed after all.
+    moved = copy.deepcopy(object_info)
+    del moved["SimpleCalculatorKJ"]
+    problems = preflight_ltx25_extend.check_substitutions_are_for_schema_shape_not_absence(moved)
+    assert any("SimpleCalculatorKJ" in problem for problem in problems), problems
+
+
+def test_the_extend_audit_refuses_a_dependency_list_built_from_the_node_list(monkeypatch):
+    """The mutation this design exists to survive, driven through the audit itself.
+
+    Two directions, because this graph is the one where both are live: a payload that dropped
+    `LatentUpscaleModelLoader` -- the habit the other two LTX adapters correctly follow -- and
+    a payload that added a model the reachable subgraph never loads.
+    """
+    honest = preflight_ltx25_extend.audit_payloads()
+
+    def without_the_upscaler() -> list[tuple[str, dict]]:
+        label, payload = honest[0]
+        payload = copy.deepcopy(payload)
+        del payload["mvp:upscaler"]
+        return [(label, payload)]
+
+    def with_an_invented_model() -> list[tuple[str, dict]]:
+        label, payload = honest[0]
+        payload = copy.deepcopy(payload)
+        payload["mvp:extra"] = {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "not-in-this-graph.safetensors", "weight_dtype": "default"},
+        }
+        return [(label, payload)]
+
+    for build in (without_the_upscaler, with_an_invented_model):
+        monkeypatch.setattr(preflight_ltx25_extend, "audit_payloads", build)
+        problems = preflight_ltx25_extend.check_dependencies_come_from_the_reachable_subgraph(
+            recorded_object_info()
+        )
+        assert any("reachable subgraph loads" in problem for problem in problems), build.__name__
+
+
+def test_a_blanked_extend_check_fails_this_suite_rather_than_printing_ok(monkeypatch, tmp_path):
+    """The audit's failure path, driven end to end against a stubbed server.
+
+    `run_audit` is what the script calls, so this is where "a failing check fails the audit"
+    has to be true -- and where "a failing audit records no fixture" has to be true with it.
+    Driven through `fetch` rather than a live server, so the failure path is exercised by the
+    suite instead of by a person remembering to break something.
+    """
+    object_info = recorded_object_info()
+    fixture = tmp_path / "object_info.json"
+
+    def stub(base_url: str) -> dict:
+        return object_info
+
+    # Clean: the audit passes and writes the fixture it was asked for.
+    preflight.run_audit(
+        preflight_ltx25_extend.audit_payloads(),
+        base_url="http://stub",
+        record=True,
+        checks=preflight_ltx25_extend.CHECKS,
+        fetch=stub,
+        fixture_path=fixture,
+    )
+    assert fixture.exists()
+    fixture.unlink()
+
+    # One check reporting a problem must fail the whole audit and record nothing.
+    def reports(_object_info: dict) -> list[str]:
+        return ["limits: a ceiling moved"]
+
+    with pytest.raises(SystemExit) as failure:
+        preflight.run_audit(
+            preflight_ltx25_extend.audit_payloads(),
+            base_url="http://stub",
+            record=True,
+            checks=(*preflight_ltx25_extend.CHECKS, reports),
+            fetch=stub,
+            fixture_path=fixture,
+        )
+    assert failure.value.code == 1
+    assert not fixture.exists()
+
+    # The mutation the brief calls for, one check at a time: replace a check with a blank that
+    # always returns [], hand the audit a schema that check would have rejected, and the audit
+    # must go from failing to printing OK. That transition is what proves the check is doing
+    # the work -- and it is why the per-check mutations above are the ones that must stay red.
+    # Each mutation is one only its own check can see. A schema break that `validate` also
+    # catches would keep the audit red with the check blanked, and would prove nothing about
+    # the check.
+    breakage = {
+        # An option list that stopped being readable. `validate` skips an unreadable COMBO
+        # rather than blaming the payload for it; naming the file is this check's whole job.
+        "check_model_files": lambda info: info["VAELoaderKJ"]["input"]["required"][
+            "vae_name"
+        ].__setitem__(0, "COMBO"),
+        "check_source_extensions": lambda info: info["VHS_LoadVideoPath"]["input"]["required"][
+            "video"
+        ][1].__setitem__("vhs_path_extensions", ["mp4"]),
+        "check_declared_limits": lambda info: info["VHS_LoadVideoPath"]["input"]["required"][
+            "force_rate"
+        ][1].__setitem__("max", 30),
+        "check_substitutions_are_for_schema_shape_not_absence": lambda info: info.pop(
+            "SimpleCalculatorKJ"
+        ),
+    }
+    assert set(breakage) <= {check.__name__ for check in preflight_ltx25_extend.CHECKS}
+
+    for name, break_it in breakage.items():
+        broken = copy.deepcopy(object_info)
+        break_it(broken)
+
+        def broken_stub(base_url: str, schema: dict = broken) -> dict:
+            return schema
+
+        arguments = {
+            "base_url": "http://stub",
+            "record": False,
+            "fetch": broken_stub,
+            "fixture_path": fixture,
+        }
+        with pytest.raises(SystemExit):
+            preflight.run_audit(
+                preflight_ltx25_extend.audit_payloads(),
+                checks=preflight_ltx25_extend.CHECKS,
+                **arguments,
+            )
+        # Blank that one check and the same broken schema audits clean, which is exactly the
+        # gutted-but-green failure this suite exists to make impossible.
+        blanked = tuple(
+            (lambda _info: []) if check.__name__ == name else check
+            for check in preflight_ltx25_extend.CHECKS
+        )
+        preflight.run_audit(
+            preflight_ltx25_extend.audit_payloads(), checks=blanked, **arguments
+        )

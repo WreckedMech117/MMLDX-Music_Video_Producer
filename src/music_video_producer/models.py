@@ -924,6 +924,78 @@ def prefer_identity_sheets(
     return kept
 
 
+#: How short a display name has to be before the prose scan stops trusting it.
+#:
+#: Named rather than spelled `4` at the one call site it had, because the scan is now the
+#: *fallback* half of a two-part rule and the number is the whole of what makes it safe: it is
+#: a plain case-insensitive substring test, so a two-character name ("AJ") matches inside a
+#: dozen ordinary words and a three-character one ("Bed") matches "Bedroom". Structural
+#: citation has no such limit — an exact id or an exact name is exact at any length — which is
+#: precisely why the fallback needs one and the primary does not.
+NAME_SCAN_MIN_LENGTH = 4
+
+
+def assets_for_proposal(
+    library: Sequence[Asset], *, declared: Sequence[str] = (), prose: str = ""
+) -> list[Asset]:
+    """Which of `library` a planned shot cites: what it *declared*, then what its prose names.
+
+    The Director's defect, measured on a live plan (2026-08-21): 24 of 30 shot prompts echoed
+    an asset's display name, because the only way to attach a picture to a shot was to type
+    that picture's label into the shot's creative writing. "Extreme close up of Crimson Lips
+    Close-up while HarderFaster performs" is not a director's sentence, it is a manifest with
+    verbs. `director.PlannedShot.assets` is the structural answer, and this is where the two
+    halves meet.
+
+    **Declared first, prose second, and the prose half is a fallback and never a primary.**
+    That ordering is the decision worth defending. A model that names an asset in the prose
+    and omits it from the field is a model whose *intent* is unambiguous, and dropping the
+    citation would mean rendering a shot without the reference it asked for — a silent,
+    permanent loss. An awkward sentence is a thing a human can read and fix; a missing
+    reference is a thing nobody sees until the render comes back wrong. So losing a citation
+    is the worse failure of the two, and the scan stays.
+
+    Matching is by **id or exact display name** (case-insensitive, surrounding space
+    stripped), because those are the two spellings the model was actually shown — the populate
+    instruction's roster is by name, the project context dump beside it carries ids. An entry
+    matching neither is dropped: it cannot invent an asset, and guessing which one a near-miss
+    meant is how a shot ends up conditioned on the wrong face.
+
+    Order is citation order, and it is deterministic: declared entries in the order the model
+    listed them, then the un-declared prose matches in **library** order. Duplicates collapse
+    to their first appearance, which is what stops a name that is both declared and written
+    from being cited twice.
+
+    Byte-identity, and it is the whole compatibility argument: with `declared` empty this
+    returns exactly `[asset for asset in library if len(asset.name) >= NAME_SCAN_MIN_LENGTH
+    and asset.name.lower() in prose.lower()]` — the same assets, in the same order, which
+    become the same citations with the same `order` values populate has always written.
+    """
+    by_id = {asset.id: asset for asset in library}
+    # First occurrence wins, so a library holding two assets under one display name resolves a
+    # by-name entry to the earlier one rather than to whichever happened to be enumerated last.
+    by_name: dict[str, Asset] = {}
+    for asset in library:
+        by_name.setdefault(asset.name.strip().casefold(), asset)
+    chosen: list[Asset] = []
+    seen: set[str] = set()
+    for entry in declared:
+        text = entry.strip()
+        asset = by_id.get(text) or by_name.get(text.casefold())
+        if asset is None or asset.id in seen:
+            continue
+        seen.add(asset.id)
+        chosen.append(asset)
+    lowered = prose.lower()
+    for asset in library:
+        if asset.id in seen:
+            continue
+        if len(asset.name) >= NAME_SCAN_MIN_LENGTH and asset.name.lower() in lowered:
+            seen.add(asset.id)
+            chosen.append(asset)
+    return chosen
+
+
 def default_setting_asset(project: Project) -> Asset | None:
     """The location this project declared, or `None`. **Never a guess.**
 

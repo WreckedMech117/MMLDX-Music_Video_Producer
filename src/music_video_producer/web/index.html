@@ -329,7 +329,21 @@
               stylesheet says state is never carried by colour alone; Delete keeps `danger-button`,
               so an icon-only destructive control still does not look like its neighbours; and
               ＋ Shot keeps its word, because a bare ＋ is what the zoom-in button beside it already
-              says and "the meaning is genuinely unambiguous" is the test for dropping a word. --><button class="quiet-button" id="add-shot" title="Add a shot to the plan" aria-label="Add a shot to the plan">＋ Shot</button><button class="quiet-button icon-tool" id="split-shot" title="Split the selected shot in two" aria-label="Split the selected shot in two">✂</button><button class="quiet-button icon-tool" id="duplicate-shot" title="Duplicate the selected shot" aria-label="Duplicate the selected shot">⧉</button><button class="danger-button icon-tool" id="delete-shot" title="Delete the selected shot. Its rendered takes stay on disk." aria-label="Delete the selected shot. Its rendered takes stay on disk.">🗑</button><span class="divider"></span><!-- The zoom slider the Director expected to find and did not: what was there was
+              says and "the meaning is genuinely unambiguous" is the test for dropping a word.
+
+              Undo and Redo lead the row, first because they step back the four gestures that
+              follow them and because the Director lost a shot to a mis-click with nothing to
+              press (2026-08-21). Both ship `disabled` with the "nothing to undo" sentence already
+              on them: the stack is empty until a save lands, and a button that looked live before
+              the first edit would be a promise this feature deliberately does not make. Their
+              accessible name is written by app.js's syncUndoControls and names the gesture — a
+              glyph is not a label, and "Undo" alone does not say what comes back. --><button class="quiet-button icon-tool" id="undo-shots" disabled title="Nothing to undo — timeline edits made in this session appear here." aria-label="Nothing to undo — timeline edits made in this session appear here.">↶</button><button class="quiet-button icon-tool" id="redo-shots" disabled title="Nothing to redo." aria-label="Nothing to redo.">↷</button><span class="divider"></span><button class="quiet-button" id="add-shot" title="Add a shot to the plan" aria-label="Add a shot to the plan">＋ Shot</button><button class="quiet-button icon-tool" id="split-shot" title="Split the selected shot in two" aria-label="Split the selected shot in two">✂</button><button class="quiet-button icon-tool" id="duplicate-shot" title="Duplicate the selected shot" aria-label="Duplicate the selected shot">⧉</button><button class="danger-button icon-tool" id="delete-shot" title="Delete the selected shot. Its rendered takes stay on disk." aria-label="Delete the selected shot. Its rendered takes stay on disk.">🗑</button><!-- The playhead magnet (the Director's ask, 2026-08-21: "Snap to timeline play marker also
+              good so i can line up to beats in the music then snap the Shot edges to it"). A
+              toggle, so its state is `aria-pressed` and not a class alone, and its accessible name
+              says on or off in words — the row already holds two mute buttons whose state is a
+              hue, and this application's rule is that state is never carried by colour alone. The
+              title here is a placeholder: app.js's syncPlayheadSnapControl writes the live one at
+              boot and on every press. --><button class="quiet-button icon-tool snap-on" id="snap-playhead" aria-pressed="true" title="Snap to playhead: on." aria-label="Snap to playhead: on.">⇥│</button><span class="divider"></span><!-- The zoom slider the Director expected to find and did not: what was there was
               `#master-volume` further along this same bar, which is a volume control. Both sliders
               now carry a visible label, because two unlabelled sliders in one row is the confusion
               that produced the report. This one drives the same `state.pixelsPerSecond` the two

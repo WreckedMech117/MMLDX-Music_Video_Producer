@@ -385,6 +385,51 @@ def test_the_trim_offset_is_a_frame_exact_start_frame_never_a_seek():
     assert "trim=" not in plain[plain.index("-vf") + 1]
 
 
+def test_a_short_window_assembles_its_own_seconds_out_of_a_minimum_length_take():
+    """A 2.083 s window against the 4.4583 s take the H3 minimum floor now renders for it.
+
+    The Director's 2026-08-20 ruling makes the rendered length and the exposed length two
+    different numbers, and this is the end of the chain that has to keep them apart: the take
+    holds 107 frames, the timeline gets 50, and the 29-frame lead is where the cut starts. The
+    numbers are written out rather than imported — assembly's job is to consume a recorded
+    offset, and it must not learn to re-derive one.
+    """
+    take_seconds = 107 / ASSEMBLY_FPS
+    short = clip("b", 3.75, 2.083)
+    short.offset = 29 / ASSEMBLY_FPS  # the lead `timeline.over_render_lead` recorded
+    short.take_seconds = take_seconds
+    plan = assembly_plan(
+        [clip("a", 0, 3.75), short, clip("c", 5.833, 4.167)],
+        song_seconds=10.0,
+        dimensions={"a": (640, 384), "b": (640, 384), "c": (640, 384)},
+    )
+    # The exposed length, on the cumulative grid — 50 frames, not the take's 107.
+    assert plan.frames == [90, 50, 100]
+    assert plan.total_frames == 240 == round(10.0 * ASSEMBLY_FPS)
+    assert sum(plan.frames[:1]) == round(3.75 * ASSEMBLY_FPS)
+    # The cut lands on the take's 29th frame and takes 50 from there, well inside 107 — the
+    # remaining 28 frames are the tail half of the invisible buffer.
+    args = trim_args(
+        Path("in.mp4"),
+        Path("out.mp4"),
+        frames=plan.frames[1],
+        width=640,
+        height=384,
+        offset=short.offset,
+    )
+    filters = args[args.index("-vf") + 1]
+    assert filters.startswith("trim=start_frame=29,setpts=PTS-STARTPTS,")
+    assert args[args.index("-frames:v") + 1] == "50"
+    assert 29 + 50 < 107
+    # And the plan is assemblable: the offset plus the window fits inside the measured take,
+    # which is the refusal that would fire if the floor and the lead ever disagreed.
+    assert assembly_refusals([short], song_seconds=2.083 + 3.75) == [
+        ASSEMBLY_GAP_REFUSAL.format(
+            start=0.0, end=3.75, before=SONG_START_LABEL, after="SHOT (b)"
+        )
+    ]
+
+
 def test_an_offset_that_runs_off_either_end_of_the_take_is_refused_with_numbers():
     """The nudge is clamped in the client, but the manifest is writable by clients that do
     not clamp — so the report decides, against the take's measured length."""

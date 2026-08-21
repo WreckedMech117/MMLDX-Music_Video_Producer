@@ -1273,6 +1273,71 @@ export function batchReportToast(report) {
 // so the kind is part of the sentence.
 export const READINESS_BLOCKING_LABEL = "Blocked";
 export const READINESS_SAMENESS_LABEL = "Near-duplicate";
+//: The two window states, named apart because they *are* apart: one is handled and one is not.
+//: Neither is a block, and neither may be drawn as one -- both of the server's sentences end by
+//: saying so.
+export const READINESS_WINDOW_LONG_LABEL = "Long window";
+export const READINESS_WINDOW_SHORT_LABEL = "Short window";
+
+// ------------------------------------------------------------------------------------------
+// The shot-length band, as the *server* judges it. `batch.NOTE_KIND_WINDOW_SHORT` and
+// `NOTE_KIND_WINDOW_LONG`, pinned by a contract test.
+//
+// **Nothing here re-derives the band.** The constants live in `timeline.py` and the short end
+// has deliberately subtle arithmetic -- the render floors at H3's minimum frame count and
+// centres the window inside it, so the floor fires well below the nominal 4 s. A client-side
+// band check would drift from the server's and paint a clip yellow the server considers fine,
+// or leave one plain that it does not. The report carries the verdict; this reads it.
+//
+// The two states are asymmetric on purpose, and the asymmetry is the Director's own ruling:
+//
+// * `window_long` is the yellow. "when dragging a clip past that it should turn yellow but we
+//   arent dead yet" -- a warning on the clip, never a refusal anywhere. The shot stays
+//   editable, submittable and armable.
+// * `window_short` is **not a problem at all** any more. The render floors and centres, so the
+//   exposed cut is exactly the window and a micro-cut is legitimate. It is reported in the
+//   readiness list, where the server's sentence explains what it costs, and it deliberately
+//   puts no state on the clip: a colour there would say "wrong" about something that is fine.
+// ------------------------------------------------------------------------------------------
+
+export const NOTE_KIND_WINDOW_SHORT = "window_short";
+export const NOTE_KIND_WINDOW_LONG = "window_long";
+
+function windowNoteKind(note) {
+  return note?.kind === NOTE_KIND_WINDOW_LONG ? NOTE_KIND_WINDOW_LONG : NOTE_KIND_WINDOW_SHORT;
+}
+
+// Which shots the report says are outside the band, and on which side. `{ shotId: kind }`, empty
+// for a report that has not been fetched or that found nothing.
+export function windowWarningsByShot(report) {
+  const found = {};
+  for (const note of report?.window_warnings || []) {
+    for (const shotId of note?.shot_ids || []) found[shotId] = windowNoteKind(note);
+  }
+  return found;
+}
+
+//: The class a clip carries for its window state, and the sentence appended to its accessible
+//: name. Only the long end draws anything: state is never carried by colour alone here either,
+//: so the class comes with words, and the short end comes with neither.
+export const CLIP_WINDOW_LONG_CLASS = "window-long";
+export const CLIP_WINDOW_LONG_NOTE =
+  "Longer than the range H3 is trained for. It still submits and renders; expect motion and " +
+  "lipsync to drift late in the take.";
+
+// `label` is the clip's whole accessible name: `shotPromptCell`'s label with this state's
+// sentence folded in, or that label untouched when there is no state. Returned from here rather
+// than joined in the template, on `shotPromptCell`'s own argument -- the timeline's markup is a
+// thin applier of decisions made in this file, and a ternary in the template is a second place
+// the two signals could come apart. A clip inside the band is byte for byte what it was.
+export function clipWindowState(kind, label = "") {
+  if (kind !== NOTE_KIND_WINDOW_LONG) return { className: "", note: "", label };
+  return {
+    className: CLIP_WINDOW_LONG_CLASS,
+    note: CLIP_WINDOW_LONG_NOTE,
+    label: label ? `${label} — ${CLIP_WINDOW_LONG_NOTE}` : CLIP_WINDOW_LONG_NOTE,
+  };
+}
 
 // Every note in a readiness report, rendered as a line, in the server's own words and under the
 // server's own names for the Shots.
@@ -1296,6 +1361,16 @@ export function readinessLines(report) {
   return [
     ...(report?.blocking || []).map(render("blocking", READINESS_BLOCKING_LABEL)),
     ...(report?.warnings || []).map(render("warning", READINESS_SAMENESS_LABEL)),
+    // The third list, drawn as its own kind and never folded into the second. `warnings` means
+    // exactly one thing to every reader it already has -- `READINESS_SAMENESS_LABEL` and
+    // `readinessSummary`'s "N near-duplicate pairs" -- so a window note posted into it would
+    // reach the Director under a name that is not what it says, counted as a pair it is not.
+    ...(report?.window_warnings || []).map((note) => render(
+      windowNoteKind(note) === NOTE_KIND_WINDOW_LONG ? "window-long" : "window-short",
+      windowNoteKind(note) === NOTE_KIND_WINDOW_LONG
+        ? READINESS_WINDOW_LONG_LABEL
+        : READINESS_WINDOW_SHORT_LABEL,
+    )(note)),
   ];
 }
 
@@ -1958,6 +2033,38 @@ export function expandAllPromptsToast(project) {
   return EXPAND_ALL_PROMPTS_TOAST.replace("{count}", written).replace("{plural}", written === 1 ? "" : "s");
 }
 
+//: The control the Director asked for "up by where the Cuts and Snap Cuts stuff are" (2026-08-21).
+//: A second affordance for `expand_plan_prompts`, not a second feature: it shares the route, the
+//: label, the help and the refusal with `EXPAND_ALL_PROMPTS_CONTROL` in the Director workspace.
+//: Its own id because two elements may not carry one id, and a control the timeline draws must be
+//: addressable from the timeline.
+export const EXPAND_ALL_PROMPTS_TIMELINE_CONTROL = "#timeline-expand-prompts";
+export const EXPAND_ALL_PROMPTS_TIMELINE_LABEL = "Expand All Prompts";
+export const EXPAND_ALL_PROMPTS_RUNNING = "Expanding…";
+//: What the click is about to cost, in the shape every expensive bulk action in this interface
+//: states it: what it does, to how many shots, and what it does not touch.
+export const EXPAND_ALL_PROMPTS_CONFIRM =
+  "Expand all {count} shot(s) into H3 prompts? That is one model call per shot and takes a " +
+  "while. No creative intent is overwritten, but the whole project comes back, so the editors " +
+  "are re-rendered from the text stored on the server.";
+
+// The sweep's own per-shot report, for the bar that raised it. The route answers with the whole
+// project and attaches one notice per group -- what was written, what was locked, what carried
+// render provenance, what was refused -- and those notices are the half a Director has to be able
+// to read. They live in the Director thread two panels away, which is nowhere near the button
+// this control puts on the timeline, so they are drawn beside it as well.
+//
+// Read from the reply's own `notices` field through `messageParts`, never recovered from the text
+// -- the same rule the thread follows, and for the same reason: the model's own output can
+// legitimately contain the separator.
+export function expansionSweepLines(project) {
+  const messages = project?.messages;
+  if (!Array.isArray(messages)) return [];
+  const reply = messages.filter((message) => message?.role === "assistant").at(-1);
+  if (!reply) return [];
+  return messageParts(reply).notices.map((notice) => ({ kind: notice.kind, text: notice.text }));
+}
+
 // What one per-shot expansion did, taken from the route's own `applied` flag rather than inferred.
 // The malformed case is deliberately not summarised into "something went wrong": the checker's
 // sentences are the actionable half, and they are shown in the panel by `expansionReportHtml` --
@@ -2225,6 +2332,39 @@ export function shotBoundaries(project) {
     edges.add(Math.round((shot.start + shot.duration) * 1000) / 1000);
   }
   return [...edges].sort((a, b) => a - b);
+}
+
+// ------------------------------------------------------------------------------------------
+// Fill section looks. The Director's report (2026-08-20): a Section clicked in the timeline
+// had an empty shared prompt, "nothing transferred the appropriate section descriptions into
+// the actual sections once they were populated on the timeline". The route reads them out of
+// the Treatment and the Style Bible; these are the words the button and its confirm use.
+// ------------------------------------------------------------------------------------------
+
+export const FILL_SECTION_LOOKS_LABEL = "Fill looks from Treatment";
+export const FILL_SECTION_LOOKS_RUNNING = "Reading the treatment…";
+export const FILL_SECTION_LOOKS_HELP =
+  "Read every section's shared look out of the Treatment and the Style Bible. Shows what " +
+  "it would write before writing it; a look you wrote yourself is never replaced without " +
+  "you saying so.";
+export const FILL_SECTION_LOOKS_OVERWRITE_QUESTION =
+  "Also replace the section looks you wrote yourself?";
+export const FILL_SECTION_LOOKS_APPLIED = "{filled} section look(s) written, {skipped} left alone.";
+
+// The report as one confirm question, in the server's own sentences. Every section is a line
+// and no line is summarised away -- `snapCutsReportLines`' rule, and for its reason: the
+// section that was skipped, and why, is exactly the one the Director needs to see, because
+// "the treatment does not describe this section" is a sentence that sends them back to the
+// treatment rather than leaving a box mysteriously blank.
+export function sectionLooksConfirmation(report) {
+  if (!report) return "";
+  const lines = (report.sections || []).map((row) => {
+    const at = `${Number(row.start).toFixed(1)}s ${row.label}`;
+    if (row.filled) return `${at}: ${row.prompt}`;
+    return `${at}: skipped — ${row.reason}`;
+  });
+  const head = report.message ? [report.message, ""] : [];
+  return [...head, ...lines, "", "Write these looks?"].join("\n");
 }
 
 // AI Mod (the Director's stage-3 ask): whether this asset can take a prompted image edit.
@@ -2656,6 +2796,395 @@ export function snapCutsReportLines(report) {
     lines.push({ kind: "skip", text: skip.reason });
   }
   return lines;
+}
+
+// ------------------------------------------------------------------------------------------
+// Direct manipulation on the SHOTS track: undo/redo, the gap-fill gesture, and snapping an
+// edge to the playhead. The Director's asks, 2026-08-21:
+//
+//   "I accidentally hit split on a clip, but there is no Undo button"
+//   "when i shorten one clip and leave a gap ... double-click on a shot edge next to that gap"
+//   "Snap to timeline play marker ... so i can line up to beats in the music"
+//
+// Every decision here is pure and executed by the contract tests. Nothing in this section
+// writes: the two gestures below answer with the windows a caller should save, and the caller
+// sends them through the same `PUT /shots` every other timeline edit goes through, so every
+// server-side gate on that route applies to them unchanged.
+//
+// **Contiguity is the invariant.** The plan tiles the song, so a shot's edge is its
+// neighbour's edge. Both gestures are written in terms of the *boundary* rather than of one
+// window, and `contiguityProblems` is what the tests hold them to.
+// ------------------------------------------------------------------------------------------
+
+//: `assembly.ASSEMBLY_FPS`, `BOUNDARY_TOLERANCE_SECONDS` and `COVERAGE_TOLERANCE_SECONDS`,
+//: each pinned to the Python constant by a contract test. Read rather than hardcoded per the
+//: same rule the snap tolerances follow: these are the numbers that decide whether a plan
+//: still assembles, and a second, drifting copy would let the timeline call a plan contiguous
+//: that the assembler then refuses.
+export const ASSEMBLY_FPS = 24;
+export const BOUNDARY_TOLERANCE_SECONDS = 1 / (2 * ASSEMBLY_FPS);
+export const COVERAGE_TOLERANCE_SECONDS = 1 / ASSEMBLY_FPS;
+
+// Seconds are stored to the microsecond. Not a grid: the drag handlers quantise to frames
+// because a drag is an approximation of an intent, and these gestures are the opposite --
+// closing a 0.002 s gap and landing on the playhead are both requests for an *exact* number,
+// and quantising either would re-open the very gap the gesture was pressed to close.
+export function exactSeconds(value) {
+  return Math.round(Number(value) * 1e6) / 1e6;
+}
+
+// Below this, two numbers are the same instant and there is no gap to close. A microsecond:
+// a millionth of a frame, which is float noise and nothing else. Deliberately *not*
+// `BOUNDARY_TOLERANCE_SECONDS` -- the Director's live plan carries 0.002 s, 0.004 s, 0.014 s
+// and 0.015 s gaps, every one of them well inside assembly's tolerance and every one of them
+// a gap they asked to be able to close.
+export const GAP_EPSILON_SECONDS = 1e-6;
+
+// Every neighbouring pair in the plan, in the order the song plays them, with the signed
+// seconds between them: positive is a gap, negative is an overlap. The song's head and tail
+// are pairs too, so a plan that starts late or ends early is not invisible here.
+export function planSeams(shots, songDuration = null) {
+  const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
+  const seams = [];
+  if (!ordered.length) return seams;
+  seams.push({ kind: "head", before: null, after: ordered[0].id, seconds: exactSeconds(ordered[0].start) });
+  for (let index = 0; index < ordered.length - 1; index += 1) {
+    const shot = ordered[index];
+    const next = ordered[index + 1];
+    seams.push({
+      kind: "seam",
+      before: shot.id,
+      after: next.id,
+      seconds: exactSeconds(next.start - (shot.start + shot.duration)),
+    });
+  }
+  const last = ordered[ordered.length - 1];
+  if (Number.isFinite(songDuration) && songDuration > 0) {
+    seams.push({
+      kind: "tail",
+      before: last.id,
+      after: null,
+      seconds: exactSeconds(songDuration - (last.start + last.duration)),
+    });
+  }
+  return seams;
+}
+
+// The plan's contiguity, judged by assembly's own numbers: a seam beyond
+// `BOUNDARY_TOLERANCE_SECONDS`, or a head/tail beyond `COVERAGE_TOLERANCE_SECONDS`, is
+// something the assembler would report. An empty list means the plan tiles the song.
+//
+// This is an *assertion helper*, not a gate: nothing in the interface refuses an edit because
+// of it. A Director mid-edit is allowed to have a plan that does not yet assemble.
+export function contiguityProblems(shots, songDuration = null) {
+  const problems = [];
+  for (const seam of planSeams(shots, songDuration)) {
+    const tolerance = seam.kind === "seam" ? BOUNDARY_TOLERANCE_SECONDS : COVERAGE_TOLERANCE_SECONDS;
+    if (Math.abs(seam.seconds) <= tolerance) continue;
+    problems.push({ ...seam, problem: seam.seconds > 0 ? "gap" : "overlap" });
+  }
+  return problems;
+}
+
+// ---- who may move a cut -------------------------------------------------------------------
+//
+// `timeline.cut_move_refusal`'s three sentences and its order, verbatim, held byte for byte
+// against the Python constants by a contract test. They are reused rather than reworded for
+// the reason this codebase reuses every refusal: a second wording of one rule is a second
+// thing to keep true, and the Director reads whichever one happens to fire.
+export const CUT_LOCKED_REFUSAL =
+  "{shot} is locked. A lock is a deliberate hands-off on this shot, and moving the cut at " +
+  "its edge changes its window, which is exactly the kind of change it refuses. Unlock the " +
+  "shot first.";
+export const CUT_APPROVED_REFUSAL =
+  "{shot} carries an approved take, and an approval records the window it was approved in. " +
+  "Moving this cut would change that window and assembly would then refuse the shot as " +
+  "stale. Un-approve the take first if the cut should move.";
+export const CUT_IN_FLIGHT_REFUSAL =
+  "A render for {shot} has not finished, and it was submitted for the window this cut " +
+  "would change. Wait for it, or refresh the render queue if it has already finished and " +
+  "this project has not been told yet.";
+
+// Why this shot's cut may not move, or "" when it may. The client half of
+// `timeline.cut_move_refusal`, on the evidence a browser holds: `status` is the in-flight
+// signal here, exactly as `shotRenderInFlight` reads it everywhere else in this file.
+export function cutMoveRefusal(project, shot) {
+  if (!shot) return "";
+  const named = (wording) => wording.replace("{shot}", shotLabel(project, shot.id));
+  if (shot.locked) return named(CUT_LOCKED_REFUSAL);
+  if (shot.approved_output || shot.status === "approved") return named(CUT_APPROVED_REFUSAL);
+  if (shotRenderInFlight(shot)) return named(CUT_IN_FLIGHT_REFUSAL);
+  return "";
+}
+
+// ---- B. double-click an edge beside a gap ---------------------------------------------------
+
+//: How long after one press on an edge a second press on the *same* edge is the same gesture.
+//: 400 ms is the platform's own double-click window on Windows, and the value is here rather
+//: than inline so the rule can be executed.
+export const EDGE_DOUBLE_CLICK_MS = 400;
+
+// Whether this press on a resize handle completes a double-click.
+//
+// **Hand-rolled rather than a `dblclick` listener, and this is not a stylistic choice.** The
+// clip's own `pointerdown` re-renders the SHOTS track, which replaces every clip node in the
+// document -- so by the time the second click of a real double-click happens, the element the
+// first one landed on no longer exists, and the browser has no common target to dispatch
+// `dblclick` at. A `dblclick` handler on the clip is therefore dead code in this panel, and it
+// is dead in a way no offline harness can see: the listener is bound, the selector matches, and
+// the event simply never arrives. It was, until a real browser was pointed at it.
+export function doubleEdgePress(last, press, windowMs = EDGE_DOUBLE_CLICK_MS) {
+  if (!last || !press || !press.shotId || !press.edge) return false;
+  if (last.shotId !== press.shotId || last.edge !== press.edge) return false;
+  const elapsed = Number(press.at) - Number(last.at);
+  return elapsed >= 0 && elapsed <= windowMs;
+}
+
+export const GAP_FILL_NO_GAP =
+  "{shot} already meets its neighbour on that side — there is no gap there to close.";
+export const GAP_FILL_TOAST = "{shot} extended by {seconds}s to close the gap.";
+//: What the far side of the gap is called when there is no shot there.
+export const GAP_FILL_SONG_HEAD = "the start of the song";
+export const GAP_FILL_SONG_TAIL = "the end of the song";
+
+// The plan for one double-click: which edge moves, where to, and how far. Pure; the caller
+// writes it.
+//
+// `edge` is "left" or "right". The far side is the nearest neighbour on that side that does
+// not already overlap this shot -- or the song's own head/tail when there is none, which is
+// what makes the gesture work on the first and last clip in the plan.
+//
+// **Both shots at the resulting cut are checked**, not only the one being stretched.
+// `timeline.snap_cut_plan` rules that a cut belongs to the two shots that share it, and this
+// gesture creates exactly such a shared cut where there was empty song. The stretched shot is
+// checked first so its own sentence is the one read when both are protected -- the order
+// `shot_write_refusal` and `populate` both use.
+export function gapFillPlan(project, shotId, edge) {
+  const shots = project?.shots || [];
+  const shot = shots.find((item) => item?.id === shotId);
+  if (!shot) return { ok: false, refusal: "" };
+  const ordered = [...shots].sort((a, b) => a.start - b.start);
+  const end = shot.start + shot.duration;
+  const refuse = (refusal) => ({ ok: false, refusal });
+  // The neighbour is the *adjacent* clip in song order, never "the nearest one that does not
+  // already overlap". Searching for a non-overlapping neighbour is how this gesture would
+  // swallow a shot whole: a right edge already overlapping the next clip would skip past it
+  // and stretch to the one after, deleting a shot from the picture without deleting it from
+  // the plan. Adjacency is what the Director sees, and an overlapping neighbour simply means
+  // there is no gap here.
+  const index = ordered.findIndex((item) => item.id === shot.id);
+  let boundary;
+  let neighbour = null;
+  if (edge === "right") {
+    neighbour = ordered[index + 1] || null;
+    boundary = neighbour ? neighbour.start : Number(project?.song?.duration);
+  } else {
+    neighbour = index > 0 ? ordered[index - 1] : null;
+    boundary = neighbour ? neighbour.start + neighbour.duration : 0;
+  }
+  if (!Number.isFinite(boundary)) return refuse(GAP_FILL_NO_GAP.replace("{shot}", shotLabel(project, shot.id)));
+  const gap = exactSeconds(edge === "right" ? boundary - end : shot.start - boundary);
+  if (gap <= GAP_EPSILON_SECONDS) {
+    return refuse(GAP_FILL_NO_GAP.replace("{shot}", shotLabel(project, shot.id)));
+  }
+  const blocked = cutMoveRefusal(project, shot) || cutMoveRefusal(project, neighbour);
+  if (blocked) return refuse(blocked);
+  const window = edge === "right"
+    ? { start: exactSeconds(shot.start), duration: exactSeconds(boundary - shot.start) }
+    : { start: exactSeconds(boundary), duration: exactSeconds(end - boundary) };
+  return {
+    ok: true,
+    refusal: "",
+    edge,
+    gap,
+    shotId: shot.id,
+    neighbourId: neighbour?.id || null,
+    against: neighbour ? shotLabel(project, neighbour.id) : (edge === "right" ? GAP_FILL_SONG_TAIL : GAP_FILL_SONG_HEAD),
+    ...window,
+  };
+}
+
+// ---- C. snap an edge to the playhead --------------------------------------------------------
+
+//: How near, in *screen pixels*, an edge must come to the playhead before it snaps. Pixels and
+//: not seconds, so the gesture feels identical at every zoom: 0.4 s of pull at 6 px/s would
+//: swallow a whole short shot, and at 64 px/s would be unreachably fine.
+export const PLAYHEAD_SNAP_PIXELS = 8;
+export const PLAYHEAD_SNAP_LABEL = "Snap to playhead";
+export const PLAYHEAD_SNAP_HELP =
+  "While it is on, dragging a shot edge within a few pixels of the playhead lands it exactly " +
+  "on the playhead, and the neighbouring shot's edge follows so the plan stays contiguous. " +
+  "Park the playhead on a beat, then drag the cut to it. Off while the song is playing — a " +
+  "moving playhead is not a target.";
+export const PLAYHEAD_SNAP_TOAST = "Cut moved to the playhead at {seconds}s.";
+export const BOUNDARY_COLLAPSE_REFUSAL =
+  "Moving that cut to the playhead would leave {shot} with no length at all.";
+
+// Whether a proposed edge position should land on the playhead instead. Pure over numbers so
+// the tolerance rule is executed rather than read.
+export function playheadSnap({
+  seconds,
+  playhead,
+  pixelsPerSecond,
+  enabled = true,
+  playing = false,
+  tolerancePixels = PLAYHEAD_SNAP_PIXELS,
+} = {}) {
+  const free = { snapped: false, seconds: exactSeconds(seconds) };
+  if (!enabled || playing) return free;
+  if (!Number.isFinite(seconds) || !Number.isFinite(playhead)) return free;
+  if (!(pixelsPerSecond > 0)) return free;
+  if (Math.abs(seconds - playhead) * pixelsPerSecond > tolerancePixels) return free;
+  return { snapped: true, seconds: exactSeconds(playhead) };
+}
+
+// Move the cut at one shot's edge to `seconds`, carrying the shot that shares it.
+//
+// This is the half that keeps the plan contiguous, and it is why snapping is not simply the
+// existing drag with a magnet on it: the freehand right-edge drag changes one duration and
+// leaves the next shot's start where it was, which is how the Director's plan came to hold
+// four sub-frame gaps. A cut is one instant belonging to two shots, so both windows move.
+//
+// A neighbour counts as sharing the cut when it meets this edge within
+// `BOUNDARY_TOLERANCE_SECONDS` -- assembly's own idea of "the same boundary written twice".
+// A neighbour further off than that is on the other side of a real gap or overlap, and this
+// gesture does not silently close one; that is what the double-click is for.
+export function boundaryMovePlan(project, shotId, edge, seconds) {
+  const shots = project?.shots || [];
+  const shot = shots.find((item) => item?.id === shotId);
+  if (!shot) return { ok: false, refusal: "", windows: [] };
+  const at = exactSeconds(seconds);
+  const end = shot.start + shot.duration;
+  const shared = shots.find((item) => item?.id !== shot.id && (edge === "right"
+    ? Math.abs(item.start - end) <= BOUNDARY_TOLERANCE_SECONDS
+    : Math.abs(item.start + item.duration - shot.start) <= BOUNDARY_TOLERANCE_SECONDS));
+  const blocked = cutMoveRefusal(project, shot) || cutMoveRefusal(project, shared);
+  if (blocked) return { ok: false, refusal: blocked, windows: [] };
+  const windows = [];
+  if (edge === "right") {
+    windows.push({ id: shot.id, start: exactSeconds(shot.start), duration: exactSeconds(at - shot.start) });
+    if (shared) {
+      windows.push({
+        id: shared.id,
+        start: at,
+        duration: exactSeconds(shared.start + shared.duration - at),
+      });
+    }
+  } else {
+    windows.push({ id: shot.id, start: at, duration: exactSeconds(end - at) });
+    if (shared) {
+      windows.push({ id: shared.id, start: exactSeconds(shared.start), duration: exactSeconds(at - shared.start) });
+    }
+  }
+  // Zero or negative only. **Not** a minimum length: short windows are legitimate and are
+  // being made more so, so nothing here may refuse one for being short -- a window with no
+  // length at all is a different thing, and it is not a window.
+  const collapsed = windows.find((window) => window.duration <= 0);
+  if (collapsed) {
+    return {
+      ok: false,
+      refusal: BOUNDARY_COLLAPSE_REFUSAL.replace("{shot}", shotLabel(project, collapsed.id)),
+      windows: [],
+    };
+  }
+  return { ok: true, refusal: "", windows, sharedId: shared?.id || null };
+}
+
+// ---- A. undo and redo -----------------------------------------------------------------------
+//
+// **A snapshot stack over the shot list, replayed through `PUT /shots`.** The manifest is one
+// atomic JSON document and the shot list is one field of it, so a snapshot of that field *is*
+// a complete description of the plan at a moment -- which is what makes the cheap design the
+// principled one here. A command history would have to carry an inverse for every gesture, and
+// each inverse would be a second implementation of the rule its gesture already encodes.
+//
+// The whole safety argument is the revision stamp, and it is deliberately not a new rule:
+//
+// * **Never undo something that was never applied.** An entry is pushed when the server
+//   confirms the write, never when the gesture is made. A refused save leaves nothing to undo.
+// * **Never clobber a state the server changed underneath.** The undo write carries the
+//   revision the stack is valid against as `PUT /shots`'s optimistic-concurrency token, so a
+//   render landing, a reconcile writing `latest_output`, or any other writer moving
+//   `updated_at` makes the server refuse it with `PROJECT_CHANGED_REFUSAL` -- the same 409
+//   every stale timeline save already gets. The client pre-flights the same comparison so the
+//   button can say so before it is pressed, and the stack is dropped rather than left holding
+//   entries that would replay over somebody else's work.
+// * **Never resurrect a shot whose render is in flight.** A snapshot taken before the render
+//   carries that shot's pre-render `status`, and `_require_in_flight_status_kept` refuses a
+//   body that walks an in-flight status back. Nothing here re-implements that check.
+//
+// Redo falls out of the same machinery: undoing displaces a state, and the displaced state is
+// pushed onto a second stack governed by exactly the same rule.
+
+export const UNDO_LABEL = "Undo";
+export const REDO_LABEL = "Redo";
+export const UNDO_ICON = "↶";
+export const REDO_ICON = "↷";
+//: How many gestures back the stack reaches. A plan's shot list is a few tens of kilobytes;
+//: forty of them is nothing, and forty gestures is far more than one sitting's worth of
+//: mis-clicks.
+export const UNDO_DEPTH = 40;
+
+export const UNDO_EMPTY = "Nothing to undo — timeline edits made in this session appear here.";
+export const REDO_EMPTY = "Nothing to redo.";
+export const UNDO_HELP = "Undo {what}. Ctrl+Z. Only the shot list is restored — takes on disk are never touched.";
+export const REDO_HELP = "Redo {what}. Ctrl+Shift+Z.";
+
+//: `app.PROJECT_CHANGED_REFUSAL`, byte for byte (a contract test holds them together). The
+//: sentence the server answers a stale `PUT /shots` with, said here *before* the request so a
+//: Director reads the same words whichever side notices first.
+export const PROJECT_CHANGED_REFUSAL =
+  "Project changed since it was loaded; refresh before replacing it";
+export const UNDO_PROJECT_MOVED =
+  `${PROJECT_CHANGED_REFUSAL}. Undo refuses rather than revert a change it did not make.`;
+
+//: What each covered gesture is called when the button names what it will undo.
+export const UNDO_GESTURES = {
+  add: "adding a shot",
+  split: "the split",
+  duplicate: "the duplicate",
+  delete: "the delete",
+  move: "moving a shot",
+  resize: "resizing a shot",
+  gapfill: "closing the gap",
+  snap: "snapping the cut to the playhead",
+  edit: "the last shot edit",
+};
+export const UNDO_GESTURE_FALLBACK = "edit";
+
+export function undoGestureLabel(kind) {
+  return UNDO_GESTURES[kind] || UNDO_GESTURES[UNDO_GESTURE_FALLBACK];
+}
+
+// Whether either button can be pressed, and what it says it will do. One function for both, so
+// the two can never disagree about the revision rule.
+//
+// `busy` is `app.js`'s `shotWriteInFlight` -- "" for none, or which automated write holds the
+// read-to-save window open. Its two sentences are the existing ones, verbatim, because an
+// undo landing in the middle of an expansion is the same hazard a hand edit is.
+export function undoControl(entries, {
+  revision = null,
+  projectRevision = null,
+  busy = "",
+  redo = false,
+} = {}) {
+  const label = redo ? REDO_LABEL : UNDO_LABEL;
+  const shut = (title) => ({ disabled: true, label, what: "", title });
+  const held = entries || [];
+  if (!held.length) return shut(redo ? REDO_EMPTY : UNDO_EMPTY);
+  if (busy) return shut(busy === "assistant" ? ASSISTANT_EDIT_BLOCKED : SHOT_EXPANSION_EDIT_BLOCKED);
+  // Both revisions known and different: something wrote the project that this stack does not
+  // account for. Refused rather than replayed -- see the note above.
+  if (revision === null || projectRevision === null || revision !== projectRevision) {
+    return shut(UNDO_PROJECT_MOVED);
+  }
+  const what = undoGestureLabel(held[held.length - 1]?.kind);
+  return {
+    disabled: false,
+    label,
+    what,
+    title: (redo ? REDO_HELP : UNDO_HELP).replace("{what}", what),
+  };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -3155,6 +3684,10 @@ export const api = {
   // The Director's section marks (Intro/Verse/Chorus...), replaced whole like the shot
   // list and for its reason. The server sorts and refuses overlaps.
   saveSections: (id, sections) => request(`/api/projects/${id}/sections`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ sections }) }),
+  // Read every section's shared look out of the Treatment and the Style Bible. Report first,
+  // apply on confirm -- `snapCuts`' two-stage shape and `populate`'s at bottom -- and
+  // `overwrite` is the *separate* consent for replacing a look the Director wrote by hand.
+  fillSectionLooks: (id, { confirmApply = false, overwrite = false } = {}) => request(`/api/projects/${id}/sections/fill-looks`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ confirm_apply: confirmApply, overwrite }) }),
   uploadSong: (id, data) => request(`/api/projects/${id}/songs/upload`, { method: "POST", body: data }),
   // Its own route, and it carries only the two context fields: the audio, the duration and the
   // provenance are not editable text, so nothing that could overwrite them is on the wire.
