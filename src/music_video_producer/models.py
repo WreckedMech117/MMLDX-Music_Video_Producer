@@ -31,6 +31,138 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
+#: Who sings this track, as the Director's own declaration. The Director's list, verbatim
+#: (2026-08-21): "Instrumental, Female sung, Male sung, Duet, 3+, Choir".
+#:
+#: `"unstated"` is the default and is **not** `"instrumental"`. Every manifest written before this
+#: field existed loads as unstated, and unstated means *nobody has said* — it is the one value that
+#: asserts nothing, which is what makes adding the field to a library of existing work safe.
+#: Instrumental is a real declaration with real consequences (no sung line to attribute, the
+#: treatment carrying the whole story), and reading it off a manifest that predates the question
+#: would be inventing a cast. Nothing in this codebase infers this field: no route derives it from
+#: the lyric sheet or from the library, no vision inspection writes it, and no tool schema exposes
+#: it to a model. `PUT .../song/vocal-type` is its one writer.
+VocalType = Literal[
+    "unstated", "instrumental", "female", "male", "duet", "ensemble", "choir"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class LineTagOption:
+    """One entry of a vocal type's per-line dropdown: which singers, and how it reads.
+
+    `slots` are `Asset.character_slot` numbers, and they are also H3's own speaker ids — the
+    notation written into the sheet is `(S1)`, `(S1, S2)`, which `h3_prompt._SPEAKER` already
+    parses and validates. Empty `slots` is the "Untagged" entry: choosing it removes the mark
+    rather than writing a different one.
+    """
+
+    slots: tuple[int, ...]
+    label: str
+
+    @property
+    def notation(self) -> str:
+        return speaker_notation(self.slots)
+
+
+def speaker_notation(slots: Sequence[int]) -> str:
+    """`(S1)`, `(S1, S2)` — H3's speaker id spelling, and `""` for no singers named.
+
+    The single construction of the mark, so the writer, the parser and the dropdown cannot
+    disagree about a space after the comma. `h3_prompt._SPEAKER` is the checker that already
+    understood this spelling before this feature existed, which is why the mark is spelled this
+    way and not invented fresh.
+    """
+    return f"({', '.join(f'S{slot}' for slot in slots)})" if slots else ""
+
+
+@dataclass(frozen=True, slots=True)
+class VocalTypeSpec:
+    """Everything a vocal type declares about itself, as a table row rather than as branches.
+
+    `slots` are the `Asset.character_slot` numbers this type's per-line marks can name, and
+    therefore exactly the character assets a plan needs slotted before a mark resolves to a
+    reference. It is empty for every type that offers no per-line tagging, which is what makes
+    "how many characters does this declaration need" one lookup rather than a second table.
+
+    `line_tags` is the dropdown offered at each lyric line, and it is empty for most types **on
+    purpose**:
+
+    * `unstated` — nothing has been declared, so there is no cast to choose from. Offering a
+      dropdown here would be asking the Director to attribute lines to singers they have not said
+      exist.
+    * `instrumental` — there is no sung line to attribute. See `INSTRUMENTAL_NOTE`.
+    * `female`, `male` — one voice sings every line, and the song-level declaration already says
+      which. A dropdown on every line of a solo song is a control whose answer never varies:
+      noise on the Director's screen, and a second place for the same fact to be wrong.
+    * `choir` — a choir is a mass voice, not a cast. There is no Char 1 to distinguish from a
+      Char 2, so the per-line question has no answer to offer; the declaration itself is the whole
+      of what a choir has to say. If a choir song turns out to have named soloists, that is a
+      `duet`/`ensemble` song with a choir behind it, and the Director declares it as one.
+
+    Only `duet` and `ensemble` name a cast, and only they are tagged.
+    """
+
+    label: str
+    slots: tuple[int, ...]
+    line_tags: tuple[LineTagOption, ...]
+
+
+#: The taxonomy as data. Adding a fourth voice to `ensemble` is a slot number and a `LineTagOption`
+#: on this row; nothing anywhere branches on a vocal type name.
+#:
+#: `ensemble` stops at three, and that is a stated bound rather than an oversight: the Director's
+#: own wording is "Char1/Char2/Char3+/Both/All", so three is the roster they named, and a fourth
+#: is one entry here plus a `character_slot` bound that widens with it (`CHARACTER_SLOT_LIMIT` is
+#: derived from this table, not typed).
+VOCAL_TYPE_SPECS: dict[VocalType, VocalTypeSpec] = {
+    "unstated": VocalTypeSpec(label="Not stated", slots=(), line_tags=()),
+    "instrumental": VocalTypeSpec(label="Instrumental", slots=(), line_tags=()),
+    "female": VocalTypeSpec(label="Female sung", slots=(), line_tags=()),
+    "male": VocalTypeSpec(label="Male sung", slots=(), line_tags=()),
+    "duet": VocalTypeSpec(
+        label="Duet",
+        slots=(1, 2),
+        line_tags=(
+            LineTagOption(slots=(), label="Untagged"),
+            LineTagOption(slots=(1,), label="Char 1"),
+            LineTagOption(slots=(2,), label="Char 2"),
+            LineTagOption(slots=(1, 2), label="Both"),
+        ),
+    ),
+    "ensemble": VocalTypeSpec(
+        label="3+ voices",
+        slots=(1, 2, 3),
+        line_tags=(
+            LineTagOption(slots=(), label="Untagged"),
+            LineTagOption(slots=(1,), label="Char 1"),
+            LineTagOption(slots=(2,), label="Char 2"),
+            LineTagOption(slots=(3,), label="Char 3"),
+            LineTagOption(slots=(1, 2, 3), label="All"),
+        ),
+    ),
+    "choir": VocalTypeSpec(label="Choir", slots=(), line_tags=()),
+}
+
+#: The largest slot number any vocal type can name, and therefore the bound on
+#: `Asset.character_slot`. Derived from the table above rather than typed, so a fourth voice added
+#: to `ensemble` widens the bound in the same edit — a hand-typed `3` here would let a Director
+#: choose "Char 4" in a dropdown and then be refused when they tried to slot an asset to it.
+CHARACTER_SLOT_LIMIT = max(
+    (max(spec.slots, default=0) for spec in VOCAL_TYPE_SPECS.values()), default=0
+)
+
+
+def line_tag_options(vocal_type: VocalType) -> tuple[LineTagOption, ...]:
+    """The per-line dropdown for one vocal type. Empty means *no dropdown at all*.
+
+    A function rather than a direct table read because "which types are tagged" is the question
+    three surfaces ask (the renderer, the populate check, the contract test), and an empty tuple
+    is the answer that has to mean "draw nothing" everywhere rather than "draw an empty select".
+    """
+    return VOCAL_TYPE_SPECS[vocal_type].line_tags
+
+
 class Song(BaseModel):
     """A track and what it is: the audio, its timing spine, and the two context fields.
 
@@ -74,6 +206,20 @@ class Song(BaseModel):
     #: arent is useful for knowing which Shots have words, when the cuts should happen,
     #: when the chorus and verses are".
     lyric_words: list[tuple[str, float, float]] = Field(default_factory=list)
+    #: Who sings this track. See `VocalType` — `"unstated"` is the default and asserts nothing.
+    #:
+    #: **Server-owned, and set by `PUT .../song/vocal-type` alone**, exactly as
+    #: `Project.default_setting_id` and `Asset.consistency_prompt` are, and for the reason those
+    #: two record: the generic full-project `PUT` binds a whole client-supplied `Song`, so a body
+    #: that simply omits this field — which is what every client written before it existed sends —
+    #: arrives carrying the default, and one ordinary save would silently un-declare the
+    #: Director's cast. That route re-adopts the stored value rather than trusting a body.
+    #:
+    #: The per-line singer marks are deliberately **not** a second field beside this one. They
+    #: live inline in `lyrics`, as `(S1)` at the head of a line, because a parallel structure keyed
+    #: on line number drifts the moment the sheet is edited and drifts *silently*. See
+    #: `timeline.lyric_line_tags`.
+    vocal_type: VocalType = "unstated"
 
 
 class SongSection(BaseModel):
@@ -145,6 +291,28 @@ class Asset(BaseModel):
     #: Every consumer must produce byte-identical output for an empty anchor — that is what
     #: makes the field safe to add to a manifest full of existing work.
     consistency_prompt: str = ""
+    #: Which singer of the song this character *is*, as a slot number, or `0` for unslotted.
+    #:
+    #: The Director's decision (2026-08-21): a character asset links to a per-line tag "by a slot
+    #: number on the Asset — `(S1)` resolves to whichever character asset holds slot 1". The link
+    #: is a number on the Asset rather than an asset id on the tag because the tag lives in the
+    #: lyric sheet, and a sheet carrying asset ids would be a sheet that breaks when an asset is
+    #: replaced. A slot survives the swap: re-slot the new character and every `(S1)` in the sheet
+    #: follows.
+    #:
+    #: `0` is the default and means *unslotted*, which is what every manifest written before this
+    #: field existed loads as and what every asset that is not a singer keeps forever. Bounded by
+    #: `CHARACTER_SLOT_LIMIT`, which is derived from `VOCAL_TYPE_SPECS`, so no asset can hold a
+    #: slot no dropdown can name.
+    #:
+    #: Meaningful only on `kind == "character"`; the route refuses any other kind by name rather
+    #: than storing a number that resolves nothing. **Server-owned, set by
+    #: `PUT .../assets/{id}/character-slot` alone**, on `consistency_prompt`'s exact rule and for
+    #: its exact reason: the generic full-project `PUT` re-adopts the stored value per asset id,
+    #: because a defaulted `int` that any pre-existing client omits arrives as `0` and one
+    #: ordinary save would un-slot the whole cast at once. Nothing infers it — no route derives it
+    #: from the library holding exactly one character, and no tool schema exposes it to a model.
+    character_slot: int = Field(default=0, ge=0, le=CHARACTER_SLOT_LIMIT)
     vision: VisionInspectionRecord | None = None
     created_at: datetime = Field(default_factory=now_utc)
 
@@ -1034,6 +1202,103 @@ def assets_for_proposal(
             seen.add(asset.id)
             chosen.append(asset)
     return chosen
+
+
+#: The recorded consequence of declaring a song instrumental, said once where the Director reads
+#: it. `docs/ROADMAP.md` (stage 1 of the user workflow): "**instrumental songs lean on the
+#: Treatment much harder** — environments/instruments carry the video when there is no singer to
+#: associate." That is the whole of what the declaration means today, and saying it is what makes
+#: the declaration coherent rather than decorative: there is no per-line tag to set, no character
+#: slot to fill, and nothing for a singer reference to attach to.
+#:
+#: What it deliberately does **not** do is touch a single shot. Declaring instrumental does not
+#: sweep `singing` to `not_singing`, because nothing in this codebase infers a singing state and a
+#: declaration about the song is not a measurement of a window. The guard that *does* act on this
+#: is the measured one and it is untouched: `Song.vocal_spans` is Whisper's own voice activity,
+#: and a truly instrumental track measures voiceless everywhere, so populate already downgrades
+#: every window of it through `shot_vocal_overlap` — by measurement, on the track, not on a label.
+INSTRUMENTAL_NOTE = (
+    "This song is declared instrumental, so no shot's words come from a singer and no character "
+    "slot is needed. The treatment carries the whole story — environments and instruments have to "
+    "do the work a performance would. Shots are untouched: whether a window is sung is still "
+    "decided by what Whisper measured on the track, never by this declaration."
+)
+
+#: "Duet declared, one character slotted" — the Director's own example of the thing to flag.
+VOCAL_CAST_SHORTFALL = (
+    "{label} declared, and {held} of the {needed} character slot(s) it needs are filled — "
+    "{missing} unfilled. A line tagged for a singer with no slotted character has no reference to "
+    "reach, so give each singer's character asset a slot number in the Assets tab."
+)
+
+
+def character_slot_assets(project: Project) -> dict[int, Asset]:
+    """Slot number → the character Asset holding it. Unslotted assets are absent, not `None`.
+
+    **The single resolution of a `(S1)` mark**, so the populate check, the Assets tab and whatever
+    pass 2 builds all answer "who is S1" the same way. Two conditions, both necessary and both the
+    rule `default_setting_asset` already established for a pointer that must never resolve to a
+    fabrication:
+
+    * ``kind == "character"``. A slot names a singer; a prop with a slot number resolves nothing,
+      and the route refuses to write one — this re-validates on read so a hand-edited manifest
+      cannot smuggle one in either.
+    * ``character_slot`` is non-zero. Zero is *unslotted*, which is what every existing asset is.
+
+    The **first** asset in manifest order wins a contested slot. Nothing in this application can
+    create a contest — the route refuses a slot another asset already holds — so this only decides
+    a hand-edited manifest, and deciding it by append order is both stable and the same tie-break
+    `assets_for_proposal` uses for a duplicated display name.
+    """
+    held: dict[int, Asset] = {}
+    for asset in project.assets:
+        if asset.kind == "character" and asset.character_slot:
+            held.setdefault(asset.character_slot, asset)
+    return held
+
+
+def vocal_cast_problems(project: Project) -> list[str]:
+    """What the declared vocal type needs and the library does not have. `[]` when it is satisfied.
+
+    The Director's ask, verbatim (2026-08-21): "Assets that we have in our Character section would
+    then also need to be linked to these character references (this is something that could be
+    flagged if the user labeled the song as a duet but they only have one character asset if the
+    user clicks Populate Timeline)."
+
+    **Flagged, never refused.** A plan with an incomplete cast is still a plan worth laying out —
+    the slots are set in another tab, and refusing the button would send the Director away from
+    the thing they asked for to fix a thing that costs them nothing yet. It is reported at
+    populate because that is the moment the Director named, and it is computed from the manifest
+    alone: no model, no I/O, no clock.
+
+    Silent for every project that has declared nothing, which is every project that existed before
+    this feature — and silent for solo and choir by the *same* rule rather than by an exemption of
+    their own: a type with no per-line marks names no slots, so nothing can be missing from a set
+    that is empty. There is deliberately no early return for "this type needs no slots"; it would
+    be a second spelling of what the `missing` loop already says, and a branch that only restates
+    a later one is a branch that can drift from it. See `VocalTypeSpec` for why those types are
+    untagged.
+
+    Instrumental is the one type that says something while needing nothing, because "there is no
+    singer" is a fact about the plan the Director should read once. See `INSTRUMENTAL_NOTE`.
+    """
+    if project.song is None:
+        return []
+    spec = VOCAL_TYPE_SPECS[project.song.vocal_type]
+    if project.song.vocal_type == "instrumental":
+        return [INSTRUMENTAL_NOTE]
+    held = character_slot_assets(project)
+    missing = [slot for slot in spec.slots if slot not in held]
+    if not missing:
+        return []
+    return [
+        VOCAL_CAST_SHORTFALL.format(
+            label=spec.label,
+            held=len(spec.slots) - len(missing),
+            needed=len(spec.slots),
+            missing=", ".join(f"S{slot}" for slot in missing),
+        )
+    ]
 
 
 def default_setting_asset(project: Project) -> Asset | None:

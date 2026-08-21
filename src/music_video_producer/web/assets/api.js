@@ -430,6 +430,233 @@ export function songContextRestoreNotice(field) {
   return SONG_CONTEXT_RESTORE_NOTICE.replace("{field}", songContextControls(field).label);
 }
 
+// -------------------------------------------------------------------------------------------
+// Who sings the song, and which of them sings each line.
+//
+// The Director's ask (2026-08-21): "We should be able to select if the song is Instrumental,
+// Female sung, Male sung, Duet, 3+, Choir. If selecting Duet or more then each line of the Lyric
+// sheet would need to be tagged with Char1/Char2/Char3+/Both/All."
+//
+// **The per-line dropdown edits the lyric sheet.** There is no parallel structure holding a tag
+// per line, because such a structure is wrong the instant a line is inserted or deleted and wrong
+// silently. The mark is written into the line as `(S1)` — H3's own speaker notation, which
+// `h3_prompt._SPEAKER` already parses — so the tag and the words it belongs to are the same
+// characters and cannot drift apart. Saving is the existing "Save song context" button; nothing
+// new goes over the wire for a tag.
+//
+// Every table and every parse below mirrors the server's (`models.VOCAL_TYPE_SPECS`,
+// `timeline.lyric_line_tags`, `timeline.tag_lyric_line`) and `tests/test_frontend_contract.py`
+// holds the two sides equal against shared fixtures — a client that read `(s1)` where the server
+// did not would show the Director a dropdown state their sheet does not carry.
+// -------------------------------------------------------------------------------------------
+
+// `models.VOCAL_TYPE_SPECS`, mirrored. `slots` is what the type's marks can name and therefore
+// how many characters need slotting; `lineTags` is the per-line dropdown, and an EMPTY array
+// means no dropdown is drawn at all rather than an empty select.
+//
+// Four of the seven are deliberately untagged, and the reasons are the server's: `unstated` has
+// declared no cast to choose from, `instrumental` has no sung line, a solo song's every line is
+// sung by the one voice the song-level choice already names, and a choir is a mass voice rather
+// than a cast. Only a duet and a 3+ ensemble name singers a line can be attributed to.
+export const VOCAL_TYPES = [
+  { value: "unstated", label: "Not stated", slots: [], lineTags: [] },
+  { value: "instrumental", label: "Instrumental", slots: [], lineTags: [] },
+  { value: "female", label: "Female sung", slots: [], lineTags: [] },
+  { value: "male", label: "Male sung", slots: [], lineTags: [] },
+  {
+    value: "duet",
+    label: "Duet",
+    slots: [1, 2],
+    lineTags: [
+      { slots: [], label: "Untagged" },
+      { slots: [1], label: "Char 1" },
+      { slots: [2], label: "Char 2" },
+      { slots: [1, 2], label: "Both" },
+    ],
+  },
+  {
+    value: "ensemble",
+    label: "3+ voices",
+    slots: [1, 2, 3],
+    lineTags: [
+      { slots: [], label: "Untagged" },
+      { slots: [1], label: "Char 1" },
+      { slots: [2], label: "Char 2" },
+      { slots: [3], label: "Char 3" },
+      { slots: [1, 2, 3], label: "All" },
+    ],
+  },
+  { value: "choir", label: "Choir", slots: [], lineTags: [] },
+];
+
+// `models.INSTRUMENTAL_NOTE`, mirrored so the Song workspace says it at the moment the
+// declaration is made and populate says the identical sentence at the moment it matters. A
+// contract test holds the two equal — a consequence worded two ways is a consequence the Director
+// cannot trust, which is the argument SONG_CHANGE_CONSEQUENCE already records.
+export const INSTRUMENTAL_NOTE =
+  "This song is declared instrumental, so no shot's words come from a singer and no character " +
+  "slot is needed. The treatment carries the whole story — environments and instruments have to " +
+  "do the work a performance would. Shots are untouched: whether a window is sung is still " +
+  "decided by what Whisper measured on the track, never by this declaration.";
+
+// One lookup, falling back to `unstated` rather than throwing — `songContextControls` throws
+// because a bad field id would bind a control to the wrong server slot, while a vocal type this
+// client does not know is a manifest from a newer build, and drawing it as undeclared is the
+// honest reading of "this client cannot offer that cast".
+export function vocalTypeSpec(value) {
+  return VOCAL_TYPES.find((entry) => entry.value === value) || VOCAL_TYPES[0];
+}
+
+// The per-line dropdown for one vocal type. `[]` means draw nothing.
+export function lineTagOptions(value) {
+  return vocalTypeSpec(value).lineTags;
+}
+
+// `models.speaker_notation`, mirrored: `(S1)`, `(S1, S2)`, and "" for no singers named.
+export function speakerNotation(slots = []) {
+  return slots.length ? `(${slots.map((slot) => `S${slot}`).join(", ")})` : "";
+}
+
+// `models.CHARACTER_SLOT_LIMIT`, derived from the table above exactly as the server derives it
+// from its own, so a fourth voice added to `ensemble` widens both bounds in one edit.
+export const CHARACTER_SLOT_LIMIT = VOCAL_TYPES.reduce(
+  (limit, entry) => Math.max(limit, ...entry.slots, 0), 0);
+
+// `timeline._LINE_SPEAKER` and `timeline._LINE_SPEAKER_SUSPECT`, mirrored. The suspect pattern is
+// deliberately narrow — `(`, an `S`, a digit — so an ordinary lyric line opening `(she said)` is
+// never dragged into it.
+const LINE_SPEAKER = /^([ \t]*)\([ \t]*(S\d+(?:[ \t]*,[ \t]*S\d+)*)[ \t]*\)[ \t]*/i;
+const LINE_SPEAKER_SUSPECT = /^[ \t]*\([ \t]*S[ \t]*\d/i;
+// Lines AND the separators between them, so a rejoin is byte-exact and a sheet pasted from
+// Windows is not silently normalised to `\n` by a tag edit. `timeline._LINE_SPLIT`.
+const LINE_SPLIT = /(\r\n|\r|\n)/;
+// `timeline._SHEET_TAG` applied to one line: `[Verse]`, `[Chorus 2]`.
+const SHEET_TAG_LINE = /^[ \t]*\[[^\]\r\n]+\][ \t]*$/;
+
+// One line's mark as slot numbers, or `null` when the head of the line was meant to be a mark and
+// could not be read. `[]` and `null` are different answers: `[]` is "carries no mark", `null` is
+// "carries something unreadable", and only the second is worth telling the Director about.
+function parseLineSlots(line) {
+  const match = LINE_SPEAKER.exec(line);
+  if (!match) return { slots: LINE_SPEAKER_SUSPECT.test(line) ? null : [], rest: line };
+  const numbers = (match[2].match(/\d+/g) || []).map(Number);
+  // The same two re-validations the server makes: a slot past the bound names a character no
+  // dropdown offers and no asset may hold, and a repeat names one singer twice.
+  if (numbers.some((number) => number < 1 || number > CHARACTER_SLOT_LIMIT)) return { slots: null, rest: line };
+  if (new Set(numbers).size !== numbers.length) return { slots: null, rest: line };
+  return { slots: numbers, rest: line.slice(match[0].length) };
+}
+
+// Every line of the sheet, in order, with what its mark says. `timeline.lyric_line_tags`.
+//
+// Blanks and `[Tag]` headers come back too, with `taggable: false`, because `index` is an index
+// into the sheet's own text and the writer uses it to touch exactly one line — a list numbering
+// only the sung lines would hand the writer a number meaning a different line.
+export function lyricLineTags(lyrics) {
+  const parts = String(lyrics ?? "").split(LINE_SPLIT);
+  const lines = [];
+  for (let index = 0; index * 2 < parts.length; index += 1) {
+    const raw = parts[index * 2];
+    const parsed = parseLineSlots(raw);
+    lines.push({
+      index,
+      raw,
+      text: parsed.rest,
+      slots: parsed.slots || [],
+      taggable: Boolean(raw.trim()) && !SHEET_TAG_LINE.test(raw),
+      unreadable: parsed.slots === null,
+    });
+  }
+  return lines;
+}
+
+// Set or clear one line's mark, and change NOTHING else in the sheet. `timeline.tag_lyric_line`.
+//
+// Every other line comes back byte for byte, separators and indentation included: only
+// `parts[2 * index]` is ever replaced. Nothing here re-wraps, re-indents, collapses blank lines or
+// touches a `[Tag]` block — the sheet is the Director's own text and a tag edit is not a licence
+// to reformat it.
+//
+// Throws rather than guessing, on the server's own three refusals, and the sheet is untouched by
+// a throw: an out-of-range line, a line that is not sung, and a line whose existing mark is
+// unreadable. Overwriting that last one would silently repair a typo the Director cannot then see
+// they made.
+export function tagLyricLine(lyrics, index, slots = []) {
+  const parts = String(lyrics ?? "").split(LINE_SPLIT);
+  const position = 2 * index;
+  if (!(index >= 0) || position >= parts.length) throw new Error(`The lyric sheet has no line ${index}.`);
+  const line = parts[position];
+  const parsed = parseLineSlots(line);
+  if (parsed.slots === null) {
+    throw new Error(
+      `Line ${index + 1} starts with something that looks like a singer mark but could not be read: ` +
+      `"${line.trim()}". Fix the line in the lyric sheet and the dropdown will follow it.`);
+  }
+  if (!line.trim() || SHEET_TAG_LINE.test(line)) {
+    throw new Error(`Line ${index + 1} is not a sung line, so it carries no singer.`);
+  }
+  // Round-trip closure, the server's own check: whatever this writes, `lyricLineTags` must read
+  // back — otherwise a caller could store a mark this module's own reader then reports as
+  // unreadable, and the Director would be told their sheet is broken by an edit they never made.
+  if (slots.some((slot) => slot < 1 || slot > CHARACTER_SLOT_LIMIT)) {
+    throw new Error(`A singer slot is a number from 1 to ${CHARACTER_SLOT_LIMIT}, and ${JSON.stringify(slots)} is not.`);
+  }
+  if (new Set(slots).size !== slots.length) {
+    throw new Error(`${JSON.stringify(slots)} names one singer twice, which is not a sung line.`);
+  }
+  const marked = LINE_SPEAKER.exec(line);
+  const indent = marked ? marked[1] : (/^[ \t]*/.exec(line) || [""])[0];
+  const body = parsed.rest.replace(/^[ \t]+/, "");
+  const notation = speakerNotation(slots);
+  parts[position] = notation ? `${indent}${notation} ${body}` : `${indent}${body}`;
+  return parts.join("");
+}
+
+// Everything the Song workspace needs to draw the vocal-type control and, when the declared type
+// asks for one, the per-line tagging list beneath it.
+//
+// `tagging` is what decides whether the list exists at all, and it is the vocal type's own table
+// row: a solo song offers no per-line dropdown, so there is nothing to draw and no row to read.
+// `unreadable` is surfaced separately from the rows because it is the one thing the Director has
+// to fix in the sheet by hand — a count of zero draws no warning at all.
+export function vocalTaggingPlan(project) {
+  const song = project?.song || null;
+  const spec = vocalTypeSpec(song?.vocal_type);
+  if (!song) return { editable: false, value: "unstated", spec, tagging: false, rows: [], unreadable: [] };
+  const tagging = spec.lineTags.length > 0;
+  const lines = tagging ? lyricLineTags(song.lyrics || "") : [];
+  return {
+    editable: true,
+    value: spec.value,
+    spec,
+    tagging,
+    rows: lines.filter((line) => line.taggable && !line.unreadable),
+    unreadable: lines.filter((line) => line.unreadable),
+  };
+}
+
+// Which slot each character asset holds, and which slots the declared type still needs.
+// `models.character_slot_assets` and `models.vocal_cast_problems`, mirrored for the Assets tab so
+// the Director can see the shortfall before Populate tells them about it.
+export function characterSlotPlan(project, asset) {
+  if (!asset || asset.kind !== "character") return null;
+  const held = new Map();
+  for (const item of project?.assets || []) {
+    if (item.kind === "character" && item.character_slot && !held.has(item.character_slot)) held.set(item.character_slot, item);
+  }
+  const spec = vocalTypeSpec(project?.song?.vocal_type);
+  return {
+    slot: asset.character_slot || 0,
+    // Zero is always offered — it is how a character says "not one of the singers" — and then
+    // every slot the declared type can name. A type that names none offers the full bound, so a
+    // Director can slot the cast before declaring it and in either order.
+    options: [0, ...(spec.slots.length ? spec.slots : Array.from({ length: CHARACTER_SLOT_LIMIT }, (_, index) => index + 1))],
+    // Named so the select can shut the slots another asset already holds rather than offering a
+    // choice the route refuses by name.
+    taken: Object.fromEntries([...held].filter(([, item]) => item.id !== asset.id).map(([slot, item]) => [slot, item.name])),
+  };
+}
+
 // True when a rejection is the song-context restore route refusing because no version was kept.
 // The buttons are disabled when the loaded project has no slot, so a refusal means this client is
 // looking at stale state — the same recovery shape as DOCUMENT_RESTORE_REFUSAL_MARKER, and keyed
@@ -4387,6 +4614,12 @@ export const api = {
   // Recovery for one context field. No body, exactly as the document restore has none: the kept
   // version lives on the server and nothing the client could send is the authority on it.
   restoreSongContext: (id, field) => request(`/api/projects/${id}/song/context/${field}/restore`, { method: "POST" }),
+  // The vocal type's one door, deliberately not folded into `saveSongContext` or `saveProject`.
+  // The whole-project PUT re-adopts the stored value and can never write this field, which is
+  // what stops an ordinary save from un-declaring the cast; and keeping it off the context body
+  // means the route that can rewrite the lyric sheet and the route that declares the cast are two
+  // different doors.
+  saveVocalType: (id, vocal_type) => request(`/api/projects/${id}/song/vocal-type`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ vocal_type }) }),
   // The flag is the Director's acknowledgement, so it is passed through rather than
   // hardcoded: a caller that never showed SONG_CHANGE_CONSEQUENCE must not claim it did.
   removeSong: (id, confirmed = false) => request(`/api/projects/${id}/song?confirm_song_replacement=${confirmed ? "true" : "false"}`, { method: "DELETE" }),
@@ -4419,6 +4652,10 @@ export const api = {
   // re-adopts the stored anchor and can never write this field, which is what stops an ordinary
   // save from blanking it.
   saveConsistencyPrompt: (projectId, assetId, consistency_prompt) => request(`/api/projects/${projectId}/assets/${assetId}/consistency-prompt`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ consistency_prompt }) }),
+  // The character slot's one door, on the anchor's own argument: the whole-project PUT re-adopts
+  // the stored slot per asset id and can never write this field, so no ordinary save can un-slot
+  // the cast and leave every `(S1)` in the sheet resolving to nothing.
+  saveCharacterSlot: (projectId, assetId, character_slot) => request(`/api/projects/${projectId}/assets/${assetId}/character-slot`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ character_slot }) }),
   analyzeLatestTake: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/analyze-latest`, { method: "POST" }),
   compileTimeline: (id, body) => request(`/api/projects/${id}/timeline/compile`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // A GET, and nothing is cached from it: readiness is derived from the prompts on every call, so

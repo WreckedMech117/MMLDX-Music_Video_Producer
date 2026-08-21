@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
 
 from .models import (
     ASSET_ROLE_LABELS,
+    CHARACTER_SLOT_LIMIT,
     SHOT_MODE_SPECS,
     Asset,
     Project,
@@ -17,6 +19,7 @@ from .models import (
     resolve_shot_mode,
     shot_label,
     song_audio_tag,
+    speaker_notation,
 )
 
 #: MiniMax H3 is trained primarily for shot windows in this range, in seconds.
@@ -474,6 +477,190 @@ def lyric_blocks(lyrics: str) -> list[tuple[str, str]]:
     return blocks
 
 
+#: A per-line singer mark at the head of a lyric line: `(S1)`, `(S1, S2)`, `(s1,s2)`.
+#:
+#: The same grammar `h3_prompt._SPEAKER` already checks, anchored to the start of a line and
+#: case-insensitive for the same reason that one is: a Director typing the mark by hand types
+#: what is comfortable, and refusing `(s1)` because of its case would be refusing the Director's
+#: own text on a technicality.
+#: `MULTILINE` so the same one pattern serves both readers: `.match()` on a single line (where the
+#: flag changes nothing, since `match` anchors at position 0 anyway) and `.sub()` over a whole
+#: block in `_lyric_tokens`, which has to reach the head of every line inside it.
+_LINE_SPEAKER = re.compile(
+    r"^([ \t]*)\(([ \t]*S\d+(?:[ \t]*,[ \t]*S\d+)*[ \t]*)\)[ \t]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: A head that *looks* like a singer mark and is not one: `(S0)`, `(S9)` past the slot bound,
+#: `(S1, S1)`, `(S1` left unclosed. Deliberately narrow — it requires `(`, an `S`, and a digit —
+#: so an ordinary lyric line opening `(she said)` or a stage direction `(quietly)` is not dragged
+#: into this at all. What it catches is a Director's own typo in a notation they were invited to
+#: type, and the answer to one is to *say so*: silently ignoring it would leave a line the
+#: Director believes is tagged carrying no tag, and silently rewriting it would edit their sheet.
+_LINE_SPEAKER_SUSPECT = re.compile(r"^[ \t]*\([ \t]*S[ \t]*\d", re.IGNORECASE)
+
+#: The sheet split into lines *and the separators between them*, so a rejoin is byte-exact.
+#:
+#: `str.splitlines()` is unusable here: it discards which separator each line ended with, so a
+#: sheet pasted from Windows round-trips as `\n` and every byte after the first edit differs from
+#: what the Director supplied. The lyric sheet is stored as supplied apart from edge whitespace —
+#: interior blank lines and indentation reach the payload unchanged — and a tag edit that quietly
+#: normalised line endings would be a far worse defect than the drift this design exists to
+#: prevent.
+_LINE_SPLIT = re.compile(r"(\r\n|\r|\n)")
+
+
+@dataclass(frozen=True, slots=True)
+class LyricLine:
+    """One line of the sheet, and what its singer mark says.
+
+    `index` counts **every** line including blanks and `[Tag]` headers, because it is an index
+    into the sheet's own text and the writer uses it to touch exactly one line. A renderer that
+    numbered only the taggable lines would hand the writer a number meaning a different line.
+
+    `slots` are the `Asset.character_slot` numbers this line is tagged for — `()` for untagged,
+    which is the state every line of every existing sheet is in.
+
+    `text` is the line with its mark removed, which is what a dropdown row shows beside the
+    select. `raw` is the line exactly as stored, mark and indentation included.
+
+    `taggable` is false for blank lines and for `[Tag]` block headers: neither is sung, and a
+    dropdown on the word `[Chorus]` would be offering to attribute a structural marker to a
+    singer.
+
+    `unreadable` is the honest third state. It is true when the head of the line matches the shape
+    of a singer mark but not its grammar — a slot number past the bound, a repeat, an unclosed
+    bracket. Such a line is **reported and left exactly as it is**: not dropped, not guessed at,
+    and not rewritten. `slots` is `()` there, because nothing was understood, and the writer
+    refuses to retag it until the Director fixes it by hand.
+    """
+
+    index: int
+    raw: str
+    text: str
+    slots: tuple[int, ...]
+    taggable: bool
+    unreadable: bool
+
+
+def _parse_line_slots(line: str) -> tuple[tuple[int, ...] | None, str]:
+    """One line's mark as slot numbers and the text after it, or `(None, line)` when unreadable.
+
+    `None` and `()` are different answers and the difference is the whole point: `()` is "this
+    line carries no mark", `None` is "this line carries something that was meant to be a mark and
+    could not be read". Only the second is worth telling the Director about.
+    """
+    match = _LINE_SPEAKER.match(line)
+    if match is None:
+        return (None, line) if _LINE_SPEAKER_SUSPECT.match(line) else ((), line)
+    numbers = [int(value) for value in re.findall(r"\d+", match.group(2))]
+    # Re-validated rather than trusted to the regex: the pattern proves the *shape*, and these two
+    # are the facts that make a mark resolve to a cast. A slot past the bound names a character no
+    # dropdown can offer and no asset may hold (`CHARACTER_SLOT_LIMIT`); a repeat names one singer
+    # twice, which is not a duet line, it is a typo.
+    if any(number < 1 or number > CHARACTER_SLOT_LIMIT for number in numbers):
+        return None, line
+    if len(set(numbers)) != len(numbers):
+        return None, line
+    return tuple(numbers), line[match.end():]
+
+
+def lyric_line_tags(lyrics: str) -> list[LyricLine]:
+    """Read the sheet's per-line singer marks **out of the sheet itself**.
+
+    This is the whole storage decision, and the reason there is no second field to read. The
+    Director asked for a per-line dropdown; the alternative implementation is a parallel map from
+    line number to singer, and that map is wrong the instant a line is inserted, deleted or
+    reordered — wrong *silently*, pointing every tag after the edit at the wrong words, which is
+    exactly the class of defect this project keeps finding. The tag is stored where the line is,
+    so an edit that moves a line moves its tag with it because they are the same characters. There
+    is nothing to reconcile, nothing to invalidate, and no state in which the two disagree.
+
+    The cost of the choice, stated: the marks are in the text the Director edits, so they can be
+    typed, mistyped and deleted by hand. That is answered by `unreadable` rather than by taking the
+    text away — see `LyricLine`.
+
+    Reads and never writes. Every line of the sheet comes back, in order, blanks and `[Tag]`
+    headers included, so a caller can address one by index.
+    """
+    parts = _LINE_SPLIT.split(lyrics)
+    lines: list[LyricLine] = []
+    for index, raw in enumerate(parts[::2]):
+        header = bool(_SHEET_TAG.fullmatch(raw))
+        slots, rest = _parse_line_slots(raw)
+        lines.append(
+            LyricLine(
+                index=index,
+                raw=raw,
+                text=rest,
+                slots=slots or (),
+                taggable=bool(raw.strip()) and not header,
+                unreadable=slots is None,
+            )
+        )
+    return lines
+
+
+class LyricTagError(ValueError):
+    """The sheet could not be retagged at the line asked for, and nothing was written."""
+
+
+def tag_lyric_line(lyrics: str, index: int, slots: Sequence[int]) -> str:
+    """Set (or clear) one line's singer mark, and change **nothing else in the sheet**.
+
+    The dropdown's write. `slots` empty removes the mark, which is what the "Untagged" entry
+    means; anything else writes `speaker_notation(slots)` at the head of the line followed by a
+    single space.
+
+    Every other line comes back byte for byte, separators included — the rejoin is over the same
+    `_LINE_SPLIT` pieces the read produced, and only `parts[2 * index]` is ever replaced. Nothing
+    here re-wraps, re-indents, collapses blank lines or touches a `[Tag]` block: the sheet is the
+    Director's own text and a tag edit is not a licence to reformat it. The one whitespace this
+    does normalise is *inside the mark it is writing*, which is the mark's own spelling and not
+    the Director's line.
+
+    Refuses rather than guesses, and both refusals leave the sheet untouched:
+
+    * a line that is blank, a `[Tag]` header, or out of range — there is no sung line there;
+    * a line whose existing mark is unreadable. Overwriting it would silently repair a typo the
+      Director cannot then see they made, and this codebase reports rather than repairs.
+    """
+    parts = _LINE_SPLIT.split(lyrics)
+    position = 2 * index
+    if index < 0 or position >= len(parts):
+        raise LyricTagError(f"The lyric sheet has no line {index}.")
+    line = parts[position]
+    parsed, rest = _parse_line_slots(line)
+    if parsed is None:
+        raise LyricTagError(
+            f"Line {index + 1} starts with something that looks like a singer mark but could not "
+            f"be read: {line.strip()!r}. Fix the line in the lyric sheet and the dropdown will "
+            "follow it."
+        )
+    if not line.strip() or _SHEET_TAG.fullmatch(line):
+        raise LyricTagError(f"Line {index + 1} is not a sung line, so it carries no singer.")
+    # Whatever this writes, `_parse_line_slots` must read back — otherwise a caller could store a
+    # mark that this module's own reader then reports as unreadable, and the Director would be
+    # told their sheet is broken by an edit they never made by hand. The two conditions are the
+    # reader's own, checked before anything is written rather than discovered afterwards.
+    if any(slot < 1 or slot > CHARACTER_SLOT_LIMIT for slot in slots):
+        raise LyricTagError(
+            f"A singer slot is a number from 1 to {CHARACTER_SLOT_LIMIT}, and {sorted(slots)} is "
+            "not."
+        )
+    if len(set(slots)) != len(slots):
+        raise LyricTagError(f"{sorted(slots)} names one singer twice, which is not a sung line.")
+    # The line's own indentation is preserved, whichever side of the mark it was read from: a
+    # matched mark carries it in group 1 (the pattern consumes it), and an unmarked line still
+    # holds it at the head of `rest`. A tag edit must not out-dent a Director's indented line.
+    marked = _LINE_SPEAKER.match(line)
+    indent = marked.group(1) if marked else line[: len(line) - len(line.lstrip(" \t"))]
+    body = rest.lstrip(" \t")
+    notation = speaker_notation(slots)
+    parts[position] = f"{indent}{notation} {body}" if notation else f"{indent}{body}"
+    return "".join(parts)
+
+
 def section_lyrics(project: Project, section) -> str:
     """The lyric block a section sings, paired **by order of appearance**.
 
@@ -540,8 +727,19 @@ def section_looks_input(project: Project) -> dict[str, Any]:
 def _lyric_tokens(text: str) -> list[str]:
     """Words as things two spellings of one sung line can agree on: lowercased, apostrophes
     dropped ("don't" == "dont"), and split on everything else — a hyphen splits, so the
-    sheet's "spread-eagle" meets Whisper's "spread", "eagle" as two words, not one blob."""
-    return re.findall(r"[a-z]+", text.lower().replace("'", ""))
+    sheet's "spread-eagle" meets Whisper's "spread", "eagle" as two words, not one blob.
+
+    Per-line singer marks are stripped first, and they have to be: `(S1)` lowercases to `(s1)`,
+    out of which `[a-z]+` reads the bare token `"s"` — one phantom word per tagged line, inflating
+    every block's token count and therefore its match threshold, against a transcript that
+    contains no such word. A duet sheet would align measurably worse than the same sheet untagged,
+    which would make tagging a song quietly degrade Analyze structure. The mark is markup, not a
+    lyric, so it is removed before the words are counted.
+
+    A no-op on a sheet with no marks: the pattern is anchored to the head of a line and matches
+    nothing there, so every untagged sheet tokenises byte for byte as it always did.
+    """
+    return re.findall(r"[a-z]+", _LINE_SPEAKER.sub("", text).lower().replace("'", ""))
 
 
 def _tokens_agree(sheet: str, heard: str) -> bool:

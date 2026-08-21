@@ -162,7 +162,23 @@
                  text. Nothing here parses or sections the lyrics — no analyser exists. -->
             <div class="song-context">
               <div class="block-heading"><h2>Song context</h2><span>Reaches the Director</span></div>
+              <!-- Who sings the track, declared before the treatment so the cast is settled before
+                   any model reads the lyrics. Its own route and its own save: the whole-project PUT
+                   re-adopts the stored value, so no ordinary save can un-declare it. "Not stated"
+                   is the default and asserts nothing — it is what every song imported before this
+                   existed carries, and re-picking it is how a declaration is taken back. The
+                   options are api.js's VOCAL_TYPES, which mirrors models.VOCAL_TYPE_SPECS; the
+                   select ships empty and renderVocalType fills it, so the two cannot drift. -->
+              <label>Vocals<select id="song-vocal-type" disabled></select></label>
+              <p class="field-help" id="song-vocal-note"></p>
               <label>Lyrics<span class="field-count" id="song-lyrics-count"></span><textarea id="song-lyrics" rows="6" placeholder="The words of the loaded song, stored as supplied"></textarea></label>
+              <!-- The per-line singer tagging, drawn only for a vocal type that names a cast (a
+                   duet, a 3+ ensemble) and drawn from the sheet in the box above. Each dropdown
+                   EDITS THAT SHEET, writing `(S1)` at the head of its line, so there is exactly one
+                   copy of every tag and an edit to the lyrics cannot leave the tags pointing at the
+                   wrong words. Nothing here is saved separately: the tags are lyrics, and "Save
+                   song context" is what stores them. -->
+              <div class="lyric-tagging" id="lyric-tagging" hidden></div>
               <label>Style<span class="field-count" id="song-style-count"></span><textarea id="song-style" rows="3" placeholder="Genre, mood, vocal character, instrumentation…"></textarea></label>
               <!-- One restore per field, because each keeps its own single previous version and a
                    save that changes only the lyrics must not offer to roll back the style too.

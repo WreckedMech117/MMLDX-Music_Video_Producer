@@ -6,6 +6,8 @@ import pytest
 
 from music_video_producer.assembly import ClipWindow, tiling_refusals
 from music_video_producer.models import (
+    CHARACTER_SLOT_LIMIT,
+    VOCAL_TYPE_SPECS,
     Asset,
     AssetCitation,
     Project,
@@ -36,15 +38,19 @@ from music_video_producer.timeline import (
     SNAP_TOLERANCE_OFF,
     SNAP_UNMEASURED,
     SNAP_WITHOUT_CUTS,
+    LyricTagError,
     TimelineError,
     _asset_description,
     _gap_snap_target,
+    _lyric_tokens,
     align_h3_frames,
+    align_lyric_blocks,
     anchored_label,
     asset_anchor,
     assistant_input,
     build_director_timeline,
     expansion_input,
+    lyric_line_tags,
     margin_frames,
     ordered_shots,
     over_render_centred,
@@ -57,6 +63,7 @@ from music_video_producer.timeline import (
     shot_expansion_input,
     snap_cut_plan,
     song_section,
+    tag_lyric_line,
     vocal_gaps,
 )
 from music_video_producer.transcription import merge_vocal_spans
@@ -2243,3 +2250,198 @@ def test_the_band_is_judged_against_the_boundary_the_previous_cut_already_settle
     assert "4.900s" not in refused.reason
     assert "under the 4s minimum" in refused.reason
     assert plan.windows == [("s0", 0.0, 6.0), ("s1", 6.0, 4.5), ("s2", 10.5, 9.5)]
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-line singer tagging (pass 1 of the vocal-type feature).
+#
+# The whole storage decision is under test here: the tags live IN the lyric sheet, as `(S1)` at
+# the head of a line, so there is exactly one copy of every tag and an edit to the sheet cannot
+# leave a tag pointing at the wrong words. What these prove is the two properties that decision
+# buys — drift is impossible, and the sheet is not reformatted — plus the honesty the decision
+# costs: a mark the Director typed wrong is *reported*, never repaired and never ignored.
+# ---------------------------------------------------------------------------------------------
+
+# CRLF on purpose. A sheet pasted from Windows is the normal case here, and a tag edit that
+# normalised line endings would rewrite every byte of a Director's lyric sheet to fix one line.
+TAGGED_SHEET = (
+    "[Verse]\r\n"
+    "(S1) I don't care if you track me down\r\n"
+    "  (S2) Like an animal that's on the run\r\n"
+    "\r\n"
+    "(S1, S2) Tie me down spread-eagle\r\n"
+    "[Chorus]\r\n"
+    "Lick it hard, lap it up\r\n"
+)
+
+
+def test_every_line_of_the_sheet_comes_back_with_what_its_mark_says():
+    lines = lyric_line_tags(TAGGED_SHEET)
+
+    # Every line, blanks and `[Tag]` headers included, because `index` is an index into the
+    # sheet's own text and the writer uses it to touch exactly one line.
+    assert [line.index for line in lines] == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert [line.slots for line in lines] == [(), (1,), (2,), (), (1, 2), (), (), ()]
+    # Neither a `[Tag]` header nor a blank line is sung, so neither is offered a dropdown.
+    assert [line.taggable for line in lines] == [
+        False, True, True, False, True, False, True, False
+    ]
+    # The mark is stripped from the text a dropdown row shows beside its select, and the
+    # indentation the Director typed is not.
+    assert lines[1].text == "I don't care if you track me down"
+    assert lines[2].raw == "  (S2) Like an animal that's on the run"
+    assert not any(line.unreadable for line in lines)
+
+
+def test_an_untagged_sheet_reads_as_untagged_rather_than_as_unreadable():
+    """Every existing project. `()` is "carries no mark" and is the state every line starts in;
+    it must never be confused with a mark that could not be read."""
+    lines = lyric_line_tags("[Verse]\nI don't care if you track me down\n(she said) quietly\n")
+
+    assert [line.slots for line in lines] == [(), (), (), ()]
+    assert not any(line.unreadable for line in lines)
+    # The suspect pattern requires `(`, an `S` and a DIGIT, so an ordinary parenthetical opening
+    # a lyric line is not dragged into the singer notation at all.
+    assert lines[2].text == "(she said) quietly"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "(S0) below the first slot",
+        "(S9) past the slot bound",
+        "(S1, S1) the same singer twice",
+        "(S1 unclosed",
+    ],
+)
+def test_a_mark_that_cannot_be_read_is_reported_and_never_repaired(line: str):
+    """The cost of storing the tags in the Director's own editable text, paid honestly.
+
+    A hand-typed mark this application cannot resolve is neither dropped (which would leave a
+    line the Director believes is tagged carrying no tag) nor rewritten (which would edit their
+    sheet to hide their typo). It is reported, and the writer refuses to touch that line until
+    they fix it.
+    """
+    sheet = f"[Verse]\n{line}\n"
+    parsed = lyric_line_tags(sheet)[1]
+
+    assert parsed.unreadable is True
+    assert parsed.slots == ()
+    assert parsed.raw == line, "an unreadable line was rewritten"
+
+    with pytest.raises(LyricTagError) as refused:
+        tag_lyric_line(sheet, 1, (1,))
+    assert "could not be read" in str(refused.value)
+
+
+def test_tagging_one_line_changes_that_line_and_not_one_byte_of_any_other():
+    """The reformatting refusal. The lyric sheet is stored as supplied apart from edge
+    whitespace — interior blank lines, indentation and `[Tag]` structure reach the payload
+    unchanged — and a tag edit is not a licence to re-wrap it."""
+    written = tag_lyric_line(TAGGED_SHEET, 6, (2,))
+
+    before = TAGGED_SHEET.split("\r\n")
+    after = written.split("\r\n")
+    assert len(before) == len(after), "the line count moved"
+    for index, (was, now) in enumerate(zip(before, after, strict=True)):
+        if index == 6:
+            continue
+        assert was == now, f"line {index} was rewritten by an edit to line 6"
+    assert after[6] == "(S2) Lick it hard, lap it up"
+    # Every separator survives as CRLF, which `splitlines` would have silently rewritten to `\n`
+    # on the way in — turning a one-line tag edit into a rewrite of every byte of the sheet.
+    assert written.count("\r\n") == TAGGED_SHEET.count("\r\n")
+    assert "\n" not in written.replace("\r\n", ""), "a line ending was normalised"
+
+
+def test_the_dropdown_round_trips_through_the_sheet_it_writes():
+    """Write via the dropdown, read back, and the dropdown shows what was written.
+
+    This is the property that makes the sheet a usable store rather than merely a safe one: a
+    tag set, cleared, re-set and re-read must produce the state the Director chose, including
+    across the `Both` mark that names two singers.
+    """
+    sheet = "[Verse]\nOne line\nTwo line\n"
+
+    for slots in ((1,), (2,), (1, 2), ()):
+        written = tag_lyric_line(sheet, 1, slots)
+        assert lyric_line_tags(written)[1].slots == tuple(slots)
+        # And re-tagging replaces the mark rather than stacking a second one on it.
+        assert lyric_line_tags(tag_lyric_line(written, 1, (2,)))[1].slots == (2,)
+    # Clearing returns the line to exactly the text it started as.
+    assert tag_lyric_line(tag_lyric_line(sheet, 1, (1, 2)), 1, ()) == sheet
+
+
+def test_editing_the_lyrics_after_tagging_cannot_move_a_tag_off_its_words():
+    """**The drift case**, and the whole argument for storing the tags in the sheet.
+
+    A parallel map from line number to singer is wrong the instant a line is inserted, deleted
+    or reordered — and wrong *silently*, pointing every tag after the edit at the wrong words.
+    Here the edit is made the way a Director makes it (a verse inserted at the top, a line
+    deleted) and every surviving tag is still on the same words, because the tag and the words
+    are the same characters. There is nothing to reconcile and no state in which the two
+    disagree.
+    """
+    tagged = tag_lyric_line(
+        tag_lyric_line("[Verse]\nAlpha line\nBravo line\nCharlie line\n", 2, (1,)), 3, (2,)
+    )
+    assert {line.text: line.slots for line in lyric_line_tags(tagged) if line.taggable} == {
+        "Alpha line": (), "Bravo line": (1,), "Charlie line": (2,)
+    }
+
+    # The Director edits afterwards: a new block at the top, "Alpha line" deleted, the rest
+    # untouched. Every tag moves with its own words, because it never left them.
+    edited = tagged.replace("[Verse]\n", "[Intro]\nZulu line\n[Verse]\n").replace(
+        "Alpha line\n", ""
+    )
+
+    assert {line.text: line.slots for line in lyric_line_tags(edited) if line.taggable} == {
+        "Zulu line": (), "Bravo line": (1,), "Charlie line": (2,)
+    }
+
+
+def test_a_singer_mark_is_not_counted_as_a_sung_word():
+    """`(S1)` lowercases to `(s1)`, out of which `[a-z]+` reads the bare token "s" — one phantom
+    word per tagged line, inflating the block's match threshold against a transcript that
+    contains no such word. Tagging a duet would quietly make Analyze structure align it worse
+    than the same sheet untagged."""
+    sung = ["I", "don't", "care", "if", "you", "track", "me", "down", "like", "an", "animal", "that's", "on", "the", "run"]
+    heard = [(word, index * 0.5, index * 0.5 + 0.4) for index, word in enumerate(sung)]
+    plain = "[Verse]\nI don't care if you track me down\nLike an animal that's on the run\n"
+    tagged = (
+        "[Verse]\n(S1) I don't care if you track me down\n"
+        "(S2) Like an animal that's on the run\n"
+    )
+
+    assert "s" not in _lyric_tokens(tagged)
+    # And the two sheets time identically, which is the consequence that actually matters.
+    assert align_lyric_blocks(tagged, heard) == align_lyric_blocks(plain, heard)
+
+
+def test_the_writer_never_writes_a_mark_its_own_reader_would_reject():
+    """Round-trip closure. A caller passing a slot past the bound, or one singer twice, would
+    otherwise store a mark that `lyric_line_tags` reports as unreadable — and the Director would
+    be told their sheet is broken by an edit they never made by hand. Checked before anything is
+    written, so a refused mark leaves the sheet untouched."""
+    sheet = "[Verse]\nOne line\n"
+
+    for slots in ((0,), (CHARACTER_SLOT_LIMIT + 1,), (1, 1)):
+        with pytest.raises(LyricTagError):
+            tag_lyric_line(sheet, 1, slots)
+    # Every mark the dropdown can actually produce round-trips, which is what makes the two
+    # refusals above about a caller rather than about the feature.
+    for spec in VOCAL_TYPE_SPECS.values():
+        for option in spec.line_tags:
+            written = tag_lyric_line(sheet, 1, option.slots)
+            assert lyric_line_tags(written)[1].slots == option.slots
+            assert not lyric_line_tags(written)[1].unreadable
+
+
+def test_the_writer_refuses_a_line_that_carries_no_singer():
+    sheet = "[Verse]\n\nOne line\n"
+
+    for index in (0, 1, 9):
+        with pytest.raises(LyricTagError):
+            tag_lyric_line(sheet, index, (1,))
+    # And nothing was written by any of them.
+    assert tag_lyric_line(sheet, 2, ()) == sheet

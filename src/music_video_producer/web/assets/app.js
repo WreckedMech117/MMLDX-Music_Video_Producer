@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, threadHtml, unsavedWorkPending, unsavedWorkQuestion, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, characterSlotPlan, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, INSTRUMENTAL_NOTE, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, VOCAL_TYPES, vocalTaggingPlan, vocalTypeSpec, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
@@ -455,6 +455,81 @@ function renderSongContext() {
     button.title = songContextRestoreTitle(field, available);
   }
   renderSongContextCounts();
+  renderVocalTagging();
+}
+
+// The vocal-type select and, when the declared type names a cast, the per-line tagging list.
+//
+// Exported for the executed frontend contract, `renderSong`'s reason exactly: this decides whether
+// a control exists at all — a solo song must be offered no per-line dropdown — and a decision like
+// that has to be run against a DOM rather than read out of the template string it lives in.
+//
+// The list is drawn from `#song-lyrics`'s CURRENT value rather than from the stored Song, because
+// the box is what the Director is editing and the tags are in it. Typing a new line and tagging it
+// works before any save, and the dropdown states follow the text on every keystroke.
+export function renderVocalTagging() {
+  const select = $("#song-vocal-type");
+  const editable = songContextEditable(state.project);
+  // Rebuilt from the table rather than from markup, so a vocal type added to api.js's VOCAL_TYPES
+  // appears here without a second edit — and cannot appear here without existing on the server,
+  // which the contract test holds.
+  const declared = state.project?.song?.vocal_type || "unstated";
+  select.innerHTML = VOCAL_TYPES.map((entry) => `<option value="${escapeHtml(entry.value)}"${entry.value === declared ? " selected" : ""}>${escapeHtml(entry.label)}</option>`).join("");
+  select.value = declared;
+  select.disabled = !editable;
+  // The instrumental consequence, said once where the declaration is made rather than only at
+  // populate. Every other type says nothing: a note that is always on screen is a note nobody
+  // reads, and the shortfall flag has its own moment.
+  $("#song-vocal-note").textContent = declared === "instrumental" ? INSTRUMENTAL_NOTE : "";
+  const region = $("#lyric-tagging");
+  // The plan reads the box, not the manifest — see above. `vocalTaggingPlan` decides `tagging`
+  // off the vocal type's own table row, so "a solo song offers no per-line dropdown" is one rule
+  // in one place rather than a condition spelled here as well.
+  const plan = vocalTaggingPlan(editable ? { song: { vocal_type: declared, lyrics: $("#song-lyrics").value } } : null);
+  region.hidden = !plan.tagging;
+  if (!plan.tagging) { region.innerHTML = ""; return; }
+  // A line whose mark could not be read is named and left exactly as it is. Not dropped, not
+  // guessed at, not rewritten: the Director typed it into their own sheet and the fix is theirs.
+  const unreadable = plan.unreadable.length
+    ? `<p class="control-reason">${plan.unreadable.map((line) => `Line ${line.index + 1} starts with something that looks like a singer mark and could not be read: ${escapeHtml(line.raw.trim())}`).join(" · ")}</p>`
+    : "";
+  const rows = plan.rows.map((line) => {
+    const options = plan.spec.lineTags.map((tag) => {
+      const value = tag.slots.join(",");
+      const selected = value === line.slots.join(",") ? " selected" : "";
+      return `<option value="${value}"${selected}>${escapeHtml(tag.label)}</option>`;
+    }).join("");
+    return `<div class="lyric-line"><select class="lyric-line-tag" data-id="${line.index}">${options}</select><span>${escapeHtml(line.text)}</span></div>`;
+  }).join("");
+  region.innerHTML = `<div class="block-heading"><h3>Who sings each line</h3><span>Written into the lyric sheet</span></div>${unreadable}${rows}`;
+  $$(".lyric-line-tag", region).forEach((control) => control.addEventListener("change", () => {
+    const index = Number(control.dataset.id);
+    const slots = control.value ? control.value.split(",").map(Number) : [];
+    try {
+      // The write, and the whole storage decision in one line: the tag goes into the lyric sheet.
+      // Nothing else in the box is touched, so a Director's indentation, blank lines and `[Tag]`
+      // blocks survive a tag edit byte for byte.
+      $("#song-lyrics").value = tagLyricLine($("#song-lyrics").value, index, slots);
+      // Unsaved, exactly as typing into the box is unsaved: the tag is lyrics, and "Save song
+      // context" is what stores it. Marking dirty is also what stops `renderSong` re-seeding the
+      // box from the stored Song and throwing the tag away.
+      state.songContextDirty = true;
+      renderVocalTagging();
+    } catch (error) { toast(error.message, "error"); renderVocalTagging(); }
+  }));
+}
+
+async function saveVocalType(value) {
+  if (!requireProject()) return;
+  if (!state.project.song) return toast("This project has no song to describe yet.", "error");
+  try {
+    state.project = await api.saveVocalType(state.project.id, value);
+    // Deliberately NOT clearing `songContextDirty`: this route writes one enum and touches no
+    // character of the lyric sheet, so unsaved text in the box is still unsaved and still the only
+    // copy. `renderSong` leaves the box alone while the flag is set, which is what keeps it.
+    renderSong();
+    toast(`Vocals recorded as ${vocalTypeSpec(value).label}; the lyric sheet was not touched`);
+  } catch (error) { toast(error.message, "error"); renderSong(); }
 }
 
 // Recovery for one context field: swap the box back to the version kept before the last save that
@@ -929,6 +1004,15 @@ export function renderAssetInspector() {
   // AI Mod, decided by `aiModPlan` (contract-tested) exactly as promotion is decided by
   // `multiviewPlan`: shown for anything image-kinded, shut until the image exists.
   const mod = aiModPlan(asset);
+  // Which singer this character is, as a slot number. Drawn only for a `character` asset, which is
+  // `characterSlotPlan`'s own rule and the route's: a slot names a singer, so a prop cannot hold
+  // one. Slots another asset already holds are shown and shut rather than hidden — a Director
+  // looking for "why can I not pick S1" is owed the name of the asset that has it, which is what
+  // the route's own refusal says too.
+  const slot = characterSlotPlan(state.project, asset);
+  const slotHtml = slot
+    ? `<label>Character slot<select id="asset-character-slot">${slot.options.map((value) => `<option value="${value}"${value === slot.slot ? " selected" : ""}${slot.taken[value] ? " disabled" : ""}>${value ? `S${value}${slot.taken[value] ? ` — held by ${escapeHtml(slot.taken[value])}` : ""}` : "Not one of the singers"}</option>`).join("")}</select></label><p class="field-help">A lyric line tagged (S${slot.slot || 1}) means this character. Slots are how a tagged line reaches a reference; leave it unset for a character who does not sing.</p>`
+    : "";
   // The appearance anchor, decided by `consistencyAnchorPlan` (contract-tested) the same way
   // the two buttons above are decided by their own pure functions. Drawn ABOVE the read-only
   // generation prompt deliberately: the anchor outranks it everywhere both are consumed, and
@@ -954,7 +1038,7 @@ export function renderAssetInspector() {
   // shot already cites, where the click was a no-op that toasted success anyway.
   const attach = attachToShotControl(state.project, state.selectedShotId, asset.id, asset.name);
   const attachHtml = `<button class="quiet-button full" id="attach-asset" style="margin-top:8px" title="${escapeHtml(attach.title)}" ${attach.disabled ? "disabled" : ""}>${escapeHtml(attach.label)}</button><p class="control-reason" id="attach-asset-target">${escapeHtml(attach.caption)}</p>`;
-  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${anchorHtml}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}${attachHtml}${replaceInHtml}<button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>${replaceHtml}`;
+  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${slotHtml}${anchorHtml}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}${attachHtml}${replaceInHtml}<button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>${replaceHtml}`;
   $("#attach-asset")?.addEventListener("click", attachSelectedAsset);
   $("#delete-asset")?.addEventListener("click", async () => {
     if (!window.confirm(`Delete ${asset.name} from the library?`)) return;
@@ -1010,6 +1094,16 @@ export function renderAssetInspector() {
       renderAssets();
       toast(typed.draft.trim() ? `Appearance anchor saved for ${asset.name}` : `Appearance anchor cleared for ${asset.name}`);
     } catch (error) { toast(error.message, "error"); }
+  });
+  // One change, one route, and the reply is adopted so the whole library's slots redraw: taking S1
+  // off this asset is what frees it on every other asset's select.
+  $("#asset-character-slot")?.addEventListener("change", async (event) => {
+    const chosen = Number(event.target.value);
+    try {
+      state.project = await api.saveCharacterSlot(state.project.id, asset.id, chosen);
+      renderAssets();
+      toast(chosen ? `${asset.name} is now S${chosen}` : `${asset.name} holds no character slot`);
+    } catch (error) { toast(error.message, "error"); renderAssets(); }
   });
   $("#create-multiview")?.addEventListener("click", createMultiview);
   $("#ai-mod-asset")?.addEventListener("click", aiModAsset);
@@ -3450,6 +3544,14 @@ function bindEvents() {
   // Typing marks the editors dirty so no incidental re-render overwrites them; a landed save, an
   // import, a removal and a load that actually changes project are the only things that clear it.
   ["song-lyrics", "song-style"].forEach((id) => $("#" + id).addEventListener("input", () => { state.songContextDirty = true; }));
+  // The declaration saves on its own, on change, because it is one enum with its own route and
+  // there is nothing to compose it with. It is bound beside the context editors rather than in
+  // them: the lyric sheet is not on that route's wire at all.
+  $("#song-vocal-type").addEventListener("change", (event) => saveVocalType(event.target.value));
+  // Editing the sheet redraws the tagging list from what is in the box, so a line typed now can be
+  // tagged now and a line deleted takes its dropdown with it. This is the drift answer made
+  // visible: there is no stored tag to go stale, only text.
+  $("#song-lyrics").addEventListener("input", renderVocalTagging);
   // Every bounded box keeps its own counter current, the import block's included: those two are not
   // seeded from anything, so a render is not what puts a number under them.
   SONG_CONTEXT_COUNTS.forEach((control) => $(control.field).addEventListener("input", renderSongContextCounts));
@@ -3649,6 +3751,12 @@ function bindEvents() {
         renderJobs();
       }
       toast(`Timeline populated: ${report.created} shots laid out (${report.proposed} proposed by the model)`);
+      // The Director's own placement for the cast check: flagged when Populate is clicked, after
+      // the plan has landed rather than instead of it. Each notice is the server's sentence
+      // verbatim — the client decides nothing about the cast, it only shows what the manifest
+      // said. Empty for every project that has declared no vocal type, which is every project
+      // that existed before this feature, so nothing new appears on an untouched plan.
+      (report.cast_notices || []).forEach((notice) => toast(notice, "error"));
     } catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; }
   });

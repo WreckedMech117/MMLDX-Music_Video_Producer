@@ -80,6 +80,7 @@ from .h3_prompt import check as h3_check
 from .h3_prompt import check_reference_bounds, normalize_audio_fields
 from .models import (
     ASSET_ROLE_LABELS,
+    CHARACTER_SLOT_LIMIT,
     NOTICE_RAW_LIMIT,
     SHOT_MODE_SPECS,
     Asset,
@@ -94,7 +95,9 @@ from .models import (
     SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
+    VocalType,
     assets_for_proposal,
+    character_slot_assets,
     citable_assets,
     citations_in_role,
     dangling_citations,
@@ -107,6 +110,7 @@ from .models import (
     reference_slot_totals,
     resolve_shot_mode,
     song_audio_tag,
+    vocal_cast_problems,
     with_default_setting,
 )
 from .preferences import EJECT_PREFERENCE_KEY, MachinePreferences
@@ -353,7 +357,61 @@ SONG_DIRECTOR_WITHHELD = frozenset(
     # instrumental"), which the code derives via `shot_vocal_overlap` — pages of floats
     # in the prompt are noise the model would misread long before they helped.
     {"vocal_spans", "lyric_words"}
+) | frozenset(
+    # The declared vocal type, withheld **in pass 1 only**, and on the never-been-in grounds
+    # `SHOT_DIRECTOR_WITHHELD` establishes: this field has never been in the dump, so classifying
+    # it withheld adds nothing to the prompt rather than subtracting something from it.
+    #
+    # It is withheld because nothing has yet been designed for the model to *do* with it. The
+    # Director's purpose for the field is explicit — "so that the LLM system can account for all
+    # that" — and that is pass 2's whole job: the vocal type and the sheet's per-line marks enter
+    # the populate instruction together, with wording that says what a tagged line means for a
+    # shot's references. Shipping a bare `"vocal_type": "unstated"` key into every chat turn and
+    # every populate call *now* would change what every existing project's model sees, in exchange
+    # for a fact the instruction never mentions and the model has no use for. That is a prompt
+    # regression bought with nothing, and it would put the live project's populate out of
+    # byte-identity with the plan the Director already has. Deleting this one entry is pass 2's
+    # first line.
+    #
+    # The per-line marks need no entry here at all, and that is the storage decision paying off:
+    # they are characters inside `lyrics`, which is already classified visible, so they travel
+    # exactly as the sheet travels and there is no second field to classify, withhold, or forget.
+    {"vocal_type"}
 )
+
+# Every field an `Asset` carries, classified exactly as `Song` and `Shot` are, and for the reason
+# `_withheld_fields` exists: the Director's context dumps `assets` whole, so until now every field
+# ever added to `Asset` entered the model's prompt the moment it was declared, with nobody deciding
+# that it should. `consistency_prompt` went in that way. This is the same guard applied to the
+# third and last model in the dump.
+#
+# **Everything that was in the dump yesterday is classified visible**, so this changes not one
+# character of what any model is prompted with. Taking an existing field out is Ask First, exactly
+# as the Shot comment rules, and this is not the story for it.
+ASSET_DIRECTOR_VISIBLE = frozenset(
+    {
+        "id",
+        "name",
+        "kind",
+        "path",
+        "source",
+        "parent_id",
+        "prompt",
+        "prompt_id",
+        "consistency_prompt",
+        "vision",
+        "created_at",
+    }
+)
+#: `character_slot` is withheld, and it is the first thing ever withheld from an Asset.
+#:
+#: Never-been-in grounds, and pass 1's own: the slot exists to resolve a `(S1)` mark in the lyric
+#: sheet to a character reference, and *that resolution is pass 2*. A model shown "this asset is
+#: S1" with no instruction that mentions singers has been handed a number it can only misuse — the
+#: recorded failure mode of this model family being to write internal labels into creative prose.
+#: It also keeps the field where the Director put it: nothing infers a slot, and a field no tool
+#: schema and no context dump carries is a field no model can be blamed for.
+ASSET_DIRECTOR_WITHHELD = frozenset({"character_slot"})
 
 
 def _withheld_fields(
@@ -682,6 +740,20 @@ DIRECTOR_CONTEXT_EXCLUDE: dict[str, Any] = {
     "song": _withheld_fields(
         Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD, family="SONG"
     ),
+    # The Asset half, written as a classification for the same reason the Song half is and never
+    # as a hand-typed nested path: what is excluded here is whatever `Asset` declares and nobody
+    # classified as visible, so a field added beside `character_slot` cannot slip into every
+    # Director prompt unnoticed. Unconditional rather than gated on the set being non-empty
+    # (`shots`' pattern), because this one is non-empty from the moment it exists; if it ever
+    # empties, it should be deleted rather than left as an exclusion that excludes nothing.
+    "assets": {
+        "__all__": _withheld_fields(
+            Asset,
+            visible=ASSET_DIRECTOR_VISIBLE,
+            withheld=ASSET_DIRECTOR_WITHHELD,
+            family="ASSET",
+        )
+    },
     # Present only once something is actually withheld from a Shot, so classifying every field as
     # visible leaves this mapping — and therefore the Director's prompt — exactly as it was. An
     # unconditional `{"shots": {"__all__": set()}}` would be an empty exclusion that looks like a
@@ -2191,6 +2263,51 @@ class SongContextRequest(BaseModel):
     caption: str = ""
 
 
+class SongVocalTypeRequest(BaseModel):
+    """Who sings this track, and nothing else on the wire.
+
+    One field, deliberately, and it is `SongContextRequest`'s argument in a smaller key: a body
+    that could also carry `lyrics` would be a route that can rewrite the lyric sheet — and since
+    the per-line singer marks live *in* the sheet, that would be a route that can invent a line's
+    singer. It cannot, because the field is not on the wire.
+
+    No default. Every other request model here defaults its fields so an omission is a blank, and
+    that is exactly wrong for this one: the omitted value would be `"unstated"`, so a client that
+    forgot the field would silently un-declare the Director's cast — the same shape as the
+    defaulted-`str` hole the generic `PUT` has now been the site of five times. A body without a
+    vocal type is a 422 here, which is the loud version of the same mistake.
+    """
+
+    vocal_type: VocalType
+
+
+class AssetCharacterSlotRequest(BaseModel):
+    """Which singer this character asset is, as a slot number. `0` clears the slot.
+
+    Bounded by the schema at `CHARACTER_SLOT_LIMIT`, which is derived from `VOCAL_TYPE_SPECS`, so
+    a client cannot reach past the largest slot any dropdown can offer into a number no `(S1)`
+    mark could ever name.
+    """
+
+    character_slot: int = Field(ge=0, le=CHARACTER_SLOT_LIMIT)
+
+
+#: Refused by name rather than stored as a number that resolves nothing. A slot says "this is the
+#: singer S1 refers to", and a prop or a setting is not a singer.
+CHARACTER_SLOT_NOT_A_CHARACTER = (
+    "{name} is a {kind} asset, and a character slot names one of the song's singers. Only "
+    "character assets can hold a slot."
+)
+
+#: Two assets in one slot makes `(S1)` ambiguous, and an ambiguous reference is the fabricated
+#: citation this codebase refuses. The refusal names the holder, because "take it off them first"
+#: is the action and a refusal that does not say whose slot it is cannot be acted on.
+CHARACTER_SLOT_TAKEN = (
+    "Slot S{slot} is already held by {name}. A slot names exactly one character, or a tagged line "
+    "would point at two — clear that asset's slot first, or give this one a different number."
+)
+
+
 class FluxRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     kind: Literal["character", "setting", "prop", "style", "image"] = "image"
@@ -3088,6 +3205,18 @@ class PopulateTimelineResponse(BaseModel):
     proposed: int
     created: int
     project: Project
+    #: What the declared cast needs and the library does not have — `models.vocal_cast_problems`.
+    #:
+    #: The Director's own placement: "this is something that could be flagged if the user labeled
+    #: the song as a duet but they only have one character asset **if the user clicks Populate
+    #: Timeline**". A flag rather than a refusal, and it rides the response rather than an
+    #: exception because populate succeeded — the plan is laid out, and the cast is a thing to fix
+    #: in another tab before the shots are wired.
+    #:
+    #: Defaulted empty, which is what every project that has declared no vocal type gets, and what
+    #: every response written before this field existed means. A client that ignores it behaves
+    #: exactly as it did.
+    cast_notices: list[str] = Field(default_factory=list)
 
 
 class SnapCutsRequest(BaseModel):
@@ -4478,6 +4607,28 @@ def _adopt_song_recovery_slots(incoming: Song | None, stored: Song | None) -> No
         setattr(incoming, slot, getattr(stored, slot) if stored is not None else None)
 
 
+def _adopt_song_vocal_type(incoming: Song | None, stored: Song | None) -> None:
+    """Overwrite `incoming`'s vocal type with the stored song's, because a client is never its author.
+
+    `_adopt_song_recovery_slots`' argument for a field with a different shape and the same hole.
+    `PUT /api/projects/{id}` binds a whole client-supplied `Project`, so its `song` arrives with
+    every field defaulted — including this one, whose default is `"unstated"`. A client written
+    before the field existed omits it and one ordinary save silently un-declares the cast; a client
+    that invents one declares a duet the Director never declared, and the per-line dropdown then
+    appears over their lyric sheet on the strength of a value nobody set.
+
+    A Song-less body is a no-op, exactly as the slots' adoption is: there is no vocal type to carry
+    across, and `import_song` builds a fresh `Song` whose default says the same thing.
+
+    Called *before* the route compares the two songs, so a body differing only here compares equal.
+    A confirmed replacement then clears it through `_detach_song_recovery_slots`' path — a different
+    track's vocal type is not this one's.
+    """
+    if incoming is None:
+        return
+    incoming.vocal_type = stored.vocal_type if stored is not None else "unstated"
+
+
 def _vision_media(path: Path) -> tuple[bytes, str]:
     suffix = path.suffix.lower()
     if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -4866,12 +5017,29 @@ def create_app(
         # or a client that predates the slots would send `None` for both, compare unequal, and
         # be told an ordinary save is a song replacement.
         _adopt_song_recovery_slots(project.song, current.song)
+        # The declared vocal type is server-owned here for the *sixth* time this exact hole has
+        # been found in this exact route, and it fails the same two ways `_adopt_song_recovery_slots`
+        # describes. A client written before the field existed omits it, so an ordinary save
+        # arrives carrying `"unstated"` and would silently un-declare the Director's cast — and a
+        # body that *invents* one would be declaring a duet nobody declared, which is the
+        # fabricated value this codebase refuses. `PUT .../song/vocal-type` is its one writer.
+        #
+        # Ahead of the comparison below for `_adopt_song_recovery_slots`' own reason: a body that
+        # differs only here must compare equal, or an ordinary save from an old client would be
+        # told it is replacing the song.
+        _adopt_song_vocal_type(project.song, current.song)
         if project.song != current.song:
             _require_song_replacement_confirmation(current, confirm_song_replacement)
             # Confirmed: this is a different song, so nothing kept for the old one comes with
             # it. Only reached once the gate above has let the replacement through, so a
             # refused save has cleared nothing.
             _detach_song_recovery_slots(project.song)
+            # And the cast goes with the track it described. A vocal type carried across a
+            # confirmed replacement would say the new song is a duet on the strength of the old
+            # one's declaration — `_detach_song_recovery_slots`' argument exactly, and the reason
+            # `import_song` builds a fresh `Song` whose default says the same thing.
+            if project.song is not None:
+                project.song.vocal_type = "unstated"
         # Render state and approval are the dedicated routes', not a save's. Both gates compare
         # the body against the stored Shot and refuse only a *difference*, so an ordinary save --
         # which round-trips both fields on every Shot -- is untouched. After the Song gate rather
@@ -4913,6 +5081,20 @@ def create_app(
         stored_anchors = {asset.id: asset.consistency_prompt for asset in current.assets}
         for asset in project.assets:
             asset.consistency_prompt = stored_anchors.get(asset.id, "")
+        # Every character slot is server-owned here on the identical argument, and it is the
+        # *seventh* time. `character_slot` is a defaulted `int`, so a body that omits it — every
+        # client written before it existed, every hand-rolled API call — arrives as `0`, and one
+        # ordinary save would un-slot the whole cast at once and leave every `(S1)` in the lyric
+        # sheet resolving to nothing. Adopting the stored value by id means this route cannot
+        # write the field in either direction: `PUT .../character-slot` is its one writer, which is
+        # also what keeps it out of reach of anything a model can call.
+        #
+        # An asset in the body that the stored project does not hold gets `0`, by the anchor's own
+        # rule: a slot that arrived on this route was not set by the Director on the route that
+        # sets slots.
+        stored_slots = {asset.id: asset.character_slot for asset in current.assets}
+        for asset in project.assets:
+            asset.character_slot = stored_slots.get(asset.id, 0)
         # The declared location is server-owned on the same argument, and it is the *fourth*
         # time this route has been the hole: `default_setting_id` is a defaulted `str`, so
         # every client written before it existed sends `""` and one ordinary save would clear
@@ -5118,6 +5300,44 @@ def create_app(
             setattr(project.song, field, text)
         return store.save(project)
 
+    @app.put("/api/projects/{project_id}/song/vocal-type", response_model=Project)
+    def replace_song_vocal_type(
+        project_id: str, request: SongVocalTypeRequest
+    ) -> Project:
+        """Declare who sings this track — the one writer of `Song.vocal_type`.
+
+        The Director's ask (2026-08-21): "We should be able to select if the song is Instrumental,
+        Female sung, Male sung, Duet, 3+, Choir… This would need to be done before treatment in
+        the Song workspace so that the LLM system can account for all that." This route is the
+        Song workspace's half; the per-line marks it unlocks are written into the lyric sheet by
+        `PUT .../song/context`, because they *are* the lyric sheet.
+
+        **Explicit, and therefore refusable and reversible.** Nothing infers this field: no route
+        derives it from the lyric sheet's shape or from a library that happens to hold two
+        characters, no vision inspection writes it, no tool schema exposes it to a model, and the
+        generic full-project `PUT` re-adopts the stored value rather than trusting a body —
+        `replace_consistency_prompt`'s rule, for the reason that route's docstring gives, and the
+        sixth time that route has had to be defended against exactly this shape of field.
+        `"unstated"` is a real value and re-declaring it is how a Director takes a declaration
+        back.
+
+        What it does **not** do is touch a shot, a section, or a character of the lyric sheet.
+        Declaring Duet does not go tagging lines, and declaring Instrumental does not sweep
+        `singing` to `not_singing` — see `models.INSTRUMENTAL_NOTE`. It is a statement about the
+        song, read by the next plan; a sweep over work the Director already has is the silent bulk
+        edit this codebase's report-then-confirm convention forbids, and `replace_default_setting`
+        refuses it in the same words.
+
+        Written onto the *stored* Song rather than a rebuilt one, `replace_song_context`'s rule:
+        there is no construction site here where `path`, `duration`, `source` or `prompt_id` could
+        be defaulted away by an edit that was only ever about one enum.
+        """
+        project = get_project(project_id)
+        if project.song is None:
+            raise HTTPException(status_code=404, detail=SONG_CONTEXT_WITHOUT_SONG)
+        project.song.vocal_type = request.vocal_type
+        return store.save(project)
+
     @app.post("/api/projects/{project_id}/song/align-lyrics", response_model=Project)
     def align_song_lyrics(project_id: str, request: AlignLyricsRequest) -> Project:
         """Hear the track, time the sheet's `[Tag]` blocks against it, fill the sections.
@@ -5315,6 +5535,67 @@ def create_app(
         # setting or clearing one changes what every shot citing this asset should be saying about
         # it. Free to re-derive for the prose shots, and recorded as stale for the rest.
         refresh_reference_maps(project)
+        return store.save(project)
+
+    @app.put(
+        "/api/projects/{project_id}/assets/{asset_id}/character-slot",
+        response_model=Project,
+    )
+    def replace_character_slot(
+        project_id: str, asset_id: str, request: AssetCharacterSlotRequest
+    ) -> Project:
+        """Link this character asset to a singer, by slot number — the one writer of the link.
+
+        The Director's decision (2026-08-21): a lyric line tagged `(S1)` resolves to whichever
+        character asset holds slot 1. The number is on the Asset rather than the asset id being in
+        the sheet, so replacing a character is one re-slot instead of an edit to every tagged line.
+
+        Three refusals, and each leaves the asset exactly as it was because the check happens
+        before anything is assigned:
+
+        * the asset is not a `character`. A slot names a singer, and storing one on a prop would
+          make `(S1)` resolve to a thing that cannot sing (`CHARACTER_SLOT_NOT_A_CHARACTER`);
+        * another asset already holds the slot. One slot, one character — otherwise a tagged line
+          points at two references and the render picks by accident (`CHARACTER_SLOT_TAKEN`);
+        * the number is outside `CHARACTER_SLOT_LIMIT`, refused by the schema before the route
+          runs, so no asset can hold a slot no dropdown can name.
+
+        `0` clears the slot, which is what "not one of the singers" means, and is a genuine no-op
+        for everything downstream: an unslotted library is what every existing project has and
+        `character_slot_assets` answers `{}` for it.
+
+        **The one door.** Nothing infers a slot — no route hands the only character asset slot 1
+        because it is the only one, no tool schema exposes it to a model, and the generic
+        full-project `PUT` re-adopts the stored value per asset id.
+
+        Writes no shot and re-derives no map, which is where it differs from
+        `replace_consistency_prompt` deliberately: an anchor is *in* the reference map's tag lines,
+        so setting one changes what every citing shot says. A slot is in no prompt anywhere in pass
+        1 — populate consuming it is pass 2 — so re-deriving anything here would be spending a
+        sweep to produce identical text.
+        """
+        project = get_project(project_id)
+        asset = next((item for item in project.assets if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        if asset.kind != "character":
+            raise HTTPException(
+                status_code=422,
+                detail=CHARACTER_SLOT_NOT_A_CHARACTER.format(
+                    name=asset.name, kind=asset.kind
+                ),
+            )
+        slot = request.character_slot
+        # Read through `character_slot_assets`, which is the same resolution a `(S1)` mark gets,
+        # so the route cannot admit a pair this application would later have to break a tie over.
+        # An asset re-asserting its own slot is not a collision.
+        holder = character_slot_assets(project).get(slot)
+        if slot and holder is not None and holder.id != asset_id:
+            raise HTTPException(
+                status_code=422,
+                detail=CHARACTER_SLOT_TAKEN.format(slot=slot, name=holder.name),
+            )
+        asset.character_slot = slot
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/default-setting", response_model=Project)
@@ -5925,6 +6206,16 @@ def create_app(
                 # with.
                 #
                 # Contrast `edit_asset` below, which deliberately does not inherit.
+                #
+                # `character_slot` is deliberately **not** inherited, and that is the opposite
+                # call for the opposite reason. A slot is not a description of the subject, it is
+                # an identity the sheet would then hold *alongside* its source — two assets in
+                # one slot, which `replace_character_slot` refuses by name precisely because a
+                # tagged line pointing at two references renders by accident. Nothing is lost by
+                # leaving it: a citation of the source resolves to this sheet through
+                # `prefer_identity_sheets` anyway, so the slot goes on naming the subject and the
+                # substitution goes on naming the picture, which is the division those two rules
+                # already have.
                 consistency_prompt=source.consistency_prompt,
             )
             payload = build_multiview_payload(
@@ -8719,7 +9010,21 @@ def create_app(
         project.shots = shots
         saved = store.save(project)
         return PopulateTimelineResponse(
-            proposed=len(proposals), created=len(saved.shots), project=saved
+            proposed=len(proposals),
+            created=len(saved.shots),
+            project=saved,
+            # Read off the manifest that was actually written, so the flag describes the project
+            # the Director is now looking at rather than the one this route read minutes ago
+            # before the model call. Pure, and no model, clock or file is touched to produce it —
+            # `[]` for every project that has declared no vocal type, which is every project that
+            # existed before this feature.
+            #
+            # **Nothing here consumes the declaration.** The shots above are wired exactly as they
+            # were: no citation is chosen by a line's singer, and no window is attributed to a
+            # slot. That is pass 2, deliberately unbuilt — the Director asked for the data to
+            # exist and be checkable first, so it can be tagged on a real song before the logic
+            # that reads it is written against a guess.
+            cast_notices=vocal_cast_problems(saved),
         )
 
     @app.post(

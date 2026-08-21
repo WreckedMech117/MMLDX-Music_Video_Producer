@@ -1,0 +1,261 @@
+<title>Effects Tab — Key Screen</title>
+<style>
+:root{
+  --bg:#0c0d0d; --surface-0:#111313; --surface-1:#171919; --surface-2:#1d2020; --surface-3:#252828;
+  --line:#303434; --line-strong:#454a49; --ink:#f0f2ed; --muted:#929a95; --dim:#626966;
+  --acid:#d4f75e; --acid-ink:#15190a; --amber:#ffb454; --red:#ff6b61; --red-edge:#7f3732;
+  --cyan:#6bd0cc; --blue:#5b9bd5; --radius:7px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:Bahnschrift,"Aptos","Segoe UI",sans-serif;font-size:14px;padding:18px}
+.mono{font-family:Consolas,monospace;font-size:9px;letter-spacing:.09em;text-transform:uppercase}
+h1{font-size:15px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:12px;margin:0 0 18px;max-width:78ch;line-height:1.5}
+.stage{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:14px;align-items:start}
+.panel{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface-0)}
+.pad{padding:14px}
+
+/* ---- monitor ---- */
+.monitor{aspect-ratio:16/9;background:linear-gradient(160deg,#243040,#3a2a30 55%,#1a1d22);
+  border-radius:var(--radius) var(--radius) 0 0;position:relative;display:grid;place-items:center}
+.monitor .stale{position:absolute;top:9px;right:10px;color:var(--amber);
+  background:rgba(0,0,0,.55);padding:3px 6px;border-radius:3px}
+.monitor .what{color:rgba(255,255,255,.34);font-size:11px}
+.drive{height:44px;position:relative;background:var(--surface-1);border-top:1px solid var(--line)}
+.drive canvas{display:block;width:100%;height:44px}
+.drive .cap{position:absolute;left:8px;top:5px;color:var(--dim);z-index:2}
+
+/* ---- timeline ---- */
+.tl{margin-top:12px;position:relative;height:66px;background:var(--surface-0);
+  border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.overlap{position:absolute;top:0;bottom:0;background:rgba(91,155,213,.22);
+  border-top:1px solid var(--blue);border-bottom:1px solid var(--blue);z-index:1;
+  display:grid;place-items:center}
+.overlap.cut{background:transparent;border-color:transparent;
+  background-image:repeating-linear-gradient(45deg,transparent 0 5px,var(--line-strong) 5px 6px)}
+.overlap .lbl{color:var(--blue);background:rgba(12,13,13,.72);padding:2px 5px;border-radius:3px}
+.overlap.cut .lbl{color:var(--dim)}
+.clip{position:absolute;top:11px;height:44px;border-radius:5px;background:var(--surface-2);
+  border:1px solid var(--acid);z-index:2;padding:6px 7px;overflow:hidden}
+.clip .name{font-size:11px;color:var(--ink)}
+.chips{position:absolute;right:5px;bottom:4px;display:flex;gap:3px}
+.chip{width:15px;height:15px;border-radius:3px;display:grid;place-items:center;
+  font-family:Consolas,monospace;font-size:10px;background:var(--surface-3)}
+.chip.ok{color:var(--cyan)} .chip.fx{color:var(--muted)} .chip.flag{color:var(--red)}
+.playhead{position:absolute;top:0;bottom:0;width:1px;background:var(--acid);z-index:4}
+
+/* ---- inspector ---- */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);padding:0 12px}
+.tab{padding:10px 11px 8px;color:var(--dim);border-bottom:2px solid transparent;cursor:default}
+.tab.on{color:var(--ink);border-bottom-color:var(--acid)}
+.tab .count{color:var(--muted);margin-left:5px}
+.card{background:var(--surface-1);border:1px solid var(--line);border-radius:var(--radius);
+  margin-bottom:9px;overflow:hidden}
+.card.off{opacity:.45}
+.chead{display:flex;align-items:center;gap:7px;padding:8px 9px;border-bottom:1px solid var(--line)}
+.grip{color:var(--dim);font-size:11px}
+.fam{color:var(--dim)} .enm{color:var(--ink);font-size:12px;flex:1}
+.tog{width:24px;height:13px;border-radius:9px;background:var(--acid);position:relative}
+.tog::after{content:"";position:absolute;top:2px;right:2px;width:9px;height:9px;border-radius:50%;
+  background:var(--acid-ink)}
+.card.off .tog{background:var(--line-strong)}
+.card.off .tog::after{left:2px;right:auto;background:var(--dim)}
+.x{color:var(--dim);font-size:12px}
+.row{display:flex;align-items:center;gap:9px;padding:7px 9px}
+.row .lab{color:var(--muted);font-size:12px;width:74px;flex:none}
+.track{flex:1;height:3px;border-radius:2px;background:var(--line);position:relative}
+.fill{position:absolute;left:0;top:0;bottom:0;background:var(--acid);border-radius:2px}
+.thumb{position:absolute;top:-4px;width:11px;height:11px;border-radius:50%;background:var(--ink);
+  transform:translateX(-50%)}
+.val{font-family:Consolas,monospace;font-size:10px;color:var(--muted);width:34px;text-align:right}
+.bind{width:15px;text-align:center;color:var(--dim);font-size:13px}
+.bind.on{color:var(--blue)}
+
+.band{background:var(--surface-2);border-left:2px solid var(--blue);margin:0 9px 9px;
+  border-radius:0 5px 5px 0;padding:9px}
+.band .cap{color:var(--dim);margin-bottom:7px;display:block}
+.spec{position:relative;height:52px;background:var(--surface-0);border:1px solid var(--line);
+  border-radius:4px;overflow:hidden}
+.spec canvas{display:block;width:100%;height:52px}
+.ends{display:flex;justify-content:space-between;color:var(--dim);margin-top:4px}
+.seg{display:flex;margin:9px 0 7px;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+.seg div{flex:1;text-align:center;padding:5px;color:var(--dim);font-family:Consolas,monospace;
+  font-size:9px;letter-spacing:.09em;text-transform:uppercase}
+.seg div.on{background:var(--blue);color:#0b1622}
+.trow{display:flex;align-items:center;gap:8px;padding:5px 0}
+.trow .lab{color:var(--muted);font-size:12px;width:52px;flex:none}
+
+.tr{display:flex;align-items:center;gap:8px;background:var(--surface-1);border:1px solid var(--line);
+  border-left:2px solid var(--blue);border-radius:0 5px 5px 0;padding:8px 9px;margin-bottom:7px}
+.tr.one{border-left-color:var(--dim)}
+.tr .lab{color:var(--muted);font-size:12px;width:82px;flex:none}
+.sel{flex:1;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;
+  padding:4px 7px;font-size:12px;color:var(--ink)}
+.note{color:var(--dim);font-size:11px;line-height:1.45;margin:2px 0 11px}
+.btn{display:block;width:100%;text-align:center;padding:7px;border-radius:5px;
+  border:1px solid var(--line);color:var(--muted);font-size:12px;background:var(--surface-1);
+  margin-top:3px}
+.legend{margin-top:20px;border-top:1px solid var(--line);padding-top:12px;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:9px}
+.legend div{color:var(--muted);font-size:11.5px;line-height:1.5}
+.legend b{color:var(--ink);font-weight:600}
+.k{color:var(--blue)}
+</style>
+
+<h1>Effects tab — key screen</h1>
+<p class="sub">Shot 05 selected, carrying two effects, with <b>Film&nbsp;grain&nbsp;→&nbsp;Size</b> bound to a bass band.
+The Monitor plays the effected picture and is mid-restage after a parameter change; the Drive readout sits beneath it.
+Shot 04 and 05 overlap by 0.50&nbsp;s with a dissolve set; shots 06 and 07 overlap untyped, which is still a hard cut.
+Tokens are the live ones from <code>styles.css</code> plus the single new <span class="k">--blue</span>.</p>
+
+<div class="stage">
+  <div>
+    <div class="panel" style="overflow:hidden">
+      <div class="monitor">
+        <span class="mono stale">STALE — RE-RENDERING</span>
+        <span class="what">effected picture · previous frame continues</span>
+      </div>
+      <div class="drive">
+        <span class="mono cap">DRIVE · FILM GRAIN / SIZE</span>
+        <canvas id="drv" width="900" height="44"></canvas>
+      </div>
+    </div>
+
+    <div class="tl">
+      <div class="overlap" style="left:29%;width:6%"><span class="mono lbl">DISSOLVE</span></div>
+      <div class="overlap cut" style="left:70%;width:4.5%"><span class="mono lbl">CUT</span></div>
+      <div class="clip" style="left:1%;width:30%">
+        <div class="name">04 · rooftop wide</div>
+        <div class="chips"><span class="chip ok">✓</span><span class="chip fx">ƒ</span></div>
+      </div>
+      <div class="clip" style="left:33%;width:39%;border-color:var(--acid)">
+        <div class="name">05 · close, singing</div>
+        <div class="chips"><span class="chip ok">✓</span><span class="chip fx">ƒ</span></div>
+      </div>
+      <div class="clip" style="left:72.5%;width:26%;border-color:var(--amber)">
+        <div class="name">06 · street push-in</div>
+        <div class="chips"><span class="chip flag">⚑</span></div>
+      </div>
+      <div class="playhead" style="left:46%"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="tabs">
+      <div class="tab mono">Shot Info</div>
+      <div class="tab on mono">Effects <span class="count">· 3</span></div>
+    </div>
+
+    <div class="pad">
+      <div class="card">
+        <div class="chead"><span class="grip">⋮⋮</span><span class="mono fam">GRADE</span>
+          <span class="enm">Film LUT</span><span class="tog"></span><span class="x">✕</span></div>
+        <div class="row"><span class="lab">Look</span>
+          <span class="val" style="flex:1;text-align:left;color:var(--ink)">Kodak 2383</span>
+          <span class="bind">〜</span></div>
+        <div class="row"><span class="lab">Strength</span>
+          <span class="track"><span class="fill" style="width:72%"></span><span class="thumb" style="left:72%"></span></span>
+          <span class="val">0.72</span><span class="bind">〜</span></div>
+        <div class="row"><span class="lab">Contrast</span>
+          <span class="track"><span class="fill" style="width:58%"></span><span class="thumb" style="left:58%"></span></span>
+          <span class="val">1.12</span><span class="bind">〜</span></div>
+      </div>
+
+      <div class="card">
+        <div class="chead"><span class="grip">⋮⋮</span><span class="mono fam">TEXTURE</span>
+          <span class="enm">Film grain</span><span class="tog"></span><span class="x">✕</span></div>
+        <div class="row"><span class="lab">Amount</span>
+          <span class="track"><span class="fill" style="width:35%"></span><span class="thumb" style="left:35%"></span></span>
+          <span class="val">0.35</span><span class="bind">〜</span></div>
+        <div class="row"><span class="lab">Size</span>
+          <span class="track"><span class="fill" style="width:24%"></span><span class="thumb" style="left:24%"></span></span>
+          <span class="val">1.20</span><span class="bind on">〜</span></div>
+
+        <div class="band">
+          <span class="mono cap">SIZE REACTS TO</span>
+          <div class="spec"><canvas id="spc" width="620" height="52"></canvas></div>
+          <div class="ends"><span class="mono">BASS</span><span class="mono">TREBLE</span></div>
+          <div class="seg"><div class="on">punch</div><div>sustain</div></div>
+          <div class="trow"><span class="lab">Floor</span>
+            <span class="track"><span class="fill" style="width:30%"></span><span class="thumb" style="left:30%"></span></span>
+            <span class="val">0.30</span></div>
+          <div class="trow"><span class="lab">Depth</span>
+            <span class="track"><span class="fill" style="width:65%"></span><span class="thumb" style="left:65%"></span></span>
+            <span class="val">0.65</span></div>
+          <div class="btn" style="margin-top:8px">Remove binding</div>
+        </div>
+      </div>
+
+      <div class="card off">
+        <div class="chead"><span class="grip">⋮⋮</span><span class="mono fam">GEOMETRY</span>
+          <span class="enm">Slow zoom</span><span class="tog"></span><span class="x">✕</span></div>
+        <div class="row"><span class="lab">Amount</span>
+          <span class="track"><span class="fill" style="width:18%"></span><span class="thumb" style="left:18%"></span></span>
+          <span class="val">0.06</span><span class="bind">〜</span></div>
+      </div>
+
+      <div class="btn">+ Effect</div>
+      <div class="btn">Copy stack to…</div>
+
+      <div style="height:16px"></div>
+      <span class="mono" style="color:var(--dim);display:block;margin-bottom:7px">TRANSITIONS</span>
+      <div class="tr"><span class="lab">Transition in</span><span class="sel">Dissolve</span></div>
+      <p class="note">0.50s · from overlap with shot 04</p>
+      <div class="tr one"><span class="lab">Transition out</span><span class="sel">Blur</span></div>
+      <p class="note">No overlap — this treats shot 05's last frames, then cuts.</p>
+    </div>
+  </div>
+</div>
+
+<div class="legend">
+  <div><b>Overlap, typed</b> — <span class="k">--blue</span> fill at 22% behind clip content, blue hairlines top and bottom, type named in Consolas. A filled region with a name is a decision.</div>
+  <div><b>Overlap, untyped</b> — <b>line-strong</b> hatch and <code>CUT</code>. An untyped overlap is still a hard cut, so it must not borrow the transition's treatment.</div>
+  <div><b>Error states are outlines</b> in this application (red edges, dashed MISSING boxes). The overlap is a soft fill precisely so it cannot be misread as one.</div>
+  <div><b>Chips</b> read <code>✓ ƒ ⚑</code> — approved, carries effects, flagged. Three is the corner's maximum; a fourth requires removing one.</div>
+  <div><b>〜 glyph</b> ends every parameter row: <b>dim</b> when inert, <span class="k">blue</span> when bound. One affordance, no reactive "mode".</div>
+  <div><b>STALE</b> — the Monitor keeps playing the previous picture while re-rendering. Never a frozen frame, never a spinner, never a percentage.</div>
+  <div><b>Drive readout</b> — envelope in blue, floor as a dim hairline, acid playhead drawn through. Below the floor the envelope draws dim, so a silenced passage looks silenced.</div>
+  <div><b>Disabled effect</b> (Slow zoom) drops to 45% and keeps its controls readable. A disabled effect is retained with its parameters, not hidden.</div>
+</div>
+
+<script>
+// Drive envelope: punch on a four-on-the-floor kick, with a floor line.
+(function(){
+  const c=document.getElementById('drv'), x=c.getContext('2d'), W=c.width, H=c.height;
+  const floor=0.30, beat=W/16;
+  const drive=t=>{const p=(t%beat)/beat; return Math.min(1,Math.exp(-p*7)*(0.55+0.45*Math.sin(t/W*5)));};
+  x.clearRect(0,0,W,H);
+  // floor hairline
+  x.strokeStyle='#626966'; x.setLineDash([3,3]); x.beginPath();
+  x.moveTo(0,H-4-floor*(H-12)); x.lineTo(W,H-4-floor*(H-12)); x.stroke(); x.setLineDash([]);
+  for(let t=0;t<W;t++){
+    const v=drive(t), h=v*(H-12), above=v>=floor;
+    x.strokeStyle=above?'#5b9bd5':'#626966';
+    x.globalAlpha=above?0.95:0.5;
+    x.beginPath(); x.moveTo(t+.5,H-4); x.lineTo(t+.5,H-4-h); x.stroke();
+  }
+  x.globalAlpha=1;
+  x.strokeStyle='#d4f75e'; x.beginPath(); x.moveTo(W*0.46,0); x.lineTo(W*0.46,H); x.stroke();
+})();
+// Spectrum strip: song average in dim, selected band region in blue.
+(function(){
+  const c=document.getElementById('spc'), x=c.getContext('2d'), W=c.width, H=c.height;
+  const centre=0.17, half=0.085, soft=0.06;
+  const weight=p=>{const d=Math.abs(p-centre);
+    return d<=half?1:Math.max(0,1-(d-half)/soft);};
+  x.clearRect(0,0,W,H);
+  for(let i=0;i<W;i+=3){
+    const p=i/W;
+    const mag=(0.30+0.62*Math.exp(-p*3.4))*(0.72+0.28*Math.sin(p*44));
+    const h=mag*(H-6), w=weight(p);
+    x.fillStyle='#626966'; x.globalAlpha=0.55; x.fillRect(i,H-3-h,2,h);
+    if(w>0.01){x.fillStyle='#5b9bd5'; x.globalAlpha=0.28+0.62*w; x.fillRect(i,H-3-h,2,h);}
+  }
+  x.globalAlpha=1;
+  // band edges + centre handle
+  x.strokeStyle='#5b9bd5';
+  [centre-half,centre+half].forEach(p=>{x.beginPath();x.moveTo(p*W,0);x.lineTo(p*W,H);x.stroke();});
+  x.fillStyle='#5b9bd5'; x.fillRect(centre*W-4,H/2-4,8,8);
+})();
+</script>

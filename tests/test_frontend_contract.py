@@ -41,11 +41,14 @@ from music_video_producer.app import (
 from music_video_producer.batch import TERMINAL_JOB_STATUSES, reconcilable_jobs
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
+    CHARACTER_SLOT_LIMIT,
+    INSTRUMENTAL_NOTE,
     LEGACY_SHOT_MODES,
     SHOT_MODE_SPECS,
     SHOT_PLAN_CONTENT_FIELDS,
     SHOT_TAKE_PROVENANCE_FIELDS,
     SHOT_UNINHERITED_DECISION_FIELDS,
+    VOCAL_TYPE_SPECS,
     Asset,
     AssetCitation,
     AssetKind,
@@ -60,7 +63,12 @@ from music_video_producer.models import (
     mode_specification_problems,
     resolve_shot_mode,
 )
-from music_video_producer.timeline import SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX
+from music_video_producer.timeline import (
+    SNAP_TOLERANCE_DEFAULT,
+    SNAP_TOLERANCE_MAX,
+    lyric_line_tags,
+    tag_lyric_line,
+)
 from music_video_producer.workflows import MUSIC3_MAX_DURATION_SECONDS
 
 APP_JS = Path("src/music_video_producer/web/assets/app.js")
@@ -12764,3 +12772,267 @@ def test_the_resize_handle_outranks_every_clip_body_without_reordering_the_clips
                 ),
                 rule,
             )
+
+
+# ---------------------------------------------------------------------------------------------
+# Who sings the song, and which of them sings each line (pass 1).
+#
+# The client mirrors three server things: the vocal-type table, the `(S1)` sheet parser, and the
+# writer that edits one line of it. All three are held equal to the server's here, and the
+# dropdown itself is *rendered and driven* against the stub DOM rather than grepped — a per-line
+# select drawn once per lyric line has no fixed id, so the only way to prove one exists and does
+# something is to find it the way the panel's own code does and fire it.
+# ---------------------------------------------------------------------------------------------
+
+# One fixture, parsed by both languages, so "the two agree" is measured on the same bytes. CRLF,
+# an indented line, a blank, a `[Tag]` header, a mark that reads, a mark that does not, and an
+# ordinary parenthetical that must not be mistaken for one.
+TAG_FIXTURE = (
+    "[Verse]\r\n"
+    "(S1) I don't care if you track me down\r\n"
+    "  (s2) Like an animal\r\n"
+    "\r\n"
+    "(S1, S2) Tie me down\r\n"
+    "[Chorus]\r\n"
+    "(S9) past the bound\r\n"
+    # An UNCLOSED mark, which is the only unreadable shape that never matches the mark pattern at
+    # all and so reaches its answer through the suspect branch rather than through the two
+    # re-validations after it. A fixture without one let a client that silently answered
+    # "untagged" there pass unnoticed — found by the mutation sweep, not by the test.
+    "(S1 unclosed\r\n"
+    "(she said) quietly\r\n"
+)
+
+
+def test_the_client_offers_exactly_the_vocal_types_and_line_tags_the_server_declares():
+    """One table, mirrored. A client offering a cast the server has no slots for would draw a
+    dropdown whose every choice the route refuses; one offering a line tag the server does not
+    know would write a mark the sheet parser cannot read back."""
+    mirrored = run_module("""
+      import { VOCAL_TYPES, CHARACTER_SLOT_LIMIT, INSTRUMENTAL_NOTE, lineTagOptions }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        types: VOCAL_TYPES.map((entry) => ({
+          value: entry.value, label: entry.label, slots: entry.slots,
+          tags: lineTagOptions(entry.value).map((tag) => [tag.label, tag.slots]),
+        })),
+        limit: CHARACTER_SLOT_LIMIT,
+        note: INSTRUMENTAL_NOTE,
+      }));
+    """)
+
+    assert [entry["value"] for entry in mirrored["types"]] == list(VOCAL_TYPE_SPECS)
+    for entry in mirrored["types"]:
+        spec = VOCAL_TYPE_SPECS[entry["value"]]
+        assert entry["label"] == spec.label
+        assert entry["slots"] == list(spec.slots)
+        assert entry["tags"] == [[tag.label, list(tag.slots)] for tag in spec.line_tags]
+    assert mirrored["limit"] == CHARACTER_SLOT_LIMIT
+    # The instrumental consequence is stated once and quoted twice; a consequence worded two ways
+    # is one the Director cannot trust.
+    assert mirrored["note"] == INSTRUMENTAL_NOTE
+
+
+def test_the_client_reads_and_writes_the_sheet_exactly_as_the_server_does():
+    """Both parsers over one fixture, and both writers over one edit.
+
+    A client that read `(s2)` where the server did not would show the Director a dropdown state
+    their sheet does not carry; one that wrote a mark the server parses differently would store a
+    tag that reads back as something else.
+    """
+    parsed = run_module(f"""
+      import {{ lyricLineTags, tagLyricLine }} from './src/music_video_producer/web/assets/api.js';
+      const sheet = {json.dumps(TAG_FIXTURE)};
+      console.log(JSON.stringify({{
+        lines: lyricLineTags(sheet).map((line) => [line.index, line.raw, line.slots, line.taggable, line.unreadable]),
+        written: tagLyricLine(sheet, 2, [1, 2]),
+        cleared: tagLyricLine(sheet, 1, []),
+        refused: [[[0], 'slot 0'], [[99], 'slot past the bound'], [[1, 1], 'one singer twice']]
+          .filter(([slots]) => {{ try {{ tagLyricLine(sheet, 1, slots); return false; }} catch {{ return true; }} }})
+          .map(([, name]) => name),
+      }}));
+    """)
+
+    assert parsed["lines"] == [
+        [line.index, line.raw, list(line.slots), line.taggable, line.unreadable]
+        for line in lyric_line_tags(TAG_FIXTURE)
+    ]
+    # Case-insensitive, exactly as `h3_prompt._SPEAKER` is: a Director typing `(s2)` by hand has
+    # not made a mistake.
+    assert parsed["lines"][2][2] == [2]
+    # Both unreadable shapes are reported by both and repaired by neither: a slot past the bound
+    # (which matches the mark pattern and fails its re-validation) and an unclosed bracket (which
+    # never matches at all).
+    assert parsed["lines"][6][4] is True and parsed["lines"][6][1] == "(S9) past the bound"
+    assert parsed["lines"][7][4] is True and parsed["lines"][7][1] == "(S1 unclosed"
+    # And the ordinary parenthetical is not dragged into the notation.
+    assert parsed["lines"][8][4] is False and parsed["lines"][8][2] == []
+
+    assert parsed["written"] == tag_lyric_line(TAG_FIXTURE, 2, (1, 2))
+    # Round-trip closure, refused on the same two conditions on both sides: neither writer may
+    # store a mark its own reader would then report as unreadable.
+    assert parsed["refused"] == ["slot 0", "slot past the bound", "one singer twice"]
+    assert parsed["cleared"] == tag_lyric_line(TAG_FIXTURE, 1, ())
+    # The writer touched one line and normalised no separator.
+    assert parsed["written"].count("\r\n") == TAG_FIXTURE.count("\r\n")
+
+
+def test_the_per_line_dropdown_is_drawn_only_for_a_cast_and_writes_into_the_sheet():
+    """The dropdown, rendered and driven against the stub DOM.
+
+    Three things no source read can prove: that a solo song is offered NO per-line control at all
+    (the Director's "an unnecessary dropdown on every line is noise"), that a duet is offered one
+    per sung line seeded from the sheet, and that changing one **edits the lyric sheet in the box**
+    rather than storing a tag beside it. The last is the whole storage decision, executed.
+    """
+    rendered = run_workspace("""
+      const sheet = '[Verse]\\nAlpha line\\nBravo line\\n\\n[Chorus]\\n(S1) Charlie line\\n';
+      const song = { title: 'Duet', source: 'imported', path: 'media/songs/000-m.wav', duration: 60, lyrics: sheet, caption: '', vocal_type: 'female' };
+      const read = () => ({
+        hidden: at('#lyric-tagging').hidden,
+        markup: at('#lyric-tagging').innerHTML,
+        selected: at('#song-vocal-type').value,
+        options: at('#song-vocal-type').innerHTML,
+        note: at('#song-vocal-note').textContent,
+        lyrics: at('#song-lyrics').value,
+      });
+      state.project = { id: 'p1', shots: [], jobs: [], song };
+      state.songContextDirty = false;
+      app.renderSong();
+      const solo = read();
+
+      state.project = { id: 'p1', shots: [], jobs: [], song: { ...song, vocal_type: 'duet' } };
+      state.songContextDirty = false;
+      app.renderSong();
+      const duet = read();
+
+      // The Director picks "Both" on the second sung line. The handler is found the way the
+      // panel's own code finds it, and fired.
+      at('.lyric-line-tag[2]').value = '1,2';
+      fire('.lyric-line-tag[2]:change');
+      const tagged = read();
+      // Re-read after the redraw: the select must come back showing what was written.
+      const reselected = at('.lyric-line-tag[2]').value;
+      const dirty = state.songContextDirty;
+
+      // And the Director edits the sheet afterwards, deleting the line above the tagged one.
+      at('#song-lyrics').value = at('#song-lyrics').value.replace('Alpha line\\n', '');
+      // Redrawn through the exported render rather than through the input event: the stub
+      // DOM keeps one listener per selector, and `#song-lyrics` carries three in the real
+      // workspace, so which one a fire reaches is an artefact of bind order.
+      app.renderVocalTagging();
+      const afterEdit = read();
+
+      state.project = { id: 'p1', shots: [], jobs: [], song: { ...song, vocal_type: 'instrumental' } };
+      state.songContextDirty = false;
+      app.renderSong();
+      const instrumental = read();
+      console.log(JSON.stringify({ solo, duet, tagged, reselected, dirty, afterEdit, instrumental }));
+    """)
+
+    # A solo song: the select carries every type and the per-line region is not drawn at all.
+    assert rendered["solo"]["selected"] == "female"
+    assert rendered["solo"]["hidden"] is True
+    assert rendered["solo"]["markup"] == ""
+    for spec in VOCAL_TYPE_SPECS.values():
+        assert f">{spec.label}</option>" in rendered["solo"]["options"]
+
+    # A duet: one select per SUNG line — three of them — and none on the blank or the two
+    # `[Tag]` headers.
+    assert rendered["duet"]["hidden"] is False
+    assert rendered["duet"]["markup"].count('class="lyric-line-tag"') == 3
+    for tag in VOCAL_TYPE_SPECS["duet"].line_tags:
+        assert f">{tag.label}</option>" in rendered["duet"]["markup"]
+    # Seeded from the sheet: the already-marked line comes up on Char 1.
+    assert '<option value="1" selected>Char 1</option>' in rendered["duet"]["markup"]
+
+    # The change wrote into the lyric sheet, and into nothing else.
+    assert rendered["tagged"]["lyrics"] == (
+        "[Verse]\nAlpha line\n(S1, S2) Bravo line\n\n[Chorus]\n(S1) Charlie line\n"
+    )
+    assert rendered["reselected"] == "1,2", "the dropdown did not read back what it wrote"
+    # Unsaved, exactly as typing is: the tag is lyrics, and Save song context is what stores it.
+    assert rendered["dirty"] is True
+
+    # **The drift case, in the browser.** Deleting the line above moves nothing: the tag is in the
+    # line, so the row that reads `(S1, S2)` is still the row whose words are "Bravo line".
+    assert rendered["afterEdit"]["lyrics"] == (
+        "[Verse]\n(S1, S2) Bravo line\n\n[Chorus]\n(S1) Charlie line\n"
+    )
+    assert rendered["afterEdit"]["markup"].count('class="lyric-line-tag"') == 2
+    assert '<option value="1,2" selected>Both</option>' in rendered["afterEdit"]["markup"]
+    # And the redraw really is wired to the box, which the stub DOM's one-listener-per-
+    # selector map cannot demonstrate by firing.
+    assert '$("#song-lyrics").addEventListener("input", renderVocalTagging);' in (
+        APP_JS.read_text(encoding="utf-8")
+    )
+
+    # Instrumental: no per-line control, and the consequence said where the declaration is made.
+    assert rendered["instrumental"]["hidden"] is True
+    assert rendered["instrumental"]["note"] == INSTRUMENTAL_NOTE
+    assert rendered["solo"]["note"] == ""
+
+
+def test_the_song_workspace_markup_carries_the_vocal_controls():
+    """The three ids `renderVocalTagging` writes into, and the select shipped empty and disabled:
+    the options come from api.js's table, so markup that hard-coded them could offer a cast the
+    server does not know."""
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert '<select id="song-vocal-type" disabled></select>' in markup
+    assert 'id="song-vocal-note"' in markup
+    assert '<div class="lyric-tagging" id="lyric-tagging" hidden></div>' in markup
+    # Not one vocal type is spelled into the template.
+    for spec in VOCAL_TYPE_SPECS.values():
+        assert f'<option value="{spec.label}"' not in markup
+
+
+def test_the_character_slot_select_shuts_a_slot_another_asset_holds():
+    """`characterSlotPlan`, executed. Offered for a character and for nothing else, and a slot
+    another asset already holds is shown-and-shut rather than hidden — a Director looking for
+    "why can I not pick S1" is owed the name of the asset that has it, which is what the route's
+    own refusal says too."""
+    plans = run_module("""
+      import { characterSlotPlan } from './src/music_video_producer/web/assets/api.js';
+      const project = { song: { vocal_type: 'duet' }, assets: [
+        { id: 'a1', name: 'Singer One', kind: 'character', character_slot: 1 },
+        { id: 'a2', name: 'Singer Two', kind: 'character', character_slot: 0 },
+        { id: 'a3', name: 'Chrome Mic', kind: 'prop', character_slot: 0 },
+      ] };
+      console.log(JSON.stringify({
+        holder: characterSlotPlan(project, project.assets[0]),
+        other: characterSlotPlan(project, project.assets[1]),
+        prop: characterSlotPlan(project, project.assets[2]),
+        undeclared: characterSlotPlan({ song: { vocal_type: 'unstated' }, assets: [] },
+                                      { id: 'a9', kind: 'character', character_slot: 0 }),
+      }));
+    """)
+
+    # A slot names a singer, so a prop is offered none at all — the route refuses one by name.
+    assert plans["prop"] is None
+    # The declared type's own slots, plus 0 for "not one of the singers".
+    assert plans["other"]["options"] == [0, *VOCAL_TYPE_SPECS["duet"].slots]
+    assert plans["other"]["taken"] == {"1": "Singer One"}
+    # The asset holding a slot does not see its own slot as taken, so it can re-assert it.
+    assert plans["holder"]["slot"] == 1 and plans["holder"]["taken"] == {}
+    # With nothing declared the full bound is offered, so the cast can be slotted in either order.
+    assert plans["undeclared"]["options"] == [0, *range(1, CHARACTER_SLOT_LIMIT + 1)]
+
+
+def test_the_client_calls_the_one_writer_for_each_new_field():
+    """Both fields have exactly one route, and the client must not reach either through
+    `saveProject` — that route re-adopts both and would silently drop the write."""
+    calls = run_module("""
+      import { api } from './src/music_video_producer/web/assets/api.js';
+      const seen = [];
+      globalThis.fetch = (path, options) => { seen.push([path, options.method, options.body]);
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({}) }); };
+      await api.saveVocalType('p1', 'duet');
+      await api.saveCharacterSlot('p1', 'a1', 2);
+      console.log(JSON.stringify(seen));
+    """)
+
+    assert calls == [
+        ["/api/projects/p1/song/vocal-type", "PUT", '{"vocal_type":"duet"}'],
+        ["/api/projects/p1/assets/a1/character-slot", "PUT", '{"character_slot":2}'],
+    ]

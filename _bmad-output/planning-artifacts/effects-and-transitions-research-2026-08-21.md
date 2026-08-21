@@ -175,11 +175,32 @@ multi-minute export is not.** Four candidate strategies, with the honest trade:
 | **C. ffmpeg short-clip proxy** — render 2–4 s at reduced resolution through the real chain | **Exact**, including motion and transitions | seconds; needs a job, cancellation, staleness handling | None | Medium — a new job class in the Queue |
 | **D. WebGL preview engine** (gl-transitions + shader ports) | Exact only for effects authored as shaders on both sides | Instant | **Highest** — precisely the trap the Visualizer Studio walked into and reversed out of | Highest |
 
-**Recommendation: B for v1, C behind an explicit button for transitions.** B is genuinely
-cheap here — the app already shells out to ffmpeg for a contact sheet (`app.py:4495` builds a
-`tile=2x2` filter chain), so the plumbing exists. And B has the property this codebase values
-above all others: *there is exactly one description of what an effect is, and it is the one
-that renders.* C is unavoidable for transitions, because a transition has no still frame.
+### Measured, 2026-08-21 — and the recommendation changed
+
+The table above priced C as materially more expensive than B. **It is not.** Timed on the
+Director's machine, 1056×608 source, 24 fps, nine-stage filter chain:
+
+| Job | Cost |
+|---|---|
+| B — single still frame, full chain, full resolution | 170 ms |
+| **C — whole 4.5 s shot, half dimensions, `ultrafast`/CRF 28** | **270 ms** |
+| C — whole 15 s shot (longest this pipeline produces) | 660 ms |
+| C — 2 s window around an `xfade` transition | 150–190 ms |
+| C — 4.5 s driven by 108 timed `sendcmd` commands | 90 ms |
+| C — 4.5 s at half dimensions via NVENC | 400–530 ms — *slower* |
+
+A still costs 170 ms; the **entire shot** costs 270 ms. The 100 ms difference buys nothing and
+costs motion, geometry, reactive drive, and transitions — all four of which are invisible in a
+still. NVENC loses at these lengths because encoder initialization dominates a sub-second job.
+
+**Revised recommendation: C for everything.** A looping clip through the real chain, at reduced
+dimensions and encoder quality and differing in nothing else. It keeps B's decisive property —
+*there is exactly one description of what an effect is, and it is the one that renders* — and it
+closes the transition gap that made B incomplete. B survives only as the fallback if a future
+effect proves too slow to render in motion.
+
+The plumbing already exists either way: the app shells out to ffmpeg for a contact sheet
+(`app.py:4495` builds a `tile=2x2` chain), so this is a new argv, not a new capability.
 
 ---
 
@@ -210,6 +231,12 @@ Two related notes:
 ---
 
 ## Proposed shape (for the PRD to firm up)
+
+> **Superseded by the Director's rulings of 2026-08-21.** The phasing below was the analyst's
+> proposal; the rulings widened it — four effect families rather than three, general audio-reactive
+> binding, and audio analysis promoted to a Phase 1 prerequisite. See
+> `effects-director-rulings-2026-08-21.md` and the PRD at
+> `prds/prd-MusicVideoProducer-effects-2026-08-21/`. Kept for the record.
 
 **Phase 1 — Look.** Effects tab in the shot inspector. A curated catalogue of per-shot effects
 in three families (grade, texture, geometry), each a named preset with 1–3 exposed parameters,

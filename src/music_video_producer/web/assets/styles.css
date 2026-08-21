@@ -139,6 +139,14 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 /* The two per-field restore buttons, above the save so the row that undoes is never mistaken for
    the row that writes. Each stretches to half the width: two equal targets for two equal fields. */
 .context-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 8px; }
+/* The per-line singer tagging, drawn only for a vocal type that names a cast. Scrolls rather than
+   growing: a three-minute duet is sixty-odd lines, and a list that pushed the save button off the
+   panel would make the tags harder to store than to set. The select is fixed-width so every line's
+   words start at the same column and the sheet still reads as a sheet. */
+.lyric-tagging { max-height: 260px; overflow: auto; margin: 0 0 10px; }
+.lyric-tagging .block-heading { margin-bottom: 8px; }
+.lyric-line { display: grid; grid-template-columns: 116px 1fr; gap: 8px; align-items: center; padding: 2px 0; }
+.lyric-line span { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .production-note { display: grid; grid-template-columns: 120px 1fr; gap: 20px; padding: 14px 18px; }
 .production-note span { color: var(--amber); font: 10px Consolas, monospace; letter-spacing: .09em; }
 .production-note p { margin: 0; color: var(--muted); font-size: 12px; }

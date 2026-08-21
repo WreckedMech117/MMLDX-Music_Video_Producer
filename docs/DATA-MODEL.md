@@ -22,6 +22,7 @@ The recoverable source of truth is `data/projects/<project-id>/project.json`.
 - `duration`
 - `lyrics`, `caption` — the song's own words and a short description of how it sounds. Both are optional, both reach the Director's context, and both are now reachable from either source: a generation path writes them from the request, and an import can carry them on the upload form or have them set afterwards through `PUT /api/projects/{id}/song/context`
 - `lyrics_previous`, `caption_previous` — the one kept version of each context field, `None` when nothing has been displaced
+- `vocal_type` — who sings the track: `unstated` (default), `instrumental`, `female`, `male`, `duet`, `ensemble` (3+ voices), `choir`. See below
 - `prompt_id` for generated songs
 
 Imported and generated songs have equal project status.
@@ -38,6 +39,31 @@ Both slots are `str | None`, which is where this **deliberately departs** from t
 
 Neither slot reaches the Director's context, and **that exclusion is a classification rather than a path**. `SONG_DIRECTOR_VISIBLE` and `SONG_DIRECTOR_WITHHELD` in `app.py` must between them account for every field `Song` declares; an unclassified, double-classified or stale entry raises at import. Adding a field without deciding what the Director sees aborts the test suite during collection with the field named, rather than silently leaking it into every prompt — which is what a nested exclusion path would have done. Verified by adding a field and watching it fail.
 
+### Who sings (`Song.vocal_type`) and who sings each line
+
+`vocal_type` is the Director's declaration of the cast, made in the Song workspace **before** the treatment. `unstated` is the default and asserts nothing — it is what every manifest written before the field existed loads as, and it is not `instrumental`: instrumental is a real declaration with real consequences, and reading it off a manifest that predates the question would be inventing a cast. Re-selecting `unstated` is how a declaration is taken back.
+
+**Nothing infers it.** No route derives it from the lyric sheet's shape or from a library that happens to hold two characters, no vision inspection writes it, no model tool schema carries it, and the generic full-project `PUT` re-adopts the stored value rather than trusting a body — `PUT /api/projects/{id}/song/vocal-type` is its only writer. That request model carries one field and has **no default**: an omitted value would be `unstated`, so forgetting it fails loudly with a 422 instead of silently un-declaring the cast.
+
+The per-line singer marks are **not a second field**. They live inline in `lyrics`, at the head of a line, in MiniMax H3's own speaker notation — `(S1)`, `(S1, S2)` — which `h3_prompt._SPEAKER` already parses and validates. The Director sets them from a per-line dropdown, and that dropdown *edits the lyric sheet*: there is exactly one copy of every tag, so a sheet edited afterwards cannot leave a tag pointing at the wrong words. A parallel map from line number to singer would be wrong the instant a line is inserted or deleted, and wrong silently. The tags therefore inherit the sheet's own write paths exactly and add none of their own; `PUT .../song/context` stores them, as it stores every other character of the sheet.
+
+A tag edit touches one line and reformats nothing: separators (CRLF included), indentation, interior blank lines and `[Tag]` block structure all survive byte for byte, which the "stored exactly as supplied" contract above requires. A line whose head *looks* like a mark and cannot be read — a slot past the bound, a repeated singer, an unclosed bracket — is **reported**, never dropped and never rewritten, and the writer refuses to retag it until the Director fixes it by hand.
+
+Which types are tagged, and why the rest are not (`models.VOCAL_TYPE_SPECS`, one table, nothing branches on a name):
+
+| Vocal type | Slots needed | Per-line dropdown | Why |
+| --- | --- | --- | --- |
+| `unstated` | — | none | No cast has been declared to attribute a line to |
+| `instrumental` | — | none | There is no sung line |
+| `female`, `male` | — | none | One voice sings every line, and the song-level choice already names it. A dropdown whose answer never varies is noise on every line of the sheet |
+| `duet` | S1, S2 | Untagged / Char 1 / Char 2 / Both | |
+| `ensemble` (3+) | S1, S2, S3 | Untagged / Char 1 / Char 2 / Char 3 / All | Stops at three because that is the roster the Director named ("Char1/Char2/Char3+"); a fourth is one row here plus the bound, which is derived from this table |
+| `choir` | — | none | A choir is a mass voice, not a cast — there is no Char 1 to distinguish from a Char 2. A choir song with named soloists is a duet or an ensemble *with* a choir, and is declared as one |
+
+**Instrumental** is a real case, not an empty one. Declaring it offers no per-line tag, needs no character slot, and surfaces one recorded consequence (`models.INSTRUMENTAL_NOTE`, restating `docs/ROADMAP.md`'s stage-1 note that instrumental songs lean on the Treatment much harder). What it deliberately does **not** do is touch a shot: it does not sweep `singing` to `not_singing`, because nothing in this codebase infers a singing state and a declaration about the song is not a measurement of a window. The guard that acts here is the measured one and is untouched — `Song.vocal_spans` is Whisper's own voice activity, and a truly instrumental track measures voiceless everywhere, so populate already downgrades every window of it. A shot marked singing over a window Whisper measured as voiceless still gets no sings clause, whatever the vocal type says.
+
+**Pass 1 withholds both new fields from every Director context dump**, and that is a decision rather than an oversight: nothing has yet been designed for a model to *do* with them, so shipping a bare key into every chat turn and every populate call would change what every existing project's model sees in exchange for a fact no instruction mentions. Pass 2 — populate reading the marks to choose a shot's character references — is where they enter the prompt, and deleting those two withhold entries is its first move.
+
 ## Asset
 
 - stable `id`
@@ -48,7 +74,10 @@ Neither slot reaches the Director's context, and **that exclusion is a classific
 - optional `parent_id` linking a multiview sheet to its source character
 - `prompt`, `prompt_id`, `created_at`
 - `consistency_prompt`: the **appearance anchor** — see below
+- `character_slot`: which singer this character is, `0` for unslotted — see below
 - optional structured vision inspection: summary, visible identity/environment details, continuity cues, prompt cues, risks, model, and analysis time
+
+Every field an `Asset` declares is classified `ASSET_DIRECTOR_VISIBLE` or `ASSET_DIRECTOR_WITHHELD`, the same import-time guard `Song` and `Shot` carry: an unclassified, double-classified or stale entry aborts collection with the field named rather than leaking it into every Director prompt. Everything that was in the dump before that classification existed is classified visible, so it changed no prompt.
 
 ### The appearance anchor (`Asset.consistency_prompt`)
 
@@ -63,6 +92,18 @@ Empty means **no anchor stored**, not "this looks like nothing", and every consu
 A per-shot `Shot.reference_labels` rename and an anchor compose as apposition — `the woman upstage, a woman in a red leather jacket`. The rename says who this picture is *in this shot*; the anchor says what she looks like in every shot. A rename meant to replace the appearance too is expressed by clearing the anchor, which is a decision about the asset rather than about one shot.
 
 Child assets: a **Krea multiview sheet inherits** its source's anchor (the promotion's whole promise is that the child depicts the same subject unchanged, and the sheet is the asset shots actually cite), by copy rather than by link. An **AI Mod edit does not** — an edit is the act of changing what the subject looks like, so inheriting would carry a description the edit was run to invalidate.
+
+### The character slot (`Asset.character_slot`)
+
+Which of the song's singers this character *is*, as a number: a lyric line tagged `(S1)` resolves to whichever character asset holds slot 1. The link is a number on the Asset rather than an asset id in the sheet, because a sheet carrying asset ids breaks when an asset is replaced — re-slot the new character and every `(S1)` in the sheet follows it.
+
+`0` is the default and means **unslotted**, which is what every existing asset is and what every non-singing character stays. Bounded by `CHARACTER_SLOT_LIMIT`, which is *derived* from `VOCAL_TYPE_SPECS` rather than typed, so no asset can hold a slot no dropdown can offer and no dropdown can offer a slot no asset may hold.
+
+Meaningful only on `kind == "character"`. `PUT /api/projects/{id}/assets/{asset_id}/character-slot` is its **only** writer and refuses three ways, each leaving the asset untouched: a non-character asset by name (a slot names a singer, and a prop cannot sing), a slot another character already holds by name (one slot, one character — otherwise a tagged line points at two references and the render picks by accident), and a number past the bound, refused by the schema before the route runs. `character_slot_assets` re-validates both conditions on every read, so a hand-edited manifest cannot smuggle in a slotted prop.
+
+The generic full-project `PUT` re-adopts the stored slot per asset id and writes `0` for an id the stored project does not hold — `consistency_prompt`'s treatment exactly, for its exact reason: `character_slot` is a defaulted `int`, so a body that merely omits it arrives as `0` and one ordinary save would un-slot the whole cast at once, leaving every `(S1)` in the sheet resolving to nothing. Nothing infers a slot: no route hands the only character asset slot 1 because it is the only one, and no model tool schema exposes the field.
+
+**Checked at Populate Timeline, flagged and never refused.** `models.vocal_cast_problems` compares the declared type's slots against the library and reports the shortfall by name — "Duet declared, and 1 of the 2 character slot(s) it needs are filled — S2 unfilled" — on `PopulateTimelineResponse.cast_notices`. The plan still lands: the slots are set in another tab, and sending the Director away from the button they pressed would cost them the plan. It is silent for every type that names no cast, because a type with no per-line marks has no `(S1)` to resolve and therefore nothing a slot would be needed for.
 
 ## Shot
 

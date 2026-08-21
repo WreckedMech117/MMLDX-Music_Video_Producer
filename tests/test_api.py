@@ -99,6 +99,7 @@ from music_video_producer.app import (
     reference_map_tag_lines,
     reference_prompt,
     reference_slot_counts,
+    song_audio_prose,
 )
 from music_video_producer.asset_replacement import (
     REPLACE_MIXED_ROLES,
@@ -134,10 +135,13 @@ from music_video_producer.h3_expansion_prompt import (
 )
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
+    CHARACTER_SLOT_LIMIT,
+    INSTRUMENTAL_NOTE,
     KEYFRAME_TAG_ROLES,
     LEGACY_SHOT_MODES,
     NOTICE_RAW_LIMIT,
     SHOT_MODE_SPECS,
+    VOCAL_TYPE_SPECS,
     Asset,
     AssetCitation,
     AssetKind,
@@ -154,13 +158,16 @@ from music_video_producer.models import (
     SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
+    character_slot_assets,
     citations_in_prompt_order,
     citations_in_role,
     dangling_citations,
+    line_tag_options,
     mode_specification_problems,
     numbered_references,
     resolve_shot_mode,
     song_audio_tag,
+    vocal_cast_problems,
 )
 from music_video_producer.store import ProjectChangedDuringSave, ProjectStore
 from music_video_producer.timeline import (
@@ -173,10 +180,12 @@ from music_video_producer.timeline import (
     SNAP_UNMEASURED,
     SNAP_WITHOUT_CUTS,
     expansion_input,
+    lyric_line_tags,
     over_render_frames,
     over_render_lead,
     over_render_window,
     shot_expansion_input,
+    tag_lyric_line,
 )
 from music_video_producer.workflows import (
     H3_ASPECT_RATIOS,
@@ -1316,7 +1325,16 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
     # guard by widening a set to `Song.model_fields` fails here.
     assert _withheld_fields(
         Song, visible=SONG_DIRECTOR_VISIBLE, withheld=SONG_DIRECTOR_WITHHELD, family="SONG"
-    ) == {"lyrics_previous", "caption_previous", "vocal_spans", "lyric_words"}
+    ) == {
+        "lyrics_previous",
+        "caption_previous",
+        "vocal_spans",
+        "lyric_words",
+        # Pass 1 only, and the entry is expected to be deleted rather than to live here: the
+        # declared vocal type is withheld until the populate instruction has wording that says
+        # what a tagged line means. Named explicitly so removing it is a decision someone makes.
+        "vocal_type",
+    }
     assert not SONG_DIRECTOR_VISIBLE & SONG_DIRECTOR_WITHHELD
 
 
@@ -18453,3 +18471,549 @@ def test_neither_whole_shot_write_can_clear_the_recorded_map(tmp_path: Path):
         arm(store, project_id)
         assert submit_h3(client, project_id, shot_id).status_code == 422, name
         assert comfy.prompts == [], name
+
+
+# ---------------------------------------------------------------------------------------------
+# Who sings the song, and which character is which singer (pass 1).
+#
+# Two new fields, both defaulted, both with exactly one writer. The tests below are the
+# `consistency_prompt`/`default_setting_id` sibling-write suite applied to them, plus the
+# validation the Director named and the byte-identity pin on their live project.
+# ---------------------------------------------------------------------------------------------
+
+
+def cast_project(store, name: str = "Cast", *, characters: int = 2) -> Project:
+    """A song plus `characters` character assets and one prop, none of them slotted."""
+    project = store.create(Project(name=name))
+    project.song = Song(title="Harder", source="imported", path="media/h.mp3", duration=60.0)
+    project.assets = [
+        Asset(id=f"asset_char{index}", name=f"Singer {index}", kind="character",
+              path=f"media/c{index}.png")
+        for index in range(1, characters + 1)
+    ] + [Asset(id="asset_mic", name="Vintage Chrome Mic", kind="prop", path="media/mic.png")]
+    store.save(project)
+    return project
+
+
+def set_vocal_type(client, project_id: str, vocal_type: str):
+    return client.put(
+        f"/api/projects/{project_id}/song/vocal-type", json={"vocal_type": vocal_type}
+    )
+
+
+def set_slot(client, project_id: str, asset_id: str, slot: int):
+    return client.put(
+        f"/api/projects/{project_id}/assets/{asset_id}/character-slot",
+        json={"character_slot": slot},
+    )
+
+
+def test_every_vocal_type_offers_exactly_the_line_options_its_cast_needs():
+    """The Director's decision: "a simple dropdown at each line with selections depending on what
+    the user selected for the song type". A solo type offers none, and that is the whole point —
+    a dropdown whose answer never varies is noise on every line of the sheet."""
+    offered = {
+        value: [option.label for option in line_tag_options(value)]
+        for value in VOCAL_TYPE_SPECS
+    }
+
+    assert offered == {
+        # Nothing declared, no sung line, one voice, one voice, and a mass voice: no cast to
+        # attribute a line to, so no dropdown is drawn at all.
+        "unstated": [],
+        "instrumental": [],
+        "female": [],
+        "male": [],
+        "choir": [],
+        "duet": ["Untagged", "Char 1", "Char 2", "Both"],
+        "ensemble": ["Untagged", "Char 1", "Char 2", "Char 3", "All"],
+    }
+    # The marks are H3's own speaker notation, which `h3_prompt._SPEAKER` already parses — the
+    # spelling is reused rather than invented, so the tag is understood downstream.
+    assert [option.notation for option in line_tag_options("duet")] == [
+        "", "(S1)", "(S2)", "(S1, S2)"
+    ]
+    assert line_tag_options("ensemble")[-1].notation == "(S1, S2, S3)"
+    # No dropdown can offer a slot no asset is allowed to hold.
+    for spec in VOCAL_TYPE_SPECS.values():
+        for option in spec.line_tags:
+            assert all(1 <= slot <= CHARACTER_SLOT_LIMIT for slot in option.slots)
+
+
+def test_the_vocal_type_is_set_by_one_route_and_nothing_else(tmp_path: Path):
+    """The write path, and every sibling that must not become a second one.
+
+    `Asset.consistency_prompt`'s rule and `Project.default_setting_id`'s, applied to a field with
+    the same shape: a defaulted value that every client written before it existed simply omits.
+    The generic full-project `PUT` is the route that has now been this hole six times, so it
+    re-adopts the stored value — and it must fail in BOTH directions, blanking and inventing.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+
+    # Defaulted, and the default asserts nothing rather than asserting a cast.
+    assert store.get(project.id).song.vocal_type == "unstated"
+    assert set_vocal_type(client, project.id, "duet").status_code == 200
+    assert store.get(project.id).song.vocal_type == "duet"
+
+    # An ordinary save from a client that has never heard of the field must not clear it.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["song"].pop("vocal_type")
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert store.get(project.id).song.vocal_type == "duet"
+
+    # And a body that INVENTS one must not declare a cast the Director never declared.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["song"]["vocal_type"] = "choir"
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert store.get(project.id).song.vocal_type == "duet", "an ordinary save re-declared the cast"
+    # Both saves above returned 200 rather than the song-replacement refusal, which is the other
+    # half of the guard: the adoption happens AHEAD of `project.song != current.song`, so a body
+    # differing only in this field compares equal and an ordinary save from an old client is not
+    # told it is replacing the song.
+
+    # Re-declaring "unstated" is how a declaration is taken back, and it is not a no-op.
+    assert set_vocal_type(client, project.id, "unstated").status_code == 200
+    assert store.get(project.id).song.vocal_type == "unstated"
+    # An unknown value is refused by the schema rather than stored.
+    assert set_vocal_type(client, project.id, "quartet").status_code == 422
+    # And a body that omits the field entirely is refused too: the omitted value would be
+    # "unstated", so a silent default here would be the same un-declaration in a smaller key.
+    assert client.put(
+        f"/api/projects/{project.id}/song/vocal-type", json={}
+    ).status_code == 422
+
+
+def test_a_confirmed_song_replacement_does_not_carry_the_old_cast_across(tmp_path: Path):
+    """`_detach_song_recovery_slots`' argument, applied to the declaration beside them: a vocal
+    type describes the track it sits on. Carried across a replacement it would say the new song
+    is a duet on the strength of the old one's declaration — which is exactly the fabricated
+    value the one-writer rule exists to prevent, arriving by a route that writes nothing."""
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+    assert set_vocal_type(client, project.id, "duet").status_code == 200
+
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["song"] = {
+        "title": "A Different Track", "source": "imported", "path": "media/other.mp3",
+        "duration": 121.0, "lyrics": "", "caption": "",
+    }
+    replaced = client.put(
+        f"/api/projects/{project.id}?confirm_song_replacement=true", json=body
+    )
+    assert replaced.status_code == 200, replaced.text
+    saved = store.get(project.id)
+    assert saved.song.title == "A Different Track"
+    assert saved.song.vocal_type == "unstated", "the new song inherited the old song's cast"
+
+
+def test_declaring_a_vocal_type_touches_no_shot_and_no_lyric(tmp_path: Path):
+    """A declaration about the song, read by the next plan. `replace_default_setting`'s rule: a
+    sweep over work the Director already has is the silent bulk edit this codebase forbids — and
+    since the per-line marks live in the lyric sheet, "touches no lyric" is also what stops the
+    route that declares the cast from being a second route that can invent a line's singer."""
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+    project.song.lyrics = "[Verse]\nOne line\nTwo line\n"
+    project.shots = [Shot(id="shot_one", start=0, duration=5, prompt="A wide shot.",
+                          singing="singing")]
+    store.save(project)
+
+    assert set_vocal_type(client, project.id, "instrumental").status_code == 200
+
+    saved = store.get(project.id)
+    assert saved.song.lyrics == "[Verse]\nOne line\nTwo line\n"
+    # Instrumental does NOT sweep the singing mark. Nothing infers a singing state, and a
+    # declaration about the song is not a measurement of a window.
+    assert saved.shots[0].singing == "singing"
+    assert saved.shots[0].prompt == "A wide shot."
+
+
+def test_a_character_slot_is_set_by_one_route_and_nothing_else(tmp_path: Path):
+    """`consistency_prompt`'s sibling-write suite, for a defaulted `int` instead of a defaulted
+    `str`. Both directions: an ordinary save can neither un-slot the cast nor invent one."""
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+
+    assert all(asset.character_slot == 0 for asset in store.get(project.id).assets)
+    assert set_slot(client, project.id, "asset_char1", 1).status_code == 200
+    assert set_slot(client, project.id, "asset_char2", 2).status_code == 200
+    assert {slot: asset.id for slot, asset in
+            character_slot_assets(store.get(project.id)).items()} == {
+        1: "asset_char1", 2: "asset_char2"
+    }
+
+    # A client that has never heard of the field omits it on every asset; one ordinary save
+    # would otherwise un-slot the whole cast at once and leave every `(S1)` resolving to nothing.
+    body = client.get(f"/api/projects/{project.id}").json()
+    for asset in body["assets"]:
+        asset.pop("character_slot")
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert [asset.character_slot for asset in store.get(project.id).assets] == [1, 2, 0]
+
+    # And a body that invents one must not slot an asset the Director never slotted.
+    body = client.get(f"/api/projects/{project.id}").json()
+    for asset in body["assets"]:
+        asset["character_slot"] = 3 if asset["id"] == "asset_mic" else 0
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert [asset.character_slot for asset in store.get(project.id).assets] == [1, 2, 0]
+
+    # An asset the stored project does not hold gets 0 rather than whatever it carried: a slot
+    # that arrived on this route was not set by the Director on the route that sets slots.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["assets"].append({
+        "id": "asset_smuggled", "name": "Uninvited", "kind": "character",
+        "path": "media/x.png", "character_slot": 3,
+    })
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    smuggled = next(a for a in store.get(project.id).assets if a.id == "asset_smuggled")
+    assert smuggled.character_slot == 0, "an ordinary save slotted an asset it also introduced"
+
+    # Zero clears it, which is what "not one of the singers" means.
+    assert set_slot(client, project.id, "asset_char1", 0).status_code == 200
+    held = character_slot_assets(store.get(project.id))
+    assert {slot: asset.id for slot, asset in held.items()} == {2: "asset_char2"}
+
+
+def test_a_promoted_identity_sheet_does_not_inherit_its_sources_slot(tmp_path: Path):
+    """The opposite call to the appearance anchor, for the opposite reason — asserted on the
+    **promotion route itself**, because that is where the decision is made and it is made by
+    omission.
+
+    An anchor describes the subject and the sheet is the picture shots actually cite, so the
+    sheet inherits it. A slot is an *identity*, and a sheet holding its source's slot would put
+    two assets in one slot — the state `replace_character_slot` refuses by name, because a tagged
+    line pointing at two references renders by accident, and the promotion route does not go
+    through that refusal. Nothing is lost: a citation of the slotted source resolves to the sheet
+    through `prefer_identity_sheets` anyway, so the slot names the subject and the substitution
+    names the picture.
+    """
+    from music_video_producer.models import identity_sheet_ids
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Promotion"))
+    lucy = upload_asset(client, project.id, "Lucy Vane", "character", "lucy.png")
+    assert set_slot(client, project.id, lucy["id"], 1).status_code == 200
+
+    assert client.post(
+        f"/api/projects/{project.id}/assets/{lucy['id']}/multiview",
+        json={"prompt": "character sheet", "seed": 0},
+    ).status_code == 202
+
+    saved = store.get(project.id)
+    sheet = saved.assets[-1]
+    assert sheet.source == "krea-multiview" and sheet.parent_id == lucy["id"]
+    assert sheet.character_slot == 0, "the promoted sheet took its source's slot"
+    # One asset in slot 1, still, and it is the subject rather than the sheet of it.
+    assert {slot: asset.id for slot, asset in character_slot_assets(saved).items()} == {
+        1: lucy["id"]
+    }
+    # And the substitution still points every citation of the slotted source at the sheet, which
+    # is why nothing is lost by leaving the sheet unslotted.
+    assert identity_sheet_ids(saved) == {}, "the sheet has no file yet, so nothing substitutes"
+
+
+def test_the_character_slot_route_refuses_what_it_cannot_resolve(tmp_path: Path):
+    """Three refusals, each leaving the asset exactly as it was: a slot on something that cannot
+    sing, a slot two characters would share, and a number no dropdown can name."""
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+
+    assert set_slot(client, project.id, "asset_gone", 1).status_code == 404
+
+    prop = set_slot(client, project.id, "asset_mic", 1)
+    assert prop.status_code == 422
+    assert "character slot names one of the song's singers" in prop.json()["detail"]
+
+    assert set_slot(client, project.id, "asset_char1", 1).status_code == 200
+    taken = set_slot(client, project.id, "asset_char2", 1)
+    assert taken.status_code == 422
+    # Named, because "take it off them first" is the action and a refusal that does not say
+    # whose slot it is cannot be acted on.
+    assert "Singer 1" in taken.json()["detail"]
+    # An asset re-asserting its own slot is not a collision.
+    assert set_slot(client, project.id, "asset_char1", 1).status_code == 200
+
+    # Past the bound, refused by the schema before the route runs.
+    assert set_slot(client, project.id, "asset_char2", CHARACTER_SLOT_LIMIT + 1).status_code == 422
+    assert set_slot(client, project.id, "asset_char2", -1).status_code == 422
+    assert [asset.character_slot for asset in store.get(project.id).assets] == [1, 0, 0]
+
+
+def test_a_hand_edited_manifest_cannot_smuggle_in_a_singer(tmp_path: Path):
+    """`character_slot_assets` re-validates on every read, because the route is not the only way
+    a number reaches the manifest. Nothing in this application can create either state below —
+    the route refuses a non-character and refuses a contested slot — so both are what a
+    hand-edited `project.json` produces, and both resolve to the honest answer rather than to a
+    fabricated singer."""
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+    saved = store.get(project.id)
+    # A prop wearing a slot number. A slot names a singer, and a prop cannot sing, so `(S1)`
+    # must not resolve to it — otherwise a duet would read as fully cast on a microphone.
+    saved.assets[2].character_slot = 1
+    store.save(saved)
+    assert character_slot_assets(store.get(project.id)) == {}
+    assert set_vocal_type(client, project.id, "duet").status_code == 200
+    assert len(vocal_cast_problems(store.get(project.id))) == 1
+
+    # Two characters in one slot. Resolved to the FIRST in manifest order, which is append
+    # order, and never to the last: a tie-break that moved when an asset was appended would make
+    # every tagged line in the sheet silently change who it points at.
+    saved = store.get(project.id)
+    saved.assets[2].character_slot = 0
+    saved.assets[0].character_slot = 1
+    saved.assets[1].character_slot = 1
+    store.save(saved)
+    resolved = character_slot_assets(store.get(project.id))
+    assert {slot: asset.id for slot, asset in resolved.items()} == {1: "asset_char1"}
+
+
+def test_populate_flags_a_duet_with_one_character_slotted(tmp_path: Path):
+    """The Director's own example, at the moment they named: "flagged if the user labeled the
+    song as a duet but they only have one character asset if the user clicks Populate Timeline".
+
+    Flagged, never refused — the plan still lands, because the slots are set in another tab and
+    sending the Director away from the button they pressed costs them the plan.
+    """
+    director = PlanningDirector(shots=[(index * 5, 5, f"Shot {index}.") for index in range(12)])
+    client, store, _comfy = make_client(tmp_path, director=director)
+    project = cast_project(store)
+    assert set_vocal_type(client, project.id, "duet").status_code == 200
+    assert set_slot(client, project.id, "asset_char1", 1).status_code == 200
+
+    flagged = populate(client, project.id)
+    assert flagged.status_code == 200
+    body = flagged.json()
+    assert len(body["cast_notices"]) == 1
+    notice = body["cast_notices"][0]
+    assert "Duet declared" in notice and "1 of the 2" in notice and "S2" in notice
+    # The plan landed anyway. A flag is not a refusal.
+    assert body["created"] == len(store.get(project.id).shots) > 0
+
+    # Slot the second singer and the same click is silent.
+    assert set_slot(client, project.id, "asset_char2", 2).status_code == 200
+    assert populate(client, project.id).json()["cast_notices"] == []
+
+
+def test_a_project_that_declared_nothing_is_never_flagged(tmp_path: Path):
+    """Every project that existed before this feature. `unstated` needs no slots, and neither
+    does a solo or a choir: a type with no per-line marks has no `(S1)` to resolve, so there is
+    nothing a slot would be needed for."""
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store, characters=0)
+
+    for value in ("unstated", "female", "male", "choir"):
+        assert set_vocal_type(client, project.id, value).status_code == 200
+        assert vocal_cast_problems(store.get(project.id)) == []
+
+    # And a duet with nothing slotted is flagged, which is what makes the silence above a
+    # decision rather than a check that never fires.
+    assert set_vocal_type(client, project.id, "duet").status_code == 200
+    assert len(vocal_cast_problems(store.get(project.id))) == 1
+
+
+def test_instrumental_is_coherent_end_to_end(tmp_path: Path):
+    """Declaring Instrumental is a real case, not an empty one.
+
+    Four things have to line up: no per-line dropdown (there is no sung line to attribute), no
+    character slot needed, the recorded consequence said once where it matters, and the singing
+    guard untouched — a window is sung or not because of what Whisper measured, never because of
+    a label.
+    """
+    director = PlanningDirector(shots=[(index * 5, 5, f"Shot {index}.") for index in range(12)])
+    client, store, _comfy = make_client(tmp_path, director=director)
+    project = cast_project(store, characters=0)
+    assert set_vocal_type(client, project.id, "instrumental").status_code == 200
+
+    # No cast to choose from at any line, and no slot to fill.
+    assert line_tag_options("instrumental") == ()
+    assert VOCAL_TYPE_SPECS["instrumental"].slots == ()
+
+    # The consequence, said once, and it is the roadmap's own recorded note.
+    assert vocal_cast_problems(store.get(project.id)) == [INSTRUMENTAL_NOTE]
+    assert "lean" not in INSTRUMENTAL_NOTE  # the roadmap's wording, restated rather than quoted
+    assert "treatment carries the whole story" in INSTRUMENTAL_NOTE
+
+    report = populate(client, project.id)
+    assert report.status_code == 200
+    assert report.json()["cast_notices"] == [INSTRUMENTAL_NOTE]
+
+    # The vocal-band guard is untouched and still the only thing that decides a sung window.
+    # This project has NO measured spans, so nothing is downgraded on evidence nobody has — the
+    # declaration did not become a measurement.
+    saved = store.get(project.id)
+    assert saved.song.vocal_spans == []
+    assert {shot.singing for shot in saved.shots} == {"not_singing"}, (
+        "the model's own performance declaration decides, exactly as it did before"
+    )
+
+
+def test_the_vocal_fields_reach_no_model_in_pass_one(tmp_path: Path):
+    """Both fields are withheld from every Director context dump, and no tool schema exposes
+    either. Pass 1's rule: nothing has been designed for a model to DO with them yet, and a bare
+    key shipped into every prompt is a prompt regression bought with nothing."""
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+    assert set_vocal_type(client, project.id, "duet").status_code == 200
+    assert set_slot(client, project.id, "asset_char1", 1).status_code == 200
+
+    dumped = store.get(project.id).model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+    assert "vocal_type" not in dumped["song"]
+    assert all("character_slot" not in asset for asset in dumped["assets"])
+    # Everything that was in the dump before is still in it: classifying the Asset fields is a
+    # guard against the NEXT field, not a removal of any existing one.
+    assert {"id", "name", "kind", "path", "source", "prompt", "consistency_prompt"} <= set(
+        dumped["assets"][0]
+    )
+    # And no model-facing schema mentions either field — the recorded rule for a mechanical one,
+    # after a local model twice omitted booleans it claimed to have set.
+    from music_video_producer.director import (
+        AssetProposal,
+        FillShotsArguments,
+        director_result_schema,
+    )
+
+    exposed = json.dumps([
+        director_result_schema(require=("shots",)),
+        FillShotsArguments.model_json_schema(),
+        AssetProposal.model_json_schema(),
+    ])
+    assert "vocal_type" not in exposed and "character_slot" not in exposed
+
+
+def test_a_manifest_without_the_vocal_fields_loads_and_round_trips(tmp_path: Path):
+    """Old manifests load unchanged. Written by hand without either key, read through a fresh
+    `ProjectStore`, and saved back — the two fields arrive at their defaults, which mean *not
+    stated* and *unslotted*, and nothing else about the manifest moves."""
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Legacy"))
+    raw = json.loads((store.project_dir(project.id) / "project.json").read_text(encoding="utf-8"))
+    raw["song"] = {
+        "title": "Harder", "source": "imported", "path": "media/h.mp3", "duration": 60.0,
+        "lyrics": "[Verse]\nOne line\n", "caption": "",
+    }
+    raw["assets"] = [{"id": "asset_a", "name": "Singer", "kind": "character", "path": "a.png"}]
+    (store.project_dir(project.id) / "project.json").write_text(
+        json.dumps(raw), encoding="utf-8"
+    )
+
+    loaded = ProjectStore(tmp_path).get(project.id)
+    assert loaded.song.vocal_type == "unstated"
+    assert loaded.assets[0].character_slot == 0
+    assert vocal_cast_problems(loaded) == []
+    assert character_slot_assets(loaded) == {}
+
+    ProjectStore(tmp_path).save(loaded)
+    again = ProjectStore(tmp_path).get(project.id)
+    assert again.song.vocal_type == "unstated"
+    assert again.assets[0].character_slot == 0
+    assert again.song.lyrics == "[Verse]\nOne line\n"
+
+
+def test_tagging_a_sheet_travels_on_the_lyric_route_and_survives_an_edit(tmp_path: Path):
+    """The storage decision, end to end over HTTP.
+
+    The dropdown's write is a lyric-sheet edit, so it lands on `PUT /song/context` — the route
+    that already exists for the sheet — and there is no second field to save, to guard, or to
+    let drift. Editing the sheet afterwards moves every tag with its own words, because they are
+    the same characters.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = cast_project(store)
+    project.song.lyrics = "[Verse]\nAlpha line\nBravo line\n"
+    store.save(project)
+    assert set_vocal_type(client, project.id, "duet").status_code == 200
+
+    # What the dropdown produces, computed by the same function the browser calls.
+    tagged = tag_lyric_line(tag_lyric_line(store.get(project.id).song.lyrics, 1, (1,)), 2, (1, 2))
+    assert client.put(
+        f"/api/projects/{project.id}/song/context", json={"lyrics": tagged, "caption": ""}
+    ).status_code == 200
+    stored = store.get(project.id).song.lyrics
+    assert {line.text: line.slots for line in lyric_line_tags(stored) if line.taggable} == {
+        "Alpha line": (1,), "Bravo line": (1, 2)
+    }
+
+    # The Director now edits the sheet by hand, inserting a block above and deleting a line.
+    edited = stored.replace("[Verse]\n", "[Intro]\nZulu line\n[Verse]\n").replace(
+        "(S1) Alpha line\n", ""
+    )
+    assert client.put(
+        f"/api/projects/{project.id}/song/context", json={"lyrics": edited, "caption": ""}
+    ).status_code == 200
+    assert {line.text: line.slots for line in
+            lyric_line_tags(store.get(project.id).song.lyrics) if line.taggable} == {
+        "Zulu line": (), "Bravo line": (1, 2)
+    }, "a tag drifted off its words when the sheet was edited"
+
+
+def test_the_directors_live_project_is_unchanged_by_the_cast_fields():
+    """**The byte-identity pin.** The Director's real project — 33 shots, one character asset,
+    a female-sung cover with a tagged lyric sheet — declares no vocal type and slots no
+    character, and after this change it must behave exactly as it did before it.
+
+    The digests below were computed against `master` at 0896832, BEFORE this feature existed:
+    every shot's `song_audio_prose`, its reference map tag lines, its reference numbering, and
+    the citations populate's own rules (`assets_for_proposal` → `with_default_setting` →
+    `prefer_identity_sheets`) would derive for its prompt. The second digest is the whole
+    Director context dump, which is what pins "identical prompts" for the model calls too.
+
+    A skip rather than a failure when the project is absent: this pins the Director's own data
+    root, which a CI checkout does not have, and a pin that fails for being run elsewhere is a
+    pin people delete.
+    """
+    root = Path("data/projects/project_59f14d19ff10")
+    if not (root / "project.json").is_file():
+        pytest.skip("the Director's live project is not in this data root")
+    project = ProjectStore(Path("data")).get("project_59f14d19ff10")
+
+    assert len(project.shots) == 33
+    assert project.song.vocal_type == "unstated", "the live project declared a cast"
+    assert [asset.character_slot for asset in project.assets] == [0] * len(project.assets)
+    assert vocal_cast_problems(project) == [], "an untouched project was flagged"
+    assert lyric_line_tags(project.song.lyrics) and not any(
+        line.slots or line.unreadable for line in lyric_line_tags(project.song.lyrics)
+    ), "the live sheet reads as tagged or unreadable"
+
+    from music_video_producer.models import (
+        assets_for_proposal,
+        citable_assets,
+        identity_sheet_ids,
+        prefer_identity_sheets,
+        with_default_setting,
+    )
+    from music_video_producer.workflows import H3_REFERENCE_LIMITS
+
+    library = citable_assets(project)
+    sheets = identity_sheet_ids(project)
+    lines = []
+    for shot in project.shots:
+        lines.append(f"PROSE {shot.id} {song_audio_prose(project, shot)}")
+        lines.append(f"MAP {shot.id} {reference_map_tag_lines(project, shot)}")
+        lines.append(f"NUM {shot.id} "
+                     f"{[(entry.tag, entry.citation.asset_id) for entry in numbered_references(project, shot)]}")
+        named = [
+            AssetCitation(asset_id=asset.id, role="reference", order=order)
+            for order, asset in enumerate(
+                assets_for_proposal(library, declared=(), prose=shot.prompt)
+            )
+        ]
+        located = with_default_setting(
+            project, named, picture_limit=H3_REFERENCE_LIMITS["picture"]
+        )
+        final = prefer_identity_sheets(located, sheets)
+        lines.append(
+            f"CIT {shot.id} {[(item.asset_id, item.role, item.order) for item in final]}"
+        )
+    context = json.dumps(
+        project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE),
+        sort_keys=True, default=str,
+    )
+
+    assert hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest() == (
+        "ef4931d4280744941ae33d5a09d07589200cd017f75cf113466c1e1a44f28873"
+    ), "a prompt, a reference map or a populate citation moved on the Director's live project"
+    assert hashlib.sha256(context.encode("utf-8")).hexdigest() == (
+        "98148c6746f83bd339fe5700f6194630b20d77dac38c67fef949b14da6250242"
+    ), "the Director context dump changed on the Director's live project"

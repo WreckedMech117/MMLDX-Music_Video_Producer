@@ -58,16 +58,54 @@ later phase. It feeds three consumers at once: reactive effect bindings (R-2), b
 the timeline, and beat-snapping for cut placement — which gives the standing "snap cuts to
 phrase boundaries" ruling actual beats to snap to for the first time.
 
-## R-6 — Preview is a still frame through the real chain, plus a peak frame
+## R-6 — Preview is a looping clip through the real chain
+
+> **Superseded the same day.** R-6 originally chose a still frame plus a peak frame, and the
+> Director then reopened it: *"We dont necessarily have to be locked into still frame choice if
+> FFMPEG gives us options for a more live preview."* It was measured, and the still frame's cost
+> advantage turned out not to exist. The original wording is kept below the ruling for the record.
+
+The Effects panel previews by rendering **the Shot itself** through the exact ffmpeg filter chain
+the export will run — at reduced dimensions and encoder quality, differing in nothing else — and
+looping it. A Transition previews as a window spanning the boundary. A reactive binding shows its
+Drive envelope drawn beneath the loop.
+
+**Measured on this machine, 2026-08-21**, 1056×608 source, 24 fps, nine-stage filter chain:
+
+| Preview | Cost |
+|---|---|
+| Single still frame, full resolution | 170 ms |
+| Whole 4.5 s shot, half dimensions, `ultrafast`/CRF 28 | **270 ms** |
+| Whole 15 s shot (longest this pipeline produces) | 660 ms |
+| 2 s window around an `xfade` transition | 150–190 ms |
+| Reactive chain driven by 108 timed `sendcmd` commands | 90 ms |
+| Same, at half dimensions, using NVENC instead | 400–530 ms — **slower** |
+
+A still costs 170 ms and the entire shot costs 270 ms. The still was never meaningfully cheaper,
+and it cannot show motion, Geometry, Drive, or a Transition. **Hardware encoding is slower than
+software here** because encoder initialization dominates a sub-second job; preview uses the CPU
+encoder deliberately.
+
+**Consequences of the reversal:**
+
+- The accepted gap — no transition preview in v1 — is **closed**. Transitions are previewable.
+- The **Peak Frame is dropped**. A 24 fps loop shows the Drive's peak several times a second, and
+  the envelope readout answers the question the peak frame was really for: *when* is this firing.
+- Preview fidelity at reduced dimensions is now an open assumption — speed is measured, but
+  whether it is faithful enough to grade by is a judgement the Director still owes.
+
+### Superseded original wording
 
 The Effects panel previews by extracting a frame through the **actual ffmpeg filter chain the
 export will run** — one engine, never an approximation. For a reactive effect it renders a
 second still at the moment in the shot where the **drive envelope peaks**, so the effect is
 visible at rest and at full.
 
-**Stated gap, accepted:** a transition has no still frame, so **transitions are not previewable
+~~**Stated gap, accepted:** a transition has no still frame, so **transitions are not previewable
 in v1**. They are judged at export. A short-clip proxy render was offered and not taken; it
-remains the obvious v2 answer if the export loop proves too slow to iterate on.
+remains the obvious v2 answer if the export loop proves too slow to iterate on.~~ — withdrawn;
+the measurement above made the proxy render cheap enough to be the default rather than the
+fallback.
 
 ## R-7 — Standing constraints these rulings inherit
 
