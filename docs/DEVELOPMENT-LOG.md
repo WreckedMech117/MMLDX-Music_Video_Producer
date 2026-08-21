@@ -4,6 +4,23 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-21 — The render-again browser assertion had been failing at baseline
+
+`tests/e2e_shot_controls.py:364` asserted the render-again button's tooltip contains
+"no GPU time is spent". That was true while render-again only *re-opened* a shot; since
+2026-08-18 it queues a take in one gesture (`713d09b`) and `RENDER_AGAIN_HELP` correctly
+says so instead. The behaviour changed and its guard did not follow, so the script has
+failed at baseline ever since — three separate agents reported it as "not mine" while
+working around it.
+
+Now asserts "queue one new take", the current wording's own cost statement, with a comment
+recording why the old sentence died so the next reader does not restore it.
+
+**Verified:** the phrase is present in the shipped `RENDER_AGAIN_HELP` and the old one is
+absent, checked against `api.js` directly; `ruff` clean. **Not verified:** the script was
+not run — it needs a real browser and an isolated data root, and a 33-shot render batch is
+using the GPU. This corrects an assertion, and does not claim the surrounding script passes.
+
 ## 2026-08-21 — Restore-song-audio laid the exposed slice over the whole take: the audio now covers the take at the take's own offset, through the render's own arithmetic
 
 **Two defects, one root cause, both recorded as follow-ups on 2026-08-19 and both made larger by the micro-cut floor.** Since the over-render margin a take is not its window — it is `over_render_frames(duration)` frames of picture beginning `latest_take_lead` seconds *before* the window, and below ~3.271 s it is centred on it. `POST .../shots/{id}/restore-song-audio` still windowed the master by the bare `shot.start` / `shot.duration`, so it laid the **exposed slice's** seconds over the **whole take**: the sound ran `lead` ahead of the mouth and stopped a margin early. On the Director's shortest live window — 2.083 s at 12 s — it sent 2.083 s starting at 12.000 for a picture that is 4.4583 s starting at 10.7917: wrong length and wrong offset. Beside it, `workflows.audio_replace_lengths` still computed `align_h3_frames(max(5, round(duration · 24)))`, the pre-margin formula, and reported that 2.083 s shot's take as **50 frames** when the render had asked H3 for **107**. Nothing rendered from that number; it is the sentence the Director reads, and it disagreed with what the take is.

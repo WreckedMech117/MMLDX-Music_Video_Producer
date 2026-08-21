@@ -361,7 +361,12 @@ def main() -> None:
             )
             assert again.is_enabled(), "render-again is drawn disabled on an ordinary completed shot"
             assert again.text.strip() == "Render again", again.text
-            assert "no GPU time is spent" in (again.get_attribute("title") or ""), (
+            # The button's own cost statement. It used to read "no GPU time is spent",
+            # which was true while render-again only re-opened the shot; since 2026-08-18
+            # it queues a take in one gesture (713d09b) and `RENDER_AGAIN_HELP` says so.
+            # This assertion tracked the old sentence and had been failing at baseline
+            # ever since — the behaviour changed and its guard did not follow.
+            assert "queue one new take" in (again.get_attribute("title") or ""), (
                 again.get_attribute("title")
             )
             assert status_chip(driver) == "complete", status_chip(driver)
