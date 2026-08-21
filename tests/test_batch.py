@@ -15,6 +15,7 @@ from music_video_producer.batch import (
     NEAR_DUPLICATE_OVERLAP,
     NOTE_KIND_PROMPT,
     NOTE_KIND_SAMENESS,
+    NOTE_KIND_STALE_MAP,
     NOTE_KIND_TAKE_UNCOVERED,
     NOTE_KIND_WINDOW_LONG,
     NOTE_KIND_WINDOW_SHORT,
@@ -28,6 +29,7 @@ from music_video_producer.batch import (
     SHOT_WINDOW_BELOW_BAND,
     SHOT_WINDOW_PAST_TAKE,
     SHOT_WITH_PLACEHOLDER_PROMPT,
+    SHOT_WITH_STALE_REFERENCE_MAP,
     SHOT_WITHOUT_PROMPT,
     SHOTS_LACK_VARIANCE,
     SHOTS_SHARE_ONE_PROMPT,
@@ -57,12 +59,20 @@ from music_video_producer.comfy import ComfyError, HistoryResult
 from music_video_producer.models import (
     SHOT_MODE_SPECS,
     Asset,
+    AssetCitation,
     JobStatus,
     Project,
     RenderJob,
     Shot,
     Song,
     VisionInspectionRecord,
+)
+from music_video_producer.reference_map import (
+    STALE_REFERENCE_MAP_CAUSE,
+    STALE_REFERENCE_MAP_CONSEQUENCE,
+    STALE_REFERENCE_MAP_REMEDY,
+    reference_map_sentence,
+    stale_reference_map,
 )
 
 
@@ -397,6 +407,190 @@ def test_readiness_is_derived_and_writes_nothing_back_onto_the_project():
 
     assert project.model_dump(mode="json") == before
     assert not any(field.startswith("ready") for field in Shot.model_fields)
+
+
+# --- A stale reference map, reported before the batch is confirmed (2026-08-21) -----------
+#
+# The gap this closes: `app.generate_h3` has refused a shot whose stored expansion carries a stale
+# reference map since 2026-08-20, and this report said nothing about it. So the pre-flight told the
+# Director "33 ready", they confirmed the GPU cost, the batch started, and *then* one shot was
+# skipped by name. Every other thing this module reports -- the unprompted shot, the near-duplicate
+# pair, the out-of-band window -- is surfaced before that confirmation precisely so it can still be
+# acted on.
+#
+# It **blocks**, and `SHOT_WITH_STALE_REFERENCE_MAP` carries the argument. The tests below hold both
+# halves of the consequence: `ready` goes false, and `ready_count` still counts the shot as having a
+# prompt, because it has one.
+
+
+def mapped(*, cites: int, expansion: str = "", stored_map: str = "") -> Project:
+    """One shot citing `cites` of two library pictures, holding `expansion` and `stored_map`.
+
+    Written straight onto the model rather than through a route, which is what lets one helper
+    build **both** staleness shapes: the prose form carries its map in its own text, and a document
+    expansion carries it in `h3_prompt_map`. `tests/test_api.py` drives the same states through the
+    real routes and asserts the submit route agrees with this report.
+    """
+    project = plan("A singer turns toward camera")
+    project.assets = [
+        Asset(id="asset_bed", name="Dusk Warehouse Bed", kind="setting", path="assets/bed.png"),
+        Asset(id="asset_lead", name="HarderFaster sheet", kind="character", path="assets/lead.png"),
+    ]
+    shot = project.shots[0]
+    shot.citations = [
+        AssetCitation(asset_id=asset.id, role="reference", order=index)
+        for index, asset in enumerate(project.assets[:cites])
+    ]
+    shot.h3_prompt = expansion
+    shot.h3_prompt_map = stored_map
+    return project
+
+
+BED_ONLY = reference_map_sentence(["<Picture 1> is Dusk Warehouse Bed"])
+BED_AND_LEAD = reference_map_sentence(
+    ["<Picture 1> is Dusk Warehouse Bed", "<Picture 2> is HarderFaster sheet"]
+)
+
+
+def test_a_prose_expansion_whose_citations_moved_blocks_by_name():
+    """The Director's own project's shape: the prose form carries its map in its own first line.
+
+    The live defect of 2026-08-20 was exactly this — a character sheet attached to a shot whose
+    stored prose still named only the bed — and `app.reference_prompt` submits a stored expansion
+    **alone**, so the render would have been conditioned on a map describing pictures the payload
+    does not wire.
+    """
+    project = mapped(cites=2, expansion=f"{BED_ONLY} She turns toward camera.")
+
+    report = readiness_report(project)
+
+    assert report.ready is False
+    assert report.blocked_ids() == ["shot_0"]
+    assert report.blocked_ids(kind=NOTE_KIND_STALE_MAP) == ["shot_0"]
+    # And not under the *other* block's kind, which is what keeps `generate_h3`'s prompt refusal
+    # from being raised over a shot that has a prompt.
+    assert report.blocked_ids(kind=NOTE_KIND_PROMPT) == []
+    note = report.blocking[0]
+    assert note.kind == NOTE_KIND_STALE_MAP
+    assert note.reason == SHOT_WITH_STALE_REFERENCE_MAP
+    assert note.labels == [shot_label(project, project.shots[0])]
+    # It has a prompt, and the summary line that counts prompts must go on saying so. What this
+    # shot loses is `ready` and a line in `blocking`, not its place in the count.
+    assert report.ready_count == 1
+    assert report.shot_count == 1
+
+
+def test_a_prose_expansion_that_still_names_the_references_it_cites_is_silent():
+    """The fresh case, and the Director's live project: 33 prose shots, nothing to report."""
+    project = mapped(cites=1, expansion=f"{BED_ONLY} She turns toward camera.")
+
+    report = readiness_report(project)
+
+    assert report.ready is True
+    assert report.blocking == []
+    assert report.window_warnings == []
+
+
+def test_a_document_expansion_blocks_when_the_map_recorded_beside_it_no_longer_matches():
+    """The second shape. A document expansion never writes the map into its own text -- the
+    specialist weaves `<Picture 2>` into prose -- so `Shot.h3_prompt_map` is the only thing that
+    can tell a stale one from a fresh one, and it is what this arm compares.
+    """
+    project = mapped(
+        cites=2,
+        expansion="integrated_multimodal_description: [Shot 1] A grey wolf paces.",
+        stored_map=BED_ONLY,
+    )
+
+    report = readiness_report(project)
+
+    assert report.ready is False
+    assert report.blocking[0].kind == NOTE_KIND_STALE_MAP
+    assert report.blocking[0].reason == SHOT_WITH_STALE_REFERENCE_MAP
+
+    # The same expansion with the map it was actually written against reports nothing.
+    fresh = mapped(
+        cites=2,
+        expansion="integrated_multimodal_description: [Shot 1] A grey wolf paces.",
+        stored_map=BED_AND_LEAD,
+    )
+    assert readiness_report(fresh).ready is True
+    assert readiness_report(fresh).blocking == []
+
+
+def test_a_shot_with_no_expansion_is_never_reported_stale():
+    """It has not been expanded; there is nothing for a map to be stale against.
+
+    Asserted with a *stale stored map still on the shot*, which is the state that would fool a
+    check keyed on `h3_prompt_map` alone: a document expansion cleared out of the inspector leaves
+    the record behind, and reporting that shot would tell a Director to fix an expansion that is
+    not there. A blank `h3_prompt` is the submit fallback, and the map it builds is correct by
+    construction.
+    """
+    project = mapped(cites=2, expansion="", stored_map=BED_ONLY)
+
+    report = readiness_report(project)
+
+    assert report.ready is True
+    assert report.blocking == []
+    assert not stale_reference_map(project, project.shots[0])
+
+
+def test_reporting_a_stale_map_writes_nothing_back_onto_the_project():
+    """AD-5 again, for the note that is easiest to be tempted to cache.
+
+    Staleness is a comparison against a sentence rebuilt from the citations, so a stored answer
+    would be wrong the moment an asset was attached -- which is the only way a shot ever becomes
+    stale in the first place.
+    """
+    project = mapped(cites=2, expansion=f"{BED_ONLY} She turns toward camera.")
+    before = project.model_dump(mode="json")
+
+    assert readiness_report(project).ready is False
+
+    assert project.model_dump(mode="json") == before
+    assert not any(field.startswith("stale") for field in Shot.model_fields)
+
+
+def test_readiness_and_the_submit_route_share_one_staleness_implementation():
+    """Not two functions that agree today: the same object, reached from both modules.
+
+    The reference *numbering* existed twice in this codebase and the two disagreed the moment a
+    video was cited (2026-08-20). This is the same rule applied to the same kind of comparison, and
+    an identity check is the only assertion that cannot be satisfied by a second copy that happens
+    to be right about the cases someone thought of.
+    """
+    from music_video_producer import app, batch, reference_map
+
+    assert batch.stale_reference_map is reference_map.stale_reference_map
+    assert app.stale_reference_map is reference_map.stale_reference_map
+    # And no module holds a second definition of it.
+    definitions = [
+        path
+        for path in Path("src/music_video_producer").glob("*.py")
+        if "def stale_reference_map" in path.read_text(encoding="utf-8")
+    ]
+    assert [path.name for path in definitions] == ["reference_map.py"]
+
+
+def test_the_pre_flight_note_and_the_submit_refusal_are_one_explanation():
+    """One problem, one Director, one set of words -- `api.js`'s `READINESS_REMEDY` rule.
+
+    The remedy in particular is why: it names clearing the H3 box *first* because that is the fix
+    that always works, and the re-expand route it names second needs a `mark-draft` step that a
+    second wording would be free to forget. Asserted as substring identity against the shared
+    clauses, so neither sentence can be reworded on its own.
+    """
+    from music_video_producer.app import STALE_REFERENCE_MAP_REFUSAL
+
+    for clause in (
+        STALE_REFERENCE_MAP_CAUSE,
+        STALE_REFERENCE_MAP_CONSEQUENCE,
+        STALE_REFERENCE_MAP_REMEDY,
+    ):
+        assert clause in STALE_REFERENCE_MAP_REFUSAL
+        assert clause in SHOT_WITH_STALE_REFERENCE_MAP
+    assert "send the shot back to draft and expand it again" in STALE_REFERENCE_MAP_REMEDY
 
 
 # --- The shot-length band, reported before the Director discovers it (2026-08-20) ---------

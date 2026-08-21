@@ -3446,59 +3446,6 @@ def test_the_generate_all_handler_confirms_then_posts_one_server_batch():
     assert "batchReportToast(report)" in body
 
 
-def test_only_a_blocked_shot_inside_the_batch_refuses_it():
-    """Negating this filter kept every asserted substring, including `queued.has(id)`.
-
-    Inverted, it lets through exactly the batch that contains a blocked Shot -- producing the
-    half-submitted batch the whole check exists to prevent -- while refusing the button over a
-    blank draft elsewhere in the plan, which is every plan most of the time. Both directions are
-    executed here rather than grepped for, and the refusal is compared to the server's own.
-    """
-    from music_video_producer.batch import readiness_refusal
-
-    script = """
-      import { batchReadinessBlock } from './src/music_video_producer/web/assets/api.js';
-      const report = (...ids) => ({ blocking: ids.map((id) => ({ shot_ids: [id], reason: 'x' })) });
-      console.log(JSON.stringify({
-        insideBatch: batchReadinessBlock(report('shot_b'), ['shot_a', 'shot_b']),
-        outsideBatch: batchReadinessBlock(report('shot_c'), ['shot_a', 'shot_b']),
-        both: batchReadinessBlock(report('shot_b', 'shot_c'), ['shot_a', 'shot_b']),
-        nothingBlocked: batchReadinessBlock({ blocking: [] }, ['shot_a']),
-        // The empty-plan note names no Shot, so it can block no batch.
-        emptyPlan: batchReadinessBlock({ blocking: [{ shot_ids: [], reason: 'no shots' }] }, ['shot_a']),
-        emptyBatch: batchReadinessBlock(report('shot_a'), []),
-        noReport: batchReadinessBlock(undefined, ['shot_a']),
-        noArguments: batchReadinessBlock(),
-        // A real report carries the names the server would have used; the refusal must use them.
-        labelled: batchReadinessBlock({ blocking: [
-          { shot_ids: ['shot_b'], labels: ['SHOT 04 (shot_b)'], reason: 'x' },
-          { shot_ids: ['shot_c'], labels: ['SHOT 09 (shot_c)'], reason: 'x' },
-        ] }, ['shot_b']),
-      }));
-    """
-
-    decisions = run_module(script)
-    assert decisions["insideBatch"]["refused"] is True
-    assert decisions["insideBatch"]["blocked"] == ["shot_b"]
-    # One refusal wording for one rule, the server's.
-    assert decisions["insideBatch"]["message"] == readiness_refusal(["shot_b"])
-    # A blank draft elsewhere in the plan is not this batch's problem.
-    assert decisions["outsideBatch"]["refused"] is False
-    assert decisions["outsideBatch"]["blocked"] == []
-    assert decisions["outsideBatch"]["message"] == ""
-    # And a report carrying both names only the one being submitted.
-    assert decisions["both"]["refused"] is True
-    assert decisions["both"]["blocked"] == ["shot_b"]
-    for allowed in ("nothingBlocked", "emptyPlan", "emptyBatch", "noReport", "noArguments"):
-        assert decisions[allowed]["refused"] is False, allowed
-    # Named as the server names them: `SHOT 04 (id)`, and only for the Shot in this batch.
-    assert decisions["labelled"]["labels"] == ["SHOT 04 (shot_b)"]
-    assert decisions["labelled"]["message"] == readiness_refusal(["SHOT 04 (shot_b)"])
-    assert "shot_c" not in decisions["labelled"]["message"]
-    # A note with no labels still names something rather than "undefined".
-    assert decisions["insideBatch"]["labels"] == ["shot_b"]
-
-
 def test_a_project_switch_during_the_batch_post_abandons_the_reload():
     """The selector stays live while the POST is in flight.
 
@@ -5037,15 +4984,11 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
     The ids, the notes and the counts all come from the route rather than from a literal written
     to match it, so a rename on either side lands here instead of in a browser nobody tests.
     """
-    from music_video_producer.batch import (
-        SHOT_WITHOUT_PROMPT,
-        SHOTS_SHARE_ONE_PROMPT,
-        readiness_refusal,
-    )
+    from music_video_producer.batch import SHOT_WITHOUT_PROMPT, SHOTS_SHARE_ONE_PROMPT
 
     report = server_readiness_report(tmp_path)
     script = f"""
-      import {{ batchReadinessBlock, blockedShotIds, blockedShotLabels, generateAllPlan,
+      import {{ blockedShotIds, blockedShotLabels, generateAllPlan,
         readinessLines, readinessSummary }}
         from './src/music_video_producer/web/assets/api.js';
       const report = {json.dumps(report)};
@@ -5055,8 +4998,6 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
         labels: blockedShotLabels(report),
         lines: readinessLines(report),
         summary: readinessSummary(report),
-        insideBatch: batchReadinessBlock(report, ['shot_blank', 'shot_written']),
-        outsideBatch: batchReadinessBlock(report, ['shot_written', 'shot_echo']),
         button: generateAllPlan({{ shots }}, report),
       }}));
     """
@@ -5070,9 +5011,6 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
     # The blocking half: the one Shot with no prompt, named as the server names it.
     assert parsed["blocked"] == ["shot_blank"]
     assert parsed["labels"] == blocked_labels
-    assert parsed["insideBatch"]["refused"] is True
-    assert parsed["insideBatch"]["message"] == readiness_refusal(blocked_labels)
-    assert parsed["outsideBatch"]["refused"] is False
     # The button stays enabled — the server-side batch (FR-4) skips the blocked shot by
     # name and submits the rest — but the heads-up is in the title before the click.
     assert parsed["button"]["disabled"] is False
@@ -5105,6 +5043,183 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
     assert "2 of 3 shots have a prompt" in parsed["summary"]
     assert "1 cannot be submitted" in parsed["summary"]
     assert "1 near-duplicate pair" in parsed["summary"]
+
+
+def server_stale_readiness_report(tmp_path: Path) -> tuple[dict, dict]:
+    """A real report over a plan with one stale reference map, and the project it is about.
+
+    Both come off the routes rather than out of a literal, for `server_readiness_report`'s reason:
+    the note's `kind` is the only thing the browser draws from, and a report built by hand would
+    keep this test green through a rename on the wire.
+
+    The stale shot is the **prose** shape -- its expansion carries the reference map in its own
+    first line and now cites a picture that line does not name -- which is the shape the Director's
+    own project is made of. Written straight onto the manifest because `refresh_reference_maps`
+    exists precisely to stop this state arriving through a route for a prose shot; the document
+    shape, which does arrive through a route, is driven end to end in `tests/test_api.py`.
+    """
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.app import create_app
+    from music_video_producer.config import Settings
+    from music_video_producer.reference_map import reference_map_sentence
+    from music_video_producer.store import ProjectStore
+
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Stale maps"))
+    project.assets = [
+        Asset(id="asset_bed", name="Dusk Warehouse Bed", kind="setting", path="assets/bed.png"),
+        Asset(id="asset_lead", name="HarderFaster sheet", kind="character", path="assets/lead.png"),
+    ]
+    bed_only = reference_map_sentence(["<Picture 1> is Dusk Warehouse Bed"])
+    project.shots = [
+        Shot(
+            id="shot_fresh", start=0, duration=5, prompt="She turns toward camera.",
+            status="ready", h3_prompt=f"{bed_only} She turns toward camera.",
+            citations=[AssetCitation(asset_id="asset_bed", role="reference", order=0)],
+        ),
+        Shot(
+            id="shot_stale", start=5, duration=5, prompt="He looks up at the sign.",
+            status="ready", h3_prompt=f"{bed_only} He looks up at the sign.",
+            citations=[
+                AssetCitation(asset_id="asset_bed", role="reference", order=0),
+                AssetCitation(asset_id="asset_lead", role="reference", order=1),
+            ],
+        ),
+    ]
+    store.save(project)
+    client = TestClient(
+        create_app(
+            settings=Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy"), store=store
+        )
+    )
+    report = client.get(f"/api/projects/{project.id}/readiness")
+    loaded = client.get(f"/api/projects/{project.id}")
+
+    assert report.status_code == 200, report.text
+    assert loaded.status_code == 200, loaded.text
+    return report.json(), loaded.json()
+
+
+def test_the_readiness_list_draws_a_stale_reference_map_under_its_own_name(tmp_path: Path):
+    """The new note kind, rendered by the workspace and read out of the markup it produced.
+
+    Not grepped: the region is drawn by a project load, in the stub DOM, from a report the server
+    really built -- so a `kind` that failed to reach the wire, a label table that failed to match
+    it, or a line that lost its list-marker class all land here.
+
+    Two things are asserted about the line, and they are different claims. It reads under its own
+    heading, because "Blocked" over both blocks would make an empty prompt and a stale map look
+    like one problem with one fix -- they send the Director to two different boxes. And it keeps
+    the `blocking` class, because it *is* a refusal and the list marker must not say otherwise.
+    """
+    from music_video_producer.batch import SHOT_WITH_STALE_REFERENCE_MAP
+
+    report, project = server_stale_readiness_report(tmp_path)
+    kinds = {note["kind"] for note in report["blocking"]}
+    assert kinds == {"stale_map"}, report["blocking"]
+
+    parsed = run_workspace(
+        """
+        at('#project-select').value = __ID__;
+        await fire('#project-select:change', { target: { value: __ID__ } });
+        await flush();
+        console.log(JSON.stringify({
+          markup: at('#plan-readiness').innerHTML,
+          blocked: at('#plan-readiness').classList.contains('blocked'),
+        }));
+        """.replace("__ID__", json.dumps(project["id"])),
+        {
+            f"/api/projects/{project['id']}": {"body": project},
+            f"/api/projects/{project['id']}/readiness": {"body": report},
+        },
+    )
+
+    markup = parsed["markup"]
+    # One line, under the stale map's own heading, carrying the server's whole sentence.
+    assert markup.count("<li") == 1, markup
+    assert '<li class="blocking">' in markup, markup
+    assert "Stale reference map - SHOT 02 (shot_stale):" in markup, markup
+    assert escape_for_markup(SHOT_WITH_STALE_REFERENCE_MAP) in markup, markup
+    # The fresh shot is not mentioned at all, and the summary counts what it counts.
+    assert "shot_fresh" not in markup
+    assert "2 of 2 shots have a prompt" in markup
+    assert "1 cannot be submitted" in markup
+    assert parsed["blocked"] is True
+
+
+def escape_for_markup(text: str) -> str:
+    """`api.escapeHtml`'s output for a sentence, so an assertion can look for it in innerHTML."""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace('"', "&quot;").replace("'", "&#39;")
+    )
+
+
+def test_the_batch_confirmation_names_the_reason_each_skipped_shot_will_be_skipped(
+    tmp_path: Path,
+):
+    """"3 will be skipped (no prompt)" was hardcoded, and a stale map is a second block.
+
+    A stale shot has a prompt -- a good one, usually -- so the old sentence would have sent the
+    Director to the inspector's intent box for a problem that lives in the expanded-prompt box. The
+    noun is read off the blocking note's `kind` now, and both blocks in one batch name both.
+    """
+    report, _project = server_stale_readiness_report(tmp_path)
+    mixed = {
+        **report,
+        "blocking": [
+            *report["blocking"],
+            {
+                "shot_ids": ["shot_fresh"], "labels": ["SHOT 01 (shot_fresh)"],
+                "reason": "This shot has no prompt.", "kind": "prompt",
+            },
+        ],
+    }
+    unknown = {
+        **report,
+        "blocking": [{**report["blocking"][0], "kind": "something_this_client_never_heard_of"}],
+    }
+    shots = [{"id": "shot_fresh", "status": "ready"}, {"id": "shot_stale", "status": "ready"}]
+
+    parsed = run_module(f"""
+      import {{ BATCH_SKIP_NOUNS, BATCH_SKIP_NOUN_UNKNOWN, generateAllPlan }}
+        from './src/music_video_producer/web/assets/api.js';
+      const shots = {json.dumps(shots)};
+      console.log(JSON.stringify({{
+        nouns: BATCH_SKIP_NOUNS,
+        fallback: BATCH_SKIP_NOUN_UNKNOWN,
+        stale: generateAllPlan({{ shots }}, {json.dumps(report)}),
+        mixed: generateAllPlan({{ shots }}, {json.dumps(mixed)}),
+        unknown: generateAllPlan({{ shots }}, {json.dumps(unknown)}),
+        clean: generateAllPlan({{ shots }}, {json.dumps({**report, "blocking": []})}),
+      }}));
+    """)
+
+    # The kinds are the server's values, not a second vocabulary.
+    from music_video_producer.batch import NOTE_KIND_PROMPT, NOTE_KIND_STALE_MAP
+
+    assert set(parsed["nouns"]) == {NOTE_KIND_PROMPT, NOTE_KIND_STALE_MAP}
+    assert parsed["stale"]["blocked"] == ["shot_stale"]
+    assert "1 will be skipped (stale reference map)" in parsed["stale"]["title"]
+    assert "no prompt" not in parsed["stale"]["title"]
+    # Both blocks in one batch: both nouns, once each, and the count is still the count.
+    assert "2 will be skipped (no prompt, stale reference map)" in parsed["mixed"]["title"]
+    assert "2 will be skipped (no prompt, stale reference map)" in parsed["mixed"]["confirm"]
+    # A kind this client has never heard of still gets counted and still says something true.
+    # The fallback is asserted non-empty first, or the containment below would pass just as
+    # happily over "1 will be skipped ()" -- a parenthesis that names nothing reads as a bug.
+    assert parsed["fallback"].strip(), "an unknown block must still be named something"
+    assert "1 will be skipped (blocked)" in parsed["unknown"]["title"]
+    assert f"1 will be skipped ({parsed['fallback']})" in parsed["unknown"]["title"]
+    # And a plan with nothing blocked says nothing about skipping, exactly as before.
+    assert "skipped" not in parsed["clean"]["title"]
+    assert parsed["clean"]["blocked"] == []
+    # The button is never disabled by a block: the server-side batch skips by name and submits
+    # the rest, and a client-side refusal the route would not make is a refusal nobody can clear.
+    assert [parsed[key]["disabled"] for key in ("stale", "mixed", "unknown", "clean")] == [
+        False, False, False, False
+    ]
 
 
 def test_an_unchecked_sameness_pass_is_never_reported_as_no_duplicates():
@@ -8428,9 +8543,19 @@ def test_the_client_and_server_agree_on_what_a_new_shot_inherits():
     assert listed["status"] == Shot.model_fields["status"].get_default()
 
     # No copy path clones a Shot any more: `structuredClone(shot)` is what carried the take.
+    #
+    # Read to the handler's own closing `  });` rather than to the end of its first line. The
+    # split handler stopped being a one-liner on 2026-08-21, when it gained the refusal it used to
+    # decline windows under a second in silence — and a source assertion that depends on where the
+    # newlines fall is an assertion about formatting, not about what the copy carries.
     workspace = APP_JS.read_text(encoding="utf-8")
     for handler in ("#duplicate-shot", "#split-shot"):
-        body = workspace.split(f'$("{handler}").addEventListener', 1)[1].split("\n", 1)[0]
+        chunk = workspace.split(f'$("{handler}").addEventListener', 1)[1]
+        first, _, rest = chunk.partition("\n")
+        # A one-liner closes on its own line; a block closes at the next `  });` in column two.
+        body = first
+        if not first.rstrip().endswith("});"):
+            body = "\n".join([first, rest.split("\n  });", 1)[0]])
         assert "newShotFromPlan(shot" in body, handler
         assert "structuredClone(shot)" not in body, handler
 
@@ -12071,3 +12196,571 @@ def test_the_assets_panel_shows_exactly_one_pane_per_subtab():
     # count on the tab and the rows behind it are always the same list.
     assert "shot_a-h3_00001-audio.mp4" in panes["all"]["clips"]
     assert "Generated clips" in panes["clips"]["clips"]
+
+
+# ==========================================================================================
+# The four recorded interaction defects cleared on 2026-08-21, plus the Director's ruling on
+# the seed randomizer's scope. Every one of these is an *interaction* claim, so the browser
+# harnesses carry the load; what is executed here is the deciding logic and the markup each
+# render actually produces, which is the half a source read cannot settle.
+# ==========================================================================================
+
+
+def test_the_clips_tab_decides_playability_from_health_and_never_guesses():
+    """Three answers, not two: online, offline, and "this browser has not been told".
+
+    Saying "ComfyUI is offline" on a browser that has no health answer at all would be
+    inventing a fact about someone else's process, which is the one thing the honest-status
+    convention in this repository forbids.
+    """
+    states = run_module("""
+      import { CLIP_OFFLINE_TITLE, CLIP_UNKNOWN_TITLE, COMFY_DEFAULT_URL, clipPreviewState }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        online: clipPreviewState({ comfy: { online: true, url: 'http://127.0.0.1:8188' } }),
+        offline: clipPreviewState({ comfy: { online: false, url: 'http://127.0.0.1:9/' } }),
+        nothing: clipPreviewState(null),
+        empty: clipPreviewState({}),
+        offlineTitle: CLIP_OFFLINE_TITLE,
+        unknownTitle: CLIP_UNKNOWN_TITLE,
+        fallbackUrl: COMFY_DEFAULT_URL,
+      }));
+    """)
+
+    assert states["online"]["playable"] is True
+    assert states["online"]["status"] == "online"
+    # Nothing is said on a card that can play; the note is the offline tab's own line.
+    assert states["online"]["note"] == ""
+
+    assert states["offline"]["playable"] is False
+    assert states["offline"]["status"] == "offline"
+    assert states["offline"]["title"] == states["offlineTitle"]
+    # The refusal names the address that was tried, because "offline" without one is a claim a
+    # Director cannot check against the ComfyUI they started.
+    assert "http://127.0.0.1:9/" in states["offline"]["note"]
+    # ...and it is precise about what is lost: the current take still plays from disk.
+    for note in (states["offline"]["note"], states["nothing"]["note"]):
+        assert "currently points at is served by this application" in note, note
+        assert "earlier take" in note.lower(), note
+
+    # No health answer is not the same fact as a health answer saying no.
+    for unknown in ("nothing", "empty"):
+        assert states[unknown]["playable"] is False, unknown
+        assert states[unknown]["status"] == "unknown", unknown
+        assert states[unknown]["title"] == states["unknownTitle"], unknown
+        assert "offline" not in states[unknown]["note"], unknown
+    assert states["nothing"]["url"] == states["fallbackUrl"]
+
+
+def test_a_clip_card_is_served_by_this_application_whenever_it_can_be():
+    """The current take needs no ComfyUI; an earlier one does. Decided per card.
+
+    `GET /api/projects/{id}/shots/{shot}/take` resolves the shot's own `latest_output` under
+    `settings.comfy_root / "output"` **on disk** and streams it — it is what the Monitor plays,
+    and no ComfyUI process is involved. It takes ids and deliberately no path, so it can serve
+    exactly one take per shot. Everything earlier is addressable only by path, and the only thing
+    that serves a path is ComfyUI's `/view`.
+    """
+    faces = run_module("""
+      import { clipCardFace, clipPreviewState }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { id: 'p1', shots: [
+        { id: 'shot_a', start: 0, duration: 5,
+          latest_output: 'music-video-producer/p1/shots/shot_a-h3_00002-audio.mp4' },
+      ] };
+      const current = { file: 'music-video-producer/p1/shots/shot_a-h3_00002-audio.mp4', shotId: 'shot_a' };
+      const earlier = { file: 'music-video-producer/p1/shots/shot_a-h3_00001-audio.mp4', shotId: 'shot_a' };
+      const orphan = { file: 'music-video-producer/p1/shots/shot_gone-h3_00001-audio.mp4', shotId: 'shot_gone' };
+      const online = clipPreviewState({ comfy: { online: true, url: 'http://127.0.0.1:8188' } });
+      const offline = clipPreviewState({ comfy: { online: false, url: 'http://127.0.0.1:9/' } });
+      console.log(JSON.stringify({
+        currentOnline: clipCardFace(project, current, online),
+        currentOffline: clipCardFace(project, current, offline),
+        earlierOnline: clipCardFace(project, earlier, online),
+        earlierOffline: clipCardFace(project, earlier, offline),
+        orphanOffline: clipCardFace(project, orphan, offline),
+      }));
+    """)
+
+    # The current take plays whatever ComfyUI is doing, and through this application's own route.
+    for when in ("currentOnline", "currentOffline"):
+        assert faces[when]["playable"] is True, when
+        assert faces[when]["via"] == "app", when
+        assert faces[when]["url"].startswith("/api/projects/p1/shots/shot_a/take?v="), faces[when]
+        assert "127.0.0.1:8188" not in faces[when]["url"], (
+            (
+                "the current take is being fetched from ComfyUI when this application can serve "
+                "it from disk"
+            ),
+            faces[when],
+        )
+
+    # An earlier take goes through ComfyUI when it is there...
+    assert faces["earlierOnline"]["playable"] is True
+    assert faces["earlierOnline"]["via"] == "comfy"
+    assert "/view?filename=" in faces["earlierOnline"]["url"]
+
+    # ...and says so, rather than 404ing, when it is not.
+    for when in ("earlierOffline", "orphanOffline"):
+        assert faces[when]["playable"] is False, when
+        assert faces[when]["via"] == "", when
+        assert faces[when]["url"] == "", when
+        assert "ComfyUI offline" in faces[when]["title"], when
+
+
+def test_the_clips_tab_draws_an_honest_card_instead_of_a_broken_video_when_comfyui_is_down():
+    """The Director's report (2026-08-21): the Clips library "goes blank" with ComfyUI down.
+
+    Executed rather than read, because the claim is about what the tab *paints*: every card
+    pointed a `<video>` at ComfyUI's `/view`, so all thirty-three 404'd at once. What has to be
+    true now is that the current take still plays from this application's own route, that no
+    video element is created for one that cannot be shown, that the take's own filename survives
+    into the card either way, and that the one action there is -- ask again -- is on screen.
+    """
+    drawn = run_workspace("""
+      state.project = {
+        id: 'p1', song: null, messages: [], assets: [],
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'The corridor.',
+                  latest_output: 'music-video-producer/p1/shots/shot_a-h3_00002-audio.mp4' }],
+        jobs: [
+          { id: 'j1', kind: 'h3', status: 'complete', target_id: 'shot_a', seed: 3,
+            output_files: ['music-video-producer/p1/shots/shot_a-h3_00001-audio.mp4'] },
+          { id: 'j2', kind: 'h3', status: 'complete', target_id: 'shot_a', seed: 4,
+            output_files: ['music-video-producer/p1/shots/shot_a-h3_00002-audio.mp4'] },
+        ],
+      };
+      state.assetTab = 'clips';
+      const show = (health) => {
+        state.health = health;
+        app.renderAssets();
+        return at('#clips-library').innerHTML;
+      };
+      console.log(JSON.stringify({
+        offline: show({ comfy: { online: false, url: 'http://127.0.0.1:9/' } }),
+        unknown: show(null),
+        online: show({ comfy: { online: true, url: 'http://127.0.0.1:8188' } }),
+      }));
+    """)
+
+    current = "shot_a-h3_00002-audio.mp4"
+    earlier = "shot_a-h3_00001-audio.mp4"
+    for state_name in ("offline", "unknown"):
+        markup = drawn[state_name]
+        assert "/view?filename=" not in markup, (
+            f"the Clips tab still points a video element at an unreachable ComfyUI while it is "
+            f"{state_name}, which is the Director's wall of broken cards unfixed"
+        )
+        # The current take still plays, through this application's own route.
+        assert 'data-via="app"' in markup, state_name
+        assert "/shots/shot_a/take?v=" in markup, state_name
+        # The earlier one says why it cannot be shown, rather than 404ing.
+        assert "clip-unplayable" in markup, state_name
+        # Both takes' identities survive: the filename is what names the file on disk.
+        assert current in markup and earlier in markup, state_name
+        # ...and so does the way back to the shot that produced them.
+        assert markup.count("clip-jump") == 2, state_name
+        assert "clips-offline" in markup, state_name
+        assert 'id="clips-recheck"' in markup, ("the tab offers no way to ask again", state_name)
+        assert "Re-check ComfyUI" in markup, state_name
+
+    # With ComfyUI answering, every take plays and there is no apology standing over a working
+    # list -- and the current take *still* comes from this application rather than from ComfyUI.
+    assert "/view?filename=" in drawn["online"]
+    assert 'data-via="app"' in drawn["online"]
+    assert 'data-via="comfy"' in drawn["online"]
+    assert "clip-unplayable" not in drawn["online"]
+    assert "clips-offline" not in drawn["online"]
+    # The re-check is drawn in *both* states. A control that appears only once the browser
+    # already knows ComfyUI is down could never be pressed by a Director whose ComfyUI stopped
+    # after the page loaded: health is fetched at boot and nowhere else, so that session would go
+    # on drawing broken cards with no way to ask.
+    assert 'id="clips-recheck"' in drawn["online"]
+
+
+def test_the_clips_recheck_asks_health_again_rather_than_polling_comfyui():
+    """The only thing that knocks on ComfyUI is a press. Nothing here polls.
+
+    A tab that re-probed on every render would be this application deciding how often to contact
+    a process it is forbidden from managing, so the request is asserted to happen *on the click*
+    and not before it.
+    """
+    asked = run_workspace(
+        """
+      state.project = {
+        id: 'p1', song: null, messages: [], assets: [],
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'The corridor.' }],
+        jobs: [
+          { id: 'j1', kind: 'h3', status: 'complete', target_id: 'shot_a', seed: 3,
+            output_files: ['out/shot_a-h3_00001-audio.mp4'] },
+        ],
+      };
+      state.health = { comfy: { online: false, url: 'http://127.0.0.1:9/' }, llm: {} };
+      state.assetTab = 'clips';
+      app.renderAssets();
+      requests.length = 0;
+      app.renderAssets();
+      const beforeClick = requests.filter((entry) => entry.path === '/api/health').length;
+      await fire('#clips-recheck:click', {});
+      await flush();
+      console.log(JSON.stringify({
+        beforeClick,
+        health: requests.filter((entry) => entry.path === '/api/health').length,
+        stillOffline: at('#clips-library').innerHTML.includes('clip-unplayable'),
+      }));
+    """,
+        responses={
+            "/api/health": {
+                "body": {
+                    "comfy": {"online": False, "url": "http://127.0.0.1:9/"},
+                    "llm": {"configured": False, "model": ""},
+                }
+            }
+        },
+    )
+
+    assert asked["beforeClick"] == 0, (
+        "the Clips tab probes ComfyUI every time it redraws; that is a poll this application does "
+        "not get to decide the rate of"
+    )
+    assert asked["health"] == 1, asked
+    # A re-check that finds nothing leaves the same honest card behind rather than blanking it.
+    assert asked["stillOffline"] is True, asked
+
+
+def test_attach_to_selected_shot_names_the_shot_it_will_write_to():
+    """The Director's report (2026-08-21): "hard to use since cant see timeline from assets page".
+
+    `replaceInShotsControl` solved the same problem by putting the count in its own label; this
+    puts the identity in the label and the window and the intent in the line under it.
+    """
+    control = run_module("""
+      import { ATTACH_LABEL_UNSELECTED, attachToShotControl, shotWindowLabel }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { id: 'p1', shots: [
+        { id: 'shot_a', start: 0, duration: 5,
+          prompt: 'Lucy walks the service corridor, hand on the rail' },
+        { id: 'shot_b', start: 5, duration: 4.5, prompt: '',
+          citations: [{ asset_id: 'asset_lucy', role: 'reference', order: 0 }] },
+      ] };
+      console.log(JSON.stringify({
+        none: attachToShotControl(project, null, 'asset_lucy', 'Lucy'),
+        missing: attachToShotControl(project, 'shot_gone', 'asset_lucy', 'Lucy'),
+        live: attachToShotControl(project, 'shot_a', 'asset_lucy', 'Lucy'),
+        cited: attachToShotControl(project, 'shot_b', 'asset_lucy', 'Lucy'),
+        noIntent: attachToShotControl(project, 'shot_b', 'asset_other', 'Corridor'),
+        unselectedLabel: ATTACH_LABEL_UNSELECTED,
+        window: shotWindowLabel({ start: 5, duration: 4.5 }),
+      }));
+    """)
+
+    # No selection: shut, and the caption is the reason rather than a shrug.
+    for empty in ("none", "missing"):
+        assert control[empty]["disabled"] is True, empty
+        assert control[empty]["label"] == control["unselectedLabel"], empty
+        assert "No shot is selected" in control[empty]["caption"], empty
+        assert "Timeline" in control[empty]["caption"], empty
+
+    # A selection: the label carries the number the timeline paints on the clip, and the caption
+    # carries the id, the window and the opening of the intent -- the three things the Assets
+    # panel cannot show.
+    assert control["live"]["disabled"] is False
+    assert control["live"]["label"] == "Attach to SHOT 01"
+    assert "SHOT 01 (shot_a)" in control["live"]["caption"]
+    assert "0.00–5.00 s" in control["live"]["caption"]
+    assert "Lucy walks the service corridor" in control["live"]["caption"]
+    assert "Lucy" in control["live"]["title"] and "SHOT 01" in control["live"]["title"]
+
+    # Already cited: shut, because the click was a no-op that toasted success all the same --
+    # the "control that appears to do nothing" shape this whole thread started from.
+    assert control["cited"]["disabled"] is True
+    assert control["cited"]["label"] == "Attach to SHOT 02"
+    assert "already cites Lucy" in control["cited"]["reason"]
+
+    # A shot with no intent written says so rather than trailing off into an empty caption.
+    assert control["noIntent"]["disabled"] is False
+    assert "no creative intent written yet" in control["noIntent"]["caption"]
+    assert control["window"] == "5.00–9.50 s"
+
+
+def test_the_assets_inspector_draws_the_named_attach_target_and_shuts_it_with_its_reason():
+    """Executed, because a control's *drawn* state is what a Director acts on.
+
+    The offline harness cannot see a button that renders and is then covered -- the browser
+    harness asserts that -- but it can prove that the panel writes the name, the window and the
+    disabled state that `attachToShotControl` decided.
+    """
+    drawn = run_workspace("""
+      state.project = {
+        id: 'p1', song: null, messages: [], jobs: [],
+        shots: [
+          { id: 'shot_a', start: 12, duration: 5, prompt: 'The corridor, pushing in on Lucy.' },
+          { id: 'shot_b', start: 17, duration: 5, prompt: 'Wider.',
+            citations: [{ asset_id: 'asset_lucy', role: 'reference', order: 0 }] },
+        ],
+        assets: [{ id: 'asset_lucy', name: 'Lucy the singer', kind: 'character',
+                   source: 'upload', path: '', prompt: '', prompt_id: '',
+                   created_at: '2026-08-20T09:15:00Z' }],
+      };
+      state.selectedAssetId = 'asset_lucy';
+      const show = (shotId) => {
+        state.selectedShotId = shotId;
+        app.renderAssetInspector();
+        return at('#asset-inspector').innerHTML;
+      };
+      console.log(JSON.stringify({
+        none: show(null),
+        live: show('shot_a'),
+        cited: show('shot_b'),
+      }));
+    """)
+
+    assert 'id="attach-asset"' in drawn["none"]
+    assert "Attach to selected shot" in drawn["none"]
+    assert "disabled" in drawn["none"].split('id="attach-asset"', 1)[1].split("</button>", 1)[0]
+    assert "No shot is selected" in drawn["none"]
+
+    live = drawn["live"]
+    assert "Attach to SHOT 01" in live
+    assert "SHOT 01 (shot_a)" in live
+    assert "12.00–17.00 s" in live
+    assert 'id="attach-asset-target"' in live
+    assert "disabled" not in live.split('id="attach-asset"', 1)[1].split("</button>", 1)[0]
+
+    cited = drawn["cited"]
+    assert "Attach to SHOT 02" in cited
+    assert "disabled" in cited.split('id="attach-asset"', 1)[1].split("</button>", 1)[0]
+    assert "already cites Lucy the singer" in cited
+
+
+def test_split_refuses_a_window_it_cannot_halve_and_names_the_arithmetic():
+    """`#split-shot` declined a window under a second and said nothing at all.
+
+    The wording explains rather than scolds, because a 0.5 s window is a real thing the Director
+    creates deliberately -- micro-cuts are legitimate, and `styles.css` deliberately draws no
+    warning on the short end.
+    """
+    plans = run_module("""
+      import { MIN_WINDOW_SECONDS, SPLIT_MINIMUM_SECONDS, splitShotPlan }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { id: 'p1', shots: [
+        { id: 'shot_a', start: 0, duration: 0.75 },
+        { id: 'shot_b', start: 0.75, duration: 1 },
+        { id: 'shot_c', start: 1.75, duration: 5.042 },
+      ] };
+      console.log(JSON.stringify({
+        min: MIN_WINDOW_SECONDS,
+        least: SPLIT_MINIMUM_SECONDS,
+        nothing: splitShotPlan(project, null),
+        short: splitShotPlan(project, project.shots[0]),
+        exactlyEnough: splitShotPlan(project, project.shots[1]),
+        ordinary: splitShotPlan(project, project.shots[2]),
+      }));
+    """)
+
+    assert plans["min"] == 0.5
+    assert plans["least"] == 1
+
+    assert plans["nothing"]["ok"] is False
+    assert "No shot is selected" in plans["nothing"]["refusal"]
+
+    short = plans["short"]
+    assert short["ok"] is False
+    assert short["halves"] == []
+    # The number the Director is looking at, the number that halving produces, the floor it lands
+    # under, and the number to drag past. All four, because a refusal that names none of them is
+    # a refusal nobody can act on.
+    assert "SHOT 01 (shot_a)" in short["refusal"]
+    assert "0.75s" in short["refusal"]
+    assert "0.375s" in short["refusal"]
+    assert "0.5s" in short["refusal"]
+    assert "past 1s" in short["refusal"]
+
+    # Exactly twice the floor still splits: the refusal is `<`, not `<=`, and each half lands
+    # exactly on the number every drag in the workspace stops at.
+    assert plans["exactlyEnough"]["ok"] is True
+    assert plans["exactlyEnough"]["halves"] == [
+        {"start": 0.75, "duration": 0.5},
+        {"start": 1.25, "duration": 0.5},
+    ]
+
+    # An ordinary window halves exactly, and the second half starts where the first one ends --
+    # the same arithmetic the one-line handler did before it grew a refusal.
+    ordinary = plans["ordinary"]
+    assert ordinary["ok"] is True
+    first, second = ordinary["halves"]
+    assert first["start"] + first["duration"] == second["start"]
+    assert first["duration"] == second["duration"] == 5.042 / 2
+
+
+def test_the_split_button_says_its_refusal_and_writes_nothing():
+    """Driven through the real handler: the toast is raised and the plan is untouched."""
+    driven = run_workspace("""
+      const toasts = [];
+      globalThis.document.createElement = () => {
+        const item = make('<toast>'); toasts.push(item); return item;
+      };
+      state.project = {
+        id: 'p1', song: null, messages: [], assets: [], jobs: [],
+        shots: [{ id: 'shot_a', start: 0, duration: 0.75, prompt: 'A micro-cut, on purpose.' }],
+      };
+      state.selectedShotId = 'shot_a';
+      requests.length = 0;
+      fire('#split-shot:click', {});
+      console.log(JSON.stringify({
+        toasts: toasts.map((item) => ({ text: item.textContent, kind: item.className })),
+        shots: state.project.shots.length,
+        duration: state.project.shots[0].duration,
+        wrote: requests.filter((entry) => entry.method === 'PUT').length,
+      }));
+    """)
+
+    assert driven["shots"] == 1, "the split it refused still added a shot"
+    assert driven["duration"] == 0.75, "the refused split narrowed the window anyway"
+    assert driven["wrote"] == 0, "a refusal wrote the shot list back"
+    assert len(driven["toasts"]) == 1, driven["toasts"]
+    said = driven["toasts"][0]
+    assert "error" in said["kind"], said
+    assert "0.75s" in said["text"] and "0.375s" in said["text"], said["text"]
+
+
+def test_the_seed_randomizer_is_armed_per_shot_and_not_for_the_session():
+    """The Director's ruling (2026-08-21): "it should be per shot".
+
+    It shipped session-wide the day before. Executed here because the defect is invisible in the
+    source -- one module-level boolean reads exactly like one module-level `Set` -- and shows up
+    only when a second shot's inspector is drawn.
+    """
+    armed = run_workspace("""
+      state.project = {
+        id: 'p1', song: null, messages: [], assets: [], jobs: [],
+        shots: [
+          { id: 'shot_a', start: 0, duration: 5, prompt: 'One.', seed: 12, status: 'complete' },
+          { id: 'shot_b', start: 5, duration: 5, prompt: 'Two.', seed: 34, status: 'complete' },
+        ],
+      };
+      const checked = (shotId) => {
+        state.selectedShotId = shotId;
+        app.renderShotInspector();
+        // `String.split(sep, limit)` truncates the *result* in JavaScript rather than limiting
+        // the number of splits as it does in Python, so no limit is passed here.
+        return at('#shot-inspector').innerHTML
+          .split('id="shot-seed-randomize"')[1].split('>')[0].includes('checked');
+      };
+      const before = { a: checked('shot_a'), b: checked('shot_b') };
+      // Tick it on shot A, through the control's own handler.
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      at('#shot-seed-randomize').checked = true;
+      fire('#shot-seed-randomize:change', { target: at('#shot-seed-randomize') });
+      const after = { a: checked('shot_a'), b: checked('shot_b') };
+      const rolledA = state.project.shots[0].seed;
+      const heldB = state.project.shots[1].seed;
+      // Typing a seed by hand on B must not disarm A.
+      state.selectedShotId = 'shot_b';
+      app.renderShotInspector();
+      at('#shot-seed').value = '4242';
+      fire('#shot-seed:change', {});
+      const afterTyping = { a: checked('shot_a'), b: checked('shot_b') };
+      console.log(JSON.stringify({ before, after, afterTyping, rolledA, heldB }));
+    """)
+
+    assert armed["before"] == {"a": False, "b": False}, "the randomizer ships armed"
+    assert armed["after"]["a"] is True, (
+        "ticking the randomizer did not arm the shot it was ticked on"
+    )
+    assert armed["after"]["b"] is False, (
+        "ticking the randomizer on one shot armed another one -- this is the Director's report "
+        'unfixed: "Clicking randomize integer on a shot toggles it for all shots"'
+    )
+    # Ticking rolls for the shot it was ticked on, and only that shot's number moves.
+    assert armed["rolledA"] != 12 and 1 <= armed["rolledA"] <= 99999, armed
+    assert armed["heldB"] == 34, "ticking on one shot rolled a seed for another"
+    # A hand-typed number is a statement about the shot it was typed on.
+    assert armed["afterTyping"] == {"a": True, "b": False}, armed["afterTyping"]
+
+
+def test_the_randomizers_armed_shots_are_forgotten_when_the_project_changes():
+    """The music lock's lifecycle, followed rather than reinvented -- and for its reasons.
+
+    Ids collide across projects, so a set carried into another project would arm the randomizer on
+    a shot nobody has looked at; and the clear is gated on the project actually *changing*, because
+    most callers of `loadProject` are refreshes of the project already on screen and unticking a
+    box there would be the control fighting the Director mid-gesture.
+
+    Asserted the same way `test_the_lock_is_session_state_and_never_a_field_on_the_shot` asserts
+    it, and no more strongly: the guard is one line inside a function the stub DOM cannot drive
+    through a project switch without a whole second project's worth of canned replies.
+    """
+    models = Path("src/music_video_producer/models.py").read_text(encoding="utf-8")
+    for spelling in ("randomize_seed", "seed_randomize", "randomise_seed"):
+        assert spelling not in models, f"the randomizer became a model field ({spelling})"
+    load = app_js_block("async function loadProject(id) {", "\nasync function")
+    assert "randomizeSeedShots.clear();" in load, (
+        "the randomizer's armed shots survive a project change, so they arm shots in a plan the "
+        "Director has not opened"
+    )
+    cleared = load.split("randomizeSeedShots.clear();", 1)[0]
+    # Inside the same "did the project actually change" guard the music lock uses -- not on every
+    # refresh. Read back through the block rather than the line before it, because the two clears
+    # sit together with a comment between them.
+    assert "documentConsentClearedOnLoad(state.project?.id, id)" in cleared
+    assert "unlockedFromMusic.clear();" in cleared, (
+        "the two session sets are no longer cleared together, so one of them is outside the guard"
+    )
+
+
+def test_the_retake_reads_the_toggle_of_the_shot_it_is_requeueing():
+    """`nextRenderSeed` stays the one branch; what changed is which shot's flag it is handed."""
+    source = APP_JS.read_text(encoding="utf-8")
+    calls = [line for line in source.splitlines() if "nextRenderSeed(" in line]
+    assert len(calls) == 1, ("there is more than one place a queued retake's seed moves", calls)
+    assert "randomizeSeedFor(shot.id)" in calls[0], calls[0]
+    # No module-level boolean survives anywhere: a session-wide flag beside a per-shot set is two
+    # answers to one question.
+    assert "let randomizeSeed = false" not in source
+    assert "const randomizeSeedShots = new Set()" in source
+
+
+def test_the_randomize_help_states_the_per_shot_scope_the_director_ruled_on():
+    help_text = run_module("""
+      import { RANDOM_SEED_HELP } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(RANDOM_SEED_HELP));
+    """)
+    assert "per shot" in help_text
+    assert "arms this shot and no other" in help_text
+    # The three things that were true before and still are.
+    assert "Render again" in help_text
+    assert "Mark ready" in help_text
+    assert "Generate All" in help_text
+
+
+def test_the_resize_handle_outranks_every_clip_body_without_reordering_the_clips():
+    """The Director's overlap report (2026-08-21), and the ruling it must not break.
+
+    A clip that overlaps its later neighbour has that neighbour painted over its right edge, so
+    the right handle cannot be grabbed. The fix raises the *handle*; which clip body paints on
+    top is untouched, because that is the 2026-08-20 layering ruling. Whether the handle is
+    genuinely hit-testable at a real overlap is a browser claim and is asserted in
+    `tests/e2e_clip_overlap_and_split.py`; this is the stylesheet half.
+    """
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    handle = re.search(r"^\.resize-handle \{([^}]*)\}", css, re.MULTILINE)
+    assert handle, "styles.css no longer declares the resize handle"
+    assert "z-index: 2" in handle.group(1), (
+        "the resize handle no longer outranks the clip bodies, so an overlapped right edge is "
+        "unreachable again"
+    )
+
+    # The clip bodies stay unranked. A z-index on `.shot-clip` -- or anything that makes one a
+    # stacking context (`transform`, `filter`, `opacity` under 1, `isolation`) -- would either
+    # change which picture is in front or trap the handle inside its own clip, and both break the
+    # ruling this fix was written around.
+    for rule in re.findall(r"^\.shot-clip[^{]*\{([^}]*)\}", css, re.MULTILINE):
+        for forbidden in ("z-index", "isolation", "transform", "filter"):
+            assert forbidden not in rule, (
+                (
+                    f"`.shot-clip` now sets {forbidden}, which changes which clip paints on top "
+                    "or makes the clip a stacking context the handle cannot escape"
+                ),
+                rule,
+            )

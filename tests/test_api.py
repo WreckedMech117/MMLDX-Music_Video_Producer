@@ -14797,7 +14797,7 @@ def test_every_reference_numbering_surface_reads_the_one_shared_walk(
 
     # Every module that binds the name, because each one imported it by name at load time and
     # patching only the definition would leave the importers on the real function.
-    for module in ("models", "app", "timeline"):
+    for module in ("models", "app", "timeline", "reference_map"):
         monkeypatch.setattr(
             f"music_video_producer.{module}.numbered_references", displaced
         )
@@ -18257,6 +18257,106 @@ def test_the_plan_wide_expansion_records_each_shots_map_too(tmp_path: Path):
         shot=shot_label(store.get(project_id), held(store, project_id, shot_id))
     )
     assert comfy.prompts == []
+
+
+def test_the_pre_flight_blocks_exactly_the_shots_the_submit_route_refuses(tmp_path: Path):
+    """The headline: the report and the route are driven against one project and must agree.
+
+    The gap, in the Director's words on 2026-08-21: the batch pre-flight said "33 ready", they
+    confirmed the GPU cost, the batch started, and *then* one shot was skipped by name. The refusal
+    had existed since 2026-08-20 and `readiness_report` said nothing about it -- so the one moment a
+    Director could have acted on it, before spending anything, passed in silence.
+
+    Asserted as set equality between "what the report blocks" and "what the route turns away",
+    rather than as two independent facts about one shot. A pre-flight that blocked *more* than the
+    route refuses would be its own defect -- a gate over a legitimate state gets worked around --
+    so both directions have to be wrong for this to pass wrongly.
+    """
+    from music_video_producer.app import STALE_REFERENCE_MAP_REFUSAL
+    from music_video_producer.batch import (
+        NOTE_KIND_STALE_MAP,
+        SHOT_WITH_STALE_REFERENCE_MAP,
+        readiness_report,
+    )
+    from music_video_producer.reference_map import STALE_REFERENCE_MAP_REMEDY
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    fresh_id = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    stale_id = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, fresh_id)
+    expand_one(client, project_id, stale_id)
+
+    # The gesture that makes one of them stale, at the route it actually arrives on: the browser
+    # attaches an asset by writing the whole shot list back.
+    shots = shots_body(store, project_id)
+    attach(next(shot for shot in shots if shot["id"] == stale_id), bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+    arm(store, project_id)
+
+    report = readiness_report(store.get(project_id))
+    # The pre-flight is pure: no model, and nothing on the wire to ComfyUI.
+    assert comfy.prompts == []
+    assert len(director.calls) == 2, "the report asked no model of its own"
+    assert report.ready is False
+    assert report.blocked_ids() == [stale_id]
+    assert report.blocked_ids(kind=NOTE_KIND_STALE_MAP) == [stale_id]
+    assert report.blocking[0].reason == SHOT_WITH_STALE_REFERENCE_MAP
+    # Both shots have a prompt, and the count that says so still says so.
+    assert (report.ready_count, report.shot_count) == (2, 2)
+
+    verdicts = {
+        shot_id: submit_h3(client, project_id, shot_id) for shot_id in (stale_id, fresh_id)
+    }
+    assert {shot_id: reply.status_code for shot_id, reply in verdicts.items()} == {
+        stale_id: 422, fresh_id: 202
+    }
+    # The set the report blocks *is* the set the route refuses. Neither layer is stricter.
+    assert {shot_id for shot_id, reply in verdicts.items() if reply.status_code == 422} == set(
+        report.blocked_ids()
+    )
+    # And the two layers say one thing about it: the route's own sentence, and the report's, share
+    # every clause that is about the problem rather than about which layer is speaking.
+    assert verdicts[stale_id].json()["detail"] == STALE_REFERENCE_MAP_REFUSAL.format(
+        shot=shot_label(store.get(project_id), held(store, project_id, stale_id))
+    )
+    assert STALE_REFERENCE_MAP_REMEDY in verdicts[stale_id].json()["detail"]
+    assert STALE_REFERENCE_MAP_REMEDY in SHOT_WITH_STALE_REFERENCE_MAP
+    # One render went out, for the one shot both layers called submittable.
+    assert len(comfy.prompts) == 1
+
+
+def test_a_readiness_report_over_a_stale_plan_leaves_the_manifest_untouched(tmp_path: Path):
+    """AD-5 at the store, not only on the in-memory object: readiness is derived, never stored.
+
+    Re-read through a **fresh** `ProjectStore` over the same data root, because the object the
+    report was handed is the one a caller is holding -- a report that quietly repaired the map, or
+    recorded its verdict, would be invisible to a comparison against that same object.
+    """
+    from music_video_producer.batch import readiness_report
+
+    client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
+    shot_id = write_shot(
+        store, project_id, mode="references",
+        citations=[AssetCitation(asset_id=bed["id"], role="reference", order=0)],
+    )
+    expand_one(client, project_id, shot_id)
+    shots = shots_body(store, project_id)
+    attach(shots[0], bed["id"], lead["id"])
+    assert put_shots(client, project_id, shots).status_code == 200
+
+    before = ProjectStore(tmp_path).get(project_id).model_dump(mode="json")
+    report = readiness_report(ProjectStore(tmp_path).get(project_id))
+
+    assert report.ready is False
+    assert ProjectStore(tmp_path).get(project_id).model_dump(mode="json") == before
+    assert comfy.prompts == []
+    assert len(director.calls) == 1
     assert len(director.calls) == 1
 
 

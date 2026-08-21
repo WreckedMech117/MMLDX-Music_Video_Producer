@@ -45,6 +45,7 @@ from .assembly import (
 from .asset_replacement import ReplacementChange, asset_replacement_plan
 from .batch import (
     JOB_NEVER_SUBMITTED,
+    NOTE_KIND_PROMPT,
     PENDING_SUBMISSION_PROMPT_ID,
     TERMINAL_JOB_STATUSES,
     ReadinessReport,
@@ -116,6 +117,21 @@ from .prompt_cleanup import (
     prompt_cleanup_input,
     rewrite_rejection,
     window_fingerprint,
+)
+
+# Moved out of this module, and re-exported by importing them here: `batch.readiness_report` has
+# to ask the same "is this stale" question the submit route asks, and `app` imports `batch`, so
+# the answer cannot live here. See `reference_map.py`'s docstring. Every existing spelling
+# (`app.stale_reference_map`, `app.reference_map_tag_lines`, …) still resolves.
+from .reference_map import (
+    REFERENCE_MAP_ROLE_TAGS,
+    STALE_REFERENCE_MAP_CAUSE,
+    STALE_REFERENCE_MAP_CONSEQUENCE,
+    STALE_REFERENCE_MAP_REMEDY,
+    reference_map_sentence,
+    reference_map_tag_lines,
+    song_audio_prose_expansion,
+    stale_reference_map,
 )
 from .store import ProjectChangedDuringSave, ProjectNotFound, ProjectStore
 from .timeline import (
@@ -478,22 +494,6 @@ SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
     }
 )
 
-#: How the reference map declares a keyframe-role picture, per MiniMax's guide §2.2.2 — read
-#: from the bundled ``Video_Prompt_Writing_Guide.pdf``, never copied: the guide's own example is
-#: this sentence shape, and the retention marker is the guide's fixed English value for a frame
-#: anchor. `[Shot 1]` for the first frame because the guide has `[Shot 1]` mark the opening shot
-#: of every prompt; the last frame is tied to *the final shot* in the guide's own alignment
-#: language ("the last frame must be reached by the final [Shot N]"), and an un-expanded intent
-#: declares no shot numbers this map could name, so the final shot is named as what it is rather
-#: than guessed at as an index.
-#:
-#: A plain reference keeps the exact line this route has always built — `<Picture N> is
-#: {label}` — so a shot with no keyframe roles is byte-identical to before these existed.
-REFERENCE_MAP_ROLE_TAGS = {
-    "first": "<Picture {number}> is the first frame of [Shot 1] (fully_preserved), showing {label}",
-    "last": "<Picture {number}> is the last frame of the final shot (fully_preserved), showing {label}",
-}
-
 #: A keyframe role names a concrete frame, and a frame is a picture. Same refusal the keyframe
 #: branch makes for the same reason: the splitter routes media by kind, and an audio or video
 #: cited as a frame would be fed to a loader under a kind it is not, which nothing downstream
@@ -501,25 +501,6 @@ REFERENCE_MAP_ROLE_TAGS = {
 REFERENCE_KEYFRAME_NOT_IMAGE = (
     "A {role} must be an image, and {name} is {article} {kind}."
 )
-
-
-#: How every reference map this application writes opens. Named because three things now read
-#: it rather than one writing it: `reference_prompt` builds the sentence, `Shot.h3_prompt_map`
-#: stores it, and `stale_reference_map` decides from it whether a stored expansion still
-#: describes the references the shot cites. The bytes are exactly what this route has always
-#: emitted — the prefix, the tags joined by `"; "`, a full stop — so every prompt ever built
-#: from it is unchanged.
-REFERENCE_MAP_PREFIX = "Reference map: "
-
-
-def reference_map_sentence(tags: list[str]) -> str:
-    """The reference map as one sentence: the single construction of it.
-
-    One function rather than an f-string in each of its three readers, because the whole point
-    of storing the map beside the expansion is that the stored copy and the live one are
-    *comparable* — two spellings of the same join would report every shot as stale.
-    """
-    return f"{REFERENCE_MAP_PREFIX}{'; '.join(tags)}."
 
 
 #: The measured lipsync clause (2026-08-19, the night's decisive experiment): the two
@@ -589,45 +570,6 @@ def reference_prompt(
     return base
 
 
-def reference_map_tag_lines(project: Project, shot: Shot) -> list[str]:
-    """The submit walk's tag sentences, computed outside the submit route.
-
-    Byte-for-byte the lines `generate_h3`'s reference branch builds — same
-    `models.numbered_references` walk, same per-kind numbering, same role wording, same
-    master-song line last — so a prompt stored ahead of submission names exactly the
-    slots the payload will fill. A citation whose asset is missing writes no line here
-    where the route 422s: this function writes text, and the render is where a dangling
-    citation must stop the world. It still consumes its *number* from the shared walk, so
-    the tags that do get written are the tags the specialist was handed.
-
-    Each label carries the Asset's stored appearance anchor when it has one, so the map
-    reads `<Picture 1> is Lucy, a woman in a red leather jacket and black boots` rather
-    than a bare name that tells the sampler nothing about the person it is holding fixed.
-    `timeline.anchored_label` is the one composition — including how a per-shot rename and
-    an anchor compose — and an asset with no anchor returns the bare label unchanged, so
-    an anchor-free project's map is byte-for-byte the map it has always been.
-    """
-    tags: list[str] = []
-    for numbered in numbered_references(project, shot):
-        asset = numbered.asset
-        if asset is None:
-            continue
-        label = anchored_label(asset, shot.reference_labels.get(asset.id, asset.name))
-        if numbered.citation.role in REFERENCE_MAP_ROLE_TAGS:
-            tags.append(
-                REFERENCE_MAP_ROLE_TAGS[numbered.citation.role].format(
-                    number=numbered.number, label=label
-                )
-            )
-            continue
-        tags.append(f"{numbered.tag} is {label}")
-    if shot.use_song_audio:
-        tags.append(
-            f"<Audio {song_audio_tag(project, shot)}> is the master song for synchronization"
-        )
-    return tags
-
-
 #: What one shot's reference-bounds refusal says. The problems are the checker's own sentences —
 #: one wording for the rule, in `h3_prompt.check_reference_bounds`, rather than a second copy here
 #: that can drift from the one the expansion retry loop feeds back to the model.
@@ -643,25 +585,16 @@ REFERENCE_BOUNDS_REFUSAL = (
 #: cannot — a document-mode expansion, which would cost an unrequested model call; a locked shot;
 #: or one with a render in flight.
 #:
-#: **Clearing the box is named first because it is the remedy that always works**, and getting
-#: that order right matters more than it reads. An empty `h3_prompt` is not a gap — it is the
-#: fallback, and `reference_prompt` then builds the map from the shot's own citations at
-#: submission, so a cleared box submits a map that is correct by construction. It works on a
-#: locked shot too, because a lock stops the automated writers and never the human in the
-#: inspector (`EXPANSION_LOCKED_NOTICE` says so in as many words).
-#:
-#: Re-expanding is named second and named *accurately*, with the step it actually needs. Anything
-#: reaching this sentence is at `ready` — `generate_h3` refuses every other status — and
-#: `shot_render_provenance` counts every status past `draft` as a render, so a document-mode
-#: shot's expansion route would answer `EXPAND_PROMPT_RENDERED` if it were pressed from here.
-#: `mark-draft` is the existing way back and is deliberately as cheap as arming was.
+#: **Composed from the shared clauses, not written out here.** `batch.SHOT_WITH_STALE_REFERENCE_MAP`
+#: says the same thing in the pre-flight — the report that now names this shot *before* the batch
+#: spends GPU time on the rest — and one problem must not reach the Director as two explanations.
+#: The cause, the consequence and the remedy live in `reference_map.py` beside the function that
+#: decides staleness; only the framing ("Not submitted", "Nothing was sent to ComfyUI") is this
+#: route's own, because only this route is the thing that did not submit. The bytes are unchanged
+#: by the split — the frozen-wording tests assert it.
 STALE_REFERENCE_MAP_REFUSAL = (
-    "Not submitted: {shot}'s expanded prompt was written against a different set of references "
-    "than the shot now cites, so the reference map it carries is stale. Nothing was sent to "
-    "ComfyUI, because a render conditioned on a map naming the wrong pictures comes back "
-    "plausible and wrong rather than failing. Clear the expanded prompt and the render will "
-    "build the map from the shot's own references, or send the shot back to draft and expand "
-    "it again."
+    f"Not submitted: {{shot}}'s {STALE_REFERENCE_MAP_CAUSE}. Nothing was sent to "
+    f"ComfyUI, because {STALE_REFERENCE_MAP_CONSEQUENCE}. {STALE_REFERENCE_MAP_REMEDY}"
 )
 
 
@@ -722,54 +655,6 @@ def song_audio_prose(project: Project, shot: Shot) -> str:
             project.song, start=shot.start, duration=shot.duration
         ),
     )
-
-
-def song_audio_prose_expansion(shot: Shot) -> bool:
-    """Whether this Shot's stored expansion is the deterministic prose form.
-
-    Read off the *text*, not off the mode, and that is the whole point: `use_song_audio` and
-    `mode` say which form the **next** expansion would take, while this says which form the one
-    already stored actually is. A song-audio reference shot can be holding a document expansion
-    written before the prose recipe existed (`song_audio_prose` blanks the field precisely so it
-    can build over one), and rewriting that from a rule about the shot rather than a fact about
-    the text would throw away model output nobody asked to replace.
-    """
-    return shot.h3_prompt.startswith(REFERENCE_MAP_PREFIX)
-
-
-def stale_reference_map(project: Project, shot: Shot) -> bool:
-    """Whether this Shot's stored expansion names references the Shot no longer cites.
-
-    The live defect, 2026-08-20: a shot whose take had invented a woman in a wedding dress got
-    the character sheet attached, `Shot.citations` changed, and `h3_prompt` went on carrying the
-    old map naming only the bed. `reference_prompt` submits a stored expansion **alone**, so the
-    next render would have been conditioned on a map that described a different set of pictures
-    than the payload wired — which comes back plausible and wrong rather than failing.
-
-    Two answers because there are two kinds of expansion, and each is decided from what can
-    actually be known about it:
-
-    * **The prose form carries its own map**, verbatim and at the front, so it is compared
-      against the map the shot would get now. Nothing is stored and nothing can be clobbered by
-      a client reasserting an old `h3_prompt` — which is exactly what the shots write does,
-      since it never adopts its own reply. This is the arm the Director's whole project uses.
-    * **A document expansion never writes the map down** — the specialist weaves `<Picture 2>`
-      into prose — so it is compared against `Shot.h3_prompt_map`, the map recorded beside it
-      when it was written.
-
-    Three states are deliberately *not* stale. A Shot with no expansion has nothing to be stale:
-    it has not been expanded, and manufacturing a map for it would invent an expansion. A
-    document expansion written before `h3_prompt_map` existed records no map, and nothing knows
-    which one it had — refusing that render on a guess is worse than the render, and the next
-    expansion records one. And a shot citing nothing at all with no song audio has an empty map,
-    which the prose form spells `"Reference map: ."` and compares equal to itself.
-    """
-    if not shot.h3_prompt.strip():
-        return False
-    sentence = reference_map_sentence(reference_map_tag_lines(project, shot))
-    if song_audio_prose_expansion(shot):
-        return not shot.h3_prompt.startswith(sentence)
-    return bool(shot.h3_prompt_map) and shot.h3_prompt_map != sentence
 
 
 #: The check, run for its refusal. See `SHOT_DIRECTOR_VISIBLE`.
@@ -6401,7 +6286,14 @@ def create_app(
         # `include_warnings=False` because sameness cannot change this answer and the batch loop
         # calls this route once per Shot: computing the pairwise pass here would run it N times
         # over the whole plan and discard the result every time.
-        if shot.id in readiness_report(project, include_warnings=False).blocked_ids():
+        # `kind=NOTE_KIND_PROMPT` because this gate raises the *prompt* refusal. Since 2026-08-21
+        # the report also blocks a stale reference map — so that the pre-flight stops calling a
+        # shot submittable that this route then turns away — and an unfiltered read here would
+        # answer such a shot with `READINESS_REFUSAL`'s "no prompt on SHOT 07", about a shot that
+        # has a prompt, while its own refusal sits three checks below. One rule, one sentence.
+        if shot.id in readiness_report(project, include_warnings=False).blocked_ids(
+            kind=NOTE_KIND_PROMPT
+        ):
             raise HTTPException(
                 # Named as the timeline names it. A raw `shot_a1b2c3d4e5f6` appears nowhere in
                 # the interface, so a refusal carrying only that asks the Director to find a Shot

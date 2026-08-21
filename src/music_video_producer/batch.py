@@ -27,6 +27,12 @@ from pydantic import BaseModel, Field
 
 from .comfy import ComfyError, HistoryResult
 from .models import Project, RenderJob, Shot, ShotStatus, shot_label
+from .reference_map import (
+    STALE_REFERENCE_MAP_CAUSE,
+    STALE_REFERENCE_MAP_CONSEQUENCE,
+    STALE_REFERENCE_MAP_REMEDY,
+    stale_reference_map,
+)
 from .timeline import (
     H3_FPS,
     H3_MAX_SHOT_SECONDS,
@@ -43,11 +49,13 @@ __all__ = [
     "NEAR_DUPLICATE_OVERLAP",
     "NOTE_KIND_PROMPT",
     "NOTE_KIND_SAMENESS",
+    "NOTE_KIND_STALE_MAP",
     "NOTE_KIND_TAKE_UNCOVERED",
     "NOTE_KIND_WINDOW_LONG",
     "NOTE_KIND_WINDOW_SHORT",
     "PLACEHOLDER_PROMPT",
     "READINESS_REFUSAL",
+    "SHOT_WITH_STALE_REFERENCE_MAP",
     "TERMINAL_JOB_STATUSES",
     "JobProgress",
     "ReadinessNote",
@@ -106,6 +114,34 @@ SHOT_WITHOUT_PROMPT = (
 SHOT_WITH_PLACEHOLDER_PROMPT = (
     f'This shot still carries the "{PLACEHOLDER_PROMPT}" placeholder every new shot is created '
     "with, which is not a prompt anyone wrote. Submitting it would spend a full GPU pass on it."
+)
+
+# The third block, and the one the pre-flight was silent about until 2026-08-21. A shot whose
+# stored expansion carries a stale reference map is **already refused at the submit route** —
+# `app.STALE_REFERENCE_MAP_REFUSAL`, since 2026-08-20 — but nothing said so before the GPU cost was
+# confirmed, so the Director read "33 ready", agreed to the batch, and learned about the one skipped
+# shot from the report afterwards. Everything else this module reports exists precisely so that
+# "22 armed, 3 skipped" is seen while a Director can still act on it.
+#
+# **It blocks rather than warns, and the split it lands on is the established one.** Sameness warns
+# because two shots may legitimately share a prompt and a gate over a legitimate state gets worked
+# around; emptiness blocks because there is no reading of an empty prompt under which the render is
+# the right thing to spend. A stale map is on emptiness' side of that line: there is no state of the
+# world in which conditioning a render on a map naming the wrong pictures is what the Director
+# meant, and the route already agrees — it refuses. Warning here would have made the report
+# *predict* a refusal while `ready` went on saying the plan may be submitted, which is the one thing
+# `ReadinessReport` must never say about a shot the route will turn away. Blocking makes the two
+# layers give one answer, and it costs nothing a Director can lose: a blocked shot no longer
+# disables the batch button (`api.js`'s `generateAllPlan`), so this names the shot and skips it
+# rather than stopping the other thirty-two.
+#
+# The sentence is composed from `reference_map.py`'s shared clauses — the same cause, the same
+# consequence and the same remedy the refusal says — because one problem must not reach the Director
+# as two explanations, and the remedy in particular has a step (`mark-draft`) that a second wording
+# would be free to forget.
+SHOT_WITH_STALE_REFERENCE_MAP = (
+    f"This shot's {STALE_REFERENCE_MAP_CAUSE}. Submitting it would spend a full GPU pass, and "
+    f"{STALE_REFERENCE_MAP_CONSEQUENCE}. {STALE_REFERENCE_MAP_REMEDY}"
 )
 
 # The one case that names no Shot, because there are none to name. An empty plan is not ready
@@ -198,6 +234,10 @@ SHOT_WINDOW_ABOVE_BAND = (
 #: because the two states are separate: one is handled and one is not.
 NOTE_KIND_PROMPT = "prompt"
 NOTE_KIND_SAMENESS = "sameness"
+#: The second **blocking** kind, and the reason `blocked_ids` grew a `kind` filter: a stale map and
+#: an empty prompt are both refusals, and each route says its own sentence about its own one. Kept
+#: apart from `NOTE_KIND_PROMPT` so no surface can print "no prompt" over a shot that has one.
+NOTE_KIND_STALE_MAP = "stale_map"
 NOTE_KIND_WINDOW_SHORT = "window_short"
 NOTE_KIND_WINDOW_LONG = "window_long"
 #: The third window state, and the Director's second yellow (2026-08-21): "if the bounds of the
@@ -352,9 +392,23 @@ class ReadinessReport:
     warnings_omitted: int = 0
     window_warnings: list[ReadinessNote] = field(default_factory=list)
 
-    def blocked_ids(self) -> list[str]:
-        """Every Shot id that blocks, in report order. Empty for an empty plan."""
-        return [shot_id for note in self.blocking for shot_id in note.shot_ids]
+    def blocked_ids(self, *, kind: str = "") -> list[str]:
+        """Every Shot id that blocks, in report order. Empty for an empty plan.
+
+        `kind` narrows to one `NOTE_KIND_*`; the default answers for every kind, which is what
+        "may this plan be submitted" means and what every client-facing reader wants. The filter
+        exists for the routes that raise **their own** sentence for **their own** rule: since a
+        stale reference map became a block, `generate_h3`'s prompt gate has to ask for prompt
+        blocks specifically, or it would answer a stale shot with `READINESS_REFUSAL` — "no prompt
+        on SHOT 07" about a shot with a prompt — while the stale refusal it already has sits three
+        checks further down. Narrowing the question is how the two stay one sentence each.
+        """
+        return [
+            shot_id
+            for note in self.blocking
+            if not kind or note.kind == kind
+            for shot_id in note.shot_ids
+        ]
 
     def blocked_labels(self) -> list[str]:
         """The same Shots under the names the Director sees. Empty for an empty plan."""
@@ -544,6 +598,21 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
     a comparison between two, so a blocked shot's window is just as true as a prompted one's and
     hiding it would make the note appear only after the prompt was written — which is the
     late-discovery this exists to end.
+
+    A **stale reference map** blocks, alongside the empty prompt, and is the one thing here that is
+    not decided in this module: `reference_map.stale_reference_map` is the submit route's own test,
+    imported so the pre-flight cannot hold a second opinion. See `SHOT_WITH_STALE_REFERENCE_MAP`
+    for why it blocks rather than warns.
+
+    `ready_count` deliberately still counts **shots that have a prompt**, which is what
+    `api.js`'s `readinessSummary` prints it as ("33 of 33 shots have a prompt"), and a stale shot
+    has one. What that shot loses is `ready` and a line in `blocking`, so the same summary goes on
+    to say "1 cannot be submitted" — which is the true statement about it, in the sentence that
+    already existed for it.
+
+    Still pure and still cheap: no model, no file, no ComfyUI, and nothing written back. The one
+    added cost is one `models.numbered_references` walk per **expanded** shot; an unexpanded shot
+    returns before walking anything.
     """
     shots = ordered_shots(project)
     if not shots:
@@ -602,6 +671,27 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
             )
         else:
             prompted.append(shot)
+        # And whether the expansion this shot is holding still describes the references it cites.
+        # `reference_map.stale_reference_map` is the submit route's own function, imported rather
+        # than re-derived: the pre-flight and the gate answer this from one implementation or they
+        # will eventually answer it differently, which is the whole failure this note exists to
+        # close in the other direction.
+        #
+        # Asked of **every** shot, blocked ones included, on `window_band_note`'s argument: a stale
+        # map is a fact about this one shot rather than a comparison with another, so it is just as
+        # true of a shot whose prompt is also blank, and hiding it until the prompt was written
+        # would make it appear only at the moment the other note stopped. A shot with no expansion
+        # is not stale and is silent here — that function's first line — so a plan being written
+        # rather than rendered reports nothing.
+        if stale_reference_map(project, shot):
+            blocking.append(
+                ReadinessNote(
+                    shot_ids=[shot.id],
+                    labels=[shot_label(project, shot)],
+                    reason=SHOT_WITH_STALE_REFERENCE_MAP,
+                    kind=NOTE_KIND_STALE_MAP,
+                )
+            )
 
     warnings: list[ReadinessNote] = []
     omitted = 0

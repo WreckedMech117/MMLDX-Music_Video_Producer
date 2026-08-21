@@ -398,6 +398,16 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .clips-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
 .clip-card { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
 .clip-card video { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; }
+/* What a card shows when ComfyUI is not answering. Same box as the video it stands in for, so the
+   grid does not reflow between the two states, and it says which state it is in — the Director's
+   report (2026-08-21) is that this tab "goes blank" when ComfyUI is down, and a wall of broken
+   video elements is exactly what a fabricated-or-empty state looks like. The take's filename is on
+   the element's title in both states; it is the one fact that does not depend on ComfyUI. */
+.clip-unplayable { display: flex; align-items: center; justify-content: center; width: 100%; aspect-ratio: 16/9; padding: 0 10px; border-bottom: 1px solid var(--line); background: var(--surface-1); color: var(--muted); font: 10px/1.4 Consolas, monospace; letter-spacing: .06em; text-align: center; }
+.clips-heading-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.clips-offline { margin: 0 2px 10px; padding: 9px 11px; border: 1px solid var(--amber); border-radius: var(--radius); background: var(--surface-1); }
+.clips-offline strong { display: block; margin-bottom: 4px; color: var(--amber); font: 10px Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.clips-offline span { display: block; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .clip-card footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 6px 8px; font-size: 10px; color: var(--muted); }
 /* A take row is a **button**, the whole row of it. The Director's report, 2026-08-21: "i can see
    the takes in the shot info window but clicking on either does nothing" — and in a browser that
@@ -478,7 +488,22 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .shot-clip .clip-state { display: block; padding: 0 9px 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--amber); font: 9px Consolas, monospace; letter-spacing: .08em; }
 .shot-clip .clip-prompt { display: -webkit-box; padding: 0 9px; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: 11px; line-height: 1.35; }
 .shot-clip.no-prompt .clip-prompt { color: var(--red); font: 9px Consolas, monospace; letter-spacing: .08em; }
-.resize-handle { position: absolute; top: 0; bottom: 0; width: 12px; cursor: ew-resize; }
+/* The resize handles paint above every clip body, and this is the whole of the fix for the
+   Director's report of 2026-08-21: a clip that overlaps its neighbour has that neighbour painted
+   over its right edge, so the right handle cannot be grabbed. Their real plan carries eighteen
+   overlaps, the largest 5.49 s — 88 px at the default zoom, which buries a 12 px handle whole.
+
+   `z-index` on the *handle*, never on the clip. The layering ruling of 2026-08-20 is that an
+   overlap resolves as layers with the later shot on top, and that is what the clip bodies still
+   do: `.shot-clip` carries no z-index, so DOM order alone decides which picture is in front.
+   `.shot-clip` is not a stacking context either (position:absolute, z-index:auto, and
+   `overflow:hidden` does not make one), so a positive z-index here resolves against the track and
+   lifts every handle above every body while clipping to its own clip exactly as before.
+
+   What this costs is 12 px at each clip's edge where a press now resizes that clip rather than
+   moving the one on top of it. That is the trade every editor makes, and the neighbour keeps its
+   own left handle and the whole of the rest of its body. */
+.resize-handle { position: absolute; top: 0; bottom: 0; z-index: 2; width: 12px; cursor: ew-resize; }
 .resize-handle:hover { background: linear-gradient(90deg, transparent, #d4f75e33, transparent); }
 .resize-handle.left { left: 0; }
 .resize-handle.right { right: 0; }

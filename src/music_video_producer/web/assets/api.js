@@ -912,6 +912,26 @@ export function blockedShotIds(report) {
   return (report?.blocking || []).flatMap((note) => note?.shot_ids || []);
 }
 
+//: The kinds a *blocking* note carries. `batch.NOTE_KIND_PROMPT` and `NOTE_KIND_STALE_MAP`, pinned
+//: by a contract test. Read for two things and nothing else: which heading the readiness list gives
+//: the line, and which noun the batch confirmation uses for a shot that will be skipped. Neither
+//: re-derives anything -- the server decides both blocks, and a stale map in particular cannot be
+//: decided here at all, since it is a comparison against the reference map the *submission* would
+//: build from the shot's citations.
+export const NOTE_KIND_PROMPT = "prompt";
+export const NOTE_KIND_STALE_MAP = "stale_map";
+
+//: What the batch confirmation calls each block, in the few words a parenthesis holds. The server's
+//: whole sentence for each is in the readiness list; this is the heads-up on the button.
+export const BATCH_SKIP_NOUNS = {
+  [NOTE_KIND_PROMPT]: "no prompt",
+  [NOTE_KIND_STALE_MAP]: "stale reference map",
+};
+//: For a kind this client does not know -- an older client against a newer server. "Blocked" is the
+//: one thing that is certainly true of any note in `blocking`, and it is better than naming the
+//: wrong reason or silently dropping the count.
+export const BATCH_SKIP_NOUN_UNKNOWN = "blocked";
+
 // Every Shot id a readiness report blocks, under the names the Director sees. Positionally
 // aligned with the ids inside each note, and carried by the report rather than derived here: the
 // server names a Shot `SHOT 01 (shot_id)` by its position in the *manifest* while the notes
@@ -1183,30 +1203,20 @@ export function shotPromptCell(shot, percent) {
   };
 }
 
-// Whether a batch may be submitted, given the server's report and the ids actually being queued.
+// `batchReadinessBlock` stood here until 2026-08-21 and is deliberately gone rather than fixed.
 //
-// The filter is the whole decision, and it is the one that inverts silently: negating it to
-// "blocked *outside* this batch" refuses the button over a blank draft elsewhere in the plan --
-// which is every plan, most of the time -- while letting the batch that really does contain a
-// blocked Shot through, producing exactly the half-submitted batch the check exists to prevent.
-// Both directions are executed as tests rather than grepped for.
-// The refusal names the blocked Shots by the report's own labels, never by id: `SHOT 03 (shot_id)`
-// is what the server would have said and what the timeline draws, and an id alone names something
-// that appears nowhere on screen.
-export function batchReadinessBlock(report, queuedIds = []) {
-  const queued = new Set(queuedIds || []);
-  const blocked = [];
-  const labels = [];
-  for (const note of report?.blocking || []) {
-    const names = noteLabels(note);
-    (note?.shot_ids || []).forEach((id, index) => {
-      if (!queued.has(id)) return;
-      blocked.push(id);
-      labels.push(names[index]);
-    });
-  }
-  return { refused: blocked.length > 0, blocked, labels, message: blocked.length ? readinessRefusal(labels) : "" };
-}
+// It decided whether a batch could be submitted, given the server's report and the ids being
+// queued. **Nothing called it.** Client-side batch refusal was removed when FR-4 made the batch
+// skip a blocked shot by name and submit the rest -- which is what the comment below has said ever
+// since -- and the function outlived its only caller, exported and reachable from the executed
+// contract alone. Its `message` was built by `readinessRefusal`, which words every block as "no
+// prompt on X"; `readiness_report` has since gained other blocking kinds, so that sentence was
+// wrong as well as unreachable. The Director's ruling: *"Ok lets not leave the wrong sentence
+// laying around."* Fixing the sentence would have left dead code behind a correct-looking message,
+// which is worse than either problem alone.
+//
+// Nothing is lost by the deletion: `blockedShotIds` and `blockedShotLabels` still read the same
+// report and are what `generateAllPlan` uses to warn before the click.
 
 // Why the batch button is off when it is off. Nothing to queue is the only remaining
 // reason: a blocked shot no longer disables the whole batch, because the server-side
@@ -1239,11 +1249,21 @@ export function generateAllPlan(project, report = null, replaceExisting = false)
       confirm: "",
     };
   }
-  const blockedIds = new Set(report ? blockedShotIds(report) : []);
-  const blocked = targets.filter((shot) => blockedIds.has(shot.id)).map((shot) => shot.id);
+  // Why each blocked shot will be skipped, from the note that blocked it. This said "(no prompt)"
+  // outright while an empty prompt was the only block; a stale reference map is a second one
+  // (2026-08-21), and it is on shots that very much do have a prompt -- so the reason is read off
+  // the report rather than assumed. The nouns are deduplicated and joined, because a batch can
+  // carry both and "3 will be skipped (no prompt)" over two stale shots is a sentence that sends a
+  // Director to the wrong box.
+  const blockedKinds = new Map();
+  for (const note of report?.blocking || []) {
+    for (const shotId of note?.shot_ids || []) blockedKinds.set(shotId, note?.kind);
+  }
+  const blocked = targets.filter((shot) => blockedKinds.has(shot.id)).map((shot) => shot.id);
   const noun = (n) => `${n} H3 shot${n === 1 ? "" : "s"}`;
+  const reasons = [...new Set(blocked.map((id) => BATCH_SKIP_NOUNS[blockedKinds.get(id)]).filter(Boolean))];
   const skipNote = blocked.length
-    ? ` — ${blocked.length} will be skipped (no prompt)`
+    ? ` — ${blocked.length} will be skipped (${reasons.join(", ") || BATCH_SKIP_NOUN_UNKNOWN})`
     : "";
   return {
     disabled: false,
@@ -1277,6 +1297,12 @@ export function batchReportToast(report) {
 // so the kind is part of the sentence.
 export const READINESS_BLOCKING_LABEL = "Blocked";
 export const READINESS_SAMENESS_LABEL = "Near-duplicate";
+//: The second blocking kind, `batch.NOTE_KIND_STALE_MAP`, pinned by a contract test. It reads under
+//: its own name rather than the generic "Blocked" for the same reason the two window states do: the
+//: two blocks send a Director to two different places -- one to write a prompt, one to clear the
+//: expanded prompt box -- and a list that called both "Blocked" would make them look like one
+//: problem with one fix. The server's own sentence still carries the whole remedy.
+export const READINESS_STALE_MAP_LABEL = "Stale reference map";
 //: The two window states, named apart because they *are* apart: one is handled and one is not.
 //: Neither is a block, and neither may be drawn as one -- both of the server's sentences end by
 //: saying so.
@@ -1425,6 +1451,15 @@ const WINDOW_LINE_LABELS = {
   [NOTE_KIND_TAKE_UNCOVERED]: READINESS_TAKE_UNCOVERED_LABEL,
 };
 
+//: The heading each blocking kind reads under. Only the kinds that have a name of their own appear;
+//: anything else -- an older server, a kind added and not yet mirrored -- falls back to
+//: `READINESS_BLOCKING_LABEL`, so a note can never lose its sentence by gaining a kind. Every line
+//: keeps the `blocking` list-marker class: these are all refusals, and the heading is what tells
+//: them apart, not the colour.
+const BLOCKING_LINE_LABELS = {
+  [NOTE_KIND_STALE_MAP]: READINESS_STALE_MAP_LABEL,
+};
+
 export function readinessLines(report) {
   const render = (kind, label) => (note) => {
     const shotIds = note?.shot_ids || [];
@@ -1433,7 +1468,8 @@ export function readinessLines(report) {
     return { kind, shotIds, shots: names, reason, text: names.length ? `${label} - ${names.join(" and ")}: ${reason}` : `${label} - ${reason}` };
   };
   return [
-    ...(report?.blocking || []).map(render("blocking", READINESS_BLOCKING_LABEL)),
+    ...(report?.blocking || []).map((note) =>
+      render("blocking", BLOCKING_LINE_LABELS[note?.kind] || READINESS_BLOCKING_LABEL)(note)),
     ...(report?.warnings || []).map(render("warning", READINESS_SAMENESS_LABEL)),
     // The third list, drawn as its own kind and never folded into the second. `warnings` means
     // exactly one thing to every reader it already has -- `READINESS_SAMENESS_LABEL` and
@@ -1595,9 +1631,9 @@ export const RANDOM_SEED_HELP =
   "Ticking this rolls a seed in 1–99999 now and holds it. It re-rolls at one moment only: when " +
   "Render again queues a take. It does not re-roll on Mark ready, on selecting another shot, or " +
   "on a redraw. Typing a seed by hand clears this toggle — a number you typed is a number you " +
-  "chose. It is a working mode for this session, not a property of the shot: it is not saved " +
-  "into the project and it is off again after a reload. Generate All has its own +" +
-  `${RESUBMIT_SEED_STRIDE} step on the server and does not read this box.`;
+  "chose. It is set per shot and for this session only: ticking it here arms this shot and no " +
+  "other, it is not saved into the project, and it is off again after a reload. Generate All has " +
+  `its own +${RESUBMIT_SEED_STRIDE} step on the server and does not read this box.`;
 
 // One roll, inside the Director's bounds. `random` is injected so the contract tests can drive the
 // edges rather than sample and hope; every caller in the application uses the default.
@@ -2538,6 +2574,112 @@ export function assetTabEmpty(tabId, query = "") {
   };
 }
 
+// -- The Clips tab when ComfyUI is not running ------------------------------------------------
+//
+// The Director's report (2026-08-21): the clips library "goes blank" whenever ComfyUI is down.
+// Each card points a `<video>` straight at ComfyUI's own `/view`, so every one of them 404s --
+// thirty-three broken video elements on a tab that exists to show thirty-three takes.
+//
+// **ComfyUI being down is an ordinary state here, not an error.** The Director starts it
+// separately and this application is forbidden from starting it. So the honest thing is a card
+// that says the take cannot be shown and why, and this decides that once for the whole tab.
+//
+// **Which takes this application can serve itself, and which it cannot.** Investigated before
+// this was written, because "fail honestly" is worth less than "do not fail":
+//
+// * `GET /api/projects/{id}/media/{path}` cannot reach a take. An H3 take's `output_files` entry
+//   is a path inside **ComfyUI's own output tree** (`music-video-producer/{project}/shots/…`),
+//   and that route serves `store.media_dir(project_id)` and 404s anything outside it.
+// * `GET /api/projects/{id}/shots/{shot}/take` **can**, and does — it is what the Monitor plays.
+//   It resolves the shot's own `latest_output` under `settings.comfy_root / "output"` on disk and
+//   streams it with Range support. No ComfyUI process is involved at any point.
+//
+// The second route takes ids and deliberately **no path** ("there is no path-injection surface to
+// defend"), so it can serve exactly one take per shot: the current one. Every earlier take in the
+// library is addressable only by its path, and the only thing in this system that serves a path is
+// ComfyUI's `/view`.
+//
+// So a card decides for itself (`clipCardFace`), and this decides the tab-level question the cards
+// that cannot be served ask: is ComfyUI answering, and what is said when it is not.
+//
+// Three answers, not two, because "we have not asked yet" and "we asked and it said no" are
+// different facts and only one of them is about ComfyUI:
+//
+// * `online`   — health says ComfyUI answered. Play the take from `/view`, exactly as before.
+// * `offline`  — health says it did not answer. Name that, and name the address that was tried.
+// * `unknown`  — this browser has no health answer at all (the first paint, or the probe failed).
+//                Saying "ComfyUI is offline" there would be inventing a fact about someone
+//                else's process.
+export const CLIP_OFFLINE_TITLE = "Earlier take — ComfyUI offline";
+export const CLIP_UNKNOWN_TITLE = "Earlier take — ComfyUI not checked yet";
+export const CLIP_OFFLINE_NOTE =
+  "The take each shot currently points at is served by this application from ComfyUI's output " +
+  "directory on disk, so those still play. An earlier take is addressable only by its path, and " +
+  "the only thing that serves a path is ComfyUI's own /view at {url} — which is not answering. " +
+  "The list itself is read from this project's job history and is complete either way.";
+export const CLIP_UNKNOWN_NOTE =
+  "The take each shot currently points at is served by this application from ComfyUI's output " +
+  "directory on disk, so those still play. An earlier take needs ComfyUI's own /view, and this " +
+  "browser has no answer from ComfyUI yet. Re-check to ask. The list itself is read from this " +
+  "project's job history and is complete either way.";
+export const CLIP_RECHECK_LABEL = "Re-check ComfyUI";
+
+//: The address the cards are pointed at when health has not said which one it is.
+export const COMFY_DEFAULT_URL = "http://127.0.0.1:8188";
+
+// Whether the Clips tab may draw video elements at all, and what it says when it may not.
+//
+// `health` is `state.health` -- the whole answer, so the three cases above stay distinguishable;
+// a caller passing only a boolean cannot tell "false" from "never asked".
+export function clipPreviewState(health) {
+  const url = health?.comfy?.url || COMFY_DEFAULT_URL;
+  if (health?.comfy?.online === true) return { playable: true, status: "online", url, title: "", note: "" };
+  if (health?.comfy?.online === false) {
+    return {
+      playable: false,
+      status: "offline",
+      url,
+      title: CLIP_OFFLINE_TITLE,
+      note: CLIP_OFFLINE_NOTE.replace("{url}", url),
+    };
+  }
+  return {
+    playable: false,
+    status: "unknown",
+    url,
+    title: CLIP_UNKNOWN_TITLE,
+    note: CLIP_UNKNOWN_NOTE,
+  };
+}
+
+// One card's own answer: where its picture comes from, or why there is not one.
+//
+// `row` is a `clipLibraryRows` entry -- `{file, shotId}` -- and `preview` is the tab-level state
+// above. Three outcomes, in the order a card prefers them:
+//
+// * `via: "app"`   — this file is the shot's current take, so the application serves it from disk
+//                    and ComfyUI's state is irrelevant. This is the case that makes the tab work
+//                    at all with ComfyUI down, and it is most of the tab: a shot's newest take is
+//                    the one it points at.
+// * `via: "comfy"` — an earlier take, and ComfyUI is answering, so `/view` serves it by path.
+// * `via: ""`      — an earlier take with no ComfyUI. The card says which, and says nothing it
+//                    cannot support.
+export function clipCardFace(project, row, preview) {
+  const shot = (project?.shots || []).find((item) => item?.id === row?.shotId) || null;
+  if (shot && row?.file && shot.latest_output === row.file) {
+    return {
+      playable: true,
+      via: "app",
+      url: shotTakeUrl(project.id, shot.id, shot.latest_output),
+      title: "",
+    };
+  }
+  if (preview?.playable) {
+    return { playable: true, via: "comfy", url: comfyOutputUrl(preview.url, row.file), title: "" };
+  }
+  return { playable: false, via: "", url: "", title: preview?.title || CLIP_UNKNOWN_TITLE };
+}
+
 // Section boxes snap to the edges of the shots below them (the Director's design:
 // a section spans whole shots, so its boundaries ARE shot boundaries when any are near).
 // Pure so the contract tests can execute the rule: the nearest boundary within
@@ -2766,6 +2908,91 @@ export function replaceInShotsControl(project, assetId) {
     shown: count > 0,
     count,
     label: `Replace in ${count} shot(s) with…`,
+  };
+}
+
+// -- "Attach to selected shot", made legible -----------------------------------------------
+//
+// The Director's report (2026-08-21), verbatim: *"Attach to selected shot (hard to use since cant
+// see timeline from assets page)"*. From the Assets panel neither the timeline nor the selection
+// is on screen, so the button acts on something invisible -- and the failure mode is silent, since
+// attaching to the wrong shot looks exactly like attaching to the right one.
+//
+// The fix is the one the neighbouring control already made: `replaceInShotsControl` puts the
+// *count* in its own label and lists the shots in its report, and that was called out as the right
+// pattern. This puts the *identity* in the label and the window and the intent in a caption beside
+// it, so the target is readable before the press rather than discoverable after it.
+//
+// Three states, and only one of them is a live button:
+//
+// * no shot selected — shut, and the caption says why and what to do. A disabled control naming
+//   its reason beats an enabled one that fails.
+// * already cited    — shut. The click was a no-op that toasted "attached" all the same, which is
+//   the "control that appears to do nothing" shape this whole thread started from.
+// * attachable       — live, named, with the window and the opening of the intent beside it.
+export const ATTACH_LABEL_UNSELECTED = "Attach to selected shot";
+export const ATTACH_NO_SHOT_REASON =
+  "No shot is selected. Pick a clip on the Timeline first — this attaches the asset to that " +
+  "shot's cited references, and nothing on this screen shows which shot that is.";
+export const ATTACH_ALREADY_CITED_REASON =
+  "{shot} already cites {asset}. Attaching it again would write the same list back and change " +
+  "nothing; remove the citation in the shot inspector if it should not be there.";
+export const ATTACH_HELP =
+  "Cite {asset} as a reference on {shot} ({window}). The shot's other citations are kept.";
+
+//: How much of a shot's creative intent the caption carries. Enough to recognise the shot,
+//: short enough that the button does not become a paragraph.
+export const ATTACH_INTENT_CHARS = 48;
+
+//: A shot's window as the caption says it: `12.00–17.00 s`. The en dash matches the section
+//: inspector's own window line, which is the other place this application prints one.
+export function shotWindowLabel(shot) {
+  const start = Number(shot?.start) || 0;
+  const duration = Number(shot?.duration) || 0;
+  return `${start.toFixed(2)}–${(start + duration).toFixed(2)} s`;
+}
+
+// The button and the line under it, decided once. `shotId` is `state.selectedShotId`, which is
+// what the Assets panel has and the timeline owns.
+export function attachToShotControl(project, shotId, assetId, assetName = "this asset") {
+  const shot = (project?.shots || []).find((item) => item?.id === shotId) || null;
+  if (!shot) {
+    return {
+      disabled: true,
+      label: ATTACH_LABEL_UNSELECTED,
+      shot: null,
+      caption: ATTACH_NO_SHOT_REASON,
+      title: ATTACH_NO_SHOT_REASON,
+      reason: ATTACH_NO_SHOT_REASON,
+    };
+  }
+  const name = shotLabel(project, shot.id);
+  const window = shotWindowLabel(shot);
+  const intent = String(shot.prompt || "").trim();
+  const shown = intent.length > ATTACH_INTENT_CHARS
+    ? `${intent.slice(0, ATTACH_INTENT_CHARS).trimEnd()}…`
+    : intent;
+  // The number is what the timeline paints on the clip, so the label is the thing a Director can
+  // match against the timeline they cannot currently see. The id disambiguates it in the caption.
+  const label = `Attach to ${name.split(" (")[0]}`;
+  const cited = (shot.citations || []).some((citation) => citation?.asset_id === assetId);
+  const caption = `${name} · ${window}${shown ? ` · ${shown}` : " · no creative intent written yet"}`;
+  if (cited) {
+    const reason = ATTACH_ALREADY_CITED_REASON
+      .replace("{shot}", name)
+      .replace("{asset}", assetName);
+    return { disabled: true, label, shot, caption, title: reason, reason };
+  }
+  return {
+    disabled: false,
+    label,
+    shot,
+    caption,
+    title: ATTACH_HELP
+      .replace("{asset}", assetName)
+      .replace("{shot}", name)
+      .replace("{window}", window),
+    reason: "",
   };
 }
 
@@ -3182,6 +3409,75 @@ export function cutMoveRefusal(project, shot) {
 }
 
 // ---- B. double-click an edge beside a gap ---------------------------------------------------
+
+// ---- the shortest window a gesture may leave behind -----------------------------------------
+//
+//: The floor every window-editing gesture in the workspace already enforced with a bare `.5`:
+//: the left-edge drag clamps at `end - .5`, the right-edge drag at `Math.max(.5, …)`, and the
+//: shot inspector's duration box carries `min=".5"`. Named here so the split's refusal can quote
+//: the same number the drags obey, rather than a second copy of it that could drift.
+//:
+//: It is a *floor*, not a minimum anyone should aim for. Micro-cuts are legitimate — a window
+//: under H3's trained band renders at the minimum with the buffer trimmed away, which is why
+//: `styles.css` deliberately draws no warning on the short end.
+export const MIN_WINDOW_SECONDS = 0.5;
+
+//: The shortest window a split can halve, which is twice the floor and nothing more interesting.
+export const SPLIT_MINIMUM_SECONDS = 2 * MIN_WINDOW_SECONDS;
+
+// -- ✂ Split, when the window is too short to halve -------------------------------------------
+//
+// `#split-shot` refused a window under a second and said **nothing at all** — the same shape as
+// the report that started this thread, a control that appears to do nothing. This is its
+// sentence, and it explains the arithmetic rather than scolding: a 0.5 s window is a real thing
+// the Director creates deliberately, and the reason it cannot be split is that halving it lands
+// under the floor every drag in this workspace already stops at.
+export const SPLIT_NO_SHOT_REFUSAL =
+  "No shot is selected, so there is nothing to split. Click a clip on the timeline first.";
+export const SPLIT_TOO_SHORT_REFUSAL =
+  "{shot} is {seconds}s long. A split halves the window, so each half would be {half}s — under " +
+  "the {minimum}s floor a shot window can be dragged to, which is why there is no cut to make " +
+  "here. Drag the window out past {least}s first, or add a shot beside this one.";
+
+//: Seconds as this refusal prints them: enough places for a 0.002 s edit to be visible, with no
+//: trailing zeroes to make a round number look like a measurement.
+function splitSeconds(value) {
+  return String(Math.round(Number(value) * 1000) / 1000);
+}
+
+// The whole of one split: whether it may happen, what it says when it may not, and the two
+// windows it produces. Pure, so the rule is executed by the contract rather than read out of a
+// one-line click handler.
+export function splitShotPlan(project, shot) {
+  if (!shot) return { ok: false, refusal: SPLIT_NO_SHOT_REFUSAL, halves: [] };
+  const duration = Number(shot.duration) || 0;
+  if (duration < SPLIT_MINIMUM_SECONDS) {
+    return {
+      ok: false,
+      refusal: SPLIT_TOO_SHORT_REFUSAL
+        .replace("{shot}", shotLabel(project, shot.id))
+        .replace("{seconds}", splitSeconds(duration))
+        .replace("{half}", splitSeconds(duration / 2))
+        .replace("{minimum}", splitSeconds(MIN_WINDOW_SECONDS))
+        .replace("{least}", splitSeconds(SPLIT_MINIMUM_SECONDS)),
+      halves: [],
+    };
+  }
+  // Deliberately un-quantised, and identical to the arithmetic this handler used before the
+  // refusal was added to it: the second half starts exactly where the first one ends, so the cut
+  // the split makes is exact rather than exact-to-a-microsecond. `exactSeconds` is for the
+  // gestures that answer a Director's number; this one answers a division.
+  const half = duration / 2;
+  const start = Number(shot.start) || 0;
+  return {
+    ok: true,
+    refusal: "",
+    halves: [
+      { start, duration: half },
+      { start: start + half, duration: half },
+    ],
+  };
+}
 
 //: How long after one press on an edge a second press on the *same* edge is the same gesture.
 //: 400 ms is the platform's own double-click window on Windows, and the value is here rather

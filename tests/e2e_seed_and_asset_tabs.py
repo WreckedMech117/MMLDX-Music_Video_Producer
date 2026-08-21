@@ -30,8 +30,12 @@ What is asserted, in order:
 2. **The label names the re-roll moment.** "Randomize on Render again" is on the screen, not only
    in a tooltip, so the moment does not have to be guessed.
 3. **Ticking rolls once, inside 1-99999, and stores it.**
-4. **It holds.** Selecting another shot and coming back -- which tears the inspector down and
-   rebuilds it, dragging a readiness reply behind it -- does not roll again. Nor does a redraw.
+4. **It holds, and it is armed on one shot.** Selecting another shot and coming back -- which
+   tears the inspector down and rebuilds it, dragging a readiness reply behind it -- does not roll
+   again, and the *other* shot's box is off. Then a Render again on that unarmed shot takes the
+   server's `RESUBMIT_SEED_STRIDE` rather than a fresh roll. This inverts the assertion that was
+   here on 2026-08-20, on the Director's ruling of the 21st: *"Clicking randomize integer on a
+   shot toggles it for all shots, it should be per shot."*
 5. **A hand-typed seed clears the toggle**, and the typed number stands.
 6. **Render again re-rolls, and by exactly one rule.** Ticked, the queued retake's stored seed is a
    fresh number in 1-99999 and specifically *not* `previous + RESUBMIT_SEED_STRIDE`; unticked, it
@@ -47,7 +51,9 @@ What is asserted, in order:
    Clips tab it is the other way round.
 10. **The tabs show and hide the right assets**, and an empty tab says so in its own words.
 11. **The clips library is unchanged by the move**: rows, hover-to-play, and "Open shot" still
-    lands on the producing shot in the timeline.
+    lands on the producing shot in the timeline. With ComfyUI at a dead port, each shot's current
+    take still plays -- this application serves it from ComfyUI's output directory on disk -- and
+    the one superseded take says why it cannot be shown instead of drawing a 404'd `<video>`.
 12. **A tab change loses no selection.** The shot selected on the timeline and the asset selected
     in the grid both survive it, so "Attach to selected shot" stays live on every tab.
 
@@ -122,17 +128,22 @@ SEEDED_ASSETS = [
     ("asset_plate", "video", "Stock plate"),
 ]
 
-#: The console entries this run causes on purpose. The clips library draws each take as a `<video>`
-#: pointed at ComfyUI's own `/view`, so every card fails while ComfyUI is unreachable -- which is
-#: the documented state for browser QA, and which this run *enforces* by pointing the application
-#: at a dead port. The H3 submission in step 6 fails for the same reason, deliberately: what is
-#: under test is the seed that was written before it. Declared by fragment rather than filtered
-#: away, so the gate stays a gate and anything unlisted still fails the run.
+#: The console entries this run causes on purpose. The H3 submission in step 6 fails because
+#: `MVP_COMFY_URL` is a dead port this run chose, deliberately: what is under test is the seed that
+#: was written before it. Declared by fragment rather than filtered away, so the gate stays a gate
+#: and anything unlisted still fails the run.
 #:
-#: `/take?v=` is the third: the fixture's shot points at a take filename that has no file behind
-#: it, because a real one would have to come off a GPU. The Monitor loads it and gets a 404. That
-#: is a property of the fixture, not of anything under test here.
-EXPECTED_CONSOLE = ["/view", "generate/h3", "/take?v="]
+#: `/take?v=` is the second: the fixture's shot points at a take filename that has no file behind
+#: it, because a real one would have to come off a GPU. The Monitor loads it and gets a 404, and
+#: since 2026-08-21 so does the Clips tab's card for that take -- the current take of a shot is
+#: served by this application from ComfyUI's output directory on disk, and this fixture puts
+#: nothing there. That is a property of the fixture, not of anything under test here.
+#:
+#: **`/view` is deliberately gone from this list.** Before 2026-08-21 every clip card was a
+#: `<video>` pointed at ComfyUI's own `/view`, so all three 404'd on every run of this script --
+#: which is the Director's report, sitting in the expected-errors list of the harness that was
+#: meant to catch it. A card that cannot be shown now says so instead of asking.
+EXPECTED_CONSOLE = ["generate/h3", "/take?v="]
 
 #: The seed row, as the browser has it: both controls, their geometry, and what the toggle says.
 SEED_ROW = """
@@ -187,6 +198,9 @@ return {
   emptyHint: (grid.querySelector('.library-empty span') || {}).textContent || '',
   clipCards: clips.querySelectorAll('.clip-card').length,
   clipVideos: clips.querySelectorAll('.clip-card video').length,
+  // Since 2026-08-21 a card whose take cannot be shown says so instead of drawing a broken
+  // `<video>`, so the two counts together are what "every take is accounted for" means.
+  clipUnplayable: clips.querySelectorAll('.clip-unplayable').length,
   clipJumps: clips.querySelectorAll('.clip-jump').length,
   clipsHeading: (clips.querySelector('.clips-heading') || {}).textContent || '',
   clipsEmpty: (clips.querySelector('.library-empty strong') || {}).textContent || '',
@@ -234,8 +248,11 @@ def seed_project(base_url: str) -> str:
     put_json(f"{base_url}/api/projects/{project_id}/shots", {"shots": [
         {"id": SHOT, "start": 0, "duration": 4, "prompt": "The corridor, pushing in on Lucy.",
          "mode": "text", "status": "complete", "seed": START_SEED, "latest_output": takes[1]},
+        # Settled, with its own take, since 2026-08-21: the per-shot randomizer ruling needs a
+        # *second* shot that Render again is actually offered for, so that "armed on A, striding
+        # on B" can be driven rather than argued.
         {"id": OTHER, "start": 4, "duration": 4, "prompt": "The same corridor, wider.",
-         "mode": "text", "status": "draft", "seed": 3},
+         "mode": "text", "status": "complete", "seed": 3, "latest_output": takes[2]},
     ]})
     project = get_json(f"{base_url}/api/projects/{project_id}")
     project["assets"] = [
@@ -259,18 +276,24 @@ def stored_seed(base_url: str, project_id: str, shot_id: str = SHOT) -> int:
     return int(next(shot["seed"] for shot in project["shots"] if shot["id"] == shot_id))
 
 
-def wait_for_seed_change(base_url: str, project_id: str, was: int, timeout: float = 12.0) -> int:
+def wait_for_seed_change(
+    base_url: str, project_id: str, was: int, timeout: float = 12.0, shot_id: str = SHOT
+) -> int:
     """The stored seed once it stops being `was` -- or whatever it still is at the timeout.
 
     Polls the *effect* rather than waiting for the panel to go quiet: `settle` returns as soon as
     nothing has mutated for its window, which a click whose PUT is still in flight satisfies
     trivially. Returning rather than raising keeps the caller's own sentence as the failure message.
+
+    `shot_id` is not decoration. It defaulted to `SHOT` and was read that way by every caller until
+    the per-shot randomizer arrived on 2026-08-21; a caller that had just requeued the *other*
+    shot then compared the wrong shot's number and reported a stride as a random roll.
     """
     deadline = time.monotonic() + timeout
-    seen = stored_seed(base_url, project_id)
+    seen = stored_seed(base_url, project_id, shot_id)
     while seen == was and time.monotonic() < deadline:
         time.sleep(0.15)
-        seen = stored_seed(base_url, project_id)
+        seen = stored_seed(base_url, project_id, shot_id)
     return seen
 
 
@@ -475,15 +498,23 @@ def main() -> None:
             )
             result["roll_on_tick"] = {"from": START_SEED, "to": rolled}
 
-            # === 4. It holds =================================================================
+            # === 4. It holds, and it is armed on ONE shot ====================================
             #
             # The panel is torn right down here -- another shot selected, then this one again,
             # each selection dragging its own readiness reply behind it -- because "hold it" is
             # the Director's word and a redraw that re-rolled would be the obvious wrong reading.
+            #
+            # **Per shot since 2026-08-21**, on the Director's ruling: *"Clicking randomize integer
+            # on a shot toggles it for all shots, it should be per shot."* It shipped session-wide
+            # the day before, and this assertion is the inversion of the one that was here then.
+            # Only a browser can see it: one module-level boolean and one module-level `Set` read
+            # identically in the source, and the difference shows up in a second shot's inspector.
             select_clip(driver, wait, OTHER)
             other_row = driver.execute_script(SEED_ROW)
-            assert other_row["checked"] is True, (
-                "the toggle is a session working mode and did not survive selecting another shot",
+            assert other_row["checked"] is False, (
+                ("ticking the randomizer on one shot armed another one, which is the Director's "
+                 "report: \"Clicking randomize integer on a shot toggles it for all shots, it "
+                 "should be per shot.\""),
                 other_row,
             )
             assert int(other_row["value"]) == 3, (
@@ -492,12 +523,45 @@ def main() -> None:
                 other_row,
             )
             select_clip(driver, wait, SHOT)
+            back_row = driver.execute_script(SEED_ROW)
+            assert back_row["checked"] is True, (
+                ("the toggle did not survive coming back to the shot it was ticked on, so it is "
+                 "not per shot -- it is per render of the inspector"),
+                back_row,
+            )
             held = seed_held(server.base_url, project_id, rolled)
             assert held == rolled, (
                 f"the seed moved from {rolled} to {held} without a render being asked for"
             )
-            assert int(driver.execute_script(SEED_ROW)["value"]) == rolled
+            assert int(back_row["value"]) == rolled
             result["held_across_rebuild"] = held
+            result["per_shot_toggle"] = {"armed_shot": True, "other_shot": other_row["checked"]}
+
+            # === 4b. A retake on the *unarmed* shot strides ==================================
+            #
+            # The other half of the ruling, and the one a checkbox's `checked` attribute cannot
+            # prove: with the randomizer armed on SHOT, a Render again on OTHER must take the
+            # server's own `RESUBMIT_SEED_STRIDE` and not a fresh roll. `nextRenderSeed` is still
+            # the single branch that decides; what changed is which shot's flag it is handed.
+            select_clip(driver, wait, OTHER)
+            other_before = stored_seed(server.base_url, project_id, OTHER)
+            driver.find_element(By.ID, "render-again").click()
+            WebDriverWait(driver, 10).until(EC.alert_is_present()).accept()
+            other_after = wait_for_seed_change(
+                server.base_url, project_id, other_before, shot_id=OTHER
+            )
+            assert other_after == other_before + RESUBMIT_SEED_STRIDE, (
+                ("a retake on a shot whose randomizer is *not* ticked was randomised anyway, so "
+                 f"the toggle is still session-wide: {other_before} -> {other_after}"),
+            )
+            # ...and the armed shot's own number did not move for someone else's render.
+            assert stored_seed(server.base_url, project_id, SHOT) == rolled, (
+                "requeueing one shot moved another shot's seed"
+            )
+            result["unarmed_shot_strides"] = {
+                "from": other_before, "to": other_after, "stride": RESUBMIT_SEED_STRIDE
+            }
+            select_clip(driver, wait, SHOT)
 
             # === 5. A hand-typed seed clears the toggle =======================================
             seed_input = driver.find_element(By.ID, "shot-seed")
@@ -549,8 +613,11 @@ def main() -> None:
                  "prompt": "The corridor, pushing in on Lucy.", "mode": "text",
                  "status": "complete", "seed": fixed_after,
                  "latest_output": f"music-video-producer/{project_id}/shots/{SHOT}-h3_00002-audio.mp4"},
+                # Put back the way the fixture seeded it -- settled, with its own take -- so the
+                # clips library still holds the three takes step 11 counts.
                 {"id": OTHER, "start": 4, "duration": 4, "prompt": "The same corridor, wider.",
-                 "mode": "text", "status": "draft", "seed": 3},
+                 "mode": "text", "status": "complete", "seed": 3,
+                 "latest_output": f"music-video-producer/{project_id}/shots/{OTHER}-h3_00001-audio.mp4"},
             ]})
             driver.refresh()
             wait.until(EC.presence_of_element_located((By.ID, "project-select")))
@@ -787,14 +854,29 @@ def main() -> None:
             # --- 11. The clips library is unchanged by the move ------------------------------
             click_tab(driver, "clips")
             facts = panes(driver)
-            assert facts["clipVideos"] == 3 and facts["clipJumps"] == 3, facts
+            # Three takes, three cards, three ways back to the shot -- and with ComfyUI at a dead
+            # port, two of them can still be shown: each shot's *current* take, which this
+            # application serves from ComfyUI's output directory on disk through
+            # `/shots/{id}/take`. The third is a superseded take, addressable only by its path,
+            # and only ComfyUI's `/view` serves a path. It says so rather than 404ing (2026-08-21).
+            assert facts["clipCards"] == 3 and facts["clipJumps"] == 3, facts
+            assert facts["clipVideos"] == 2, (
+                ("the Clips tab is drawing a video element for a take it cannot fetch; ComfyUI is "
+                 "at a dead port for this whole run"),
+                facts,
+            )
+            assert facts["clipUnplayable"] == 1, facts
+            assert facts["clipVideos"] + facts["clipUnplayable"] == facts["clipCards"], (
+                "a take is neither shown nor accounted for", facts
+            )
             assert "Generated clips" in facts["clipsHeading"], facts
             first_video = driver.find_element(By.CSS_SELECTOR, "#clips-library .clip-card video")
             visible_and_clickable(driver, first_video, "the first clip card")
-            # Hover-to-play is still bound. The source 404s (ComfyUI is deliberately unreachable),
-            # so what is asserted is that the gesture reaches the element's own play path rather
-            # than that a frame appeared -- `play()` on a failed source rejects, and the handler
-            # swallows that, which is exactly the behaviour that moved here unchanged.
+            # Hover-to-play is still bound. The source 404s (this fixture has no file on disk, and
+            # a real one would have to come off a GPU), so what is asserted is that the gesture
+            # reaches the element's own play path rather than that a frame appeared -- `play()` on
+            # a failed source rejects, and the handler swallows that, which is exactly the
+            # behaviour that moved here unchanged.
             played = driver.execute_script(
                 "const v = arguments[0];"
                 "let plays = 0, pauses = 0;"

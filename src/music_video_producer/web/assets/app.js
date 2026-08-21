@@ -8,7 +8,10 @@ import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clamp
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
-import { GAP_FILL_TOAST, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, anchoredNudge, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, playheadSnap, undoControl, undoGestureLabel } from "./api.js";
+import { GAP_FILL_TOAST, MIN_WINDOW_SECONDS, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, anchoredNudge, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, playheadSnap, splitShotPlan, undoControl, undoGestureLabel } from "./api.js";
+// The Clips tab's honest state when ComfyUI is not running, and the Assets panel's named attach
+// target -- two of the four interaction defects cleared on 2026-08-21.
+import { CLIP_RECHECK_LABEL, attachToShotControl, clipCardFace, clipPreviewState } from "./api.js";
 // The shot-length band, as the server judges it: the report carries the verdict and the clip
 // reads it. Nothing on this side re-derives the band -- see `clipWindowState` for why.
 import { clipWindowState, windowWarningsByShot } from "./api.js";
@@ -264,6 +267,11 @@ async function loadProject(id) {
   if (documentConsentClearedOnLoad(state.project?.id, id)) {
     clearDocumentConsent(applyDocumentsControl());
     unlockedFromMusic.clear();
+    // The seed randomizer, per shot since 2026-08-21 and cleared on the same test for the same
+    // reason: ids collide across projects, so a set carried into another project would arm the
+    // randomizer on a shot nobody has looked at -- and a *refresh* must not untick a box the
+    // Director ticked a second ago.
+    randomizeSeedShots.clear();
   }
   // Whatever readiness this client held belongs to the project being left, and the revision bump
   // discards an answer still in flight for it. A readiness report drawn under another project's
@@ -847,7 +855,13 @@ function clipLibraryRows() {
 function renderClipsLibrary() {
   const region = $("#clips-library");
   if (!region) return;
-  const comfyUrl = state.health?.comfy?.url || "http://127.0.0.1:8188";
+  // Whether a `<video>` may be drawn at all, decided by `clipPreviewState` off the health answer
+  // this browser actually holds. The Director's report (2026-08-21) is that this tab goes blank
+  // when ComfyUI is down -- which is not an error here, because the Director starts ComfyUI
+  // separately and this application is forbidden from starting it. A card that says the take
+  // cannot be shown, and why, is worth more than a broken video element; see the function for
+  // why the project-media route cannot serve these files instead.
+  const preview = clipPreviewState(state.health);
   const rows = clipLibraryRows();
   if (!rows.length) {
     // An empty tab says so, rather than rendering nothing and reading as a panel that failed to
@@ -856,12 +870,38 @@ function renderClipsLibrary() {
     region.innerHTML = `<div class="library-empty"><strong>${escapeHtml(empty.title)}</strong><span>${escapeHtml(empty.hint)}</span></div>`;
     return;
   }
-  region.innerHTML = `<h3 class="clips-heading">Generated clips · ${rows.length}</h3><div class="clips-grid">${rows.map((row) =>
-    `<div class="clip-card"><video preload="metadata" muted src="${escapeHtml(comfyOutputUrl(comfyUrl, row.file))}" title="${escapeHtml(row.file)}"></video><footer><span>${escapeHtml(shotLabel(state.project, row.shotId))}</span><button class="quiet-button clip-jump" data-shot-id="${escapeHtml(row.shotId)}">Open shot</button></footer></div>`
-  ).join("")}</div>`;
+  // Each card decides for itself where its picture comes from: the shot's *current* take is served
+  // by this application off ComfyUI's output directory on disk (the same route the Monitor plays,
+  // which needs no ComfyUI process), and only an earlier take has to go through ComfyUI's `/view`.
+  // That is what makes this tab work at all while ComfyUI is down, and it is most of the tab.
+  const faces = rows.map((row) => ({ row, face: clipCardFace(state.project, row, preview) }));
+  // One notice for the whole tab rather than a sentence on each of thirty-three cards, and only
+  // when there is actually a card it cannot show -- a tab whose takes all play needs no apology
+  // for a ComfyUI it never asked for. Nothing here polls: a tab that quietly re-probed ComfyUI
+  // every render would be this application deciding how often to knock on a process it does not own.
+  const notice = faces.every((entry) => entry.face.playable) ? "" : `<div class="clips-offline"><strong>${escapeHtml(preview.title)}</strong><span>${escapeHtml(preview.note)}</span></div>`;
+  // The re-check sits in the heading and is drawn in **both** states, not only the offline one.
+  // A control that appears only once the browser already knows ComfyUI is down could never be
+  // pressed by a Director whose ComfyUI stopped after this page loaded -- health is fetched at
+  // boot and nowhere else, so that session would go on drawing broken cards with no way to ask.
+  // It is the same button either way, and the answer it gets is what changes.
+  region.innerHTML = `<div class="clips-heading-row"><h3 class="clips-heading">Generated clips · ${rows.length}</h3><button class="quiet-button" id="clips-recheck" title="Ask the application to probe ComfyUI again. These takes play from ComfyUI's own /view endpoint, so whether they can be shown depends on it answering.">${escapeHtml(CLIP_RECHECK_LABEL)}</button></div>${notice}<div class="clips-grid">${faces.map(({ row, face }) => {
+    // The take's own filename stays on the card in both states: it is the take's identity, it is
+    // what names the file on disk, and it is the one fact that does not depend on ComfyUI.
+    const picture = face.playable
+      ? `<video preload="metadata" muted src="${escapeHtml(face.url)}" data-via="${face.via}" title="${escapeHtml(row.file)}"></video>`
+      : `<div class="clip-unplayable" title="${escapeHtml(row.file)}">${escapeHtml(face.title)}</div>`;
+    return `<div class="clip-card">${picture}<footer><span>${escapeHtml(shotLabel(state.project, row.shotId))}</span><button class="quiet-button clip-jump" data-shot-id="${escapeHtml(row.shotId)}">Open shot</button></footer></div>`;
+  }).join("")}</div>`;
   $$(".clip-card video", region).forEach((video) => {
     video.addEventListener("mouseenter", () => { video.play().catch(() => {}); });
     video.addEventListener("mouseleave", () => { video.pause(); video.currentTime = 0; });
+  });
+  // Ask health again, then redraw. `loadHealth` swallows its own failure and repaints the ComfyUI
+  // dot in the header, so a re-check that finds nothing leaves the same honest card behind.
+  $("#clips-recheck", region)?.addEventListener("click", async () => {
+    await loadHealth();
+    renderAssets();
   });
   $$(".clip-jump", region).forEach((button) => button.addEventListener("click", () => {
     state.selectedShotId = button.dataset.shotId;
@@ -907,7 +947,14 @@ export function renderAssetInspector() {
   const replaceInHtml = replaceIn.shown
     ? `<button class="quiet-button full" id="replace-in-shots" style="margin-top:8px" title="Re-point every shot citing this asset at another one. You see the whole list before anything is written, and nothing is deleted or rendered.">${escapeHtml(replaceIn.label)}</button>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${anchorHtml}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}<button class="quiet-button full" id="attach-asset" style="margin-top:8px" ${selectedShot() ? "" : "disabled"}>Attach to selected shot</button>${replaceInHtml}<button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>${replaceHtml}`;
+  // "Attach to selected shot", named. The Director's report (2026-08-21) is that it is hard to use
+  // "since cant see timeline from assets page" -- so the button says which shot it will write to
+  // and the line under it carries that shot's window and the opening of its intent. Decided by
+  // `attachToShotControl`, which is also what shuts it: with no selection, and on an asset this
+  // shot already cites, where the click was a no-op that toasted success anyway.
+  const attach = attachToShotControl(state.project, state.selectedShotId, asset.id, asset.name);
+  const attachHtml = `<button class="quiet-button full" id="attach-asset" style="margin-top:8px" title="${escapeHtml(attach.title)}" ${attach.disabled ? "disabled" : ""}>${escapeHtml(attach.label)}</button><p class="control-reason" id="attach-asset-target">${escapeHtml(attach.caption)}</p>`;
+  inspector.innerHTML = `<span class="eyebrow">${escapeHtml(asset.kind)}</span><h2>${escapeHtml(asset.name)}</h2><div class="asset-preview">${url ? `<img src="${url}" alt="${escapeHtml(asset.name)}">` : "Awaiting output"}</div><div class="meta-list"><b>Source</b><span>${escapeHtml(asset.source)}</span><b>Prompt ID</b><span>${escapeHtml(asset.prompt_id || "—")}</span><b>Created</b><span>${new Date(asset.created_at).toLocaleString()}</span></div>${vision}${anchorHtml}${asset.prompt ? `<label>Generation prompt<textarea rows="7" readonly>${escapeHtml(asset.prompt)}</textarea></label>` : ""}<button class="quiet-button full" id="analyze-asset" ${asset.path && !["audio"].includes(asset.kind) ? "" : "disabled"}>Inspect with vision model</button>${promotion ? `<button class="primary-button full" id="create-multiview" ${promotion.ready ? "" : "disabled"}>Create Krea multiview sheet</button>` : ""}${mod ? `<button class="primary-button full" id="ai-mod-asset" ${mod.ready ? "" : "disabled"} title="Prompt an image edit. A new asset is produced beside this one — keep it, delete it to reject, or mod it again. The source is never changed.">AI Mod (image edit)</button>` : ""}${attachHtml}${replaceInHtml}<button class="danger-button full" id="delete-asset" style="margin-top:8px" title="Remove this asset from the library. Refused by name while any shot cites it; an uploaded file goes with it, a generated file stays in ComfyUI's output tree.">Delete asset</button>${replaceHtml}`;
   $("#attach-asset")?.addEventListener("click", attachSelectedAsset);
   $("#delete-asset")?.addEventListener("click", async () => {
     if (!window.confirm(`Delete ${asset.name} from the library?`)) return;
@@ -1782,9 +1829,9 @@ function bindClip(clip) {
         if (takeAnchor(shot).held) {
           const lead = shot.latest_take_lead || 0;
           const floor = original.start - Math.max(0, lead + original.nudge);
-          moveWindowStart(shot, clamp(want, Math.max(0, floor), end - .5), original);
+          moveWindowStart(shot, clamp(want, Math.max(0, floor), end - MIN_WINDOW_SECONDS), original);
         } else {
-          moveWindowStart(shot, clamp(want, 0, end - .5), original);
+          moveWindowStart(shot, clamp(want, 0, end - MIN_WINDOW_SECONDS), original);
         }
         shot.duration = exactSeconds(end - shot.start);
         // Only when the clamp did not fight the magnet: an edge held off the playhead by the
@@ -1795,8 +1842,8 @@ function bindClip(clip) {
       if (mode === "right") {
         const pull = magnet(original.start + original.duration + delta);
         shot.duration = pull.snapped
-          ? Math.max(.5, exactSeconds(pull.seconds - shot.start))
-          : Math.max(.5, grid(original.duration + snapped));
+          ? Math.max(MIN_WINDOW_SECONDS, exactSeconds(pull.seconds - shot.start))
+          : Math.max(MIN_WINDOW_SECONDS, grid(original.duration + snapped));
         if (pull.snapped && exactSeconds(shot.start + shot.duration) === pull.seconds) magnetised = pull.seconds;
       }
       state.dirty = true;
@@ -1931,23 +1978,35 @@ function shotCitationRows(shot, assets) {
   }).join("");
 }
 
-// Whether the next queued retake rolls a fresh seed. Session-wide and session-only, on the
-// precedent of the two line mutes and the snap magnet: never persisted, never sent, never in the
-// manifest.
+// Which shots re-roll their seed at their next Render again, by id. Empty means every shot keeps
+// the number it has, which is what a project opens with.
 //
-// Deliberately NOT a field on the Shot. A per-shot persisted flag is a new model field, and this
-// application's repeat offender is the generic full-project PUT writing every defaulted field back
-// -- so a new field earns its keep or it is not added. This one would not: what is durable about
-// randomizing is the *number*, and the number is already a persisted per-shot field that this
-// toggle writes. The flag itself is a working mode -- "I want different takes right now" -- which
-// is a fact about the session in front of the screen, not about the shot. Session-wide rather than
-// per-shot for the same reason: a Director sweeping ten shots with Render again asked for
-// randomness once, not ten times.
+// **Per shot since 2026-08-21, on the Director's ruling**: *"Clicking randomize integer on a shot
+// toggles it for all shots, it should be per shot."* It shipped session-wide the day before, on
+// the reasoning that a Director sweeping ten shots with Render again asked for randomness once;
+// the Director has overruled that, and the shape here is now `unlockedFromMusic`'s, written in
+// this file on the same day for the sister reason -- the state is dangerous on the *next* shot,
+// and a Director who ticks a box on one clip does not mean it for a clip they have not looked at.
 //
-// The consequence, stated because it is visible: ticking rolls a seed for the *selected* shot
-// only. Moving to another shot leaves the box ticked and that shot's stored seed untouched until
-// its own Render again queues -- which is what `RANDOM_SEED_LABEL` says on the control.
-let randomizeSeed = false;
+// Still deliberately NOT a field on the Shot, which the ruling does not change. A per-shot
+// persisted flag is a new model field, and this application's repeat offender is the generic
+// full-project PUT writing every defaulted field back -- so a new field earns its keep or it is
+// not added. This one would not: what is durable about randomizing is the *number*, and the number
+// is already a persisted per-shot field that this toggle writes. The flag itself is a working mode
+// -- "I want a different take of this shot" -- which is a fact about the session in front of the
+// screen.
+//
+// Cleared when the project on screen *changes*, never on a refresh of the one already there, and
+// through the same `documentConsentClearedOnLoad` test the music lock uses: ids collide across
+// projects, and a queue poll unticking the box mid-gesture would be the control fighting them.
+const randomizeSeedShots = new Set();
+
+// Whether this shot re-rolls at its next Render again. One reader for the checkbox, the hand-typed
+// clear and the retake, so the box on screen and the seed that is written can never disagree about
+// which shot was asked -- the same rule `takeAnchor` follows for the music lock.
+function randomizeSeedFor(shotId) {
+  return randomizeSeedShots.has(shotId);
+}
 
 // Exported for the executed frontend contract, on the `renderSong` precedent: the render-again
 // control is drawn, enabled and bound in here, and a test that only read this source could not
@@ -2199,8 +2258,9 @@ export function renderShotInspector() {
   // the toggle -- whose label names the one moment it re-rolls, because a toggle whose re-roll
   // moment has to be guessed is worse than a button.
   //
-  // `randomizeSeed` is a session working mode, not a field on the Shot: see its declaration.
-  const seedHtml = `<div class="seed-row"><label class="seed-field">Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label class="lock-toggle seed-randomize" title="${escapeHtml(RANDOM_SEED_HELP)}"><input id="${RANDOM_SEED_CONTROL}" type="checkbox" ${randomizeSeed ? "checked" : ""}>${escapeHtml(RANDOM_SEED_LABEL)}</label></div>`;
+  // The toggle is a session working mode, not a field on the Shot, and it is asked *of this shot*
+  // -- the Director's ruling of 2026-08-21. See `randomizeSeedShots`.
+  const seedHtml = `<div class="seed-row"><label class="seed-field">Seed<input id="shot-seed" type="number" min="0" value="${shot.seed}"></label><label class="lock-toggle seed-randomize" title="${escapeHtml(RANDOM_SEED_HELP)}"><input id="${RANDOM_SEED_CONTROL}" type="checkbox" ${randomizeSeedFor(shot.id) ? "checked" : ""}>${escapeHtml(RANDOM_SEED_LABEL)}</label></div>`;
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
@@ -2215,8 +2275,11 @@ export function renderShotInspector() {
   //
   // Order matters: the flag is cleared before the write, so the rebuild `updateShotFromInspector`
   // triggers draws the box unticked in the same gesture that typed the number.
+  //
+  // It clears the toggle for **this shot** and no other, since 2026-08-21: typing a number on one
+  // clip says nothing about a clip the Director has not opened.
   $("#shot-seed").addEventListener("change", () => {
-    randomizeSeed = false;
+    randomizeSeedShots.delete(shot.id);
     updateShotFromInspector();
   });
   // Ticking rolls once, now, and holds -- the Director's word. It writes the shot's own seed
@@ -2227,8 +2290,10 @@ export function renderShotInspector() {
   // becomes an ordinary fixed seed, because deleting a value the Director may be about to compare
   // against is not something a checkbox should do.
   $("#" + RANDOM_SEED_CONTROL).addEventListener("change", (event) => {
-    randomizeSeed = Boolean(event.target.checked);
-    if (!randomizeSeed) return;
+    const wanted = Boolean(event.target.checked);
+    if (wanted) randomizeSeedShots.add(shot.id);
+    else randomizeSeedShots.delete(shot.id);
+    if (!wanted) return;
     shot.seed = randomSeed();
     state.dirty = true;
     saveShotsSilently();
@@ -2404,7 +2469,10 @@ export function renderShotInspector() {
       // is the gesture that spends GPU time, and it is the only one whose whole point is a
       // different take. Cancelling the dialog above returns before this line, so the old contract
       // holds unchanged -- re-opened, seed untouched, nothing queued.
-      if (fresh) fresh.seed = nextRenderSeed(fresh, randomizeSeed);
+      //
+      // Asked of *this shot's* toggle since 2026-08-21 (`randomizeSeedFor`): a retake on a shot
+      // whose box is unticked strides, whatever was ticked on another clip.
+      if (fresh) fresh.seed = nextRenderSeed(fresh, randomizeSeedFor(shot.id));
       // Through the one blessed shot saver, then awaited settled, because the render reads
       // the seed from the store: a stride still on the wire at submission renders the
       // identical take.
@@ -3218,17 +3286,23 @@ function syncMonitor() {
   }
 }
 
+// The same decision the button was drawn from, asked again at the click. The button is already
+// shut in both refusing cases, so this is the belt to that brace -- but it says the reason rather
+// than returning silently, because a control that appears to do nothing is the report this whole
+// thread started from. The success toast names the shot too: from the Assets panel the timeline is
+// not on screen, so "attached to shot" was the one thing the Director could not check.
 function attachSelectedAsset() {
   const asset = selectedAsset();
-  const shot = selectedShot();
-  if (!asset || !shot) return;
-  if (!shotCitations(shot).some((citation) => citation.asset_id === asset.id)) {
-    shot.citations = [...shotCitations(shot), { asset_id: asset.id, role: "reference", order: shotCitations(shot).length }];
-    reconcileShotCitations(shot);
-  }
+  if (!asset) return;
+  const attach = attachToShotControl(state.project, state.selectedShotId, asset.id, asset.name);
+  if (attach.disabled) return toast(attach.reason, "error");
+  const shot = attach.shot;
+  shot.citations = [...shotCitations(shot), { asset_id: asset.id, role: "reference", order: shotCitations(shot).length }];
+  reconcileShotCitations(shot);
   saveShotsSilently();
   renderTimeline();
-  toast(`${asset.name} attached to shot`);
+  renderAssetInspector();
+  toast(`${asset.name} attached to ${shotLabel(state.project, shot.id)}`);
 }
 
 function bindEvents() {
@@ -3238,6 +3312,15 @@ function bindEvents() {
     $$(".rail-item").forEach((item) => item.classList.toggle("active", item === button));
     $$(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === `panel-${state.activePanel}`));
     if (state.activePanel === "timeline") requestAnimationFrame(renderTimeline);
+    // The asset inspector's attach control names the shot it will write to (the Director's report,
+    // 2026-08-21), and the only way to change that selection is to leave this panel and come back.
+    // Without this the caption is drawn once and then goes stale: the Assets panel would say
+    // "Attach to SHOT 01" while SHOT 02 was the one selected on the timeline -- a named target that
+    // names the wrong thing, which is worse than the unnamed button it replaced.
+    //
+    // Synchronously, unlike the timeline above: that one is deferred because it measures a canvas
+    // and needs the panel's layout to have happened, and this one only writes `innerHTML`.
+    if (state.activePanel === "assets") renderAssetInspector();
   }));
   $("#project-select").addEventListener("change", async (event) => {
     const previousId = state.project?.id || "";
@@ -3717,7 +3800,22 @@ function bindEvents() {
   // nothing, so it carries the plan and no take. The first half keeps everything it had --
   // narrowing a window is not a reason to touch a pointer, and the take it names is still the
   // last thing this Shot rendered.
-  $("#split-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot || shot.duration < 1) return; const half = shot.duration / 2; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + half, duration: half }); shot.duration = half; state.project.shots.push(copy); saveShotsSilently("split"); renderTimeline(); });
+  //
+  // It said **nothing at all** about a window it could not halve until 2026-08-21 -- the same
+  // shape as the report that started this thread, a control that appears to do nothing.
+  // `splitShotPlan` owns both the arithmetic and the sentence; the halves it returns are the two
+  // windows written here.
+  $("#split-shot").addEventListener("click", () => {
+    const shot = selectedShot();
+    const plan = splitShotPlan(state.project, shot);
+    if (!plan.ok) return toast(plan.refusal, "error");
+    const [first, second] = plan.halves;
+    const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: second.start, duration: second.duration });
+    shot.duration = first.duration;
+    state.project.shots.push(copy);
+    saveShotsSilently("split");
+    renderTimeline();
+  });
   $("#monitor-fullscreen")?.addEventListener("click", () => {
     const monitor = $("#timeline-monitor");
     if (document.fullscreenElement) document.exitFullscreen();
