@@ -463,18 +463,58 @@ def shot_vocal_overlap(song, *, start: float, duration: float) -> float | None:
 _SHEET_TAG = re.compile(r"^[ \t]*\[([^\]\r\n]+)\][ \t]*$", re.MULTILINE)
 
 
-def lyric_blocks(lyrics: str) -> list[tuple[str, str]]:
-    """The sheet's own structure: ``(tag, block text)`` in order of appearance."""
+def _sheet_blocks(lyrics: str) -> list[tuple[str, str, tuple[int, ...]]]:
+    """The sheet's blocks with the **sheet line numbers** each one owns.
+
+    ``(tag, block text, line indices)``. The line numbers are `lyric_line_tags`' own — every
+    line of the sheet counted, blanks and `[Tag]` headers included — so a block's words and a
+    line's singer mark are addressed by the same number. Blank lines inside a block are left
+    out of the tuple, because a blank line is not sung and nothing can be aligned to it.
+
+    One segmentation, two readers: `lyric_blocks` projects the first two fields and
+    `align_lyric_lines` needs the third. A second walk over the sheet's `[Tag]` positions is
+    exactly the kind of duplicate rule this codebase keeps being bitten by — it would place a
+    line in one block for timing and another for tagging the first time the two disagreed.
+    """
     if not lyrics.strip():
         return []
-    blocks: list[tuple[str, str]] = []
+    # `_SHEET_TAG` is anchored with `^[ \t]*`, so every match starts at a line start; that is
+    # what makes this offset lookup exact rather than a search.
+    parts = _LINE_SPLIT.split(lyrics)
+    line_of: dict[int, int] = {}
+    offset = 0
+    for number, position in enumerate(range(0, len(parts), 2)):
+        line_of[offset] = number
+        offset += len(parts[position])
+        if position + 1 < len(parts):
+            offset += len(parts[position + 1])
     matches = list(_SHEET_TAG.finditer(lyrics))
+    headers = [line_of[match.start()] for match in matches]
+    line_count = (len(parts) + 1) // 2
+    blocks: list[tuple[str, str, tuple[int, ...]]] = []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(lyrics)
         text = lyrics[match.end():end].strip()
-        if text:
-            blocks.append((match.group(1).strip(), text))
+        if not text:
+            continue
+        stop = headers[index + 1] if index + 1 < len(matches) else line_count
+        blocks.append(
+            (
+                match.group(1).strip(),
+                text,
+                tuple(
+                    number
+                    for number in range(headers[index] + 1, stop)
+                    if parts[2 * number].strip()
+                ),
+            )
+        )
     return blocks
+
+
+def lyric_blocks(lyrics: str) -> list[tuple[str, str]]:
+    """The sheet's own structure: ``(tag, block text)`` in order of appearance."""
+    return [(tag, text) for tag, text, _lines in _sheet_blocks(lyrics)]
 
 
 #: A per-line singer mark at the head of a lyric line: `(S1)`, `(S1, S2)`, `(s1,s2)`.
@@ -754,10 +794,40 @@ def _tokens_agree(sheet: str, heard: str) -> bool:
     return len(shorter) >= 4 and longer.startswith(shorter)
 
 
+def _heard_tokens(
+    words: list[tuple[str, float, float]]
+) -> list[tuple[str, float, float]]:
+    """The transcript as comparable tokens, each carrying the word's own clock.
+
+    One word can tokenise to several — Whisper writes "spread-eagle" as one word — and each
+    piece keeps the whole word's span, which is the only honest answer: the transcript does
+    not say where inside a word one syllable stopped.
+    """
+    heard: list[tuple[str, float, float]] = []
+    for text, start, end in words:
+        for token in _lyric_tokens(text):
+            heard.append((token, start, end))
+    return heard
+
+
 def align_lyric_blocks(
     lyrics: str, words: list[tuple[str, float, float]]
 ) -> list[tuple[str, float, float]]:
-    """Each `[Tag]` block of the sheet, timed against transcribed words: (tag, start, end).
+    """Each `[Tag]` block of the sheet, timed against transcribed words: (tag, start, end)."""
+    blocks = _sheet_blocks(lyrics)
+    return [
+        (blocks[index][0], start, end) for index, start, end in _align_blocks(lyrics, words)
+    ]
+
+
+def _align_blocks(
+    lyrics: str, words: list[tuple[str, float, float]]
+) -> list[tuple[int, float, float]]:
+    """`align_lyric_blocks`, keyed by the block's index into `_sheet_blocks` rather than its tag.
+
+    The index is what a caller needs to reach the block's *lines*, and a tag cannot give it:
+    tags repeat, and a block that never anchored is omitted, so the Nth answer is not the Nth
+    block. `align_lyric_blocks` projects the tag back out for every existing caller.
 
     The sheet is the truth about the words; the transcript is the truth about the clock.
     Both run in song order, so the walk is monotonic: one pointer into the transcript,
@@ -772,14 +842,11 @@ def align_lyric_blocks(
     chorus and verses are" — this is the sheet-tags half; `Song.vocal_spans` is the
     words-at-all half.
     """
-    blocks = lyric_blocks(lyrics)
-    heard: list[tuple[str, float, float]] = []
-    for text, start, end in words:
-        for token in _lyric_tokens(text):
-            heard.append((token, start, end))
-    aligned: list[tuple[str, float, float]] = []
+    blocks = _sheet_blocks(lyrics)
+    heard = _heard_tokens(words)
+    aligned: list[tuple[int, float, float]] = []
     cursor = 0
-    for tag, text in blocks:
+    for block_index, (_tag, text, _lines) in enumerate(blocks):
         tokens = _lyric_tokens(text)
         if not tokens:
             continue
@@ -837,9 +904,98 @@ def align_lyric_blocks(
                 continue
             chosen = fallback[1]
         first, last = chosen
-        aligned.append((tag, window[first][1], window[last][2]))
+        aligned.append((block_index, window[first][1], window[last][2]))
         cursor = cursor + last + 1
     return aligned
+
+
+@dataclass(frozen=True, slots=True)
+class LyricLineSpan:
+    """One sung line of the sheet, timed, with whoever the sheet says sings it.
+
+    `index` is `LyricLine.index` — a number into the sheet's own lines — so a caller holding
+    one of these can reach the very line the Director typed, mark and all.
+
+    `slots` are the `Asset.character_slot` numbers the line's `(S1)` mark names, and `()` is
+    **untagged, not unsung**: every line of every sheet written before per-line marks existed
+    reads `()`, and nothing may read that as "the first singer". The distinction is the same
+    one `shot_vocal_overlap` draws between silent and unmeasured.
+
+    `start`/`end` are the first and last *heard* word this line matched, so the span is a
+    measurement rather than a share-out of the block's length. A line no word of which was
+    heard produces no span at all — it is omitted, `align_lyric_blocks`' rule for a block that
+    never anchored.
+    """
+
+    index: int
+    text: str
+    slots: tuple[int, ...]
+    start: float
+    end: float
+
+
+def align_lyric_lines(
+    lyrics: str, words: list[tuple[str, float, float]]
+) -> list[LyricLineSpan]:
+    """Every sung line of the sheet, timed against the transcript, in song order.
+
+    **Composed, not re-derived.** `_align_blocks` places each `[Tag]` block against the
+    transcript — with all of the repeat-defeating machinery that took to get right — and this
+    only splits one block's own span among its own lines. Aligning lines directly against the
+    whole transcript would need a second answer to the refrain problem (a chorus's lines match
+    every other chorus's), and two answers to that question is precisely how a line would end
+    up timed to the wrong verse.
+
+    Inside a block the walk is one LCS of the block's tokens, each token carrying the line it
+    was typed on, against the words heard within the block's span. Because the LCS is ordered,
+    the matched words run strictly forward, so the lines come out in order and no two spans
+    overlap. A line whose words were all misheard is dropped rather than given the gap between
+    its neighbours: this is the fact a shot's citations will be chosen from, and an invented
+    line is worse than a missing one.
+
+    Empty for an unmeasured song (`words` empty) and for a sheet with no `[Tag]` blocks —
+    both are "nothing was aligned", stated by the empty list rather than by a guess. Neither
+    needs a guard here: `_align_blocks` places no block without a transcript and no block from
+    a sheet that has none, so both cases arrive as an empty loop.
+    """
+    sheet = lyric_line_tags(lyrics)
+    blocks = _sheet_blocks(lyrics)
+    heard = _heard_tokens(words)
+    spans: list[LyricLineSpan] = []
+    for block_index, start, end in _align_blocks(lyrics, words):
+        _tag, _text, lines = blocks[block_index]
+        # The heard words this block was measured to span. Whole words only: a word half
+        # inside the block belongs to the block that heard its start.
+        window = [
+            token for token in heard if token[1] >= start - 1e-9 and token[2] <= end + 1e-9
+        ]
+        tokens: list[str] = []
+        owners: list[int] = []
+        for number in lines:
+            for token in _lyric_tokens(sheet[number].text):
+                tokens.append(token)
+                owners.append(number)
+        if not tokens or not window:
+            continue
+        _count, pairs = _lcs_pairs(tokens, window)
+        matched: dict[int, list[int]] = {}
+        for token_index, window_index in pairs:
+            matched.setdefault(owners[token_index], []).append(window_index)
+        for number in lines:
+            hits = matched.get(number)
+            if not hits:
+                continue
+            line = sheet[number]
+            spans.append(
+                LyricLineSpan(
+                    index=number,
+                    text=line.text.strip(),
+                    slots=line.slots,
+                    start=window[hits[0]][1],
+                    end=window[hits[-1]][2],
+                )
+            )
+    return spans
 
 
 def _lcs_matches(
@@ -847,8 +1003,20 @@ def _lcs_matches(
 ) -> tuple[int, list[int]]:
     """Longest common subsequence of a block against a transcript slice.
 
-    Returns the match count and the traceback's window indices, in order. Plain LCS —
-    ordered, gaps free on both sides — because that is what survives a mishearing
+    Returns the match count and the traceback's window indices, in order. `_lcs_pairs` with
+    the token half projected away — the block walk only ever needed to know *which words* were
+    heard, and the line walk needs to know which sheet token each of them answered.
+    """
+    count, pairs = _lcs_pairs(tokens, window)
+    return count, [position for _token, position in pairs]
+
+
+def _lcs_pairs(
+    tokens: list[str], window: list[tuple[str, float, float]]
+) -> tuple[int, list[tuple[int, int]]]:
+    """Longest common subsequence, as ``(token index, window index)`` pairs in order.
+
+    Plain LCS — ordered, gaps free on both sides — because that is what survives a mishearing
     mid-line where any greedy walk loses its place.
     """
     n, m = len(tokens), len(window)
@@ -861,10 +1029,10 @@ def _lcs_matches(
             else:
                 row[j] = max(next_row[j], row[j + 1])
     i = j = 0
-    matches: list[int] = []
+    matches: list[tuple[int, int]] = []
     while i < n and j < m:
         if _tokens_agree(tokens[i], window[j][0]):
-            matches.append(j)
+            matches.append((i, j))
             i += 1
             j += 1
         elif table[i + 1][j] >= table[i][j + 1]:
@@ -1442,7 +1610,14 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
 #   exactly, to the last bit of the float.
 # * **Cuts are decided left to right**, each against the boundary its left neighbour has
 #   already settled on and against its right neighbour's *original* edge. That is what makes
-#   the band check exact rather than provisional: see `snap_cut_plan`.
+#   the band check exact rather than provisional: see `snap_window_plan`.
+#
+# **One implementation, two doors.** `snap_window_plan` is the whole of the decision and it
+# knows nothing about Shots; `snap_cut_plan` is the door from a project's timeline (the
+# snap-cuts route) and `app.line_up_shots` is the door from a freshly laid-out tiling that has
+# no shots yet (populate's second step). A second snapper for the second caller would put a cut
+# in one place or another depending on which door the Director came through, which is the
+# reference-map-numbering defect wearing different clothes.
 # ------------------------------------------------------------------------------------------
 
 #: How far *inside* a voiceless gap a snapped cut must land, at either end of the gap.
@@ -1562,10 +1737,17 @@ SNAP_WITHOUT_CUTS = (
     "A cut is the boundary two shots share, and this plan has {count} shot(s), so there is "
     "no cut to snap."
 )
+#: A gap and an overlap are *different* defects to this application and the sentence says so.
+#: Assembly refuses a gap — there is no picture for those seconds — but since the Director's
+#: overlap ruling (2026-08-20) it treats an overlap as a **layer**, cutting the earlier clip at
+#: the later one's start, so an overlapping plan is a legitimate editing gesture. It still has
+#: no single boundary to move, which is what this refusal is about; claiming assembly refuses
+#: it too would be repeating a sentence that stopped being true.
 SNAP_NOT_CONTIGUOUS = (
     "This plan is not a contiguous tiling — {before} ends at {end:.3f}s but {after} starts at "
-    "{start:.3f}s — so the two do not share a cut to move. Close the gap (or the overlap) "
-    "first; assembly refuses the plan for the same reason."
+    "{start:.3f}s — so the two do not share a cut to move. A gap there is a hole assembly "
+    "refuses the plan for; an overlap is a layer assembly accepts. Either way there is no one "
+    "boundary here to place, so close it first or move this cut by hand."
 )
 
 
@@ -1758,6 +1940,56 @@ def window_move_refusal(
     return ""
 
 
+@dataclass(frozen=True, slots=True)
+class SnapWindow:
+    """One window offered to the snapper: where it is, what to call it, whether it may move.
+
+    The whole of what `snap_window_plan` needs to know about a window, and deliberately not a
+    `Shot`: the second caller — populate's line-up step — is snapping a tiling that has no
+    shots yet, and a core that could only be given Shots would have forced a second
+    implementation for it. The two protections a Shot carries arrive as `refusal`, already
+    worded, because `window_move_refusal` is the one reader of a Shot's lock, its approval and
+    its in-flight render, and a second walk over those is the guard hole this codebase keeps
+    finding.
+
+    `id` is the address the plan's windows come back on — a Shot's id for the timeline route,
+    a positional name for a layout that has none. `refusal` is `""` when the window may move.
+    """
+
+    id: str
+    start: float
+    duration: float
+    label: str
+    refusal: str = ""
+
+    @property
+    def end(self) -> float:
+        return self.start + self.duration
+
+
+def shot_snap_windows(
+    project: Project, *, rendering: frozenset[str] = frozenset()
+) -> list[SnapWindow]:
+    """A project's timeline as windows the snapping core can be handed, in song order.
+
+    The one place a Shot becomes a `SnapWindow`, so the two routes that snap a *stored*
+    timeline — `snap-cuts` and a project-sourced `line-up` — name their shots the same way and
+    honour the same protections. Both facts would be trivially easy to write twice and
+    trivially easy to get subtly different, which is how the same cut would come back
+    protected on one route and movable on the other.
+    """
+    return [
+        SnapWindow(
+            id=shot.id,
+            start=shot.start,
+            duration=shot.duration,
+            label=shot_label(project, shot),
+            refusal=window_move_refusal(project, shot, rendering=rendering),
+        )
+        for shot in ordered_shots(project)
+    ]
+
+
 def snap_cut_plan(
     project: Project,
     *,
@@ -1766,11 +1998,45 @@ def snap_cut_plan(
     minimum: float = H3_MIN_SHOT_SECONDS,
     maximum: float = H3_MAX_SHOT_SECONDS,
 ) -> CutSnapPlan:
-    """Propose a new position for every cut in the plan. Pure, I/O-free, writes nothing.
+    """Snap the cuts of a **project's timeline**. Pure, I/O-free, writes nothing.
+
+    One of the two doors onto `snap_window_plan`, and it is the door that knows about Shots:
+    it puts them in song order, names each the way the Director sees it, and asks
+    `window_move_refusal` which of them are protected. Every decision about where a cut goes
+    is the core's — see `snap_window_plan`, including for the band and the contiguity
+    guarantee. Populate's line-up step comes through the other door with the same core, so a
+    cut cannot land in one place because it was reached from the timeline and another because
+    it was reached from a fresh layout.
+
+    Raises `TimelineError` when the plan is not already a contiguous tiling, because then the
+    two shots at a "cut" do not share a boundary and there is nothing single to move.
+    """
+    return snap_window_plan(
+        shot_snap_windows(project, rendering=rendering),
+        project.song,
+        tolerance=tolerance,
+        minimum=minimum,
+        maximum=maximum,
+    )
+
+
+def snap_window_plan(
+    windows: Sequence[SnapWindow],
+    song,
+    *,
+    tolerance: float = SNAP_TOLERANCE_DEFAULT,
+    minimum: float = H3_MIN_SHOT_SECONDS,
+    maximum: float = H3_MAX_SHOT_SECONDS,
+) -> CutSnapPlan:
+    """Propose a new position for every cut in a tiling. The one implementation.
 
     Each cut is offered the nearest voiceless moment within ``tolerance`` seconds
-    (`_gap_snap_target` decides "nearest"), and takes it only when both shots it belongs to
+    (`_gap_snap_target` decides "nearest"), and takes it only when both windows it belongs to
     survive every check. Everything else is reported as a skip with its reason.
+
+    `windows` arrive **in song order** — the caller's ordering is the one used, unchanged —
+    and each carries its own `refusal`, so this function decides nothing about protections
+    beyond honouring them.
 
     **The band.** ``minimum``/``maximum`` default to `H3_MIN_SHOT_SECONDS` and
     `H3_MAX_SHOT_SECONDS` — 4–15 s — which is the band `populate_windows` itself defaults to,
@@ -1779,29 +2045,31 @@ def snap_cut_plan(
     but is an *argument the populate route passes at layout time*, not an invariant on stored
     windows: a Director may deliberately edit a shot to 9 s, and enforcing 6 s here would
     refuse every cut in such a plan for a rule it was never held to. Both are parameters, so
-    a caller that does want the tighter ceiling asks for it.
+    a caller that does want the tighter ceiling asks for it — and populate's line-up step
+    does, because a lay-out that capped its windows at 6 s must not be undone by the step
+    after it.
 
     **Why the band check is exact and not provisional.** Cuts are decided left to right. When
-    cut *i* is judged, the left edge of shot *i* is a boundary already settled, so shot *i*'s
-    final length is known here. Shot *i+1*'s right edge is still its original one — but cut
-    *i+1* will re-judge shot *i+1* against its now-settled left edge before moving, and will
-    refuse to move if that leaves it out of band. So shot *i+1* is in band whether cut *i+1*
-    moves (checked there) or stays (checked here), and every window in the result is inside
-    the band on both counts.
+    cut *i* is judged, the left edge of window *i* is a boundary already settled, so window
+    *i*'s final length is known here. Window *i+1*'s right edge is still its original one —
+    but cut *i+1* will re-judge window *i+1* against its now-settled left edge before moving,
+    and will refuse to move if that leaves it out of band. So window *i+1* is in band whether
+    cut *i+1* moves (checked there) or stays (checked here), and every window in the result is
+    inside the band on both counts.
 
     **Contiguity is structural.** The plan is carried as a boundary list; the returned windows
     are consecutive differences of it, and the two outer boundaries are copied through from
-    the shots untouched. There is no arithmetic by which a gap, an overlap or an accumulated
+    the input untouched. There is no arithmetic by which a gap, an overlap or an accumulated
     rounding drift can appear — only the interior boundaries are ever assigned, and each is
     assigned once, to a value rounded to the millisecond the rest of this module works in. A
-    shot no cut of which moved keeps its stored floats untouched to the bit, which is what
+    window no cut of which moved keeps its given floats untouched to the bit, which is what
     stops an ulp of recomputation from making an approved shot read as stale to assembly.
 
-    Raises `TimelineError` when the plan is not already a contiguous tiling, because then the
-    two shots at a "cut" do not share a boundary and there is nothing single to move.
+    Raises `TimelineError` when the input is not already a contiguous tiling, because then the
+    two windows at a "cut" do not share a boundary and there is nothing single to move.
     """
-    ordered = ordered_shots(project)
-    unchanged = [(shot.id, shot.start, shot.duration) for shot in ordered]
+    ordered = list(windows)
+    unchanged = [(window.id, window.start, window.duration) for window in ordered]
     # Tolerance 0 is the feature switched off, and off means *nothing was examined* — not a
     # loop that happens to find no candidates. Checked before the song is read, before the
     # plan's shape is judged, before anything: a switched-off feature that can still raise is
@@ -1817,21 +2085,21 @@ def snap_cut_plan(
         if abs(current.start - previous.end) > SNAP_CONTIGUITY_TOLERANCE:
             raise TimelineError(
                 SNAP_NOT_CONTIGUOUS.format(
-                    before=shot_label(project, previous),
-                    after=shot_label(project, current),
+                    before=previous.label,
+                    after=current.label,
                     end=previous.end,
                     start=current.start,
                 )
             )
-    gaps = vocal_gaps(project.song, start=ordered[0].start, end=ordered[-1].end)
+    gaps = vocal_gaps(song, start=ordered[0].start, end=ordered[-1].end)
     if gaps is None:
         return CutSnapPlan("unmeasured", tolerance, [], [], unchanged, SNAP_UNMEASURED)
 
     # The plan as boundaries. `boundaries[0]` and `boundaries[-1]` are the plan's outer edges
     # and are never assigned, so the coverage of the song is bit-identical afterwards.
-    boundaries = [shot.start for shot in ordered] + [ordered[-1].end]
+    boundaries = [window.start for window in ordered] + [ordered[-1].end]
     # Which boundaries were actually assigned. Read once, at the end, to keep every untouched
-    # shot's stored floats rather than recomputing them — see the note there.
+    # window's given floats rather than recomputing them — see the note there.
     touched: set[int] = set()
     moves: list[CutMove] = []
     skips: list[CutSkip] = []
@@ -1841,16 +2109,14 @@ def snap_cut_plan(
         names = {
             "before_id": before.id,
             "after_id": after.id,
-            "before_label": shot_label(project, before),
-            "after_label": shot_label(project, after),
+            "before_label": before.label,
+            "after_label": after.label,
             "boundary": boundary,
         }
         labels = {"before": names["before_label"], "after": names["after_label"]}
-        # A cut belongs to two shots, so either shot's protection protects it. The first
+        # A cut belongs to two windows, so either window's protection protects it. The first
         # refusal wins, and `window_move_refusal` orders its own three.
-        refusal = window_move_refusal(project, before, rendering=rendering) or (
-            window_move_refusal(project, after, rendering=rendering)
-        )
+        refusal = before.refusal or after.refusal
         if refusal:
             skips.append(CutSkip(**names, reason=refusal))
             continue
@@ -1936,17 +2202,17 @@ def snap_cut_plan(
         boundaries[index + 1] = proposed
         touched.add(index + 1)
         moves.append(CutMove(**names, proposed=proposed, gap=gap_length))
-    # A shot neither of whose boundaries moved keeps its **stored floats**, not a recomputed
+    # A window neither of whose boundaries moved keeps its **given floats**, not a recomputed
     # difference of them. `start + duration` and `boundaries[k + 1]` are the same real number
     # and can be a bit apart in IEEE-754, so recomputing every window would rewrite untouched
     # shots by an ulp — and `assembly_refusals` compares an approved shot's window snapshot to
     # its live window with **exact** inequality, so an ulp on an untouched approved shot is a
     # plan that stops assembling for a move nobody made. Contiguity survives the mix because
-    # an untouched boundary was never assigned: it is still the float both its shots hold.
-    windows = [
-        (shot.id, shot.start, shot.duration)
+    # an untouched boundary was never assigned: it is still the float both its windows hold.
+    settled = [
+        (window.id, window.start, window.duration)
         if index not in touched and index + 1 not in touched
-        else (shot.id, boundaries[index], boundaries[index + 1] - boundaries[index])
-        for index, shot in enumerate(ordered)
+        else (window.id, boundaries[index], boundaries[index + 1] - boundaries[index])
+        for index, window in enumerate(ordered)
     ]
-    return CutSnapPlan("ready", tolerance, moves, skips, windows)
+    return CutSnapPlan("ready", tolerance, moves, skips, settled)

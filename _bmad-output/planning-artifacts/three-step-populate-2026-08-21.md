@@ -93,7 +93,7 @@ The value of the split is that each step's **output is inspectable and re-runnab
 
 **Phase A — make the steps separable without changing behaviour.** Extract the three concerns inside the existing route so each produces a named intermediate. No new model calls, no new UI, byte-identical output pinned. This is the enabling step and it is testable to the byte. **— SHIPPED 2026-08-21, see below.**
 
-**Phase B — line-up consumes the alignment.** Wire phrase-boundary awareness into the layout instead of leaving it to a manual snap afterwards, and hand each shot the lines it covers. Highest ratio of existing machinery to new code.
+**Phase B — line-up consumes the alignment.** Wire phrase-boundary awareness into the layout instead of leaving it to a manual snap afterwards, and hand each shot the lines it covers. Highest ratio of existing machinery to new code. **— SHIPPED 2026-08-21, see below.**
 
 **Phase C — re-runnable fill-in.** A route that redoes content against fixed windows. Directly serves the broad-then-detail workflow and preserves hand-tuned timing.
 
@@ -169,9 +169,29 @@ On the wire: `LayOutResponse` → `LineUpResponse` → `FillInResponse`, each st
 
 **Verification.** 22 new cases; suite 1558 passing; ruff and both `node --check` gates clean; a 34-mutant sweep in a `git worktree` with a failing sentinel killed 33, the survivor being a documented defence-in-depth re-check that the revision check above it makes unreachable.
 
+## Phase B as shipped — 2026-08-21
+
+Built on Phase A. Backend only; no UI, no prompt wording changed, no model call split, no citation chosen.
+
+**The prediction held.** Line-up was the step with the most machinery built and the least wired in, and Phase B is almost entirely composition: `snap_cut_plan`, `vocal_gaps`, `align_lyric_blocks` and `lyric_line_tags` all existed; populate called none of them.
+
+**One snapping implementation, two doors.** The decision was lifted out of `snap_cut_plan` whole into `timeline.snap_window_plan(windows, song, *, tolerance, minimum, maximum)`, which knows nothing about `Shot`. Windows arrive as `SnapWindow(id, start, duration, label, refusal)` — the protections already worded, from `window_move_refusal`, the one reader of them. `shot_snap_windows` is the one place a Shot becomes one. `snap_cut_plan` is now a caller; `app.line_up_shots` is the other. Proved rather than claimed: the two doors are compared cut for cut on the same input, and a single substitution of `_gap_snap_target` is observed by both.
+
+**Line-up moves windows and hands each one its lines.** `ShotPlacement` gained `lines` (`timeline.LyricLineSpan(index, text, slots, start, end)` — the sheet's own line numbers) and `singers`, a derived property rather than a stored field. `ShotAlignment` gained `status`, `tolerance`, `moves`, `skips`, and `moved` now means something. **Nothing consumes the cast facts** — that is fill-in's, and Phase B produces them so pass 2 can be written against a real tagged song rather than a guess.
+
+**Line times are composed, not re-derived.** `_align_blocks` places the `[Tag]` blocks with the repeat-defeating machinery that already exists; `align_lyric_lines` only splits one block's span among its own lines. A second answer to the refrain problem is how a line gets timed to the wrong verse.
+
+**Confirmation, as ruled.** The chain asks once, at lay-out. Standalone line-up over an existing timeline is report-then-confirm in `snap-cuts`' shape, with the locked / approved / in-flight protections in their existing wordings. `snap_tolerance` reaches the chain; **0 is a genuine no-op**, and Phase A's two byte digests are still pinned through it as the control arm.
+
+**Live, read-only, on the Director's project.** 6 of 29 cuts move on their real song (mean 0.229 s, max 0.430 s), 39 lyric lines time cleanly, contiguity is exact. **But their actual 34-shot timeline cannot be lined up at all**: 16 of its 33 seams are outside assembly's tolerance because overlapping shots are now a deliberate editing gesture, and the snapper models a cut as a boundary two shots *share*. `snap-cuts` has always refused such a plan; Phase B inherits the gap rather than creating it.
+
+**Verification.** 22 new cases; suite 1580 passing; ruff and both `node --check` gates clean; a 42-mutant sweep in a `git worktree` with a failing sentinel per file killed all 42.
+
 ## Still open
 
-Nothing blocking. Phase E's story layer (beats, characters as entities, scenes) remains deliberately unplanned until the app is aimed at narrative work.
+**Snapping requires a contiguous tiling; the Director's real timelines are no longer contiguous by design.** Found by running Phase B's route against `project_59f14d19ff10` on 2026-08-21. The 2026-08-20 layers ruling made an overlap a legitimate gesture — `assembly_plan` cuts the earlier clip at the later one's start — but `snap_window_plan` still requires two shots to *share* a boundary, so both snapping doors refuse a plan with any overlap. The shape of the answer is visible: assembly already computes the resolved cut list, and the snapper could read that instead of the raw window edges. It is a design decision about what a "cut" is under layers, not a bug fix, and it was deliberately not smuggled into Phase B.
+
+Phase E's story layer (beats, characters as entities, scenes) remains deliberately unplanned until the app is aimed at narrative work.
 
 ## What this plan does not claim
 

@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Container
+from collections.abc import AsyncIterator, Callable, Container, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -145,8 +145,15 @@ from .timeline import (
     MIN_SINGING_VOCAL_SECONDS,
     SNAP_TOLERANCE_DEFAULT,
     SNAP_TOLERANCE_MAX,
+    SNAP_UNMEASURED,
+    SNAP_WITHOUT_CUTS,
+    CutMove,
+    CutSkip,
+    LyricLineSpan,
+    SnapWindow,
     TimelineError,
     align_lyric_blocks,
+    align_lyric_lines,
     anchored_label,
     assistant_input,
     build_director_timeline,
@@ -162,8 +169,10 @@ from .timeline import (
     repair_sections,
     section_looks_input,
     shot_expansion_input,
+    shot_snap_windows,
     shot_vocal_overlap,
     snap_cut_plan,
+    snap_window_plan,
     song_section,
 )
 from .transcription import merge_vocal_spans, transcribe_song_words
@@ -2690,12 +2699,20 @@ class ShotLayout:
 
 @dataclass(frozen=True)
 class ShotPlacement:
-    """One window with the musical facts measured against it.
+    """One window, where line-up put it, with the musical facts measured against it.
 
     `vocal_seconds` is `timeline.shot_vocal_overlap`: seconds of measured voice inside the
     window, and **`None` means unmeasured, not silent** — the codebase's absent-analysis
     convention. `voiceless` is the one-directional guard fill-in consumes: a window the track
     is measured to leave voiceless cannot be marked singing, whatever the model declared.
+
+    `lines` are the sung lines of the lyric sheet this window covers, in song order, each
+    with the seconds it was heard at and the singer slots its `(S1)` mark names
+    (`timeline.align_lyric_lines`). Empty is the honest answer in three different situations
+    and the report says which: an unmeasured song, a window in an instrumental stretch, and a
+    line whose words were all misheard. **Nothing here chooses anything** — this is the seam
+    the multi-character work reads, and a citation chosen from a singer slot is fill-in's act,
+    deliberately not built here.
     """
 
     index: int
@@ -2705,20 +2722,41 @@ class ShotPlacement:
     section: str
     vocal_seconds: float | None
     voiceless: bool
+    #: The sheet lines sung across this window, in song order. `timeline.LyricLineSpan`
+    #: verbatim, because a line's identity, text, mark and timing are one fact and a second
+    #: shape for them here would be a second place for them to disagree.
+    lines: tuple[LyricLineSpan, ...] = ()
+
+    @property
+    def singers(self) -> tuple[int, ...]:
+        """Every character slot the sheet marks as singing across this window, ascending.
+
+        A **projection of `lines`**, computed rather than stored, so it cannot drift from
+        them: the wire row carries it for a reader, and the wire's own value is written from
+        this property and read back through it.
+
+        `()` means *no line across this window carries a mark* — untagged, which is the state
+        of every sheet written before per-line marks existed. It is not "slot 1": an unstated
+        value is never read as a stated one.
+        """
+        return tuple(sorted({slot for line in self.lines for slot in line.slots}))
 
 
 @dataclass(frozen=True)
 class ShotAlignment:
-    """Step two's output: the layout, unmoved, with per-window musical facts attached.
+    """Step two's output: the layout **moved onto the music**, with per-window facts attached.
 
-    `moved` is 0 and says so on the wire. **Line-up moves nothing in this phase**, and that
-    is a statement about what is built rather than a claim about music: the alignment
-    machinery exists and is strong (`snap_cut_plan`, `vocal_gaps`, `align_lyric_blocks`) and
-    populate has never consumed any of it — snapping is a separate gesture the Director takes
-    afterwards. Wiring phrase boundaries into the layout is the next phase and it changes what
-    a populate produces, which this one may not. What line-up does today is real but small:
-    it measures each window against the track and hands fill-in the fact that decides
-    `singing`. Naming it as a step is the point; inventing work for it would not be.
+    Line-up consumes the alignment rather than standing beside it (Phase B, 2026-08-21). Each
+    cut in the tiling is offered the nearest moment the track leaves voiceless, through the
+    same `timeline.snap_window_plan` the snap-cuts route reaches by its own door, and `moved`
+    is how many took it. `status` is that core's honest four-way answer — `"ready"`,
+    `"off"` (tolerance 0), `"unmeasured"` (nothing heard on this track) or `"no_cuts"` — and
+    three of those four mean nothing was examined.
+
+    `moves` and `skips` are the whole report: every cut that would move and every cut that
+    would not, with the sentence saying why. They are what makes a standalone line-up
+    report-then-confirm in the same words `snap-cuts` uses; in a chained populate they ride
+    along as the record of what the pass did to a timeline nobody had seen yet.
     """
 
     layout: ShotLayout
@@ -2727,6 +2765,12 @@ class ShotAlignment:
     #: `vocal_seconds` is `None`, and fill-in's voiceless guard is a no-op.
     measured: bool
     moved: int = 0
+    #: `CutSnapPlan.status`, carried rather than re-derived from the counts: "0 moved" is a
+    #: different statement from "snapping was off" and from "nothing was ever heard".
+    status: str = "ready"
+    tolerance: float = 0.0
+    moves: tuple[CutMove, ...] = ()
+    skips: tuple[CutSkip, ...] = ()
 
 
 def lay_out_protections(project: Project) -> None:
@@ -3064,27 +3108,103 @@ async def lay_out_shots(
     )
 
 
-def line_up_shots(layout: ShotLayout) -> ShotAlignment:
-    """Step two — line it up. Measure each window against the track; move nothing.
+#: How a window of a layout is named in a line-up report, before any Shot exists to name.
+#:
+#: `shot_label`'s job for a plan that has no shots: the numbers a Director would read off the
+#: timeline once this lands, one-based like `SHOT 01`, and deliberately a *different word* so
+#: nobody mistakes a report about a proposal for a report about the plan on disk.
+LINE_UP_WINDOW_LABEL = "WINDOW {number:02d}"
 
-    Pure, model-free and, in this phase, close to a pass-through: see `ShotAlignment` for
-    why that is the honest shape rather than a gap. What it produces is the per-window
-    musical fact fill-in consumes — `shot_vocal_overlap`, which populate used to compute
-    inline in the middle of building a `Shot` — plus the section each window falls in, which
-    lay-out knows and nothing downstream had a name for.
 
-    **No window moves here.** `moved` is 0, `windows` come out as they went in, and the
-    snapping machinery is deliberately not called: wiring phrase boundaries into the layout
-    changes what a populate produces and this phase may not.
+def line_up_windows(layout: ShotLayout) -> list[SnapWindow]:
+    """A layout's tiling as windows the snapping core can be handed.
+
+    **No refusal on any of them, and that is a statement rather than an omission.** These
+    windows were created moments ago by the lay-out step; there is no shot at them yet, so
+    there is no lock to honour, no approved take whose window would go stale, and no render in
+    flight submitted for one. Inventing a check that could never fire would read as a
+    protection this path has and does not. The protections are real on the other entry point —
+    lining up a timeline the Director already has — and they arrive there from
+    `window_move_refusal`, the one reader of them.
     """
-    song = layout.project.song
+    return [
+        SnapWindow(
+            id=f"window_{index:03d}",
+            start=start,
+            duration=length,
+            label=LINE_UP_WINDOW_LABEL.format(number=index + 1),
+        )
+        for index, (start, length) in enumerate(layout.windows)
+    ]
+
+
+def line_up_shots(
+    layout: ShotLayout,
+    *,
+    tolerance: float = SNAP_TOLERANCE_DEFAULT,
+    windows: Sequence[SnapWindow] | None = None,
+    minimum: float = H3_MIN_SHOT_SECONDS,
+    maximum: float = POPULATE_MAX_WINDOW_SECONDS,
+) -> ShotAlignment:
+    """Step two — line it up. Move each cut onto the music, then measure what it now covers.
+
+    Pure, model-free, and it writes nothing: it answers with a proposal and the caller decides
+    whether to keep it. Two things come out, and the second is the one nothing downstream has
+    had before:
+
+    * **The windows, moved.** Every cut is offered the nearest moment the track leaves
+      voiceless, by `timeline.snap_window_plan` — the same core the snap-cuts route reaches
+      through `snap_cut_plan`, with the same clearance clamp, the same band check and the same
+      per-cut refusals. Populate used to produce its layout blind to phrase boundaries and
+      leave the fix to a manual snap afterwards; it no longer does.
+    * **What each window covers.** The seconds of measured voice inside it (the fact that
+      downgrades `singing`), the section it falls in, and — new — the lyric lines sung across
+      it with the singer slots their `(S1)` marks name. See `ShotPlacement`.
+
+    `windows` is how the second caller identifies and protects its windows: a project-sourced
+    line-up hands in the timeline's own shots, named and carrying `window_move_refusal`'s
+    sentences. The default is the layout's own fresh tiling (`line_up_windows`), which has
+    nothing to protect.
+
+    **The band is the layout's own**, `POPULATE_MAX_WINDOW_SECONDS` at the top rather than
+    `H3_MAX_SHOT_SECONDS`: lay-out capped these windows at 6 s on a measured render-cost
+    decision, and a step whose whole job is to nudge a cut by less than a second must not be
+    the thing that undoes it. A caller lining up stored windows passes the wider band, for the
+    reason `snap_window_plan` gives.
+
+    **Tolerance 0 is the feature off and is a genuine no-op** — the core answers `"off"`
+    before it examines anything, every window comes back with the floats it went in with, and
+    a populate run that way is byte-for-byte the one this application shipped before phrase
+    awareness existed.
+
+    **An unmeasured song is an explicitly empty branch.** No measurement means no gap to snap
+    to (`vocal_gaps` answers `None`, the core answers `"unmeasured"`, nothing moves) and no
+    word times to place a line at, so `lines` is empty on every window. Neither is a guess and
+    neither is a crash.
+    """
+    project = layout.project
+    song = project.song
+    offered = list(line_up_windows(layout) if windows is None else windows)
+    plan = snap_window_plan(
+        offered, song, tolerance=tolerance, minimum=minimum, maximum=maximum
+    )
+    # Every sung line of the sheet, timed once for the whole plan rather than per window: the
+    # alignment is over the song, not over a shot, and asking it 30 times would be 30 chances
+    # to answer differently. Empty for an unmeasured song and for a project with no sheet —
+    # `align_lyric_lines` states both by returning nothing rather than by guessing a span.
+    lines = (
+        align_lyric_lines(song.lyrics, [tuple(word) for word in song.lyric_words])
+        if song is not None and song.lyrics and song.lyric_words
+        else []
+    )
     sections = layout.sections
     placements: list[ShotPlacement] = []
-    for index, (start, length) in enumerate(layout.windows):
+    for index, (_id, start, length) in enumerate(plan.windows):
         # One measurement per window, the same call populate made inline. `None` is
         # unmeasured — the absent-analysis convention — and `voiceless` stays False for it,
         # so an untranscribed song changes nothing about what fill-in writes.
         vocal = shot_vocal_overlap(song, start=start, duration=length)
+        end = start + length
         middle = start + length / 2
         placements.append(
             ShotPlacement(
@@ -3101,13 +3221,24 @@ def line_up_shots(layout: ShotLayout) -> ShotAlignment:
                 ),
                 vocal_seconds=vocal,
                 voiceless=vocal is not None and vocal < MIN_SINGING_VOCAL_SECONDS,
+                # A line is covered when any of the seconds it was *heard* at fall inside this
+                # window. Not "mostly inside" and not "its midpoint": a cut through the middle
+                # of a line leaves both shots showing a mouth saying those words, and both of
+                # them need to know it.
+                lines=tuple(
+                    line for line in lines if line.start < end and line.end > start
+                ),
             )
         )
     return ShotAlignment(
         layout=layout,
         placements=tuple(placements),
         measured=any(placement.vocal_seconds is not None for placement in placements),
-        moved=0,
+        moved=len(plan.moves),
+        status=plan.status,
+        tolerance=plan.tolerance,
+        moves=tuple(plan.moves),
+        skips=tuple(plan.skips),
     )
 
 
@@ -3814,6 +3945,18 @@ class PopulateTimelineRequest(BaseModel):
     #: live run says which way is better, and `false` is byte-for-byte the old behaviour,
     #: so this is not a one-way door in either direction.
     two_stage: bool = False
+    #: How far the line-up step may move a cut onto a phrase boundary, `SnapCutsRequest`'s
+    #: field in the same key's meaning and with the same bound. Defaulted to the same 0.75 s
+    #: the snap-cuts route defaults to, so a first-pass populate lands its cuts where the
+    #: Director would have snapped them by hand.
+    #:
+    #: **0 is the feature switched off and is a genuine no-op** — the layout is written
+    #: exactly as `populate_windows` tiled it, byte for byte the plan this application
+    #: produced before phrase awareness existed. That is not a courtesy: it is the control
+    #: arm, and the test suite pins the pre-Phase-B digests through it.
+    snap_tolerance: float = Field(
+        default=SNAP_TOLERANCE_DEFAULT, ge=0, le=SNAP_TOLERANCE_MAX
+    )
 
 
 class PopulateTimelineResponse(BaseModel):
@@ -3822,6 +3965,12 @@ class PopulateTimelineResponse(BaseModel):
     proposed: int
     created: int
     project: Project
+    #: How many cuts the line-up step moved onto a phrase boundary, and how many it left where
+    #: they were with a reason. Counts rather than the sentences: a chained populate's report
+    #: is the timeline itself, and the per-cut reasons are what the standalone `line-up` route
+    #: exists to show. 0/0 is what an unmeasured song and a 0 tolerance both produce.
+    moved: int = 0
+    skipped: int = 0
     #: What the declared cast needs and the library does not have — `models.vocal_cast_problems`.
     #:
     #: The Director's own placement: "this is something that could be flagged if the user labeled
@@ -3869,6 +4018,17 @@ LINE_UP_PLAN_MISMATCH = (
     "The lay-out report sent to this step does not match its own plan_id, so it is not a "
     "report this server emitted. Nothing was written. Run the lay-out step again."
 )
+#: Line-up's confirm moves the windows of shots a lay-out already created. If the timeline is
+#: not that layout — the lay-out report was never confirmed, or the plan has been edited since
+#: — the shot a row addresses is not the shot it was lined up for, so it refuses rather than
+#: write a window onto whatever sits at that index now. `FILL_IN_WINDOWS_CHANGED`'s rule, one
+#: step earlier, and the same sentence shape.
+LINE_UP_WINDOWS_CHANGED = (
+    "This line-up was computed for a layout the timeline does not hold ({expected} windows "
+    "reported, {found} shots on the timeline). Its confirm moves the windows of shots the "
+    "lay-out step already created, so it refused rather than move a cut belonging to some "
+    "other plan. Nothing was written. Confirm the lay-out first, then line it up."
+)
 FILL_IN_NO_PLAN = (
     "Fill in needs a line-up report to fill in. Run the lay-out step, then the line-up step, "
     "then send the line-up report here as `plan`. Nothing was written and no model was asked."
@@ -3895,8 +4055,9 @@ FILL_IN_WINDOWS_CHANGED = (
     "The timeline's windows are not the windows this report was laid out for ({expected} "
     "shots reported, {found} on the timeline{detail}). Fill in only writes what is inside a "
     "window and never moves one, so it refused rather than write a shot's content onto a "
-    "different shot. Nothing was written. Lay the timeline out again, then line it up and "
-    "fill it in from that report."
+    "different shot. Nothing was written. If the line-up moved cuts, confirm the line-up "
+    "first — that is the step that writes a window — or lay the timeline out again and walk "
+    "the three steps from that report."
 )
 
 
@@ -3988,12 +4149,63 @@ class LayOutRequest(BaseModel):
     plan: LayOutResponse | None = None
 
 
+class SnapCutMove(BaseModel):
+    """One cut that would move, named by both windows that share it.
+
+    `gap` is how long the voiceless stretch it lands in is, carried on the wire because the
+    length is what tells a Director what kind of opportunity the cut found — a one-second
+    breath is an extended shot, four seconds is room for something else entirely. It is
+    `timeline.CutMove.gap` verbatim; nothing is decided here.
+
+    Shared by `SnapCutsResponse` and `LineUpResponse` rather than written twice: the two
+    routes reach one snapping core through two doors, and a cut that came back described in
+    two shapes would invite the two to drift in the reader's mind even while the core did not.
+    `before`/`after` are `shot_label`'s names on the timeline route and
+    `LINE_UP_WINDOW_LABEL`'s on a layout that has no shots yet.
+    """
+
+    before: str
+    after: str
+    boundary: float
+    proposed: float
+    shift: float
+    gap: float
+
+
+class SnapCutSkip(BaseModel):
+    """One cut that would not move, and the sentence saying why."""
+
+    before: str
+    after: str
+    boundary: float
+    reason: str
+
+
+class LineUpLineRow(BaseModel):
+    """One sheet line sung across a window — `timeline.LyricLineSpan` on the wire.
+
+    `index` addresses the line in the Director's own lyric sheet, so a reader can find the
+    very line the mark was typed on. `slots` are the `(S1)` mark's character slots and `[]`
+    is **untagged**, never "the first singer".
+    """
+
+    index: int
+    text: str = ""
+    slots: list[int] = Field(default_factory=list)
+    start: float = 0
+    end: float = 0
+
+
 class LineUpWindowRow(BaseModel):
     """One window with the musical facts measured against it — `ShotPlacement` on the wire.
 
     `vocal_seconds` is `None` for unmeasured, which is not the same as silent: a project
     whose song has never been transcribed reports `None` on every row and `voiceless` false
     on every row, and fill-in's guard is then a no-op.
+
+    `lines` and `singers` are Phase B's new facts and the seam the multi-character work reads.
+    `singers` is written from `ShotPlacement.singers` and read back through it, so the wire
+    cannot carry a slot no line on the row names.
     """
 
     index: int
@@ -4002,39 +4214,72 @@ class LineUpWindowRow(BaseModel):
     section: str = ""
     vocal_seconds: float | None = None
     voiceless: bool = False
+    lines: list[LineUpLineRow] = Field(default_factory=list)
+    #: Every character slot marked as singing across this window, ascending. A projection of
+    #: `lines`; `[]` is untagged.
+    singers: list[int] = Field(default_factory=list)
 
 
 class LineUpResponse(BaseModel):
-    """Step two's report. There is no applied form of it in this phase.
+    """Step two's report, and — only on a confirmed project-sourced call — the saved project.
 
-    No `project` field and no `applied` flag, and their absence is the honest statement:
-    **line-up moves nothing yet**. `moved` is on the wire and reads 0 for the same reason —
-    see `ShotAlignment`. What this report carries is the per-window measurement fill-in
-    consumes, plus the lay-out report it was computed from, so it is the whole input to the
-    fill-in step.
+    Two shapes of the same report, because the step has two entry points:
+
+    * **From a lay-out report** (`plan` on the request). Nothing is written on any path: the
+      windows this describes do not exist yet, and it is fill-in's confirm — or the chain's
+      single save — that lands them. `project` stays `None` and `applied` stays false.
+    * **From the project's own timeline** (no `plan`). Then this is report-then-confirm in
+      `SnapCutsResponse`'s exact shape: `moves` and `skips` name every cut, and only a call
+      carrying `confirm_apply` writes the windows.
+
+    `status` is the snapping core's four-way answer and three of its values mean *nothing was
+    examined* — see `ShotAlignment`.
     """
 
+    applied: bool = False
     measured: bool = False
+    #: The core's `"ready"` / `"off"` / `"unmeasured"` / `"no_cuts"`.
+    status: str = "ready"
+    #: How far a cut was allowed to travel on this pass. 0 is the feature switched off.
+    tolerance: float = 0
     moved: int = 0
+    skipped: int = 0
+    moves: list[SnapCutMove] = Field(default_factory=list)
+    skips: list[SnapCutSkip] = Field(default_factory=list)
     windows: list[LineUpWindowRow] = Field(default_factory=list)
     #: The lay-out report this was lined up from, echoed whole so fill-in needs only this
-    #: one body. Its own `plan_id` still has to check out.
+    #: one body. Its own `plan_id` still has to check out. `None` on the project-sourced
+    #: path, and that absence is what makes such a report unusable as a fill-in input —
+    #: correctly, because it describes windows rather than content.
     layout: LayOutResponse | None = None
     message: str = ""
+    project: Project | None = None
     plan_id: str = ""
     updated_at: datetime | None = None
 
 
 class LineUpRequest(BaseModel):
-    """One line-up pass. It has no confirm because it has nothing to write.
+    """One line-up pass: which windows, how far a cut may travel, and whether it may write.
 
-    `plan` is a lay-out report and is required: in this phase line-up is a pure function of
-    a layout, and there is no project-sourced entry point yet — re-lining-up a timeline the
-    Director already has is the next phase's job, and it needs the snapping this one
-    deliberately does not do.
+    **`plan` is what picks the entry point.** With a lay-out report, line-up is a pure
+    function of that report — the by-hand walk through the three routes, where its confirm
+    moves the windows the lay-out step's confirm created. Without one, it lines up the
+    timeline the project already has, which is the pass a Director runs on a plan they have
+    been editing.
+
+    `tolerance` is `SnapCutsRequest`'s field in the same key, with the same bound and the same
+    meaning: how far a cut may travel, 0 being the feature switched off and a genuine no-op.
+
+    `confirm_apply` is `SnapCutsRequest`'s too, and on both paths it writes the same thing and
+    only that thing: each shot's `start` and `duration`. Nothing else on a shot is read or
+    written by this route, on any path.
     """
 
     plan: LayOutResponse | None = None
+    tolerance: float = Field(
+        default=SNAP_TOLERANCE_DEFAULT, ge=0, le=SNAP_TOLERANCE_MAX
+    )
+    confirm_apply: bool = False
 
 
 class FillInShotRow(BaseModel):
@@ -4175,12 +4420,42 @@ def layout_from_report(project: Project, plan: LayOutResponse) -> ShotLayout:
     )
 
 
-def alignment_report(alignment: ShotAlignment, layout: LayOutResponse) -> LineUpResponse:
-    """`ShotAlignment` as a report, with the lay-out report it was computed from echoed on it."""
+def alignment_report(
+    alignment: ShotAlignment, layout: LayOutResponse | None
+) -> LineUpResponse:
+    """`ShotAlignment` as a report, with the lay-out report it was computed from echoed on it.
+
+    `layout` is `None` for a line-up sourced from the project's own timeline: there was no
+    lay-out report, and inventing one would hand fill-in a plan with no proposals in it.
+    """
     voiced = sum(1 for placement in alignment.placements if not placement.voiceless)
+    lined = sum(1 for placement in alignment.placements if placement.lines)
     return LineUpResponse(
         measured=alignment.measured,
+        status=alignment.status,
+        tolerance=alignment.tolerance,
         moved=alignment.moved,
+        skipped=len(alignment.skips),
+        moves=[
+            SnapCutMove(
+                before=move.before_label,
+                after=move.after_label,
+                boundary=move.boundary,
+                proposed=move.proposed,
+                shift=move.shift,
+                gap=move.gap,
+            )
+            for move in alignment.moves
+        ],
+        skips=[
+            SnapCutSkip(
+                before=skip.before_label,
+                after=skip.after_label,
+                boundary=skip.boundary,
+                reason=skip.reason,
+            )
+            for skip in alignment.skips
+        ],
         windows=[
             LineUpWindowRow(
                 index=placement.index,
@@ -4189,22 +4464,42 @@ def alignment_report(alignment: ShotAlignment, layout: LayOutResponse) -> LineUp
                 section=placement.section,
                 vocal_seconds=placement.vocal_seconds,
                 voiceless=placement.voiceless,
+                lines=[
+                    LineUpLineRow(
+                        index=line.index,
+                        text=line.text,
+                        slots=list(line.slots),
+                        start=line.start,
+                        end=line.end,
+                    )
+                    for line in placement.lines
+                ],
+                # The property, never a second sum over the rows above: one implementation of
+                # "who sings across this window", and the wire is a copy of its answer.
+                singers=list(placement.singers),
             )
             for placement in alignment.placements
         ],
         layout=layout,
         message=(
             f"{len(alignment.placements)} windows measured against the track, "
-            f"{voiced} carrying voice, 0 moved"
+            f"{voiced} carrying voice, {lined} carrying lyric lines, "
+            f"{alignment.moved} moved onto a phrase boundary, {len(alignment.skips)} left"
             if alignment.measured
             else f"{len(alignment.placements)} windows; the song's voice has not been "
-            "measured, so no window carries a vocal fact and 0 moved"
+            f"measured, so no window carries a vocal fact and {alignment.moved} moved"
         ),
     )
 
 
 def alignment_from_report(project: Project, plan: LineUpResponse) -> ShotAlignment:
-    """A line-up report back into the intermediate the fill-in step reads."""
+    """A line-up report back into the intermediate the fill-in step reads.
+
+    `singers` is deliberately **not** read off the wire: `ShotPlacement.singers` derives it
+    from `lines`, and reading a second copy back would let a hand-edited body claim a singer
+    no line names. The moves and skips are not read back either — they are the report of what
+    the pass did, and fill-in decides nothing from them.
+    """
     return ShotAlignment(
         layout=layout_from_report(project, plan.layout or LayOutResponse()),
         placements=tuple(
@@ -4215,11 +4510,23 @@ def alignment_from_report(project: Project, plan: LineUpResponse) -> ShotAlignme
                 section=row.section,
                 vocal_seconds=row.vocal_seconds,
                 voiceless=row.voiceless,
+                lines=tuple(
+                    LyricLineSpan(
+                        index=line.index,
+                        text=line.text,
+                        slots=tuple(line.slots),
+                        start=line.start,
+                        end=line.end,
+                    )
+                    for line in row.lines
+                ),
             )
             for row in plan.windows
         ),
         measured=plan.measured,
         moved=plan.moved,
+        status=plan.status,
+        tolerance=plan.tolerance,
     )
 
 
@@ -4241,32 +4548,6 @@ class SnapCutsRequest(BaseModel):
         default=SNAP_TOLERANCE_DEFAULT, ge=0, le=SNAP_TOLERANCE_MAX
     )
     confirm_apply: bool = False
-
-
-class SnapCutMove(BaseModel):
-    """One cut that would move, named by both shots that share it.
-
-    `gap` is how long the voiceless stretch it lands in is, carried on the wire because the
-    length is what tells a Director what kind of opportunity the cut found — a one-second
-    breath is an extended shot, four seconds is room for something else entirely. It is
-    `timeline.CutMove.gap` verbatim; nothing is decided here.
-    """
-
-    before: str
-    after: str
-    boundary: float
-    proposed: float
-    shift: float
-    gap: float
-
-
-class SnapCutSkip(BaseModel):
-    """One cut that would not move, and the sentence saying why."""
-
-    before: str
-    after: str
-    boundary: float
-    reason: str
 
 
 class SnapCutsResponse(BaseModel):
@@ -9696,34 +9977,175 @@ def create_app(
         response_model=LineUpResponse,
     )
     def line_up_timeline(project_id: str, request: LineUpRequest) -> LineUpResponse:
-        """Step two of a populate: measure the layout against the music. Move nothing.
+        """Step two of a populate: move each cut onto the music, and say what it now covers.
 
         `line_up_shots` makes every decision, and it is the function a chained populate calls
-        too. It is pure and asks no model, so this route has no confirm and no write — see
-        `LineUpResponse` and `ShotAlignment` for why that is the honest shape of this step
-        today rather than a hole in it. What comes back is the input the fill-in step needs:
-        each window's measured voice, whether the track leaves it voiceless, and which
-        section it falls in.
+        too. It is pure and asks no model. What comes back is the input the fill-in step
+        needs — each window's measured voice, whether the track leaves it voiceless, which
+        section it falls in, and the lyric lines sung across it with their singer marks — plus
+        the cut report: every cut that moved and every cut that did not, with the sentence
+        saying why.
 
-        The lay-out report arrives as `plan` and has to prove it is one this server emitted —
-        the digest and the revision, `section_looks_plan_writes`' checks. It is echoed back on
-        the response so the fill-in step needs one body rather than two.
+        **Two entry points, one step, and the difference is where the windows come from.**
 
-        Nothing is written on any path. `comfy` is not touched, no `status` moves.
+        * **With a lay-out report as `plan`** — the by-hand walk through the three routes. The
+          report has to prove it is one this server emitted (the digest and the revision,
+          `section_looks_plan_writes`' checks) and is echoed back so the fill-in step needs
+          one body rather than two. Its confirm writes the moved windows onto the shots the
+          lay-out step's own confirm created, and refuses when the timeline is not that layout
+          — line-up is the step that owns where a cut sits, so it is the step that writes one.
+          Before lay-out has been confirmed there is no shot at any of these windows, so the
+          report describes proposals and protects nothing, which is the truth about them.
+        * **Without one** — line up the timeline the project already has, which is the pass a
+          Director runs over a plan they have been editing. Report-then-confirm in
+          `snap_timeline_cuts`' exact shape: without `confirm_apply` this route **does not
+          call `store.save`** and the response carries no project at all. The three window
+          protections hold here and are `window_move_refusal`'s own sentences — a locked shot,
+          a shot carrying an approved take and a shot with a render in flight each refuse the
+          cuts at their edges, by name.
+
+        Only the windows are ever written, and only on the second path's confirm. The lyric
+        lines and singer slots are **derived facts and are not persisted**: they are re-read
+        from the sheet and the transcript every time, so a sheet the Director retags is
+        answered by the next line-up rather than by a stale copy in the manifest.
+
+        Nothing renders, arms, queues or approves. `comfy` is not touched.
         """
         project = get_project(project_id)
         plan = request.plan
-        if plan is None or not plan.windows or not plan.plan_id:
-            raise HTTPException(status_code=422, detail=LINE_UP_NO_PLAN)
-        if plan.updated_at is None or plan.updated_at != project.updated_at:
-            raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
-        if plan_fingerprint(project, plan) != plan.plan_id:
-            raise HTTPException(status_code=422, detail=LINE_UP_PLAN_MISMATCH)
-        response = alignment_report(
-            line_up_shots(layout_from_report(project, plan)), plan
+        if plan is not None:
+            if not plan.windows or not plan.plan_id:
+                raise HTTPException(status_code=422, detail=LINE_UP_NO_PLAN)
+            if plan.updated_at is None or plan.updated_at != project.updated_at:
+                raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
+            if plan_fingerprint(project, plan) != plan.plan_id:
+                raise HTTPException(status_code=422, detail=LINE_UP_PLAN_MISMATCH)
+            layout = layout_from_report(project, plan)
+            # Whether the timeline is *already* this layout — the state lay-out's own confirm
+            # leaves behind. When it is, the shots at these windows are the windows: they are
+            # named as the Director sees them and they carry their protections, so a locked
+            # shot's cut is skipped by name rather than moved. When it is not — the ordinary
+            # report, taken before lay-out was confirmed, and every chained populate — there
+            # is no shot at any of these windows and nothing to protect, which
+            # `line_up_windows` says in as many words.
+            laid_out = [
+                (shot.start, shot.duration) for shot in ordered_shots(project)
+            ] == list(layout.windows)
+            rendering = frozenset(
+                shot.id for shot in project.shots if shot_render_in_flight(project, shot)
+            )
+            try:
+                alignment = line_up_shots(
+                    layout,
+                    tolerance=request.tolerance,
+                    windows=(
+                        shot_snap_windows(project, rendering=rendering)
+                        if laid_out
+                        else None
+                    ),
+                )
+            except TimelineError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            response = alignment_report(alignment, plan)
+            response.updated_at = project.updated_at
+            response.plan_id = plan_fingerprint(project, response)
+            if not request.confirm_apply:
+                return response
+            # The confirm writes windows and only windows, onto shots this layout already
+            # created. It refuses rather than write when the timeline is something else: the
+            # shot a row addresses would not be the shot the row was lined up for.
+            if not laid_out:
+                raise HTTPException(
+                    status_code=422,
+                    detail=LINE_UP_WINDOWS_CHANGED.format(
+                        expected=len(plan.windows), found=len(project.shots)
+                    ),
+                )
+            if alignment.moves:
+                for shot, placement in zip(ordered_shots(project), alignment.placements):
+                    shot.start = placement.start
+                    shot.duration = placement.duration
+                saved = store.save(project)
+                response.project = saved
+                response.applied = True
+                # Re-stamped over the saved revision so this body is a *valid* plan for the
+                # fill-in step, `lay_out_timeline`'s line and for its reason: the confirm
+                # moved `updated_at`, and a report still claiming the revision it was read
+                # from would be refused by the next route on its way past. The alignment
+                # itself is unchanged — same windows, same facts, same cut report.
+                response.updated_at = saved.updated_at
+                response.plan_id = plan_fingerprint(saved, response)
+            return response
+        # The project-sourced path. Its windows are the timeline's own shots, so it needs the
+        # song check and the protections `snap_timeline_cuts` needs, in the same words.
+        if not project.song or project.song.duration <= 0:
+            raise HTTPException(status_code=422, detail=SNAP_CUTS_NO_SONG)
+        # The in-flight set and the protections are `snap_timeline_cuts`' own, through the one
+        # builder both routes call: a cut that is protected on one of them is protected on the
+        # other because there is only one answer to ask.
+        rendering = frozenset(
+            shot.id for shot in project.shots if shot_render_in_flight(project, shot)
         )
+        stored = shot_snap_windows(project, rendering=rendering)
+        # A cut is a boundary two shots *share*, so a plan with a gap or an overlap has no
+        # single thing to move — refused in `snap_timeline_cuts`' own words, and found the
+        # first time this route was pointed at the Director's live plan (2026-08-21), where
+        # two hand-dragged shots disagreed about their shared edge by 42 ms.
+        try:
+            alignment = line_up_shots(
+                ShotLayout(
+                    project=project,
+                    duration=project.song.duration,
+                    required=len(project.shots),
+                    # No proposals, and the emptiness is what stops this report being fed to
+                    # fill-in: there is no content half here to fill anything in from.
+                    # `layout` comes back `None` on the response for the same reason.
+                    proposals=(),
+                    windows=tuple(
+                        (shot.start, shot.duration) for shot in ordered_shots(project)
+                    ),
+                    sections=tuple(project.sections),
+                    sections_origin="director" if project.sections else "",
+                    message="",
+                ),
+                tolerance=request.tolerance,
+                windows=stored,
+                # The stored-window band, not the layout's tighter ceiling: these windows
+                # were not laid out by this pass and a Director may deliberately have edited
+                # one to 9 s — `snap_window_plan` argues the case.
+                maximum=H3_MAX_SHOT_SECONDS,
+            )
+        except TimelineError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        # The two honest-empty branches refuse rather than report, `snap_timeline_cuts`' rule
+        # and its wording: no cut was examined, so there is nothing to report over.
+        if alignment.status in ("unmeasured", "no_cuts"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    SNAP_UNMEASURED
+                    if alignment.status == "unmeasured"
+                    else SNAP_WITHOUT_CUTS.format(count=len(project.shots))
+                ),
+            )
+        response = alignment_report(alignment, None)
         response.updated_at = project.updated_at
         response.plan_id = plan_fingerprint(project, response)
+        if not request.confirm_apply or not alignment.moves:
+            return response
+        # Applied by shot id from the alignment's own placements, which are the whole tiling —
+        # unmoved windows included — so the contiguity the core builds structurally is the
+        # contiguity that lands in the manifest rather than being re-derived here.
+        by_id = {shot.id: shot for shot in project.shots}
+        for window, placement in zip(stored, alignment.placements):
+            shot = by_id[window.id]
+            shot.start = placement.start
+            shot.duration = placement.duration
+        saved = store.save(project)
+        response.project = saved
+        response.applied = True
+        response.updated_at = saved.updated_at
+        response.plan_id = plan_fingerprint(saved, response)
         return response
 
     @app.post(
@@ -9920,8 +10342,15 @@ def create_app(
             two_stage=request.two_stage,
             reread=lambda: get_project(project_id),
         )
-        # Line it up — measure each window against the track. Moves nothing yet.
-        alignment = line_up_shots(layout)
+        # Line it up — move each cut onto the nearest moment the track leaves voiceless, then
+        # measure what each window now covers. **No second confirmation is asked for it**, and
+        # that is the ruling rather than an oversight: `confirm_replace` above is consent to
+        # replace this timeline's windows, these windows were created by the lay-out call it
+        # consented to seconds ago, and there is no shot on the timeline for a protection to
+        # be about — `lay_out_protections` has already refused if there were. The standalone
+        # `line-up` route is where a Director lining up a plan they have been editing reads a
+        # report first and confirms it.
+        alignment = line_up_shots(layout, tolerance=request.snap_tolerance)
         # Fill it in — prompts, citations, singing, seeds.
         shots = fill_in_shots(alignment)
         # The re-read project lay-out returned, carrying the section layer it assigned. One
@@ -9934,6 +10363,8 @@ def create_app(
             proposed=len(layout.proposals),
             created=len(saved.shots),
             project=saved,
+            moved=alignment.moved,
+            skipped=len(alignment.skips),
             # Read off the manifest that was actually written, so the flag describes the project
             # the Director is now looking at rather than the one this route read minutes ago
             # before the model call. Pure, and no model, clock or file is touched to produce it —
