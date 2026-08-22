@@ -118,7 +118,7 @@ mode ComfyUI named, matching what was asked), `wrong-mode`, `unconfirmed`, `regi
 no positive line — and the report says so; the `pytorch` arm is partly there as the
 discriminator.
 
-**Tests: 219 in `test_workflows.py`, from 173.** Default-profile digests per affected variant;
+**Tests: 232 in `test_workflows.py`, from 173.** Default-profile digests per affected variant;
 every profile's node, values and input order against a table written in the test rather than
 read from the registry; every profile's wiring against a *literal* position table, for a
 reason a sweep found (below); an unknown, blank, non-string or unhashable profile refused with
@@ -128,8 +128,8 @@ is a real option of the live node and deliberately not a profile; every way an
 which is truthy everywhere it is read; the audit's three drift cases and a vanished node; the
 harness's gate, its frame arithmetic, its arm diff, and all six engagement verdicts.
 
-**Mutation-checked: 41 mutations across the three files, final survivors 0, and all four
-sentinels failed as required.** Swept in a dedicated `git worktree` with `PYTHONPATH` at its
+**Mutation-checked: 93 mutations across the four files, final survivors 0, and every
+sentinel failed as required.** Swept in a dedicated `git worktree` with `PYTHONPATH` at its
 own `src` (confirmed by printing `workflows.__file__` from inside it, because an editable
 `.pth` pointing at the live checkout is how a sweep reports everything as surviving),
 restoring with `read_bytes`/`write_bytes`, converting each anchor to that file's own line
@@ -138,7 +138,15 @@ time-boxing every run at 300 s. The sweep script is uniquely named under the scr
 generic `mutate.py` there was clobbered earlier in this session, which is the recurring
 hazard the naming avoids.
 
-**Three survivors were found and fixed, and each was a real gap.** (1)
+**Eleven survivors were found and fixed across the sweeps, and each was a real gap.** The
+last five were all live-path code no test could reach — the preview override, the cost-basis
+choice and `/free`'s status and settle — and the fix was to extract the decisions into pure
+functions (`apply_preview_override`, `cost_fields`) and stub the server for the rest, rather
+than to accept them as untestable. Two of them mattered: a mutation that applied the preview
+override *unconditionally*, and one that applied it to the attention node instead, both passed
+the whole suite while the logic sat inline in the submission path — either would have altered
+every submitted payload while the builders and all their digests went on agreeing with
+themselves. Earlier ones: (1)
 `test_each_attention_profile_wires_its_node_where_its_evidence_puts_it` read
 `H3_ATTENTION_CHAIN_POSITION` to decide which assertion to make, so moving
 `ModelAttentionBackend` to the wrong side of the sigma shift made the test agree with the
@@ -181,6 +189,17 @@ consonant-rich part of a sung phrase and a hint elsewhere. Silence on either sid
 as absent, never scored 0.0, which would read as "this arm's audio bears no resemblance to the
 song". Speed, audio and lip-sync stay three verdicts and are never averaged; fewer steps is a
 picture trade as much as a speed one, and which trade is worth making is the Director's call.
+
+**What the Director should take from this entry, in one paragraph.** The **sampling bundle** is
+worth four to five times what the attention backend is worth: at 226 frames,
+`turbo-references2v` (8 steps) sampled **4.62× cheaper** than `default` (20 steps) and `turbo`
+(4 steps) **5.11× cheaper** — ~5 minutes against ~25. That comparison is solid: all three arms
+were measured warm, in one invocation, on one fixture. **The attention backend is a dead end**
+— no backend beat the shipped default, and swapping one re-rolls every take, so an approved
+take would not survive the change. **The window-ceiling question is unresolved**: two attempts
+at a cost curve across 158–226 frames disagreed with each other by up to 63% at the same frame
+count, so `POPULATE_MAX_WINDOW_SECONDS` gets no recommendation from this work. Details below,
+including three measurement defects of the harness's own that had to be found first.
 
 **It was run, and three of its own defects had to be found before any number could be trusted.**
 All three were in the harness, none was caught by a passing test, and each was found by reading
@@ -234,9 +253,46 @@ was wrong. It was stopped before a record was written. `resolve_run_dir` now ref
 today's directory holds no arms and another one does, naming both and making the operator
 choose — two defensible answers is a refusal, not a coin toss.
 
+**The reproducibility control was never run, and it is the first thing to run next.** Three
+identical 158-frame renders in one invocation — frame count held constant, so any rise is
+render order and only order. It is the one measurement that would make the band data
+conclusive rather than inconclusive, and at ~12 minutes it is cheaper than any of the sweeps
+that failed to settle it. It must not get lost behind the more interesting preview finding.
+The in-sweep 226 point was **cancelled by the operator** to release the GPU, at step 5 of 8,
+and is recorded with no timing fields — a partial render's elapsed time in a cost column is
+worse than an absent one. The harness's own watchdog did not fire and could not have: the arm
+had logged `loaded completely`, one of the four signals `should_cut` requires together.
+
+**The band sweep was run twice and produced no usable curve, which is itself the result.**
+`turbo-references2v` at 158/175/192/209 frames, once warm and once with `POST /free` between
+arms: the two runs disagree by up to **63% at the same frame count**, and in *shape* — one
+climbs monotonically, the other jumps and then plateaus downward. Both designs render ascending
+frame counts sequentially, so order and size are perfectly confounded in each and neither can
+separate "bigger render" from "later render". The strongest fact against a size reading is
+already inside the data: on this bundle 226 frames cost 320 s while 209 cost 657 s and 192 cost
+534 s. Against that, the Director's own overnight batch — 14 shots at a constant 141 frames
+across 30 positions and 4½ hours — shows *no* degradation with position and a second-half
+median faster than its first. So **`POPULATE_MAX_WINDOW_SECONDS` gets no recommendation from
+this work**, and what the run established instead is that cost measurements at these frame
+counts are not currently reproducible on this machine. Spec §6.16.
+
+**Two things measured on the way that matter beyond this experiment.** `POST /free`
+(`unload_models` + `free_memory`) releases VRAM between renders but **does not stop host-memory
+accumulation** — host RAM free fell 48.58 → 8.11 GiB across four arms that each called it,
+where a full ComfyUI restart recovers it; a previous session reached 94.75 GiB committed against
+61.6 GiB physical. And `ModelPreviewOverrideKJ` — emitted at all three H3 sites with the audited
+export's own `preview_frames: 12` — makes ComfyUI decode, resize and WebP-encode **twelve frames
+per sampling step whether or not anyone is watching**, because `send_image` encodes before
+`send_bytes` consults its socket list. That is ~240 operations per 20-step shot and ~8,000
+across a 33-shot batch, paid on every production render. **Neither is changed here**: the
+preview values are the Director's export's, so any change is a batch-mode option for them to
+decide, not a defect to correct. Spec §6.14 and §6.15.
+
 **Not done, and named.** Nothing is exposed in the UI or the API, and no manifest field
 exists; if a backend is ever adopted, that is its own change with its own digest. The
-batch/Render-Again profile split is recorded above and **not** reconciled. The Comfy Kitchen
+batch/Render-Again profile split is recorded above and **not** reconciled. The preview cost is
+**not measured** — `--preview-frames` exists to measure it without touching a builder, and the
+12-versus-1 run is deferred to a future GPU window. The Comfy Kitchen
 graph is cited by path rather than copied into
 `workflow_templates/reference_exports/` — adding audited evidence is a separate ceremony. And
 `MVP_SAGE_ATTENTION`'s submission-time choke point rewrites every `PathchSageAttentionKJ` and

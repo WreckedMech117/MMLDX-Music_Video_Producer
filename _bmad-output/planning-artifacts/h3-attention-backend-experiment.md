@@ -816,3 +816,202 @@ grounds better than speed: **there is nothing to gain and a take to lose.**
 is a real result: both takes sit the same way against the song. It is *not* a statement that
 the mouth matches the audio, because it never looks at the picture. Audio-to-song is measured;
 mouth-to-audio is not, and no number in this experiment measures it.
+
+### 6.14 Preview generation is paid on every render, for nobody — measured cost deferred
+
+`ModelPreviewOverrideKJ` is emitted at **three sites** in `workflows.py` —
+`build_h3_director_payload` (node `2344`), `build_h3_reference_payload` and
+`build_h3_keyframe_payload` (both `mvp:preview`) — every one carrying
+`max_resolution 1024, jpeg_quality 80, suppress_default_preview True, preview_frames 12,
+preview_fps 12`.
+
+**Those are not our values.** `h3-ultra-references-user-export.json` node `2376` carries
+exactly them, so the adapter is faithfully reproducing the Director's own export. This is not
+a defect anyone introduced; it is a setting that made sense in a graph someone was watching
+render, and does not in a batch. That distinction decides the shape of any fix: **a batch-mode
+option, not a bug correction.**
+
+**ComfyUI generates previews whether or not anyone is listening.** Read from `server.py`
+rather than assumed: `send_image` performs the resize and the quality-95 encode *before*
+`send_bytes` ever consults `self.sockets`, and with no clients attached that is an empty loop
+over zero sockets. The previewer itself is constructed from `args.preview_method` (forced by
+this node), not from client count, so the latent→image decode in the sampler callback is paid
+too. Attaching a listener adds only a socket write of an already-encoded buffer.
+
+`preview_frames: 12` therefore means **twelve frames sampled from each step's latent, decoded,
+resized and WebP-encoded, on every sampling step, for an audience of nobody** during a batch.
+On a 20-step render that is 240 decode-and-encode operations per shot; across a 33-shot batch,
+roughly eight thousand.
+
+**Not changed, and not measured yet.** Changing any of the three sites moves every H3 payload
+digest and deviates from audited evidence — a Director decision with its own change.
+`tests/measure_h3_attention.py --preview-frames N` patches the value at *submission* for
+measurement only; with the flag absent nothing is patched and the payload is byte-identical.
+The measurement itself — 12 against the node's default of 1, same bundle, seed and fixture,
+back to back, with host RAM recorded either side — is **deferred to the next GPU window**.
+
+A second question rides on it for free: thousands of PIL allocations and WebP encodes per
+render is the shape of workload that fragments a host heap, and this machine has an
+unexplained host-memory accumulation (§6.15). If the `preview_frames: 1` arm accumulates
+visibly less, that is a mechanism. If they accumulate identically, previews are exonerated.
+**No evidence connects them today and none is asserted.**
+
+### 6.15 `/free` releases VRAM between renders and does not stop host-memory accumulation
+
+`POST /free` with `{"unload_models": true, "free_memory": true}` is core ComfyUI
+(`server.py:1192`); it sets queue flags that `main.py:398-410` consumes on the worker's next
+tick, calling `unload_all_models()`, resetting the executor cache and forcing a gc. It is
+**asynchronous** — nothing has happened when the 200 arrives — and it answers **200 with a
+zero-length body**, which is worth knowing because parsing that reply as JSON raises and makes
+a successful call look like a failed one.
+
+Measured across the clean five-point sweep, which called it before every arm: host RAM free
+went from **48.58 GiB after the Director's restart to 8.11 GiB four arms later.** So `/free`
+does not prevent the host-side accumulation. Whatever grows is not what `unload_all_models()`
+releases.
+
+For contrast, the preceding session reached **94.75 GiB committed against 61.6 GiB of physical
+RAM** (`python` pid 24088, 22.78 GiB resident) with Windows holding 19 GiB in Memory
+Compression, and a full ComfyUI restart recovered it to 48.58 GiB free. **A restart clears it;
+`/free` does not.**
+
+**What this does not establish:** that the accumulation costs render time. The Director's own
+overnight batch rendered 14 shots at a constant 141 frames across 30 positions and 4½ hours in
+one session, and its second-half median (6.3 min) was *faster* than its first-half median
+(7.2 min), with the five fastest all after position 24. Memory pressure was presumably
+accumulating there too and cost did not rise. **So host-memory accumulation and render cost
+are not demonstrably coupled**, and no production recommendation follows from this yet.
+
+### 6.16 The band sweep: two attempts, no usable curve, and why that is the honest result
+
+The Director approved a sweep of the unmeasured band — **175, 192 and 209 frames** — between
+the last known-good count (158, which is what `POPULATE_MAX_WINDOW_SECONDS = 6.0` maps to) and
+the measured cliff at 226. It was run twice on `turbo-references2v`, and **the two runs
+disagree in shape, not merely in level.**
+
+| frames | sweep A (no `/free`, warm) | sweep B (`/free` between arms) | spread |
+|---|---|---|---|
+| 158 | 140 s (17.61 s/it) | 137 s (17.22 s/it) | **2%** |
+| 175 | 191 s (23.93 s/it) | 222 s (27.81 s/it) | **16%** |
+| 192 | 328 s (41.00 s/it) | 534 s (66.76 s/it) | **63%** |
+| 209 | 657 s (82.25 s/it) | 523 s (65.39 s/it) | **26%** |
+
+Sweep A climbs monotonically. Sweep B jumps between 175 and 192 and then **plateaus, going
+slightly down** at 209. One accelerates where the other flattens, and they cross. The same
+frame count on the same bundle, same machine, same fixture arithmetic and same seed differs by
+up to **63%**.
+
+**Neither sweep is a curve.** Sweep A's local exponents rise with render position — 3.04, 5.83,
+8.19 — across frame steps all within 2% of each other in size; sweep B's rise faster still
+(4.72, 9.47) and then reverse. An exponent near 9 for a 10% frame increase is not attention
+scaling by any reading; attention is quadratic.
+
+**Order and size are perfectly confounded in both designs.** Both render ascending frame counts
+sequentially in one invocation, so nothing either produced can separate "bigger render" from
+"later render". That was a design fault, and it is the reason a **constant-frame control** —
+the same count rendered repeatedly — is the measurement that was actually needed.
+
+**Counter-evidence against the order reading, from production.** The Director's overnight batch
+rendered **14 shots at a constant 141 frames across 30 positions and 4½ hours** in one session.
+First-half median 7.2 min, **second-half median 6.3 min** — later renders were *faster*, and the
+five fastest all landed after position 24. That is a real constant-size control, on the `default`
+20-step bundle through the app's batch path, and it shows **no degradation with position.** Its
+caveat is that it is mtime-derived, so it carries the ~60–80 s fixed overhead of §6.12 — but
+that overhead is roughly constant and therefore neither creates nor hides a trend.
+
+**And the strongest single fact against a frame-count reading is inside the data already:** on
+this bundle, **226 frames cost 320 s** while 209 cost 657 s and 192 cost 534 s. If size drove
+cost, 226 could not be the cheapest of the three. That 226 point was measured in a separate,
+earlier invocation — which is precisely the escape hatch, and precisely why it had to be
+re-measured inside a sweep.
+
+**So the band question is unresolved and no ceiling recommendation follows from it.** What the
+run established instead is that **cost measurements on this machine are not reproducible at
+these frame counts** — a characterised measurement problem, which every future measurement here
+inherits, and which is more durable than a curve would have been. `POPULATE_MAX_WINDOW_SECONDS`
+stays where it is, on the evidence it already had.
+
+**What is unaffected by any of this:** the bundle comparison at 226 frames (§6.13). Those three
+arms were measured **warm, in one invocation**, so the drift that ruins the band sweeps does not
+touch them — and the effect there is 4.6–5.1×, far outside the spread seen here.
+
+### 6.17 What was NOT measured, and what to run first next time
+
+**The reproducibility control was never run.** It is the single measurement that would make
+§6.16 conclusive instead of inconclusive, and it is cheap:
+
+```
+uv run python tests/measure_h3_attention.py --project <id> --shot <id> \
+    --run-dir <new> --frames 158 --repeats 3 --sampling turbo-references2v \
+    --profiles default --free-between-arms --confirm-gpu
+```
+
+Three identical renders — **frame count held constant, so any rise is render order and only
+order.** Flat within a few percent means order is innocent, the sweeps' 63% spread is variance
+far larger than anyone assumed, and no cost number from this machine should be quoted at n=1
+again. Scattered by tens of percent and the sweeps are artefacts of the harness's back-to-back
+path, which the Director's production batch does not share. Either answer is worth more than a
+fourth attempt at the curve. **Run this before the preview measurement.**
+
+**The in-sweep 226 point was cancelled**, by the operator, to release the GPU. It had reached
+step 5 of 8 at roughly 155 s/step. Recorded as `cancelled-by-operator` with **no timing
+fields** — it sampled partially, so any duration in a cost column would sit beside completed
+arms pretending to mean the same thing. This was the sharpest test available: the
+separately-measured 226 on this bundle cost 320 s, *below* the same sweep's 192 (534 s) and 209
+(523 s), and only an in-sweep 226 could have separated run conditions from frame count. It
+remains unmeasured.
+
+**The preview cost is unmeasured** (§6.14). Second in the queue, after the control.
+
+**A note on the harness's own watchdog, since a cancelled arm looks like a cut one.** It did
+not fire and could not have: the arm logged `loaded completely`, which is one of the four
+signals `should_cut` requires in conjunction, and the run log carries no `cutting this arm`
+line. The cancellation was external. The distinction is recorded because "the harness killed
+its own arm" is exactly the sort of thing that becomes true in a retelling.
+
+---
+
+## 7. What the Director should take from all of this
+
+**Solid, and the only thing here worth acting on:**
+
+* **The sampling bundle is where the cost is.** At 226 frames, `turbo-references2v` (8 steps)
+  sampled **4.62× cheaper** than `default` (20 steps), and `turbo` (4 steps) **5.11× cheaper** —
+  roughly 5 minutes of sampling against 25. All three arms were measured **warm, in one
+  invocation, on one fixture**, so none of the instability in §6.16 touches them.
+* **But it is a quality trade, not a free win**, and this run cannot settle the quality half.
+  The three bundles produced **three entirely different shots** at the same seed — frontal
+  close-up, side view, three-quarter — so there is no frame-to-frame comparison to make. `turbo`
+  (4 steps) also scored the lowest envelope correlation against the song (0.2491 against
+  `default`'s 0.3399), with `turbo-references2v` close to `default` at 0.3230. That is one
+  number at n=1 and not a verdict, but it points the same way caution does:
+  **`turbo-references2v` looks the safer of the two on both counts.** The takes are preserved;
+  the picture judgement is the Director's.
+* **The batch and "Render Again" already ship different bundles** — batch defaults to `default`
+  (20 steps), `app.js:2575` hardcodes `turbo` (4 steps). Recorded, not reconciled, because
+  whether the batch should move is the same quality decision as above.
+
+**Settled, and requiring no action:**
+
+* **The attention backend is a dead end.** No backend beat the shipped default; the whole spread
+  was 3.3% at 107 frames with `default` marginally fastest. And a backend swap **re-rolls every
+  take**, so an approved take would not survive one — nothing to gain and a take to lose.
+* **The premise that started this was wrong**: acceleration was never off. ComfyUI runs
+  `--use-sage-attention` and the adapters' `sage_attention: "disabled"` declines to override it
+  rather than disabling anything.
+* **Plain PyTorch attention cannot fit 226 frames on this 32 GB card** — 97 minutes, zero
+  sampling steps, memory-bound. It fits at 107. The wall sits between.
+
+**Open, with the next step named:**
+
+* **The window ceiling.** `POPULATE_MAX_WINDOW_SECONDS = 6.0` maps to 158 frames, the largest
+  count ever measured successfully, and it stays where it is. Two attempts at a cost curve
+  across the unmeasured band disagreed by up to 63% at the same frame count. **Next step: the
+  reproducibility control above**, not another curve.
+* **Two operational findings needing the Director's decision, neither a defect.** `POST /free`
+  releases VRAM between renders but does **not** stop host-memory accumulation (48.58 → 8.11 GiB
+  across four arms that each called it; only a restart recovers it) — that is the direct answer
+  to the Manager/Crystools "Unload Models" question. And `preview_frames: 12`, faithful to their
+  own audited export, makes ComfyUI decode, resize and WebP-encode twelve frames **per sampling
+  step** whether or not anyone is watching — ~8,000 operations across a 33-shot batch. A
+  **batch-mode option**, not a bug, and its cost is not yet measured.

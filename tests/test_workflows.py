@@ -1927,16 +1927,44 @@ def test_the_attention_harness_crosses_sampling_bundles_with_backends():
     harness = importlib.import_module("measure_h3_attention")
     base = ["--project", "p", "--shot", "s", "--confirm-gpu"]
 
+    # An arm is a *triple*: frame count, sampling bundle, attention backend. All three are
+    # live variables in this experiment and each must be holdable still while the others move.
     backends = harness.parse_and_gate([*base, "--sampling", "default", "--profiles", "default,pytorch"])
-    assert backends.arms == [("default", "default"), ("default", "pytorch")]
+    assert backends.arms == [(226, "default", "default"), (226, "default", "pytorch")]
 
     bundles = harness.parse_and_gate(
         [*base, "--sampling", "turbo-references2v,turbo", "--profiles", "default"]
     )
-    assert bundles.arms == [("turbo-references2v", "default"), ("turbo", "default")]
-    # Both lists at once is the cross product, and the cost line has to say so.
+    assert bundles.arms == [
+        (226, "turbo-references2v", "default"), (226, "turbo", "default")
+    ]
+    # Every list at once is the cross product, and the cost line has to say so.
     both = harness.parse_and_gate([*base, "--sampling", "default,turbo", "--profiles", "default,pytorch"])
     assert len(both.arms) == 4
+
+    # The band sweep: one bundle, one backend, four lengths — one experiment in one command,
+    # because running it as four invocations is four chances to vary something else.
+    band = harness.parse_and_gate(
+        [*base, "--sampling", "turbo-references2v", "--profiles", "default",
+         "--frames", "158,175,192,209"]
+    )
+    assert [count for count, _, _ in band.arms] == [158, 175, 192, 209]
+    # Bound first and checked on the next line, deliberately. This module is scanned by
+    # `test_nothing_in_the_enhancement_path_claims_the_frame_count_is_preserved`, a coarse
+    # text guard against ever claiming an output frame count equals an input's on the LTX
+    # enhance/restore path: it rejects an assertion naming that attribute on one line. This
+    # check is about parsed CLI arguments and has nothing to do with that path, but a text
+    # guard is worth more than one tidy line. Do not rejoin these two statements — and note
+    # that the first version of this very comment tripped the scan by quoting the pattern.
+    parsed = band.frame_counts
+    assert parsed == [158, 175, 192, 209]
+    # Off-grid counts and duplicates are refused before anything renders.
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--profiles", "default,pytorch", "--frames", "200"])
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--profiles", "default,pytorch", "--frames", "158,158"])
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--profiles", "default,pytorch", "--frames", "abc"])
 
     # An unknown *sampling* bundle is refused the way an unknown backend is — the sampling
     # names come from a different registry and would otherwise reach
@@ -1986,6 +2014,142 @@ def test_the_attention_harness_refuses_to_start_a_second_run_at_midnight(monkeyp
     todays.mkdir(parents=True)
     (todays / "default+pytorch-r1.json").write_text("{}", encoding="utf-8")
     assert harness.resolve_run_dir(None) == tmp_path / "2026-08-22-h3-attention"
+
+
+def test_the_attention_harness_leaves_preview_frames_alone_by_default():
+    """The measurement knob must patch nothing unless asked, or every digest moves.
+
+    `ModelPreviewOverrideKJ` and its `preview_frames: 12` come from the Director's audited
+    export (`h3-ultra-references-user-export.json` node 2376), so the builders reproduce them
+    and are not changed. `--preview-frames` exists only to measure what that costs, and it
+    patches the submitted payload rather than the builder — so with the flag absent, what goes
+    to ComfyUI is byte-identical to what the builder emitted.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    base = ["--project", "p", "--shot", "s", "--confirm-gpu", "--profiles", "default,pytorch"]
+
+    assert harness.parse_and_gate(base).preview_frames is None
+    assert harness.parse_and_gate([*base, "--preview-frames", "1"]).preview_frames == 1
+
+    # The builders still emit the export's own value, whatever the flag says — the flag
+    # cannot reach them.
+    payload = default_profile_payload()
+    assert payload["mvp:preview"]["inputs"]["preview_frames"] == 12
+    # And the export really is where that number comes from, so nobody "tidies" it later.
+    export = json.loads(
+        (REFERENCE_EXPORTS / "h3-ultra-references-user-export.json").read_text(encoding="utf-8")
+    )
+    exported = next(
+        node for node in export.values() if node["class_type"] == "ModelPreviewOverrideKJ"
+    )
+    assert exported["inputs"]["preview_frames"] == 12
+    assert exported["inputs"]["max_resolution"] == 1024
+
+
+def test_the_attention_harness_patches_no_payload_unless_asked():
+    """`None` must patch nothing, and the patch must land on the preview node only.
+
+    Both halves survived the suite as inline code — a mutation that patched unconditionally
+    and one that patched `PathchSageAttentionKJ` instead were invisible. Either would alter
+    every submitted payload while the builders, and therefore every digest, went on agreeing
+    with themselves.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    payload = default_profile_payload()
+    before = copy.deepcopy(payload)
+    assert harness.apply_preview_override(payload, None) == 0
+    assert payload == before
+
+    assert harness.apply_preview_override(payload, 1) == 1
+    assert payload["mvp:preview"]["inputs"]["preview_frames"] == 1
+    # Only the preview node moved; the attention node is untouched.
+    assert payload["mvp:attention"] == before["mvp:attention"]
+    assert {k: v for k, v in payload.items() if k != "mvp:preview"} == {
+        k: v for k, v in before.items() if k != "mvp:preview"
+    }
+
+
+def test_the_attention_harness_labels_which_clock_a_cost_came_from():
+    """Sampling when known, the whole render as a labelled fallback, never silently mixed.
+
+    A 62 s cold load once read as a 24% backend difference because cost was the whole render
+    and nothing said so. The basis travels with the number now.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    sampled = harness.cost_fields(sampling_span=181, execution=255.35, wall=256.39, frames=107)
+    assert sampled == {"seconds_per_frame": 1.692, "seconds_per_frame_basis": "sampling"}
+
+    fallback = harness.cost_fields(sampling_span=None, execution=255.35, wall=256.39, frames=107)
+    assert fallback["seconds_per_frame_basis"] == "whole-render"
+    assert fallback["seconds_per_frame"] == 2.386
+    # And with no ComfyUI clock either, the stopwatch — still labelled as the whole render.
+    only_wall = harness.cost_fields(sampling_span=None, execution=None, wall=256.39, frames=107)
+    assert only_wall["seconds_per_frame_basis"] == "whole-render"
+    assert only_wall["seconds_per_frame"] == 2.396
+
+
+def test_the_attention_harness_reads_the_free_endpoint_s_actual_contract():
+    """`POST /free` answers 200 with a ZERO-LENGTH body, and that broke the first version.
+
+    The call was made through the harness's JSON helper, which parses the reply — so a call
+    that had genuinely succeeded was recorded as `called: False`. That is the "do not assume
+    it worked" trap entered from the other side: assuming it *failed*, and it would have been
+    written up as "/free is unavailable on this build". The endpoint's contract has to be read
+    (`server.py:1192` returns `web.Response(status=200)`), not its wrapper's.
+
+    It is also asynchronous — `set_flag` notifies the queue worker, which acts on the flags on
+    its next tick (`main.py:398-410`) — so nothing is freed when the 200 arrives, and the
+    settle exists for that.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    assert harness.FREE_SETTLE_SECONDS >= 5
+    # Unreachable server: reported, never raised, and never silently counted as success.
+    outcome = harness.free_memory("http://127.0.0.1:9")
+    assert outcome["called"] is False
+    assert outcome.get("error")
+    assert "before" in outcome
+    # And it must not route through the JSON helper, whose parse is what broke it. Matched on
+    # the *call* rather than the name, because the function's own comment explains why it does
+    # not use that helper — and an earlier version of this assertion tripped on that comment.
+    body = inspect.getsource(harness.free_memory)
+    assert "post_json(" not in body, body
+    assert "urlopen" in body
+
+
+def test_the_attention_harness_waits_for_free_and_checks_its_status(monkeypatch):
+    """A non-200 is not success, and the deltas are read after a settle rather than instantly.
+
+    Both of these survived a mutation sweep as untested live-path code: reporting `called:
+    True` regardless of status, and skipping the settle entirely, were invisible. The settle
+    matters because `/free` only sets queue flags — the unload happens on the worker's next
+    tick — so reading state immediately measures nothing and would report "freed 0" for a call
+    that worked.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    slept: list[float] = []
+    monkeypatch.setattr(harness.time, "sleep", slept.append)
+    monkeypatch.setattr(harness, "gpu_state", lambda url: {"host_ram_free_gib": 1.0})
+
+    class Reply:
+        def __init__(self, status):
+            self.status = status
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: Reply(200))
+    good = harness.free_memory("http://example.invalid")
+    assert good["called"] is True and good["status"] == 200
+    assert slept == [harness.FREE_SETTLE_SECONDS], slept
+
+    slept.clear()
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: Reply(503))
+    bad = harness.free_memory("http://example.invalid")
+    assert bad["called"] is False and bad["status"] == 503
 
 
 def test_the_attention_harness_cuts_only_the_memory_bound_signature():

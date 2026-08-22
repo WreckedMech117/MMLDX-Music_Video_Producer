@@ -499,6 +499,152 @@ def gpu_power_watts() -> float | None:
         return None
 
 
+#: How long to let ComfyUI act on a `/free` before reading the result. The endpoint sets
+#: queue flags and returns; `PromptQueue.set_flag` calls `not_empty.notify()`, which wakes the
+#: idle worker so it reaches `get_flags()` and runs `unload_all_models()` plus a gc — but none
+#: of that has happened when the 200 arrives. Verified by reading state either side rather
+#: than trusted: `free_memory` below records the delta, and a zero delta is reported, not
+#: hidden.
+FREE_SETTLE_SECONDS = 8.0
+
+
+def free_memory(comfy_url: str) -> dict[str, Any]:
+    """Ask ComfyUI to unload models and drop its caches, and measure whether it did.
+
+    `POST /free` is core ComfyUI (`server.py:1192`), not a custom node: it sets the
+    `unload_models` and `free_memory` queue flags, which `main.py:398-410` consumes on the
+    worker's next tick — calling `comfy.model_management.unload_all_models()`, resetting the
+    executor's cache and forcing a gc.
+
+    **It is asynchronous and this function does not assume it worked.** State is read before
+    the call and again after a settle, and the deltas are returned for the record. On this
+    machine a long session grew ComfyUI to 22.78 GiB resident against 61.6 GiB of physical
+    RAM, and the arms rendered late in that session cost up to twice what the same frame
+    counts cost early — so whether this endpoint holds the line is itself a question worth
+    measuring, and a production answer for long batches if it does.
+    """
+    before = gpu_state(comfy_url)
+    outcome: dict[str, Any] = {"before": before}
+    try:
+        # **A raw request, not `post_json`.** `/free` answers 200 with a zero-length body, so
+        # parsing the reply as JSON raises — and the first version of this reported `called:
+        # False` for a call that had in fact succeeded. That is the same trap as assuming it
+        # worked, entered from the other side: the endpoint's *contract* has to be read, not
+        # its convenience wrapper's.
+        call = urllib.request.Request(
+            f"{comfy_url}/free",
+            data=json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(call, timeout=60) as response:
+            outcome["called"] = response.status == 200
+            outcome["status"] = response.status
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        outcome["called"] = False
+        outcome["error"] = str(error)
+        return outcome
+    time.sleep(FREE_SETTLE_SECONDS)
+    after = gpu_state(comfy_url)
+    outcome["after"] = after
+    outcome["freed"] = {
+        key: round(after[key] - before[key], 2)
+        for key in ("comfy_vram_free_gib", "host_ram_free_gib", "vram_used_mib")
+        if isinstance(before.get(key), (int, float)) and isinstance(after.get(key), (int, float))
+    }
+    return outcome
+
+
+def apply_preview_override(payload: dict[str, dict[str, Any]], preview_frames: int | None) -> int:
+    """Patch `ModelPreviewOverrideKJ.preview_frames` for a measurement. Returns nodes touched.
+
+    **`None` must patch nothing**, or every submitted payload silently stops matching the
+    builder that produced it and every digest in the suite becomes a statement about something
+    else. Extracted from the submission path purely so that guarantee is testable: a mutation
+    that made it patch unconditionally, and one that made it patch the *attention* node
+    instead, both survived the suite while the logic lived inline.
+    """
+    if preview_frames is None:
+        return 0
+    touched = 0
+    for node in payload.values():
+        if node.get("class_type") == "ModelPreviewOverrideKJ":
+            node["inputs"]["preview_frames"] = preview_frames
+            touched += 1
+    return touched
+
+
+def cost_fields(
+    *, sampling_span: float | None, execution: float | None, wall: float, frames: int
+) -> dict[str, Any]:
+    """Per-frame cost and the basis it was computed on.
+
+    Sampling time when it is known, because that is the only part a backend or a bundle
+    touches and the only part independent of whether the checkpoint happened to be resident.
+    The whole render is the fallback, and it is *labelled* as such — mixing the two silently
+    is how a 62 s cold load once read as a 24% backend difference.
+    """
+    if sampling_span:
+        return {
+            "seconds_per_frame": round(sampling_span / frames, 3),
+            "seconds_per_frame_basis": "sampling",
+        }
+    return {
+        "seconds_per_frame": round((execution or wall) / frames, 3),
+        "seconds_per_frame_basis": "whole-render",
+    }
+
+
+def gpu_state(comfy_url: str) -> dict[str, Any]:
+    """Whatever the card and the server will cheaply say about conditions right now.
+
+    Recorded per arm at submission time, and **not interpreted**. This run has twice been
+    misled by a measurement whose conditions differed from its neighbours' — a cold checkpoint
+    read as a slower backend, and a fixture that conditioned on 42 ms of song — and in both
+    cases the conditions were knowable at the time and simply were not written down. VRAM
+    already in use, temperature and power draw cost one subprocess call and one HTTP request;
+    the next anomaly then has context instead of a hypothesis.
+
+    Everything here is best-effort. A missing reading is `None`, never a guess, and nothing
+    decides anything on these values.
+    """
+    state: dict[str, Any] = {}
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        try:
+            result = subprocess.run(
+                [
+                    smi,
+                    (
+                        "--query-gpu=memory.used,memory.total,temperature.gpu,power.draw,"
+                        "utilization.gpu,clocks.current.sm"
+                    ),
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            fields = [item.strip() for item in result.stdout.strip().splitlines()[0].split(",")]
+            names = ("vram_used_mib", "vram_total_mib", "temp_c", "power_w", "util_pct", "sm_mhz")
+            for name, raw in zip(names, fields, strict=False):
+                try:
+                    state[name] = float(raw)
+                except ValueError:
+                    state[name] = None
+        except (subprocess.SubprocessError, OSError, IndexError):
+            pass
+    try:
+        stats = get_json(f"{comfy_url}/system_stats", timeout=20)
+        devices = stats.get("devices") or []
+        if devices:
+            state["comfy_vram_free_gib"] = round(devices[0].get("vram_free", 0) / 2**30, 2)
+        state["host_ram_free_gib"] = round(
+            (stats.get("system") or {}).get("ram_free", 0) / 2**30, 2
+        )
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        pass
+    return state
+
+
 def progress_frames_seen(comfy_url: str, seconds: float) -> int:
     """How many per-step progress frames ComfyUI emits over `seconds`.
 
@@ -1015,13 +1161,31 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
     # the first arm that has no record yet — which is the arm the dead process was on, because
     # arms are rendered in order and each writes its record the moment it lands.
     parser.add_argument("--adopt", default=None)
+    # Call `POST /free` before every arm, so each starts from the same machine state instead
+    # of inheriting whatever the previous one left. Off by default: it changes what is being
+    # measured, and an experiment that quietly cleaned up between arms would be describing a
+    # machine nobody runs.
+    parser.add_argument("--free-between-arms", action="store_true")
+    # Override `ModelPreviewOverrideKJ.preview_frames` at submission, for measuring what
+    # preview generation costs. **Default None patches nothing**, so the submitted payload is
+    # byte-identical to what the builders emit and every digest is untouched. The builders are
+    # deliberately not changed: the node and its `preview_frames: 12` come from the Director's
+    # audited export (`h3-ultra-references-user-export.json` node 2376), so altering them is a
+    # deviation from evidence and a Director decision, not a measurement's business.
+    #
+    # Worth measuring because ComfyUI generates previews whether or not anyone is listening:
+    # `server.py`'s `send_image` resizes and encodes *before* `send_bytes` consults
+    # `self.sockets`, and the previewer is built from `args.preview_method` rather than from
+    # client count. So a batch pays for twelve decoded, resized, WebP-encoded frames per
+    # sampling step for an audience of nobody.
+    parser.add_argument("--preview-frames", type=int, default=None)
     # Which evidence directory this invocation belongs to. Defaults to today, and `resolve_run_dir`
     # refuses rather than guesses when today is not where the run lives.
     parser.add_argument("--run-dir", default=None)
     # The frame count every arm in this invocation renders. 226 is the cliff point and the
     # default; `--frames 107` is the cheap screen that answers "does this backend load,
     # engage and sample at all" for a few minutes instead of half an hour.
-    parser.add_argument("--frames", type=int, default=MEASURED_FRAMES)
+    parser.add_argument("--frames", default=str(MEASURED_FRAMES))
     parser.add_argument("--seed", type=int, default=20260821)
     # The gate. Deliberately not a `--dry-run` inverted into a default-on submission: the
     # safe state has to be the one a mistyped command lands in.
@@ -1069,34 +1233,54 @@ def parse_and_gate(argv: list[str]) -> argparse.Namespace:
                 f"An {label} profile is named twice in {names}; an arm compared with itself "
                 f"measures noise"
             )
-    arms = [(sampling, attention) for sampling in samplings for attention in attentions]
-    if len(arms) < 2:
-        abort("An A/B needs at least two arms")
+    # A *list*, because a band sweep is one experiment across frame counts and running it as
+    # seven invocations would be seven chances to vary something else by accident.
+    try:
+        frame_counts = [int(i.strip()) for i in str(args.frames).split(",") if i.strip()]
+    except ValueError:
+        abort(f"--frames takes whole numbers, not {args.frames!r}")
+        raise AssertionError("unreachable")
+    if not frame_counts:
+        abort("--frames needs at least one count")
+    if len(set(frame_counts)) != len(frame_counts):
+        abort(f"A frame count is named twice in {frame_counts}")
+    # Solved rather than trusted: a count off H3's 17k+5 grid has no duration that produces
+    # it, and the arms would silently render a neighbouring length instead.
+    for count in frame_counts:
+        duration_for_frames(count)
+    arms = [
+        (count, sampling, attention)
+        for count in frame_counts
+        for sampling in samplings
+        for attention in attentions
+    ]
+    # Two *renders*, not two distinct arms. One arm repeated is a legitimate experiment and
+    # an important one: with frame count held constant, any rise across repeats is render
+    # ORDER and nothing else. Both sweeps run so far confound order with size — they render
+    # ascending frame counts in sequence — so neither can separate "bigger render" from
+    # "later render", and only a constant-frame repeat can.
+    if len(arms) * args.repeats < 2:
+        abort(
+            "An A/B needs at least two renders: either two arms, or one arm with --repeats"
+        )
     if args.repeats < 1:
         abort("--repeats must be at least 1")
-    # Solved rather than trusted: a frame count off H3's 17k+5 grid has no duration that
-    # produces it, and the arms would silently render a neighbouring length instead.
-    duration_for_frames(args.frames)
 
     renders = len(arms) * args.repeats + (0 if args.no_warmup else 1)
     # Costed per arm rather than at one flat rate, because step count is exactly what these
     # arms vary: quoting 30 minutes for a 4-step bundle would misprice the run by 5x in the
     # direction that matters — a Director declining a measurement that is actually cheap.
     minutes = round(
-        sum(
-            RECORDED_SECONDS_PER_FRAME * args.frames * args.repeats
-            for sampling, _ in arms
-        )
-        / 60
+        sum(RECORDED_SECONDS_PER_FRAME * count * args.repeats for count, _, _ in arms) / 60
     ) + (0 if args.no_warmup else 6)
     if not args.confirm_gpu:
         print(USAGE, file=sys.stderr)
         print(
-            f"\nThis would submit {renders} H3 renders of {args.frames} frames each "
+            f"\nThis would submit {renders} H3 renders at {frame_counts} frames "
             f"(roughly {minutes} minutes at the last recorded 20-step cost; the turbo bundles "
-            f"sample fewer steps and should come in under it) to the user-managed ComfyUI at "
+            f"sample fewer steps and come in well under it) to the user-managed ComfyUI at "
             f"{args.comfy_url}.\n"
-            f"Arms: {', '.join(f'{s}+{a}' for s, a in arms)}\n"
+            f"Arms: {', '.join(f'{s}+{a}@{c}f' for c, s, a in arms)}\n"
             f"It refuses to submit anything without --confirm-gpu.",
             file=sys.stderr,
         )
@@ -1104,6 +1288,7 @@ def parse_and_gate(argv: list[str]) -> argparse.Namespace:
     args.arms = arms
     args.attention_list = attentions
     args.sampling_list = samplings
+    args.frame_counts = frame_counts
     args.render_count = renders
     return args
 
@@ -1144,37 +1329,44 @@ def main() -> None:
             f"it every arm's result would be unfalsifiable. Nothing was submitted."
         )
 
-    frames = args.frames
-    duration = duration_for_frames(frames)
-    if over_render_frames(duration) != frames:
-        abort("The solved duration does not produce the requested frame count")
-    if frames != MEASURED_FRAMES:
-        print(
-            f"Screening at {frames} frames, not the {MEASURED_FRAMES}-frame cliff point. "
-            f"These numbers say whether a backend works and roughly what it costs; they do "
-            f"not answer the cliff question."
-        )
+    frame_counts = args.frame_counts
 
     manifest, shot, project_root = load_shot(args.project, args.shot)
     start = float(shot.get("start") or 0.0)
-    # **The take's own seconds of the song, through the same two functions the route uses.**
-    # A take does not begin at `shot.start`: it begins `lead` seconds earlier, and take second
-    # `t` is song second `start - lead + t` (`timeline.over_render_window`). The first version
-    # of this harness sent the bare exposed slice `(start, start + duration)` — which is
-    # shorter than the take and not lead-shifted — so it conditioned H3 on a window the
-    # application would never send, and then compared the result against a *third* window
-    # again. Every audio number it produced was measuring that mismatch.
     song_duration = float((manifest.get("song") or {}).get("duration") or 0.0)
-    picture_seconds = over_render_frames(duration) / H3_FPS
-    take_lead = over_render_lead(
-        start=start, duration=duration,
-        picture_seconds=picture_seconds, song_duration=song_duration,
-    )
-    window = over_render_window(
-        start=start, lead=take_lead,
-        picture_seconds=picture_seconds, song_duration=song_duration,
-    )
-    references = build_references(manifest, shot, project_root, window)
+
+    def fixture_for(count: int) -> tuple[float, tuple[float, float], float, list[dict]]:
+        """Duration, take window, lead and references for one frame count.
+
+        **The take's own seconds of the song, through the same two functions the route uses.**
+        A take does not begin at `shot.start`: it begins `lead` seconds earlier, and take
+        second `t` is song second `start - lead + t` (`timeline.over_render_window`). The
+        first version of this harness sent the bare exposed slice `(start, start + duration)`
+        — shorter than the take and not lead-shifted — so it conditioned H3 on a window the
+        application would never send, and then compared the result against a *third* window
+        again. Every audio number it produced was measuring that mismatch.
+
+        Computed **per frame count**, because a sweep across lengths must vary the length and
+        nothing else: each count gets its own natural duration, its own lead, and conditioning
+        audio proportional to the take. Sharing one window across counts would reintroduce the
+        confound the corrected fixture was built to remove.
+        """
+        span = duration_for_frames(count)
+        if over_render_frames(span) != count:
+            abort(f"The solved duration does not produce {count} frames")
+        picture = over_render_frames(span) / H3_FPS
+        lead = over_render_lead(
+            start=start, duration=span,
+            picture_seconds=picture, song_duration=song_duration,
+        )
+        take_window = over_render_window(
+            start=start, lead=lead, picture_seconds=picture, song_duration=song_duration,
+        )
+        return span, take_window, lead, build_references(
+            manifest, shot, project_root, take_window
+        )
+
+    fixtures = {count: fixture_for(count) for count in frame_counts}
     prompt = shot.get("h3_prompt") or shot.get("prompt") or ""
     if not prompt.strip():
         abort("The shot has no prompt; an empty prompt is not a controlled variable")
@@ -1217,11 +1409,12 @@ def main() -> None:
         print(f"Reusing {len(existing)} arm(s) already on disk: {', '.join(sorted(existing))}")
 
     def payload_for(
-        name: str, frames_duration: float, prefix: str, sampling: str = H3_DEFAULT_PROFILE
+        name: str, frames_duration: float, prefix: str, sampling: str = H3_DEFAULT_PROFILE,
+        refs: list[dict] | None = None,
     ) -> dict:
         return build_h3_reference_payload(
             prompt=prompt,
-            references=references,
+            references=refs if refs is not None else fixtures[frame_counts[0]][3],
             duration=frames_duration,
             seed=args.seed,
             prefix=prefix,
@@ -1238,15 +1431,19 @@ def main() -> None:
     # Run **per sampling bundle**, because two bundles legitimately differ in a LoRA node and
     # a step count and the guard would rightly refuse them. Within one bundle, attention is
     # the only thing allowed to move.
-    for sampling in args.sampling_list:
-        group = [attention for group_sampling, attention in arms if group_sampling == sampling]
-        if H3_DEFAULT_ATTENTION in group and len(group) > 1:
-            only_the_attention_node_differs(
-                {
-                    name: payload_for(name, duration, "mvp/attention-compare", sampling)
-                    for name in group
-                }
-            )
+    for count in frame_counts:
+        span, _, _, refs = fixtures[count]
+        for sampling in args.sampling_list:
+            group = [a for c, s_, a in arms if c == count and s_ == sampling]
+            if H3_DEFAULT_ATTENTION in group and len(group) > 1:
+                only_the_attention_node_differs(
+                    {
+                        name: payload_for(
+                            name, span, "mvp/attention-compare", sampling, refs
+                        )
+                        for name in group
+                    }
+                )
     if H3_DEFAULT_ATTENTION not in attentions:
         print(
             "The default attention profile is not among the arms, so within a sampling bundle "
@@ -1274,7 +1471,7 @@ def main() -> None:
             f"Unavailable is a result; a mislabelled render is not. Nothing was submitted."
         )
 
-    print(f"Renders: {renders}. Frames: {frames}. Seed: {args.seed}.")
+    print(f"Renders: {renders}. Frames: {frame_counts}. Seed: {args.seed}.")
     print(f"ComfyUI {stats.get('system', {}).get('comfyui_version')} launched as {launch_argv}")
     print("The default profile inherits that launch flag rather than selecting a backend.")
     print(f"ModelAttentionBackend.attention publishes {backends}")
@@ -1283,7 +1480,7 @@ def main() -> None:
     log_offset = comfy_log.stat().st_size
 
     def run_one(
-        sampling: str, name: str, repeat: int, payload: dict, label: str,
+        frames: int, sampling: str, name: str, repeat: int, payload: dict, label: str,
         adopt: str | None = None,
     ) -> dict[str, Any]:
         nonlocal log_offset
@@ -1292,6 +1489,13 @@ def main() -> None:
         # construction — this harness submits one prompt at a time and waits — which is the
         # only reason a window can be attributed at all.
         _, log_offset = log_tail(comfy_log, log_offset)
+        # Before the state snapshot, so what is recorded is the state this arm actually
+        # started from rather than the state it inherited.
+        # Patched here rather than in the builder, so the *builder* still emits the export's
+        # own value and only this measurement's submission differs. `None` patches nothing.
+        apply_preview_override(payload, args.preview_frames)
+        freed = free_memory(args.comfy_url) if (args.free_between_arms and not adopt) else None
+        state_before = gpu_state(args.comfy_url)
         started = time.monotonic()
         if adopt:
             prompt_id = adopt
@@ -1414,14 +1618,17 @@ def main() -> None:
                 if execution and sampled_span else None
             ),
             "frames": frames,
-            "seconds_per_frame": (
-                round(sampled_span / frames, 3) if sampled_span
-                else round((execution or wall) / frames, 3)
+            **cost_fields(
+                sampling_span=sampled_span, execution=execution, wall=wall, frames=frames
             ),
-            "seconds_per_frame_basis": "sampling" if sampled_span else "whole-render",
             "timing_source": "comfy" if execution else "wall-clock-upper-bound",
             "engagement": verdict,
             "engagement_evidence": evidence,
+            "preview_frames": args.preview_frames,
+            # Conditions at submission, recorded and not interpreted. See `gpu_state`.
+            "state_before": state_before,
+            "state_after": gpu_state(args.comfy_url),
+            "free_before_arm": freed,
             "output": str(kept),
         }
         record["adopted"] = bool(adopt)
@@ -1467,21 +1674,22 @@ def main() -> None:
     adopt = args.adopt
     for repeat in range(1, args.repeats + 1):
         print(f"Repeat {repeat} of {args.repeats}:")
-        for sampling, name in arms:
+        for count, sampling, name in arms:
             # The frame count is part of the identity, not just of the numbers. Without it a
             # 107-frame screen and a 226-frame promotion of the same arm share a label, and
             # the resume logic would "reuse" the screen as though it answered the cliff
             # question. Labels are how arms are told apart; anything that changes what an arm
             # measured belongs in one.
-            label = f"{sampling}+{name}-f{frames}-r{repeat}"
+            label = f"{sampling}+{name}-f{count}-r{repeat}"
             if label in existing:
                 results.append(existing[label])
                 print(f"  {label}: reused from disk")
                 continue
+            span, _, _, refs = fixtures[count]
             results.append(
                 run_one(
-                    sampling, name, repeat,
-                    payload_for(name, duration, f"mvp/attention-{label}", sampling),
+                    count, sampling, name, repeat,
+                    payload_for(name, span, f"mvp/attention-{label}", sampling, refs),
                     label,
                     adopt=adopt,
                 )
@@ -1507,15 +1715,25 @@ def main() -> None:
             # This invocation's frame count, and every count present in the directory —
             # a run directory accumulates arms across invocations and one number would
             # misdescribe the others. Each arm carries its own `frames` in `runs`.
-            "frames_this_invocation": frames,
+            "frames_this_invocation": frame_counts,
             "frame_counts_present": sorted(
-                {record.get("frames") or frames for record in results}
+                {record["frames"] for record in results if record.get("frames")}
             ),
-            "window": {"start": window[0], "end": window[1]},
-            "take_lead_seconds": round(take_lead, 4),
+            # One window per frame count, because each length has its own lead and its own
+            # take. A single top-level window would describe at most one of the arms.
+            "windows": {
+                str(count): {
+                    "start": fixtures[count][1][0], "end": fixtures[count][1][1],
+                    "take_lead_seconds": round(fixtures[count][2], 4),
+                    "shot_duration": fixtures[count][0],
+                }
+                for count in frame_counts
+            },
             "repeats": args.repeats,
             "warmup": not args.no_warmup,
-            "sample_frames": list(sample_indices(frames)),
+            "sample_frames": {
+                str(count): list(sample_indices(count)) for count in frame_counts
+            },
             "published_attention_options": backends,
             "runs": results,
             "contact_sheets": sheets,
@@ -1539,11 +1757,11 @@ def main() -> None:
     for record in finished:
         sampled[record["label"]] = sample_frames(
             ffmpeg, Path(record["output"]), frames_dir, record["label"],
-            indices=sample_indices(record.get("frames") or frames),
+            indices=sample_indices(record["frames"]),
         )
     sheets: list[str] = []
-    for length in sorted({record.get("frames") or frames for record in finished}):
-        peers = [record for record in finished if (record.get("frames") or frames) == length]
+    for length in sorted({record["frames"] for record in finished}):
+        peers = [record for record in finished if record["frames"] == length]
         for index in sample_indices(length):
             row = [
                 (record["label"], sampled[record["label"]][index])
@@ -1566,30 +1784,33 @@ def main() -> None:
     audio_dir = run_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     try:
-        master = Path(next(item["file"] for item in references if item["kind"] == "audio"))
+        master = Path(
+            next(
+                item["file"]
+                for item in fixtures[frame_counts[0]][3]
+                if item["kind"] == "audio"
+            )
+        )
         # One reference window **per frame count**, for the same reason the contact sheets are
         # grouped: a 107-frame arm was conditioned on 4.5 s of the song and a 226-frame arm on
         # 8.25 s of it. Comparing either take against the other's window would measure the
         # length difference and report it as an audio difference.
         sources: dict[int, Path] = {}
-        for length in sorted({record.get("frames") or frames for record in finished}):
-            # The take's own window, recomputed for that length the way the render computed
-            # it — so take second 0 is reference second 0 and a measured lag is a real one.
-            span_duration = duration_for_frames(length)
-            span_picture = over_render_frames(span_duration) / H3_FPS
-            span_lead = over_render_lead(
-                start=start, duration=span_duration,
-                picture_seconds=span_picture, song_duration=song_duration,
-            )
-            span_window = over_render_window(
-                start=start, lead=span_lead,
-                picture_seconds=span_picture, song_duration=song_duration,
+        for length in sorted({record["frames"] for record in finished}):
+            # The take's own window, through `fixture_for` — the same call the render used,
+            # never a second copy of the arithmetic. Reusing it is the whole point: the last
+            # time this window was computed twice the two answers disagreed, and every audio
+            # number measured the disagreement rather than the audio. A length reached from a
+            # reused record rather than this invocation's list is computed on demand, by that
+            # same function.
+            span_window = (
+                fixtures[length][1] if length in fixtures else fixture_for(length)[1]
             )
             sources[length] = decode_audio(
                 ffmpeg, master, audio_dir / f"master-window-f{length}.wav", span_window,
             )
         for record in finished:
-            length = record.get("frames") or frames
+            length = record["frames"]
             take_audio = decode_audio(
                 ffmpeg, Path(record["output"]), audio_dir / f"{record['label']}.wav"
             )
