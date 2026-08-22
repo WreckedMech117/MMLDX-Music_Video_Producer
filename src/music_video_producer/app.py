@@ -61,6 +61,7 @@ from .batch import (
     reconcile_render_jobs,
     render_status_report,
     shot_label,
+    stamp_job_settled,
     supersede_target_jobs,
 )
 from .comfy import ComfyClient, ComfyError, ComfyProgressListener, ProgressTracker
@@ -2158,6 +2159,49 @@ def _adopt_expansion_maps(project: Project, stored: dict[str, Shot]) -> None:
             )
 
 
+#: Everything about a job that this application measured rather than a client supplied. Named
+#: as a set so `replace_project`'s guard and the test that proves it cannot drift apart: a field
+#: added to `RenderJob`'s timing block and not to this list is the eighth instance of the hole.
+JOB_MEASURED_FIELDS = ("render_seconds", "render_seconds_source", "render_frames", "updated_at")
+
+
+def _adopt_job_measurements(project: Project, stored: dict[str, RenderJob]) -> None:
+    """Server-own every measured field on `RenderJob` across the generic whole-project write.
+
+    **The eighth time this exact hole has been found in `replace_project`**, and it fails the
+    identical two ways `_adopt_expansion_maps`, `_adopt_song_recovery_slots` and the anchor, slot
+    and location adoptions all describe. `render_seconds` and `render_frames` are defaulted
+    numbers and `render_seconds_source` a defaulted string, so a client written before they
+    existed — which is every client, including any hand-rolled API call — omits all three, they
+    arrive as `0.0`/`0`/`""`, and **one ordinary save would erase every render timing in the
+    project at once**: the exact loss this instrumentation exists to make impossible, arriving
+    through the exact route that has caused it seven times before. And a body that *invented* a
+    duration would be planting a measurement nobody took, which is what this whole change is a
+    correction of.
+
+    `updated_at` is adopted with them because it is now evidence rather than bookkeeping — it is
+    the settle moment, and half of the `record`-sourced span — and because a body that omits it
+    gets a fresh `now_utc()` from the default factory, which would silently redate every settled
+    job to whenever somebody last pressed save.
+
+    `created_at` is deliberately **not** adopted: it is not measured, a client round-trips it
+    faithfully, and adopting it would mean this route could never carry a job the store does not
+    already hold. Nor is `status`, `error` or `progress` — each has its own writer and its own
+    argument, and widening this beyond the measurements would be a different change hiding
+    inside a guard.
+
+    A job in the body that the stored project does not hold keeps its own values, on the
+    anchor's rule inverted: there is nothing measured to protect, and a new record arriving on
+    the generic write is already reported by every other means.
+    """
+    for job in project.jobs:
+        was = stored.get(job.id)
+        if was is None:
+            continue
+        for name in JOB_MEASURED_FIELDS:
+            setattr(job, name, getattr(was, name))
+
+
 def _require_approval_unchanged(project: Project, shots: list[Shot]) -> None:
     """Refuse a save that changes any of `APPROVAL_FIELDS`. Approval is the approve route's.
 
@@ -2447,15 +2491,57 @@ POPULATE_SHORT_PLAN_REFUSAL = (
     "its own smaller ask, or point MVP_LLM_MODEL at a larger model and try again."
 )
 
-#: See the populate route's window_mean comment: the creator's "fastest / safest" preset,
-#: measured on this card as the difference between minutes and hours per shot.
+#: See the populate route's window_mean comment: the creator's "fastest / safest" preset, and
+#: the flat end of a measured per-frame cost curve — 141 frames (~5.1 s) is a median 6.3 min,
+#: where 226 frames is 30 min. The table and its caveats are on `POPULATE_MAX_WINDOW_SECONDS`.
 POPULATE_TARGET_WINDOW_SECONDS = 5.2
 
-#: The *enforced* ceiling the tiling repair applies, tighter than H3's 15 s legality.
-#: Guidance alone is not enough: on the first 5.2 s-target run the local model simply
-#: echoed the previous plan's 9 s windows out of its own context, and 9 s windows are
-#: the measured 2.2-hour cliff. The bound is what the target means; a Director who
-#: wants longer shots edits them deliberately, one at a time, in the timeline.
+#: The *enforced* ceiling the tiling repair applies, tighter than H3's 15 s legality, and it
+#: rests on two things — one measured, one observed.
+#:
+#: **The render-cost cliff (corrected 2026-08-21).** This comment used to assert that the
+#: 221-frame windows a 9.5 s mean produced "took 2.2 HOURS each on this card". That figure had
+#: **no primary record anywhere in this repository** — it appeared only here, and was quoted
+#: onward into `tests/test_api.py`, `tests/test_populate_steps.py` and `docs/DEVELOPMENT-LOG.md`
+#: as though those were corroboration. It is wrong by roughly 3.4x. What the serial overnight
+#: batch of 2026-08-19/20 actually shows, reconstructed from the mtimes of the `.mp4` files in
+#: ComfyUI's output tree:
+#:
+#: ===== ======== == ========= ==========
+#: frames window   n median    sec/frame
+#: ===== ======== == ========= ==========
+#: 107   <=3.3 s   7  4.6 min   2.58
+#: 124   ~4.5 s    4  5.4 min   2.61
+#: 141   ~5.1 s   14  6.3 min   2.68
+#: 158   ~5.8 s    5  7.6 min   2.89
+#: 226    8.75 s   1 30.2 min   8.02
+#: 277   10.38 s   1 39.1 min   8.47
+#: ===== ======== == ========= ==========
+#:
+#: **A cliff is real; 2.2 hours is not.** Per-frame cost is flat at 2.6-2.9 s/frame out to 158
+#: frames and then triples to ~8 s/frame at 226+. The measured worst case is 39 minutes.
+#:
+#: Three caveats, and the bound is not re-derived until they are answered:
+#:
+#: 1. **n=1 at both cliff points.** A single sample is exactly what produced the 2.2-hour claim.
+#: 2. **The acceleration is unmeasured.** Every H3 render this project has ever timed ran with
+#:    `PathchSageAttentionKJ` at `sage_attention: "disabled"` and `allow_compile: False`
+#:    (`workflows.py`, faithful to the Director's 2026-08-17 export). Attention is exactly the
+#:    term that explains a cliff — 158→226 frames is 1.43x, whose quadratic term predicts ~2.05x
+#:    where 3.0x was observed, which points at spilling rather than pure compute. A specified,
+#:    unrun experiment is at `_bmad-output/planning-artifacts/h3-attention-backend-experiment.md`.
+#: 3. **These came from file mtimes, not instrumentation.** They are gaps between consecutive
+#:    output files on a serial batch, so each includes whatever sat between two renders. One
+#:    141-frame outlier at 26.7 min and one 158 at 9.5 min sit outside the pattern and are most
+#:    likely machine contention; they are named rather than smoothed away. Renders now record
+#:    their own elapsed time (`RenderJob.render_seconds`), so the next table is measured.
+#:
+#: **The second half of the rationale stands on its own and is why the constant did not move.**
+#: Guidance alone is not enough: on the first 5.2 s-target run the local model simply echoed the
+#: previous plan's 9 s windows out of its own context. The bound is what the target means; a
+#: Director who wants longer shots edits them deliberately, one at a time, in the timeline.
+#: What would settle the ceiling: n>=5 at 226 and 277 frames on the shipped graph, then the same
+#: on an accelerated one, timed by the instrumentation rather than by hand.
 POPULATE_MAX_WINDOW_SECONDS = 6.0
 
 def populate_required_shots(duration: float) -> int:
@@ -2843,10 +2929,17 @@ async def lay_out_shots(
     # The count comes from `POPULATE_TARGET_WINDOW_SECONDS`, the target window populate
     # steers the model toward and thereby the plan's typical shot length. NOT the
     # midpoint of H3's 4–15 s training range: the creator's own preset table calls
-    # 5.17 s (124 frames) "fastest / safest", and the first live batch measured why —
-    # 124-frame renders take ~2–6 min while the 221-frame windows a 9.5 s mean produced
-    # took 2.2 HOURS each on this card (2026-08-19). ~5 s cuts also edit better for
-    # music video than 9 s holds.
+    # 5.17 s (124 frames) "fastest / safest", and the overnight batch of 2026-08-19/20
+    # measured why — a median 5.4 min at 124 frames and 6.3 min at 141, against 30.2 min at
+    # 226 frames and 39.1 min at 277, where per-frame cost triples from ~2.6 s to ~8 s.
+    #
+    # **Corrected 2026-08-21.** This comment previously said those long windows "took 2.2
+    # HOURS each"; that claim had no primary record anywhere and is wrong by roughly 3.4x.
+    # The table above was reconstructed from output-file mtimes, is n=1 at both cliff
+    # points, and was measured with attention acceleration disabled. All three caveats, and
+    # what would settle the bound, are on `POPULATE_MAX_WINDOW_SECONDS`.
+    #
+    # ~5 s cuts also edit better for music video than 9 s holds.
     required = populate_required_shots(duration)
     context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
     # The roster's rule applied to the context dump, which is the other place the model can
@@ -4166,10 +4259,18 @@ class SnapCutMove(BaseModel):
 
     before: str
     after: str
+    #: Where the cut is. For an overlapping seam that is the transition's centre and neither
+    #: clip has an edge there — `timeline.SEAM_POINT` argues why — which is why `overlap`
+    #: travels beside it rather than leaving the number unexplained.
     boundary: float
     proposed: float
     shift: float
     gap: float
+    #: How long the transition at this seam is, 0 for a hard cut. `timeline.CutMove.overlap`
+    #: verbatim. It is the same before and after the move: a transition is authored with a
+    #: length the Director chose, so snapping moves both its edges together and resizes
+    #: nothing.
+    overlap: float = 0
 
 
 class SnapCutSkip(BaseModel):
@@ -4444,6 +4545,7 @@ def alignment_report(
                 proposed=move.proposed,
                 shift=move.shift,
                 gap=move.gap,
+                overlap=move.overlap,
             )
             for move in alignment.moves
         ],
@@ -4876,6 +4978,10 @@ def heal_orphaned_local_jobs(project: Project, live_job_ids: Container[str]) -> 
     for job in healed:
         job.status = "error"
         job.error = ASSEMBLY_ORPHANED_ERROR
+        # A settle, and stamped like every other one. The span it records runs from the export
+        # being enqueued to the boot that noticed the crash, which is not how long the export
+        # ran — `render_timing_summary` reports a non-`complete` job as exactly that.
+        stamp_job_settled(job)
     return healed
 
 
@@ -6013,11 +6119,23 @@ def create_app(
         before_submit=ejector.eject,
     )
     # The SageAttention choke point. Every H3 adapter emits a `PathchSageAttentionKJ`
-    # node with the exports' own `disabled` (their creator launches ComfyUI with
-    # `--use-sage-attention`; this installation does not). When the Director opts in via
+    # node with the exports' own `disabled`. When the Director opts in via
     # MVP_SAGE_ATTENTION, the value is patched here — one wrapper over `comfy.submit`, so
     # every current and future adapter is covered and no builder or digest moves. Blank
     # (the default) leaves every payload byte-identical to the evidence.
+    #
+    # **Corrected 2026-08-21.** This comment used to add "their creator launches ComfyUI with
+    # `--use-sage-attention`; this installation does not". The second half is false, and had
+    # been since 2026-08-19. Live `/system_stats` reports this server's own argv as
+    # `[main.py, --use-sage-attention, --fast]`, and `ComfyUI/user/comfyui.log` prints
+    # `Using sage attention` at every start it retains — including `2026-08-20 09:00:34`,
+    # inside the serial overnight batch the render-cost cliff on `POPULATE_MAX_WINDOW_SECONDS`
+    # was reconstructed from. `PathchSageAttentionKJ` at `disabled` returns the model
+    # untouched (`model_optimization_nodes.py:124`), so it writes no override and the model
+    # samples on ComfyUI's *global* backend — which on this machine is SageAttention. The
+    # node does not disable acceleration; it declines to override it. Blank here therefore
+    # means "whatever ComfyUI was launched with", not "none", and the cliff was measured on
+    # SageAttention rather than on an unaccelerated path.
     if settings.sage_attention:
         unpatched_submit = comfy.submit
 
@@ -6157,6 +6275,10 @@ def create_app(
             job.status = "error"
             job.error = JOB_NEVER_SUBMITTED
             job.missing_ticks = 0
+            # Stamped like every other settle, though what it records is the seconds a
+            # submission spent being refused — nothing rendered here, and nothing may read it
+            # as though something had. See `batch.render_timing_summary`.
+            stamp_job_settled(job)
         try:
             store.save(project)
         except ProjectChangedDuringSave:
@@ -6389,6 +6511,12 @@ def create_app(
         # The recorded map is server-owned here for the fifth time this exact hole has been found
         # in this exact route. See `_adopt_expansion_maps`.
         _adopt_expansion_maps(project, {shot.id: shot for shot in current.shots})
+        # Every measured render timing is server-owned here for the *eighth* time this hole has
+        # been found in this route. A body carries every field of every job, and the three
+        # timing fields are defaulted, so without this one ordinary save from any existing
+        # client would blank the render costs this application now records. See
+        # `_adopt_job_measurements`.
+        _adopt_job_measurements(project, {job.id: job for job in current.jobs})
         # The generic write is the widest citation writer there is: a body carries every field of
         # every Shot *and* every Asset, so one save can move a citation, re-role one, rename a
         # reference, rename an asset, or remove one — and this is the recorded sibling-write hole
@@ -6747,6 +6875,11 @@ def create_app(
                 raise HTTPException(status_code=502, detail=str(error)) from error
         job.status = "cancelled"
         job.error = CANCEL_JOB_NOTE
+        # Settled here, so stamped here. Deliberately no ComfyUI measurement: this route never
+        # reads `/history`, and a cancelled prompt's execution span is not this render's cost
+        # anyway. What is recorded is how long the record stood open, which is what
+        # `render_timing_summary` calls it.
+        stamp_job_settled(job)
         if job.kind == "h3":
             shot = next((item for item in project.shots if item.id == job.target_id), None)
             if shot and shot.status in ("queued", "running"):
@@ -8354,6 +8487,17 @@ def create_app(
             prompt_id=PENDING_SUBMISSION_PROMPT_ID,
             target_id=shot.id,
             seed=shot.seed,
+            # What this render is actually being asked for, recorded at the one moment it is
+            # true. All three H3 branches above resolve to the same count — the reference and
+            # keyframe builders each call `over_render_frames(duration)` on `shot.duration`, and
+            # the Director branch's `timeline.aligned_frames` is that same number arrived at
+            # through `picture_seconds` — so this is the graph's length however the shot renders.
+            #
+            # Persisted because it cannot be recovered afterwards: `shot.duration` is edited
+            # after a render (an edge drag, a snapped cut), so re-deriving the frame count later
+            # describes a render that never happened. A duration with no frame count beside it
+            # is what made the mtime reconstruction of 2026-08-21 as laborious as it was.
+            render_frames=over_render_frames(shot.duration),
         )
         project.jobs.append(job)
         store.save(project)
@@ -9534,6 +9678,11 @@ def create_app(
             def patch(recorded: RenderJob) -> None:
                 recorded.status = "error"
                 recorded.error = message
+                # A settle, stamped like the rest. `settle` is also the progress writer, so the
+                # stamp goes in the two terminal patches and nowhere else — a hundred progress
+                # ticks moving `updated_at` would leave it meaning "last touched" instead of
+                # "when this ended", and the duration would evaporate. See `RenderJob.updated_at`.
+                stamp_job_settled(recorded)
 
             settle(patch)
             return HTTPException(status_code=502, detail=message)
@@ -9645,6 +9794,11 @@ def create_app(
             # that can stop a few milliseconds short of the file it just wrote, and a
             # finished export reading 99 % is a bar that never lands.
             recorded.progress = 100
+            # An assembly is local work started the moment its record is created, so here —
+            # uniquely — `created_at` really is the start and `record` is an exact export time
+            # rather than an upper bound. It is still labelled `record`, because the label
+            # describes where the span came from and not how much to trust it in one case.
+            stamp_job_settled(recorded)
 
         settled = settle(complete)
         return AssemblyResponse(
@@ -10087,10 +10241,10 @@ def create_app(
             shot.id for shot in project.shots if shot_render_in_flight(project, shot)
         )
         stored = shot_snap_windows(project, rendering=rendering)
-        # A cut is a boundary two shots *share*, so a plan with a gap or an overlap has no
-        # single thing to move — refused in `snap_timeline_cuts`' own words, and found the
-        # first time this route was pointed at the Director's live plan (2026-08-21), where
-        # two hand-dragged shots disagreed about their shared edge by 42 ms.
+        # A **hole** has no seam in it, so a plan with one is refused in `snap_timeline_cuts`'
+        # own words. An overlap is not a hole: it is an authored transition (R-3) and the core
+        # moves it as a unit, which is what made this route usable on the Director's live plan
+        # at all — 15 of its 33 seams are overlaps, one of them 5.49 s long.
         try:
             alignment = line_up_shots(
                 ShotLayout(
@@ -10439,6 +10593,7 @@ def create_app(
                     proposed=move.proposed,
                     shift=move.shift,
                     gap=move.gap,
+                    overlap=move.overlap,
                 )
                 for move in plan.moves
             ],

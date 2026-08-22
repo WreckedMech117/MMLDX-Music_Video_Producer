@@ -626,7 +626,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .snap-note { color: var(--ink); border-left: 2px solid var(--acid); padding-left: 8px; margin: 4px 0; }
 .queue-layout { display: grid; grid-template-columns: 1fr 300px; gap: 12px; }
 .queue-table, .finish-stack { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-0); }
-.queue-header, .job-row { display: grid; grid-template-columns: 1.4fr 1fr .7fr .6fr 1.2fr; gap: 10px; align-items: center; min-height: 48px; padding: 0 14px; border-bottom: 1px solid var(--line); }
+.queue-header, .job-row { display: grid; grid-template-columns: 1.4fr 1fr .7fr .6fr .8fr 1.2fr; gap: 10px; align-items: center; min-height: 48px; padding: 0 14px; border-bottom: 1px solid var(--line); }
+/* Render cost, recorded by the application that ran it since 2026-08-21. Monospaced so a column
+   of durations lines up under scanning, which is the whole reason it is a column and not prose. */
+.job-row .job-took { font: 11px Consolas, monospace; color: var(--muted); white-space: nowrap; }
 .queue-header { color: var(--dim); font: 9px Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .job-row { font-size: 12px; }
 .job-row .job-kind { color: var(--acid); text-transform: uppercase; }

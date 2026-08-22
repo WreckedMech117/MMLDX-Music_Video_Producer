@@ -4,7 +4,7 @@ from itertools import pairwise
 
 import pytest
 
-from music_video_producer.assembly import ClipWindow, tiling_refusals
+from music_video_producer.assembly import ClipWindow, assembly_plan, tiling_refusals
 from music_video_producer.models import (
     CHARACTER_SLOT_LIMIT,
     VOCAL_TYPE_SPECS,
@@ -29,16 +29,20 @@ from music_video_producer.timeline import (
     SNAP_APPROVED_REFUSAL,
     SNAP_CLEARANCE_SECONDS,
     SNAP_CONTIGUITY_TOLERANCE,
+    SNAP_HOLE,
     SNAP_IN_FLIGHT_REFUSAL,
     SNAP_LOCKED_REFUSAL,
     SNAP_MINIMUM_GAP_SECONDS,
+    SNAP_NESTED,
     SNAP_NO_GAP_IN_TOLERANCE,
+    SNAP_OFF_THE_PLAN,
     SNAP_OUT_OF_BAND,
     SNAP_TOLERANCE_DEFAULT,
     SNAP_TOLERANCE_OFF,
     SNAP_UNMEASURED,
     SNAP_WITHOUT_CUTS,
     LyricTagError,
+    SnapWindow,
     TimelineError,
     _asset_description,
     _gap_snap_target,
@@ -62,6 +66,7 @@ from music_video_producer.timeline import (
     section_lyrics,
     shot_expansion_input,
     snap_cut_plan,
+    snap_window_plan,
     song_section,
     tag_lyric_line,
     vocal_gaps,
@@ -2009,10 +2014,20 @@ def test_the_snap_target_clamps_into_the_gap_rather_than_jumping_to_its_middle()
     assert _gap_snap_target(narrow, 40.0) == pytest.approx(10.1)
 
 
-def test_a_plan_that_is_not_a_contiguous_tiling_has_no_cut_to_move():
-    """Two shots that do not share a boundary do not share a cut, so there is nothing single
-    to move. Refused by name rather than repaired: closing a hole is an editing decision."""
-    with pytest.raises(TimelineError, match="not a contiguous tiling"):
+def test_a_hole_has_no_seam_in_it_and_an_overlap_is_not_a_hole():
+    """The restated precondition, and it turns on the **sign** of the disagreement.
+
+    A hole is seconds of song with no picture in them: `assembly.tiling_refusals` refuses the
+    export for it, and there is no seam to place in a stretch that holds nothing. Refused by
+    name rather than repaired — closing a hole is an editing decision, and one this pass could
+    only make by guessing which window should grow.
+
+    An overlap is the opposite of an absence. Since the layers ruling assembly accepts it, and
+    since R-3 it is how a transition is authored, so it is snapped. The two fixtures below
+    differ by the *direction* of one second, which is what says this is one rule reading a
+    sign rather than two rules that happen to disagree.
+    """
+    with pytest.raises(TimelineError, match="has a hole in it"):
         snap_cut_plan(
             Project(
                 name="Holed",
@@ -2024,18 +2039,25 @@ def test_a_plan_that_is_not_a_contiguous_tiling_has_no_cut_to_move():
             ),
             tolerance=1.0,
         )
-    with pytest.raises(TimelineError, match="not a contiguous tiling"):
-        snap_cut_plan(
-            Project(
-                name="Overlapped",
-                song=snap_song([(0.5, 7.0)], duration=20.0),
-                shots=[
-                    Shot(id="s0", start=0.0, duration=6.0),
-                    Shot(id="s1", start=5.0, duration=6.0),
-                ],
-            ),
-            tolerance=1.0,
-        )
+    overlapped = snap_cut_plan(
+        Project(
+            name="Overlapped",
+            song=snap_song([(0.5, 7.0)], duration=20.0),
+            shots=[
+                Shot(id="s0", start=0.0, duration=6.0),
+                Shot(id="s1", start=5.0, duration=15.0),
+            ],
+        ),
+        tolerance=2.0,
+    )
+    assert overlapped.status == "ready"
+    # The cut is the overlap's centre — 5.500s, not either clip's edge — and it moves into the
+    # rest that begins at 7.000s, carrying its whole one-second blend with it.
+    assert [(move.boundary, move.overlap) for move in overlapped.moves] == [(5.5, 1.0)]
+    windows = {shot_id: (start, length) for shot_id, start, length in overlapped.windows}
+    assert windows["s0"][0] + windows["s0"][1] - windows["s1"][0] == pytest.approx(
+        1.0, abs=1e-9
+    )
 
 
 def test_a_plan_with_fewer_than_two_shots_has_no_cut_at_all():
@@ -2250,6 +2272,411 @@ def test_the_band_is_judged_against_the_boundary_the_previous_cut_already_settle
     assert "4.900s" not in refused.reason
     assert "under the 4s minimum" in refused.reason
     assert plan.windows == [("s0", 0.0, 6.0), ("s1", 6.0, 4.5), ("s2", 10.5, 9.5)]
+
+
+# ---------------------------------------------------------------------------------------------
+# Transitions: a seam that is an overlap, and what moving it may and may not do.
+#
+# R-3 (2026-08-21): a transition **is** an overlap, authored by dragging clip edges across each
+# other, with a length the Director chose. So an overlapping seam has two edges and no shared
+# boundary, and the two questions this section pins are which point of it lands in the silence
+# (`timeline.SEAM_POINT`: the overlap's midpoint) and what may not change while it does (the
+# blend's length, and the plan's coverage of the song — R-7).
+# ---------------------------------------------------------------------------------------------
+
+
+def snap_windows_of(rows, *, refusals=()):
+    """`(start, duration)` pairs as `SnapWindow`s, named the way a timeline names shots."""
+    blocked = dict(refusals)
+    return [
+        SnapWindow(
+            id=f"w{index:02d}",
+            start=start,
+            duration=length,
+            label=f"SHOT {index + 1:02d}",
+            refusal=blocked.get(index, ""),
+        )
+        for index, (start, length) in enumerate(rows)
+    ]
+
+
+def seam_lengths(rows):
+    """Every seam's overlap length, positive for an overlap and negative for a hole."""
+    return [
+        round((start_a + length_a) - start_b, 9)
+        for (start_a, length_a), (start_b, _length_b) in pairwise(rows)
+    ]
+
+
+def assembled_frames(rows, song_seconds):
+    """What assembly would actually cut — the resolved layer plan's frame count.
+
+    Read through `assembly.assembly_plan` rather than computed here, because the number R-7
+    protects is the one the export produces, and a second arithmetic for it in a test would be
+    the second implementation this repository keeps finding.
+    """
+    clips = [
+        ClipWindow(
+            shot_id=f"w{index:02d}", label=f"SHOT {index + 1:02d}", start=start,
+            duration=length, approved_output="take.mp4", approved_start=start,
+            approved_duration=length, source=None,
+        )
+        for index, (start, length) in enumerate(rows)
+    ]
+    plan = assembly_plan(clips, song_seconds, {clip.shot_id: (640, 384) for clip in clips})
+    return plan.total_frames
+
+
+def snapped_rows(plan):
+    return [(start, length) for _id, start, length in plan.windows]
+
+
+def test_an_overlap_moves_as_a_unit_and_is_never_resized():
+    """**The headline.** A transition is an authored artefact with a length the Director chose.
+
+    Both of its edges travel by the same delta, so the blend lands somewhere new and is exactly
+    as long afterwards as it was before. The alternative — moving the later clip's start alone,
+    which is what `assembly_plan` resolves an overlap to today — would turn this 2.000 s
+    dissolve into a 1.550 s one as a side effect of moving a cut, which is editing something
+    nobody asked to edit.
+
+    The cut itself is `SEAM_POINT`: the overlap's **midpoint**, 11.000 s here. At the later
+    clip's start nothing is visible yet — B is at zero opacity — so placing that instant in the
+    silence would be a guarantee about arithmetic rather than about the picture.
+    """
+    rows = [(0.0, 12.0), (10.0, 10.0), (20.0, 10.0)]
+    song = measured_song(words=[("a", 0.0, 11.45), ("b", 13.0, 30.0)], duration=30.0)
+
+    plan = snap_window_plan(snap_windows_of(rows), song, tolerance=1.0)
+
+    assert plan.status == "ready"
+    move = next(move for move in plan.moves if move.overlap)
+    # The cut is the centre of the blend, not either edge of it, and the report says so.
+    assert (move.boundary, move.overlap) == (11.0, 2.0)
+    assert move.proposed == round(11.45 + SNAP_CLEARANCE_SECONDS, 3)
+    after = snapped_rows(plan)
+    # Both edges moved, by the same amount, and the blend is the length it was.
+    assert after[0][0] + after[0][1] == pytest.approx(12.6, abs=1e-9)
+    assert after[1][0] == pytest.approx(10.6, abs=1e-9)
+    assert seam_lengths(after)[0] == pytest.approx(seam_lengths(rows)[0], abs=1e-9)
+    assert seam_lengths(after)[0] == pytest.approx(2.0, abs=1e-9)
+    # And the later clip's start alone is *not* where the silence was bought, which is the
+    # design this rejects: 10.600 s is inside the phrase that runs to 11.450 s.
+    assert after[1][0] < 11.45
+
+
+def test_a_hard_cut_is_snapped_exactly_as_it_was_before_overlaps_were_admitted():
+    """Phase B's simple path, pinned to the float, so the layered one cannot have disturbed it.
+
+    A plan with no overlap in it must come out of the seam arithmetic byte-identical to what
+    the boundary arithmetic produced: one shared boundary assigned per move, both windows
+    derived from it, every untouched window's stored floats copied rather than recomputed.
+    `overlap` is 0 on every move, which is what makes the two paths the same rule rather than
+    two rules that agree on this fixture.
+
+    **The first seam carries a 1 ms accidental overlap** — the kind a freehand drag leaves,
+    well inside assembly's half-frame tolerance — and it is a *hard cut*, not a 1 ms
+    transition. That is the half of `SNAP_CONTIGUITY_TOLERANCE` that did not change: two
+    numbers that close within half a frame are the same boundary written twice, so the move
+    closes them **exactly** rather than preserving the millimetre of daylight as a blend.
+    """
+    rows = [(0.0, 6.001), (6.0, 6.0), (12.0, 6.0), (18.0, 6.1)]
+    song = snap_song([(0.5, 7.0), (8.0, 13.0)], duration=24.1)
+
+    plan = snap_window_plan(snap_windows_of(rows), song, tolerance=1.5)
+
+    assert [(move.boundary, move.proposed, move.overlap) for move in plan.moves] == [
+        (6.0, 7.15, 0.0),
+        (12.0, 13.15, 0.0),
+    ]
+    # Exact floats, not approximations: 7.150 rather than 7.1505, which is what the 1 ms would
+    # have become had it been carried as a blend.
+    assert snapped_rows(plan) == [
+        (0.0, 7.15),
+        (7.15, 6.0),
+        (13.15, 4.85),
+        # Neither of its seams moved, so its stored floats are copied, not recomputed.
+        (18.0, 6.1),
+    ]
+    assert all(move.overlap == 0.0 for move in plan.moves)
+
+
+def test_snapping_never_changes_what_the_assembled_video_would_be_worth_in_frames():
+    """R-7, asserted through the pass that actually cuts the video.
+
+    The frame grid is inviolable: nothing here may change the assembled video's length
+    relative to the song. It holds structurally — the plan's first start and last end are
+    copied through untouched — and it holds through the layer resolution, because moving a
+    seam moves both of its edges and every visible boundary is still some clip's own edge.
+    Asserted on a plan with a transition in it, where the resolution has work to do.
+    """
+    rows = [(0.0, 12.0), (10.0, 10.0), (20.0, 6.0), (26.0, 4.0)]
+    song = measured_song(
+        words=[("a", 0.0, 11.45), ("b", 13.0, 19.4), ("c", 21.0, 30.0)], duration=30.0
+    )
+    before = assembled_frames(rows, 30.0)
+
+    plan = snap_window_plan(snap_windows_of(rows), song, tolerance=1.0)
+    after = snapped_rows(plan)
+
+    assert plan.moves, "a plan that moved nothing proves nothing about what a move preserves"
+    assert assembled_frames(after, 30.0) == before
+    assert after[0][0] == rows[0][0]
+    assert after[-1][0] + after[-1][1] == rows[-1][0] + rows[-1][1]
+
+
+def test_the_band_measures_whole_windows_with_their_transitions_in_them():
+    """H3 renders a window, so the band judges a window — overlapped parts included.
+
+    Two fixtures, each rigged so the band decision **flips** on whether a transition is
+    counted. Both moves are legal and both would be refused by an arithmetic that measured
+    from the cut instead of from the clip's own edges, which is the arithmetic Phase B had
+    because a hard cut's edges *are* the cut.
+
+    * **The transition at this seam.** SHOT 01 runs to 5.000 s and SHOT 02 starts at 3.000 s,
+      a 2.000 s blend centred on 4.000 s. Moving it to 3.500 s leaves SHOT 01 running to
+      4.500 s — 4.500 s long, inside the 4 s floor. Measured from the cut it reads 3.500 s and
+      the move is refused for a shot that is not that short.
+    * **The transition at the seam beyond.** SHOT 02 runs 5.000–10.000 s and SHOT 03 starts at
+      8.000 s, so SHOT 02's last 2.000 s are a blend. Moving the cut at 5.000 s to 5.500 s
+      leaves SHOT 02 4.500 s long. Measured to SHOT 03's start instead of to SHOT 02's own end
+      it reads 2.500 s, and the move is refused for a window that does not exist.
+    """
+    near = [(0.0, 5.0), (3.0, 9.0), (12.0, 6.0)]
+    plan = snap_window_plan(
+        snap_windows_of(near),
+        measured_song(words=[("a", 0.0, 3.0), ("b", 3.65, 18.0)], duration=18.0),
+        tolerance=0.75,
+    )
+
+    assert [(move.boundary, move.proposed, move.overlap) for move in plan.moves] == [
+        (4.0, 3.5, 2.0)
+    ]
+    assert snapped_rows(plan)[0] == pytest.approx((0.0, 4.5), abs=1e-9)
+
+    beyond = [(0.0, 5.0), (5.0, 5.0), (8.0, 6.0)]
+    plan = snap_window_plan(
+        snap_windows_of(beyond),
+        measured_song(words=[("a", 0.0, 5.35), ("b", 5.65, 14.0)], duration=14.0),
+        tolerance=0.75,
+    )
+
+    assert [(move.boundary, move.proposed, move.overlap) for move in plan.moves] == [
+        (5.0, 5.5, 0.0)
+    ]
+    assert snapped_rows(plan)[1] == pytest.approx((5.5, 4.5), abs=1e-9)
+
+
+def test_a_transition_that_would_hang_off_the_end_of_the_plan_stays_where_it_is():
+    """R-7 as a per-cut refusal, and it is not the band check wearing a different hat.
+
+    A transition travels **whole**, so a seam can have room to move without its far edge
+    having room. The band bounds the two *windows*; an overlap longer than the minimum window
+    can still push its far edge past the plan's last frame, and that frame is the assembled
+    video's last one. The band is deliberately wide open here (25 s) so the only thing that
+    can refuse this move is the frame grid.
+
+    This is not hypothetical geometry: the Director's own last seam is a 5.492 s transition
+    ending 15 ms before the plan does.
+    """
+    rows = [(0.0, 18.0), (10.0, 10.0)]
+    song = measured_song(words=[("a", 0.0, 16.5), ("b", 18.5, 20.0)], duration=20.0)
+
+    plan = snap_window_plan(
+        snap_windows_of(rows), song, tolerance=3.0, minimum=4.0, maximum=25.0
+    )
+
+    assert plan.moves == []
+    assert plan.skips[0].reason == SNAP_OFF_THE_PLAN.format(
+        before="SHOT 01",
+        after="SHOT 02",
+        boundary=14.0,
+        proposed=16.65,
+        overlap=8.0,
+        edge="past the plan's last frame",
+    )
+    assert snapped_rows(plan) == rows
+    # And the number the refusal protects: the plan is worth the frames it was worth.
+    assert assembled_frames(snapped_rows(plan), 20.0) == assembled_frames(rows, 20.0)
+
+    # The same thing at the head of the plan, because a transition has two edges and the
+    # plan's first frame is as fixed as its last.
+    head = [(0.0, 10.0), (2.0, 18.0)]
+    early = measured_song(words=[("a", 0.0, 1.0), ("b", 3.0, 20.0)], duration=20.0)
+
+    plan = snap_window_plan(
+        snap_windows_of(head), early, tolerance=3.5, minimum=4.0, maximum=25.0
+    )
+
+    assert plan.moves == []
+    assert plan.skips[0].reason == SNAP_OFF_THE_PLAN.format(
+        before="SHOT 01",
+        after="SHOT 02",
+        boundary=6.0,
+        proposed=2.85,
+        overlap=8.0,
+        edge="back before the plan's first frame",
+    )
+    assert snapped_rows(plan) == head
+
+
+def test_a_window_laid_wholly_over_another_is_refused_rather_than_guessed_at():
+    """The geometry this module still has no seam for, refused by name.
+
+    An overlay that swallows a window whole has **two** visible cuts — `assembly_plan` splits
+    the clip underneath around it and resumes it afterwards — so "the cut between these two"
+    names no single instant. And the seam *after* a swallowed window is not what it looks
+    like: the next window can start well after the swallowed one ends and still be covered by
+    the clip underneath, so calling that a shared boundary and moving it would stretch a
+    window by seconds without anybody asking.
+    """
+    with pytest.raises(TimelineError) as refused:
+        snap_window_plan(
+            snap_windows_of([(0.0, 20.0), (5.0, 3.0), (10.0, 5.0)]),
+            snap_song([(0.5, 7.0)], duration=20.0),
+            tolerance=1.0,
+        )
+
+    assert str(refused.value) == SNAP_NESTED.format(
+        before="SHOT 01", after="SHOT 02", start=0.0, end=20.0, inner_start=5.0, inner_end=8.0
+    )
+
+
+def test_an_overlapping_plan_with_an_unmeasured_song_snaps_nothing_and_guesses_nothing():
+    """The absent-analysis rule, restated over the path that now accepts more plans.
+
+    Admitting overlaps must not admit a *guess*: a song nobody has heard has no voiceless map,
+    so there is nowhere to put a transition and the answer is the explicitly empty one. Every
+    window comes back with the floats it went in with, blend included.
+    """
+    rows = [(0.0, 12.0), (10.0, 10.0), (20.0, 10.0)]
+
+    for song in (measured_song(duration=30.0), None):
+        plan = snap_window_plan(snap_windows_of(rows), song, tolerance=1.0)
+        assert plan.status == "unmeasured"
+        assert plan.message == SNAP_UNMEASURED
+        assert plan.moves == [] and plan.skips == []
+        assert snapped_rows(plan) == rows
+
+
+def test_a_protection_at_either_end_of_a_transition_refuses_it_in_the_existing_words():
+    """A seam belongs to two windows however wide it is, so either one's protection stops it.
+
+    The three sentences are `window_move_refusal`'s own and are unchanged — a transition is
+    still a cut two shots share, and the reason it may not move is still about the shots.
+    """
+    rows = [(0.0, 12.0), (10.0, 10.0), (20.0, 10.0)]
+    song = measured_song(words=[("a", 0.0, 11.45), ("b", 13.0, 30.0)], duration=30.0)
+
+    for index, refusal in ((0, SNAP_LOCKED_REFUSAL), (1, SNAP_APPROVED_REFUSAL)):
+        plan = snap_window_plan(
+            snap_windows_of(rows, refusals={index: refusal.format(shot="SHOT 01")}),
+            song,
+            tolerance=1.0,
+        )
+        assert plan.moves == []
+        assert plan.skips[0].reason == refusal.format(shot="SHOT 01")
+        assert snapped_rows(plan) == rows
+
+
+# ---------------------------------------------------------------------------------------------
+# The Director's own timeline, as geometry.
+#
+# Copied out of `project_59f14d19ff10` on 2026-08-21 and frozen here as numbers. Deliberately
+# **not** read from the live project: a test that asserts that project's content has gone red
+# twice for the Director's own edits and was deleted for it. What is under test is a *shape* —
+# thirty-three hand-dragged seams, fifteen of them transitions — and a shape can be pinned.
+# ---------------------------------------------------------------------------------------------
+
+#: 34 windows over the 154.64 s song. Every number is the Director's, to the millisecond.
+DIRECTOR_PLAN = [
+    (0.0, 6.208), (6.208, 4.792), (11.0, 5.042), (16.0, 5.333),
+    (21.333, 2.083), (23.417, 5.833), (29.25, 3.292), (32.54, 5.375),
+    (37.917, 4.917), (42.792, 3.042), (45.754, 5.121), (50.875, 5.5),
+    (56.36, 4.667), (61.0, 1.75), (62.75, 1.833), (64.583, 1.875),
+    (66.379, 5.01), (71.167, 6.019), (77.208, 5.125), (82.292, 5.167),
+    (87.417, 8.75), (95.958, 2.667), (98.583, 4.625), (103.2, 4.333),
+    (107.458, 1.833), (108.583, 5.102), (113.686, 5.027), (118.713, 4.57),
+    (123.292, 5.625), (128.833, 5.292), (134.113, 5.007), (139.12, 5.167),
+    (144.25, 10.375), (149.133, 5.507),
+]
+
+
+def test_the_directors_real_geometry_snaps_once_its_one_hole_is_closed():
+    """The plan this whole change exists for, and the honest thing it still refuses.
+
+    **16 of its 33 seams are outside assembly's half-frame tolerance.** Fifteen are overlaps,
+    from 27 ms to a 5.492 s transition on the last cut; snapping used to refuse the plan
+    outright for them and now moves them as units. The sixteenth is a genuine 22 ms **hole** at
+    77.186 s — the plan does not assemble either, and `assembly.tiling_refusals` says so in its
+    own words — so the plan is still refused until it is closed. One 22 ms nudge is the whole
+    difference between the two halves of this test, which is what makes it a statement about
+    the sign of a disagreement rather than about two plans.
+    """
+    seams = seam_lengths(DIRECTOR_PLAN)
+    overlaps = [seam for seam in seams if seam > SNAP_CONTIGUITY_TOLERANCE]
+    holes = [seam for seam in seams if seam < -SNAP_CONTIGUITY_TOLERANCE]
+    assert len(seams) == 33
+    assert len(overlaps) + len(holes) == 16
+    assert len(overlaps) == 15 and round(max(overlaps), 3) == 5.492
+    assert [round(-hole, 3) for hole in holes] == [0.022]
+    song = measured_song(words=real_song_words(), duration=REAL_SONG_SECONDS)
+
+    # As it stands: refused, and the sentence names the hole rather than the transitions.
+    with pytest.raises(TimelineError) as refused:
+        snap_window_plan(snap_windows_of(DIRECTOR_PLAN), song, tolerance=0.75)
+    assert str(refused.value) == SNAP_HOLE.format(
+        before="SHOT 18", after="SHOT 19", end=77.186, start=77.208, length=0.022
+    )
+    # Assembly refuses the same plan for the same seconds, which is what says this precondition
+    # is assembly's notion of a hole rather than a second one invented here.
+    clips = [
+        ClipWindow(
+            shot_id=f"w{index:02d}", label=f"SHOT {index + 1:02d}", start=start,
+            duration=length, approved_output="", approved_start=0, approved_duration=0,
+            source=None,
+        )
+        for index, (start, length) in enumerate(DIRECTOR_PLAN)
+    ]
+    assert any("77.186s to 77.208s" in problem for problem in tiling_refusals(clips, 154.64))
+
+    # The one edit: the 22 ms hole closed, every transition left exactly as it was.
+    closed = list(DIRECTOR_PLAN)
+    closed[17] = (closed[17][0], round(closed[18][0] - closed[17][0], 3))
+    assert seam_lengths(closed)[17] == 0.0
+    assert seam_lengths(closed)[32] == pytest.approx(5.492, abs=1e-9)
+
+    plan = snap_window_plan(snap_windows_of(closed), song, tolerance=0.75)
+
+    assert plan.status == "ready"
+    assert plan.moves, "the Director's plan snapped nothing, so this proves nothing"
+    after = snapped_rows(plan)
+    # Every transition is the length it was — none was resized by a move at it or beside it.
+    # Compared seam by seam, and by *kind*: an overlap keeps its length to the nanosecond, and
+    # a hard cut stays a hard cut. The sub-half-frame disagreements the Director's freehand
+    # drags left behind (8 ms, 9 ms, 12 ms) are closed exactly wherever a cut moved, which is
+    # Phase B's own behaviour and is asserted rather than tolerated.
+    for index, (was, now) in enumerate(zip(seam_lengths(closed), seam_lengths(after))):
+        if was > SNAP_CONTIGUITY_TOLERANCE:
+            assert now == pytest.approx(was, abs=1e-9), f"transition {index} was resized"
+        else:
+            assert abs(now) <= SNAP_CONTIGUITY_TOLERANCE, f"seam {index} opened a hole"
+    # R-7: the assembled video is worth the frames it was worth.
+    assert assembled_frames(after, 154.64) == assembled_frames(closed, 154.64)
+    assert after[0][0] == 0.0
+    assert after[-1][0] + after[-1][1] == pytest.approx(closed[-1][0] + closed[-1][1], abs=1e-9)
+    # And no new hole was opened anywhere: assembly has nothing to say about the tiling.
+    assert tiling_refusals(
+        [
+            ClipWindow(
+                shot_id=f"w{index:02d}", label=f"SHOT {index + 1:02d}", start=start,
+                duration=length, approved_output="", approved_start=0, approved_duration=0,
+                source=None,
+            )
+            for index, (start, length) in enumerate(after)
+        ],
+        154.64,
+    ) == []
 
 
 # ---------------------------------------------------------------------------------------------

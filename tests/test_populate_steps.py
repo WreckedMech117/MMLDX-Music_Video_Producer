@@ -47,6 +47,7 @@ from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import (
     SNAP_CLEARANCE_SECONDS,
     SNAP_CONTIGUITY_TOLERANCE,
+    SNAP_LOCKED_REFUSAL,
     snap_cut_plan,
     vocal_gaps,
 )
@@ -741,6 +742,99 @@ def test_a_substituted_snap_target_is_observed_through_both_doors(tmp_path, monk
     )
 
 
+#: The same tiling with one authored transition in it: window 4 starts a second before window
+#: 3 ends. The overlap's centre is 20.500 s, inside the phrase that runs to 17.900–20.000 s's
+#: right-hand edge, so the seam has somewhere to go and the move is a real one.
+OVERLAPPING_WINDOWS = tuple(
+    (15.0, 6.0) if index == 3 else window
+    for index, window in enumerate(PHRASE_WINDOWS)
+)
+
+
+def test_one_snapping_core_serves_both_doors_on_a_plan_with_a_transition_in_it(tmp_path: Path):
+    """The Phase B headline, restated for the geometry that used to refuse on both doors.
+
+    An overlap is an authored transition (R-3), and which point of it lands in the silence —
+    `timeline.SEAM_POINT`, the overlap's midpoint — is a decision that must be the *same*
+    decision on both doors, or a transition would land in one place because the Director came
+    through the timeline and another because they came through a lay-out. Same plan, same
+    tolerance, same band; the moves agree including the blend length, and the geometry the two
+    would write agrees to the float.
+    """
+    project = measured_project()
+    shot_plan = snap_cut_plan(
+        tiled(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+    alignment = app_module.line_up_shots(
+        layout_of(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+
+    blended = [move for move in shot_plan.moves if move.overlap]
+    assert blended, "the fixture moved no transition, so this proves nothing"
+    assert [(move.boundary, move.proposed, move.overlap) for move in blended] == [(20.5, 19.85, 1.0)]
+    assert [
+        (move.boundary, move.proposed, move.gap, move.overlap) for move in shot_plan.moves
+    ] == [
+        (move.boundary, move.proposed, move.gap, move.overlap) for move in alignment.moves
+    ]
+    assert [(skip.boundary, skip_kind(skip.reason)) for skip in shot_plan.skips] == [
+        (skip.boundary, skip_kind(skip.reason)) for skip in alignment.skips
+    ]
+    assert [(start, length) for _id, start, length in shot_plan.windows] == [
+        (placement.start, placement.duration) for placement in alignment.placements
+    ]
+    # The blend is the length it was, on both doors, and the plan covers what it covered.
+    windows = [(start, length) for _id, start, length in shot_plan.windows]
+    assert windows[3][0] + windows[3][1] - windows[4][0] == pytest.approx(1.0, abs=1e-9)
+    assert windows[0][0] == 0.0
+    assert windows[-1][0] + windows[-1][1] == pytest.approx(PHRASE_SONG_DURATION, abs=1e-9)
+
+
+def test_a_substituted_snap_target_is_observed_through_both_doors_on_a_transition(
+    tmp_path, monkeypatch
+):
+    """One core, proved by taking it away — on the seam shape that needed the new code.
+
+    `_gap_snap_target` is still the single editorial decision about *where inside a gap* a cut
+    lands, and the seam arithmetic above it is the single decision about *what the cut of a
+    transition is*. One patch moves both doors; two snappers would need two.
+    """
+    project = measured_project()
+    unpatched = snap_cut_plan(
+        tiled(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+
+    monkeypatch.setattr(
+        timeline_module,
+        "_gap_snap_target",
+        lambda gap, boundary: min(max(boundary, gap[0] + 0.4), gap[1] - 0.4),
+    )
+    shot_plan = snap_cut_plan(
+        tiled(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+    alignment = app_module.line_up_shots(
+        layout_of(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+
+    proposed = [move.proposed for move in shot_plan.moves]
+    assert proposed == [move.proposed for move in alignment.moves]
+    assert proposed and proposed != [move.proposed for move in unpatched.moves], (
+        "the substitute changed nothing, so it observed nothing"
+    )
+    # The transition's own fate changed with the substitute — a wider clearance puts its target
+    # out of reach, so the seam that moved unpatched is now skipped — and it changed the same
+    # way on both doors. That is the substitution being observed at the seam this test is
+    # about, rather than only at the hard cuts around it.
+    assert [move.overlap for move in unpatched.moves if move.overlap] == [1.0]
+    assert [move.overlap for move in shot_plan.moves if move.overlap] == []
+    assert [(skip.boundary, skip_kind(skip.reason)) for skip in shot_plan.skips] == [
+        (skip.boundary, skip_kind(skip.reason)) for skip in alignment.skips
+    ]
+    # And whether it moved or not, the blend is exactly the length it was.
+    windows = [(start, length) for _id, start, length in shot_plan.windows]
+    assert windows[3][0] + windows[3][1] - windows[4][0] == pytest.approx(1.0, abs=1e-9)
+
+
 def test_a_protected_shot_is_skipped_by_name_on_both_snapping_doors(tmp_path: Path):
     """Locked, approved and in-flight refuse a cut in the existing wordings.
 
@@ -769,6 +863,30 @@ def test_a_protected_shot_is_skipped_by_name_on_both_snapping_doors(tmp_path: Pa
             project.shots[index].start,
             project.shots[index].duration,
         )
+
+    # A transition is a seam two shots share however wide it is, so a lock at either of its
+    # ends refuses it — in the same sentence, on both doors, and without resizing the blend by
+    # moving one of its edges on its own.
+    blended = tiled(measured_project(), OVERLAPPING_WINDOWS)
+    blended.shots[4].locked = True
+    locked = SNAP_LOCKED_REFUSAL.format(shot=app_module.shot_label(blended, blended.shots[4]))
+    stored = timeline_module.shot_snap_windows(blended)
+    door_one = snap_cut_plan(blended, tolerance=0.75, minimum=4.0, maximum=6.0)
+    door_two = app_module.line_up_shots(
+        layout_of(blended, OVERLAPPING_WINDOWS),
+        tolerance=0.75,
+        minimum=4.0,
+        maximum=6.0,
+        windows=stored,
+    )
+
+    assert not [move for move in door_one.moves if move.overlap]
+    assert locked in [skip.reason for skip in door_one.skips]
+    assert [skip.reason for skip in door_one.skips] == [
+        skip.reason for skip in door_two.skips
+    ]
+    assert door_one.windows[3][1:] == (blended.shots[3].start, blended.shots[3].duration)
+    assert door_one.windows[4][1:] == (blended.shots[4].start, blended.shots[4].duration)
 
 
 def test_the_timeline_door_reads_the_plan_in_song_order_not_manifest_order(tmp_path: Path):
@@ -953,7 +1071,11 @@ def test_line_up_keeps_the_layouts_own_window_ceiling(tmp_path: Path):
     """A step that nudges a cut may not undo the length decision of the step before it.
 
     Lay-out caps its windows at `POPULATE_MAX_WINDOW_SECONDS` on a measured render-cost
-    decision — 5.2 s windows render in minutes where 9.5 s ones took hours — so a move that
+    decision — a 5.2 s window is 141 frames at a median 6.3 min, where a 9.5 s one is 226+
+    frames at 30–39 min, per-frame cost tripling across that step (measured from output-file
+    mtimes over the 2026-08-19/20 batch; the "took hours" this docstring used to say came from
+    a claim of 2.2 hours that had no primary record and was wrong by ~3.4x — see the constant's
+    own docstring for the table and its caveats). So a move that
     would push a window past 6 s is refused *there*, by the band, and named as such. A caller
     lining up stored windows passes the wider 4–15 s band instead, which is
     `snap_window_plan`'s own argument.
@@ -1225,41 +1347,76 @@ def test_a_standalone_line_up_refuses_an_unmeasured_song_rather_than_guessing(tm
     assert comfy.prompts == []
 
 
-def test_a_standalone_line_up_refuses_a_plan_that_is_not_a_contiguous_tiling(tmp_path: Path):
-    """Two shots that do not share a boundary do not share a cut. `snap-cuts`' refusal.
-
-    **Found by pointing this route at the Director's live plan** (2026-08-21), which holds
-    sixteen seams outside assembly's tolerance — overlaps, which this application now treats
-    as layers. `TimelineError` escaped as a 500 there; it is a 422 with the sentence that
-    names both shots, exactly as the snap-cuts route has always answered.
-    """
+def standalone_line_up_client(tmp_path: Path, project: Project):
+    """A client over one saved project, for the `line-up` route's project-sourced door."""
     settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
     store = ProjectStore(tmp_path)
-    project = tiled(measured_project())
-    # A quarter-second overlap: shot 3 starts before shot 2 ends.
-    project.shots[3].start -= 0.25
-    project.shots[3].duration += 0.25
     saved = store.save(project)
     comfy = NullComfy()
     client = TestClient(
         create_app(settings=settings, store=store, comfy=comfy, director=StepDirector())
     )
+    return client, saved, comfy
+
+
+def test_a_standalone_line_up_refuses_a_hole_and_lines_up_an_overlap(tmp_path: Path):
+    """The restated precondition, both halves, on the door that found the problem.
+
+    **Found by pointing this route at the Director's live plan** (2026-08-21), which holds
+    sixteen seams outside assembly's tolerance. Fifteen of them are overlaps — authored
+    transitions under R-3 — and those are now snapped as units rather than refused. The
+    sixteenth is a real 22 ms hole, and a hole still refuses: `assembly.tiling_refusals`
+    refuses the export for it too, and there is no seam in a stretch with no picture in it.
+
+    Same fixture, same route, one shot moved a quarter second one way or the other. That is
+    what makes this a test about the *sign* of the disagreement rather than about two
+    unrelated plans.
+    """
+    holed = tiled(measured_project())
+    # A quarter-second hole: shot 4 starts after shot 3 ends, and nothing covers the gap.
+    holed.shots[3].start += 0.25
+    holed.shots[3].duration -= 0.25
+    client, saved, comfy = standalone_line_up_client(tmp_path, holed)
 
     response = client.post(
         f"/api/projects/{saved.id}/timeline/line-up", json={"confirm_apply": True}
     )
     assert response.status_code == 422
     detail = response.json()["detail"]
-    assert "not a contiguous tiling" in detail
+    assert "has a hole in it" in detail
     assert "SHOT 03" in detail and "SHOT 04" in detail
     assert [
         (shot.start, shot.duration) for shot in ProjectStore(tmp_path).get(saved.id).shots
     ] == [(shot.start, shot.duration) for shot in saved.shots]
     assert comfy.prompts == []
 
+    # An overlap in the same plan is lined up rather than refused, and the blend is exactly as
+    # long afterwards as the Director made it — asserted on the manifest, through the route.
+    overlapped = tiled(measured_project(), OVERLAPPING_WINDOWS)
+    client, saved, comfy = standalone_line_up_client(tmp_path / "overlap", overlapped)
+
+    applied = client.post(
+        f"/api/projects/{saved.id}/timeline/line-up",
+        json={"confirm_apply": True, "tolerance": 0.75},
+    )
+    assert applied.status_code == 200, applied.text
+    body = applied.json()
+    assert body["applied"] is True and body["moved"] > 0
+    # The wire says which of its moves is a transition and how wide the blend is, so a reader
+    # knows the instant it names is a centre rather than a clip edge.
+    assert [row["overlap"] for row in body["moves"] if row["overlap"]] == [1.0]
+    assert [row["boundary"] for row in body["moves"] if row["overlap"]] == [20.5]
+    shots = sorted(
+        ProjectStore(tmp_path / "overlap").get(saved.id).shots, key=lambda shot: shot.start
+    )
+    assert shots[3].end - shots[4].start == pytest.approx(1.0, abs=1e-9)
+    assert shots[0].start == 0.0
+    assert shots[-1].end == pytest.approx(PHRASE_SONG_DURATION, abs=1e-9)
+    assert comfy.prompts == []
+
 
 def test_a_lay_out_report_with_a_hole_in_it_is_refused_rather_than_lined_up(tmp_path: Path):
-    """The same refusal on the plan-carrying door: no shared boundary, no cut.
+    """The same refusal on the plan-carrying door: no picture in the hole, no seam to place.
 
     `lay_out_shots` tiles contiguously and the digest stops a report being edited on its way
     back, so this is a body no ordinary path produces — which is exactly why it is answered
@@ -1291,7 +1448,7 @@ def test_a_lay_out_report_with_a_hole_in_it_is_refused_rather_than_lined_up(tmp_
         f"/api/projects/{project_id}/timeline/line-up", json={"plan": plan}
     )
     assert response.status_code == 422
-    assert "not a contiguous tiling" in response.json()["detail"]
+    assert "has a hole in it" in response.json()["detail"]
     assert ProjectStore(tmp_path).get(project_id).shots == []
     assert comfy.prompts == []
 

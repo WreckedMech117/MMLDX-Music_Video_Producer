@@ -17,7 +17,9 @@ inputDocuments:
 
 This document breaks down the **Shot Effects and Transitions** feature (25 FX requirements, 6 FX-NFRs) into implementable stories. It is a companion to `epics.md`, which covers Epics 1–7 of the base product and remains authoritative for those; epic numbering continues here at **Epic 8** so the two documents share one numbering space and a story ID is unambiguous across both.
 
-Brownfield, and unusually well-supported: `assembly.py` already re-encodes every clip through a `-vf` chain (so effects are nearly free), already normalizes every intermediate to identical geometry, rate, SAR and pixel format (so `xfade`'s precondition holds by construction), and already resolves clip overlaps (so a transition needs no new timeline geometry). The architecture spine's AD-16…AD-31 fix the invariants; the epics below are its slices A–F from `BUILD-ORDER.md`.
+Brownfield, and unusually well-supported: `assembly.py` already re-encodes every clip through a `-vf` chain (so effects are nearly free), already normalizes every intermediate to identical geometry, rate, SAR and pixel format (so `xfade`'s precondition holds by construction), and already resolves clip overlaps (so a transition needs no new timeline geometry). The architecture spine's AD-16…AD-31 fix the invariants.
+
+**On the relationship to `BUILD-ORDER.md`.** That document's six slices A–F remain the *build* sequence and are unchanged. They are not the epic structure: slices B (chain builder) and D (preview) deliver nothing a Director can see on their own, and slices B, C and D touch the same files end to end — `effects.py`, the effects routes, `app.js`, `styles.css`. Organised by user value and consolidated for file overlap, they collapse into the four epics below. Each story names the slice it implements, so the build order survives the regrouping.
 
 ## Requirements Inventory
 
@@ -100,8 +102,52 @@ UX-DR15: Accessibility floor — state never colour-alone (Overlap carries its t
 
 ### FR Coverage Map
 
-*To be completed in step 2.*
+FX-1: Epic 8 — Song Envelope extraction, cached and fingerprint-invalidated
+FX-2: Epic 8 — beat and onset markers on the waveform
+FX-3: Epic 8 — beat snapping for Shot-boundary edits
+FX-4: Epic 9 — the two-tab shot inspector
+FX-5: Epic 9 — Effect Stack editing
+FX-6: Epic 9 — copying a Stack across Shots
+FX-7: Epic 9 — locked-Shot refusal in the Effects tab
+FX-8: Epic 9 — Grade family
+FX-9: Epic 9 — Texture family
+FX-10: Epic 9 — Stylize family
+FX-11: Epic 9 — Geometry family
+FX-12: Epic 10 — binding a parameter to a Band
+FX-13: Epic 10 — Band selection against the song's spectrum
+FX-14: Epic 10 — punch/sustain Drive with floor and depth
+FX-15: Epic 10 — refusal without a Song Envelope, bindings retained
+FX-16: Epic 11 — Overlap-authored Transitions with the blue band
+FX-17: Epic 11 — the Transition Pair and its auto-match
+FX-18: Epic 11 — one-sided transitions
+FX-19: Epic 11 — the curated transition catalogue
+FX-20: Epic 9 — looping Preview Clip through the real chain
+FX-21: Epic 11 — Transition preview across the boundary
+FX-22: Epic 10 — the Drive readout
+FX-23: Epic 9 — non-destructive, re-derivable Effects
+FX-24: Epic 9 — export refusals naming every Shot and reason
+FX-25: Epic 9 — export provenance records the look
+FX-NFR-1: Epic 11 — the frame grid across every Effect and Transition combination
+FX-NFR-2: Epic 11 — the stream-copy join (guarded in Epic 9, threatened in Epic 11)
+FX-NFR-3: Epic 9 — one engine describes an Effect
+FX-NFR-4: Epic 8, Epic 9 — no new runtime dependency
+FX-NFR-5: Epic 9, Epic 10 — pure, comparable generated render inputs
+FX-NFR-6: Epic 9 — the measured preview budget
 
 ## Epic List
 
-*To be completed in step 2.*
+### Epic 8: The Song Becomes Measurable
+The Director sees where the beats are and can put a cut on one. The song stops being a waveform and becomes a structure with named moments — which is what every later epic binds to, and what makes the standing "snap cuts to phrase boundaries" ruling mean something for the first time.
+**FRs covered:** FX-1, FX-2, FX-3, FX-NFR-4
+
+### Epic 9: One Look Across a Song
+The Director gives a Shot a look and sees it, then carries that look across the whole video. Forty independently generated clips become one film. Consolidates the chain builder, the Effects tab and the preview, which are one component end to end and share every file they touch — the Director cannot judge a grade they cannot see, and a preview of nothing is nothing.
+**FRs covered:** FX-4, FX-5, FX-6, FX-7, FX-8, FX-9, FX-10, FX-11, FX-20, FX-23, FX-24, FX-25, FX-NFR-3, FX-NFR-4, FX-NFR-5, FX-NFR-6
+
+### Epic 10: The Picture Moves With the Music
+The Director ties a parameter to a frequency band and the video answers the track — grain surging on the kick, the frame breathing with the bass — without animating anything by hand. The song becomes the automation.
+**FRs covered:** FX-12, FX-13, FX-14, FX-15, FX-22, FX-NFR-5
+
+### Epic 11: Cuts That Blend
+The Director drags two clips together and the cut between them becomes a transition, visible on the timeline and exactly as long as the overlap. The only epic that touches the cumulative frame grid, and isolated for that reason.
+**FRs covered:** FX-16, FX-17, FX-18, FX-19, FX-21, FX-NFR-1, FX-NFR-2

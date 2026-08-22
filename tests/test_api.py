@@ -6,6 +6,7 @@ import re
 import subprocess
 import wave
 from dataclasses import replace
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import get_args
@@ -37,6 +38,7 @@ from music_video_producer.app import (
     EXPANSION_REJECTED_EMPTY_NOTICE,
     GENERIC_WRITE_APPROVAL_REFUSAL,
     H3_ADAPTERS,
+    JOB_MEASURED_FIELDS,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
     MARK_READY_APPROVED_REFUSAL,
     MARK_READY_IN_FLIGHT_REFUSAL,
@@ -106,6 +108,7 @@ from music_video_producer.asset_replacement import (
     REPLACE_OVER_SLOT_LIMIT,
 )
 from music_video_producer.batch import (
+    JOB_LOST_WITH_QUEUE,
     JOB_NEVER_SUBMITTED,
     JOB_SUPERSEDED,
     MISSING_TICKS_LIMIT,
@@ -114,6 +117,7 @@ from music_video_producer.batch import (
     accept_submission,
     readiness_refusal,
     reconcilable_jobs,
+    render_timing_summary,
     shot_label,
 )
 from music_video_producer.comfy import ComfyError
@@ -3970,8 +3974,13 @@ def test_populate_timeline_lays_out_the_whole_song_from_the_models_shape(tmp_pat
     cursor = 0.0
     for shot in sorted(saved.shots, key=lambda item: item.start):
         assert shot.start == pytest.approx(cursor, abs=1e-6)
-        # POPULATE_MAX_WINDOW_SECONDS: the enforced speed ceiling, tighter than H3's
-        # 15 s legality — 9 s windows are the measured 2.2-hour cliff.
+        # POPULATE_MAX_WINDOW_SECONDS: the enforced speed ceiling, tighter than H3's 15 s
+        # legality. The measured cliff (corrected 2026-08-21, from mtimes over the 2026-08-19/20
+        # batch): flat at 2.6–2.9 s/frame out to 158 frames — 141 frames is a median 6.3 min —
+        # then ~8 s/frame at 226+, where 226 frames measured 30.2 min and 277 measured 39.1 min.
+        # The "2.2 hours" this comment used to cite had no primary record and was wrong by ~3.4x;
+        # the constant's own docstring carries the table and the three caveats (n=1 at the cliff,
+        # acceleration never enabled, mtimes rather than instrumentation).
         assert 4.0 - 1e-9 <= shot.duration <= 6.0 + 1e-9
         assert shot.status == "draft"
         assert shot.prompt
@@ -16017,9 +16026,11 @@ def test_snap_cuts_bounds_the_tolerance_in_the_schema(tmp_path: Path):
     ).json()["tolerance"] == SNAP_TOLERANCE_DEFAULT
 
 
-def test_snap_cuts_refuses_a_plan_that_is_not_a_contiguous_tiling(tmp_path: Path):
-    """Two shots that do not share a boundary do not share a cut. Refused by name, and the
-    sentence points at the same defect assembly refuses the plan for."""
+def test_snap_cuts_refuses_a_plan_with_a_hole_in_it(tmp_path: Path):
+    """A hole has no seam in it. Refused by name, and the sentence points at the same defect
+    assembly refuses the plan for. An **overlapping** plan is not this: it is snapped, which
+    `tests/test_timeline.py` owns and `test_snap_cuts_moves_an_overlap_as_a_unit` proves on
+    the wire."""
     client, _comfy, project = snap_client(
         tmp_path,
         spans=SNAP_SPANS,
@@ -16034,8 +16045,51 @@ def test_snap_cuts_refuses_a_plan_that_is_not_a_contiguous_tiling(tmp_path: Path
     )
 
     assert response.status_code == 422
-    assert "not a contiguous tiling" in response.json()["detail"]
+    assert "has a hole in it" in response.json()["detail"]
     assert "SHOT 01 (s0)" in response.json()["detail"]
+
+
+def test_snap_cuts_moves_an_overlap_as_a_unit(tmp_path: Path):
+    """The route's half of the layers ruling: an overlapping plan snaps, and keeps its blend.
+
+    Three shots, the first two overlapping by 2.000 s — an authored transition under R-3. The
+    seam's cut is the overlap's centre at 7.000 s, which sits on the end of the 0.5–7.0 s
+    phrase; both edges travel together, and the manifest that comes back holds an overlap of
+    exactly the length it went in with. The plan's outer edges are untouched, so the assembled
+    length against the song is the number it was (R-7).
+    """
+    client, _comfy, project = snap_client(
+        tmp_path,
+        spans=SNAP_SPANS,
+        shots=[
+            Shot(id="s0", start=0.0, duration=8.0),
+            Shot(id="s1", start=6.0, duration=8.0),
+            Shot(id="s2", start=14.0, duration=10.0),
+        ],
+    )
+
+    report = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts", json={"tolerance": 1.5}
+    )
+    assert report.status_code == 200, report.text
+    body = report.json()
+    assert body["applied"] is False and body["project"] is None
+    move = next(row for row in body["moves"] if row["overlap"])
+    assert move["boundary"] == pytest.approx(7.0)
+    assert move["overlap"] == pytest.approx(2.0)
+    assert move["proposed"] > move["boundary"]
+    # The hard cut in the same plan reports no transition at all, so the two read differently.
+    assert [row["overlap"] for row in body["moves"] if row["boundary"] == 14.0] == [0.0]
+
+    applied = client.post(
+        f"/api/projects/{project.id}/timeline/snap-cuts",
+        json={"tolerance": 1.5, "confirm_apply": True},
+    )
+    assert applied.status_code == 200, applied.text
+    shots = sorted(applied.json()["project"]["shots"], key=lambda row: row["start"])
+    ends = [row["start"] + row["duration"] for row in shots]
+    assert ends[0] - shots[1]["start"] == pytest.approx(2.0, abs=1e-9), "the blend was resized"
+    assert shots[0]["start"] == 0.0 and ends[-1] == pytest.approx(24.0, abs=1e-9)
 
 
 # --- Replace With: moving every citation of one asset onto another (2026-08-20) -----------
@@ -18940,3 +18994,269 @@ def test_tagging_a_sheet_travels_on_the_lyric_route_and_survives_an_edit(tmp_pat
         "Zulu line": (), "Bravo line": (1, 2)
     }, "a tag drifted off its words when the sheet was edited"
 
+
+
+# ----------------------------------------------------------------------------------------------
+# Render timing at the routes (2026-08-21).
+#
+# `RenderJob.updated_at` was set by its default factory and no settle path ever wrote it again,
+# so every settled job in the Director's live manifest carried `updated_at == created_at` to the
+# microsecond and this application had never recorded what a render costs. The one render-cost
+# figure the codebase acted on -- a 221-frame window at "2.2 HOURS" -- was a code comment citing
+# itself, with no primary record anywhere; when it was finally challenged it proved wrong by
+# roughly 3.4x, and correcting it meant reading mtimes off ComfyUI's output tree by hand.
+#
+# These tests walk each settle path through its real route, because the property that matters is
+# not that a helper works: it is that no way of ending a job leaves it unmeasured.
+# ----------------------------------------------------------------------------------------------
+
+
+def timing_of(store: ProjectStore, project_id: str, job_id: str) -> RenderJob:
+    return next(job for job in store.get(project_id).jobs if job.id == job_id)
+
+
+def test_a_completed_render_records_comfyuis_own_execution_time(tmp_path: Path):
+    """The measurement preferred wherever it exists: `execution_start` to `execution_success`
+    out of `/history`, which is the render with the queue wait already excluded."""
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Timed"))
+    project.shots = [
+        Shot(id="shot_t", start=0, duration=5, prompt="A singer turns", mode="text", status="ready")
+    ]
+    store.save(project)
+    job_id = submit_h3(client, project.id, "shot_t").json()["id"]
+
+    async def timed_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {
+                "prompt_id": prompt_id,
+                "status": "complete",
+                "outputs": [
+                    {
+                        "subfolder": f"music-video-producer/{project.id}/shots",
+                        "filename": "shot_t-h3_00001.mp4",
+                    }
+                ],
+                "error": "",
+                "elapsed_seconds": 378.0,
+            },
+        )()
+
+    comfy.history = timed_history
+    assert client.get(f"/api/projects/{project.id}/jobs/{job_id}").status_code == 200
+
+    settled = timing_of(store, project.id, job_id)
+    assert settled.status == "complete"
+    assert settled.render_seconds == 378.0
+    assert settled.render_seconds_source == "comfy"
+    assert settled.updated_at > settled.created_at
+    # And the line the Director reads is a render time, with the frames beside it.
+    assert render_timing_summary(settled) == "rendered in 6m18s, 141 frames"
+
+
+def test_every_h3_submission_records_the_frames_its_graph_was_built_for(tmp_path: Path):
+    """A duration with no frame count beside it is uninterpretable -- 6m18s is unremarkable at
+    141 frames and impossible at 277 -- and the count cannot be recovered later, because the
+    window is edited after the render. So it is written at the one moment it is true."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Frames"))
+    project.shots = [
+        Shot(id="shot_a", start=0, duration=5.0, prompt="Wide", mode="text", status="ready"),
+        Shot(id="shot_b", start=6, duration=8.75, prompt="Hold", mode="text", status="ready"),
+    ]
+    store.save(project)
+
+    first = submit_h3(client, project.id, "shot_a").json()["id"]
+    second = submit_h3(client, project.id, "shot_b").json()["id"]
+
+    # `over_render_frames` on each window: the same number all three H3 branches build for.
+    assert timing_of(store, project.id, first).render_frames == over_render_frames(5.0)
+    assert timing_of(store, project.id, second).render_frames == over_render_frames(8.75)
+    assert timing_of(store, project.id, first).render_frames == 141
+    assert timing_of(store, project.id, second).render_frames == 226
+
+    # The window then moves, as windows do. The recorded count describes the render that
+    # happened, not the window as it stands now -- which is the whole reason it is persisted.
+    moved = store.get(project.id)
+    moved.shots[1].duration = 4.0
+    store.save(moved)
+    assert timing_of(store, project.id, second).render_frames == 226
+
+
+def test_cancelling_a_job_stamps_it_and_never_calls_the_result_a_render_time(tmp_path: Path):
+    """A cancel is a settle. What it can honestly record is how long the record stood open --
+    some unknown part of which was rendering -- so the surfaced line says exactly that."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Cancel timing"))
+    project.shots = [Shot(id="shot_c", start=0, duration=4, prompt="Wide", status="queued")]
+    project.jobs = [
+        RenderJob(id="job_c", kind="h3", target_id="shot_c", status="queued", prompt_id="p-c")
+    ]
+    project.jobs[0].created_at = project.jobs[0].created_at - timedelta(seconds=900)
+    store.save(project)
+
+    assert client.delete(f"/api/projects/{project.id}/jobs/job_c").status_code == 200
+
+    settled = timing_of(store, project.id, "job_c")
+    assert settled.status == "cancelled"
+    assert settled.render_seconds == pytest.approx(900, abs=10)
+    assert settled.render_seconds_source == "record"
+    assert settled.updated_at > settled.created_at
+    line = render_timing_summary(settled)
+    assert "not render time" in line and "rendered" not in line
+
+
+def test_a_submission_comfyui_refused_settles_a_stamped_record(tmp_path: Path):
+    """The record-first ordering's own settle path. Nothing rendered, so nothing may read as a
+    render -- but the record is still closed, and a closed record carries when it closed."""
+    client, store, comfy = make_client(tmp_path)
+    project = h3_ready_project(store, "Refused submission")
+    comfy.submit_error = True
+
+    assert generate_h3(client, project).status_code == 502
+
+    settled = store.get(project.id).jobs[0]
+    assert settled.status == "error"
+    assert settled.error == JOB_NEVER_SUBMITTED
+    assert settled.updated_at > settled.created_at
+    assert settled.render_seconds_source == "record"
+
+
+def test_a_prompt_that_died_with_the_queue_settles_a_stamped_record(tmp_path: Path):
+    """The `missing_ticks` death. There is no ComfyUI measurement to prefer here by
+    definition -- the branch is reached *because* ComfyUI has no record of the prompt."""
+    client, store, comfy = make_client(tmp_path)
+    project_id, job = flux_job(client, store, comfy, "Lost with the queue")
+
+    async def unknown_history(prompt_id):
+        return type(
+            "History",
+            (),
+            {"prompt_id": prompt_id, "status": "queued", "outputs": [], "error": "", "known": False},
+        )()
+
+    comfy.history = unknown_history
+    for _ in range(MISSING_TICKS_LIMIT):
+        assert client.get(f"/api/projects/{project_id}/render-status").status_code == 200
+
+    settled = timing_of(store, project_id, job["id"])
+    assert settled.status == "error"
+    assert settled.error == JOB_LOST_WITH_QUEUE
+    assert settled.updated_at > settled.created_at
+    assert settled.render_seconds_source == "record"
+
+
+def test_a_superseded_record_is_stamped_when_the_newer_render_takes_its_target(tmp_path: Path):
+    client, store, _comfy = make_client(tmp_path)
+    project = h3_ready_project(store, "Superseded timing")
+    assert generate_h3(client, project).status_code == 202
+    # The status walk-back a whole-manifest write can produce, which is the state supersession
+    # exists for: the shot reads `ready` again while its first job is still open.
+    stale = store.get(project.id)
+    stale.shots[0].status = "ready"
+    stale.jobs[0].created_at = stale.jobs[0].created_at - timedelta(seconds=300)
+    store.save(stale)
+
+    assert generate_h3(client, store.get(project.id)).status_code == 202
+
+    older = store.get(project.id).jobs[0]
+    assert older.status == "cancelled"
+    assert older.superseded_by
+    assert older.updated_at > older.created_at
+    assert older.render_seconds == pytest.approx(300, abs=10)
+    assert older.render_seconds_source == "record"
+
+
+def test_a_job_record_that_predates_the_instrumentation_round_trips_unchanged(tmp_path: Path):
+    """Old manifests load unchanged, and -- the half that matters -- a settled job written
+    before 2026-08-21 is never retroactively given a duration it was never measured for."""
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Old manifest"))
+    manifest = store.manifest_path(project.id)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["jobs"] = [
+        {
+            "id": "job_ancient",
+            "kind": "h3",
+            "status": "complete",
+            "prompt_id": "p-old",
+            "target_id": "shot_old",
+            "created_at": "2026-08-19T01:00:00+00:00",
+            "updated_at": "2026-08-19T01:00:00+00:00",
+        }
+    ]
+    manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    loaded = store.get(project.id)
+
+    assert loaded.jobs[0].render_seconds == 0.0
+    assert loaded.jobs[0].render_seconds_source == ""
+    assert loaded.jobs[0].render_frames == 0
+    assert loaded.jobs[0].updated_at == loaded.jobs[0].created_at
+    assert render_timing_summary(loaded.jobs[0]) == ""
+    # Saving it back adds the three keys and changes nothing else about the record.
+    store.save(loaded)
+    again = json.loads(manifest.read_text(encoding="utf-8"))["jobs"][0]
+    assert again["render_seconds"] == 0.0
+    assert again["render_seconds_source"] == ""
+    assert again["render_frames"] == 0
+    assert again["created_at"] == again["updated_at"] == "2026-08-19T01:00:00Z"
+
+
+def test_an_ordinary_full_project_put_cannot_erase_a_recorded_render_timing(tmp_path: Path):
+    """**The eighth time this hole has been found in this route.** Every timing field is
+    defaulted, so a client written before they existed omits all three and they arrive as
+    `0.0`/`""`/`0` -- and one ordinary save would blank every render cost in the project at
+    once, which is the exact loss the instrumentation exists to prevent. A body that *invents*
+    a duration is refused the same way: nothing but a settle may write a measurement.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, _shot_id, job_id = rendered_shot(client, store, comfy, "Guarded timing")
+    measured = timing_of(store, project_id, job_id)
+    measured.render_seconds = 378.0
+    measured.render_seconds_source = "comfy"
+    measured.render_frames = 141
+    stored = store.save(store.get(project_id).model_copy(update={"jobs": [measured]}))
+
+    body = json.loads(stored.model_dump_json())
+    # Exactly what a client written before these fields existed sends: the keys are simply
+    # absent. Pydantic fills them from the defaults, which is where the erasure came from.
+    for key in ("render_seconds", "render_seconds_source", "render_frames"):
+        body["jobs"][0].pop(key)
+    saved = client.put(f"/api/projects/{project_id}", json=body)
+
+    assert saved.status_code == 200, saved.text
+    kept = timing_of(store, project_id, job_id)
+    assert (kept.render_seconds, kept.render_seconds_source, kept.render_frames) == (
+        378.0,
+        "comfy",
+        141,
+    )
+
+    # And a body that claims its own numbers is ignored rather than believed.
+    forged = json.loads(store.get(project_id).model_dump_json())
+    forged["jobs"][0]["render_seconds"] = 7920.0
+    forged["jobs"][0]["render_seconds_source"] = "comfy"
+    forged["jobs"][0]["render_frames"] = 221
+    forged["jobs"][0]["updated_at"] = "2030-01-01T00:00:00Z"
+    assert client.put(f"/api/projects/{project_id}", json=forged).status_code == 200
+
+    unmoved = timing_of(store, project_id, job_id)
+    assert unmoved.render_seconds == 378.0
+    assert unmoved.render_frames == 141
+    assert unmoved.updated_at.year != 2030
+
+
+def test_every_measured_field_on_a_job_is_named_in_the_routes_guard():
+    """The drift this pins: a field added to `RenderJob`'s timing block and not to
+    `JOB_MEASURED_FIELDS` is silently writable by any client, which is how this route has been
+    the hole seven times before. Enumerated here so adding the eighth fails loudly."""
+    measured = {
+        name
+        for name in RenderJob.model_fields
+        if name.startswith("render_") or name == "updated_at"
+    }
+
+    assert measured == set(JOB_MEASURED_FIELDS)

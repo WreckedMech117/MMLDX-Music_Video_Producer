@@ -42,6 +42,93 @@ class HistoryResult:
     #: answers — and that ambiguity is how a job whose prompt died with a crashed queue
     #: stayed "queued" in the manifest forever (met three times live on 2026-08-19/20).
     known: bool = True
+    #: ComfyUI's own execution clock for this prompt, in epoch **milliseconds**, or `None`
+    #: where the answer does not carry one. See `execution_span_ms` for where they come from
+    #: and for what was checked before this was written.
+    started_ms: int | None = None
+    finished_ms: int | None = None
+
+    @property
+    def elapsed_seconds(self) -> float | None:
+        """How long ComfyUI spent *executing* this prompt, or `None` if it did not say.
+
+        Queue wait is excluded by construction — `execution_start` is stamped when the prompt
+        leaves the queue — which is exactly what makes this the number to compare one render
+        against another with, and what the record's own `created_at`→settle span is not.
+
+        `None` rather than `0.0` for "not reported", because zero is a legitimate reading for a
+        fully cached prompt and a caller must be able to tell the two apart. A span that runs
+        backwards is also `None`: the two stamps come off `time.time()`, which a clock
+        adjustment can move, and a negative duration is not a measurement.
+        """
+        if self.started_ms is None or self.finished_ms is None:
+            return None
+        span = (self.finished_ms - self.started_ms) / 1000.0
+        return span if span >= 0 else None
+
+
+#: The ``status.messages`` events that end a prompt's execution. `execution_interrupted` is one
+#: of them: a cancel is a real end, and how long a render ran before it was cancelled is a
+#: measurement worth keeping — see `RenderJob.render_seconds` on what it does and does not mean.
+_EXECUTION_END_EVENTS = frozenset(
+    {"execution_success", "execution_error", "execution_interrupted"}
+)
+
+
+def execution_span_ms(status_data: Any) -> tuple[int | None, int | None]:
+    """``(started_ms, finished_ms)`` out of one ``/history`` entry's ``status`` object.
+
+    **Checked, not assumed**, twice. Read from the Director's own portable install's source on
+    2026-08-21: `PromptExecutor.add_message` stamps ``"timestamp": int(time.time() * 1000)`` onto
+    *every* status message it appends, `execute()` clears `status_messages` and emits
+    ``execution_start`` before the first node runs, and `PromptQueue.task_done` copies the whole
+    list into the history entry as ``status.messages``. Identical in 0.33.1 and in 0.33.3, which
+    the Director updated to the same day.
+
+    Then **confirmed against the live server on 0.33.3** with one 512x512 4-step Flux still: the
+    history entry carried ``['execution_start', 'execution_cached', 'execution_success']``, this
+    function read the span as 32.431 s, and an independent stopwatch around the submission
+    measured 33.140 s — the recorded render sitting inside the observed window, +0.709 s of poll
+    granularity and transport. So a finished prompt's history really does carry its own execution
+    clock, and this application no longer has to reconstruct render costs from output-file mtimes.
+    There is no per-prompt *duration* field — only these two stamps — and there is no start stamp
+    at all on a prompt still executing.
+
+    ``extra_data.create_time`` (server.py) is a third stamp, the enqueue moment in milliseconds.
+    It is deliberately not read here: `RenderJob.created_at` already records enqueue from this
+    side, and a queue wait derived from a foreign clock's zero point is worse evidence than one
+    derived from our own.
+
+    Deliberately forgiving, on `progress_from_message`'s rule: this reads a foreign wire format
+    from a component the Director upgrades independently, so a missing key, a message that is
+    not a two-element pair, a non-integer timestamp or a shape from some future build answers
+    `None` rather than raising. A timing is an enhancement; nothing about a render may fail
+    because ComfyUI phrased its history differently.
+    """
+    if not isinstance(status_data, dict):
+        return (None, None)
+    messages = status_data.get("messages")
+    if not isinstance(messages, list):
+        return (None, None)
+    started: int | None = None
+    finished: int | None = None
+    for message in messages:
+        if not isinstance(message, (list, tuple)) or len(message) != 2:
+            continue
+        event, data = message
+        if not isinstance(data, dict):
+            continue
+        stamp = data.get("timestamp")
+        # `bool` is an `int` in Python and `True` is not a timestamp.
+        if not isinstance(stamp, int) or isinstance(stamp, bool):
+            continue
+        if event == "execution_start":
+            started = stamp
+        elif event in _EXECUTION_END_EVENTS:
+            # The *last* ending wins. A prompt emits one, but reading the last of whatever is
+            # there cannot be wrong where reading the first can.
+            finished = stamp
+    return (started, finished)
 
 
 class ComfyClient:
@@ -187,12 +274,15 @@ class ComfyClient:
                 data = message[1]
                 error = f"{data.get('node_type', 'Node')}: {data.get('exception_message', 'error')}"
                 break
+        started_ms, finished_ms = execution_span_ms(status_data)
         return HistoryResult(
             prompt_id=prompt_id,
             status=status,
             outputs=outputs,
             error=error,
             raw=entry,
+            started_ms=started_ms,
+            finished_ms=finished_ms,
         )
 
     async def upload(self, filename: str, content: bytes, content_type: str) -> dict[str, Any]:

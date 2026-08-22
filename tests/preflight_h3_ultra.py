@@ -8,7 +8,7 @@ with a live, user-managed ComfyUI (never started or stopped here):
 
     uv run python tests/preflight_h3_ultra.py [base_url] [--record]
 
-Fourteen payload variants are audited separately, chosen to reach every input any
+Twenty-one payload variants are audited separately, chosen to reach every input any
 adapter can emit: one picture; the full 9 pictures + 3 videos + 3 audios, which
 fills every autogrow slot the graph offers; a video carrying its paired
 soundtrack; ``ref_image_size="max"``; the longest window that still fits the
@@ -27,9 +27,12 @@ entirely and an input the audit never omits is an optionality claim it never
 tests; the first-only variant also takes the default geometry, so the 0.6 MP
 selection is exercised through this adapter and not only the reference one. The
 ``fl2va`` checkpoint joins the model-file check by being *loaded* by these
-variants, never by being mentioned.
+variants, never by being mentioned. **Every attention profile** is here too: one
+reference variant per non-default backend plus one keyframe variant, because the
+two attention node classes take *different* input names and a profile nothing
+validates is exactly the unproven combination the registry exists to prevent.
 
-Beyond the shared per-node validation, seven claims about the *adapters* are
+Beyond the shared per-node validation, eight claims about the *adapters* are
 checked against the live schema:
 
 * the reference adapter's hardcoded per-kind limits equal the autogrow ``max`` of
@@ -50,7 +53,11 @@ checked against the live schema:
   ``MiniMaxH3ImageToVideo`` declares ``first_frame`` and ``last_frame`` optional
   (what lets ``image_to_video`` omit the last frame) and offers **no**
   reference-audio input of any kind (what makes "keyframe shots cannot lip-sync
-  to the song" the node's fact rather than this project's claim).
+  to the song" the node's fact rather than this project's claim);
+* every attention profile's node is registered, its input names are the ones the
+  live class declares, and its combo value is in the live option list — the eight
+  sage kernels and the two attention backends are published lists, not literals
+  this project is entitled to assert.
 
 ``--record`` merges the audited classes into ``tests/fixtures/object_info.json``
 only when the audit found zero problems, keeping every class already recorded
@@ -71,7 +78,11 @@ from music_video_producer.app import H3Request
 from music_video_producer.timeline import OVER_RENDER_SECONDS, align_h3_frames
 from music_video_producer.workflows import (
     H3_ASPECT_RATIOS,
+    H3_ATTENTION_INPUT_TYPES,
+    H3_ATTENTION_NODE_INPUTS,
+    H3_ATTENTION_PROFILES,
     H3_DEFAULT_ASPECT_RATIO,
+    H3_DEFAULT_ATTENTION,
     H3_DEFAULT_MEGAPIXELS,
     H3_DEFAULT_MULTIPLE,
     H3_DIRECTOR_MAX_FRAMES,
@@ -241,6 +252,42 @@ def audit_payloads() -> list[tuple[str, dict]]:
                 references=pictures[:1],
                 duration=8,
                 profile="turbo-references2v",
+                **shared,
+            ),
+        ),
+        *(
+            (
+                # One variant per non-default attention backend, so every profile's node
+                # class, input names and combo value are put in front of `/prompt`'s own
+                # validator rather than only in front of `check_attention_profiles` below.
+                # A profile that has never been validated is exactly the unproven
+                # combination the profile registry exists to prevent, and the two classes
+                # take *different* input names — a mismatch is a 502 after the round trip.
+                # The default profile needs no variant of its own: every other payload in
+                # this list already carries it.
+                f"attention-{name}",
+                build_h3_reference_payload(
+                    prompt="<Picture 1>",
+                    references=pictures[:1],
+                    duration=8,
+                    attention=name,
+                    **shared,
+                ),
+            )
+            for name in sorted(H3_ATTENTION_PROFILES)
+            if name != H3_DEFAULT_ATTENTION
+        ),
+        (
+            # The keyframe graph on a non-default backend. Its own variant because the
+            # keyframe adapter loads a different UNET and wires the patch chain itself, so
+            # "the reference graph accepted it" is not the same claim.
+            "attention-keyframe",
+            build_h3_keyframe_payload(
+                prompt="A singer turns",
+                first_frame="F:/refs/picture-0.png",
+                last_frame="F:/refs/picture-1.png",
+                duration=8,
+                attention="comfy-kitchen",
                 **shared,
             ),
         ),
@@ -693,6 +740,76 @@ def check_keyframe_schema_claims(object_info: dict) -> list[str]:
     return problems
 
 
+def check_attention_profiles(object_info: dict) -> list[str]:
+    """Every attention profile's node, input names and combo value, against the live schema.
+
+    The per-node validation `run_audit` already performs covers the payloads it is given, so
+    this exists for the part that validation cannot see: whether the *registry* still
+    describes the live nodes. Three claims, each of which has a way of going wrong silently:
+
+    * every profile's class is registered. A KJNodes update that renames
+      ``PathchSageAttentionKJ`` — a class whose name is already a typo — takes the default
+      profile with it.
+    * ``H3_ATTENTION_NODE_INPUTS`` still lists exactly the non-``model`` inputs the class
+      declares, in the schema's own order. This is the table the profiles are validated
+      against at import, so if it drifts from the schema every profile is checked against a
+      fiction. ``allow_compile`` is ``optional`` rather than ``required`` on the live node,
+      which is why both halves of the input map are read.
+    * every profile's combo value is in the live option list. **This is the check the
+      measurement rests on**: the eight sage kernels and the two attention backends are
+      published lists, not literals this project may assert, and a value the node stopped
+      offering is a 502 after the round trip. The types are re-read too, so a ``BOOLEAN``
+      turning into a combo is named here rather than found by a render.
+    """
+    problems: list[str] = []
+    for class_type, expected in H3_ATTENTION_NODE_INPUTS.items():
+        schema = object_info.get(class_type, {}).get("input", {})
+        if not schema:
+            problems.append(
+                f"attention: {class_type} publishes no input map at all — the profiles that "
+                f"emit it would fail at /prompt validation"
+            )
+            continue
+        declared = {**schema.get("required", {}), **schema.get("optional", {})}
+        named = tuple(name for name in declared if name != "model")
+        if named != expected:
+            problems.append(
+                f"attention: {class_type} declares {named}, but H3_ATTENTION_NODE_INPUTS "
+                f"says {expected} — every profile emitting it is validated against that"
+            )
+    for name, profile in H3_ATTENTION_PROFILES.items():
+        schema = object_info.get(profile.class_type, {}).get("input", {})
+        declared = {**schema.get("required", {}), **schema.get("optional", {})}
+        for input_name, value in profile.inputs:
+            spec = declared.get(input_name)
+            if spec is None:
+                problems.append(
+                    f"attention: profile {name!r} sets {profile.class_type}.{input_name}, "
+                    f"which the live node does not declare"
+                )
+                continue
+            if H3_ATTENTION_INPUT_TYPES[input_name] is bool:
+                if spec[0] != "BOOLEAN":
+                    problems.append(
+                        f"attention: {profile.class_type}.{input_name} is {spec[0]!r}, not "
+                        f"BOOLEAN — profile {name!r} sends {value!r}"
+                    )
+                continue
+            options = combo_options(spec)
+            if options is None:
+                problems.append(
+                    f"attention: {profile.class_type}.{input_name} publishes no combo "
+                    f"options, so profile {name!r}'s {value!r} cannot be confirmed"
+                )
+            elif value not in options:
+                problems.append(
+                    f"attention: profile {name!r} sends "
+                    f"{profile.class_type}.{input_name}={value!r}, which is not one of "
+                    f"{sorted(options)}"
+                )
+    return problems
+
+
 #: Every check this audit runs. Named as one tuple so a test can assert the audit wires all
 #: of them: a check deleted from here is a check that still passes its own unit test while
 #: the live audit stops performing it.
@@ -706,6 +823,7 @@ CHECKS = (
     check_aspect_ratios,
     check_default_geometry,
     check_keyframe_schema_claims,
+    check_attention_profiles,
 )
 
 

@@ -1495,7 +1495,64 @@ class RenderJob(BaseModel):
     #: decision — it is provenance — and its `prompt_id` is deliberately left in place, so the
     #: file an already-executing ComfyUI prompt still writes remains traceable to this record.
     superseded_by: str = ""
+    #: How long this job took, in seconds, or `0.0` for one that has never settled — which is
+    #: also what every manifest written before this field existed loads as, and what a job
+    #: settled by a build older than the instrumentation keeps forever.
+    #:
+    #: **This application had no render timings at all until 2026-08-21.** `updated_at` was set
+    #: by its `default_factory` and never written again, so every settled job in the Director's
+    #: live manifest carried `updated_at == created_at` to the microsecond, and the render costs
+    #: that justify `app.POPULATE_MAX_WINDOW_SECONDS` had to be reconstructed by hand from the
+    #: mtimes of ComfyUI's output files. This field, `render_seconds_source` and `render_frames`
+    #: exist so that reconstruction never has to happen again.
+    #:
+    #: Written **once**, by the settle path that ended the job (`batch.stamp_job_settled`), and
+    #: never re-measured: a job that settles is terminal, and a second stamp could only be a
+    #: later clock overwriting the real one. For a `complete` job it is how long the render took;
+    #: for a `cancelled` or superseded one it is how long the record stood open before it was
+    #: closed, which is **not** a render time. Read `status` before quoting it as one.
+    render_seconds: float = Field(default=0.0, ge=0.0)
+    #: Where `render_seconds` was measured, and therefore what it *includes*:
+    #:
+    #: * ``""`` — not measured. Never settled, or settled by a build older than this field.
+    #: * ``"comfy"`` — ComfyUI's own execution clock, read out of `/history`'s
+    #:   ``status.messages``: ``execution_start`` to ``execution_success``/``execution_error``.
+    #:   This is the render **alone**; queue wait is excluded, so it is the number to compare
+    #:   against another render's.
+    #: * ``"record"`` — this record's `created_at` to its settle. `created_at` is **enqueue**
+    #:   time, not start time, so for a job that waited behind others in a batch this is queue
+    #:   wait *plus* render and is only an **upper bound** on the render. Every surface that
+    #:   shows it must say so; `batch.render_timing_summary` is the one that does.
+    #:
+    #: A plain `str` rather than a `Literal` on `superseded_by`'s precedent: a manifest carrying
+    #: a value some future build wrote must still load, and the closed set is enforced by there
+    #: being exactly one writer, not by the schema refusing to read.
+    render_seconds_source: str = ""
+    #: The frames the graph this job submitted was built for, or `0` where the job's kind has no
+    #: single frame count this application computes (every kind but `h3` today).
+    #:
+    #: Persisted rather than re-derived because it cannot be re-derived: `over_render_frames`
+    #: reads `Shot.duration`, and the Director edits a window after the render — dragging a
+    #: clip's edge, snapping a cut — so a duration read later describes a different render.
+    #: Without this, a recorded duration is uninterpretable, which is half of why the mtime
+    #: reconstruction was needed at all.
+    #:
+    #: **Server-owned.** `POST .../shots/{id}/render` is its one writer, and the generic
+    #: full-project `PUT` re-adopts it from the store (`app._adopt_job_measurements`) rather than
+    #: trusting a body — a defaulted `int` that any pre-existing client omits arrives as `0`, and
+    #: one ordinary save would otherwise erase the frame count off every job at once. That hole
+    #: has been found in that route seven times; these three fields are not the eighth.
+    render_frames: int = Field(default=0, ge=0)
+    #: Enqueue time — when the *record* was created, which for a ComfyUI job is a moment before
+    #: its graph was submitted, not a moment when the GPU started work. See `render_seconds`.
     created_at: datetime = Field(default_factory=now_utc)
+    #: When this job **settled**, and only that. Written by every settle path — completion,
+    #: failure, cancellation, supersession, and the `missing_ticks` death — and deliberately
+    #: **not** by a progress tick or a queued→running transition: assembly writes `progress` up
+    #: to a hundred times per export, and if those moved this stamp then `updated_at -
+    #: created_at` would stop being a duration. Equal to `created_at` means "never settled", or
+    #: "settled before this application recorded anything", which is every job written before
+    #: 2026-08-21.
     updated_at: datetime = Field(default_factory=now_utc)
 
 

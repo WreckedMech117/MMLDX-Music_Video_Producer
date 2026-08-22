@@ -32,6 +32,7 @@ from music_video_producer.assembly import (
     ASSEMBLY_STALE_REFUSAL,
     ASSEMBLY_UNAPPROVED_REFUSAL,
 )
+from music_video_producer.batch import render_timing_summary
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.models import Project, RenderJob
@@ -1133,3 +1134,100 @@ def test_boot_survives_a_store_that_raises_on_list_and_on_save(tmp_path: Path):
     # The unwritable one is honestly still `running` on disk -- nothing pretended otherwise.
     assert fresh.get(unwritable_id).jobs[0].status == "running"
     assert TestClient(saving).get("/api/projects").status_code == 200
+
+
+# ----------------------------------------------------------------------------------------------
+# Render timing on the local-work settle paths (2026-08-21).
+#
+# `settle` is also this route's *progress* writer, called up to a hundred times per export, so the
+# stamp goes in the two terminal patches and nowhere else: if a progress tick moved `updated_at`,
+# it would stop meaning "when this ended" and the duration would evaporate. An assembly is also
+# the one job kind whose `created_at` really is a start -- local work begins the moment its record
+# exists -- so its `record`-sourced span is an exact export time rather than an upper bound.
+# ----------------------------------------------------------------------------------------------
+
+
+def test_a_finished_export_records_how_long_it_took_and_a_progress_tick_does_not(tmp_path: Path):
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    stamps: list[tuple[int, str]] = []
+    real_save = store.save
+
+    def recording_save(project):
+        for job in project.jobs:
+            if job.kind == "post" and not job.prompt_id:
+                stamps.append((job.progress, str(job.updated_at)))
+        return real_save(project)
+
+    store.save = recording_save
+    try:
+        response = client.post(f"/api/projects/{project_id}/assemble")
+    finally:
+        store.save = real_save
+
+    assert response.status_code == 200, response.text
+    settled = store.get(project_id).jobs[-1]
+    assert settled.status == "complete"
+    assert settled.render_seconds > 0
+    assert settled.render_seconds_source == "record"
+    assert settled.updated_at > settled.created_at
+    # Every write before the settlement carried the *same* `updated_at`: a hundred progress
+    # ticks moved the percentage and nothing else, which is what keeps the duration a duration.
+    during = {stamp for percent, stamp in stamps if percent < 100}
+    assert len(during) == 1, during
+    assert during != {str(settled.updated_at)}
+    assert comfy.prompts == []
+
+
+def test_a_failed_export_is_stamped_too_and_is_never_called_a_render(
+    tmp_path: Path, monkeypatch
+):
+    """A failure after forty minutes is exactly as interesting as a success after forty --
+    but it produced no video, so the surfaced line says what it is. The verification verdict
+    is forced the way `test_a_failed_verification_is_reported_with_numbers` forces it."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    import music_video_producer.app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "verification_problems",
+        lambda song, measured, streams: ["forced, so the failure path is the one under test"],
+    )
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+
+    assert response.status_code == 502
+    settled = store.get(project_id).jobs[-1]
+    assert settled.status == "error"
+    assert settled.render_seconds_source == "record"
+    assert settled.updated_at > settled.created_at
+    assert "not render time" in render_timing_summary(settled)
+
+
+def test_healing_an_orphaned_export_at_boot_stamps_the_record_it_settles(tmp_path: Path):
+    """The crash path. The span runs from the export being enqueued to the boot that noticed
+    the crash, which is not how long the export ran -- and the surfaced line says so rather
+    than reporting a machine that was switched off overnight as a very slow render."""
+    store = ProjectStore(tmp_path)
+    project_id = crashed_project(
+        store,
+        "Crashed and stamped",
+        [
+            RenderJob(id="job_local", kind="post", status="running", target_id="assembly",
+                      progress=42),
+        ],
+    )
+    orphan = store.get(project_id).jobs[0]
+    assert orphan.updated_at == orphan.created_at, "the fixture must start unstamped"
+
+    make_client(tmp_path)
+
+    healed = ProjectStore(tmp_path).get(project_id).jobs[0]
+    assert healed.status == "error"
+    assert healed.error == ASSEMBLY_ORPHANED_ERROR
+    assert healed.updated_at > healed.created_at
+    assert healed.created_at == orphan.created_at, "a settle must not move the enqueue time"
+    assert healed.render_seconds_source == "record"
+    assert "not render time" in render_timing_summary(healed)

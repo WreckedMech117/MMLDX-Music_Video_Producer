@@ -247,7 +247,11 @@ The fix is a KJ resize after SeedVR2 with `width=0`, `height=0`, and `divisible_
 
 Both the repo adapter (`patch_ltx25_dimension_boundary`) and the Director's saved workflow `04 - H3 Music Video - LTX 2.5 READY.json` carry divisor 32. The audited reference export still shows the pre-fix wiring by design; the patch is applied in memory. Standalone LTX submission from the application remains disabled until it accepts an approved take rather than creator-specific source media.
 
-Keep optional `PathchSageAttentionKJ` nodes bypassed unless a compatible `sageattention` installation has been verified — `sageattention` is not installed in ComfyUI's embedded Python, and an enabled node aborts the run with `ModuleNotFoundError: sageattention`.
+`PathchSageAttentionKJ` and the attention backend, corrected 2026-08-21. This paragraph used to say `sageattention` was not installed and that an enabled node aborts with `ModuleNotFoundError`. Both were true when written and neither is now: `sageattention 2.2.0+cu128torch2.7.1` has been in ComfyUI's embedded Python since 2026-08-19, and ComfyUI is launched with `--use-sage-attention`. Three consequences worth keeping straight:
+
+- The adapters' `sage_attention: "disabled"` is **not** "no acceleration". At `disabled` the node returns the model untouched, writing no `optimized_attention_override`, so the render uses ComfyUI's global backend — which that launch flag makes SageAttention. To actually get PyTorch attention you have to override it, which is what `ModelAttentionBackend` does.
+- `sageattn3` and `sageattn3_per_block_mean` import a **separate** `sageattn3` package that is not installed, and would fail at sampling time — after the checkpoint is loaded. The installed library's own dispatcher also notes its triton kernel is unusable on sm120, which is this card.
+- `MVP_SAGE_ATTENTION` still patches every `PathchSageAttentionKJ` at submission (`create_app`'s one choke point) and is a *different* mechanism from the per-payload `attention` profile in `workflows.H3_ATTENTION_PROFILES`. Do not set both; `tests/measure_h3_attention.py` refuses to run while the environment variable is set, for that reason.
 
 ### Self-hosting browser QA (no server to start)
 

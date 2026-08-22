@@ -1,6 +1,7 @@
 import ast
 import copy
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -27,6 +28,7 @@ from music_video_producer.timeline import (
     H3_MIN_RENDER_FRAMES,
     OVER_RENDER_SECONDS,
     align_h3_frames,
+    margin_frames,
     over_render_frames,
 )
 from music_video_producer.workflows import (
@@ -37,7 +39,11 @@ from music_video_producer.workflows import (
     AUDIO_REPLACE_SOURCE_FORMAT,
     AUDIO_REPLACE_VIDEO_EXTENSIONS,
     H3_ASPECT_RATIOS,
+    H3_ATTENTION_CHAIN_POSITION,
+    H3_ATTENTION_NODE_INPUTS,
+    H3_ATTENTION_PROFILES,
     H3_DEFAULT_ASPECT_RATIO,
+    H3_DEFAULT_ATTENTION,
     H3_DEFAULT_MEGAPIXELS,
     H3_DEFAULT_MULTIPLE,
     H3_DEFAULT_PROFILE,
@@ -74,6 +80,7 @@ from music_video_producer.workflows import (
     MUSIC3_MAX_DURATION_SECONDS,
     SONGPLANNER_DEFAULT_DURATION_HEADROOM,
     SONGPLANNER_MAX_DURATION_HEADROOM,
+    H3AttentionProfile,
     H3SamplingProfile,
     WorkflowCatalog,
     audio_replace_lengths,
@@ -92,6 +99,7 @@ from music_video_producer.workflows import (
     normalize_to_divisor,
     patch_ltx25_dimension_boundary,
     reachable_node_ids,
+    resolve_h3_attention,
     select_resolution,
     song_audio_window,
 )
@@ -1567,6 +1575,753 @@ def test_the_default_profile_matches_the_audited_export_it_reproduces():
     lora_entries = [value for key, value in power_lora.items() if key.startswith("lora_")]
     assert lora_entries, power_lora
     assert all(entry["on"] is False for entry in lora_entries), lora_entries
+
+
+# --------------------------------------------------------------------------------------------
+# Attention backend profiles — spec-h3-attention-backend.
+#
+# The whole point of this block is the first three tests: the three H3 payload families that
+# carry an attention node must be byte-identical on the default profile. Everything after them
+# describes what the *other* profiles do, and none of that would matter if the default moved.
+# --------------------------------------------------------------------------------------------
+
+#: The keyframe and image-edit payloads for one fixed set of arguments each, hashed at commit
+#: `c4c0722` — the commit before attention profiles existed — by running that revision's
+#: builders over exactly the arguments below and hashing
+#: `json.dumps(payload, separators=(",", ":"))`, key order included, the same way
+#: `H3_DEFAULT_PROFILE_DIGEST` is taken.
+#:
+#: These two families had no payload digest before today. The reference family had two
+#: (`H3_DEFAULT_PROFILE_DIGEST` and `H3_SONG_AUDIO_PRE_KEYFRAME_DIGEST`) and the text-only
+#: family one (`H3_TEXT_ONLY_PRE_KEYFRAME_DIGEST`, whose builder emits no attention node at
+#: all), so with these the digest cover is complete: **every** builder that emits a
+#: `PathchSageAttentionKJ` now has its default pinned.
+#:
+#: If one of these fails, a pre-existing mode's payload changed. Re-deriving the digest is the
+#: wrong fix unless the Director has renegotiated the promise.
+H3_KEYFRAME_PRE_ATTENTION_DIGEST = (
+    "0f3bc5fbfa509b813c8fb2f2cd8041f4ae2a1fc99a1336b3aeffa741a4946231"
+)
+H3_IMAGE_EDIT_PRE_ATTENTION_DIGEST = (
+    "2228c5fb799523afd2e3024112f55925863d4f64288e7bfa2acddbf3e38db9fe"
+)
+
+
+def keyframe_attention_payload(**overrides) -> dict:
+    """The exact arguments `H3_KEYFRAME_PRE_ATTENTION_DIGEST` was taken over."""
+    arguments = {
+        "prompt": "A singer turns to the window",
+        "first_frame": "F:/refs/first.png",
+        "last_frame": "F:/refs/last.png",
+        "duration": 4.0,
+        "seed": 99,
+        "prefix": "mvp/keyframe-attention",
+        "width": 1280,
+        "height": 720,
+        "steps": 20,
+    }
+    return build_h3_keyframe_payload(**{**arguments, **overrides})
+
+
+def image_edit_attention_payload(**overrides) -> dict:
+    """The exact arguments `H3_IMAGE_EDIT_PRE_ATTENTION_DIGEST` was taken over."""
+    arguments = {
+        "prompt": "Give the jacket a red collar",
+        "pictures": [{"file": "F:/refs/base.png"}, {"file": "F:/refs/swatch.png"}],
+        "seed": 11,
+        "width": 1024,
+        "height": 1024,
+        "steps": 20,
+        "prefix": "mvp/image-edit-attention",
+    }
+    return build_h3_image_edit_payload(**{**arguments, **overrides})
+
+
+def test_the_default_attention_leaves_every_h3_payload_byte_identical():
+    """AC-1, and the reason everything else in this block is allowed to exist.
+
+    Three digests, one per payload family that carries an attention node. The reference
+    family's own pre-attention digests are asserted by
+    `test_the_default_profile_emits_the_graph_the_adapter_shipped_before_profiles` and
+    `test_every_pre_existing_h3_shape_is_byte_identical_across_the_keyframe_change`, which
+    were taken at earlier baselines and still pass unchanged — so this test covers the two
+    families that had no digest, and re-covers the reference one through the arguments that
+    exercise the LoRA branch as well.
+
+    Named and omitted must also agree, or "the default" would mean two things.
+    """
+    keyframe = keyframe_attention_payload()
+    serialized = json.dumps(keyframe, separators=(",", ":")).encode("utf-8")
+    assert hashlib.sha256(serialized).hexdigest() == H3_KEYFRAME_PRE_ATTENTION_DIGEST
+
+    edit = image_edit_attention_payload()
+    serialized = json.dumps(edit, separators=(",", ":")).encode("utf-8")
+    assert hashlib.sha256(serialized).hexdigest() == H3_IMAGE_EDIT_PRE_ATTENTION_DIGEST
+
+    assert keyframe_attention_payload(attention="default") == keyframe
+    assert keyframe_attention_payload(attention=H3_DEFAULT_ATTENTION) == keyframe
+    assert image_edit_attention_payload(attention="default") == edit
+    assert default_profile_payload(attention="default") == default_profile_payload()
+    # The LoRA-carrying sampling profiles run through the same patch-chain helper, so they
+    # get the same promise: a `turbo` graph is what it was too.
+    for profile in sorted(H3_REFERENCE_PROFILES):
+        named = default_profile_payload(profile=profile, attention="default")
+        assert named == default_profile_payload(profile=profile), profile
+
+
+def test_the_default_attention_profile_is_the_audited_export_s_own_node():
+    """The evidence, read rather than restated — the same standard the sampling profiles hold.
+
+    `h3-ultra-references-user-export.json` carries the node this adapter reproduces, with the
+    values it reproduces, in the chain position it reproduces: the sage node draws from the
+    sigma shift, not the other way round. If someone ever switches that export's
+    `sage_attention` on, this stops agreeing — which is the moment the default profile's
+    evidence changed and the constant should be revisited rather than the test.
+    """
+    export = json.loads(
+        (REFERENCE_EXPORTS / "h3-ultra-references-user-export.json").read_text(encoding="utf-8")
+    )
+    sage_id, sage = next(
+        (node_id, node)
+        for node_id, node in export.items()
+        if node["class_type"] == "PathchSageAttentionKJ"
+    )
+    shift_id, _ = next(
+        (node_id, node)
+        for node_id, node in export.items()
+        if node["class_type"] == "MiniMaxH3SigmaShift"
+    )
+    profile = H3_ATTENTION_PROFILES[H3_DEFAULT_ATTENTION]
+
+    assert profile.class_type == sage["class_type"]
+    assert dict(profile.inputs) == {
+        "sage_attention": sage["inputs"]["sage_attention"],
+        "allow_compile": sage["inputs"]["allow_compile"],
+    }
+    # The position, chain-walked: the export's sage node is fed by its sigma shift.
+    assert sage["inputs"]["model"] == [shift_id, 0], sage_id
+    assert profile.position == "after-shift"
+
+
+@pytest.mark.parametrize(
+    "name, class_type, values",
+    [
+        ("default", "PathchSageAttentionKJ", {"sage_attention": "disabled", "allow_compile": False}),
+        ("pytorch", "ModelAttentionBackend", {"attention": "pytorch attention"}),
+        ("comfy-kitchen", "ModelAttentionBackend", {"attention": "comfy kitchen attention"}),
+        ("sage-auto", "PathchSageAttentionKJ", {"sage_attention": "auto", "allow_compile": False}),
+        (
+            "sage-fp8-cuda++",
+            "PathchSageAttentionKJ",
+            {"sage_attention": "sageattn_qk_int8_pv_fp8_cuda++", "allow_compile": False},
+        ),
+    ],
+)
+def test_each_attention_profile_emits_the_node_and_values_it_claims(name, class_type, values):
+    """Every profile, in every builder that takes one: the class and the values it names.
+
+    Parametrized over the registry's whole contents rather than a sample, and asserted
+    against the table above rather than against the registry, so a value edited in
+    `workflows.py` has to be edited here too — a test that reads the same dict it is checking
+    proves only that the dict equals itself.
+    """
+    reference = default_profile_payload(attention=name)["mvp:attention"]
+    keyframe = keyframe_attention_payload(attention=name)["mvp:attention"]
+    edit = image_edit_attention_payload(attention=name)["mvp:attention"]
+
+    for node in (reference, keyframe, edit):
+        assert node["class_type"] == class_type
+        assert {k: v for k, v in node["inputs"].items() if k != "model"} == values
+        # Input order is fixed, because a digest pins it and the schema publishes it in
+        # this order. `model` always first, as every other node in these builders has it.
+        assert list(node["inputs"]) == ["model", *values]
+
+
+@pytest.mark.parametrize(
+    "name, position",
+    [
+        ("default", "after-shift"),
+        ("pytorch", "before-shift"),
+        ("comfy-kitchen", "before-shift"),
+        ("sage-auto", "after-shift"),
+        ("sage-fp8-cuda++", "after-shift"),
+    ],
+)
+def test_each_attention_profile_wires_its_node_where_its_evidence_puts_it(name, position):
+    """The chain position, asserted as wiring rather than as a label.
+
+    `PathchSageAttentionKJ` after the sigma shift — chain-walked in
+    `h3-ultra-references-user-export.json` by
+    `test_the_default_attention_profile_is_the_audited_export_s_own_node`.
+    `ModelAttentionBackend` before it — chain-walked on 2026-08-21 in the Director's Comfy
+    Kitchen graph, `J:/Hermes-Remote/comfyui/workflowsbackup/ComfyKitchen/MiniMax-H3 TXT2VID
+    IMG2VID (Full)- 20260818.json`, where node 6095 feeds sigma shift 6007 which feeds guider
+    214. That file is the Director's and lives outside this repo, so the position is written
+    out here as a literal rather than read from `H3_ATTENTION_CHAIN_POSITION` — an earlier
+    version of this test read the table it was checking, and a mutation sweep walked straight
+    past a profile moved to the wrong side of the shift.
+
+    Whichever way round, exactly one attention node exists and everything downstream reads
+    the *last* patch — the two classes write the same `optimized_attention_override`, so a
+    graph carrying both would silently discard one.
+    """
+    assert H3_ATTENTION_PROFILES[name].position == position
+    for payload in (default_profile_payload(attention=name), keyframe_attention_payload(attention=name)):
+        attention = payload["mvp:attention"]["inputs"]["model"]
+        shift = payload["mvp:shift"]["inputs"]["model"]
+        downstream = payload["mvp:preview"]["inputs"]["model"]
+
+        if position == "after-shift":
+            assert attention == ["mvp:shift", 0]
+            assert shift != ["mvp:attention", 0]
+            assert downstream == ["mvp:attention", 0]
+        else:
+            assert shift == ["mvp:attention", 0]
+            assert attention != ["mvp:shift", 0]
+            assert downstream == ["mvp:shift", 0]
+
+        classes = [node["class_type"] for node in payload.values()]
+        assert sum(classes.count(each) for each in H3_ATTENTION_NODE_INPUTS) == 1, classes
+        # The scheduler and the guider read the preview, which reads the end of the patch
+        # chain, so the whole graph samples the patched model rather than a half-patched one.
+        assert payload["mvp:scheduler"]["inputs"]["model"] == ["mvp:preview", 0]
+        assert payload["mvp:guider"]["inputs"]["model"] == ["mvp:preview", 0]
+
+    # The image-edit graph has no sigma shift to be ordered against, so every profile lands in
+    # the one slot and the scheduler and guider read it directly.
+    edit = image_edit_attention_payload(attention=name)
+    assert "mvp:shift" not in edit
+    assert edit["mvp:scheduler"]["inputs"]["model"] == ["mvp:attention", 0]
+    assert edit["mvp:guider"]["inputs"]["model"] == ["mvp:attention", 0]
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [default_profile_payload, keyframe_attention_payload, image_edit_attention_payload],
+)
+@pytest.mark.parametrize("unknown", ["", "sage", "sageattn3", "PYTORCH", None, 7, ["default"]])
+def test_an_unknown_attention_profile_is_refused_rather_than_defaulted(builder, unknown):
+    """Every builder refuses, and refuses with a `ValueError` the routes translate to a 422.
+
+    A silent fall back to the default is the failure this experiment cannot survive: a
+    measurement run that mistyped its backend would report the baseline's numbers under the
+    candidate's name and nobody would see it. `sageattn3` is in the parameters on purpose —
+    it is a real option of the live node and deliberately *not* a profile here, so asking for
+    it must fail rather than quietly render on something else. Unhashable and non-string
+    values are covered because a `TypeError` escapes a route's `except ValueError` as a 500.
+    """
+    with pytest.raises(ValueError) as raised:
+        builder(attention=unknown)
+
+    assert "attention profile" in str(raised.value)
+    assert "comfy-kitchen" in str(raised.value)
+
+
+def test_resolve_h3_attention_returns_the_registry_s_own_profile():
+    """The shared lookup all three builders use, checked once where it lives."""
+    for name, profile in H3_ATTENTION_PROFILES.items():
+        assert resolve_h3_attention(name) is profile
+    with pytest.raises(ValueError):
+        resolve_h3_attention("nope")
+
+
+@pytest.mark.parametrize(
+    "kwargs, complaint",
+    [
+        ({"class_type": "SomeAttention", "inputs": ()}, "known attention node"),
+        ({"class_type": "ModelAttentionBackend", "inputs": (("mode", "pytorch attention"),)}, "takes"),
+        (
+            {"class_type": "PathchSageAttentionKJ", "inputs": (("allow_compile", False), ("sage_attention", "auto"))},
+            "takes",
+        ),
+        ({"class_type": "ModelAttentionBackend", "inputs": (("attention", True),)}, "takes a str"),
+        (
+            {"class_type": "PathchSageAttentionKJ", "inputs": (("sage_attention", "auto"), ("allow_compile", "False"))},
+            "takes a bool",
+        ),
+        (
+            {"class_type": "PathchSageAttentionKJ", "inputs": (("sage_attention", "  "), ("allow_compile", False))},
+            "must be named",
+        ),
+    ],
+)
+def test_an_attention_profile_that_could_not_validate_fails_at_import(kwargs, complaint):
+    """Every way a new profile can be wrong, refused on the line that wrote it.
+
+    A node input ComfyUI does not declare, or a value of the wrong type, reaches `/prompt`
+    validation as an opaque 502 after the submission round-trip — at the end of the one path
+    where the profile was supposed to be the trustworthy part. The `allow_compile="False"`
+    case is the one worth the line: it is truthy everywhere it is read, so without a type
+    check it would silently enable `torch.compile` on a timing run.
+    """
+    with pytest.raises(ValueError) as raised:
+        H3AttentionProfile(**kwargs)
+
+    assert complaint in str(raised.value)
+
+
+def test_the_attention_registry_names_no_two_profiles_the_same_graph():
+    """Two names for one node is a measurement that compares a thing with itself.
+
+    Also pins the registry's own shape: every profile's class is one this module knows how to
+    place and how to check, which is what `tests/preflight_h3_ultra.py` then audits live.
+    """
+    emitted = [
+        (profile.class_type, profile.inputs) for profile in H3_ATTENTION_PROFILES.values()
+    ]
+    assert len(set(emitted)) == len(emitted), emitted
+    for profile in H3_ATTENTION_PROFILES.values():
+        assert profile.class_type in H3_ATTENTION_NODE_INPUTS
+        assert profile.class_type in H3_ATTENTION_CHAIN_POSITION
+    assert H3_DEFAULT_ATTENTION in H3_ATTENTION_PROFILES
+
+
+def test_the_attention_harness_refuses_to_render_without_its_gpu_argument():
+    """The gate, checked the only way it can be: by trying to get past it.
+
+    `--confirm-gpu` is the whole safety of a script whose ordinary run costs hours of the
+    Director's card. The refusal has to land *before* any network call, so this test needs no
+    ComfyUI and no ffmpeg — if it ever starts needing one, the gate has moved behind
+    something that already touched the machine.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    argv = ["--project", "project_nonexistent", "--shot", "shot_nonexistent"]
+
+    with pytest.raises(SystemExit) as raised:
+        harness.parse_and_gate(argv)
+
+    assert raised.value.code == 2
+    # And the same command *with* the flag gets past the gate rather than being refused for
+    # some unrelated reason — otherwise the test above would pass on a broken parser.
+    assert harness.parse_and_gate([*argv, "--confirm-gpu"]).confirm_gpu is True
+
+
+def test_the_attention_harness_measures_the_frame_count_the_cliff_sits_at():
+    """226 frames, on H3's own grid, reached the way the application reaches a frame count.
+
+    The harness takes seconds and lets `over_render_frames` derive frames, because that is
+    the project's rule and a harness that hardcoded 226 into a payload would be measuring a
+    graph the application cannot produce.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    assert harness.MEASURED_FRAMES == 226
+    assert (harness.MEASURED_FRAMES - 5) % 17 == 0
+    assert over_render_frames(harness.measured_duration()) == harness.MEASURED_FRAMES
+    assert over_render_frames(harness.warmup_duration()) == harness.WARMUP_FRAMES
+    # The enhancer investigation's own indices are kept so the two are comparable, and every
+    # index has to exist in a 226-frame clip or it silently samples nothing.
+    assert {20, 44, 70} <= set(harness.SAMPLE_FRAMES)
+    assert max(harness.SAMPLE_FRAMES) < harness.MEASURED_FRAMES
+
+
+def test_the_attention_harness_crosses_sampling_bundles_with_backends():
+    """An arm is a pair, because the cost table answered neither question on its own.
+
+    Every number in the recorded render-cost table is a `default`-profile, 20-step
+    measurement — the batch route's `BatchRequest.profile` defaults there and the frontend
+    sends no profile with a batch, while single-shot "Render Again" hardcodes `turbo`. So the
+    bundle is at least as live a variable as the backend, and the harness has to be able to
+    hold either one still.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    base = ["--project", "p", "--shot", "s", "--confirm-gpu"]
+
+    backends = harness.parse_and_gate([*base, "--sampling", "default", "--profiles", "default,pytorch"])
+    assert backends.arms == [("default", "default"), ("default", "pytorch")]
+
+    bundles = harness.parse_and_gate(
+        [*base, "--sampling", "turbo-references2v,turbo", "--profiles", "default"]
+    )
+    assert bundles.arms == [("turbo-references2v", "default"), ("turbo", "default")]
+    # Both lists at once is the cross product, and the cost line has to say so.
+    both = harness.parse_and_gate([*base, "--sampling", "default,turbo", "--profiles", "default,pytorch"])
+    assert len(both.arms) == 4
+
+    # An unknown *sampling* bundle is refused the way an unknown backend is — the sampling
+    # names come from a different registry and would otherwise reach
+    # `build_h3_reference_payload` unchecked, after the gate. Paired with a known bundle on
+    # purpose: with only the bad one named this would produce a single arm and abort for
+    # *that* reason instead, and the test would pass with the validation deleted.
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--sampling", "turbo,ultra-turbo", "--profiles", "default"])
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--sampling", "turbo,turbo", "--profiles", "default"])
+    # One arm is not an A/B whichever axis it came from.
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--sampling", "turbo", "--profiles", "default"])
+
+
+def test_the_attention_harness_refuses_to_start_a_second_run_at_midnight(monkeypatch, tmp_path):
+    """The bug this test exists for actually happened, mid-experiment, at 00:23.
+
+    The evidence directory is date-stamped and a five-arm experiment takes hours, so a
+    resumed run crosses midnight. Taking `today()` unconditionally made a second, empty
+    directory, found no records in it, and began adopting an in-flight render as the *first*
+    arm of a fresh experiment — filing a `pytorch` render under the `default` label. That is
+    the mislabelled-arm failure the harness exists to prevent, arriving through the door
+    nobody was watching. Two defensible answers means refuse and name them, never pick one.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    monkeypatch.setattr(harness, "ARTIFACT_ROOT", tmp_path)
+    monkeypatch.setattr(harness, "today", lambda: "2026-08-22")
+
+    # Nothing anywhere: today's directory, and no complaint. A genuinely new run.
+    assert harness.resolve_run_dir(None) == tmp_path / "2026-08-22-h3-attention"
+
+    yesterday = tmp_path / "2026-08-21-h3-attention" / "records"
+    yesterday.mkdir(parents=True)
+    (yesterday / "default+default-r1.json").write_text("{}", encoding="utf-8")
+
+    # Yesterday holds arms and today does not: refuse, and name the directory to pass.
+    with pytest.raises(SystemExit):
+        harness.resolve_run_dir(None)
+    # Explicitly named, either way, is always honoured — that is how the refusal is answered.
+    assert harness.resolve_run_dir("2026-08-21-h3-attention") == tmp_path / "2026-08-21-h3-attention"
+    assert harness.resolve_run_dir("2026-08-22-h3-attention") == tmp_path / "2026-08-22-h3-attention"
+
+    # Once today's directory holds arms of its own it is unambiguous again, even though
+    # yesterday's still exists — otherwise every later invocation of a new run would refuse.
+    todays = tmp_path / "2026-08-22-h3-attention" / "records"
+    todays.mkdir(parents=True)
+    (todays / "default+pytorch-r1.json").write_text("{}", encoding="utf-8")
+    assert harness.resolve_run_dir(None) == tmp_path / "2026-08-22-h3-attention"
+
+
+def test_the_attention_harness_cuts_only_the_memory_bound_signature():
+    """The standing authorisation to cut an arm, and every way it must decline to.
+
+    Measured on 2026-08-22: plain PyTorch attention spent 97 minutes on a 226-frame sequence
+    without reaching `loaded completely` or emitting one sampling step, pinned at 100%
+    utilisation drawing 159 W on a card that pulls 400-575 W under compute. Re-confirming that
+    costs hours of GPU for nothing, so it is cut automatically — but *only* on all four
+    signals, because each alone has an innocent reading.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    stalled = {
+        "elapsed": 5820.0, "baseline": 1753.3, "loaded_completely": False,
+        "progress_frames": 0, "watts": 159.0,
+    }
+
+    assert harness.should_cut(**stalled) is True
+    # Each signal alone is a reason not to cut.
+    assert harness.should_cut(**{**stalled, "loaded_completely": True}) is False
+    assert harness.should_cut(**{**stalled, "progress_frames": 1}) is False
+    assert harness.should_cut(**{**stalled, "watts": 480.0}) is False
+    # An unreadable power meter is not evidence of thrashing.
+    assert harness.should_cut(**{**stalled, "watts": None}) is False
+    # Merely slow is allowed to be slow: below the multiple, nothing is cut.
+    assert harness.should_cut(**{**stalled, "elapsed": 1753.3 * 1.4}) is False
+    assert harness.should_cut(**{**stalled, "elapsed": 1753.3 * 1.6}) is True
+    # And the first arm of a run, with nothing completed to be slow against, is never cut —
+    # this rule stops re-confirming a known pattern, it does not police a fresh experiment.
+    assert harness.should_cut(**{**stalled, "baseline": None}) is False
+
+    # The two constants the watchdog's IO depends on, pinned because nothing else can reach
+    # them and a sweep proved it: sentinel mutations to both survived the whole suite.
+    #
+    # `LOADED_LINE` must be the string ComfyUI actually prints, or the check reads "never
+    # loaded" for every arm and the first signal is permanently true — the cut would then rest
+    # on three signals, not four. Verified against this machine's own log, where the completed
+    # 226-frame arm printed "loaded completely; 8571.52 MB usable, 4966.19 MB loaded".
+    assert harness.LOADED_LINE == "loaded completely"
+    # The listen has to outlast the longest single sampling step, or "no frames seen" means
+    # "did not look long enough". The measured baseline was ~88 s per step at 226 frames.
+    assert harness.PROGRESS_LISTEN_SECONDS >= 180
+    assert harness.DID_NOT_COMPLETE_POWER_WATTS == 200
+    assert harness.DID_NOT_COMPLETE_BASELINE_MULTIPLE == 1.5
+
+
+def test_the_attention_harness_screens_cheaply_before_the_cliff_point():
+    """226 frames is the question; 107 frames is what asks it cheaply first.
+
+    97 minutes went into discovering that a backend does not fit 226 frames. Five minutes at
+    107 would have suggested it, so a backend is screened before it is promoted — and the
+    sampled frame indices have to follow the frame count, or a screening take would be asked
+    for frames it does not have.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    assert harness.SCREEN_FRAMES == 107
+    assert over_render_frames(harness.duration_for_frames(harness.SCREEN_FRAMES)) == 107
+    assert over_render_frames(harness.duration_for_frames(226)) == 226
+    # **The fixture bug that voided a whole screen.** `over_render_frames` floors every window
+    # below ~3.271 s at `H3_MIN_RENDER_FRAMES` = 107, so a search that walks up from one frame
+    # answers 0.0417 s for 107 — and a render built from it is conditioned on 42 ms of song.
+    # The duration must come from the *un-floored* arithmetic, which is `margin_frames`.
+    for count in (107, 141, 158, 175, 192, 209, 226):
+        chosen = harness.duration_for_frames(count)
+        assert margin_frames(chosen) == count, (count, chosen)
+        assert chosen > 3.0, (count, chosen)
+    # Specifically: the floored answer is available and must not be the one returned.
+    assert over_render_frames(0.0417) == 107
+    assert margin_frames(0.0417) != 107
+    assert harness.duration_for_frames(107) > 3.29
+    # Indices past the end are dropped, never clamped: three arms sharing a clamped index
+    # would look aligned while all three showed their last frame, which is agreement about
+    # nothing. So the count must *shrink* and the survivors must stay distinct — asserting
+    # only "max is in range" passes on a clamped tuple, which a mutation proved.
+    screened = harness.sample_indices(harness.SCREEN_FRAMES)
+    assert max(screened) < harness.SCREEN_FRAMES
+    assert {20, 44, 70} <= set(screened)
+    assert len(set(screened)) == len(screened), screened
+    assert len(screened) < len(harness.SAMPLE_FRAMES)
+    assert set(screened) == {i for i in harness.SAMPLE_FRAMES if i < harness.SCREEN_FRAMES}
+    assert set(harness.sample_indices(226)) == set(harness.SAMPLE_FRAMES)
+    # A frame count off H3's 17k+5 grid has no duration that produces it, and rendering a
+    # neighbouring length silently is exactly what the grid rule exists to prevent.
+    with pytest.raises(SystemExit):
+        harness.duration_for_frames(200)
+
+
+def test_the_attention_harness_costs_sampling_not_the_model_load():
+    """The error this exists to prevent was made, reported twice, and retracted.
+
+    On 2026-08-22 a 107-frame screen ran with the checkpoint cold for its first arm and
+    resident for the rest. That arm paid a 62 s load (CLIP 25.9 GB + UNET 20.0 GB) the others
+    did not, and a table built on *total execution* reported it as the attention backend being
+    24% slower. ComfyUI's own per-step rates were 9.08, 9.18 and 9.22 s/it — indistinguishable.
+
+    So cost is sampling time, parsed from ComfyUI's tqdm summary, and the load is reported
+    beside it instead of inside it. Total execution measures whatever the machine happened to
+    be doing; this measures the thing under test.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    # The real line, from the run that caused this. tqdm prints its summary twice; the last
+    # complete one wins.
+    window = (
+        "[2026-08-22 01:41:46.703] 100%|xxxx| 20/20 [03:01<00:00,  9.08s/it]"
+        "100%|xxxx| 20/20 [03:01<00:00,  9.14s/it]"
+    )
+    assert harness.sampling_seconds(window) == (181, 9.14)
+
+    # A partial bar is not a sampling time. An arm cut mid-render has none, and reporting the
+    # elapsed-so-far as its cost is exactly the confusion this function removes.
+    assert harness.sampling_seconds("[x] 3/20 [00:30<02:00,  9.08s/it]") == (None, None)
+    assert harness.sampling_seconds("no bar here at all") == (None, None)
+
+    # And the arithmetic that made the error visible: at 107 frames the three arms differ by
+    # ~2% on sampling while their totals differ by 24%.
+    assert round(181 / 107, 3) == 1.692
+    assert round(183 / 107, 3) == 1.710
+    assert abs((255.35 - 193.06) - 62.29) < 0.01
+
+
+def test_the_attention_harness_never_compares_takes_of_different_lengths(tmp_path):
+    """Frame 44 of a 4.5 s take is not frame 44 of an 8.25 s take.
+
+    A run directory accumulates arms across invocations, so once a 107-frame screen and a
+    226-frame arm share one it becomes possible to hstack two *different instants* of the
+    performance and present them as the same moment. That is worse than producing no sheet:
+    it manufactures an apparent lip-sync difference out of arithmetic, in the one artefact a
+    person is asked to judge by eye. Sheets and audio windows are therefore grouped by frame
+    count, and the grouping is what this pins.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    # The windows really are different, which is the whole reason grouping matters.
+    assert harness.duration_for_frames(107) != harness.duration_for_frames(226)
+    # Indices only exist where the take is long enough, so a mixed comparison could not even
+    # be made honestly for the back half.
+    assert 113 in harness.sample_indices(226)
+    assert 113 not in harness.sample_indices(107)
+    # Sheet names carry the length, so two invocations at different counts cannot overwrite
+    # each other's evidence — the earlier scheme keyed only on the frame index.
+    short, long_ = harness.sample_indices(107), harness.sample_indices(226)
+    assert f"mouth_compare-f107-i{short[0]:04d}.png" != f"mouth_compare-f226-i{long_[0]:04d}.png"
+    # And an arm's own frame count is what it is grouped by, not the invocation's.
+    records = [{"frames": 107}, {"frames": 226}, {"frames": 107}]
+    grouped = sorted({record["frames"] for record in records})
+    assert grouped == [107, 226]
+
+
+def test_the_attention_harness_records_each_arm_s_own_sampling_bundle():
+    """An arm that reported the wrong step count would read as an attention result.
+
+    The bundles differ five-fold in steps, so a record that took `default`'s 20 while
+    rendering `turbo`'s 4 would attribute the whole difference to the backend. Asserted
+    against the registry's values here — this is the one place the two are allowed to be
+    compared, because the point is that the harness reads the *arm's* bundle rather than a
+    fixed one.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+
+    for name, profile in H3_REFERENCE_PROFILES.items():
+        facts = harness.bundle_facts(name)
+        assert facts["steps"] == profile.steps
+        assert facts["lora"] == profile.lora
+        assert facts["scheduler"] == profile.scheduler
+        assert facts["sampler"] == profile.sampler
+    # And the bundles really are distinguishable by what is recorded, or the check above
+    # would pass on a harness that always answered `default`.
+    assert len({harness.bundle_facts(name)["steps"] for name in H3_REFERENCE_PROFILES}) > 1
+    assert harness.bundle_facts("turbo")["steps"] != harness.bundle_facts("default")["steps"]
+
+
+def test_the_attention_harness_measures_audio_against_the_window_it_was_given():
+    """The third verdict, and the reason it is a comparison rather than a score.
+
+    H3 *generates* its audio conditioned on the reference, so a correlation well below 1 is
+    the model working as designed — the Director's "a bit of a mutation of what I assume was
+    the input audio" describes that, not a defect. What is worth knowing is whether one arm
+    departs further, or lands later, than another at the same seed. The lag is the half that
+    does not need a person, so it is the half worth pinning: a signal delayed by a known
+    number of samples must report that delay and not zero.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    numpy = pytest.importorskip("numpy")
+
+    # Pinned as a literal, not read from the module. An earlier version built its fixture at
+    # `harness.AUDIO_COMPARE_RATE` and therefore agreed with any value the module chose — a
+    # sentinel mutation moving it to 8 kHz passed, which means the whole test was measuring
+    # the module against itself.
+    assert harness.AUDIO_COMPARE_RATE == 16000
+    assert harness.AUDIO_LAG_LIMIT_SECONDS == 1.0
+    rate = 16000
+    # Broadband *with syllable structure*, because that is what the measure is built for and
+    # neither simpler fixture worked. A pure 220 Hz tone is periodic, so its correlation peaks
+    # at every multiple of its period and a 100 ms delay read as 50 ms — eleven periods out.
+    # Flat white noise then broke the other half: its amplitude envelope is nearly constant,
+    # so envelope correlation had nothing to lock onto and a 100 ms delay read as 43.8 ms.
+    # Speech is neither — it is broadband carrier under a strong ~4 Hz syllable envelope — so
+    # the fixture is noise modulated at 4 Hz, and both halves of the measure can be checked.
+    noise = numpy.random.default_rng(20260822).normal(0, 6000, rate)
+    syllables = 0.5 + 0.5 * numpy.sin(2 * numpy.pi * 4 * numpy.arange(rate) / rate) ** 2
+    tone = noise * syllables
+
+    def write(path, samples):
+        import wave
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(samples.astype("<i2").tobytes())
+        return path
+
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        reference = write(root / "reference.wav", tone)
+        same = write(root / "same.wav", tone)
+        # 100 ms late, which is roughly two frames at 24 fps and far more than a mouth can
+        # hide: a comparison that reported 0 here would be blind to exactly what it is for.
+        delay = rate // 10
+        late = write(root / "late.wav", numpy.concatenate((numpy.zeros(delay), tone[:-delay])))
+
+        aligned = harness.audio_comparison(same, reference)
+        assert aligned["correlation"] > 0.99
+        assert abs(aligned["lag_ms"]) < 1
+
+        shifted = harness.audio_comparison(late, reference)
+        assert abs(abs(shifted["lag_ms"]) - 100) < 2, shifted
+        # Both halves must find it: the envelope is what survives H3 regenerating the audio,
+        # and the waveform pair is kept only so the first run's numbers stay explainable.
+        assert abs(abs(shifted["waveform_lag_ms"]) - 100) < 2, shifted
+        assert shifted["basis"].startswith("amplitude envelope")
+        # A peak on the edge of the search window is flagged rather than reported as a delay —
+        # the first live run produced exactly that (-873 ms against a +/-1000 ms window) and
+        # reading it as "the audio is 873 ms late" would have invented an offset.
+        edge = harness.audio_comparison(
+            write(root / "unrelated.wav",
+                  numpy.random.default_rng(7).normal(0, 6000, rate)),
+            reference,
+        )
+        if abs(edge["lag_ms"]) >= 900:
+            assert "search window" in edge.get("note", "")
+
+        # A DC offset is not a performance difference. Some encoders leave one, and without
+        # centring it dominates the correlation and buries the shape being compared.
+        offset = write(root / "offset.wav", numpy.clip(tone + 4000, -32768, 32767))
+        biased = harness.audio_comparison(offset, reference)
+        assert biased["correlation"] > 0.95, biased
+
+        # Silence on one side is reported, never scored — a decode that produced nothing must
+        # not read as "perfectly different", which is the most alarming thing this table can
+        # say and would send the Director hunting a defect in the wrong place.
+        silent = write(root / "silent.wav", numpy.zeros(rate))
+        dead = harness.audio_comparison(silent, reference)
+        assert dead["correlation"] is None and dead["lag_ms"] is None
+        assert "silence" in dead["note"]
+
+
+def test_the_attention_harness_keeps_the_muxed_take_not_the_silent_companion(tmp_path):
+    """`VHS_VideoCombine` can write two files; only one of them has a voice in it.
+
+    The whole secondary measure is whether the mouth still matches the song, so preserving
+    the silent companion would leave every contact sheet technically produced and evidentially
+    worthless. Chosen between rather than refused, because by the time this runs the GPU
+    minutes are already spent.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    for name in ("attention-default_00001.mp4", "attention-default_00001-audio.mp4"):
+        (tmp_path / name).write_bytes(b"not really a video")
+    entry = {
+        "outputs": {
+            "mvp:save": {
+                "gifs": [
+                    {"filename": "attention-default_00001.mp4", "subfolder": ""},
+                    {"filename": "attention-default_00001-audio.mp4", "subfolder": ""},
+                ]
+            }
+        }
+    }
+
+    assert harness.output_video(tmp_path, entry).name == "attention-default_00001-audio.mp4"
+    # A render that produced nothing on disk is a failure, not a choice.
+    with pytest.raises(SystemExit):
+        harness.output_video(tmp_path / "empty", entry)
+
+
+def test_the_attention_harness_calls_a_substituted_backend_inconclusive():
+    """The false-null guard, and the reason this harness reads a log at all.
+
+    `ModelAttentionBackend.VALIDATE_INPUTS` returns `True` for any string, so a payload
+    naming an unavailable backend validates, renders, and produces a perfectly good video —
+    on PyTorch attention, with one warning line as the only trace. "Comfy kitchen came out
+    identical to baseline" is exactly what a successful-but-inert run looks like, so the
+    harness has to be able to tell them apart before either is written down.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    fell_back = (
+        "[2026-08-21 23:00:00] Attention backend 'comfy kitchen attention' is unavailable; "
+        "using PyTorch attention."
+    )
+
+    verdict, evidence = harness.engagement("comfy-kitchen", fell_back)
+    assert verdict == "fell-back"
+    assert evidence
+
+    # A clean window on the same arm is `registered`, not `confirmed`: the node emits no
+    # positive line, so the evidence is the option list plus the absence of the fallback.
+    assert harness.engagement("comfy-kitchen", "[..] Prompt executed")[0] == "registered"
+    # A sage arm has a positive line and is held to it — including the *mode*, because a
+    # kernel that quietly resolved to a different one is the same trap wearing other clothes.
+    asked = "sageattn_qk_int8_pv_fp8_cuda++"
+    assert harness.engagement("sage-fp8-cuda++", f"Using sage attention mode: {asked}")[0] == "confirmed"
+    assert harness.engagement("sage-fp8-cuda++", "Using sage attention mode: auto")[0] == "wrong-mode"
+    assert harness.engagement("sage-fp8-cuda++", "[..] Prompt executed")[0] == "unconfirmed"
+    # And the default profile patches nothing, so there is nothing to confirm — it inherits
+    # ComfyUI's launch flag, which the report records rather than infers.
+    assert harness.engagement("default", "[..] Prompt executed")[0] == "inherited"
+
+
+def test_the_attention_harness_refuses_arms_that_differ_by_anything_else():
+    """One controlled variable, checked before the GPU rather than discovered after it.
+
+    The real profiles must pass — otherwise the harness could never run — and a payload
+    tampered with anywhere outside the attention node must not.
+    """
+    harness = importlib.import_module("measure_h3_attention")
+    payloads = {
+        name: default_profile_payload(attention=name) for name in H3_ATTENTION_PROFILES
+    }
+
+    harness.only_the_attention_node_differs(payloads)
+
+    tampered = {name: copy.deepcopy(payload) for name, payload in payloads.items()}
+    tampered["comfy-kitchen"]["mvp:noise"]["inputs"]["noise_seed"] = 1234
+    with pytest.raises(SystemExit):
+        harness.only_the_attention_node_differs(tampered)
 
 
 def test_the_turbo_profile_matches_the_export_it_reproduces():
@@ -3076,8 +3831,9 @@ def test_the_h3_audit_wires_every_check_it_defines():
         preflight_h3_ultra.check_aspect_ratios,
         preflight_h3_ultra.check_default_geometry,
         preflight_h3_ultra.check_keyframe_schema_claims,
+        preflight_h3_ultra.check_attention_profiles,
     }
-    assert len(preflight_h3_ultra.CHECKS) == 9
+    assert len(preflight_h3_ultra.CHECKS) == 10
     # And the class those last two read is named for recording, or they would check the live
     # schema and nothing else: absent from the fixture, both report "publishes nothing" in the
     # offline half of the suite, which reads as a real failure and is not.
@@ -3198,6 +3954,38 @@ def test_each_h3_check_passes_the_real_schema_and_names_a_moved_one():
     assert any(
         "audio-shaped inputs" in problem and "ref_audios" in problem
         for problem in preflight_h3_ultra.check_keyframe_schema_claims(grown_audio)
+    )
+
+    # The attention registry, moved three ways — the three ways a profile stops describing
+    # the live node. Each has to be named rather than absorbed, because a profile the audit
+    # silently passes is the unproven combination the whole registry exists to prevent.
+    dropped_kernel = copy.deepcopy(schema)
+    sage = dropped_kernel["PathchSageAttentionKJ"]["input"]["required"]["sage_attention"]
+    sage[0] = [option for option in sage[0] if "fp8_cuda" not in str(option)]
+    assert any(
+        "sageattn_qk_int8_pv_fp8_cuda++" in problem and "not one of" in problem
+        for problem in preflight_h3_ultra.check_attention_profiles(dropped_kernel)
+    )
+    dropped_backend = copy.deepcopy(schema)
+    backend = dropped_backend["ModelAttentionBackend"]["input"]["required"]["attention"]
+    backend[0] = [option for option in backend[0] if "kitchen" not in str(option)]
+    assert any(
+        "comfy kitchen attention" in problem
+        for problem in preflight_h3_ultra.check_attention_profiles(dropped_backend)
+    )
+    renamed_input = copy.deepcopy(schema)
+    inputs = renamed_input["ModelAttentionBackend"]["input"]["required"]
+    inputs["backend"] = inputs.pop("attention")
+    problems = preflight_h3_ultra.check_attention_profiles(renamed_input)
+    assert any("H3_ATTENTION_NODE_INPUTS" in problem for problem in problems)
+    assert any("the live node does not declare" in problem for problem in problems)
+    # And a node that vanished from the server entirely — a KJNodes rename would take the
+    # *default* profile with it, so the audit has to say so rather than find nothing to check.
+    gone = copy.deepcopy(schema)
+    gone.pop("PathchSageAttentionKJ")
+    assert any(
+        "publishes no input map at all" in problem
+        for problem in preflight_h3_ultra.check_attention_profiles(gone)
     )
 
 

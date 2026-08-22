@@ -1602,15 +1602,19 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
 #
 # Three geometric facts shape the whole design:
 #
-# * **A cut is shared.** Moving it changes shot A's duration and shot B's start together —
-#   one move, not two — so the plan is modelled as a list of *boundaries* and the shots are
-#   derived from it. Contiguity is then true by construction rather than by arithmetic.
+# * **A seam is shared.** Moving it changes shot A's duration and shot B's start together —
+#   one move, not two — so the plan is modelled as a list of *seams* and the shots are derived
+#   from them. Coverage is then true by construction rather than by arithmetic. A seam is a
+#   single boundary when the two shots meet at one, and an **overlap** when the Director has
+#   dragged them across each other; `_seam_overlaps` is the one place that tells them apart
+#   and `SEAM_POINT` argues where an overlap's cut actually is.
 # * **The plan's outer edges never move.** The first shot's start and the last shot's end are
 #   copied through untouched, so whatever coverage the plan had of the song it still has,
-#   exactly, to the last bit of the float.
-# * **Cuts are decided left to right**, each against the boundary its left neighbour has
-#   already settled on and against its right neighbour's *original* edge. That is what makes
-#   the band check exact rather than provisional: see `snap_window_plan`.
+#   exactly, to the last bit of the float. That is the frame grid (R-7) held structurally: the
+#   assembled video's length against the song cannot change, whatever any seam does.
+# * **Seams are decided left to right**, each against the edge its left neighbour has already
+#   settled on and against its right neighbour's *original* edge. That is what makes the band
+#   check exact rather than provisional: see `snap_window_plan`.
 #
 # **One implementation, two doors.** `snap_window_plan` is the whole of the decision and it
 # knows nothing about Shots; `snap_cut_plan` is the door from a project's timeline (the
@@ -1663,11 +1667,18 @@ SNAP_TOLERANCE_DEFAULT = 0.75
 SNAP_TOLERANCE_MAX = 3.0
 
 #: How far two adjacent windows may disagree about where their shared boundary is before this
-#: module refuses to call them one cut. Half a frame, the number assembly's own
+#: module stops calling it one boundary. Half a frame, the number assembly's own
 #: `BOUNDARY_TOLERANCE_SECONDS` uses — the same number, because "the same boundary written twice" has to mean the same
 #: thing to the pass that moves cuts and to the pass that assembles them. Deliberately a
 #: literal rather than an import: `assembly` sits beside `timeline` in the graph, not below
 #: it, and `app` is the module that imports both.
+#:
+#: **What it decides has changed, and only in one direction.** Past this tolerance a *positive*
+#: disagreement — B starts after A ends — is a hole, and holes are still refused (`SNAP_HOLE`).
+#: A *negative* one is an overlap, which since the Director's layers ruling (2026-08-20) is a
+#: legitimate editing gesture and since R-3 (2026-08-21) is how a transition is authored. Those
+#: are snapped, as units. The sign is the whole of the difference, and it is the sign
+#: `assembly.tiling_refusals` already reads: a gap is a refusal there, an overlap is not.
 SNAP_CONTIGUITY_TOLERANCE = 1 / (2 * H3_FPS)
 
 # ------------------------------------------------------------------------------------------
@@ -1737,17 +1748,50 @@ SNAP_WITHOUT_CUTS = (
     "A cut is the boundary two shots share, and this plan has {count} shot(s), so there is "
     "no cut to snap."
 )
-#: A gap and an overlap are *different* defects to this application and the sentence says so.
-#: Assembly refuses a gap — there is no picture for those seconds — but since the Director's
-#: overlap ruling (2026-08-20) it treats an overlap as a **layer**, cutting the earlier clip at
-#: the later one's start, so an overlapping plan is a legitimate editing gesture. It still has
-#: no single boundary to move, which is what this refusal is about; claiming assembly refuses
-#: it too would be repeating a sentence that stopped being true.
-SNAP_NOT_CONTIGUOUS = (
-    "This plan is not a contiguous tiling — {before} ends at {end:.3f}s but {after} starts at "
-    "{start:.3f}s — so the two do not share a cut to move. A gap there is a hole assembly "
-    "refuses the plan for; an overlap is a layer assembly accepts. Either way there is no one "
-    "boundary here to place, so close it first or move this cut by hand."
+#: A gap and an overlap are *different* things to this application, and only one of them stops
+#: this pass. A hole is seconds of song with no picture in them: `assembly.tiling_refusals`
+#: refuses the export for it, and there is no seam there to place because there is nothing
+#: there at all. An overlap is the opposite of an absence — it is an authored transition
+#: (R-3) — and it snaps, as a unit. The sentence says both, so a Director who reads it knows
+#: their overlaps are not what is being complained about.
+#:
+#: Refused rather than repaired, which is the rule the retired `SNAP_NOT_CONTIGUOUS` carried
+#: and the half of it that survived: closing a hole is an editing decision, and it is one this
+#: pass could only make by guessing which of the two windows should grow.
+SNAP_HOLE = (
+    "This plan has a hole in it — {before} ends at {end:.3f}s but {after} starts at "
+    "{start:.3f}s, and nothing covers the {length:.3f}s between. Assembly refuses that hole "
+    "too, so there is no seam here to place: close it first, or move this cut by hand. An "
+    "overlap is not a hole — a transition is an overlap, and this pass moves one as a unit."
+)
+#: The other shape this module has no seam for, and it is a *plan* refusal like the hole
+#: rather than a per-cut skip, for the same reason: the geometry is not one this pass can
+#: reason about at all.
+#:
+#: An overlap that swallows a window whole is two visible cuts, not one — `assembly_plan`
+#: splits the underneath clip around the overlay and resumes it afterwards — so "the cut
+#: between these two" names no single instant. Worse, the seam *after* a swallowed window is
+#: not what it appears to be: the next window may start well after the swallowed one ends and
+#: still be covered by the clip underneath, so treating that as a shared boundary and moving
+#: it would silently stretch a window by seconds. Refused rather than guessed at.
+SNAP_NESTED = (
+    "{after} sits entirely inside {before} — {before} runs {start:.3f}s to {end:.3f}s and "
+    "{after}'s {inner_start:.3f}s to {inner_end:.3f}s is within it. One clip laid wholly over "
+    "another has two visible cuts rather than one seam, so there is no single point here to "
+    "place. Move one of them out from under the other, or place these cuts by hand."
+)
+#: R-7 as a per-cut refusal: **the frame grid is inviolable.**
+#:
+#: A transition is as wide as the Director made it, and a seam near either end of the plan can
+#: have room to move without having room for its whole blend to move — the band check bounds
+#: the two *windows*, and an overlap longer than the minimum window can still hang its far
+#: edge off the end. That edge is the assembled video's last frame, so letting it travel would
+#: change the video's length against the song, which nothing here may do. The cut stays.
+SNAP_OFF_THE_PLAN = (
+    "The cut between {before} and {after} at {boundary:.3f}s would move to {proposed:.3f}s, "
+    "which would carry its {overlap:.3f}s transition {edge}. The assembled video's length "
+    "against the song may not change, so a transition may not hang off either end of the "
+    "plan. Left where it was."
 )
 
 
@@ -1768,11 +1812,19 @@ class CutMove:
     after_id: str
     before_label: str
     after_label: str
+    #: Where the cut **is**, which for an overlapping seam is the transition's centre rather
+    #: than either clip's edge — `SEAM_POINT` argues why. 0 for a hard cut means the two are
+    #: the same number, so a plan without transitions reads exactly as it always did.
     boundary: float
     proposed: float
     #: Length in seconds of the voiceless stretch `proposed` lands in. Deliberately without a
     #: default: a move that could not say which gap it found would be a move nobody measured.
     gap: float
+    #: How long the transition at this seam is, 0 for a hard cut. Carried because without it
+    #: the report names an instant at which neither clip has an edge, and a Director looking
+    #: for that instant on the timeline would find nothing there. It is also the number that
+    #: says the move did not resize anything: the same length before and after.
+    overlap: float = 0.0
 
     @property
     def shift(self) -> float:
@@ -1907,6 +1959,87 @@ def _gap_snap_target(gap: tuple[float, float], boundary: float) -> float:
     return min(max(boundary, low + SNAP_CLEARANCE_SECONDS), high - SNAP_CLEARANCE_SECONDS)
 
 
+# ------------------------------------------------------------------------------------------
+# Where the cut is when the two shots overlap. **The decision, and the argument for it.**
+#
+# Under the Director's rulings a seam has two shapes. With no overlap it is one boundary the
+# two shots share and the cut is that instant. With an overlap it is a **transition** (R-3):
+# authored by dragging the edges across each other, drawn blue, A's *transition out* and B's
+# *transition in* describing one blend that "cannot disagree". Two points could plausibly be
+# the cut of such a seam, and this module snaps **the overlap's midpoint**.
+#
+# * **A dissolve has no event at B's start.** At that instant B is at zero opacity and nothing
+#   about the picture changes; it is where the blend begins to be computed, not where it is
+#   seen. Placing *that* instant in a voiceless gap guarantees silence at a moment the viewer
+#   registers nothing — which is a guarantee about arithmetic rather than about the video. The
+#   moment the change is registered is where the two images are equally present, and that is
+#   the midpoint. Every editor's default agrees: an NLE applied to a cut *centres* the
+#   transition on it, because the cut point of a dissolve is its centre.
+# * **R-3 says the overlap is one artefact owned by both shots.** A's out sets B's in; the
+#   pair is a single blend. Its two edges are the ends of one object, so electing one of them
+#   "the cut" privileges half of something symmetric — and it privileges the half that today's
+#   `assembly_plan` happens to resolve to, which is a rendering fallback for a transition
+#   feature that is not built yet, not a statement about what the Director authored.
+# * **It degenerates exactly.** A hard cut is a zero-length overlap and its midpoint is the
+#   shared boundary itself, so there is one rule here rather than two, and a plan with no
+#   transitions in it is snapped by arithmetic identical to Phase B's.
+#
+# What is *not* decided here is the length of the blend: both edges travel by the same delta,
+# so the transition lands somewhere new and is never resized. Resizing it would be editing
+# something the Director authored as a side effect of moving something else.
+# ------------------------------------------------------------------------------------------
+
+#: Named so the ruling above has an address the rest of the module can cite.
+SEAM_POINT = "the overlap's midpoint"
+
+
+def _seam_overlaps(windows: Sequence[SnapWindow]) -> list[float]:
+    """How long the transition at each seam is, indexed like the plan's edge list.
+
+    ``result[k]`` is the overlap at the seam between window ``k-1`` and window ``k``, so
+    ``result[0]`` and ``result[-1]`` are the plan's outer edges and are always 0 — the outer
+    edges have no neighbour to blend with, and they are the two numbers that never move.
+
+    A disagreement inside `SNAP_CONTIGUITY_TOLERANCE` is 0: half a frame is where "the same
+    boundary written twice" ends, and it is where it ends for `assembly.tiling_refusals` too.
+    Past it, the **sign** decides, exactly as it decides there — a positive disagreement is a
+    hole with no picture in it and raises, a negative one is an authored overlap and is
+    returned as its length.
+
+    Raises for the one other geometry this module has no seam for: a window that ends before
+    the one before it does, which is a clip laid *wholly* over another — see `SNAP_NESTED`.
+    Ruling that out is also what makes the last window's end the plan's end, which the frame
+    grid guarantee leans on.
+    """
+    overlaps = [0.0] * (len(windows) + 1)
+    for index, (previous, current) in enumerate(pairwise(windows)):
+        slack = current.start - previous.end
+        if slack > SNAP_CONTIGUITY_TOLERANCE:
+            raise TimelineError(
+                SNAP_HOLE.format(
+                    before=previous.label,
+                    after=current.label,
+                    end=previous.end,
+                    start=current.start,
+                    length=slack,
+                )
+            )
+        if current.end < previous.end - SNAP_CONTIGUITY_TOLERANCE:
+            raise TimelineError(
+                SNAP_NESTED.format(
+                    before=previous.label,
+                    after=current.label,
+                    start=previous.start,
+                    end=previous.end,
+                    inner_start=current.start,
+                    inner_end=current.end,
+                )
+            )
+        if slack < -SNAP_CONTIGUITY_TOLERANCE:
+            overlaps[index + 1] = -slack
+    return overlaps
+
+
 def window_move_refusal(
     project: Project, shot: Shot, *, rendering: frozenset[str] = frozenset()
 ) -> str:
@@ -2008,8 +2141,10 @@ def snap_cut_plan(
     cut cannot land in one place because it was reached from the timeline and another because
     it was reached from a fresh layout.
 
-    Raises `TimelineError` when the plan is not already a contiguous tiling, because then the
-    two shots at a "cut" do not share a boundary and there is nothing single to move.
+    Raises `TimelineError` when the plan has a hole in it, because there is no seam in a hole
+    — see `SNAP_HOLE` — or when one shot is laid wholly over another (`SNAP_NESTED`). An
+    **overlapping** plan is snapped, not refused: an overlap is an authored transition and it
+    moves as a unit.
     """
     return snap_window_plan(
         shot_snap_windows(project, rendering=rendering),
@@ -2028,11 +2163,19 @@ def snap_window_plan(
     minimum: float = H3_MIN_SHOT_SECONDS,
     maximum: float = H3_MAX_SHOT_SECONDS,
 ) -> CutSnapPlan:
-    """Propose a new position for every cut in a tiling. The one implementation.
+    """Propose a new position for every cut in a plan. The one implementation.
 
     Each cut is offered the nearest voiceless moment within ``tolerance`` seconds
     (`_gap_snap_target` decides "nearest"), and takes it only when both windows it belongs to
     survive every check. Everything else is reported as a skip with its reason.
+
+    **A seam may be an overlap, and then it moves as a unit.** Since R-3 an overlap is how a
+    transition is authored, with a length the Director chose; the cut is `SEAM_POINT` and both
+    edges travel by the same delta, so the blend lands somewhere new and is never resized.
+    Moving the later clip's start alone would silently turn a 2 s dissolve into a 1.5 s one —
+    editing something authored as a side effect of moving something else. A hard cut is the
+    zero-length case of the same arithmetic and behaves exactly as it did before overlaps were
+    admitted here.
 
     `windows` arrive **in song order** — the caller's ordering is the one used, unchanged —
     and each carries its own `refusal`, so this function decides nothing about protections
@@ -2057,16 +2200,21 @@ def snap_window_plan(
     cut *i+1* moves (checked there) or stays (checked here), and every window in the result is
     inside the band on both counts.
 
-    **Contiguity is structural.** The plan is carried as a boundary list; the returned windows
-    are consecutive differences of it, and the two outer boundaries are copied through from
-    the input untouched. There is no arithmetic by which a gap, an overlap or an accumulated
-    rounding drift can appear — only the interior boundaries are ever assigned, and each is
-    assigned once, to a value rounded to the millisecond the rest of this module works in. A
-    window no cut of which moved keeps its given floats untouched to the bit, which is what
-    stops an ulp of recomputation from making an approved shot read as stale to assembly.
+    **Coverage is structural, and so is the seam geometry.** The plan is carried as an edge
+    list plus the overlap length at each seam (`_seam_overlaps`); the returned windows are
+    derived from the two, and the two outer edges are copied through from the input untouched.
+    There is no arithmetic by which a hole, a resized transition or an accumulated rounding
+    drift can appear — only the interior edges are ever assigned, each once, from a seam point
+    rounded to the millisecond the rest of this module works in, and the overlap lengths are
+    *carried* rather than recomputed, so what comes out has the transitions that went in. The
+    plan's first start and last end being untouched is R-7 held by construction: the assembled
+    video's length against the song is the number it was. A window no seam of which moved
+    keeps its given floats untouched to the bit, which is what stops an ulp of recomputation
+    from making an approved shot read as stale to assembly.
 
-    Raises `TimelineError` when the input is not already a contiguous tiling, because then the
-    two windows at a "cut" do not share a boundary and there is nothing single to move.
+    Raises `TimelineError` for the two geometries that have no seam at all: a **hole**
+    (`SNAP_HOLE`) and a window laid **wholly over** another (`SNAP_NESTED`). An overlapping
+    plan is snapped rather than refused; that is the whole of this change.
     """
     ordered = list(windows)
     unchanged = [(window.id, window.start, window.duration) for window in ordered]
@@ -2081,22 +2229,17 @@ def snap_window_plan(
             "no_cuts", tolerance, [], [], unchanged,
             SNAP_WITHOUT_CUTS.format(count=len(ordered)),
         )
-    for previous, current in pairwise(ordered):
-        if abs(current.start - previous.end) > SNAP_CONTIGUITY_TOLERANCE:
-            raise TimelineError(
-                SNAP_NOT_CONTIGUOUS.format(
-                    before=previous.label,
-                    after=current.label,
-                    end=previous.end,
-                    start=current.start,
-                )
-            )
+    overlaps = _seam_overlaps(ordered)
     gaps = vocal_gaps(song, start=ordered[0].start, end=ordered[-1].end)
     if gaps is None:
         return CutSnapPlan("unmeasured", tolerance, [], [], unchanged, SNAP_UNMEASURED)
 
-    # The plan as boundaries. `boundaries[0]` and `boundaries[-1]` are the plan's outer edges
-    # and are never assigned, so the coverage of the song is bit-identical afterwards.
+    # The plan as its **earlier** edges: `boundaries[k]` is where window `k` starts, which for
+    # an overlapping seam is the lower of the two edges and the transition's own start. The
+    # window before it ends at `boundaries[k] + overlaps[k]`, so one assignment moves both
+    # edges of a transition together and its length is carried, never recomputed.
+    # `boundaries[0]` and `boundaries[-1]` are the plan's outer edges and are never assigned,
+    # so the coverage of the song is bit-identical afterwards.
     boundaries = [window.start for window in ordered] + [ordered[-1].end]
     # Which boundaries were actually assigned. Read once, at the end, to keep every untouched
     # window's given floats rather than recomputing them — see the note there.
@@ -2105,7 +2248,11 @@ def snap_window_plan(
     skips: list[CutSkip] = []
     for index in range(len(ordered) - 1):
         before, after = ordered[index], ordered[index + 1]
-        boundary = boundaries[index + 1]
+        overlap = overlaps[index + 1]
+        # The cut. `SEAM_POINT`: the centre of the transition, which for a hard cut is the
+        # shared boundary itself because the transition is zero long.
+        half = overlap / 2
+        boundary = boundaries[index + 1] + half
         names = {
             "before_id": before.id,
             "after_id": after.id,
@@ -2165,15 +2312,47 @@ def snap_window_plan(
                 )
             )
             continue
-        left, right = boundaries[index], boundaries[index + 2]
+        # **R-7 before the band.** A transition travels whole, so the seam has room to move
+        # only if its far edge does too. `boundaries[0]` and `boundaries[-1]` are the plan's
+        # first frame and its last — the two numbers the assembled video's length against the
+        # song is made of — and `_seam_overlaps` has already ruled out the geometry in which
+        # the last window is not the plan's end. A hard cut cannot reach this: its target came
+        # out of `vocal_gaps`, which is clamped to exactly this span.
+        if (
+            proposed - half < boundaries[0] - 1e-9
+            or proposed + half > boundaries[-1] + 1e-9
+        ):
+            skips.append(
+                CutSkip(
+                    **names,
+                    reason=SNAP_OFF_THE_PLAN.format(
+                        **labels,
+                        boundary=boundary,
+                        proposed=proposed,
+                        overlap=overlap,
+                        edge=(
+                            "back before the plan's first frame"
+                            if proposed - half < boundaries[0]
+                            else "past the plan's last frame"
+                        ),
+                    ),
+                )
+            )
+            continue
+        # Each neighbour's whole window, transitions included: `left` is where the shot before
+        # this seam starts — an edge an earlier seam may already have settled — and `right` is
+        # where the shot after it ends, which is past `boundaries[index + 2]` by whatever
+        # transition sits at the seam beyond. A window's length is its own window, overlapped
+        # or not, because that is the length H3 has to render.
+        left, right = boundaries[index], boundaries[index + 2] + overlaps[index + 2]
         # Both neighbours, each named with the length the move would give it and the bound it
         # would break. The nearest gap is the only candidate considered: the ruling is that a
         # move which pushes a neighbour out of the band is rejected *for that cut*, and
         # walking on to a further gap would report a reason about a move nobody proposed.
         out_of_band = None
         for neighbour, length in (
-            (names["before_label"], proposed - left),
-            (names["after_label"], right - proposed),
+            (names["before_label"], proposed + half - left),
+            (names["after_label"], right - (proposed - half)),
         ):
             if length < minimum - 1e-9:
                 out_of_band = (neighbour, length, "under", minimum, "minimum")
@@ -2199,9 +2378,16 @@ def snap_window_plan(
                 )
             )
             continue
-        boundaries[index + 1] = proposed
+        # One assignment, both edges. The transition's start moves to `proposed - half` and
+        # its end follows from the length carried in `overlaps`, so the blend is somewhere new
+        # and is exactly as long as the Director made it. `half` is 0 for a hard cut, and
+        # `proposed - 0.0` is `proposed` to the bit, so that path is Phase B's arithmetic
+        # unchanged.
+        boundaries[index + 1] = proposed - half
         touched.add(index + 1)
-        moves.append(CutMove(**names, proposed=proposed, gap=gap_length))
+        moves.append(
+            CutMove(**names, proposed=proposed, gap=gap_length, overlap=round(overlap, 3))
+        )
     # A window neither of whose boundaries moved keeps its **given floats**, not a recomputed
     # difference of them. `start + duration` and `boundaries[k + 1]` are the same real number
     # and can be a bit apart in IEEE-754, so recomputing every window would rewrite untouched
@@ -2212,7 +2398,11 @@ def snap_window_plan(
     settled = [
         (window.id, window.start, window.duration)
         if index not in touched and index + 1 not in touched
-        else (window.id, boundaries[index], boundaries[index + 1] - boundaries[index])
+        else (
+            window.id,
+            boundaries[index],
+            boundaries[index + 1] + overlaps[index + 1] - boundaries[index],
+        )
         for index, window in enumerate(ordered)
     ]
     return CutSnapPlan("ready", tolerance, moves, skips, settled)

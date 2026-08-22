@@ -21,12 +21,13 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import combinations
+from math import isfinite
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from .comfy import ComfyError, HistoryResult
-from .models import Project, RenderJob, Shot, ShotStatus, shot_label
+from .models import Project, RenderJob, Shot, ShotStatus, now_utc, shot_label
 from .reference_map import (
     STALE_REFERENCE_MAP_CAUSE,
     STALE_REFERENCE_MAP_CONSEQUENCE,
@@ -63,6 +64,7 @@ __all__ = [
     "RenderReconciliation",
     "RenderStatusReport",
     "apply_job_history",
+    "format_duration",
     "prompt_is_missing",
     "prompt_rejection",
     "queue_locations",
@@ -71,7 +73,9 @@ __all__ = [
     "reconcilable_jobs",
     "reconcile_render_jobs",
     "render_status_report",
+    "render_timing_summary",
     "shot_label",
+    "stamp_job_settled",
     "supersede_target_jobs",
     "take_coverage_note",
     "window_band_note",
@@ -738,6 +742,124 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
 #: together, because a client that polls for a status the server calls settled polls forever.
 TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"complete", "error", "cancelled"})
 
+
+# --------------------------------------------------------------------------------------------
+# Render timing — how long a render actually took, recorded by the application that ran it.
+#
+# **Why this exists.** Until 2026-08-21 this application recorded nothing about render cost.
+# `RenderJob.updated_at` was set by its `default_factory` and no settle path ever wrote it
+# again, so every settled job in the Director's live manifest carried `updated_at ==
+# created_at` to the microsecond. The one render-cost figure this codebase acted on — a
+# 221-frame window "took 2.2 HOURS", quoted into a live constant's justification and onward
+# into three other files — had no primary record anywhere: it was a comment citing itself.
+# When it was finally challenged it turned out to be wrong by roughly 3.4x, and settling that
+# meant reading mtimes off the `.mp4` files in ComfyUI's output tree by hand. Nothing below is
+# clever; it is the measurement this application should always have been taking.
+# --------------------------------------------------------------------------------------------
+
+#: `render_seconds` came from ComfyUI's own execution clock — `execution_start` to
+#: `execution_success`/`execution_error` in `/history`'s `status.messages`. The render alone:
+#: queue wait is excluded, so two jobs measured this way are directly comparable.
+JOB_TIMING_FROM_COMFY = "comfy"
+
+#: `render_seconds` came from this record: `created_at` (enqueue) to the settle. It therefore
+#: includes any time the prompt spent **waiting** behind other prompts, and is only an upper
+#: bound on the render. Every surface that shows it has to say so.
+JOB_TIMING_FROM_RECORD = "record"
+
+
+def format_duration(seconds: float) -> str:
+    """Seconds as the Director reads them: ``42s``, ``6m18s``, ``2h04m``.
+
+    Compact because it sits in a table column, and never rounded up into the next unit — a
+    render reported as `7m` when it took 6m59s is the kind of smoothing this whole module
+    exists to stop. Negative and non-finite inputs answer ``"—"``; neither is a duration, and
+    a clock adjustment can produce the first.
+    """
+    if not isfinite(seconds) or seconds < 0:
+        return "—"
+    whole = int(seconds)
+    if whole < 60:
+        return f"{whole}s"
+    if whole < 3600:
+        return f"{whole // 60}m{whole % 60:02d}s"
+    return f"{whole // 3600}h{(whole % 3600) // 60:02d}m"
+
+
+def stamp_job_settled(job: RenderJob, *, elapsed_seconds: float | None = None) -> bool:
+    """Record that this job has stopped, and how long it was running. Returns whether it wrote.
+
+    **Every settle path calls this** — completion and failure (`apply_job_history`), the
+    `missing_ticks` death, supersession (`supersede_target_jobs`), the cancel route, the
+    never-submitted settle, the orphaned-assembly heal, and both ends of an export. Enumerated
+    rather than centralised in one status setter because the paths live in two modules and each
+    writes a different `error`; what they share is this one call, and a settle path that forgets
+    it is the defect this function exists to make findable.
+
+    `elapsed_seconds` is ComfyUI's own execution span where the caller has one
+    (`HistoryResult.elapsed_seconds`); the render alone, and preferred whenever it exists. With
+    no measurement to hand, the span is taken off this record — `created_at` to now — which is
+    **enqueue** to settle and therefore an upper bound rather than a render time. The two are
+    not interchangeable and `render_seconds_source` is what keeps them distinguishable
+    afterwards; nothing may show one as though it were the other.
+
+    **Idempotent, and that is load-bearing.** A job that already carries a source is left
+    entirely alone, `updated_at` included: terminal is terminal, so a second call can only be a
+    later clock overwriting the real measurement — and it would also make a re-read of an
+    already-settled record look like a change to the reconciler, which would rewrite the
+    manifest on a tick that learned nothing and collide with whatever the Director is editing.
+
+    What it does **not** do: touch `status`, `error`, or the target. Those are each caller's own
+    decision and settling is not one act — see `apply_job_history` and `supersede_target_jobs`.
+    """
+    if job.render_seconds_source:
+        return False
+    job.updated_at = now_utc()
+    if elapsed_seconds is not None and isfinite(elapsed_seconds) and elapsed_seconds >= 0:
+        job.render_seconds = round(elapsed_seconds, 3)
+        job.render_seconds_source = JOB_TIMING_FROM_COMFY
+        return True
+    span = (job.updated_at - job.created_at).total_seconds()
+    # A negative span is a clock that moved, not a render that finished before it started. The
+    # stamp still lands — the job did settle — but nothing is claimed about its length.
+    if span >= 0:
+        job.render_seconds = round(span, 3)
+        job.render_seconds_source = JOB_TIMING_FROM_RECORD
+    return True
+
+
+def render_timing_summary(job: RenderJob) -> str:
+    """One honest line about what this job cost, or ``""`` where nothing was measured.
+
+    The whole point is that the caveat travels with the number. A `comfy`-sourced timing is a
+    render time and says so plainly; a `record`-sourced one is enqueue-to-settle and says *that*
+    plainly, because for anything submitted as a batch the difference is most of the number and
+    a reader who is not told will read it as render cost. That misreading is precisely how a
+    221-frame render came to be recorded as taking 2.2 hours.
+
+    A non-`complete` job is never described as having rendered: a cancellation that stood open
+    for forty minutes rendered for some unknown part of that, and "rendered in 40m" would be a
+    fabrication. It is reported as what it is — how long the record was open.
+
+    The frame count is included when there is one, because a duration without it is
+    uninterpretable: 6m18s is unremarkable at 141 frames and impossible at 277. Empty string
+    for an unmeasured job rather than "unknown", so a caller can simply not draw the line.
+    """
+    if not job.render_seconds_source:
+        return ""
+    length = format_duration(job.render_seconds)
+    frames = f", {job.render_frames} frames" if job.render_frames else ""
+    if job.status != "complete":
+        return f"{job.status} after {length}{frames} (time the record was open, not render time)"
+    if job.render_seconds_source == JOB_TIMING_FROM_COMFY:
+        return f"rendered in {length}{frames}"
+    queued = " — this job was submitted in a batch" if job.batch_id else ""
+    return (
+        f"{length} from queued to done{frames}; ComfyUI reported no execution clock for this "
+        f"prompt, so the wait in the queue is included{queued}"
+    )
+
+
 #: The history statuses adopted verbatim onto a job. Anything else ComfyUI invents — it has
 #: reported bare "success" strings before `HistoryResult` normalised them — reads as "running",
 #: which is the only honest reading of "there is an entry and it is not finished".
@@ -856,10 +978,24 @@ def apply_job_history(project: Project, job: RenderJob, history: HistoryResult) 
     delegate here, so `Shot.status`, an Asset's landed file and a Song's audio path cannot be
     adopted by two subtly different rules. Everything in here is a decision about data already
     fetched; nothing touches the network.
+
+    This is also where a *completed* render's cost is recorded, and the one settle path with a
+    real measurement to record: ComfyUI stamps its own `execution_start` and `execution_success`
+    into the history entry this function is reading, so the duration written here is the render
+    with the queue wait already excluded. See `stamp_job_settled`.
     """
+    settled_before = job.status in TERMINAL_JOB_STATUSES
     job.status = (
         history.status if history.status in _ADOPTED_HISTORY_STATUSES else "running"
     )
+    # On the transition into a terminal status, and only there. A history re-read of a job that
+    # was already settled must not re-stamp it with a later clock, and a queued→running move is
+    # not a settle at all.
+    if not settled_before and job.status in TERMINAL_JOB_STATUSES:
+        # `getattr` with a `None` default, on the `known` flag's precedent below: a history
+        # double built before this existed reports no execution clock, and "no clock" is exactly
+        # what the default means. The record's own span is then used instead, labelled as such.
+        stamp_job_settled(job, elapsed_seconds=getattr(history, "elapsed_seconds", None))
     job.output_files = [
         "/".join(
             part.replace("\\", "/").strip("/")
@@ -988,6 +1124,11 @@ async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconcili
             changed = True
             if job.missing_ticks >= MISSING_TICKS_LIMIT:
                 job.status = "error"
+                # A settle, so it is stamped like one. There is no ComfyUI measurement to
+                # prefer here by definition — this branch is reached precisely because ComfyUI
+                # has no record of the prompt — so the span is the record's own, and
+                # `render_seconds_source` says `record` so nobody reads it as a render time.
+                stamp_job_settled(job)
                 # A record still carrying the pre-submission sentinel is not a prompt that
                 # died with the queue — ComfyUI never had it — so it is settled in the
                 # sentence that says so. Same terminal state, same consequence, an
@@ -1070,6 +1211,10 @@ def supersede_target_jobs(
             job.error = JOB_SUPERSEDED
             job.superseded_by = keep_job_id
             job.missing_ticks = 0
+            # Settled, therefore stamped. Not a render time and `render_timing_summary` will
+            # not call it one: an older prompt may still be executing on ComfyUI as this runs,
+            # so what is recorded is how long the *record* stood open.
+            stamp_job_settled(job)
             superseded.append(job)
     return superseded
 

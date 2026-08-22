@@ -3504,10 +3504,21 @@ export function snapCutsReportLines(report) {
     // `NaNs`. Nothing here suggests a shot type; the number is the whole addition.
     const gap = Number(move.gap);
     const found = Number.isFinite(gap) && gap > 0 ? ` in a ${seconds(gap)} gap` : "";
+    // An overlapping seam is a transition (R-3), and the two seconds figures above are its
+    // *centre* -- an instant at which neither clip has an edge, so a Director looking for it
+    // on the timeline would find nothing there unless the line says what it is. The clause
+    // also says the length twice over: it is what went in and what comes out, because the
+    // snap moves both edges together and never resizes a blend somebody authored. Drawn only
+    // when the server sent a positive number, so a hard cut reads exactly as it always has
+    // and a report from before the field existed loses the clause rather than printing `NaN`.
+    const overlap = Number(move.overlap);
+    const blend = Number.isFinite(overlap) && overlap > 0
+      ? ` · centre of a ${seconds(overlap)} overlap, moved whole`
+      : "";
     lines.push({
       kind: "move",
       text: `${move.before} → ${move.after}: ${seconds(move.boundary)} → ` +
-        `${seconds(move.proposed)} (${signed(move.shift)})${found}`,
+        `${seconds(move.proposed)} (${signed(move.shift)})${found}${blend}`,
     });
   }
   for (const skip of report.skips || []) {

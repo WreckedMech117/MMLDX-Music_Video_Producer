@@ -2764,6 +2764,48 @@ export async function pollRenderStatus() {
   }
 }
 
+// Seconds as the Director reads them. The exact mirror of `batch.format_duration`; a contract
+// test runs both over the same table, because a duration formatted two ways in two languages is
+// how a number stops meaning what the other half thinks it means.
+export function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  const whole = Math.floor(seconds);
+  if (whole < 60) return `${whole}s`;
+  if (whole < 3600) return `${Math.floor(whole / 60)}m${String(whole % 60).padStart(2, "0")}s`;
+  return `${Math.floor(whole / 3600)}h${String(Math.floor((whole % 3600) / 60)).padStart(2, "0")}m`;
+}
+
+// One honest line about what a job cost, mirroring `batch.render_timing_summary` word for word --
+// the contract test asserts the two strings are identical, so the caveat cannot be dropped on the
+// way to the only place a Director actually reads it.
+//
+// The caveat is the point, not decoration. Until 2026-08-21 this application recorded no render
+// timings at all, and the one figure it acted on -- a 221-frame window at "2.2 hours" -- was a code
+// comment citing itself, wrong by roughly 3.4x. A duration shown without saying whether queue wait
+// is inside it is the same mistake with better provenance.
+export function renderTimingSummary(job) {
+  if (!job?.render_seconds_source) return "";
+  const length = formatDuration(job.render_seconds);
+  const frames = job.render_frames ? `, ${job.render_frames} frames` : "";
+  if (job.status !== "complete") {
+    return `${job.status} after ${length}${frames} (time the record was open, not render time)`;
+  }
+  if (job.render_seconds_source === "comfy") return `rendered in ${length}${frames}`;
+  const queued = job.batch_id ? " — this job was submitted in a batch" : "";
+  return `${length} from queued to done${frames}; ComfyUI reported no execution clock for this prompt, so the wait in the queue is included${queued}`;
+}
+
+// The queue column's compact form. `≤` is the caveat made *visible* rather than left in a tooltip:
+// a `record`-sourced span runs from enqueue, so it is an upper bound on the render and never the
+// render itself, and a reader scanning the column has to be able to see that without hovering.
+// The full sentence rides the same cell's `title`.
+export function renderTimingCell(job) {
+  if (!job?.render_seconds_source) return "—";
+  const length = formatDuration(job.render_seconds);
+  const frames = job.render_frames ? ` · ${job.render_frames}f` : "";
+  return `${job.render_seconds_source === "comfy" ? "" : "≤"}${length}${frames}`;
+}
+
 function renderJobs() {
   const jobs = state.project?.jobs || [];
   const list = $("#job-list");
@@ -2797,7 +2839,7 @@ function renderJobs() {
   const progress = remaining
     ? `<div class="batch-progress">Batch: ${batchJobs.length - remaining} of ${batchJobs.length} settled · ${remaining} to go (~${Math.round(remaining * 2.7)} min on turbo)</div>`
     : "";
-  list.innerHTML = progress + [...jobs].reverse().map((job) => `<div class="job-row ${job.kind === "h3" && job.target_id ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${job.kind === "h3" ? escapeHtml(job.target_id || "") : ""}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(target(job))}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span>${open(job) ? `<button class="job-cancel" data-job-id="${job.id}" title="Cancel this render: dequeued (interrupted when running) on ComfyUI, the job settled, the shot released.">×</button>` : ""}</div>`).join("");
+  list.innerHTML = progress + [...jobs].reverse().map((job) => `<div class="job-row ${job.kind === "h3" && job.target_id ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${job.kind === "h3" ? escapeHtml(job.target_id || "") : ""}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(target(job))}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span class="job-took" title="${escapeHtml(renderTimingSummary(job) || "This job has no recorded timing. Every settle path records one since 2026-08-21; a job settled before that carries none, and none was ever invented for it.")}">${escapeHtml(renderTimingCell(job))}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span>${open(job) ? `<button class="job-cancel" data-job-id="${job.id}" title="Cancel this render: dequeued (interrupted when running) on ComfyUI, the job settled, the shot released.">×</button>` : ""}</div>`).join("");
   $$(".job-row.linked", list).forEach((row) => row.addEventListener("click", () => {
     state.selectedShotId = row.dataset.shotId;
     state.selectedSectionId = null;

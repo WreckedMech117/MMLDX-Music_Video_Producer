@@ -4,6 +4,321 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-21 — The accelerator was never off: the attention backend becomes a profile, and the cliff turns out to have been measured on SageAttention
+
+Spec: `_bmad-output/planning-artifacts/h3-attention-backend-experiment.md` (extended, §6 — that
+file was already written by another agent this session and this work extends it rather than
+adding a second one).
+
+**The finding first, because it invalidates the premise this task was given.** The brief, the
+spec's §1–§2, `app.py`'s corrected cost-cliff comment, `docs/ROADMAP.md` and
+`docs/OPERATIONS.md` all said the same thing: every H3 render this project has timed ran with
+attention acceleration switched off, because `workflows.py` emits
+`PathchSageAttentionKJ` at `sage_attention: "disabled"`. The premise is wrong.
+
+At `disabled`, KJNodes' `patch` is `return model,` — no clone, and **no
+`optimized_attention_override` written** (`model_optimization_nodes.py:124`). A node that
+writes no override does not disable anything. It declines to override whatever ComfyUI
+selected globally at startup. And this ComfyUI selects SageAttention: `/system_stats` reports
+`argv` as `['…/main.py', '--use-sage-attention', '--fast']`, and
+`ComfyUI/user/comfyui.log` prints `Using sage attention` at every start it still retains —
+including **`2026-08-20 09:00:34`**, inside the serial overnight batch the render-cost cliff
+was reconstructed from. `sageattention 2.2.0+cu128torch2.7.1` has been in the embedded python
+since 2026-08-19; `run_nvidia_gpu.bat` was last modified 2026-08-19 12:08, which is when this
+became true and when three documents quietly went stale.
+
+So the cliff was measured **on SageAttention**, the comparison arm nobody here has ever
+rendered is plain PyTorch, and the pin to `disabled` is still correct — it is faithful to the
+export — but it means "do not override", never "no acceleration". `app.py`'s choke-point
+comment, `docs/ROADMAP.md` and `docs/OPERATIONS.md` are corrected in place, each saying what
+it used to claim.
+
+**What landed.** The attention backend is a named profile, following `H3SamplingProfile`'s
+bundle pattern for its reason: a profile is a whole node, never a set of knobs.
+`H3_ATTENTION_PROFILES` has five — `default` (today's node and values), `pytorch`,
+`comfy-kitchen`, `sage-auto`, `sage-fp8-cuda++` — and `attention=` is a parameter of
+`build_h3_reference_payload`, `build_h3_keyframe_payload` and `build_h3_image_edit_payload`.
+`build_h3_director_payload` takes none and grows no node; it never had one.
+
+**It is not persisted and not routed, deliberately.** `H3Request.profile` is a request field
+that never reaches a manifest, and the attention profile does not even go that far: it is a
+builder parameter the measurement harness passes. Nothing is written to a project, so the
+generic full-project `PUT` — the hole in a guard seven times here — has no new field to lose,
+and there are no write paths to enumerate because there are none. Exposing it on the route
+before the measurement exists would put an unmeasured backend one dropdown away from a render.
+
+**The chain position was read, not guessed.** Node order in a patch chain is semantic, and the
+two classes arrive with different evidence. `PathchSageAttentionKJ` sits *after* the sigma
+shift in `h3-ultra-references-user-export.json` (node `2372` fed by shift `2373`) — where this
+adapter already emits it, which is why the default's bytes do not move.
+`ModelAttentionBackend` sits *before* it in the Director's Comfy Kitchen graph, chain-walked
+by MODEL link: `215 UNETLoader → 6006 LoraLoaderModelOnly (muted) → 6088 Power Lora Loader →
+6095 ModelAttentionBackend → 6007 MiniMaxH3SigmaShift (12/3) → 214 BasicGuider / 212
+BasicScheduler → 213 SamplerCustomAdvanced`. That graph's Sage node (`223`, muted,
+`["auto", false]`) is a **parallel alternative branch**, not a stack.
+
+Whether the ordering is load-bearing was checked in the implementations rather than inferred
+from the picture. It is not — **but only because exactly one attention node is ever emitted.**
+Both classes write the *same* `model_options["transformer_options"]
+["optimized_attention_override"]` (`comfy/model_patcher.py:688` and
+`model_optimization_nodes.py:134`). Two in one chain do not compose; the later one wins,
+silently. That is the mechanical reason the Kitchen graph branches, and the reason each
+profile carries its node's own position rather than sharing a slot.
+
+**Two of the eight sage kernels are blessed, and the argument is the installed library rather
+than the option list.** `sageattn3` and `sageattn3_per_block_mean` import a *separate*
+`sageattn3` package that is **not installed** — they would raise at sampling time, after the
+checkpoint is loaded and the minutes are spent. `sageattn_qk_int8_pv_fp16_triton` is ruled out
+by the vendor's own comment that the triton kernel "is currently not usable on sm120", which
+is this card. `sage-auto` is offered because `sageattention/core.py:152` routes sm120 to
+`sageattn_qk_int8_pv_fp8_cuda(pv_accum_dtype="fp32+fp16", qk_quant_gran="per_warp")` — the
+vendor's own Blackwell choice, and on a `--use-sage-attention` server it should reproduce
+`default`, which makes it the experiment's internal control rather than a fifth guess.
+`sage-fp8-cuda++` names that same kernel by hand at KJ's default `per_thread` granularity, so
+it differs from `sage-auto` in exactly one term. The other two stay unreachable; adding one is
+a one-line edit plus a reason, which is the point of a closed registry.
+
+**The acceptance criterion, and how it is held.** The reference family's two pre-existing
+digests and the text-only digest pass untouched. The keyframe and image-edit families had no
+payload digest at all, so two were taken at commit `c4c0722` — the commit before this work —
+and pinned: `H3_KEYFRAME_PRE_ATTENTION_DIGEST` and `H3_IMAGE_EDIT_PRE_ATTENTION_DIGEST`. Every
+builder that emits an attention node now has its default pinned. Separately, all five
+sampling-profile × builder combinations were hashed at `c4c0722` and re-hashed after the
+change: identical, including the LoRA-carrying `turbo` and `turbo-references2v` paths that run
+through the new patch-chain helper.
+
+**Pre-flight covers every profile.** `check_attention_profiles` re-reads the live schema for
+three things a profile can silently stop describing: the class being registered at all, the
+non-`model` input names matching `H3_ATTENTION_NODE_INPUTS` in the schema's own order, and
+every combo value being in the published option list. Five payload variants were added — one
+per non-default backend plus a keyframe one, because the two classes take different input
+names. All six adapter audits pass clean on 0.33.3; the H3 one is now **21 variants / 373
+nodes / 25 classes**. `ModelAttentionBackend` was recorded into
+`tests/fixtures/object_info.json` so the offline half of the suite checks it too.
+
+**The harness, and the trap it exists to avoid.** `tests/measure_h3_attention.py` renders one
+singing shot at 226 frames — the cliff point — under each profile at identical seed, prompt,
+references, window and geometry, and **diffs the arms against each other before submitting
+anything**, aborting unless the only difference is the attention node. It refuses to submit
+without `--confirm-gpu`. It preserves every output and samples frames **20, 44, 70, 113, 180,
+225** by frame index (`select=eq(n,N)`, never by timestamp, because a neighbouring frame is
+the size of the difference being looked for), hstacking each index into one labelled sheet
+across arms — the LTX enhancer investigation's own indices and comparison shape, so the two
+are comparable.
+
+The trap is that `ModelAttentionBackend.VALIDATE_INPUTS` returns `True` for any string, and
+`patch` falls back to PyTorch attention with nothing but a log line when the named backend is
+not registered. **A successful-but-inert run is indistinguishable from a real one in the
+output, and reads as "no difference".** So the harness reads live `/object_info` and refuses
+to run `comfy-kitchen` unless the option is published; opens a per-render window on
+`ComfyUI/user/comfyui.log`, saves it beside the output, and classifies each arm as
+`fell-back` (**inconclusive**, never a null result), `confirmed` (a sage arm whose selected
+mode ComfyUI named, matching what was asked), `wrong-mode`, `unconfirmed`, `registered`, or
+`inherited`. `registered` is honestly weaker than `confirmed` — `ModelAttentionBackend` emits
+no positive line — and the report says so; the `pytorch` arm is partly there as the
+discriminator.
+
+**Tests: 219 in `test_workflows.py`, from 173.** Default-profile digests per affected variant;
+every profile's node, values and input order against a table written in the test rather than
+read from the registry; every profile's wiring against a *literal* position table, for a
+reason a sweep found (below); an unknown, blank, non-string or unhashable profile refused with
+a `ValueError` by all three builders — `sageattn3` among the parameters on purpose, since it
+is a real option of the live node and deliberately not a profile; every way an
+`H3AttentionProfile` can be malformed refused at import, including `allow_compile="False"`,
+which is truthy everywhere it is read; the audit's three drift cases and a vanished node; the
+harness's gate, its frame arithmetic, its arm diff, and all six engagement verdicts.
+
+**Mutation-checked: 41 mutations across the three files, final survivors 0, and all four
+sentinels failed as required.** Swept in a dedicated `git worktree` with `PYTHONPATH` at its
+own `src` (confirmed by printing `workflows.__file__` from inside it, because an editable
+`.pth` pointing at the live checkout is how a sweep reports everything as surviving),
+restoring with `read_bytes`/`write_bytes`, converting each anchor to that file's own line
+ending, asserting the match count before mutating, purging `__pycache__` between runs and
+time-boxing every run at 300 s. The sweep script is uniquely named under the scratchpad; a
+generic `mutate.py` there was clobbered earlier in this session, which is the recurring
+hazard the naming avoids.
+
+**Three survivors were found and fixed, and each was a real gap.** (1)
+`test_each_attention_profile_wires_its_node_where_its_evidence_puts_it` read
+`H3_ATTENTION_CHAIN_POSITION` to decide which assertion to make, so moving
+`ModelAttentionBackend` to the wrong side of the sigma shift made the test agree with the
+mutation; the position table is now a literal in the test — the same literals-versus-evidence
+rule the sampling-profile tests already record, in the other direction. (2) The same test also
+survived pinning `position` to a constant, for the same reason. (3) `output_video`'s
+preference for the muxed `-audio` file over `VHS_VideoCombine`'s silent companion was
+untested — preserving the silent one would have left every contact sheet technically produced
+and evidentially worthless, since the question is whether the mouth matches the song.
+
+**A second finding, recorded and deliberately not fixed: the batch and "Render Again" have
+been rendering different bundles, and nobody noticed.** Both `api.generateBatch` call sites
+(`app.js:4157` and `4173`) send **no `profile`**, so `BatchRequest.profile` falls through to
+its `"default"` — 20 steps, `res_multistep`, no LoRA. Single-shot "Render Again"
+(`app.js:2575`) hardcodes `profile: "turbo"` — 4 steps, the `ref2v` turbo LoRA at 0.7,
+`beta`/`euler`. So **every number in the render-cost table is a 20-step measurement**, taken
+on the slowest bundle the application ships, while one-off re-renders have been running the
+fastest one.
+
+That reframes the cost problem: it is bundle selection first, attention second. The Director's
+own reading is that at matched settings we are not slow — their workflow does a 10 s
+reference-to-video at 20 steps in about half an hour, which is what 226 frames in 29 minutes
+is. **Whether the batch should default to turbo is a quality ruling, not a performance fix**,
+and it needs the numbers in front of it, so nothing here changes a default. The harness now
+takes `--sampling`, an arm is a `(bundle, backend)` pair, and every arm records its own step
+count, LoRA, scheduler and sampler beside its cost — a record that reported the default
+bundle's 20 steps while rendering turbo's 4 would attribute a five-fold difference to the
+attention backend, which a mutation caught before it could.
+
+**And a third verdict was added, because the Director heard something.** They described a test
+render's audio as "a bit of a mutation of what I assume was the input audio". H3 *generates*
+its audio conditioned on the reference rather than copying it, so some departure is the model
+working as designed — but whether it departs *more* under fewer steps or a quantised backend
+is a fact this run can produce and nobody had. Each arm's take is decoded to mono 16 kHz
+against the same master-song window and reported as a normalised correlation plus the lag in
+milliseconds at its peak. Two honesty notes are in the code and belong here too: it is a
+*comparative* measure and not a fidelity score, and **the lag aliases on periodic material** —
+a 220 Hz tone delayed 100 ms reports 50 ms, eleven periods out — so it is meaningful on the
+consonant-rich part of a sung phrase and a hint elsewhere. Silence on either side is reported
+as absent, never scored 0.0, which would read as "this arm's audio bears no resemblance to the
+song". Speed, audio and lip-sync stay three verdicts and are never averaged; fewer steps is a
+picture trade as much as a speed one, and which trade is worth making is the Director's call.
+
+**It was run, and three of its own defects had to be found before any number could be trusted.**
+All three were in the harness, none was caught by a passing test, and each was found by reading
+the code the harness was supposed to be reproducing.
+
+1. **Cost included model load.** The 107-frame screen ran with the checkpoint cold for its
+   first arm and resident for the rest, so that arm paid a 62 s load the others did not — and
+   the table reported it as the attention backend being **24% slower**. That figure was
+   reported twice before it was checked. ComfyUI's own per-step rates were 9.08 / 9.18 / 9.22
+   s/it: indistinguishable. Cost is now *sampling* time, parsed from ComfyUI's tqdm summary,
+   so residency cannot move it; the load is reported beside it, not inside it.
+2. **The harness never called `over_render_window`.** A take begins `lead` seconds before
+   `shot.start`, and the route conditions H3 on exactly that window. The harness sent the bare
+   exposed slice and then compared the output against a *third* window, producing a
+   "systematic −513 ms offset" that was nearly written up as a finding about render geometry.
+   **This is the defect `over_render_window` was extracted to prevent** — its own docstring
+   records `restore_song_audio` making it — met again from a new direction. The invariant had
+   a home and the harness did not use it.
+3. **The 107-frame fixture was 42 milliseconds of song.** `duration_for_frames` walked *up*
+   from one frame and took the first match; `over_render_frames` floors every window below
+   ~3.271 s at `H3_MIN_RENDER_FRAMES` = 107, so it answered **0.0417 s**. The whole screen
+   rendered a 42 ms window. It now requires the un-floored `margin_frames` arithmetic and
+   takes the top of the natural band, with a test asserting the floored answer exists and is
+   not the one returned.
+
+**What survives and what is void** is tabulated in the spec's §6.10 and summarised here: the
+backend ranking survives (identical fixture in every arm, so the relative comparison holds),
+as does "no backend beats the shipped default" and the memory wall; **void** are every audio
+number from the 107 screen, the 107-frame contact sheets as lip-sync evidence, and the
+107-frame half of the mtime cost table's corroboration. `9.08 s/it` is a same-fixture
+comparison point and **not** what a 107-frame render costs.
+
+**The harness had to become resumable, and the reason is worth recording.** The first run was
+killed by the environment after two arms — ComfyUI carried on rendering the prompt it had
+already been given, because a dead wrapper does not cancel a queued render, and the GPU
+minutes were being spent with nothing left to collect them. So each arm now writes its record
+the moment it lands, a later invocation reuses every arm already on disk instead of
+re-rendering it, and `--adopt PROMPT_ID` takes over a render a killed run left in flight —
+recovering its log window from ComfyUI's own execution span, since the byte offsets the live
+path uses died with the process. A multi-hour experiment can now be run one arm per
+invocation, which is what makes it survivable at all.
+
+**And one defect that nearly filed the wrong result, found at 00:23 by running into it.** The
+evidence directory is date-stamped and a five-arm experiment takes hours, so the resumed run
+crossed midnight, took `today()`, made a *second* empty directory, found no records in it, and
+began adopting the in-flight `pytorch` render as the first arm of a fresh experiment — which
+would have filed it under the `default` label. That is precisely the mislabelled-arm failure
+the engagement checks exist to prevent, arriving through the one door nobody was watching, and
+no amount of log-scanning would have caught it because the *render* was fine; only its name
+was wrong. It was stopped before a record was written. `resolve_run_dir` now refuses when
+today's directory holds no arms and another one does, naming both and making the operator
+choose — two defensible answers is a refusal, not a coin toss.
+
+**Not done, and named.** Nothing is exposed in the UI or the API, and no manifest field
+exists; if a backend is ever adopted, that is its own change with its own digest. The
+batch/Render-Again profile split is recorded above and **not** reconciled. The Comfy Kitchen
+graph is cited by path rather than copied into
+`workflow_templates/reference_exports/` — adding audited evidence is a separate ceremony. And
+`MVP_SAGE_ATTENTION`'s submission-time choke point rewrites every `PathchSageAttentionKJ` and
+would silently override a sage profile if the two ever met on the route; the harness refuses
+to run while it is set, and reconciling them is a prerequisite for routing the profile.
+
+## 2026-08-21 — The 2.2-hour render was folklore: renders now time themselves, and the constant's evidence is corrected
+
+**The claim, and what it rested on.** `app.POPULATE_MAX_WINDOW_SECONDS = 6.0` was justified, in part, by a comment asserting that the 221-frame windows a 9.5 s mean produced "took 2.2 HOURS each on this card (2026-08-19)". The Director challenged that figure today and **they were right**. It had **no primary record anywhere in this repository**: it appeared only as a code comment in `app.py`, and was quoted onward into `tests/test_api.py`, `tests/test_populate_steps.py` and one line of this log — each citing the comment rather than a measurement. Four sites, one unsourced sentence, and a live constant standing on it.
+
+**The root cause is that this application had never recorded how long a render takes.** `RenderJob.updated_at` was set by `default_factory` at creation and **no settle path ever wrote it again**, so in the Director's live manifest every completed job carried `updated_at == created_at` to the microsecond. There was nothing to check the claim against, which is exactly why it went four files deep unchallenged.
+
+**How it was actually measured.** By hand, from the mtimes of the `.mp4` files in ComfyUI's output tree — gaps between consecutive `*h3-reference*_00001-audio.mp4` over the serial overnight batch of 2026-08-19/20, in `project_59f14d19ff10` (read, never written):
+
+| frames | window | n | median | sec/frame |
+|---|---|---|---|---|
+| 107 | ≤3.3 s | 7 | 4.6 min | 2.58 |
+| 124 | ~4.5 s | 4 | 5.4 min | 2.61 |
+| 141 | ~5.1 s | 14 | 6.3 min | 2.68 |
+| 158 | ~5.8 s | 5 | 7.6 min | 2.89 |
+| 226 | 8.75 s | 1 | 30.2 min | 8.02 |
+| 277 | 10.38 s | 1 | 39.1 min | 8.47 |
+
+**A cliff is real; 2.2 hours is not** — the measured worst case is 39 minutes, so the claim is wrong by roughly **3.4×**. Per-frame cost is flat at 2.6–2.9 s/frame out to 158 frames and then triples to ~8 s/frame at 226+. All four sites now carry this table **with its three caveats attached**: n=1 at both cliff points, the acceleration finding below, and that these came from file mtimes rather than instrumentation. One 141-frame outlier at 26.7 min and one 158 at 9.5 min are named as probable machine contention rather than smoothed into the medians.
+
+**The constant did not move, deliberately.** Its second justification stands on its own — on the first 5.2 s-target run the local model simply echoed the previous plan's 9 s windows out of its own context, so guidance alone failed — and re-deriving the bound needs a measurement nobody can take while the Director has the GPU. The evidence was fixed; the bound was not touched; what would settle it is recorded in the constant's own docstring.
+
+**So renders now time themselves.** Every settle path writes `updated_at` — completion, failure, cancellation, supersession, the `missing_ticks` death, the never-submitted settle, the orphaned-assembly heal at boot, and both ends of an export. Eight paths in two modules, enumerated rather than centralised because each writes a different `error`; what they share is one call to `batch.stamp_job_settled`, so a path that forgets it is findable. Alongside it: `render_seconds`, `render_seconds_source` and `render_frames`.
+
+**The source label is the honest half.** `created_at` is **enqueue**, not start, so `created_at → settle` is queue wait *plus* render — an upper bound, and for a batch most of the number. So where ComfyUI reports its own execution clock that is preferred and labelled `comfy`; the record's span is labelled `record`; and `batch.render_timing_summary` never shows one as though it were the other.
+
+**`/history` does carry a per-prompt execution clock — checked, not assumed, and then confirmed live.** Read from the Director's own install's source: `PromptExecutor.add_message` stamps `"timestamp"` in epoch milliseconds onto every status message, `execute()` clears the list and emits `execution_start` before the first node runs, and `PromptQueue.task_done` copies it into the history entry as `status.messages`. Identical in 0.33.1 and in **0.33.3**, which the Director updated to the same day. Then **confirmed against the live 0.33.3 server** with one authorised 512×512 4-step Flux still — the smallest thing that answers the question. Its history carried `['execution_start', 'execution_cached', 'execution_success']`; `execution_span_ms` read **32.431 s**; `apply_job_history` recorded `render_seconds = 32.431` with source `comfy`; and an independent stopwatch around the submission measured **33.140 s**, so the recorded render sits *inside* the observed window with +0.709 s (+2.2 %) of poll granularity and transport around it. **The instrumentation's number is a real render time and has now been checked against a real render.** There is no duration field, only the two stamps; `extra_data.create_time` is a third stamp (enqueue) and is deliberately not read, because `created_at` already records enqueue from this side. The parse degrades to `(None, None)` on any shape it does not recognise, so a future ComfyUI that rephrases its history costs the label and not the render.
+
+**A settle stamps once, and a progress tick never stamps.** The idempotence is load-bearing twice over: terminal is terminal, so a second stamp could only be a later clock overwriting the real measurement, and a re-read of an already-settled record would otherwise look like a change to the reconciler — which would rewrite the manifest on a tick that learned nothing and collide with whatever the Director is editing. Assembly writes `progress` up to a hundred times per export and none of those move `updated_at`; if they did, `updated_at - created_at` would stop being a duration.
+
+**`render_frames` is persisted because it cannot be re-derived.** `over_render_frames` reads `Shot.duration`, and the Director edits a window *after* the render — an edge drag, a snapped cut — so a count derived later describes a render that never happened. It is written at H3 submission, where all three branches resolve to the same number. **And it is server-owned in the generic full-project `PUT` for the eighth time this exact hole has been found in that route:** all three timing fields are defaulted, so a client written before they existed omits them, they arrive as `0.0`/`""`/`0`, and **one ordinary save would erase every render timing in the project at once** — the exact loss the instrumentation exists to prevent, arriving through the exact route that has caused it seven times before. `_adopt_job_measurements` re-adopts them by job id, `updated_at` included, and `JOB_MEASURED_FIELDS` is enumerated so a ninth field cannot be added without a test failing.
+
+**Surfaced where the Director reads, with the caveat visible rather than hovering.** The queue panel has a **Took** column: `6m18s · 141f` for a render ComfyUI timed, `≤30m12s · 226f` for one measured off the record, the `≤` being the caveat made visible. The cell's title carries the full sentence. That sentence is written once, in `batch.render_timing_summary`, and the browser's mirror is **executed under node** against the same jobs and compared character for character — a wording that drifts on one side fails in the suite rather than in front of the person reading it.
+
+**The acceleration finding, recorded as an unrun experiment.** `workflows.py` emits `PathchSageAttentionKJ` with `sage_attention: "disabled"` and `allow_compile: False` at three sites, and KJNodes' own implementation returns the model untouched for `"disabled"` — so **every H3 render this project has ever timed ran with attention acceleration off**. That is faithful to the Director's 2026-08-17 export, not a bug, but it means the cliff was measured on the unaccelerated path, and attention is exactly the term that explains a cliff. It is also steeper than attention's quadratic term alone predicts: 158→226 frames is 1.43×, whose quadratic is ~2.05×, where 3.0× was observed — which points at spilling rather than pure compute. Meanwhile Comfy Kitchen's MiniMax-H3 graph (2026-08-18) sets `ModelAttentionBackend` to `comfy kitchen attention` while leaving `PathchSageAttentionKJ` bypassed — a different backend **in place of** Sage. **No workflow adapter was changed.** The experiment is specified and unrun in `_bmad-output/planning-artifacts/h3-attention-backend-experiment.md`: which graph changes, n≥5 at 141 and 226 frames, whether lip sync survives, and what each result would justify. An attention backend swap alters every render this project makes and must be measured, not assumed — the LTX enhancer is the precedent, and this project's whole premise is H3's audio-driven sync.
+
+**Found and not fixed.** Two corrections to premises, both recorded in the experiment spec rather than acted on. First, the three `mvp:attention` sites are the **reference**, **keyframe** and **image-edit** builders — `build_h3_director_payload` emits no such node at all, so an attention change would not reach the text-only path without adding one. Second, `ModelAttentionBackend`'s `"comfy kitchen attention"` option is gated on a **runtime** availability check and its `VALIDATE_INPUTS` returns `True` unconditionally, so an unavailable backend silently falls back to PyTorch attention with only a log line — a GPU job logged under a configuration that was never applied, which is the thing this codebase refuses. `/object_info` has to be read for that option before any measurement. Separately, `RenderJob.created_at`, `status`, `error` and `progress` remain writable through the generic `PUT`; that is pre-existing and each has its own argument, so widening `_adopt_job_measurements` beyond the measurements would have been a different change hiding inside a guard.
+
+**Tests: 44 cases** across `test_comfy.py` (ComfyUI's history shape, including every malformed variant answering `None` rather than raising, and `True` in the table because `bool` is an `int`), `test_batch.py` (the stamp's idempotence, the fallback labelling, the formatter refusing to round `6m59s` up to `7m`, and the three reconciler settle paths), `test_api.py` (each settle path through its real route, the frame count at submission, an old manifest round-tripping with the three keys added and nothing else changed, and the `PUT` guard refusing both an omission and a forged duration), `test_assembly_route.py` (both export ends, the progress ticks that must *not* stamp, and the boot heal) and `test_frontend_contract.py` (the two languages' sentences compared character for character). Suite **1640 passing**, ruff clean, both `node --check` gates green.
+
+## 2026-08-21 — A transition is a seam too: snapping moves an overlap as a unit, and only a hole still refuses
+
+**The conflict.** Phase B wired phrase-boundary snapping into populate's line-up step and it worked — on a plan nobody had hand-edited. Measured on the Director's live 34-shot plan: **422, not a contiguous tiling**, because 16 of its 33 seams fall outside assembly's half-frame tolerance, up to a 5.49 s overlap. `snap_cut_plan` had always refused such a plan, so nothing had regressed; the timeline that most needed snapping was simply the one that could not have it. The cause was that the snapper modelled a cut as a boundary two shots **share**, and under the 2026-08-20 layers ruling — reinforced by **R-3**, *a transition is an overlap* — there is no shared boundary to move.
+
+**Which point of an overlap lands in the silence: its midpoint.** Deliberately not the later clip's start, which is where B first appears and is what `assembly_plan` resolves an overlap to today.
+
+* **A dissolve has no event at B's start.** At that instant B is at zero opacity and nothing about the picture changes; it is where the blend begins to be *computed*, not where it is *seen*. Placing that instant in a voiceless gap is a guarantee about arithmetic rather than about the video. The moment a viewer registers the change is where the two images are equally present — the midpoint. Every NLE agrees by default: a transition dropped on a cut is *centred* on it, because the cut point of a dissolve is its centre.
+* **R-3 says the overlap is one artefact owned by both shots** — A's *transition out* sets B's *transition in*, and the pair "cannot disagree". Its two edges are the ends of one object, so electing one of them "the cut" privileges half of something symmetric, and privileges the half that today's layer resolution happens to fall out at — a rendering fallback for a transition feature not yet built, not a statement about what the Director authored.
+* **It degenerates exactly.** A hard cut is a zero-length overlap whose midpoint is the shared boundary, so there is one rule here rather than two, and a plan with no transitions is snapped by arithmetic identical to Phase B's.
+
+**An overlap moves as a unit and is never resized.** `_seam_overlaps` carries each seam's blend length beside the plan's edge list; the seam's move assigns the lower edge and the upper one follows from the carried length, so both edges travel by the same delta. Moving the later clip's start alone would turn a 2 s dissolve into a 1.5 s one as a side effect of moving a cut — editing something the Director authored to fix something else, which this codebase consistently refuses to do. The band check now measures each neighbour's **whole** window, transitions included, because that is the length H3 has to render.
+
+**Contiguity restated, and it now turns on the sign of the disagreement.** The old precondition was `abs(current.start - previous.end) > tolerance` — one test for two opposite defects. It is now: past half a frame, a **positive** disagreement is a hole and raises; a **negative** one is an authored transition and is snapped. That is `assembly.tiling_refusals`' own notion rather than a second one — a gap is a refusal there, an overlap is not — reused as the same number and the same sign rather than as an import, because `assembly` sits beside `timeline` in the graph. A test binds the two: on the Director's real geometry, assembly names the same 22 ms hole in the same seconds that the snapper refuses for. `SNAP_NOT_CONTIGUOUS` became `SNAP_HOLE` and says both halves, so a Director reading it knows their overlaps are not what is being complained about.
+
+**Two guards the change needed and would not have had, found while asserting R-7.** Both are refusals, not repairs.
+
+* **A transition may not hang off either end of the plan** (`SNAP_OFF_THE_PLAN`, a per-cut skip). The band check bounds the two *windows*; a blend longer than the minimum window can still push its far edge past the plan's last frame while both windows stay in band. That frame is the assembled video's last one, so the move would have lengthened the video against the song. This is not hypothetical geometry — the Director's own final seam is a 5.492 s transition whose far edge sits **15 ms** before the plan's last frame, so any rightward move at all would have carried it past. It happens to land clear of every phrase already and so never moves; the guard is not there because that seam moved, it is there because the only thing stopping it was luck.
+* **A window laid *wholly* over another is refused** (`SNAP_NESTED`, a plan refusal beside the hole). Such an overlay has **two** visible cuts, not one — `assembly_plan` splits the clip underneath around it and resumes it afterwards — so "the cut between these two" names no instant. Worse, the seam *after* a swallowed window looks like a hard cut while the clip underneath is still covering the song there, so moving it would have stretched a window by seconds. Ruling it out is also what makes the last window's end the plan's end, which the frame-grid guarantee leans on. The Director's plan has no nesting; the refusal is there because the arithmetic silently misreads it.
+
+**What it does to the Director's real 34 shots, computed read-only** (`data/projects/project_59f14d19ff10`, read and not written; no model call, no ComfyUI submission, no GPU work anywhere in this change):
+
+* **15 of the 16 out-of-tolerance seams are overlaps** — 27 ms, 37 ms, five at 42 ms, 75 ms, 79 ms, 80 ms, 83 ms, 208 ms, 222 ms, 708 ms and one of **5.492 s** on the last cut — and every one of them now snaps instead of refusing the whole plan.
+* **The sixteenth is a real 22 ms hole** at 77.186 s → 77.208 s, and the plan is *still* refused for it, now by a sentence that names that one seam instead of the first disagreement it met. This is the honest answer: `assembly.tiling_refusals` refuses the same plan for the same seconds, so the timeline does not export today either. One 22 ms nudge is the whole fix.
+* **With that hole closed and nothing else touched**, at the 0.75 s default: **9 cuts move, 24 are skipped** (19 with no rest in reach, 3 refused by the band, 2 already landing clear). Two of the moves are at transitions — the 42 ms one at 87.438 s and the 37 ms one at 144.268 s — and both keep their length to the nanosecond. No transition anywhere in the plan is resized. The plan still starts at 0.0 and ends where it ended, `assembly.tiling_refusals` has nothing to say about the result, and **the assembled video is 3711 frames before and after** (R-7 held, read through `assembly_plan`'s own resolution rather than recomputed).
+* The 5.492 s transition itself does not move, and the report finally says why: its centre at **151.879 s already lands clear of every sung phrase** — it sits inside the 20.08 s outro. Before this change that seam was the reason the whole plan was refused.
+* The 3 band refusals are the plan's own doing, not this change's: eight of its windows are under H3's 4 s floor (1.75 s to 3.29 s), and a cut beside one of those cannot move without leaving it shorter still.
+
+**One implementation, two doors, still.** `snap_window_plan` remains the whole decision; `snap_cut_plan` and `app.line_up_shots` remain its two callers. The both-doors tests were re-run on a plan with a transition in it — the moves agree including the blend length, the skips agree by kind, the geometry agrees float for float, and **one** monkeypatched `_gap_snap_target` is still observed through both. The three protections are unchanged and still `window_move_refusal`'s own sentences: a lock at either end of a transition refuses that seam by name on both doors.
+
+**Report-then-confirm is unchanged**, and the report gained one number: `CutMove.overlap`, on the wire as `SnapCutMove.overlap` and drawn by `snapCutsReportLines` as *"· centre of a 5.492s overlap, moved whole"*. Without it the report names an instant at which neither clip has an edge, and a Director looking for it on the timeline would find nothing there. A hard cut carries 0 and reads exactly as it always has. **No new persisted field** — nothing here is written to a manifest, so there is no write path to enumerate and old manifests load unchanged.
+
+**Verification.** 13 new cases (suite **1593 passing**, from 1580), ruff and both `node --check` gates clean. A **27-mutant sweep** over `timeline.py`, `app.py` and `api.js` in a `git worktree` with `PYTHONPATH` at its own `src`, a sentinel per file that had to fail: no survivors. The mutants that matter are the two design alternatives written out as code — `half = 0.0` (snap the later clip's start) and `half = overlap` (snap the earlier clip's end) — and the resize (`boundaries[index + 1] = proposed`, moving one edge and leaving the other). All three are caught.
+
+**The sweep found four gaps in the tests before it was clean, and each is now a case.** A sub-half-frame *negative* disagreement being a hard cut rather than a 1 ms transition (the first seam of the hard-cut pin now carries one, and the move closes it exactly); both halves of the band being measured over whole windows — `test_the_band_measures_whole_windows_with_their_transitions_in_them` is rigged so the band decision *flips* on whether the blend is counted, once for the transition at the seam and once for the transition at the seam beyond; and the line-up route's own wire carrying `overlap`, which only the function had been asserted on.
+
+**Found and not fixed.** On a plan whose edges sit on the 24 fps frame grid — the Director's do, at multiples of 1/24 — `proposed = round(target, 3)` reports a "move" of up to half a millisecond at a cut that was already clear, because the millisecond rounding disagrees with the frame grid. Two of the nine moves above are that and nothing else (`6.208333…` → `6.208`, a shift of 0.008 frames). It is Phase B behaviour, harmless to the picture, and noise in the report; the fix is a question about which grid the snapper quantises to, which is a decision rather than a repair. Also unchanged: `shot_label` numbers shots by manifest position rather than song order, so a report over a re-ordered plan reads "SHOT 30 → SHOT 01" for the first cut in the song.
+
 ## 2026-08-21 — Line-up consumes the alignment: cuts land on phrase boundaries, and every window is told which lines it covers (Phase B)
 
 **Phase B of `_bmad-output/planning-artifacts/three-step-populate-2026-08-21.md`.** The plan called line-up *"the step with the most machinery already built and the least of it wired in"*, and that was exact: `snap_cut_plan`, `vocal_gaps`, `align_lyric_blocks` and `lyric_line_tags` all existed and populate called none of them. It produced its layout blind to phrase boundaries and left the fix to a manual snap afterwards. It no longer does. **This changes what a populate produces** — windows move — so there is deliberately no byte pin on a default populate any more; the pin moved to the control arm (below).
@@ -30,7 +345,7 @@
 
 **Two entry points, and the confirmation split.** With a lay-out report as `plan`, line-up is a pure function of that report; its confirm moves the windows the lay-out step's own confirm created and refuses when the timeline is not that layout (`LINE_UP_WINDOWS_CHANGED`). Without a plan it lines up the timeline the project already has — report-then-confirm in `snap-cuts`' exact shape, naming every cut it would move and every one it would skip, with the locked / approved / in-flight protections honoured **in the existing wordings** because they arrive from `window_move_refusal`. **The chain asks for no second confirmation**: `confirm_replace` is consent to replace this timeline's windows, the windows being moved were created by the call it consented to, and there is no shot on the timeline for a protection to be about — `lay_out_protections` has already refused if there were. Only `start` and `duration` are ever written; the line facts are derived and are **not persisted**, so a sheet the Director retags is answered by the next line-up rather than by a stale copy in the manifest. No new persisted field, so no write path to enumerate.
 
-**The band is the layout's own.** Line-up defaults to `POPULATE_MAX_WINDOW_SECONDS` (6 s) rather than `H3_MAX_SHOT_SECONDS`: lay-out capped its windows there on a measured render-cost decision — 5.2 s windows render in minutes where 9.5 s ones took hours — and a step whose job is to nudge a cut by less than a second must not undo it. The project-sourced door passes the wider 4–15 s band, for the reason `snap_window_plan` already argued: a stored window is not held to a rule it was never laid out under.
+**The band is the layout's own.** Line-up defaults to `POPULATE_MAX_WINDOW_SECONDS` (6 s) rather than `H3_MAX_SHOT_SECONDS`: lay-out capped its windows there on a measured render-cost decision — a 5.2 s window is 141 frames at a median 6.3 min, a 9.5 s one is 226+ frames at 30–39 min, and per-frame cost triples across that step (the figure this line originally carried, "took hours", came from a 2.2-hour claim that had no primary record and was wrong by ~3.4x; corrected 2026-08-21, table and caveats on `POPULATE_MAX_WINDOW_SECONDS`) — and a step whose job is to nudge a cut by less than a second must not undo it. The project-sourced door passes the wider 4–15 s band, for the reason `snap_window_plan` already argued: a stored window is not held to a rule it was never laid out under.
 
 **Contiguity is structural and is asserted anyway.** The core carries the plan as a boundary list, assigns only interior boundaries and copies the outer two through untouched, so a gap, an overlap or accumulated rounding cannot arise arithmetically. Pinned on a 60-window, five-minute plan where per-cut drift would show: first start exactly 0, last end exactly the song length, worst seam **0.0 s** against assembly's half-frame tolerance.
 
@@ -44,7 +359,7 @@
 
 **Verification.** 22 new cases (44 in `tests/test_populate_steps.py`, suite **1580 passing**), ruff and both `node --check` gates clean. A **42-mutant sweep** over `app.py` and `timeline.py` in a `git worktree`, with a sentinel in each file that had to fail: **42 killed, no survivors.** Nothing calls a model, starts ComfyUI or submits a render; `comfy.prompts` is asserted empty on every path.
 
-**Still open, found here and not fixed.** Snapping requires a contiguous tiling, and the Director's real timelines are no longer contiguous by design. The snapper models a cut as a boundary two shots *share*; under the layers ruling the effective cut is where the later clip starts, which `assembly_plan` already computes. Teaching the snapper to read assembly's own resolved cut list would make both doors work on an overlapping plan, and it is a design decision rather than a bug fix — deliberately not smuggled into this phase.
+**Still open, found here and not fixed.** Snapping requires a contiguous tiling, and the Director's real timelines are no longer contiguous by design. The snapper models a cut as a boundary two shots *share*; under the layers ruling the effective cut is where the later clip starts, which `assembly_plan` already computes. Teaching the snapper to read assembly's own resolved cut list would make both doors work on an overlapping plan, and it is a design decision rather than a bug fix — deliberately not smuggled into this phase. *(Settled the same day — see "A transition is a seam too" above. The cut of an overlap is its **midpoint**, not the later clip's start, and it moves as a unit.)*
 
 ## 2026-08-21 — Populate becomes three steps: lay it out, line it up, fill it in (Phase A — separable, named, and byte-identical)
 
