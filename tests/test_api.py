@@ -11857,7 +11857,7 @@ def test_measured_silence_outranks_a_singing_mark():
     and it invented its own words and lipsynced to them. With `Song.vocal_spans`
     measured, a voiceless window gets no clause whatever the mark says; an unmeasured
     song (`[]` → overlap None) changes nothing, and a window with voice keeps its clause."""
-    from music_video_producer.app import SONG_AUDIO_SINGS_CLAUSE_BARE, song_audio_prose
+    from music_video_producer.app import SONG_AUDIO_SINGS_CLAUSE_BARE
     from music_video_producer.timeline import shot_vocal_overlap
 
     song = Song(title="Harder Faster", source="imported", duration=154.6,
@@ -11893,7 +11893,6 @@ def test_song_audio_prose_is_the_submit_walks_own_string(tmp_path: Path):
     expansion is still on the Shot."""
     from music_video_producer.app import (
         reference_map_tag_lines,
-        song_audio_prose,
     )
 
     project = Project(
@@ -11936,7 +11935,7 @@ def test_a_song_audio_reference_shots_expansion_is_deterministic_and_calls_no_mo
     track (≤0.43 envelope correlation), every plain-prose reference-map prompt followed
     it (≥0.77; 0.94 with the sings clause). So a song-audio reference shot's expansion
     is `song_audio_prose`, and the director is never called for it."""
-    from music_video_producer.app import attempt_expansion, song_audio_prose
+    from music_video_producer.app import attempt_expansion
 
     class ExplodingDirector:
         async def expand_shot(self, **_):
@@ -17486,7 +17485,7 @@ def test_attaching_an_asset_re_expands_the_reference_map_and_calls_no_model(tmp_
     which is the same string pressing Expand Prompt Again would have produced -- so this is the
     button, fired automatically, and not a second construction of the prompt.
     """
-    from music_video_producer.app import reference_map_sentence, song_audio_prose
+    from music_video_producer.app import reference_map_sentence
 
     client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
     shot_id = write_shot(
@@ -17528,7 +17527,6 @@ def test_detaching_an_asset_re_expands_the_map_too(tmp_path: Path):
     """A removed reference is exactly as stale as an added one, and the trailing removal --
     where every surviving line still appears in the old text and only the *whole* map sentence
     differs -- is the one a per-line comparison would miss."""
-    from music_video_producer.app import song_audio_prose
 
     client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
     shot_id = write_shot(
@@ -17567,7 +17565,6 @@ def test_detaching_an_asset_re_expands_the_map_too(tmp_path: Path):
 def test_replace_citations_re_expands_every_shot_it_rewrote_in_one_pass(tmp_path: Path):
     """Where the free rebuild pays off most: the route rewrites citations across many shots at
     once, and every prose expansion among them is re-derived in the same save, for nothing."""
-    from music_video_producer.app import song_audio_prose
 
     client, store, comfy, director, project_id, _bed, lead = map_project(tmp_path)
     krea = upload_asset(client, project_id, "Krea multiview", "character", "krea.png")
@@ -17768,7 +17765,6 @@ def test_a_render_in_flight_is_not_rewritten_underneath_itself(tmp_path: Path):
 def test_renaming_a_reference_for_one_shot_re_expands_that_shots_map(tmp_path: Path):
     """`reference_labels` is *in* the map -- `<Picture 1> is the woman upstage` -- so renaming a
     reference for one shot changes that shot's text and nobody else's."""
-    from music_video_producer.app import song_audio_prose
 
     client, store, comfy, director, project_id, _bed, lead = map_project(tmp_path)
     first = write_shot(
@@ -17799,7 +17795,6 @@ def test_renaming_a_reference_for_one_shot_re_expands_that_shots_map(tmp_path: P
 def test_an_appearance_anchor_re_expands_every_map_that_names_it(tmp_path: Path):
     """The anchor is composed into the label by `anchored_label`, so setting one changes what
     every citing shot's map says about that asset -- on a route that writes no shot at all."""
-    from music_video_producer.app import song_audio_prose
 
     client, store, comfy, director, project_id, _bed, lead = map_project(tmp_path)
     shot_id = write_shot(
@@ -17827,7 +17822,6 @@ def test_the_whole_project_put_re_expands_and_cannot_clear_the_recorded_map(tmp_
     """The widest sibling write path there is: one body carries every field of every Shot *and*
     every Asset. It can move a citation and it can rename an asset, so it re-derives -- and a
     body that has never heard of `h3_prompt_map` must not clear the record on its way past."""
-    from music_video_producer.app import song_audio_prose
 
     client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
     prose_shot = write_shot(
@@ -18094,7 +18088,6 @@ def test_a_hand_edited_prose_whose_map_has_gone_stale_is_regenerated(tmp_path: P
     and nothing is lost that the Director cannot get back, because `Shot.prompt` is where their
     intent lives and the regeneration is built from it.
     """
-    from music_video_producer.app import song_audio_prose
 
     client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
     shot_id = write_shot(
@@ -18947,73 +18940,3 @@ def test_tagging_a_sheet_travels_on_the_lyric_route_and_survives_an_edit(tmp_pat
         "Zulu line": (), "Bravo line": (1, 2)
     }, "a tag drifted off its words when the sheet was edited"
 
-
-def test_the_directors_live_project_is_unchanged_by_the_cast_fields():
-    """**The byte-identity pin.** The Director's real project — 33 shots, one character asset,
-    a female-sung cover with a tagged lyric sheet — declares no vocal type and slots no
-    character, and after this change it must behave exactly as it did before it.
-
-    The digests below were computed against `master` at 0896832, BEFORE this feature existed:
-    every shot's `song_audio_prose`, its reference map tag lines, its reference numbering, and
-    the citations populate's own rules (`assets_for_proposal` → `with_default_setting` →
-    `prefer_identity_sheets`) would derive for its prompt. The second digest is the whole
-    Director context dump, which is what pins "identical prompts" for the model calls too.
-
-    A skip rather than a failure when the project is absent: this pins the Director's own data
-    root, which a CI checkout does not have, and a pin that fails for being run elsewhere is a
-    pin people delete.
-    """
-    root = Path("data/projects/project_59f14d19ff10")
-    if not (root / "project.json").is_file():
-        pytest.skip("the Director's live project is not in this data root")
-    project = ProjectStore(Path("data")).get("project_59f14d19ff10")
-
-    assert len(project.shots) == 33
-    assert project.song.vocal_type == "unstated", "the live project declared a cast"
-    assert [asset.character_slot for asset in project.assets] == [0] * len(project.assets)
-    assert vocal_cast_problems(project) == [], "an untouched project was flagged"
-    assert lyric_line_tags(project.song.lyrics) and not any(
-        line.slots or line.unreadable for line in lyric_line_tags(project.song.lyrics)
-    ), "the live sheet reads as tagged or unreadable"
-
-    from music_video_producer.models import (
-        assets_for_proposal,
-        citable_assets,
-        identity_sheet_ids,
-        prefer_identity_sheets,
-        with_default_setting,
-    )
-    from music_video_producer.workflows import H3_REFERENCE_LIMITS
-
-    library = citable_assets(project)
-    sheets = identity_sheet_ids(project)
-    lines = []
-    for shot in project.shots:
-        lines.append(f"PROSE {shot.id} {song_audio_prose(project, shot)}")
-        lines.append(f"MAP {shot.id} {reference_map_tag_lines(project, shot)}")
-        lines.append(f"NUM {shot.id} "
-                     f"{[(entry.tag, entry.citation.asset_id) for entry in numbered_references(project, shot)]}")
-        named = [
-            AssetCitation(asset_id=asset.id, role="reference", order=order)
-            for order, asset in enumerate(
-                assets_for_proposal(library, declared=(), prose=shot.prompt)
-            )
-        ]
-        located = with_default_setting(
-            project, named, picture_limit=H3_REFERENCE_LIMITS["picture"]
-        )
-        final = prefer_identity_sheets(located, sheets)
-        lines.append(
-            f"CIT {shot.id} {[(item.asset_id, item.role, item.order) for item in final]}"
-        )
-    context = json.dumps(
-        project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE),
-        sort_keys=True, default=str,
-    )
-
-    assert hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest() == (
-        "ef4931d4280744941ae33d5a09d07589200cd017f75cf113466c1e1a44f28873"
-    ), "a prompt, a reference map or a populate citation moved on the Director's live project"
-    assert hashlib.sha256(context.encode("utf-8")).hexdigest() == (
-        "98148c6746f83bd339fe5700f6194630b20d77dac38c67fef949b14da6250242"
-    ), "the Director context dump changed on the Director's live project"

@@ -2613,6 +2613,623 @@ POPULATE_RETRY_TEMPERATURE = 0.2
 
 
 # ------------------------------------------------------------------------------------------
+# The three steps of a populate — lay it out, line it up, fill it in.
+#
+# The Director's model (2026-08-21): *"Populating the timeline is definitely a multi-step
+# process.. Laying it out, lining it up, filling it in."* The three functions below are those
+# steps, and they are the **only** implementation of them: `populate_timeline` chains them,
+# and `lay_out_timeline` / `line_up_timeline` / `fill_in_timeline` each expose one of them on
+# its own route. Nothing re-implements a step for the chain's benefit — this codebase has been
+# bitten twice by one rule with two implementations (the reference-map numbering, the
+# readiness/submit staleness test), and a chain that drifted from its own steps would make the
+# steps decorative.
+#
+# They are module-level and not closures on purpose: that is what lets a test monkeypatch one
+# step and observe the chain calling it, which is the only way "the chain is a caller" is a
+# fact rather than a claim.
+#
+# **Each step takes the previous step's output as data.** No step reads a field the previous
+# one did not put on its intermediate, and no step reaches back into the request or the store.
+# The intermediates are `ShotLayout` and `ShotAlignment` below; the third step's output is an
+# ordinary `list[Shot]`.
+#
+# **The model call lives in lay-out, and there is exactly one of it.** The single call answers
+# both "how many shots and how long" (lay-out's question) and "what is in them" (fill-in's), and
+# splitting it into two asks is deliberately *not* this change: the combined ask was measured on
+# 2026-08-20 to deliver both halves on 0 of 9 rolls, and unpicking that is its own phase with
+# its own live measurement. So lay-out owns the call because lay-out owns the count it is held
+# to and the retry that enforces it, and fill-in receives the content half as data —
+# `ShotLayout.proposals`, an opaque payload lay-out itself never reads for anything but the
+# count. That is the whole of "how the other step receives what it needs, without a second
+# call".
+
+
+@dataclass(frozen=True)
+class ShotProposal:
+    """One shot as the model proposed it, frozen into a record the next steps can read.
+
+    The director reply is duck-typed at every call site — a double that predates
+    `performance` or `assets` must keep working — so the `getattr` defaults live in
+    `lay_out_shots` where the reply is read, once, and everything downstream sees these five
+    fields and nothing else. `prompt` is the raw string, unstripped: fill-in strips it for
+    `Shot.prompt` and scans it unstripped for asset names, exactly as populate always has.
+    """
+
+    start: float
+    duration: float
+    prompt: str
+    performance: bool = False
+    assets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ShotLayout:
+    """Step one's output: the *structure*, plus the model's content payload carried forward.
+
+    `project` is the re-read project — lay-out re-reads across its own model call, because a
+    local model can hold that call open for minutes — and it is the object the later steps
+    read the library, the identity sheets and the song from, and the one a caller saves.
+    `sections` is the section layer as laid out (already assigned onto `project`), and
+    `windows` is the contiguous tiling. `proposals` is the content half of the single model
+    call, untouched by this step beyond the count check and the sort.
+    """
+
+    project: Project
+    duration: float
+    required: int
+    proposals: tuple[ShotProposal, ...]
+    windows: tuple[tuple[float, float], ...]
+    sections: tuple[SongSection, ...]
+    #: Where the section layer came from: `"director"` (boxes already marked), `"structure"`
+    #: (the two-stage structure pass), `"shots"` (volunteered by the shots call) or `""`.
+    sections_origin: str
+    #: The model's narration. Carried for the report only; nothing decides on it — the
+    #: recorded failure mode here is a model that narrates fields it did not emit.
+    message: str
+
+
+@dataclass(frozen=True)
+class ShotPlacement:
+    """One window with the musical facts measured against it.
+
+    `vocal_seconds` is `timeline.shot_vocal_overlap`: seconds of measured voice inside the
+    window, and **`None` means unmeasured, not silent** — the codebase's absent-analysis
+    convention. `voiceless` is the one-directional guard fill-in consumes: a window the track
+    is measured to leave voiceless cannot be marked singing, whatever the model declared.
+    """
+
+    index: int
+    start: float
+    duration: float
+    #: The label of the section containing this window, `""` when it sits outside them all.
+    section: str
+    vocal_seconds: float | None
+    voiceless: bool
+
+
+@dataclass(frozen=True)
+class ShotAlignment:
+    """Step two's output: the layout, unmoved, with per-window musical facts attached.
+
+    `moved` is 0 and says so on the wire. **Line-up moves nothing in this phase**, and that
+    is a statement about what is built rather than a claim about music: the alignment
+    machinery exists and is strong (`snap_cut_plan`, `vocal_gaps`, `align_lyric_blocks`) and
+    populate has never consumed any of it — snapping is a separate gesture the Director takes
+    afterwards. Wiring phrase boundaries into the layout is the next phase and it changes what
+    a populate produces, which this one may not. What line-up does today is real but small:
+    it measures each window against the track and hands fill-in the fact that decides
+    `singing`. Naming it as a step is the point; inventing work for it would not be.
+    """
+
+    layout: ShotLayout
+    placements: tuple[ShotPlacement, ...]
+    #: Whether the song carries measured voice activity at all. False means every
+    #: `vocal_seconds` is `None`, and fill-in's voiceless guard is a no-op.
+    measured: bool
+    moved: int = 0
+
+
+def lay_out_protections(project: Project) -> None:
+    """The refusals lay-out owns, in the order populate has always asked them.
+
+    Asked once, by the step that would violate them. Lay-out is the destructive step — it
+    replaces the windows — so the song check, the in-flight check and the locked/approved
+    check are its, and fill-in deliberately does not inherit them: fill-in touches no window,
+    which is what will later make re-running content against approved timing safe.
+
+    Shared by the `lay-out` route and by the chain rather than written twice. The *consent*
+    (`confirm_replace`) is not here, because the two callers legitimately answer it
+    differently — see `lay_out_timeline` and `populate_timeline`.
+    """
+    if not project.song or project.song.duration <= 0:
+        raise HTTPException(status_code=422, detail=POPULATE_NO_SONG_REFUSAL)
+    if reconcilable_jobs(project):
+        raise HTTPException(
+            status_code=409,
+            detail="Renders are in flight; populate would replace the shots they "
+            "are rendering for. Let the queue settle first.",
+        )
+    protected = [
+        shot_label(project, shot)
+        for shot in project.shots
+        if shot.locked or shot.approved_output or shot.status == "approved"
+    ]
+    if protected:
+        raise HTTPException(
+            status_code=422,
+            detail=POPULATE_PROTECTED_REFUSAL.format(shots=", ".join(protected)),
+        )
+
+
+async def lay_out_shots(
+    project: Project,
+    *,
+    director: Any,
+    two_stage: bool,
+    reread: Callable[[], Project],
+) -> ShotLayout:
+    """Step one — lay it out. The model call, the count enforcement, and the tiling.
+
+    Every decision in here is the one `populate_timeline` made before this split, moved
+    without a change: the roster the model is offered (`citable_assets`, not the whole
+    library), the context dump filtered to the same rows, the optional structure-first pass,
+    the instruction assembled in the same order with the same fragments, the single guided
+    retry that only a short count buys, the two refusals for an empty or short plan, the
+    re-read across the await with its staleness 409, the section layer's three sources, and
+    the per-section tiling that keeps a shot from straddling a boundary.
+
+    `reread` is how this step re-reads the project after its own await — the store lives on
+    the app's closure and this function does not — and the fresh project it returns rides out
+    on `ShotLayout.project`, because that is the one being written to.
+
+    Nothing here writes. `project.sections` is assigned on the re-read object and the caller
+    decides whether that object is saved, which is what makes the report path of the `lay-out`
+    route free of a store call rather than merely careful about one.
+    """
+    duration = project.song.duration if project.song else 0.0
+    # The roster the model is offered, and it is `citable_assets` rather than the whole
+    # library on purpose. A promoted identity sheet is no longer separately citable — a
+    # citation of its source resolves to it below — so offering its display name buys
+    # nothing and costs the naming leak the Director reported: `"Close up on eyes of
+    # HarderFaster · multiview with flickering light reflections"`, an internal asset label
+    # sitting in a shot's creative prose, written there because citation correctness used
+    # to depend on the model typing that label. A name never shown cannot be echoed.
+    citable = citable_assets(project)
+    assets = "; ".join(f"{asset.name} ({asset.kind})" for asset in citable) or "none yet"
+    # The count comes from `POPULATE_TARGET_WINDOW_SECONDS`, the target window populate
+    # steers the model toward and thereby the plan's typical shot length. NOT the
+    # midpoint of H3's 4–15 s training range: the creator's own preset table calls
+    # 5.17 s (124 frames) "fastest / safest", and the first live batch measured why —
+    # 124-frame renders take ~2–6 min while the 221-frame windows a 9.5 s mean produced
+    # took 2.2 HOURS each on this card (2026-08-19). ~5 s cuts also edit better for
+    # music video than 9 s holds.
+    required = populate_required_shots(duration)
+    context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+    # The roster's rule applied to the context dump, which is the other place the model can
+    # read an asset's name from — and the place it would still have read `· multiview` from
+    # if only the instruction had been trimmed. Done here, on populate's own copy, rather
+    # than in `DIRECTOR_CONTEXT_EXCLUDE`: that mapping withholds *fields* from every caller,
+    # and this withholds *rows* from this one. The chat route's dump is untouched.
+    citable_ids = {asset.id for asset in citable}
+    context["assets"] = [
+        asset for asset in context["assets"] if asset["id"] in citable_ids
+    ]
+    # Stage one of the two-stage populate, opt-in and skipped entirely when the
+    # Director has already marked the boxes: structure first, on its own, from the
+    # lyric sheet. It gets exactly one call and no retry — its whole premise is that a
+    # small ask succeeds where the combined one did not, so spending a second 300 s
+    # call to re-ask a small question would be arguing with the premise. If it comes
+    # back empty, `wants_sections` stays true below and the shots call asks for the
+    # structure the way it always has; nothing is lost but the one call.
+    staged_sections: list[SongSection] = []
+    if two_stage and not project.sections:
+        try:
+            structure = await director.plan(
+                message=POPULATE_SECTIONS_INSTRUCTION.format(duration=duration),
+                project_context=context,
+                # This stage's *whole* output is `sections`, so that is what its
+                # schema requires — and `shots` is pointedly left optional, because
+                # HARD CONSTRAINT 3 asks this call to leave it empty and a schema
+                # that demanded it would be arguing with the instruction beside it.
+                # See `director_result_schema` for why the required set is the fix.
+                response_schema=director_result_schema(require=("sections",)),
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        staged_sections = [
+            SongSection(label=label, start=start, duration=length, prompt=prompt)
+            for label, start, length, prompt in repair_sections(
+                [
+                    (item.label, item.start, item.duration, item.prompt)
+                    for item in structure.sections
+                ],
+                duration,
+            )
+        ]
+    # Structure is only *asked for and demanded back* in the shots call when it is
+    # still unknown. Boxes the Director marked, or boxes stage one just produced, make
+    # the ask a second job bolted onto the one that matters — and an empty `sections`
+    # in the reply is then not an omission, so naming it in a retry would be noise.
+    known_sections = staged_sections or project.sections
+    wants_sections = not known_sections
+    instruction = POPULATE_INSTRUCTION.format(
+        duration=duration,
+        count=required,
+        assets=assets,
+        sections_ask=POPULATE_SECTIONS_ASK if wants_sections else "",
+        sections_constraint=POPULATE_SECTIONS_CONSTRAINT if wants_sections else "",
+    )
+    # The declared location, named before the section map so the two read as project fact
+    # then song structure. Only when there is one: nothing is invented, and a project with
+    # no declaration sends the instruction it has always sent, character for character.
+    declared_location = default_setting_asset(project)
+    if declared_location is not None:
+        instruction += POPULATE_LOCATION_LINE.format(name=declared_location.name)
+    if known_sections:
+        section_map = "; ".join(
+            f"{section.label} {section.start:.1f}-{section.end:.1f}s"
+            + (f" ({section.prompt})" if section.prompt else "")
+            for section in known_sections
+        )
+        origin = (
+            "marked by the director"
+            if project.sections
+            else "just laid out in the structure pass"
+        )
+        instruction += (
+            # Newline, not a leading space, and it is load-bearing: this branch runs
+            # only when `known_sections` is truthy, which is exactly when
+            # `sections_constraint` is empty — so a space glued the section map onto
+            # the end of "3. Every shot needs a non-empty `prompt`." and it read as a
+            # continuation of that constraint. Both neighbouring fragments
+            # (POPULATE_SECTIONS_CONSTRAINT, POPULATE_FINAL_CHECK) open with "\n";
+            # this one was the outlier. Found by the 2026-08-20 live run.
+            f"\nThe song's sections, {origin}, are: "
+            f"{section_map}. Shots must respect these boundaries — every shot sits "
+            "inside one section and takes that section's character."
+        )
+    # Last, after the section map, so the count is the final thing the model reads.
+    instruction += POPULATE_FINAL_CHECK.format(count=required)
+    # The pattern's third and fourth parts: verify in code, then one guided retry with
+    # the fault named. Only the *count* buys the retry. A dropped `sections` rides
+    # along in the corrective feedback when a retry is being spent anyway, but does
+    # not trigger one on its own: sections are scaffolding the Director drags, this
+    # model family drops them on most rolls (the roadmap's run-2 measurement), and a
+    # check that fires on most rolls is a check that doubles every populate's cost.
+    attempt_message = instruction
+    result = None
+    proposals: list[Any] = []
+    for attempt in range(1, POPULATE_ATTEMPTS + 1):
+        try:
+            result = await director.plan(
+                message=attempt_message,
+                project_context=context,
+                temperature=(
+                    PLAN_TEMPERATURE if attempt == 1 else POPULATE_RETRY_TEMPERATURE
+                ),
+                # The shots call cannot proceed without `shots`, so the grammar it is
+                # decoded under must say so. Everything above this line — the count
+                # stated three times, the final check, the guided retry — asks in
+                # *words* for a field the schema did not require, and the constrained
+                # decoder was free to close the object without it. That is the whole
+                # of the measured `shots: []` failure.
+                #
+                # The required set follows the instruction rather than being fixed:
+                # `sections` is demanded back only when `wants_sections` put the ask
+                # and HARD CONSTRAINT 4 in the text above, so the grammar and the
+                # words always agree about what this call owes. When the boxes are
+                # already known the ask is dropped, and requiring a field nobody asked
+                # for would make the model fabricate structure to close the object.
+                #
+                # Requiring both was measured, not assumed (2026-08-20, N=3 per arm):
+                # the combined ask delivered shots *and* sections on 0 of 9 rolls
+                # across runs 1–2 and on 3 of 3 with both fields required, at no cost
+                # in shots or wall clock.
+                response_schema=director_result_schema(
+                    require=("shots", "sections") if wants_sections else ("shots",)
+                ),
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        proposals = sorted(
+            (shot for shot in result.shots if shot.prompt.strip()),
+            key=lambda shot: shot.start,
+        )
+        if len(proposals) >= required or attempt == POPULATE_ATTEMPTS:
+            break
+        # Read off the reply, never off `result.message`: the recorded failure mode is
+        # a model that narrates fields it did not emit.
+        problems = [
+            POPULATE_SHORT_COUNT_PROBLEM.format(
+                returned=len(proposals), required=required
+            )
+        ]
+        if wants_sections and not result.sections:
+            problems.append(POPULATE_MISSING_SECTIONS_PROBLEM)
+        attempt_message = (
+            POPULATE_RETRY_PREFIX.format(problems="\n".join(problems)) + instruction
+        )
+    if not proposals:
+        raise HTTPException(
+            status_code=502,
+            detail=POPULATE_NO_PLAN_REFUSAL.format(
+                message=((result.message if result else "") or "").strip()[:300]
+                or "(empty)"
+            ),
+        )
+    if len(proposals) < required:
+        # Loudly, and with nothing written: the destructive replace below has not
+        # happened yet, and a half-length plan laid over the Director's timeline would
+        # be worse than no plan at all.
+        raise HTTPException(
+            status_code=502,
+            detail=POPULATE_SHORT_PLAN_REFUSAL.format(
+                required=required, duration=duration, returned=len(proposals)
+            ),
+        )
+    # Re-read after the await — the model can hold this open for minutes — and
+    # re-check what matters before the destructive write: a protection set or a
+    # render submitted while the model thought must still refuse.
+    project = reread()
+    if reconcilable_jobs(project) or any(
+        shot.locked or shot.approved_output or shot.status == "approved"
+        for shot in project.shots
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The project changed while the model was planning (a render or a "
+            "protection appeared). Nothing was replaced; try again.",
+        )
+    # Sections come from the Director's own boxes when marked, else from stage one's
+    # structure pass, else from whatever structure the shots call happened to volunteer
+    # (repaired: sorted, clamped, overlaps truncated) — Populate fills the section
+    # layer too, per the Director's design, and the boxes land on the track for
+    # dragging afterward. Stage one's list is carried across the re-read rather than
+    # re-derived: the fresh project is the one being written, and it has never seen it.
+    sections_origin = "director" if project.sections else ""
+    if not project.sections and staged_sections:
+        project.sections = staged_sections
+        sections_origin = "structure"
+    elif not project.sections and result.sections:
+        project.sections = [
+            SongSection(label=label, start=start, duration=length, prompt=prompt)
+            for label, start, length, prompt in repair_sections(
+                [
+                    (item.label, item.start, item.duration, item.prompt)
+                    for item in result.sections
+                ],
+                duration,
+            )
+        ]
+        sections_origin = "shots"
+    # With sections marked, each section tiles independently so no shot straddles a
+    # boundary — cuts land exactly on the music's own switches, the Director's ask.
+    # Unmarked stretches (before, between, after sections) tile as their own spans so
+    # the plan still covers the whole song and assembly's gap refusal stays silent.
+    # Without sections, the whole song tiles as one span, exactly as before.
+    if project.sections:
+        spans: list[tuple[float, float]] = []
+        cursor = 0.0
+        for section in project.sections:
+            if section.start - cursor > 0.5:
+                spans.append((cursor, section.start - cursor))
+            spans.append((section.start, section.duration))
+            cursor = section.end
+        if duration - cursor > 0.5:
+            spans.append((cursor, duration - cursor))
+        windows = []
+        for span_start, span_length in spans:
+            inside = [
+                (shot.start, shot.duration)
+                for shot in proposals
+                if span_start <= shot.start < span_start + span_length
+            ]
+            for start, length in populate_windows(
+                inside, span_length, maximum=POPULATE_MAX_WINDOW_SECONDS
+            ):
+                windows.append((round(span_start + start, 3), length))
+    else:
+        windows = populate_windows(
+            [(shot.start, shot.duration) for shot in proposals],
+            duration,
+            maximum=POPULATE_MAX_WINDOW_SECONDS,
+        )
+    return ShotLayout(
+        project=project,
+        duration=duration,
+        required=required,
+        # The one place the reply's duck-typed fields are read. `getattr` for the reason
+        # the citation and performance lines below it used it: `plan` is duck-typed at
+        # every call site and a double that predates `assets` or `performance` must keep
+        # working. Absent `assets` is `()`, which is the byte-identical old behaviour —
+        # the prose scan alone.
+        proposals=tuple(
+            ShotProposal(
+                start=proposal.start,
+                duration=proposal.duration,
+                prompt=proposal.prompt,
+                performance=bool(getattr(proposal, "performance", False)),
+                assets=tuple(getattr(proposal, "assets", None) or ()),
+            )
+            for proposal in proposals
+        ),
+        windows=tuple(windows),
+        sections=tuple(project.sections),
+        sections_origin=sections_origin,
+        message=(result.message if result else "") or "",
+    )
+
+
+def line_up_shots(layout: ShotLayout) -> ShotAlignment:
+    """Step two — line it up. Measure each window against the track; move nothing.
+
+    Pure, model-free and, in this phase, close to a pass-through: see `ShotAlignment` for
+    why that is the honest shape rather than a gap. What it produces is the per-window
+    musical fact fill-in consumes — `shot_vocal_overlap`, which populate used to compute
+    inline in the middle of building a `Shot` — plus the section each window falls in, which
+    lay-out knows and nothing downstream had a name for.
+
+    **No window moves here.** `moved` is 0, `windows` come out as they went in, and the
+    snapping machinery is deliberately not called: wiring phrase boundaries into the layout
+    changes what a populate produces and this phase may not.
+    """
+    song = layout.project.song
+    sections = layout.sections
+    placements: list[ShotPlacement] = []
+    for index, (start, length) in enumerate(layout.windows):
+        # One measurement per window, the same call populate made inline. `None` is
+        # unmeasured — the absent-analysis convention — and `voiceless` stays False for it,
+        # so an untranscribed song changes nothing about what fill-in writes.
+        vocal = shot_vocal_overlap(song, start=start, duration=length)
+        middle = start + length / 2
+        placements.append(
+            ShotPlacement(
+                index=index,
+                start=start,
+                duration=length,
+                section=next(
+                    (
+                        section.label
+                        for section in sections
+                        if section.start <= middle < section.end
+                    ),
+                    "",
+                ),
+                vocal_seconds=vocal,
+                voiceless=vocal is not None and vocal < MIN_SINGING_VOCAL_SECONDS,
+            )
+        )
+    return ShotAlignment(
+        layout=layout,
+        placements=tuple(placements),
+        measured=any(placement.vocal_seconds is not None for placement in placements),
+        moved=0,
+    )
+
+
+def fill_in_shots(alignment: ShotAlignment) -> list[Shot]:
+    """Step three — fill it in. What each window contains, and nothing about where it sits.
+
+    Pure and model-free: every content decision here is made from `ShotAlignment` and the
+    project's own library, and the model's half of it arrived on `ShotLayout.proposals` from
+    the single call lay-out spent. Windows are read and never written — this step is the one
+    that will later be re-runnable against timing the Director has already approved, and that
+    promise starts by it having no way to move anything.
+
+    The mechanical fills the first run needed a hand-run script for, now populate's own act
+    (the run-2 audit's items 4 and 5):
+
+    * `performance` comes from the model and maps onto `singing`/`use_song_audio`.
+      `resolve_shot_mode` then routes performance shots to references automatically, so no
+      mode needs writing. A field with a default is not in the schema's `required`, so the
+      decoder was free to omit it, and on 2026-08-20 one model omitted it on 4 of 5 rolls and
+      every shot came through here silently non-performance. `director_result_schema` now
+      promotes `performance` into `PlannedShot.required` whenever `shots` is required, which
+      is what makes the model decide per shot rather than fall through a default. Note what
+      that does *not* change: absent and `false` are indistinguishable by the time a
+      `ShotProposal` exists, so the line below still reads `not_singing` off silence on any
+      path where the grammar is not enforced (the schema-free retry in `_completion`, a
+      provider that ignores strict).
+    * citations come from the shot's own `assets` field first and from its prose only as a
+      fallback (`models.assets_for_proposal`). The instruction commands prose that names
+      nothing; the scan is kept, demoted, because a model that writes a name and omits the
+      field has said unambiguously which picture it wants, and dropping that citation would
+      send the shot to render without the reference it asked for — invisible until the take
+      comes back wrong. Names under `NAME_SCAN_MIN_LENGTH` characters are still skipped as
+      substring noise, and an asset named both ways is cited once.
+
+      The scan is over `citable_assets`, not the whole library, and that is the same line the
+      roster and the context dump are drawn on: an identity sheet is not separately citable,
+      and scanning for its name was also a live substring bug — "HarderFaster · multiview"
+      contains "HarderFaster", so a prompt naming the sheet matched *both* assets and spent
+      two picture slots on one face.
+
+      Two rules then run over what the scan produced, in this order and no other:
+      `with_default_setting` may append the project's declared location (it counts picture
+      slots, so it must see the pre-substitution list — the widest the list can be), and
+      `prefer_identity_sheets` then re-points every reference at the promoted sheet of what it
+      names and collapses duplicates, which can only make the list shorter. Both are no-ops on
+      a project with no promotions and no declared location, so such a project's citations are
+      byte-identical to what populate has always written.
+    """
+    layout = alignment.layout
+    project = layout.project
+    proposals = layout.proposals
+    library = citable_assets(project)
+    sheets = identity_sheet_ids(project)
+
+    def proposal_citations(proposal: ShotProposal) -> list[AssetCitation]:
+        named = [
+            AssetCitation(asset_id=asset.id, role="reference", order=order)
+            for order, asset in enumerate(
+                assets_for_proposal(
+                    library, declared=proposal.assets, prose=proposal.prompt
+                )
+            )
+        ]
+        located = with_default_setting(
+            project, named, picture_limit=H3_REFERENCE_LIMITS["picture"]
+        )
+        return prefer_identity_sheets(located, sheets)
+
+    shots: list[Shot] = []
+    for placement in alignment.placements:
+        proposal = proposals[
+            proposal_for_position(
+                placement.start + placement.duration / 2,
+                layout.duration,
+                len(proposals),
+            )
+        ]
+        # Mapped from the model's own `performance` declaration — a dedicated strict-
+        # schema field the instruction explicitly asks for — never inferred from
+        # prose. The nothing-infers-singing guard permits exactly this mapping and
+        # forbids everything looser; the Director reviews the result per shot in the
+        # inspector, exactly as they reviewed the hand-run script it replaces.
+        # One measured exception to the declaration, one-directional, and it arrives
+        # from line-up rather than being measured here: a window the track is
+        # *measured* to leave voiceless cannot be sung, whatever the model declared —
+        # live on 2026-08-19 it marked the intro and the whole instrumental outro
+        # singing, and H3 invented words for them and lipsynced to the invention.
+        # Unmeasured changes nothing, and a not-singing declaration over vocals is a
+        # legitimate creative choice, untouched. This is not the inference the singing
+        # guard forbids: nothing reads prose, mode or library for it — only Whisper's
+        # measured voice activity on the track.
+        # Named locals rather than the attribute chain, and deliberately: the mapping below is
+        # pinned to one spelling at one site by the nothing-infers-singing test, and the pin is
+        # what keeps a second, looser writer of `singing` from appearing somewhere else.
+        performing = proposal.performance
+        voiceless = placement.voiceless
+        declared_singing: SingingState = (
+            "singing" if performing and not voiceless else "not_singing"
+        )
+        shots.append(
+            Shot(
+                start=placement.start,
+                duration=placement.duration,
+                prompt=proposal.prompt.strip(),
+                citations=proposal_citations(proposal),
+                singing=declared_singing,
+                # Every shot rides its window of the master as reference — the
+                # Director's ruling (2026-08-19): a non-singing shot still gets its
+                # piece of the track "for dancing and moving on beat"; `singing`
+                # alone decides whether the prompt asks for an articulating mouth.
+                use_song_audio=True,
+                # Distinct per shot, derived from the window rather than random so a
+                # re-populate of the same plan is reproducible. Sixteen shots sharing
+                # seed 0 made one bad sampling trajectory a batch-wide risk on the
+                # first live batch (3 of 4 lost to a NaN'd audio latent).
+                seed=1 + placement.index,
+            )
+        )
+    return shots
+
+
+# ------------------------------------------------------------------------------------------
 # Report-then-confirm, made real: the plan the Director read is the plan that lands.
 #
 # Both model-backed bulk passes below (`clean_shot_prompts`, `fill_section_looks`) are
@@ -3217,6 +3834,393 @@ class PopulateTimelineResponse(BaseModel):
     #: every response written before this field existed means. A client that ignores it behaves
     #: exactly as it did.
     cast_notices: list[str] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------------------------------------
+# The three steps on the wire. One route each, chained by `populate_timeline`.
+#
+# Each route reports first and writes only on an explicit confirm, and each carries the
+# previous step's report forward as `plan` — the plan-carrying idiom above, for its reason:
+# lay-out spends the model call, so its confirm must apply *that* reading rather than roll
+# again, and line-up and fill-in are pure functions of what lay-out returned.
+#
+# Reading the chain off the routes: lay-out's report is line-up's `plan`, line-up's report is
+# fill-in's `plan`, and fill-in's confirm is what writes the content. A first-run
+# `populate` does the same three steps in one call with one confirmation — see
+# `populate_timeline`.
+# ------------------------------------------------------------------------------------------
+
+#: The plan-carrying refusals, `CLEAN_PROMPTS_NO_PLAN`'s rule in each step's own words.
+LAY_OUT_NO_PLAN = (
+    "This confirm carries no lay-out report, so there is nothing it could write. The windows "
+    "this step writes are the ones a person read in a report: run the report, read it, then "
+    "confirm with that report as `plan`. Nothing was written and no model was asked."
+)
+LAY_OUT_PLAN_MISMATCH = (
+    "The plan sent with this confirm is not the plan this step reported: it does not match "
+    "its own plan_id. Refused rather than asking the model again, because the layout that "
+    "lands has to be the layout that was read. Nothing was written. Run the report again."
+)
+LINE_UP_NO_PLAN = (
+    "Line up needs a lay-out report to line up. Run the lay-out step, then send its report "
+    "here as `plan`. Nothing was written."
+)
+LINE_UP_PLAN_MISMATCH = (
+    "The lay-out report sent to this step does not match its own plan_id, so it is not a "
+    "report this server emitted. Nothing was written. Run the lay-out step again."
+)
+FILL_IN_NO_PLAN = (
+    "Fill in needs a line-up report to fill in. Run the lay-out step, then the line-up step, "
+    "then send the line-up report here as `plan`. Nothing was written and no model was asked."
+)
+FILL_IN_PLAN_MISMATCH = (
+    "The line-up report sent to this step does not match its own plan_id, so it is not a "
+    "report this server emitted. Nothing was written. Run the line-up step again."
+)
+#: Fill in writes content onto windows that already exist and never moves or makes one. If
+#: the timeline no longer matches the report's windows, the shot a row addresses is not the
+#: shot it was written for — refused rather than written to whatever is at that index now.
+#: The other half of the same promise, and the half that is about this server rather than
+#: about the timeline: the shots the fill-in step produced must sit in the windows it was
+#: given. Unreachable while the step reads its geometry from the alignment it was handed —
+#: which is exactly why it is checked rather than argued, `CLEAN_PROMPTS_WINDOWS_MOVED`'s rule.
+#: It fires on the report too, because a report that describes windows the confirm would not
+#: write is worse than a refusal.
+FILL_IN_WINDOWS_MOVED = (
+    "Refused: filling in produced shots whose windows are not the windows it was given. "
+    "Nothing was written. This step may only ever change what is inside a window — the "
+    "timeline's geometry is the director's own work and is not this step's to touch."
+)
+FILL_IN_WINDOWS_CHANGED = (
+    "The timeline's windows are not the windows this report was laid out for ({expected} "
+    "shots reported, {found} on the timeline{detail}). Fill in only writes what is inside a "
+    "window and never moves one, so it refused rather than write a shot's content onto a "
+    "different shot. Nothing was written. Lay the timeline out again, then line it up and "
+    "fill it in from that report."
+)
+
+
+class LayOutWindowRow(BaseModel):
+    """One window of the laid-out structure. Geometry only — nothing about content."""
+
+    index: int
+    start: float
+    duration: float
+
+
+class LayOutProposalRow(BaseModel):
+    """One shot proposal from the model, carried on the report for the fill-in step.
+
+    This is the content half of the single model call lay-out spends: lay-out reads only the
+    *count* of these, and fill-in is what turns them into prompts and citations. They ride
+    the report so the next step is a pure function of what a person read, rather than of a
+    second ask.
+    """
+
+    index: int
+    start: float
+    duration: float
+    prompt: str
+    performance: bool = False
+    assets: list[str] = Field(default_factory=list)
+
+
+class LayOutSectionRow(BaseModel):
+    """One section of the layout's section layer, as it would be written."""
+
+    label: str
+    start: float
+    duration: float
+    prompt: str = ""
+
+
+class LayOutResponse(BaseModel):
+    """Step one's report, and — only on a confirmed call — the saved project.
+
+    `project` is `None` on a report, `SnapCutsResponse`'s rule and for its reason: the
+    absence is the wire's own statement that nothing was written.
+
+    This model is also the *request* body of the confirm that applies it (`plan` on
+    `LayOutRequest`) and of the line-up step (`plan` on `LineUpRequest`), which is why
+    `plan_id` and `updated_at` are on it.
+    """
+
+    applied: bool = False
+    #: The song length this layout was tiled across, carried rather than re-read: it is what
+    #: `proposal_for_position` divides, so the step that consumes it must see the number the
+    #: layout was actually computed with.
+    duration: float = 0
+    #: The count the model was held to (`populate_required_shots`) and the count it returned.
+    required: int = 0
+    proposed: int = 0
+    #: Windows in the tiling. Not the same number as `proposed`: the geometry is repaired.
+    created: int = 0
+    windows: list[LayOutWindowRow] = Field(default_factory=list)
+    proposals: list[LayOutProposalRow] = Field(default_factory=list)
+    sections: list[LayOutSectionRow] = Field(default_factory=list)
+    #: `"director"`, `"structure"`, `"shots"` or `""` — see `ShotLayout.sections_origin`.
+    sections_origin: str = ""
+    message: str = ""
+    project: Project | None = None
+    #: The digest that ties this report to the confirm that applies it — `plan_fingerprint`.
+    plan_id: str = ""
+    #: The project revision this report was read from. Checked against the live one on the
+    #: confirm with `PROJECT_CHANGED_REFUSAL`, `replace_shots`' rule and its wording.
+    updated_at: datetime | None = None
+
+
+class LayOutRequest(BaseModel):
+    """One lay-out pass: whether it may write, and how it asks for the structure.
+
+    `confirm_replace` is populate's own field in populate's own key, because this is the
+    step that carries populate's destructive act: without it this route **reports** — the
+    model is asked, the tiling is computed, and `store.save` is not called. With it, and with
+    the report echoed back as `plan`, the windows land.
+
+    `two_stage` is populate's field unchanged: ask for the song's structure in its own call
+    before asking for the shots. Off by default, and that default is the honest one — the
+    split answers a measured single-call failure but has never been run against a live model
+    from here, and `false` is byte-for-byte the old behaviour.
+    """
+
+    confirm_replace: bool = False
+    two_stage: bool = False
+    plan: LayOutResponse | None = None
+
+
+class LineUpWindowRow(BaseModel):
+    """One window with the musical facts measured against it — `ShotPlacement` on the wire.
+
+    `vocal_seconds` is `None` for unmeasured, which is not the same as silent: a project
+    whose song has never been transcribed reports `None` on every row and `voiceless` false
+    on every row, and fill-in's guard is then a no-op.
+    """
+
+    index: int
+    start: float
+    duration: float
+    section: str = ""
+    vocal_seconds: float | None = None
+    voiceless: bool = False
+
+
+class LineUpResponse(BaseModel):
+    """Step two's report. There is no applied form of it in this phase.
+
+    No `project` field and no `applied` flag, and their absence is the honest statement:
+    **line-up moves nothing yet**. `moved` is on the wire and reads 0 for the same reason —
+    see `ShotAlignment`. What this report carries is the per-window measurement fill-in
+    consumes, plus the lay-out report it was computed from, so it is the whole input to the
+    fill-in step.
+    """
+
+    measured: bool = False
+    moved: int = 0
+    windows: list[LineUpWindowRow] = Field(default_factory=list)
+    #: The lay-out report this was lined up from, echoed whole so fill-in needs only this
+    #: one body. Its own `plan_id` still has to check out.
+    layout: LayOutResponse | None = None
+    message: str = ""
+    plan_id: str = ""
+    updated_at: datetime | None = None
+
+
+class LineUpRequest(BaseModel):
+    """One line-up pass. It has no confirm because it has nothing to write.
+
+    `plan` is a lay-out report and is required: in this phase line-up is a pure function of
+    a layout, and there is no project-sourced entry point yet — re-lining-up a timeline the
+    Director already has is the next phase's job, and it needs the snapping this one
+    deliberately does not do.
+    """
+
+    plan: LayOutResponse | None = None
+
+
+class FillInShotRow(BaseModel):
+    """One filled shot in the report: what would be written into that window.
+
+    `start` and `duration` ride along and are never written back. They are here so the
+    report itself is evidence that the windows did not move — `CleanPromptRow`'s rule.
+    """
+
+    index: int
+    start: float
+    duration: float
+    prompt: str = ""
+    citations: list[AssetCitation] = Field(default_factory=list)
+    singing: str = ""
+    use_song_audio: bool = False
+    seed: int = 0
+
+
+class FillInResponse(BaseModel):
+    """Step three's report, and — only on a confirmed call — the saved project.
+
+    `project` is `None` on a report, `SnapCutsResponse`'s rule and for its reason.
+    """
+
+    applied: bool = False
+    filled: int = 0
+    shots: list[FillInShotRow] = Field(default_factory=list)
+    message: str = ""
+    project: Project | None = None
+    plan_id: str = ""
+    updated_at: datetime | None = None
+
+
+class FillInRequest(BaseModel):
+    """One fill-in pass: the line-up report it fills from, and whether it may write.
+
+    `confirm_apply` is `SnapCutsRequest`'s field in the same key and for the same reason.
+
+    **This step deliberately inherits none of lay-out's refusals.** A locked shot, an
+    approved take and a render in flight all refuse a lay-out, because a lay-out replaces the
+    windows those protections were placed on. Fill in writes inside windows it never touches,
+    and that is checked rather than promised: the window fingerprint is taken before the
+    writes and compared after, and a mismatch refuses without saving.
+    """
+
+    confirm_apply: bool = False
+    plan: LineUpResponse | None = None
+
+
+# `plan` names a response model declared above it, and `from __future__ import annotations`
+# makes that a forward reference — rebuilt here rather than left for whatever first touches
+# them to discover. `SectionLooksRequest`'s line, for its reason.
+LayOutRequest.model_rebuild()
+LineUpRequest.model_rebuild()
+FillInRequest.model_rebuild()
+
+
+# The four translations between the steps' intermediates and their wire forms. They are the
+# only place either shape is built, so "what the intermediate carries" has one spelling, and a
+# field added to a step's output either travels or fails to compile here.
+
+
+def layout_report(layout: ShotLayout) -> LayOutResponse:
+    """`ShotLayout` as a report a person can read and the next step can be handed."""
+    return LayOutResponse(
+        duration=layout.duration,
+        required=layout.required,
+        proposed=len(layout.proposals),
+        created=len(layout.windows),
+        windows=[
+            LayOutWindowRow(index=index, start=start, duration=length)
+            for index, (start, length) in enumerate(layout.windows)
+        ],
+        proposals=[
+            LayOutProposalRow(
+                index=index,
+                start=proposal.start,
+                duration=proposal.duration,
+                prompt=proposal.prompt,
+                performance=proposal.performance,
+                assets=list(proposal.assets),
+            )
+            for index, proposal in enumerate(layout.proposals)
+        ],
+        sections=[
+            LayOutSectionRow(
+                label=section.label,
+                start=section.start,
+                duration=section.duration,
+                prompt=section.prompt,
+            )
+            for section in layout.sections
+        ],
+        sections_origin=layout.sections_origin,
+        message=(
+            f"{len(layout.windows)} windows laid out from {len(layout.proposals)} "
+            f"proposals across {layout.duration:.1f}s"
+        ),
+    )
+
+
+def layout_from_report(project: Project, plan: LayOutResponse) -> ShotLayout:
+    """A lay-out report back into the intermediate the next steps read.
+
+    `project` is the **live** project, not one carried on the report: the later steps read the
+    library, the identity sheets and the song from it, and a report is a statement about
+    geometry rather than a snapshot of the manifest. What makes that safe is the revision
+    check every route runs before calling this — the report is refused unless the project is
+    still the revision it was read from.
+    """
+    return ShotLayout(
+        project=project,
+        duration=plan.duration,
+        required=plan.required,
+        proposals=tuple(
+            ShotProposal(
+                start=row.start,
+                duration=row.duration,
+                prompt=row.prompt,
+                performance=row.performance,
+                assets=tuple(row.assets),
+            )
+            for row in plan.proposals
+        ),
+        windows=tuple((row.start, row.duration) for row in plan.windows),
+        sections=tuple(
+            SongSection(
+                label=row.label,
+                start=row.start,
+                duration=row.duration,
+                prompt=row.prompt,
+            )
+            for row in plan.sections
+        ),
+        sections_origin=plan.sections_origin,
+        message=plan.message,
+    )
+
+
+def alignment_report(alignment: ShotAlignment, layout: LayOutResponse) -> LineUpResponse:
+    """`ShotAlignment` as a report, with the lay-out report it was computed from echoed on it."""
+    voiced = sum(1 for placement in alignment.placements if not placement.voiceless)
+    return LineUpResponse(
+        measured=alignment.measured,
+        moved=alignment.moved,
+        windows=[
+            LineUpWindowRow(
+                index=placement.index,
+                start=placement.start,
+                duration=placement.duration,
+                section=placement.section,
+                vocal_seconds=placement.vocal_seconds,
+                voiceless=placement.voiceless,
+            )
+            for placement in alignment.placements
+        ],
+        layout=layout,
+        message=(
+            f"{len(alignment.placements)} windows measured against the track, "
+            f"{voiced} carrying voice, 0 moved"
+            if alignment.measured
+            else f"{len(alignment.placements)} windows; the song's voice has not been "
+            "measured, so no window carries a vocal fact and 0 moved"
+        ),
+    )
+
+
+def alignment_from_report(project: Project, plan: LineUpResponse) -> ShotAlignment:
+    """A line-up report back into the intermediate the fill-in step reads."""
+    return ShotAlignment(
+        layout=layout_from_report(project, plan.layout or LayOutResponse()),
+        placements=tuple(
+            ShotPlacement(
+                index=row.index,
+                start=row.start,
+                duration=row.duration,
+                section=row.section,
+                vocal_seconds=row.vocal_seconds,
+                voiceless=row.voiceless,
+            )
+            for row in plan.windows
+        ),
+        measured=plan.measured,
+        moved=plan.moved,
+    )
 
 
 class SnapCutsRequest(BaseModel):
@@ -8588,6 +9592,269 @@ def create_app(
         return response
 
     @app.post(
+        "/api/projects/{project_id}/timeline/lay-out",
+        response_model=LayOutResponse,
+    )
+    async def lay_out_timeline(
+        project_id: str, request: LayOutRequest
+    ) -> LayOutResponse:
+        """Step one of a populate, on its own route: how many shots, where, how long.
+
+        `lay_out_shots` makes every decision; this route's additions are the project lookup,
+        the refusals lay-out owns (`lay_out_protections`), the plan-carrying checks and the
+        write. The same function is what `populate_timeline` calls, so a layout produced
+        here and a layout produced inside a chained populate cannot differ.
+
+        Report first, apply on confirm. Without `confirm_replace` this route asks the model,
+        computes the tiling and **does not call `store.save`** — the response carries no
+        project at all, so "nothing was written" is visible on the wire. With it, the report
+        must come back as `plan` and the windows in that report are the windows that land:
+        no model is asked on the confirming call, which is the 2026-08-21 rule (a second
+        generation at `PLAN_TEMPERATURE` is a different layout, and the Director read the
+        first one).
+
+        **What it writes is structure, and only structure.** Sections, when this step laid
+        them out, and one draft shot per window carrying its `start` and `duration` and
+        nothing else. Prompts, citations, `singing`, `use_song_audio` and seeds are the
+        fill-in step's to write — that is what makes them re-runnable against timing that is
+        already approved. A Director stepping through the three routes by hand runs
+        `line-up` and then `fill-in` on this report to get a plan with content in it; a
+        Director who wants all three at once clicks Populate Timeline, which is the chain.
+
+        Destructive by design and guarded exactly as populate is: the protections
+        (`lay_out_protections`) refuse before the model is asked, and refuse again on the
+        re-read inside `lay_out_shots` after it, because a lock or a render that appeared
+        while the model thought must still stop the replace.
+
+        Nothing renders, arms, queues or approves. `comfy` is not touched on any path.
+        """
+        project = get_project(project_id)
+        # The confirm, and the only path that writes. No model is asked on it: `plan` is the
+        # report a person read, and the windows it writes are that report's own numbers.
+        if request.confirm_replace:
+            plan = request.plan
+            if plan is None or not plan.windows or not plan.plan_id:
+                raise HTTPException(status_code=422, detail=LAY_OUT_NO_PLAN)
+            if plan.updated_at is None or plan.updated_at != project.updated_at:
+                raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
+            if plan_fingerprint(project, plan) != plan.plan_id:
+                raise HTTPException(status_code=422, detail=LAY_OUT_PLAN_MISMATCH)
+            # Asked again on the confirming call, and not only on the report: the two are
+            # separate requests, and a lock set between them is a protection that would
+            # otherwise vanish with the timeline it protected.
+            #
+            # Unreachable while the revision check above holds — a lock, an approval and a
+            # submitted job all move `updated_at`, so the 409 speaks first — and checked
+            # anyway, `CLEAN_PROMPTS_WINDOWS_MOVED`'s rule: the cost is one comparison and
+            # what it defends is the whole timeline. It survives mutation for that reason
+            # (2026-08-21 sweep), which is the honest reading of a defence-in-depth line
+            # rather than a gap in the tests.
+            lay_out_protections(project)
+            # Written only when this step is what produced them. A section layer the Director
+            # marked is left exactly as it is — rewriting it from the report would mint new
+            # ids for boxes nobody changed.
+            if plan.sections_origin in ("structure", "shots"):
+                project.sections = [
+                    SongSection(
+                        label=row.label,
+                        start=row.start,
+                        duration=row.duration,
+                        prompt=row.prompt,
+                    )
+                    for row in plan.sections
+                ]
+            project.shots = [
+                Shot(start=row.start, duration=row.duration) for row in plan.windows
+            ]
+            response = plan.model_copy(deep=True)
+            saved = store.save(project)
+            response.project = saved
+            response.applied = True
+            # Re-stamped over the saved revision so this body is a *valid* plan for the
+            # line-up step: the confirm moved `updated_at`, and a report still claiming the
+            # revision it was read from would be refused by the next route on its way past.
+            # The layout itself is unchanged — same windows, same proposals, same sections.
+            response.updated_at = saved.updated_at
+            response.plan_id = plan_fingerprint(saved, response)
+            return response
+        lay_out_protections(project)
+        layout = await lay_out_shots(
+            project,
+            director=director,
+            two_stage=request.two_stage,
+            reread=lambda: get_project(project_id),
+        )
+        response = layout_report(layout)
+        # Minted over the *re-read* project — the one `lay_out_shots` returned and the one a
+        # confirm will be checked against. Nothing is written on this path.
+        response.updated_at = layout.project.updated_at
+        response.plan_id = plan_fingerprint(layout.project, response)
+        return response
+
+    @app.post(
+        "/api/projects/{project_id}/timeline/line-up",
+        response_model=LineUpResponse,
+    )
+    def line_up_timeline(project_id: str, request: LineUpRequest) -> LineUpResponse:
+        """Step two of a populate: measure the layout against the music. Move nothing.
+
+        `line_up_shots` makes every decision, and it is the function a chained populate calls
+        too. It is pure and asks no model, so this route has no confirm and no write — see
+        `LineUpResponse` and `ShotAlignment` for why that is the honest shape of this step
+        today rather than a hole in it. What comes back is the input the fill-in step needs:
+        each window's measured voice, whether the track leaves it voiceless, and which
+        section it falls in.
+
+        The lay-out report arrives as `plan` and has to prove it is one this server emitted —
+        the digest and the revision, `section_looks_plan_writes`' checks. It is echoed back on
+        the response so the fill-in step needs one body rather than two.
+
+        Nothing is written on any path. `comfy` is not touched, no `status` moves.
+        """
+        project = get_project(project_id)
+        plan = request.plan
+        if plan is None or not plan.windows or not plan.plan_id:
+            raise HTTPException(status_code=422, detail=LINE_UP_NO_PLAN)
+        if plan.updated_at is None or plan.updated_at != project.updated_at:
+            raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
+        if plan_fingerprint(project, plan) != plan.plan_id:
+            raise HTTPException(status_code=422, detail=LINE_UP_PLAN_MISMATCH)
+        response = alignment_report(
+            line_up_shots(layout_from_report(project, plan)), plan
+        )
+        response.updated_at = project.updated_at
+        response.plan_id = plan_fingerprint(project, response)
+        return response
+
+    @app.post(
+        "/api/projects/{project_id}/timeline/fill-in",
+        response_model=FillInResponse,
+    )
+    def fill_in_timeline(project_id: str, request: FillInRequest) -> FillInResponse:
+        """Step three of a populate: what is inside each window. Never where it sits.
+
+        `fill_in_shots` makes every decision, and it is the function a chained populate calls
+        too. It is pure and asks no model — the model's content half arrived on the lay-out
+        report this call carries — so the report and the confirm compute the same thing, and
+        the confirm is a write rather than a second reading.
+
+        **The windows are sacred and this route may not touch them**, which is what lets it
+        inherit none of lay-out's refusals: a locked shot, an approved take and a render in
+        flight all refuse a *lay-out*, because a lay-out replaces the windows those
+        protections were placed on; they do not refuse this. Three things make that a
+        guarantee rather than an intention, `clean_shot_prompts`' rule:
+
+        * the write assigns the five content fields and nothing else — no branch here reads or
+          writes `start`, `duration`, `mode`, `status`, `locked`, `latest_output`,
+          `approved_output` or the takes;
+        * every row of the report is matched to the shot at its index and refused unless that
+          shot's window is still the window the row was laid out for
+          (`FILL_IN_WINDOWS_CHANGED`);
+        * `prompt_cleanup.window_fingerprint` is taken before the writes and compared after,
+          and a mismatch **refuses without saving**.
+
+        Report first, apply on confirm — `snap_timeline_cuts`' shape. Without `confirm_apply`
+        this route **does not call `store.save`** and the response carries no project at all.
+
+        Nothing renders, arms, queues or approves. `comfy` is not touched and no `status`
+        moves; a rendered shot keeps its take and its job record, and the Director decides
+        what to re-render.
+        """
+        project = get_project(project_id)
+        plan = request.plan
+        if (
+            plan is None
+            or plan.layout is None
+            or not plan.windows
+            or not plan.plan_id
+        ):
+            raise HTTPException(status_code=422, detail=FILL_IN_NO_PLAN)
+        if plan.updated_at is None or plan.updated_at != project.updated_at:
+            raise HTTPException(status_code=409, detail=PROJECT_CHANGED_REFUSAL)
+        if plan_fingerprint(project, plan) != plan.plan_id:
+            raise HTTPException(status_code=422, detail=FILL_IN_PLAN_MISMATCH)
+        # Matched in manifest order, which is the order `window_fingerprint` and `shot_label`
+        # use — a report is about shot 12 of the list, not about the twelfth shot to play.
+        shots = list(project.shots)
+        mismatch = next(
+            (
+                row.index
+                for row, shot in zip(plan.windows, shots)
+                if (shot.start, shot.duration) != (row.start, row.duration)
+            ),
+            None,
+        )
+        if len(shots) != len(plan.windows) or mismatch is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=FILL_IN_WINDOWS_CHANGED.format(
+                    expected=len(plan.windows),
+                    found=len(shots),
+                    detail=(
+                        f"; shot {mismatch + 1} no longer sits at its reported window"
+                        if mismatch is not None
+                        else ""
+                    ),
+                ),
+            )
+        filled = fill_in_shots(alignment_from_report(project, plan))
+        if any(
+            (produced.start, produced.duration) != (shot.start, shot.duration)
+            for shot, produced in zip(shots, filled)
+        ) or len(filled) != len(shots):
+            # Before the report is built, not only before the write: a report describing a
+            # window the confirm would refuse to write is a report nobody can act on.
+            raise HTTPException(status_code=500, detail=FILL_IN_WINDOWS_MOVED)
+        response = FillInResponse(
+            filled=len(filled),
+            shots=[
+                FillInShotRow(
+                    index=index,
+                    start=shot.start,
+                    duration=shot.duration,
+                    prompt=shot.prompt,
+                    citations=list(shot.citations),
+                    singing=shot.singing,
+                    use_song_audio=shot.use_song_audio,
+                    seed=shot.seed,
+                )
+                for index, shot in enumerate(filled)
+            ],
+            message=f"{len(filled)} shots filled in; no window moved",
+        )
+        response.updated_at = project.updated_at
+        response.plan_id = plan_fingerprint(project, response)
+        if not request.confirm_apply:
+            return response
+        # The guarantee, taken on the project about to be written and checked against it after.
+        geometry = window_fingerprint(project)
+        for index, (shot, produced) in enumerate(zip(shots, filled)):
+            # Validated as a whole Shot rather than assigned field by field,
+            # `asset_replacement`'s rule and for its reason: this is what runs
+            # `Shot._reconcile_citations`, so `asset_ids` is rebuilt as the projection of the
+            # new reference-role citations instead of being kept in sync by a second hand.
+            project.shots[index] = Shot.model_validate(
+                {
+                    **shot.model_dump(),
+                    "prompt": produced.prompt,
+                    "citations": [
+                        citation.model_dump() for citation in produced.citations
+                    ],
+                    "singing": produced.singing,
+                    "use_song_audio": produced.use_song_audio,
+                    "seed": produced.seed,
+                }
+            )
+        if window_fingerprint(project) != geometry:
+            # Nothing has been saved at this point, and nothing will be. Unreachable by
+            # construction — the loop above carries `id`, `start` and `duration` across
+            # untouched — which is exactly why it is checked rather than argued.
+            raise HTTPException(status_code=500, detail=CLEAN_PROMPTS_WINDOWS_MOVED)
+        response.project = store.save(project)
+        response.applied = True
+        return response
+
+    @app.post(
         "/api/projects/{project_id}/timeline/populate",
         response_model=PopulateTimelineResponse,
     )
@@ -8596,24 +9863,45 @@ def create_app(
     ) -> PopulateTimelineResponse:
         """Stage 4 of the Director's user workflow: one button lays out the whole plan.
 
+        **This route is a caller, not a fourth implementation.** It runs the same three steps
+        the `lay-out`, `line-up` and `fill-in` routes run, in the same order, through the same
+        three module-level functions — `lay_out_shots`, `line_up_shots`, `fill_in_shots` —
+        and its own body is the four lines that join them plus the single save. A chain with
+        its own copy of any step would be a second spelling of a rule this codebase has twice
+        been bitten by having two of (the reference-map numbering, the readiness/submit
+        staleness test), and the byte-identity test that pins this change would go on passing
+        while the two drifted.
+
         The model's answer is treated as *shape*, never as arithmetic: its shots carry the
         story (prompts, relative lengths, order), and `populate_windows` repairs the
         geometry into what assembly will later demand — contiguous from 0 to the song's
-        end, every window inside H3's reliable 4–15 s range.
+        end, every window inside H3's reliable 4–15 s range. The one number the model is
+        *held* to is how many shots it returns, and that is a judgement about shape, not
+        arithmetic: `populate_required_shots` computes the count, the instruction states it
+        three times over as a hard constraint, the reply is counted rather than believed, and
+        a short one buys exactly one guided retry at a lower temperature with the shortfall
+        named in numbers. Each tiled window draws its prompt from the proposal whose
+        proportional span of the song contains it (`proposal_for_position`), so a count repair
+        cannot orphan a window from the story. The shots land as ordinary drafts — mode and
+        expansion remain the existing lanes' acts, exactly as the workflow describes ("this
+        is also when the prompts for each shot would be Expanded").
 
-        The one number the model is *held* to is how many shots it returns, and that is a
-        judgement about shape, not arithmetic: the geometry is repaired either way, but a
-        four-shot answer to a three-minute song leaves each prompt smeared across a dozen
-        windows, which is a plan in name only. `populate_required_shots` computes the
-        count here, the instruction states it three times over as a hard constraint, the
-        reply is counted rather than believed, and a short one buys exactly one guided
-        retry at a lower temperature with the shortfall named in numbers. Each tiled
-        window draws its
-        prompt from the proposal whose proportional span of the song contains it
-        (`proposal_for_position`), so a count repair cannot orphan a window from the
-        story. The shots land as ordinary drafts — mode, citations, singing and
-        expansion remain the existing lanes' acts, exactly as the workflow describes
-        ("this is also when the prompts for each shot would be Expanded").
+        **One confirmation, asked by the step that would violate the protection.** Each step's
+        own route is report-then-confirm on its own terms, but three modal confirmations to
+        lay out one timeline would be worse than the one button this replaces. Lay-out is the
+        destructive step, so its consent — `confirm_replace`, in populate's own words, with
+        the browser showing the same warning — is the consent for the whole pass: line-up
+        writes nothing at all, and fill-in writes content into windows that same consent
+        created. The refusals are `lay_out_protections`, the one implementation the `lay-out`
+        route also calls, asked in the order populate has always asked them and before the
+        model is spent.
+
+        The consent is required up front here rather than answered by a report, and that is
+        the one place this route deliberately differs from the `lay-out` route it calls: a
+        chained populate has no report step to confirm against — it never had one — and
+        adding one would either spend the 300 s model call twice or hand back a plan the
+        Director has to send again. The standalone route is where a layout can be read before
+        it lands.
 
         Destructive by design and doubly guarded: the browser shows the warning, and the
         route refuses without `confirm_replace` in the same words — while shots carrying
@@ -8621,396 +9909,29 @@ def create_app(
         protection that vanishes with the timeline it protected was never a protection.
         """
         project = get_project(project_id)
-        if not project.song or project.song.duration <= 0:
-            raise HTTPException(status_code=422, detail=POPULATE_NO_SONG_REFUSAL)
-        if reconcilable_jobs(project):
-            raise HTTPException(
-                status_code=409,
-                detail="Renders are in flight; populate would replace the shots they "
-                "are rendering for. Let the queue settle first.",
-            )
-        protected = [
-            shot_label(project, shot)
-            for shot in project.shots
-            if shot.locked or shot.approved_output or shot.status == "approved"
-        ]
-        if protected:
-            raise HTTPException(
-                status_code=422,
-                detail=POPULATE_PROTECTED_REFUSAL.format(shots=", ".join(protected)),
-            )
+        lay_out_protections(project)
         if not request.confirm_replace:
             raise HTTPException(status_code=422, detail=POPULATE_CONFIRM_REFUSAL)
-        duration = project.song.duration
-        # The roster the model is offered, and it is `citable_assets` rather than the whole
-        # library on purpose. A promoted identity sheet is no longer separately citable — a
-        # citation of its source resolves to it below — so offering its display name buys
-        # nothing and costs the naming leak the Director reported: `"Close up on eyes of
-        # HarderFaster · multiview with flickering light reflections"`, an internal asset label
-        # sitting in a shot's creative prose, written there because citation correctness used
-        # to depend on the model typing that label. A name never shown cannot be echoed.
-        citable = citable_assets(project)
-        assets = (
-            "; ".join(f"{asset.name} ({asset.kind})" for asset in citable) or "none yet"
+        # Lay it out — the model call, the count enforcement, the re-read across it, and the
+        # tiling. Everything after this point is arithmetic over what it returned.
+        layout = await lay_out_shots(
+            project,
+            director=director,
+            two_stage=request.two_stage,
+            reread=lambda: get_project(project_id),
         )
-        # The count comes from `POPULATE_TARGET_WINDOW_SECONDS`, the target window populate
-        # steers the model toward and thereby the plan's typical shot length. NOT the
-        # midpoint of H3's 4–15 s training range: the creator's own preset table calls
-        # 5.17 s (124 frames) "fastest / safest", and the first live batch measured why —
-        # 124-frame renders take ~2–6 min while the 221-frame windows a 9.5 s mean produced
-        # took 2.2 HOURS each on this card (2026-08-19). ~5 s cuts also edit better for
-        # music video than 9 s holds.
-        required = populate_required_shots(duration)
-        context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
-        # The roster's rule applied to the context dump, which is the other place the model can
-        # read an asset's name from — and the place it would still have read `· multiview` from
-        # if only the instruction had been trimmed. Done here, on populate's own copy, rather
-        # than in `DIRECTOR_CONTEXT_EXCLUDE`: that mapping withholds *fields* from every caller,
-        # and this withholds *rows* from this one. The chat route's dump is untouched.
-        citable_ids = {asset.id for asset in citable}
-        context["assets"] = [
-            asset for asset in context["assets"] if asset["id"] in citable_ids
-        ]
-        # Stage one of the two-stage populate, opt-in and skipped entirely when the
-        # Director has already marked the boxes: structure first, on its own, from the
-        # lyric sheet. It gets exactly one call and no retry — its whole premise is that a
-        # small ask succeeds where the combined one did not, so spending a second 300 s
-        # call to re-ask a small question would be arguing with the premise. If it comes
-        # back empty, `wants_sections` stays true below and the shots call asks for the
-        # structure the way it always has; nothing is lost but the one call.
-        staged_sections: list[SongSection] = []
-        if request.two_stage and not project.sections:
-            try:
-                structure = await director.plan(
-                    message=POPULATE_SECTIONS_INSTRUCTION.format(duration=duration),
-                    project_context=context,
-                    # This stage's *whole* output is `sections`, so that is what its
-                    # schema requires — and `shots` is pointedly left optional, because
-                    # HARD CONSTRAINT 3 asks this call to leave it empty and a schema
-                    # that demanded it would be arguing with the instruction beside it.
-                    # See `director_result_schema` for why the required set is the fix.
-                    response_schema=director_result_schema(require=("sections",)),
-                )
-            except DirectorUnavailable as error:
-                raise HTTPException(status_code=503, detail=str(error)) from error
-            except DirectorError as error:
-                raise HTTPException(status_code=502, detail=str(error)) from error
-            staged_sections = [
-                SongSection(label=label, start=start, duration=length, prompt=prompt)
-                for label, start, length, prompt in repair_sections(
-                    [
-                        (item.label, item.start, item.duration, item.prompt)
-                        for item in structure.sections
-                    ],
-                    duration,
-                )
-            ]
-        # Structure is only *asked for and demanded back* in the shots call when it is
-        # still unknown. Boxes the Director marked, or boxes stage one just produced, make
-        # the ask a second job bolted onto the one that matters — and an empty `sections`
-        # in the reply is then not an omission, so naming it in a retry would be noise.
-        known_sections = staged_sections or project.sections
-        wants_sections = not known_sections
-        instruction = POPULATE_INSTRUCTION.format(
-            duration=duration,
-            count=required,
-            assets=assets,
-            sections_ask=POPULATE_SECTIONS_ASK if wants_sections else "",
-            sections_constraint=POPULATE_SECTIONS_CONSTRAINT if wants_sections else "",
-        )
-        # The declared location, named before the section map so the two read as project fact
-        # then song structure. Only when there is one: nothing is invented, and a project with
-        # no declaration sends the instruction it has always sent, character for character.
-        declared_location = default_setting_asset(project)
-        if declared_location is not None:
-            instruction += POPULATE_LOCATION_LINE.format(name=declared_location.name)
-        if known_sections:
-            section_map = "; ".join(
-                f"{section.label} {section.start:.1f}-{section.end:.1f}s"
-                + (f" ({section.prompt})" if section.prompt else "")
-                for section in known_sections
-            )
-            origin = (
-                "marked by the director"
-                if project.sections
-                else "just laid out in the structure pass"
-            )
-            instruction += (
-                # Newline, not a leading space, and it is load-bearing: this branch runs
-                # only when `known_sections` is truthy, which is exactly when
-                # `sections_constraint` is empty — so a space glued the section map onto
-                # the end of "3. Every shot needs a non-empty `prompt`." and it read as a
-                # continuation of that constraint. Both neighbouring fragments
-                # (POPULATE_SECTIONS_CONSTRAINT, POPULATE_FINAL_CHECK) open with "\n";
-                # this one was the outlier. Found by the 2026-08-20 live run.
-                f"\nThe song's sections, {origin}, are: "
-                f"{section_map}. Shots must respect these boundaries — every shot sits "
-                "inside one section and takes that section's character."
-            )
-        # Last, after the section map, so the count is the final thing the model reads.
-        instruction += POPULATE_FINAL_CHECK.format(count=required)
-        # The pattern's third and fourth parts: verify in code, then one guided retry with
-        # the fault named. Only the *count* buys the retry. A dropped `sections` rides
-        # along in the corrective feedback when a retry is being spent anyway, but does
-        # not trigger one on its own: sections are scaffolding the Director drags, this
-        # model family drops them on most rolls (the roadmap's run-2 measurement), and a
-        # check that fires on most rolls is a check that doubles every populate's cost.
-        attempt_message = instruction
-        result = None
-        proposals: list[Any] = []
-        for attempt in range(1, POPULATE_ATTEMPTS + 1):
-            try:
-                result = await director.plan(
-                    message=attempt_message,
-                    project_context=context,
-                    temperature=(
-                        PLAN_TEMPERATURE if attempt == 1 else POPULATE_RETRY_TEMPERATURE
-                    ),
-                    # The shots call cannot proceed without `shots`, so the grammar it is
-                    # decoded under must say so. Everything above this line — the count
-                    # stated three times, the final check, the guided retry — asks in
-                    # *words* for a field the schema did not require, and the constrained
-                    # decoder was free to close the object without it. That is the whole
-                    # of the measured `shots: []` failure.
-                    #
-                    # The required set follows the instruction rather than being fixed:
-                    # `sections` is demanded back only when `wants_sections` put the ask
-                    # and HARD CONSTRAINT 4 in the text above, so the grammar and the
-                    # words always agree about what this call owes. When the boxes are
-                    # already known the ask is dropped, and requiring a field nobody asked
-                    # for would make the model fabricate structure to close the object.
-                    #
-                    # Requiring both was measured, not assumed (2026-08-20, N=3 per arm):
-                    # the combined ask delivered shots *and* sections on 0 of 9 rolls
-                    # across runs 1–2 and on 3 of 3 with both fields required, at no cost
-                    # in shots or wall clock.
-                    response_schema=director_result_schema(
-                        require=("shots", "sections") if wants_sections else ("shots",)
-                    ),
-                )
-            except DirectorUnavailable as error:
-                raise HTTPException(status_code=503, detail=str(error)) from error
-            except DirectorError as error:
-                raise HTTPException(status_code=502, detail=str(error)) from error
-            proposals = sorted(
-                (shot for shot in result.shots if shot.prompt.strip()),
-                key=lambda shot: shot.start,
-            )
-            if len(proposals) >= required or attempt == POPULATE_ATTEMPTS:
-                break
-            # Read off the reply, never off `result.message`: the recorded failure mode is
-            # a model that narrates fields it did not emit.
-            problems = [
-                POPULATE_SHORT_COUNT_PROBLEM.format(
-                    returned=len(proposals), required=required
-                )
-            ]
-            if wants_sections and not result.sections:
-                problems.append(POPULATE_MISSING_SECTIONS_PROBLEM)
-            attempt_message = (
-                POPULATE_RETRY_PREFIX.format(problems="\n".join(problems)) + instruction
-            )
-        if not proposals:
-            raise HTTPException(
-                status_code=502,
-                detail=POPULATE_NO_PLAN_REFUSAL.format(
-                    message=((result.message if result else "") or "").strip()[:300]
-                    or "(empty)"
-                ),
-            )
-        if len(proposals) < required:
-            # Loudly, and with nothing written: the destructive replace below has not
-            # happened yet, and a half-length plan laid over the Director's timeline would
-            # be worse than no plan at all.
-            raise HTTPException(
-                status_code=502,
-                detail=POPULATE_SHORT_PLAN_REFUSAL.format(
-                    required=required, duration=duration, returned=len(proposals)
-                ),
-            )
-        # Re-read after the await — the model can hold this open for minutes — and
-        # re-check what matters before the destructive write: a protection set or a
-        # render submitted while the model thought must still refuse.
-        project = get_project(project_id)
-        if reconcilable_jobs(project) or any(
-            shot.locked or shot.approved_output or shot.status == "approved"
-            for shot in project.shots
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="The project changed while the model was planning (a render or a "
-                "protection appeared). Nothing was replaced; try again.",
-            )
-        # Sections come from the Director's own boxes when marked, else from stage one's
-        # structure pass, else from whatever structure the shots call happened to volunteer
-        # (repaired: sorted, clamped, overlaps truncated) — Populate fills the section
-        # layer too, per the Director's design, and the boxes land on the track for
-        # dragging afterward. Stage one's list is carried across the re-read rather than
-        # re-derived: the fresh project is the one being written, and it has never seen it.
-        if not project.sections and staged_sections:
-            project.sections = staged_sections
-        elif not project.sections and result.sections:
-            project.sections = [
-                SongSection(label=label, start=start, duration=length, prompt=prompt)
-                for label, start, length, prompt in repair_sections(
-                    [
-                        (item.label, item.start, item.duration, item.prompt)
-                        for item in result.sections
-                    ],
-                    duration,
-                )
-            ]
-        # With sections marked, each section tiles independently so no shot straddles a
-        # boundary — cuts land exactly on the music's own switches, the Director's ask.
-        # Unmarked stretches (before, between, after sections) tile as their own spans so
-        # the plan still covers the whole song and assembly's gap refusal stays silent.
-        # Without sections, the whole song tiles as one span, exactly as before.
-        if project.sections:
-            spans: list[tuple[float, float]] = []
-            cursor = 0.0
-            for section in project.sections:
-                if section.start - cursor > 0.5:
-                    spans.append((cursor, section.start - cursor))
-                spans.append((section.start, section.duration))
-                cursor = section.end
-            if duration - cursor > 0.5:
-                spans.append((cursor, duration - cursor))
-            windows = []
-            for span_start, span_length in spans:
-                inside = [
-                    (shot.start, shot.duration)
-                    for shot in proposals
-                    if span_start <= shot.start < span_start + span_length
-                ]
-                for start, length in populate_windows(
-                    inside, span_length, maximum=POPULATE_MAX_WINDOW_SECONDS
-                ):
-                    windows.append((round(span_start + start, 3), length))
-        else:
-            windows = populate_windows(
-                [(shot.start, shot.duration) for shot in proposals],
-                duration,
-                maximum=POPULATE_MAX_WINDOW_SECONDS,
-            )
-        # The mechanical fills the first run needed a hand-run script for, now populate's
-        # own act (the run-2 audit's items 4 and 5):
-        #
-        # * `performance` comes from the model and maps onto `singing`/`use_song_audio`.
-        #   `resolve_shot_mode` then routes performance shots to references automatically,
-        #   so no mode needs writing. This used to say the strict json_schema's decoder
-        #   "forces every key to be emitted"; it does not, and did not — a field with a
-        #   default is not in `required`, so the decoder was free to omit it, and on
-        #   2026-08-20 one model omitted it on 4 of 5 rolls and every shot came through
-        #   here silently non-performance. `director_result_schema` now promotes
-        #   `performance` into `PlannedShot.required` whenever `shots` is required, which
-        #   is what makes the model decide per shot rather than fall through a default.
-        #   Note what that does *not* change: absent and `false` are indistinguishable by
-        #   the time a `PlannedShot` exists, so the line below still reads `not_singing`
-        #   off silence on any path where the grammar is not enforced (the schema-free
-        #   retry in `_completion`, a provider that ignores strict). Telling those apart
-        #   needs a tri-state on the shared chat schema and a live measurement of what
-        #   `singing="unknown"` does to expansion; neither was in this change.
-        # * citations come from the shot's own `assets` field first and from its prose only
-        #   as a fallback (`models.assets_for_proposal`). This used to read "citations come
-        #   from the prompt itself", and that sentence was the defect: the instruction
-        #   commanded exact asset names *in the prose* because the scan was the only
-        #   mechanism, so the model had to write "Extreme close up of Crimson Lips Close-up"
-        #   to attach a picture — 24 of 30 prompts on the Director's live plan carried a
-        #   label. `PlannedShot.assets` is a structural place to name an asset, promoted into
-        #   the strict grammar by `PLANNED_SHOT_DECISIONS`, and the instruction now asks for
-        #   prose that names nothing.
-        #
-        #   The scan is kept, demoted. A model that writes a name and omits the field has
-        #   said unambiguously which picture it wants, and dropping that citation would send
-        #   the shot to render without the reference it asked for — invisible until the take
-        #   comes back wrong. An awkward sentence is reviewable; a missing reference is not.
-        #   Names under `NAME_SCAN_MIN_LENGTH` characters are still skipped as substring
-        #   noise, and an asset named both ways is cited once.
-        #
-        #   The scan is over `citable_assets`, not the whole library, and that is the same
-        #   line the roster and the context dump are drawn on: an identity sheet is not
-        #   separately citable, and scanning for its name was also a live substring bug —
-        #   "HarderFaster · multiview" contains "HarderFaster", so a prompt naming the sheet
-        #   matched *both* assets and spent two picture slots on one face.
-        #
-        #   Two rules then run over what the scan produced, in this order and no other:
-        #   `with_default_setting` may append the project's declared location (it counts
-        #   picture slots, so it must see the pre-substitution list — the widest the list
-        #   can be), and `prefer_identity_sheets` then re-points every reference at the
-        #   promoted sheet of what it names and collapses duplicates, which can only make
-        #   the list shorter. Both are no-ops on a project with no promotions and no
-        #   declared location, so such a project's citations are byte-identical to what
-        #   populate has always written.
-        library = citable_assets(project)
-        sheets = identity_sheet_ids(project)
-
-        def proposal_citations(proposal: Any) -> list[AssetCitation]:
-            # `getattr` for the same reason the `performance` line below uses it: `plan` is
-            # duck-typed at every call site and a double that predates this field must keep
-            # working, exactly as one that predates `performance` does. Absent is `()`, which
-            # is the byte-identical old behaviour — the prose scan alone.
-            named = [
-                AssetCitation(asset_id=asset.id, role="reference", order=order)
-                for order, asset in enumerate(
-                    assets_for_proposal(
-                        library,
-                        declared=getattr(proposal, "assets", None) or (),
-                        prose=proposal.prompt,
-                    )
-                )
-            ]
-            located = with_default_setting(
-                project, named, picture_limit=H3_REFERENCE_LIMITS["picture"]
-            )
-            return prefer_identity_sheets(located, sheets)
-
-        shots: list[Shot] = []
-        for index, (start, length) in enumerate(windows):
-            proposal = proposals[
-                proposal_for_position(start + length / 2, duration, len(proposals))
-            ]
-            performing = bool(getattr(proposal, "performance", False))
-            # Mapped from the model's own `performance` declaration — a dedicated strict-
-            # schema field the instruction explicitly asks for — never inferred from
-            # prose. The nothing-infers-singing guard permits exactly this mapping and
-            # forbids everything looser; the Director reviews the result per shot in the
-            # inspector, exactly as they reviewed the hand-run script it replaces.
-            # One measured exception to the declaration, one-directional: a window the
-            # track is *measured* to leave voiceless cannot be sung, whatever the model
-            # declared — live on 2026-08-19 it marked the intro and the whole
-            # instrumental outro singing, and H3 invented words for them and lipsynced
-            # to the invention. Unmeasured (`None`) changes nothing, and a not-singing
-            # declaration over vocals is a legitimate creative choice, untouched. This
-            # is not the inference the singing guard forbids: nothing here reads prose,
-            # mode or library — only Whisper's measured voice activity on the track.
-            vocal = shot_vocal_overlap(project.song, start=start, duration=length)
-            voiceless = vocal is not None and vocal < MIN_SINGING_VOCAL_SECONDS
-            declared_singing: SingingState = (
-                "singing" if performing and not voiceless else "not_singing"
-            )
-            shots.append(
-                Shot(
-                    start=start,
-                    duration=length,
-                    prompt=proposal.prompt.strip(),
-                    citations=proposal_citations(proposal),
-                    singing=declared_singing,
-                    # Every shot rides its window of the master as reference — the
-                    # Director's ruling (2026-08-19): a non-singing shot still gets its
-                    # piece of the track "for dancing and moving on beat"; `singing`
-                    # alone decides whether the prompt asks for an articulating mouth.
-                    use_song_audio=True,
-                    # Distinct per shot, derived from the window rather than random so a
-                    # re-populate of the same plan is reproducible. Sixteen shots sharing
-                    # seed 0 made one bad sampling trajectory a batch-wide risk on the
-                    # first live batch (3 of 4 lost to a NaN'd audio latent).
-                    seed=1 + index,
-                )
-            )
+        # Line it up — measure each window against the track. Moves nothing yet.
+        alignment = line_up_shots(layout)
+        # Fill it in — prompts, citations, singing, seeds.
+        shots = fill_in_shots(alignment)
+        # The re-read project lay-out returned, carrying the section layer it assigned. One
+        # save for the whole pass: the intermediates travelled as data, so no half-populated
+        # timeline is ever visible on disk.
+        project = layout.project
         project.shots = shots
         saved = store.save(project)
         return PopulateTimelineResponse(
-            proposed=len(proposals),
+            proposed=len(layout.proposals),
             created=len(saved.shots),
             project=saved,
             # Read off the manifest that was actually written, so the flag describes the project

@@ -91,7 +91,7 @@ The value of the split is that each step's **output is inspectable and re-runnab
 
 ## Sequencing
 
-**Phase A — make the steps separable without changing behaviour.** Extract the three concerns inside the existing route so each produces a named intermediate. No new model calls, no new UI, byte-identical output pinned. This is the enabling step and it is testable to the byte.
+**Phase A — make the steps separable without changing behaviour.** Extract the three concerns inside the existing route so each produces a named intermediate. No new model calls, no new UI, byte-identical output pinned. This is the enabling step and it is testable to the byte. **— SHIPPED 2026-08-21, see below.**
 
 **Phase B — line-up consumes the alignment.** Wire phrase-boundary awareness into the layout instead of leaving it to a manual snap afterwards, and hand each shot the lines it covers. Highest ratio of existing machinery to new code.
 
@@ -138,6 +138,36 @@ Requirements that follow:
 - Nothing infers a role from prose. It is assigned by fill-in, visible in the inspector, and editable — the same stance as `singing` and the vocal type.
 - A shot with **no** role is *unassigned*, not "establish". An unstated value must never be read as a stated one; this codebase refuses fabricated defaults.
 - The role is fill-in output, so it is re-runnable and must not survive as a stale claim if fill-in runs again.
+
+## Phase A as shipped — 2026-08-21
+
+Built against `master` at 9c3db45. Backend only; no UI, no prompt wording changed, no model call split.
+
+**The three steps** are module-level functions in `app.py` — `lay_out_shots` (async, owns the model call), `line_up_shots` (pure), `fill_in_shots` (pure) — with three routes over them (`POST /timeline/lay-out`, `/timeline/line-up`, `/timeline/fill-in`) and `POST /timeline/populate` as the chain that calls the same three functions. Module-level rather than closures precisely so a test can monkeypatch a step and assert the chain observed it; the chain holds no copy of any step.
+
+**The intermediates, named:**
+
+| Step | Intermediate | Fields |
+|---|---|---|
+| lay it out | `ShotLayout` | `project` (re-read, carries the assigned section layer), `duration`, `required`, `proposals` (`ShotProposal(start, duration, prompt, performance, assets)`), `windows`, `sections`, `sections_origin`, `message` |
+| line it up | `ShotAlignment` | `layout`, `placements` (`ShotPlacement(index, start, duration, section, vocal_seconds, voiceless)`), `measured`, `moved` (always 0 in this phase) |
+| fill it in | `list[Shot]` | prompt, citations, `singing`, `use_song_audio`, seed |
+
+On the wire: `LayOutResponse` → `LineUpResponse` → `FillInResponse`, each step's report being the next step's `plan`, digest-checked and revision-checked.
+
+**The model call lives in lay-out**, once. The combined ask is deliberately unsplit — that is a later phase and the 0-of-9 measurement is the evidence for it — so fill-in receives the content half as data on `ShotLayout.proposals`, which lay-out reads only the length of.
+
+**One confirmation for the first pass.** `confirm_replace` on the chain is lay-out's consent: lay-out is the destructive step, line-up writes nothing, fill-in writes content into windows that consent created. Each route keeps its own report-then-confirm when called alone. The chain requires the consent up front rather than reporting first, because a chained populate has never had a report step and adding one would spend the 300 s model call twice.
+
+**Protections placed as ruled.** `lay_out_protections` (no song / renders in flight / locked or approved shots) is one function shared by the `lay-out` route and the chain. **Fill-in inherits none of them**, guaranteed by a window fingerprint across the write, a per-row window match against the live timeline, and a check that the produced shots sit in the windows the step was handed.
+
+**Line-up is a pass-through that attaches musical facts**, stated rather than dressed up: it moves nothing, `moved` reads 0, and `LineUpResponse` has no applied form. What it contributes is `shot_vocal_overlap` per window — the fact that downgrades `singing`, which populate used to compute inline — and the section each window falls in. Phase B is where it consumes the alignment for real.
+
+**Byte identity, proved.** Digests over every field of every shot and section a populate writes (only the freshly-minted shot ids dropped) were measured on a `git stash`ed `master` tree before any code was written, and reproduce exactly after: `8b101523…cab0b8` (sections marked) and `085917f1…3c88c5` (unmarked), pinned in `tests/test_populate_steps.py`. A second run against a *copy* of the Director's live project agreed on both trees; the live manifest was read only and its SHA-256 is unchanged.
+
+**No new persisted field**, so no write-path enumeration was needed and old manifests load untouched.
+
+**Verification.** 22 new cases; suite 1558 passing; ruff and both `node --check` gates clean; a 34-mutant sweep in a `git worktree` with a failing sentinel killed 33, the survivor being a documented defence-in-depth re-check that the revision check above it makes unreachable.
 
 ## Still open
 
