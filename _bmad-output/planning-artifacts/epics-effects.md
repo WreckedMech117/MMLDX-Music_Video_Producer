@@ -1,5 +1,5 @@
 ---
-stepsCompleted: [1, 2]
+stepsCompleted: [1, 2, 3, 4]
 inputDocuments:
   - _bmad-output/planning-artifacts/prds/prd-MusicVideoProducer-effects-2026-08-21/prd.md
   - _bmad-output/planning-artifacts/prds/prd-MusicVideoProducer-effects-2026-08-21/addendum.md
@@ -178,7 +178,8 @@ So that later work can be tied to what the music actually does instead of to a g
 
 **Given** an envelope for a 3-minute song
 **When** it is persisted
-**Then** it is written as a sidecar file under the project media dir, and the manifest carries only a pointer, the analysis rate, the band count, the estimated BPM, and the song fingerprint it was computed from (AD-20)
+**Then** it is written as a sidecar file under the project media dir, and the manifest carries only a defaulted `SongAnalysis` record — a pointer, the analysis rate, the band count, the estimated BPM, and the song fingerprint it was computed from (AD-20)
+**And** `SongAnalysis` is the only model entity this story adds, and it carries a default so every existing `project.json` loads unchanged
 **And** the envelope is never embedded in a Project response, and is served by its own read-only endpoint
 **And** a test asserts the manifest's own size is not materially changed by the presence of an envelope.
 
@@ -421,7 +422,8 @@ So that what I see is what ships, and a six-month-old project still tells me wha
 **Given** an Effect that cannot be applied — a missing LUT file, an unresolvable binding, a transition type not valid for its boundary
 **When** an export is requested
 **Then** it refuses and names the Shot and the reason, in one report covering every such problem rather than one at a time (FX-24)
-**And** an export never silently drops an Effect the Director configured.
+**And** an export never silently drops an Effect the Director configured
+**And** the report is built as an extensible list of checks, so the binding case (Epic 10) and the transition case (Epic 11) register into it later without reshaping it — this story ships the missing-LUT case and the report itself, and is complete without either later epic.
 
 **Given** a completed export
 **When** its provenance is read
@@ -452,6 +454,7 @@ So that the video moves with the track without my animating anything.
 **Given** any parameter of any Effect in any family
 **When** its bind glyph is clicked
 **Then** a band panel opens inline beneath that row, with a `--blue` left edge marking it as reactive (FX-12, UX-DR5)
+**And** `ParameterBinding` is added to the model as the only entity this story creates, defaulted so every existing manifest loads unchanged, and written only by the dedicated binding route (AD-16)
 **And** only one band panel is open at a time; opening another closes the first
 **And** no parameter is specially privileged and none is excluded by category (FX-12).
 
@@ -581,6 +584,13 @@ So that a cut the song does not accent stops jarring.
 **Given** more than two Shots overlapping at one point
 **When** assembly runs
 **Then** the case is refused with a stated reason rather than left undefined (FX-16).
+
+**Given** a Transition has to be stored before it can be assembled
+**When** the model is extended
+**Then** `TransitionSpec` is added along with `Shot.transition_in` and `Shot.transition_out`, all defaulted so every existing manifest loads unchanged (AD-16)
+**And** they are written only by a dedicated `.../shots/{shot_id}/transitions` route, and `replace_project` adopts them from the stored Shot via the same `_adopt_*` idiom that protects `effects` (AD-16)
+**And** a test asserts a full-project PUT omitting the transition fields leaves them intact
+**And** the route is sufficient to set and clear a Transition without any interface, so this story is completable and testable before Story 11.3 exists.
 
 ### Story 11.2: The Overlap on the Timeline
 

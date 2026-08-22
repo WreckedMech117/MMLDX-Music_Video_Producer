@@ -98,6 +98,8 @@ FR-2:  Epic 6 — real-workspace composition
 FR-3:  Epic 6 — escape and non-recurrence
 FR-23: Epic 7 — standalone Finishing adapter + chain
 
+> **Companion document.** The **Shot Effects and Transitions** feature is broken down separately in [`epics-effects.md`](epics-effects.md), which continues this numbering at **Epic 8** (Epics 8–11, Stories 8.1–11.5). Story IDs are unique across both files.
+
 ## Epic List
 
 ### Epic 1: Any Song Becomes the Spine
