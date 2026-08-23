@@ -21,6 +21,10 @@ Brownfield, and unusually well-supported: `assembly.py` already re-encodes every
 
 **On the relationship to `BUILD-ORDER.md`.** That document's six slices A–F remain the *build* sequence and are unchanged. They are not the epic structure: slices B (chain builder) and D (preview) deliver nothing a Director can see on their own, and slices B, C and D touch the same files end to end — `effects.py`, the effects routes, `app.js`, `styles.css`. Organised by user value and consolidated for file overlap, they collapse into the four epics below. Each story names the slice it implements, so the build order survives the regrouping.
 
+> **Sibling documents.** [`epics.md`](epics.md) holds Epics 1–7 (base product); [`epics-treatment.md`](epics-treatment.md) holds Epics 12–17 (Treatment Planning). One numbering space across all three.
+>
+> **Cross-feature note.** Story 8.1 ships **first** by the Director's decision, so Treatment Planning owns making the two song analyses share one trigger — see its Story 16.2. Nothing in this document changes because of it.
+
 ## Requirements Inventory
 
 ### Functional Requirements

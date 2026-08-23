@@ -1,0 +1,200 @@
+<title>Treatment Planning — Key Screen</title>
+<style>
+:root{
+  --bg:#0c0d0d; --surface-0:#111313; --surface-1:#171919; --surface-2:#1d2020; --surface-3:#252828;
+  --chrome:#0e1010; --line:#303434; --line-strong:#454a49; --ink:#f0f2ed; --muted:#929a95;
+  --dim:#626966; --acid:#d4f75e; --acid-ink:#15190a; --amber:#ffb454; --red:#ff6b61;
+  --red-edge:#7f3732; --cyan:#6bd0cc; --blue:#5b9bd5; --radius:7px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:Bahnschrift,"Aptos","Segoe UI",sans-serif;font-size:14px;padding:18px}
+.mono{font-family:Consolas,monospace;font-size:9px;letter-spacing:.09em;text-transform:uppercase}
+h1{font-size:15px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:12px;margin:0 0 16px;max-width:80ch;line-height:1.5}
+h2.step{font-size:12px;color:var(--muted);margin:22px 0 8px;font-weight:600}
+.wrap{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.panel{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface-0);overflow:hidden}
+
+/* planning bar — reuses the wizard guidance-banner shape */
+.planbar{display:flex;align-items:center;gap:9px;background:var(--chrome);
+  border-bottom:1px solid var(--line);padding:9px 12px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--amber);flex:none}
+.planbar .txt{font-size:12px;color:var(--ink);flex:1}
+.planbar .txt b{color:var(--amber);font-weight:600}
+.qbtn{border:1px solid var(--line);background:var(--surface-1);color:var(--muted);
+  border-radius:5px;padding:4px 9px;font-size:11px}
+
+/* doc tabs */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);padding:0 11px}
+.tab{padding:9px 10px 7px;color:var(--dim);border-bottom:2px solid transparent;font-size:12px}
+.tab.on{color:var(--ink);border-bottom-color:var(--acid)}
+.chip{background:var(--surface-2);color:var(--muted);border-radius:3px;padding:1px 4px;
+  margin-left:5px;font-family:Consolas,monospace;font-size:9px}
+.tab .warn{color:var(--amber);margin-left:4px}
+
+.body{padding:13px}
+.doclabel{display:block;color:var(--muted);font-size:12px;margin-bottom:2px}
+.contract{display:block;color:var(--dim);font-size:11px;line-height:1.45;margin-bottom:8px}
+
+/* the brief with in-place attribution */
+.brief{background:var(--surface-1);border:1px solid var(--line);border-radius:var(--radius);
+  padding:11px;line-height:1.62;font-size:13px;min-height:210px}
+.brief p{margin:0 0 10px}
+.ai{background:var(--surface-2);border-left:2px solid var(--line-strong);
+  padding:6px 9px;margin-left:-9px;border-radius:0 4px 4px 0;position:relative}
+.ai:hover{border-left-color:var(--muted)}
+.ai .who{position:absolute;right:7px;top:5px;color:var(--dim);opacity:.9}
+.mine{padding:0 0 0 2px}
+
+.undo{display:flex;align-items:center;gap:8px;margin-top:10px}
+.undo .lbl{color:var(--dim);font-size:11px;flex:1}
+
+/* proposal cards */
+.card{background:var(--surface-1);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px;margin-bottom:9px}
+.card.stale{border-left:2px solid var(--amber)}
+.card .top{display:flex;align-items:baseline;gap:8px;margin-bottom:4px}
+.card .nm{color:var(--ink);font-size:13px;flex:1}
+.card .pr{color:var(--muted);font-size:12px;line-height:1.5;margin:0 0 7px}
+.origin{color:var(--dim);font-size:11px;line-height:1.45;border-top:1px solid var(--line);
+  padding-top:6px;margin-bottom:6px}
+.origin b{color:var(--muted);font-weight:400}
+.flag{color:var(--amber);font-size:11px;margin-bottom:6px;line-height:1.45}
+.acts{display:flex;gap:6px}
+.acts .qbtn{font-size:10px;padding:3px 8px}
+.acts .go{background:var(--acid);border-color:var(--acid);color:var(--acid-ink)}
+
+/* pass indicator */
+.pass{display:flex;align-items:center;gap:9px;background:var(--surface-1);
+  border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px}
+.pass .t{flex:1;font-size:12px;color:var(--ink)}
+.pass .el{font-family:Consolas,monospace;font-size:11px;color:var(--muted)}
+.pulse{animation:p 1.6s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.28}}
+@media (prefers-reduced-motion:reduce){.pulse{animation:none}}
+
+/* proceed */
+.proceed{border-top:1px solid var(--line);padding:12px 13px;background:var(--surface-0)}
+.offer{background:var(--surface-1);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px;margin-bottom:9px}
+.offer .h{font-size:12px;color:var(--ink);margin-bottom:3px}
+.offer .d{font-size:11px;color:var(--dim);line-height:1.5;margin-bottom:8px}
+.pbtn{background:var(--acid);color:var(--acid-ink);border:none;border-radius:5px;
+  padding:7px 13px;font-size:12px;font-weight:600;width:100%}
+.legend{margin-top:20px;border-top:1px solid var(--line);padding-top:12px;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px}
+.legend div{color:var(--muted);font-size:11.5px;line-height:1.5}
+.legend b{color:var(--ink);font-weight:600}
+.k{color:var(--amber)}
+</style>
+
+<h1>Treatment Planning — key screen</h1>
+<p class="sub">Left: the document column in <b>Planning Mode</b>, showing in-place attribution — the assistant's
+contributions washed and ruled, the Director's own text unmarked. Right: the fourth tab, <b>Assets</b>, with proposal
+origins and one stale flag; below it the long-pass indicator and the Song&nbsp;→&nbsp;Treatment proceed offer. Tokens are
+the live ones; <b>no seventh accent is introduced</b>.</p>
+
+<div class="wrap">
+  <!-- LEFT: planning mode + brief -->
+  <div>
+    <h2 class="step">Planning Mode · Brief with attribution</h2>
+    <div class="panel">
+      <div class="planbar">
+        <span class="dot"></span>
+        <span class="txt"><b>Planning</b> — the Brief is being edited live, without the per-turn tick.</span>
+        <button class="qbtn">Exit planning</button>
+      </div>
+      <div class="tabs">
+        <div class="tab on">Brief</div>
+        <div class="tab">Treatment</div>
+        <div class="tab">Style bible</div>
+        <div class="tab">Assets <span class="chip">7</span><span class="warn">●</span></div>
+      </div>
+      <div class="body">
+        <span class="doclabel">Creative brief</span>
+        <span class="contract">The source document. Treatment and Style bible are generated from what you settle here.</span>
+        <div class="brief">
+          <p class="ai"><span class="mono who">ProducerBot · 14:15</span>
+            A single night drive through a city that never resolves into a real place — sodium light,
+            wet asphalt, reflections that do not quite match what is casting them.</p>
+          <p class="mine">She is a passenger, not the driver. Her brother drives. They do not speak
+            for the whole video.</p>
+          <p class="ai"><span class="mono who">ProducerBot · 14:22</span>
+            The brother appears only in profile and never in the same frame as her face, until the
+            final chorus, where a single wide holds them both.</p>
+        </div>
+        <div class="undo">
+          <span class="lbl">Last change: added the brother's framing rule</span>
+          <button class="qbtn">Step back</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: assets tab, pass indicator, proceed -->
+  <div>
+    <h2 class="step">Assets tab · proposals with origins</h2>
+    <div class="panel">
+      <div class="tabs">
+        <div class="tab">Brief</div>
+        <div class="tab">Treatment</div>
+        <div class="tab">Style bible</div>
+        <div class="tab on">Assets <span class="chip">7</span><span class="warn">●</span></div>
+      </div>
+      <div class="body">
+        <div class="card">
+          <div class="top"><span class="mono" style="color:var(--dim)">CHARACTER</span><span class="nm">The brother</span></div>
+          <p class="pr">Late twenties, close-cropped hair, denim jacket over a work shirt, shot in
+            profile under sodium light.</p>
+          <div class="origin"><b>From the Brief:</b> “Her brother drives. They do not speak for the
+            whole video.”</div>
+          <div class="acts"><button class="qbtn go">Accept</button><button class="qbtn">Edit prompt</button><button class="qbtn">Delete</button></div>
+        </div>
+
+        <div class="card stale">
+          <div class="top"><span class="mono" style="color:var(--dim)">SETTING</span><span class="nm">Bus depot, dawn</span></div>
+          <p class="pr">Empty depot, low sun through wire glass, buses nose-in under strip light.</p>
+          <div class="flag"><span class="mono">MAY BE STALE</span> — the Brief passage this came from
+            changed when the ending did.</div>
+          <div class="origin"><b>From the Brief:</b> “…they arrive at the depot where he works.”
+            <i>(no longer present)</i></div>
+          <div class="acts"><button class="qbtn go">Accept anyway</button><button class="qbtn">Re-propose</button><button class="qbtn">Delete</button></div>
+        </div>
+      </div>
+    </div>
+
+    <h2 class="step">Long pass · elapsed only, never a percentage</h2>
+    <div class="panel"><div class="body" style="padding:11px">
+      <div class="pass">
+        <span class="dot pulse"></span>
+        <span class="t">Suggesting a video from your song…</span>
+        <span class="el">2:14</span>
+        <button class="qbtn">Abandon</button>
+      </div>
+    </div></div>
+
+    <h2 class="step">Song → Treatment · proceeding offers, never does</h2>
+    <div class="panel"><div class="proceed">
+      <div class="offer">
+        <div class="h">Analyse the song first?</div>
+        <div class="d">Hears the track, times the lyric sheet's [Tag] blocks against it, fills the
+          Sections row, and measures the beat map the timeline uses. One pass, a couple of minutes.
+          You can skip it — nothing below needs it.</div>
+        <div class="acts"><button class="qbtn go">Analyse, then continue</button><button class="qbtn">Skip</button></div>
+      </div>
+      <button class="pbtn">Build treatment →</button>
+    </div></div>
+  </div>
+</div>
+
+<div class="legend">
+  <div><b>Attribution is neutral, not coloured.</b> A <b>surface wash + left rule</b> says “the machine wrote this”. Provenance is quieter than state — a coloured wash would read as running, error or approved.</div>
+  <div><b>Your text is the unmarked default.</b> Only the assistant's contribution is marked, and <b>editing a marked range clears its mark</b> — once you have touched it, it is yours.</div>
+  <div><b>No seventh accent.</b> Every meaning here reuses an existing one: <span class="k">amber</span> for planning-mode and staleness, because both are honestly cautions.</div>
+  <div><b>Stale is amber, never red.</b> A stale proposal is not an error and nothing is broken — the bus depot may well survive the rewrite. It stays acceptable.</div>
+  <div><b>The pass shows elapsed time and nothing else.</b> No bar, no percentage, no estimate — this pass has 26× variance and any number would be a lie.</div>
+  <div><b>The planning bar sits over the documents</b>, not beside the chat, because the documents are what is at risk. It reuses the wizard guidance-banner shape.</div>
+  <div><b>Every offer is inline.</b> The pre-flight remains the application's only modal; declining an offer always proceeds.</div>
+  <div><b>One analysis moment.</b> The offer covers structure <i>and</i> the effects beat map together — a Director must not sit through two passes for a distinction they never asked about.</div>
+</div>

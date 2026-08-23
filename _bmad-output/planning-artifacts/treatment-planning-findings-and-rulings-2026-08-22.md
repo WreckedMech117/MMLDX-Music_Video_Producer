@@ -208,6 +208,8 @@ The effects PRD (`prd-MusicVideoProducer-effects-2026-08-21`, **FX-1**) puts a *
 
 Recorded here as a **cross-PRD dependency**, owned by whichever of the two features is built second. Neither PRD is changed by it; both should cite it.
 
+**Ownership settled 2026-08-22: Treatment Planning owns it.** The Director accepted the recommendation that effects **Story 8.1** (the Song Envelope) is built first, as the story with no dependencies and no blockers. Treatment Planning therefore arrives second at the same song and inherits the obligation: **TP-18's offer must present one analysis moment covering both computations, with one indicator**, rather than adding a second pass the Director sits through separately. Designing for it now is cheaper than retrofitting it.
+
 ## Open questions for the PRD
 
 1. ~~**What exactly is a "Brief" for, now?**~~ **Answered 2026-08-22, and the analyst's premise was wrong.** The Brief is *already* upstream: `timeline.py` puts `creative_brief` into the project dump at three call sites, and the Director's own prompt opens *"You are handed the whole project: creative brief, treatment, style bible, the song's words."* Treatment and Style Bible have always been generated with the Brief as an input — the Director's original understanding was correct.
