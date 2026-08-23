@@ -16,6 +16,7 @@ from test_workflows import PANEL_COUNT_PATTERN
 
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
+    ASSET_NAME_LIMIT,
     CONSISTENCY_PROMPT_LIMIT,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
@@ -38,7 +39,12 @@ from music_video_producer.app import (
     document_not_requested_notice,
     document_restore_notice,
 )
-from music_video_producer.batch import TERMINAL_JOB_STATUSES, reconcilable_jobs
+from music_video_producer.batch import (
+    TERMINAL_JOB_STATUSES,
+    format_duration,
+    reconcilable_jobs,
+    render_timing_summary,
+)
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
     CHARACTER_SLOT_LIMIT,
@@ -8728,6 +8734,34 @@ def test_a_move_line_says_how_long_the_gap_it_found_was():
     assert "gap" not in lines["gapless"][0]["text"]
 
 
+def test_a_move_line_says_when_the_number_it_names_is_the_centre_of_a_transition():
+    """R-3's consequence for the report: an overlapping seam has no edge at the cut.
+
+    A transition is authored as an overlap, and `timeline.SEAM_POINT` places its *midpoint* in
+    the silence — an instant at which neither clip begins or ends. A Director reading
+    "144.268s" and looking for a clip edge there would find nothing, so the line says what the
+    number is and that the blend moved whole rather than being trimmed to fit. A hard cut
+    carries `overlap` 0 and reads exactly as it always has, which is what keeps the clause a
+    statement about transitions rather than decoration on every line.
+    """
+    report = json.loads(json.dumps(SNAP_REPORT))
+    report["moves"][0]["overlap"] = 5.492
+    report["moves"][1]["overlap"] = 0
+
+    lines = run_module("""
+      import { snapCutsReportLines } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        lines: snapCutsReportLines(__REPORT__),
+        older: snapCutsReportLines(__OLDER__),
+      }));
+    """.replace("__REPORT__", json.dumps(report)).replace("__OLDER__", json.dumps(SNAP_REPORT)))
+
+    assert lines["lines"][0]["text"].endswith("· centre of a 5.492s overlap, moved whole")
+    assert "overlap" not in lines["lines"][1]["text"], "a hard cut reads as it always has"
+    # A report from a server older than the field loses the clause rather than drawing `NaN`.
+    assert "overlap" not in lines["older"][0]["text"]
+
+
 def test_the_snap_button_runs_for_a_song_measured_in_words_alone():
     """`timeline.vocal_gaps` reads `lyric_words` first, so the browser's gate must too.
 
@@ -13029,10 +13063,245 @@ def test_the_client_calls_the_one_writer_for_each_new_field():
         return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({}) }); };
       await api.saveVocalType('p1', 'duet');
       await api.saveCharacterSlot('p1', 'a1', 2);
+      await api.renameAsset('p1', 'a1', 'Lucy');
       console.log(JSON.stringify(seen));
     """)
 
     assert calls == [
         ["/api/projects/p1/song/vocal-type", "PUT", '{"vocal_type":"duet"}'],
         ["/api/projects/p1/assets/a1/character-slot", "PUT", '{"character_slot":2}'],
+        ["/api/projects/p1/assets/a1/name", "PUT", '{"name":"Lucy"}'],
     ]
+
+
+# ----------------------------------------------------------------------------------------------
+# Renaming an asset (2026-08-22).
+#
+# The Director's fix for the internal label leaking into shot prose. The client half is the
+# anchor editor's shape with one rule inverted: an empty box is unsavable rather than a clear.
+# ----------------------------------------------------------------------------------------------
+
+
+def test_the_name_editor_decides_every_state_from_one_executed_rule():
+    """Executed, kind by kind and state by state, and the bound is compared to the route's.
+
+    Offered for **every** kind including `audio`, which is where this parts from the anchor: a
+    sound has no appearance but it does have a name. And the empty box is not a clear — the
+    route refuses a blank name by name, so the button must not be able to send one.
+    """
+    kinds = list(get_args(AssetKind))
+    executed = run_module(f"""
+      import {{ ASSET_NAME_LIMIT, assetNamePlan }}
+        from './src/music_video_producer/web/assets/api.js';
+      const kinds = {json.dumps(kinds)};
+      const offered = {{}};
+      for (const kind of kinds) {{
+        offered[kind] = assetNamePlan({{ id: 'a', kind, name: 'Anything' }}) !== null;
+      }}
+      const stored = {{ id: 'a', kind: 'character', name: 'HarderFaster \\u00b7 multiview' }};
+      console.log(JSON.stringify({{
+        limit: ASSET_NAME_LIMIT,
+        offered,
+        nothingSelected: assetNamePlan(null),
+        untouched: assetNamePlan(stored),
+        whitespaceOnly: assetNamePlan(stored, '  HarderFaster \\u00b7 multiview  '),
+        renamed: assetNamePlan(stored, 'Lucy'),
+        emptied: assetNamePlan(stored, '   '),
+        overLong: assetNamePlan(stored, 'z'.repeat(ASSET_NAME_LIMIT + 1)),
+        atLimit: assetNamePlan(stored, 'z'.repeat(ASSET_NAME_LIMIT)),
+      }}));
+    """)
+
+    assert executed["limit"] == ASSET_NAME_LIMIT
+    assert all(executed["offered"][kind] for kind in kinds)
+    assert executed["nothingSelected"] is None
+
+    assert executed["untouched"]["stored"] == "HarderFaster · multiview"
+    assert executed["untouched"]["savable"] is False
+    # Trailing whitespace is not an edit, because the route trims before it stores.
+    assert executed["whitespaceOnly"]["savable"] is False
+
+    # The whole name is replaced — the promotion suffix is not preserved by either side.
+    assert executed["renamed"]["savable"] is True
+    assert executed["renamed"]["draft"] == "Lucy"
+
+    # Emptying the box is a change and still unsavable, and the count says why in words rather
+    # than only in a colour.
+    assert executed["emptied"]["changed"] is True
+    assert executed["emptied"]["savable"] is False
+    assert "cannot be empty" in executed["emptied"]["count"]
+
+    assert executed["overLong"]["savable"] is False
+    assert "too long to save" in executed["overLong"]["count"]
+    assert executed["atLimit"]["savable"] is True
+
+
+def test_the_inspector_draws_a_rename_box_and_saves_it_through_the_one_route():
+    """Rendered and clicked, not read as text — `renderAssetInspector`'s own markup.
+
+    The box sits above the appearance anchor and the read-only generation prompt: the name is
+    what the rest of the panel is about, and it is the field the Director renames to keep an
+    internal label out of shot prose. The save goes to the dedicated route carrying the trimmed
+    name and nothing else; folded into the whole-project PUT it would be silently re-adopted.
+    """
+    fired = run_workspace("""
+      state.project = { id: 'p1', shots: [], jobs: [], assets: [{
+        id: 'a1', kind: 'character', path: 'out/a.png', name: 'HarderFaster \\u00b7 multiview',
+        source: 'krea-multiview', prompt: 'a woman in a blue dress',
+        consistency_prompt: '', created_at: '2026-08-20T00:00:00Z',
+      }] };
+      state.selectedAssetId = 'a1';
+      app.renderAssetInspector();
+      const markup = at('#asset-inspector').innerHTML;
+
+      const before = markup.includes('id="save-asset-name" disabled');
+      at('#asset-name').value = '   ';
+      await fire('#asset-name:input', {});
+      const afterEmptying = {
+        disabled: at('#save-asset-name').disabled,
+        count: at('#asset-name-count').textContent,
+      };
+      at('#asset-name').value = '  Lucy  ';
+      await fire('#asset-name:input', {});
+      const afterTyping = { disabled: at('#save-asset-name').disabled };
+      requests.length = 0;
+      await fire('#save-asset-name:click', {});
+      const saved = requests.map((sent) => ({ path: sent.path, method: sent.method, body: sent.body }));
+
+      console.log(JSON.stringify({
+        drawn: markup.includes('id="asset-name"'),
+        holdsStored: markup.includes('HarderFaster'),
+        nameBeforeAnchor: markup.indexOf('id="asset-name"') < markup.indexOf('Generation prompt'),
+        noMaxlength: !markup.includes('maxlength'),
+        before, afterEmptying, afterTyping, saved,
+        adopted: state.project.id,
+      }));
+    """, responses={
+        "/api/projects/p1/assets/a1/name": {
+            "body": {
+                "project": {"id": "p2", "shots": [], "jobs": [], "assets": []},
+                "name": "Lucy",
+                "previous": "HarderFaster · multiview",
+                "prompts": 0,
+                "maps": 0,
+                "message": "Renamed HarderFaster · multiview to Lucy.",
+            },
+        },
+    })
+
+    assert fired["drawn"] is True
+    assert fired["holdsStored"] is True
+    assert fired["nameBeforeAnchor"] is True
+    # No `maxlength`, the anchor's rule: it truncates an oversized paste silently.
+    assert fired["noMaxlength"] is True
+
+    assert fired["before"] is True
+    assert fired["afterEmptying"]["disabled"] is True
+    assert "cannot be empty" in fired["afterEmptying"]["count"]
+    assert fired["afterTyping"]["disabled"] is False
+
+    assert fired["saved"] == [
+        {
+            "path": "/api/projects/p1/assets/a1/name",
+            "method": "PUT",
+            "body": json.dumps({"name": "Lucy"}, separators=(",", ":")),
+        }
+    ]
+    # The reply is a report, so the client has to reach through `project` — adopting the body
+    # itself would replace the manifest on screen with a rename report.
+    assert fired["adopted"] == "p2"
+
+
+# ----------------------------------------------------------------------------------------------
+# Render timing, surfaced (2026-08-21).
+#
+# The number is only worth recording if a Director can read it without a Python prompt, and it is
+# only *honest* if the caveat travels with it: a `record`-sourced span runs from enqueue, so for
+# anything submitted as a batch the queue wait is most of the number. A duration read without
+# that caveat is exactly how a 221-frame render came to be recorded as taking 2.2 hours.
+#
+# So the sentence is written once, in `batch.render_timing_summary`, and the browser's copy is
+# *executed under node* against the same jobs and compared character for character. A wording
+# that drifts on one side fails here rather than in front of the person reading it.
+# ----------------------------------------------------------------------------------------------
+
+TIMING_JOBS = [
+    # A solo render measured by ComfyUI's own execution clock: a render time, said plainly.
+    {"status": "complete", "render_seconds": 378.0, "render_seconds_source": "comfy",
+     "render_frames": 141, "batch_id": ""},
+    # The same length measured off the record, in a batch: the caveat, and the batch named.
+    {"status": "complete", "render_seconds": 1812.0, "render_seconds_source": "record",
+     "render_frames": 226, "batch_id": "batch_1"},
+    # Measured off the record but not in a batch: the caveat without the batch claim.
+    {"status": "complete", "render_seconds": 95.0, "render_seconds_source": "record",
+     "render_frames": 0, "batch_id": ""},
+    # Never `rendered in`: a cancellation rendered for some unknown part of the time it stood open.
+    {"status": "cancelled", "render_seconds": 2400.0, "render_seconds_source": "record",
+     "render_frames": 141, "batch_id": ""},
+    {"status": "error", "render_seconds": 3661.0, "render_seconds_source": "record",
+     "render_frames": 277, "batch_id": "batch_1"},
+    # Every job written before 2026-08-21: no measurement, and none invented.
+    {"status": "complete", "render_seconds": 0.0, "render_seconds_source": "",
+     "render_frames": 0, "batch_id": ""},
+]
+
+
+def test_the_browsers_timing_sentence_is_the_servers_sentence_character_for_character():
+    jobs = [RenderJob(kind="h3", target_id="shot_a", **fields) for fields in TIMING_JOBS]
+    wire = json.dumps([json.loads(job.model_dump_json()) for job in jobs])
+    body = f"""
+      console.log(JSON.stringify({wire}.map(app.renderTimingSummary)));
+    """
+
+    assert run_workspace(body) == [render_timing_summary(job) for job in jobs]
+
+
+def test_the_two_duration_formatters_agree_and_neither_rounds_a_render_up():
+    """`6m59s` must never be shown as `7m` on either side. A render is a measurement now."""
+    table = [0, 42.9, 59.999, 60, 378, 419.9, 3599, 3600, 7500, -1]
+    body = f"""
+      console.log(JSON.stringify({json.dumps(table)}.map(app.formatDuration)));
+    """
+
+    assert run_workspace(body) == [format_duration(value) for value in table]
+
+
+def test_the_queue_column_shows_the_caveat_rather_than_hiding_it_in_a_tooltip():
+    """`≤` is the caveat made visible: an enqueue-to-settle span is an upper bound on the
+    render and never the render itself, and a reader scanning the column has to see that
+    without hovering. The full sentence rides the same cell's `title`."""
+    jobs = [json.loads(RenderJob(kind="h3", **fields).model_dump_json()) for fields in TIMING_JOBS]
+    body = f"""
+      console.log(JSON.stringify({json.dumps(jobs)}.map(app.renderTimingCell)));
+    """
+
+    cells = run_workspace(body)
+
+    assert cells == ["6m18s · 141f", "≤30m12s · 226f", "≤1m35s", "≤40m00s · 141f",
+                     "≤1h01m · 277f", "—"]
+    # Nothing measured by ComfyUI's own clock is marked as an upper bound, and nothing measured
+    # off the record is shown without the mark.
+    assert not cells[0].startswith("≤")
+
+
+def test_the_queue_panel_actually_draws_the_column_it_declares():
+    """A header with no cell under it, or a cell with no header over it, is a table that lies
+    about which column a number is in. Both sides are read, and so is the grid that lays them
+    out -- a six-column header over a five-column grid template silently overflows."""
+    header = re.search(r'<div class="queue-header">(.*?)</div>', INDEX_HTML.read_text("utf-8"))
+    assert header, "the queue table no longer declares a header row"
+    columns = re.findall(r"<span[^>]*>([^<]+)</span>", header.group(1))
+    assert columns == ["Job", "Target", "Status", "Seed", "Took", "Output"]
+
+    source = without_comments(APP_JS.read_text(encoding="utf-8"))
+    row = source.split('list.innerHTML = progress +', 1)[1].split("\n", 1)[0]
+    assert 'class="job-took"' in row, "the queue row draws no timing cell under the Took header"
+    assert "renderTimingCell(job)" in row
+    assert "renderTimingSummary(job)" in row, "the full sentence must ride the cell's title"
+
+    grid = re.search(
+        r"\.queue-header, \.job-row \{[^}]*grid-template-columns: ([^;]+);",
+        STYLES_CSS.read_text(encoding="utf-8"),
+    )
+    assert grid, "the queue grid no longer declares its columns"
+    assert len(grid.group(1).split()) == len(columns)

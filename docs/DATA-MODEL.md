@@ -79,6 +79,18 @@ Which types are tagged, and why the rest are not (`models.VOCAL_TYPE_SPECS`, one
 
 Every field an `Asset` declares is classified `ASSET_DIRECTOR_VISIBLE` or `ASSET_DIRECTOR_WITHHELD`, the same import-time guard `Song` and `Shot` carry: an unclassified, double-classified or stale entry aborts collection with the field named rather than leaking it into every Director prompt. Everything that was in the dump before that classification existed is classified visible, so it changed no prompt.
 
+### The display name (`Asset.name`)
+
+What this asset is called everywhere it is named: the library, the roster the planner is offered (`models.citable_assets`), the prose scan that turns a named asset into a citation (`models.assets_for_proposal`), and the reference map line a render is conditioned on (`timeline.anchored_label`).
+
+`PUT /api/projects/{id}/assets/{asset_id}/name` is its **only editor** — five routes *create* an asset with a name (upload, Flux generation, the stage manager's fill, and the two derivations that mint a child from a source), and nothing else assigns it. The generic full-project `PUT` re-adopts the stored name per asset id, so an ordinary whole-manifest save can neither rename an asset nor undo a rename. The hazard runs the opposite way to `consistency_prompt`'s: `name` is required, so no client omits it — every client sends back whatever name it was holding, and a browser tab left open across a rename would otherwise reassert the old one on its next save. An id the stored project does not hold keeps the body's name, because a new asset has no other source for one; blanking it would produce a library row nobody can pick.
+
+A rename **replaces the whole display name**. The ` · multiview` and ` · edit` suffixes are appended by the two derivation routes, not decorations to be preserved — preserving them would leave the Director unable to remove the very label they are renaming to get rid of, which was the Director's own reason for asking for the feature: the internal label `HarderFaster · multiview` was appearing in shot prose, and the picture is of a woman named Lucy. Trimmed, non-empty (there is no meaningful blank name, unlike an anchor or a slot), and bounded by `ASSET_NAME_LIMIT` 80 characters measured after trimming.
+
+**What a rename cannot break, and what it does not touch.** Citations resolve by `AssetCitation.asset_id`, so no shot can lose its reference. Reference maps *are* re-derived where they can be for free, because the name is in the map. Prose already written — a shot's `prompt`, a per-shot `reference_labels` rename — keeps the old spelling: those are words a person or a model wrote, and no route edits them on a rename's behalf. The route says so in its response rather than leaving the Director to read the first prompt they open as evidence the rename failed.
+
+Two assets may share a name. `models.assets_for_proposal` resolves a by-name reference to the first in library order and documents it, so this is a deterministic state rather than the ambiguity a character slot refuses — a slot is a link, and a name is a label that carries no citation.
+
 ### The appearance anchor (`Asset.consistency_prompt`)
 
 One short phrase per asset naming what it looks like — "a woman in a red leather jacket and black boots" — carried into every place a description of that asset is consumed: the reference map's tag lines (`<Picture 1> is Lucy, a woman in a red leather jacket`), the H3 expansion specialist's per-reference block, and the assistant's asset library. Bounded at `CONSISTENCY_PROMPT_LIMIT` 400 characters, measured after trimming.

@@ -4,13 +4,18 @@
 `Project` and no client, so the rules are asserted rather than inferred from a route's status code.
 """
 
+from datetime import timedelta
 from pathlib import Path
 from typing import get_args
+
+import pytest
 
 from music_video_producer.batch import (
     JOB_LOST_WITH_QUEUE,
     JOB_NEVER_SUBMITTED,
     JOB_SUPERSEDED,
+    JOB_TIMING_FROM_COMFY,
+    JOB_TIMING_FROM_RECORD,
     MISSING_TICKS_LIMIT,
     NEAR_DUPLICATE_OVERLAP,
     NOTE_KIND_PROMPT,
@@ -42,6 +47,8 @@ from music_video_producer.batch import (
     _overlap,
     _words,
     accept_submission,
+    apply_job_history,
+    format_duration,
     prompt_is_missing,
     prompt_rejection,
     queue_locations,
@@ -50,7 +57,9 @@ from music_video_producer.batch import (
     reconcilable_jobs,
     reconcile_render_jobs,
     render_status_report,
+    render_timing_summary,
     shot_label,
+    stamp_job_settled,
     supersede_target_jobs,
     take_coverage_note,
     window_band_note,
@@ -1539,3 +1548,277 @@ def test_supersession_defaults_to_absent_on_every_manifest_written_before_it():
     """The field is defaulted, so a job record that predates it loads unchanged."""
     assert RenderJob(kind="h3").superseded_by == ""
     assert RenderJob.model_validate_json('{"kind": "h3"}').superseded_by == ""
+
+
+# ----------------------------------------------------------------------------------------------
+# Render timing.
+#
+# Until 2026-08-21 this application recorded nothing about what a render cost. `updated_at` was
+# set by its default factory and no settle path ever wrote it again, so every settled job in the
+# Director's live manifest carried `updated_at == created_at` to the microsecond -- and the one
+# render-cost figure the codebase acted on turned out to be a comment citing itself, wrong by
+# roughly 3.4x. These tests are the guarantee that the reconstruction never has to happen again.
+# ----------------------------------------------------------------------------------------------
+
+
+def test_format_duration_never_rounds_a_render_up_into_the_next_unit():
+    """A render reported as `7m` when it took 6m59s is the smoothing this module exists to stop."""
+    assert format_duration(0) == "0s"
+    assert format_duration(42.9) == "42s"
+    assert format_duration(59.999) == "59s"
+    assert format_duration(60) == "1m00s"
+    assert format_duration(378) == "6m18s"
+    assert format_duration(419.9) == "6m59s"
+    assert format_duration(3599) == "59m59s"
+    assert format_duration(3600) == "1h00m"
+    assert format_duration(7_500) == "2h05m"
+    # Neither is a duration, and a clock adjustment produces the first.
+    assert format_duration(-1) == "—"
+    assert format_duration(float("inf")) == "—"
+    assert format_duration(float("nan")) == "—"
+
+
+def test_a_settle_writes_the_moment_it_ended_and_never_moves_the_enqueue_time():
+    """The stamp itself, pinned on its own.
+
+    `updated_at` used to be set by its `default_factory` and written again by nothing, so every
+    settled job in the Director's live manifest read `updated_at == created_at` to the
+    microsecond -- which is the fixture below, because that is what every manifest written
+    before 2026-08-21 actually holds. A settle moves the one and leaves the other exactly where
+    it was: `created_at` is the enqueue moment and is evidence, not bookkeeping.
+    """
+    job = RenderJob(kind="h3", target_id="shot_a")
+    enqueued = job.created_at - timedelta(hours=2)
+    job.created_at = enqueued
+    job.updated_at = enqueued
+
+    stamp_job_settled(job, elapsed_seconds=378.0)
+
+    assert job.created_at == enqueued, "a settle must not move the enqueue time"
+    assert job.updated_at > enqueued
+
+
+def test_a_job_settled_before_the_instrumentation_is_never_given_a_duration_by_a_re_read():
+    """The retroactive fabrication the transition check prevents.
+
+    Every settled job in the Director's manifest predates this instrumentation and carries no
+    measurement. A history re-read of one must leave it that way -- not record the hours between
+    the render and whenever somebody next clicked refresh, which would be a fabricated
+    measurement dressed as a recorded one, and the exact failure this whole change corrects.
+    """
+    project = render_plan()
+    settled = next(item for item in project.jobs if item.id == "job_done")
+    ended = settled.created_at - timedelta(days=1)
+    settled.created_at = ended
+    settled.updated_at = ended
+    assert settled.status == "complete" and settled.render_seconds_source == ""
+
+    apply_job_history(project, settled, completed("prompt-done", "singer_00001_.png"))
+
+    assert settled.render_seconds == 0.0
+    assert settled.render_seconds_source == ""
+    assert settled.updated_at == ended
+
+
+def test_a_settle_with_comfyuis_own_clock_records_the_render_and_says_where_it_came_from():
+    job = RenderJob(kind="h3", target_id="shot_a", render_frames=141)
+    job.created_at = job.created_at - timedelta(hours=3)
+
+    assert stamp_job_settled(job, elapsed_seconds=378.0) is True
+
+    assert job.render_seconds == 378.0
+    assert job.render_seconds_source == JOB_TIMING_FROM_COMFY
+    # The three-hour queue wait this record sat through is *not* in the number, which is the
+    # whole reason ComfyUI's clock is preferred over the record's own span.
+    assert job.updated_at > job.created_at
+
+
+def test_a_settle_with_no_measurement_falls_back_to_the_record_and_labels_it_as_such():
+    """`created_at` is enqueue, so the fallback is an upper bound and never a render time."""
+    job = RenderJob(kind="h3", target_id="shot_a")
+    job.created_at = job.created_at - timedelta(seconds=1800)
+
+    assert stamp_job_settled(job) is True
+
+    assert job.render_seconds == pytest.approx(1800, abs=5)
+    assert job.render_seconds_source == JOB_TIMING_FROM_RECORD
+
+
+def test_a_settle_is_idempotent_so_a_second_look_cannot_overwrite_the_real_measurement():
+    """Terminal is terminal. A second call could only be a later clock replacing the truth --
+    and it would make a re-read of a settled record look like a change to the reconciler, which
+    would rewrite the manifest on a tick that learned nothing."""
+    job = RenderJob(kind="h3", target_id="shot_a")
+    stamp_job_settled(job, elapsed_seconds=378.0)
+    stamped = job.updated_at
+
+    assert stamp_job_settled(job, elapsed_seconds=9999.0) is False
+
+    assert job.render_seconds == 378.0
+    assert job.updated_at == stamped
+
+
+def test_a_clock_that_ran_backwards_still_settles_the_job_but_claims_no_length():
+    job = RenderJob(kind="h3", target_id="shot_a")
+    job.created_at = job.created_at + timedelta(hours=1)
+
+    assert stamp_job_settled(job) is True
+
+    assert job.updated_at != job.created_at
+    assert job.render_seconds == 0.0
+    assert job.render_seconds_source == ""
+    assert render_timing_summary(job) == ""
+
+
+def test_a_negative_or_non_finite_measurement_is_refused_in_favour_of_the_records_own_span():
+    for offered in (-1.0, float("nan"), float("inf")):
+        job = RenderJob(kind="h3", target_id="shot_a")
+        job.created_at = job.created_at - timedelta(seconds=90)
+        stamp_job_settled(job, elapsed_seconds=offered)
+        assert job.render_seconds_source == JOB_TIMING_FROM_RECORD, offered
+        assert job.render_seconds == pytest.approx(90, abs=5), offered
+
+
+def test_the_surfaced_line_is_a_render_time_for_a_solo_job_and_carries_the_caveat_otherwise():
+    """The caveat travels with the number, because a number read without it is how a 221-frame
+    render came to be recorded as taking 2.2 hours."""
+    solo = RenderJob(kind="h3", target_id="shot_a", status="complete", render_frames=141)
+    stamp_job_settled(solo, elapsed_seconds=378.0)
+    assert render_timing_summary(solo) == "rendered in 6m18s, 141 frames"
+
+    queued = RenderJob(
+        kind="h3", target_id="shot_b", status="complete", batch_id="batch_1", render_frames=226
+    )
+    queued.created_at = queued.created_at - timedelta(seconds=1812)
+    stamp_job_settled(queued)
+    line = render_timing_summary(queued)
+    assert line.startswith("30m12s from queued to done, 226 frames;")
+    assert "the wait in the queue is included" in line
+    assert "submitted in a batch" in line
+
+    # Measured off the record but *not* part of a batch: the queue wait is still inside the
+    # number and still said so, without claiming a batch that did not happen.
+    alone = RenderJob(kind="h3", target_id="shot_c", status="complete")
+    alone.created_at = alone.created_at - timedelta(seconds=95)
+    stamp_job_settled(alone)
+    assert "submitted in a batch" not in render_timing_summary(alone)
+    assert "the wait in the queue is included" in render_timing_summary(alone)
+
+
+def test_a_job_that_did_not_complete_is_never_described_as_having_rendered():
+    """A cancellation that stood open for forty minutes rendered for some unknown part of that.
+    "rendered in 40m" would be a fabrication."""
+    job = RenderJob(kind="h3", target_id="shot_a", status="cancelled", render_frames=141)
+    job.created_at = job.created_at - timedelta(seconds=2400)
+    stamp_job_settled(job)
+
+    line = render_timing_summary(job)
+
+    assert line == (
+        "cancelled after 40m00s, 141 frames (time the record was open, not render time)"
+    )
+    assert "rendered" not in line
+
+
+def test_a_job_with_no_recorded_timing_surfaces_nothing_rather_than_a_guess():
+    """Every manifest written before 2026-08-21 is this case, and none of them may grow a number."""
+    assert render_timing_summary(RenderJob(kind="h3", target_id="shot_a")) == ""
+    assert render_timing_summary(RenderJob(kind="h3", status="complete")) == ""
+
+
+def test_the_timing_fields_default_so_every_manifest_written_before_them_loads_unchanged():
+    stored = RenderJob.model_validate_json('{"kind": "h3", "id": "job_old"}')
+
+    assert stored.render_seconds == 0.0
+    assert stored.render_seconds_source == ""
+    assert stored.render_frames == 0
+    # And "never settled" stays legible as itself rather than becoming a zero-length render.
+    assert render_timing_summary(stored) == ""
+
+
+def test_a_completion_records_the_render_from_comfyuis_clock_when_it_has_one():
+    project = render_plan()
+    job = next(item for item in project.jobs if item.id == "job_flux")
+    job.created_at = job.created_at - timedelta(seconds=4000)
+    history = HistoryResult(
+        prompt_id="prompt-flux",
+        status="complete",
+        outputs=[{"subfolder": "out", "filename": "singer_00001_.png"}],
+        started_ms=1_724_000_000_000,
+        finished_ms=1_724_000_212_000,
+    )
+
+    apply_job_history(project, job, history)
+
+    assert job.status == "complete"
+    assert job.render_seconds == pytest.approx(212.0)
+    assert job.render_seconds_source == JOB_TIMING_FROM_COMFY
+
+
+def test_a_completion_with_no_clock_falls_back_to_the_record_and_a_re_read_changes_nothing():
+    """The per-job refresh route runs `apply_job_history` on the same answer twice. A settled
+    job re-read must not be re-dated -- see `stamp_job_settled`'s idempotence."""
+    project = render_plan()
+    job = next(item for item in project.jobs if item.id == "job_flux")
+    history = completed("prompt-flux", "singer_00001_.png")
+
+    apply_job_history(project, job, history)
+    first = (job.render_seconds, job.render_seconds_source, job.updated_at)
+    apply_job_history(project, job, history)
+
+    assert job.render_seconds_source == JOB_TIMING_FROM_RECORD
+    assert (job.render_seconds, job.render_seconds_source, job.updated_at) == first
+
+
+def test_a_queued_to_running_move_is_not_a_settle_and_stamps_nothing():
+    """`updated_at` means "when this ended". If a status move that is not an ending wrote it,
+    `updated_at - created_at` would stop being a duration."""
+    project = render_plan()
+    job = next(item for item in project.jobs if item.id == "job_flux")
+    created = job.created_at
+
+    apply_job_history(project, job, HistoryResult(prompt_id="prompt-flux", status="running"))
+
+    assert job.status == "running"
+    assert job.updated_at == created
+    assert job.render_seconds_source == ""
+
+
+async def test_the_missing_ticks_death_stamps_the_record_it_settles():
+    """No ComfyUI measurement exists by definition here -- this branch is reached *because*
+    ComfyUI has no record of the prompt -- so the span is the record's own and is labelled so."""
+    project = render_plan()
+    job = next(item for item in project.jobs if item.id == "job_flux")
+    job.created_at = job.created_at - timedelta(seconds=600)
+    comfy = ScriptedComfy(
+        histories={
+            "prompt-flux": HistoryResult(prompt_id="prompt-flux", status="queued", known=False)
+        }
+    )
+
+    for _ in range(MISSING_TICKS_LIMIT):
+        await reconcile_render_jobs(project, comfy)
+
+    assert job.status == "error"
+    assert job.error == JOB_LOST_WITH_QUEUE
+    assert job.render_seconds_source == JOB_TIMING_FROM_RECORD
+    assert job.render_seconds == pytest.approx(600, abs=5)
+    assert job.updated_at > job.created_at
+
+
+def test_supersession_stamps_the_record_and_does_not_call_it_a_render():
+    """An older prompt may still be executing on ComfyUI as this runs, so what is recorded is
+    how long the *record* stood open -- and the surfaced line says exactly that."""
+    project = superseding_plan()
+    stale = next(job for job in project.jobs if job.id == "job_stale")
+    stale.created_at = stale.created_at - timedelta(seconds=125)
+
+    supersede_target_jobs(project, kinds={"h3"}, target_id="shot_a", keep_job_id="job_new")
+
+    assert stale.status == "cancelled"
+    assert stale.render_seconds == pytest.approx(125, abs=5)
+    assert stale.render_seconds_source == JOB_TIMING_FROM_RECORD
+    assert "not render time" in render_timing_summary(stale)
+    # The bystanders are untouched, timing included: a settle stamps the record it settles.
+    bystander = next(job for job in project.jobs if job.id == "job_other_shot")
+    assert bystander.render_seconds_source == ""

@@ -4134,6 +4134,45 @@
     "python_module": "comfy_extras.nodes_minimax_music",
     "search_aliases": null
   },
+  "ModelAttentionBackend": {
+    "category": "model/patch",
+    "description": "",
+    "display_name": "ModelAttentionBackend",
+    "has_intermediate_output": false,
+    "input": {
+      "required": {
+        "attention": [
+          [
+            "pytorch attention",
+            "comfy kitchen attention"
+          ]
+        ],
+        "model": [
+          "MODEL"
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "model",
+        "attention"
+      ]
+    },
+    "is_input_list": false,
+    "name": "ModelAttentionBackend",
+    "output": [
+      "MODEL"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "output_name": [
+      "MODEL"
+    ],
+    "output_node": false,
+    "python_module": "comfy_extras.nodes_model_advanced",
+    "search_aliases": []
+  },
   "ModelPreviewOverrideKJ": {
     "api_node": false,
     "category": "KJNodes/sampling",
@@ -4151,6 +4190,26 @@
         ]
       },
       "optional": {
+        "tiny_vae": [
+          "COMBO",
+          {
+            "default": "none",
+            "multiselect": false,
+            "options": [
+              "none",
+              "taef1_decoder.safetensors",
+              "taef1_encoder.safetensors",
+              "taeh3.safetensors",
+              "taesd3_decoder.safetensors",
+              "taesd3_encoder.safetensors",
+              "taesd_decoder.safetensors",
+              "taesd_encoder.safetensors",
+              "taesdxl_decoder.safetensors",
+              "taesdxl_encoder.safetensors"
+            ],
+            "tooltip": "Tiny VAE decoder from models/vae_approx for true-RGB previews. Overrides Latent2RGB and the 'vae' input."
+          }
+        ],
         "vae": [
           "VAE",
           {
@@ -4219,7 +4278,8 @@
         "unique_id"
       ],
       "optional": [
-        "vae"
+        "vae",
+        "tiny_vae"
       ],
       "required": [
         "model",
@@ -5662,10 +5722,10 @@
             "minimax_h3_video_vae_fp16.safetensors",
             "minimax_music3_dav.safetensors",
             "qwen_image_vae.safetensors",
-            "taef1",
-            "taesd",
-            "taesd3",
             "taesdxl",
+            "taesd",
+            "taef1",
+            "taesd3",
             "pixel_space"
           ]
         ]

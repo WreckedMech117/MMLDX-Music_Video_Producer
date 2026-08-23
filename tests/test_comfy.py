@@ -11,8 +11,10 @@ from music_video_producer.comfy import (
     ComfyError,
     ComfyProgressListener,
     ComfyWebSocket,
+    HistoryResult,
     ProgressTracker,
     WebSocketClosed,
+    execution_span_ms,
     progress_from_message,
 )
 
@@ -632,3 +634,174 @@ async def test_an_absurd_frame_length_is_refused_rather_than_allocated():
         with pytest.raises(WebSocketClosed, match="Refusing"):
             await asyncio.wait_for(socket.receive(), timeout=5)
         await socket.close()
+
+
+# ----------------------------------------------------------------------------------------------
+# ComfyUI's own execution clock, out of `/history`.
+#
+# The shape asserted here is not guessed. It was read out of the Director's own ComfyUI 0.33.1
+# source on 2026-08-21: `PromptExecutor.add_message` stamps `"timestamp": int(time.time() * 1000)`
+# onto every status message, `execute()` clears `status_messages` and emits `execution_start`
+# before the first node runs, and `PromptQueue.task_done` copies the list into the history entry
+# as `status.messages`. These tests pin that reading, so a ComfyUI upgrade that changes it fails
+# here rather than silently reverting this application to having no render timings at all.
+# ----------------------------------------------------------------------------------------------
+
+
+def history_payload(prompt_id: str, messages: list) -> dict:
+    """One `/history/{id}` answer in ComfyUI 0.33.1's shape, with the given status messages."""
+    return {
+        prompt_id: {
+            "prompt": [0, prompt_id, {}, {"create_time": 1_724_000_000_000}, []],
+            "outputs": {"9": {"gifs": [{"filename": "take.mp4", "subfolder": "shots"}]}},
+            "status": {"status_str": "success", "completed": True, "messages": messages},
+        }
+    }
+
+
+async def history_of(payload: dict, prompt_id: str = "p-1"):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    client = ComfyClient("http://comfy.test", transport=httpx.MockTransport(handler))
+    try:
+        return await client.history(prompt_id)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_history_reads_comfyuis_own_execution_clock_and_excludes_the_queue_wait():
+    """The measurement this application should always have been taking.
+
+    `execution_start` is stamped when the prompt *leaves* the queue, so the span between it and
+    `execution_success` is the render alone. That is the whole reason it is preferred over the
+    job record's `created_at`, which is enqueue and therefore carries the wait with it -- the
+    difference between the two is most of the number for anything submitted as a batch.
+    """
+    start = 1_724_000_100_000
+    result = await history_of(
+        history_payload(
+            "p-1",
+            [
+                ["execution_start", {"prompt_id": "p-1", "timestamp": start}],
+                ["execution_cached", {"nodes": [], "timestamp": start + 200}],
+                ["execution_success", {"prompt_id": "p-1", "timestamp": start + 378_000}],
+            ],
+        )
+    )
+
+    assert result.started_ms == start
+    assert result.finished_ms == start + 378_000
+    assert result.elapsed_seconds == pytest.approx(378.0)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_and_an_interrupted_prompt_both_report_how_long_they_ran():
+    """An error after forty minutes is exactly as interesting as a success after forty."""
+    start = 1_724_000_100_000
+    for event in ("execution_error", "execution_interrupted"):
+        result = await history_of(
+            history_payload(
+                "p-1",
+                [
+                    ["execution_start", {"prompt_id": "p-1", "timestamp": start}],
+                    [event, {"prompt_id": "p-1", "timestamp": start + 61_500}],
+                ],
+            )
+        )
+        assert result.elapsed_seconds == pytest.approx(61.5), event
+
+
+@pytest.mark.asyncio
+async def test_a_history_answer_with_no_execution_clock_reports_none_rather_than_zero():
+    """`None` is "ComfyUI did not say"; `0.0` is a legitimate reading for a fully cached prompt.
+
+    A caller that cannot tell them apart records a render as having taken no time, which is a
+    fabricated measurement -- the precise failure mode this whole change is a correction of.
+    """
+    result = await history_of(history_payload("p-1", []))
+
+    assert result.started_ms is None
+    assert result.finished_ms is None
+    assert result.elapsed_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_that_started_and_has_not_finished_has_no_span_yet():
+    start = 1_724_000_100_000
+    result = await history_of(
+        history_payload("p-1", [["execution_start", {"prompt_id": "p-1", "timestamp": start}]])
+    )
+
+    assert result.started_ms == start
+    assert result.finished_ms is None
+    assert result.elapsed_seconds is None
+
+
+@pytest.mark.parametrize(
+    "status_data",
+    [
+        None,
+        "messages",
+        {},
+        {"messages": "execution_start"},
+        {"messages": [["execution_start"], []]},
+        {"messages": [["execution_start", "1724000100000"]]},
+        {"messages": [["execution_start", {"prompt_id": "p-1"}]]},
+        {"messages": [["execution_start", {"timestamp": "1724000100000"}]]},
+        {"messages": [["execution_start", {"timestamp": True}]]},
+    ],
+)
+def test_a_history_shape_this_build_does_not_recognise_answers_none_rather_than_raising(
+    status_data,
+):
+    """`progress_from_message`'s rule, one endpoint over.
+
+    This reads a foreign wire format from a component the Director upgrades independently of
+    this application. A timing is an enhancement; a render must never fail because ComfyUI
+    phrased its history differently, so every unrecognised shape is `(None, None)`.
+
+    `True` is in the table on purpose: `bool` is an `int` in Python, so an unguarded
+    `isinstance(stamp, int)` accepts it and records a render as having finished in 1970.
+    """
+    assert execution_span_ms(status_data) == (None, None)
+
+
+def test_a_clock_that_ran_backwards_is_not_a_measurement():
+    """Both stamps come off `time.time()`, which a clock adjustment can move. A negative
+    duration is not a fast render."""
+    result = HistoryResult(
+        prompt_id="p-1",
+        status="complete",
+        started_ms=1_724_000_500_000,
+        finished_ms=1_724_000_100_000,
+    )
+
+    assert result.elapsed_seconds is None
+
+
+def test_a_fully_cached_prompt_reports_zero_seconds_and_not_nothing():
+    result = HistoryResult(
+        prompt_id="p-1",
+        status="complete",
+        started_ms=1_724_000_100_000,
+        finished_ms=1_724_000_100_000,
+    )
+
+    assert result.elapsed_seconds == 0.0
+
+
+def test_the_last_ending_wins_when_a_history_carries_more_than_one():
+    """A prompt emits one ending. Reading the last of whatever is there cannot be wrong where
+    reading the first can."""
+    start = 1_724_000_100_000
+    assert execution_span_ms(
+        {
+            "messages": [
+                ["execution_start", {"timestamp": start}],
+                ["execution_error", {"timestamp": start + 1_000}],
+                ["execution_success", {"timestamp": start + 9_000}],
+            ]
+        }
+    ) == (start, start + 9_000)

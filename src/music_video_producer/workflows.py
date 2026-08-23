@@ -556,6 +556,260 @@ H3_REFERENCE_PROFILES: dict[str, H3SamplingProfile] = {
 H3_DEFAULT_PROFILE = "default"
 
 
+# --------------------------------------------------------------------------------------------
+# Attention backend profiles — spec-h3-attention-backend, unmeasured.
+# --------------------------------------------------------------------------------------------
+
+#: The non-``model`` inputs each attention node class declares, in the order the live schema
+#: publishes them. A profile whose keys do not match its class's exactly is refused at import:
+#: an input name ComfyUI does not know reaches ``/prompt`` validation as an opaque 502 after
+#: the submission round-trip, the same failure ``H3_REFERENCE_MAX_FRAMES`` exists to prevent.
+#: Confirmed against live ``/object_info`` on ComfyUI 0.33.3, 2026-08-21, and re-checked there
+#: by ``tests/preflight_h3_ultra.py`` rather than trusted from here.
+H3_ATTENTION_NODE_INPUTS: dict[str, tuple[str, ...]] = {
+    "PathchSageAttentionKJ": ("sage_attention", "allow_compile"),
+    "ModelAttentionBackend": ("attention",),
+}
+
+#: The Python type each of those inputs takes, so ``allow_compile="False"`` — a string that is
+#: truthy everywhere it is read — fails on the line that wrote it rather than silently enabling
+#: ``torch.compile`` on a measurement run. ``sage_attention`` and ``attention`` are COMBO
+#: strings; the pre-flight is what checks their *values* against the live option list.
+H3_ATTENTION_INPUT_TYPES: dict[str, type] = {
+    "sage_attention": str,
+    "attention": str,
+    "allow_compile": bool,
+}
+
+#: Where each attention node class sits relative to ``MiniMaxH3SigmaShift`` in the model patch
+#: chain. **Read from the graphs, not chosen**, because node order in a patch chain is
+#: semantic and each class arrives with its own evidence:
+#:
+#: - ``PathchSageAttentionKJ`` sits *after* the sigma shift in
+#:   ``workflow_templates/reference_exports/h3-ultra-references-user-export.json`` and in every
+#:   other H3 export this adapter reproduces — which is where this adapter already emits it,
+#:   and why the default profile's bytes do not move.
+#: - ``ModelAttentionBackend`` sits *before* the sigma shift in the Director's Comfy Kitchen
+#:   graph, ``J:/Hermes-Remote/comfyui/workflowsbackup/ComfyKitchen/MiniMax-H3 TXT2VID IMG2VID
+#:   (Full)- 20260818.json``. Chain-walked there on 2026-08-21 by MODEL link rather than by
+#:   layout: node ``215`` (``UNETLoader``) → ``6006`` (``LoraLoaderModelOnly``, muted) → ``6088``
+#:   (``Power Lora Loader (rgthree)``) → **``6095`` (``ModelAttentionBackend``, ``"comfy kitchen
+#:   attention"``)** → ``6007`` (``MiniMaxH3SigmaShift`` 12/3) → ``214`` (``BasicGuider``) and
+#:   ``212`` (``BasicScheduler``) → ``213`` (``SamplerCustomAdvanced``). That graph's *disabled*
+#:   Sage branch (node ``223``, muted, ``["auto", False]``) hangs off the same Power Lora output
+#:   and feeds its own muted sigma shift ``6097``, so the two attention nodes there are parallel
+#:   branches rather than a stack.
+#:
+#: Whether the placement is load-bearing was checked in the implementations rather than assumed
+#: from the picture, and the answer is that it is not — but only because exactly one attention
+#: node is ever emitted. ``ModelAttentionBackend.patch`` calls
+#: ``ModelPatcher.set_model_optimized_attention``, which writes
+#: ``model_options["transformer_options"]["optimized_attention_override"]``
+#: (``comfy/model_patcher.py:688``); ``PathchSageAttentionKJ.patch`` writes **the same key**
+#: (``ComfyUI-KJNodes/nodes/model_optimization_nodes.py:134``). Two of them in one chain do not
+#: compose — the later one wins, silently — which is the mechanical reason this registry emits
+#: one node per profile and the reason the Kitchen graph branches instead of stacking. Given
+#: that, the position each class is placed at is faithfulness to its own evidence rather than a
+#: functional claim, and faithfulness is what this module trades on.
+H3_ATTENTION_CHAIN_POSITION: dict[str, str] = {
+    "PathchSageAttentionKJ": "after-shift",
+    "ModelAttentionBackend": "before-shift",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class H3AttentionProfile:
+    """One *whole* way for the H3 graph to compute attention: a node class and its values.
+
+    A bundle for the same reason ``H3SamplingProfile`` is one. The two classes are not two
+    settings of one knob — they come from different graphs, take different input names, sit at
+    different points in the patch chain, and write the *same* model option, so a payload
+    carrying both is a graph where one of them silently does nothing. Naming a profile picks
+    the whole node; the individual values are never accepted from a caller.
+
+    ``position`` is a property rather than a field on purpose: it is a property of the node
+    class's evidence, not a knob a new profile may choose. See ``H3_ATTENTION_CHAIN_POSITION``.
+
+    **None of these has been rendered.** Every profile here is schema-audited only — its class
+    exists and its combo value is in the live option list, checked by
+    ``tests/preflight_h3_ultra.py`` — and that is not evidence of a frame, still less of a
+    frame whose mouth is in the right place. ``tests/measure_h3_attention.py`` is the
+    measurement, and it has not been run.
+    """
+
+    class_type: str
+    #: The non-``model`` inputs, as ordered pairs so the emitted node's key order is fixed and
+    #: a digest can pin it. A mapping would be mutable and unhashable on a frozen dataclass.
+    inputs: tuple[tuple[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        expected = H3_ATTENTION_NODE_INPUTS.get(self.class_type)
+        if expected is None:
+            raise ValueError(
+                f"An H3 attention profile must name a known attention node, not "
+                f"{self.class_type!r}; the classes are "
+                f"{', '.join(sorted(H3_ATTENTION_NODE_INPUTS))}"
+            )
+        names = tuple(name for name, _ in self.inputs)
+        if names != expected:
+            raise ValueError(
+                f"{self.class_type} takes {expected}, not {names}"
+            )
+        for name, value in self.inputs:
+            wanted = H3_ATTENTION_INPUT_TYPES[name]
+            # `type(...) is` rather than `isinstance`: `bool` is an `int` and, more to the
+            # point here, a caller who writes `allow_compile="False"` gets a truthy string.
+            if type(value) is not wanted:
+                raise ValueError(
+                    f"{self.class_type}.{name} takes a {wanted.__name__}, not {value!r}"
+                )
+            if wanted is str and not value.strip():
+                raise ValueError(f"{self.class_type}.{name} must be named, not {value!r}")
+
+    @property
+    def position(self) -> str:
+        """Where this profile's node sits relative to the sigma shift."""
+        return H3_ATTENTION_CHAIN_POSITION[self.class_type]
+
+    def node(self, model_source: list[Any]) -> dict[str, Any]:
+        """The single node this profile emits, drawing from ``model_source``."""
+        return {
+            "class_type": self.class_type,
+            "inputs": {"model": model_source, **dict(self.inputs)},
+        }
+
+
+#: The attention backends a caller may select, each whole.
+#:
+#: ``default`` is what every H3 adapter here has always emitted: ``PathchSageAttentionKJ`` at
+#: ``disabled`` with ``allow_compile`` off, faithful to the Director's 2026-08-17 exports. Read
+#: the KJ node's source before reading that as "no acceleration": at ``disabled`` its ``patch``
+#: is ``return model,`` — no clone, no model option written, nothing. **The default profile
+#: does not select a backend; it declines to override the one ComfyUI was launched with.**
+#:
+#: On this machine that is *not* pytorch. ``/system_stats`` reports ``argv`` as
+#: ``[main.py, --use-sage-attention, --fast]`` and ``ComfyUI/user/comfyui.log`` prints
+#: ``Using sage attention`` at every start retained, including ``2026-08-20 09:00:34`` —
+#: inside the serial overnight batch the render-cost cliff was reconstructed from. So the
+#: cliff was measured **on SageAttention**, and the comparison arm nobody here has ever
+#: rendered is plain ``pytorch``. That is why ``pytorch`` is a profile.
+#:
+#: ``pytorch`` and ``comfy-kitchen`` are ``ModelAttentionBackend``'s two published options,
+#: read from live ``/object_info`` and re-checked by the pre-flight. ``comfy-kitchen`` is the
+#: backend the Director's own Comfy Kitchen graph selects (node ``6095``, active); it is
+#: ``comfy-kitchen``'s int8 attention (core maps the label to ``comfy_kitchen_int8``), so a
+#: lip-sync check is not optional on it.
+#:
+#: **Two of the eight sage kernels are blessed, and the argument is the installed library, not
+#: the option list.** ComfyUI's embedded python has ``sageattention 2.2.0+cu128torch2.7.1``
+#: and no ``sageattn3`` package at all:
+#:
+#: - ``sage-auto`` (``auto``) calls the library's own dispatcher, and that dispatcher's sm120
+#:   branch is explicit — ``sageattention/core.py:152`` routes Blackwell to
+#:   ``sageattn_qk_int8_pv_fp8_cuda(pv_accum_dtype="fp32+fp16", qk_quant_gran="per_warp")``,
+#:   commenting that "sm120 has accurate fp32 accumulator for fp8 mma". This is the vendor's
+#:   own choice for this card, and it should reproduce ``default``'s timing — which makes it
+#:   the experiment's internal control rather than a fifth guess.
+#: - ``sage-fp8-cuda++`` names that same kernel and accumulator by hand. KJ's ``++`` mode
+#:   passes ``pv_accum_dtype="fp32+fp16"`` and leaves ``qk_quant_gran`` at the library default
+#:   ``per_thread`` (``model_optimization_nodes.py:46``), so it differs from ``sage-auto`` in
+#:   exactly one term. If the two diverge, granularity is what diverged.
+#:
+#: The other five are deliberately **not reachable**, each for a stated reason, because a
+#: registry that lists every option the schema publishes is a list of things nobody has
+#: reasoned about:
+#:
+#: - ``sageattn3`` / ``sageattn3_per_block_mean`` import ``sageattn3``, a *separate* package
+#:   (``model_optimization_nodes.py:51``) that is not installed. They would raise ImportError
+#:   at sampling time — after the checkpoint is loaded and the GPU minutes are spent.
+#: - ``sageattn_qk_int8_pv_fp16_triton``: the installed library's own sm120 comment says "the
+#:   triton kernel is currently not usable on sm120".
+#: - ``sageattn_qk_int8_pv_fp16_cuda`` and plain ``sageattn_qk_int8_pv_fp8_cuda``
+#:   (``fp32+fp32``) are lower-precision-accumulator paths the vendor does not select for this
+#:   architecture. Adding one is a one-line edit here plus a reason; that is the point.
+#:
+#: ``allow_compile`` stays ``False`` on every sage profile. It is a second variable, it needs
+#: a ``torch.compile`` warmup this measurement does not budget for, and holding it constant is
+#: what makes the sage arms comparable to each other.
+H3_ATTENTION_PROFILES: dict[str, H3AttentionProfile] = {
+    "default": H3AttentionProfile(
+        class_type="PathchSageAttentionKJ",
+        inputs=(("sage_attention", "disabled"), ("allow_compile", False)),
+    ),
+    "pytorch": H3AttentionProfile(
+        class_type="ModelAttentionBackend",
+        inputs=(("attention", "pytorch attention"),),
+    ),
+    "comfy-kitchen": H3AttentionProfile(
+        class_type="ModelAttentionBackend",
+        inputs=(("attention", "comfy kitchen attention"),),
+    ),
+    "sage-auto": H3AttentionProfile(
+        class_type="PathchSageAttentionKJ",
+        inputs=(("sage_attention", "auto"), ("allow_compile", False)),
+    ),
+    "sage-fp8-cuda++": H3AttentionProfile(
+        class_type="PathchSageAttentionKJ",
+        inputs=(("sage_attention", "sageattn_qk_int8_pv_fp8_cuda++"), ("allow_compile", False)),
+    ),
+}
+
+#: The attention profile a caller that names none gets: today's node, today's values.
+H3_DEFAULT_ATTENTION = "default"
+
+
+def resolve_h3_attention(attention: str) -> H3AttentionProfile:
+    """Look up an attention profile by name, refusing anything else.
+
+    The type is checked as well as the membership for ``build_h3_reference_payload``'s
+    reason: a caller that is not the route can pass an unhashable value, and
+    ``attention in {...}`` would raise ``TypeError``, which no caller's ``except ValueError``
+    translates. Silently falling back to the default would be worse than either — a
+    measurement run that mistyped its profile would report the baseline's numbers under the
+    candidate's name, which is the one outcome this whole experiment cannot survive.
+    """
+    if not isinstance(attention, str) or attention not in H3_ATTENTION_PROFILES:
+        raise ValueError(
+            f"Unknown H3 attention profile: {attention!r}; the profiles are "
+            f"{', '.join(sorted(H3_ATTENTION_PROFILES))}"
+        )
+    return H3_ATTENTION_PROFILES[attention]
+
+
+def _h3_attention_chain(
+    attention: H3AttentionProfile, model_source: list[Any]
+) -> tuple[dict[str, dict[str, Any]], list[Any]]:
+    """The sigma shift and the attention patch, in the order the profile's evidence puts them.
+
+    Returns the two nodes and the output the rest of the graph must read, so no caller has to
+    know which of them ended up last. Shared by the reference and keyframe adapters, which
+    carry the same 12/3 shift; the image-edit graph has no sigma shift at all and so has
+    nothing to be ordered against — it emits ``profile.node`` directly.
+    """
+    shift_tail = {"shift_video": 12, "shift_audio": 3}
+    if attention.position == "after-shift":
+        return (
+            {
+                "mvp:shift": {
+                    "class_type": "MiniMaxH3SigmaShift",
+                    "inputs": {"model": model_source, **shift_tail},
+                },
+                "mvp:attention": attention.node(["mvp:shift", 0]),
+            },
+            ["mvp:attention", 0],
+        )
+    return (
+        {
+            "mvp:attention": attention.node(model_source),
+            "mvp:shift": {
+                "class_type": "MiniMaxH3SigmaShift",
+                "inputs": {"model": ["mvp:attention", 0], **shift_tail},
+            },
+        },
+        ["mvp:shift", 0],
+    )
+
+
 #: The frame ceiling ``MiniMaxH3ReferenceToVideo.length`` declares (about 150 s at 24 fps).
 #: Above it ComfyUI rejects the whole prompt at ``/prompt`` validation with
 #: ``value_bigger_than_max``, which reaches the Director as an opaque 502 after the submission
@@ -821,6 +1075,7 @@ def build_h3_reference_payload(
     steps: int | None = None,
     ref_image_size: str = "match",
     profile: str = H3_DEFAULT_PROFILE,
+    attention: str = H3_DEFAULT_ATTENTION,
 ) -> dict[str, dict[str, Any]]:
     """Build the H3 Ultra references-to-video path in one of its evidenced profiles.
 
@@ -846,6 +1101,11 @@ def build_h3_reference_payload(
     ``steps`` left as ``None`` takes the profile's own count — the number its evidence
     was rendered at. A count supplied here overrides it: the profile chooses the graph,
     the Director chooses the effort.
+
+    ``attention`` selects a whole attention node from ``H3_ATTENTION_PROFILES`` — the class,
+    its values and its place in the patch chain together. It is orthogonal to ``profile``:
+    one names how the model is sampled, the other how its attention is computed. The default
+    emits the node this builder has always emitted, in the position it has always been in.
 
     **Geometry comes one way or the other, never both.** ``width``/``height`` are an explicit
     frame and are honoured exactly — a caller asking for 640x384 gets 640x384, byte for byte,
@@ -874,6 +1134,10 @@ def build_h3_reference_payload(
             f"{', '.join(sorted(H3_REFERENCE_PROFILES))}"
         )
     sampling = H3_REFERENCE_PROFILES[profile]
+    # Resolved here, beside the sampling profile and before any reference is looked at, for
+    # the same reason: a mistyped backend name must fail on the request rather than on
+    # whichever unrelated thing it happens to trip over next.
+    attention_profile = resolve_h3_attention(attention)
     sampled_steps = sampling.steps if steps is None else steps
     # Geometry, resolved once and before any reference is looked at, so a request carrying
     # two contradictory ways to say how big the frame is fails on that rather than on
@@ -979,6 +1243,10 @@ def build_h3_reference_payload(
     # a LoRA moves the whole graph onto it rather than leaving a node behind on the
     # unpatched model — which would silently sample half-adapted.
     model_source = ["mvp:model", 0] if sampling.lora is None else ["mvp:lora", 0]
+    # The shift and the attention patch, in the attention profile's evidenced order, and the
+    # output everything downstream reads — which is `mvp:attention` on the default profile,
+    # exactly as it was before an attention profile existed.
+    patch_chain, patched_model = _h3_attention_chain(attention_profile, model_source)
     return {
         "mvp:model": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
         # Absent entirely on a profile with no LoRA: an unpacked empty mapping adds no
@@ -997,9 +1265,8 @@ def build_h3_reference_payload(
                 }
             }
         ),
-        "mvp:shift": {"class_type": "MiniMaxH3SigmaShift", "inputs": {"model": model_source, "shift_video": 12, "shift_audio": 3}},
-        "mvp:attention": {"class_type": "PathchSageAttentionKJ", "inputs": {"model": ["mvp:shift", 0], "sage_attention": "disabled", "allow_compile": False}},
-        "mvp:preview": {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": ["mvp:attention", 0], "max_resolution": 1024, "jpeg_quality": 80, "suppress_default_preview": True, "preview_frames": 12, "preview_fps": 12}},
+        **patch_chain,
+        "mvp:preview": {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": patched_model, "max_resolution": 1024, "jpeg_quality": 80, "suppress_default_preview": True, "preview_frames": 12, "preview_fps": 12}},
         "mvp:clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
         "mvp:video_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
         "mvp:audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
@@ -1048,6 +1315,7 @@ def build_h3_keyframe_payload(
     aspect_ratio: str | None = None,
     multiple: int | None = None,
     steps: int | None = None,
+    attention: str = H3_DEFAULT_ATTENTION,
 ) -> dict[str, dict[str, Any]]:
     """Build the MiniMax H3 first/last keyframe graph (the Director's ``I2V-FLframe`` mode).
 
@@ -1108,8 +1376,14 @@ def build_h3_keyframe_payload(
       computed here exactly as ``build_h3_reference_payload`` computes it.
 
     ``steps`` left as ``None`` takes ``H3_KEYFRAME_DEFAULT_STEPS``, the export's own count.
-    There is no ``profile`` parameter on purpose — see that constant.
+    There is no *sampling* ``profile`` parameter on purpose — see that constant. ``attention``
+    is a different question and is offered: it names how attention is computed rather than
+    what is sampled, so unlike a LoRA bundle it carries no unevidenced blend of this graph
+    with someone else's. The default emits this graph's own two patch nodes unchanged.
     """
+    # Refused before anything else, so a mistyped backend fails on the request rather than on
+    # whichever unrelated thing it happens to trip over next.
+    attention_profile = resolve_h3_attention(attention)
     # Both checks are one condition apiece so a wrong type and a blank string alike arrive
     # as the `ValueError` the route translates into a 422 — a `TypeError` would escape as a
     # 500, the same reasoning `select_resolution` records for its own combined conditions.
@@ -1144,6 +1418,10 @@ def build_h3_keyframe_payload(
     # frame, entry 1 the last. The labels name the roles so a ComfyUI-side log reads as the
     # shot does; which file plays which role is decided by the named parameters above,
     # never by the order a caller happened to list citations in.
+    # The shift and the attention patch, in the attention profile's evidenced order. Same
+    # helper and same 12/3 shift as the reference adapter; the default emits this graph's
+    # existing two nodes, in their existing order, byte for byte.
+    patch_chain, patched_model = _h3_attention_chain(attention_profile, ["mvp:model", 0])
     frames = [{"kind": "picture", "file": first_frame, "label": "first frame", "enabled": True}]
     if last_frame is not None:
         frames.append(
@@ -1162,9 +1440,8 @@ def build_h3_keyframe_payload(
         condition_inputs["last_frame"] = ["mvp:split", H3_SPLIT_OFFSETS["picture"] + 1]
     return {
         "mvp:model": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
-        "mvp:shift": {"class_type": "MiniMaxH3SigmaShift", "inputs": {"model": ["mvp:model", 0], "shift_video": 12, "shift_audio": 3}},
-        "mvp:attention": {"class_type": "PathchSageAttentionKJ", "inputs": {"model": ["mvp:shift", 0], "sage_attention": "disabled", "allow_compile": False}},
-        "mvp:preview": {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": ["mvp:attention", 0], "max_resolution": 1024, "jpeg_quality": 80, "suppress_default_preview": True, "preview_frames": 12, "preview_fps": 12}},
+        **patch_chain,
+        "mvp:preview": {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": patched_model, "max_resolution": 1024, "jpeg_quality": 80, "suppress_default_preview": True, "preview_frames": 12, "preview_fps": 12}},
         "mvp:clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
         "mvp:video_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
         "mvp:audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
@@ -1312,6 +1589,7 @@ def build_h3_image_edit_payload(
     height: int | None = None,
     steps: int | None = None,
     profile: str = "default",
+    attention: str = H3_DEFAULT_ATTENTION,
     prefix: str,
 ) -> dict[str, dict[str, Any]]:
     """Build the H3 image-edit graph: a ``length: 5`` reference render that saves one image.
@@ -1332,9 +1610,15 @@ def build_h3_image_edit_payload(
     ``ImageScaleToTotalPixelsX`` (2 MP, ×32, crop, lanczos) into ``ref_image_0`` while
     pictures 2–9 ride the splitter unscaled; and the sampler's latent is an
     ``EmptyMiniMaxH3ImageLatentAV`` canvas, not the conditioner's output.
+
+    ``attention`` selects a whole attention node from ``H3_ATTENTION_PROFILES``. **There is no
+    sigma shift in this export**, so this graph's attention node has nothing to be ordered
+    against and every profile's node lands in the one slot — between the model source and the
+    scheduler and guider, where this builder's ``PathchSageAttentionKJ`` already sits.
     """
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("An image edit requires a prompt")
+    attention_profile = resolve_h3_attention(attention)
     if profile not in H3_IMAGE_EDIT_PROFILES:
         named = ", ".join(sorted(H3_IMAGE_EDIT_PROFILES))
         raise ValueError(f"Unknown H3 image-edit profile {profile!r}; expected one of: {named}")
@@ -1396,7 +1680,7 @@ def build_h3_image_edit_payload(
                 }
             }
         ),
-        "mvp:attention": {"class_type": "PathchSageAttentionKJ", "inputs": {"model": model_source, "sage_attention": "disabled", "allow_compile": False}},
+        "mvp:attention": attention_profile.node(model_source),
         "mvp:clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
         "mvp:image_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_t1_image_vae_step1597.safetensors"}},
         "mvp:audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},

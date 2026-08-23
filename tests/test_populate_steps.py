@@ -47,6 +47,7 @@ from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import (
     SNAP_CLEARANCE_SECONDS,
     SNAP_CONTIGUITY_TOLERANCE,
+    SNAP_LOCKED_REFUSAL,
     snap_cut_plan,
     vocal_gaps,
 )
@@ -279,23 +280,41 @@ def populate(client: TestClient, project_id: str, **body) -> dict:
 # The headline: byte identity.
 # --------------------------------------------------------------------------------------------
 
-#: Measured on `master` at 9c3db45 — the single-route populate, before the split existed — by
-#: running `test_a_chained_populate_writes_exactly_what_the_single_route_wrote` against a
-#: stashed tree. Both arms of it are here because the two take different branches: the marked
-#: sections tile per section, the unmarked ones tile the whole song as one span and then adopt
-#: whatever structure the shots call volunteered.
+#: Originally measured on `master` at 9c3db45 — the single-route populate, before the split
+#: existed — by running this test's body against a stashed tree. Both arms are here because the
+#: two take different branches: the marked sections tile per section, the unmarked ones tile the
+#: whole song as one span and then adopt whatever structure the shots call volunteered.
 #:
 #: **Phase B reached them through `snap_tolerance=0`** and did not re-measure them. Phase B
-#: moves windows onto phrase boundaries, so there is deliberately no byte pin on a *default*
-#: populate any more — the plan it produces is a different plan, which is the point of the
-#: phase. What survives untouched is the control arm: snapping switched off must leave lay-out
-#: and fill-in producing the very bytes they produced before line-up could move anything, and
-#: these two digests are that claim rather than a new one written down after the fact.
+#: moves windows onto phrase boundaries, so there is no byte pin on a *default* populate any
+#: more — the plan it produces is a different plan, which is the point of the phase. What
+#: survived untouched was the control arm: snapping switched off left lay-out and fill-in
+#: producing the very bytes they produced before line-up could move anything.
+#:
+#: **Both were re-measured on 2026-08-22 and neither is a pre-split pin any longer.** The
+#: per-section proposal pairing (`app.paired_proposals`) deliberately changes which prompt a
+#: window carries, which is the whole of the defect it closes, so a digest that did not move
+#: would have meant the fix did nothing. The pre-2026-08-22 values are recorded here rather than
+#: deleted, because the claim they carried is worth being able to reconstruct:
+#:
+#:   marked   8b101523562766bba9abb858498aa79b75f536ffe2f6ff771b59a11b60cab0b8
+#:   unmarked 085917f16a42fd9116ba31e8e34952c0c763e36c8d046879787bb6035e3c88c5
+#:
+#: Note that **both** arms moved, and the second is the more interesting one: "no sections" here
+#: means the *Director* marked none, not that the plan has none — `lay_out_shots` adopts the
+#: structure the shots call volunteered, so that arm tiles per section too. The genuinely
+#: section-free path (`timeline.layout_spans` answering `[]`) is byte-identical to the old
+#: global rule and is pinned on its own by
+#: `test_a_layout_with_no_sections_at_all_still_maps_by_global_proportion`.
+#:
+#: What these two now pin is that the pairing, the tiling and everything fill-in writes are
+#: deterministic for a given model reply — the property the split was built for — not that they
+#: agree with a populate that predates the fix.
 CHAINED_DIGEST_SECTIONS_MARKED = (
-    "8b101523562766bba9abb858498aa79b75f536ffe2f6ff771b59a11b60cab0b8"
+    "74af40ecc06c295923c4aef2517d9d22f1d2e5c1b4a0aee7584b7dd03194ede6"
 )
 CHAINED_DIGEST_NO_SECTIONS = (
-    "085917f16a42fd9116ba31e8e34952c0c763e36c8d046879787bb6035e3c88c5"
+    "4accf454c1424d4fbd6d3a77ba41aecf95cf66120af5e759990d8549d3ab914c"
 )
 
 
@@ -309,17 +328,17 @@ CHAINED_DIGEST_NO_SECTIONS = (
 def test_a_chained_populate_with_snapping_off_writes_what_the_single_route_wrote(
     tmp_path: Path, marked: bool, expected: str
 ):
-    """**The safety property of the whole change.** Same shots, same windows, same citations,
-    same prompts, same `singing`, same seeds, given the same model reply.
+    """**Determinism, to the byte.** Same shots, same windows, same citations, same prompts,
+    same `singing`, same seeds, given the same model reply.
 
-    The digest above was taken against `master` before a line of the split was written, by
-    running this same body against a stashed tree — not copied off a number somebody wrote
-    down. Everything a populate writes is inside it except the shot ids, which are minted
+    Everything a populate writes is inside the digest except the shot ids, which are minted
     fresh on every run and could not be identical if they tried.
 
     Reached with `snap_tolerance=0` since Phase B: tolerance 0 is snapping switched off and a
-    genuine no-op, so this is now the control arm — it says that giving line-up something to
-    do is the *only* thing that changed about what a populate writes.
+    genuine no-op, so line-up contributes nothing here and what is pinned is lay-out's tiling
+    and fill-in's content. **Re-measured 2026-08-22** when the per-section pairing changed which
+    proposal a window takes — see the constants above for both values and for why the older
+    pair is no longer the right claim.
     """
     client, _store, comfy, _director, project_id = make_client(tmp_path, sections=marked)
     body = populate(client, project_id, snap_tolerance=0)
@@ -667,6 +686,7 @@ def skip_kind(reason: str) -> str:
     """
     for phrase, kind in (
         ("already lands clear", "already-silent"),
+        ("sits on the boundary of", "section-boundary"),
         ("no voiceless gap within", "out-of-tolerance"),
         ("which leaves", "out-of-band"),
         ("is locked", "locked"),
@@ -741,6 +761,99 @@ def test_a_substituted_snap_target_is_observed_through_both_doors(tmp_path, monk
     )
 
 
+#: The same tiling with one authored transition in it: window 4 starts a second before window
+#: 3 ends. The overlap's centre is 20.500 s, inside the phrase that runs to 17.900–20.000 s's
+#: right-hand edge, so the seam has somewhere to go and the move is a real one.
+OVERLAPPING_WINDOWS = tuple(
+    (15.0, 6.0) if index == 3 else window
+    for index, window in enumerate(PHRASE_WINDOWS)
+)
+
+
+def test_one_snapping_core_serves_both_doors_on_a_plan_with_a_transition_in_it(tmp_path: Path):
+    """The Phase B headline, restated for the geometry that used to refuse on both doors.
+
+    An overlap is an authored transition (R-3), and which point of it lands in the silence —
+    `timeline.SEAM_POINT`, the overlap's midpoint — is a decision that must be the *same*
+    decision on both doors, or a transition would land in one place because the Director came
+    through the timeline and another because they came through a lay-out. Same plan, same
+    tolerance, same band; the moves agree including the blend length, and the geometry the two
+    would write agrees to the float.
+    """
+    project = measured_project()
+    shot_plan = snap_cut_plan(
+        tiled(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+    alignment = app_module.line_up_shots(
+        layout_of(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+
+    blended = [move for move in shot_plan.moves if move.overlap]
+    assert blended, "the fixture moved no transition, so this proves nothing"
+    assert [(move.boundary, move.proposed, move.overlap) for move in blended] == [(20.5, 19.85, 1.0)]
+    assert [
+        (move.boundary, move.proposed, move.gap, move.overlap) for move in shot_plan.moves
+    ] == [
+        (move.boundary, move.proposed, move.gap, move.overlap) for move in alignment.moves
+    ]
+    assert [(skip.boundary, skip_kind(skip.reason)) for skip in shot_plan.skips] == [
+        (skip.boundary, skip_kind(skip.reason)) for skip in alignment.skips
+    ]
+    assert [(start, length) for _id, start, length in shot_plan.windows] == [
+        (placement.start, placement.duration) for placement in alignment.placements
+    ]
+    # The blend is the length it was, on both doors, and the plan covers what it covered.
+    windows = [(start, length) for _id, start, length in shot_plan.windows]
+    assert windows[3][0] + windows[3][1] - windows[4][0] == pytest.approx(1.0, abs=1e-9)
+    assert windows[0][0] == 0.0
+    assert windows[-1][0] + windows[-1][1] == pytest.approx(PHRASE_SONG_DURATION, abs=1e-9)
+
+
+def test_a_substituted_snap_target_is_observed_through_both_doors_on_a_transition(
+    tmp_path, monkeypatch
+):
+    """One core, proved by taking it away — on the seam shape that needed the new code.
+
+    `_gap_snap_target` is still the single editorial decision about *where inside a gap* a cut
+    lands, and the seam arithmetic above it is the single decision about *what the cut of a
+    transition is*. One patch moves both doors; two snappers would need two.
+    """
+    project = measured_project()
+    unpatched = snap_cut_plan(
+        tiled(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+
+    monkeypatch.setattr(
+        timeline_module,
+        "_gap_snap_target",
+        lambda gap, boundary: min(max(boundary, gap[0] + 0.4), gap[1] - 0.4),
+    )
+    shot_plan = snap_cut_plan(
+        tiled(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+    alignment = app_module.line_up_shots(
+        layout_of(project, OVERLAPPING_WINDOWS), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+
+    proposed = [move.proposed for move in shot_plan.moves]
+    assert proposed == [move.proposed for move in alignment.moves]
+    assert proposed and proposed != [move.proposed for move in unpatched.moves], (
+        "the substitute changed nothing, so it observed nothing"
+    )
+    # The transition's own fate changed with the substitute — a wider clearance puts its target
+    # out of reach, so the seam that moved unpatched is now skipped — and it changed the same
+    # way on both doors. That is the substitution being observed at the seam this test is
+    # about, rather than only at the hard cuts around it.
+    assert [move.overlap for move in unpatched.moves if move.overlap] == [1.0]
+    assert [move.overlap for move in shot_plan.moves if move.overlap] == []
+    assert [(skip.boundary, skip_kind(skip.reason)) for skip in shot_plan.skips] == [
+        (skip.boundary, skip_kind(skip.reason)) for skip in alignment.skips
+    ]
+    # And whether it moved or not, the blend is exactly the length it was.
+    windows = [(start, length) for _id, start, length in shot_plan.windows]
+    assert windows[3][0] + windows[3][1] - windows[4][0] == pytest.approx(1.0, abs=1e-9)
+
+
 def test_a_protected_shot_is_skipped_by_name_on_both_snapping_doors(tmp_path: Path):
     """Locked, approved and in-flight refuse a cut in the existing wordings.
 
@@ -769,6 +882,30 @@ def test_a_protected_shot_is_skipped_by_name_on_both_snapping_doors(tmp_path: Pa
             project.shots[index].start,
             project.shots[index].duration,
         )
+
+    # A transition is a seam two shots share however wide it is, so a lock at either of its
+    # ends refuses it — in the same sentence, on both doors, and without resizing the blend by
+    # moving one of its edges on its own.
+    blended = tiled(measured_project(), OVERLAPPING_WINDOWS)
+    blended.shots[4].locked = True
+    locked = SNAP_LOCKED_REFUSAL.format(shot=app_module.shot_label(blended, blended.shots[4]))
+    stored = timeline_module.shot_snap_windows(blended)
+    door_one = snap_cut_plan(blended, tolerance=0.75, minimum=4.0, maximum=6.0)
+    door_two = app_module.line_up_shots(
+        layout_of(blended, OVERLAPPING_WINDOWS),
+        tolerance=0.75,
+        minimum=4.0,
+        maximum=6.0,
+        windows=stored,
+    )
+
+    assert not [move for move in door_one.moves if move.overlap]
+    assert locked in [skip.reason for skip in door_one.skips]
+    assert [skip.reason for skip in door_one.skips] == [
+        skip.reason for skip in door_two.skips
+    ]
+    assert door_one.windows[3][1:] == (blended.shots[3].start, blended.shots[3].duration)
+    assert door_one.windows[4][1:] == (blended.shots[4].start, blended.shots[4].duration)
 
 
 def test_the_timeline_door_reads_the_plan_in_song_order_not_manifest_order(tmp_path: Path):
@@ -953,7 +1090,11 @@ def test_line_up_keeps_the_layouts_own_window_ceiling(tmp_path: Path):
     """A step that nudges a cut may not undo the length decision of the step before it.
 
     Lay-out caps its windows at `POPULATE_MAX_WINDOW_SECONDS` on a measured render-cost
-    decision — 5.2 s windows render in minutes where 9.5 s ones took hours — so a move that
+    decision — a 5.2 s window is 141 frames at a median 6.3 min, where a 9.5 s one is 226+
+    frames at 30–39 min, per-frame cost tripling across that step (measured from output-file
+    mtimes over the 2026-08-19/20 batch; the "took hours" this docstring used to say came from
+    a claim of 2.2 hours that had no primary record and was wrong by ~3.4x — see the constant's
+    own docstring for the table and its caveats). So a move that
     would push a window past 6 s is refused *there*, by the band, and named as such. A caller
     lining up stored windows passes the wider 4–15 s band instead, which is
     `snap_window_plan`'s own argument.
@@ -1225,41 +1366,76 @@ def test_a_standalone_line_up_refuses_an_unmeasured_song_rather_than_guessing(tm
     assert comfy.prompts == []
 
 
-def test_a_standalone_line_up_refuses_a_plan_that_is_not_a_contiguous_tiling(tmp_path: Path):
-    """Two shots that do not share a boundary do not share a cut. `snap-cuts`' refusal.
-
-    **Found by pointing this route at the Director's live plan** (2026-08-21), which holds
-    sixteen seams outside assembly's tolerance — overlaps, which this application now treats
-    as layers. `TimelineError` escaped as a 500 there; it is a 422 with the sentence that
-    names both shots, exactly as the snap-cuts route has always answered.
-    """
+def standalone_line_up_client(tmp_path: Path, project: Project):
+    """A client over one saved project, for the `line-up` route's project-sourced door."""
     settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
     store = ProjectStore(tmp_path)
-    project = tiled(measured_project())
-    # A quarter-second overlap: shot 3 starts before shot 2 ends.
-    project.shots[3].start -= 0.25
-    project.shots[3].duration += 0.25
     saved = store.save(project)
     comfy = NullComfy()
     client = TestClient(
         create_app(settings=settings, store=store, comfy=comfy, director=StepDirector())
     )
+    return client, saved, comfy
+
+
+def test_a_standalone_line_up_refuses_a_hole_and_lines_up_an_overlap(tmp_path: Path):
+    """The restated precondition, both halves, on the door that found the problem.
+
+    **Found by pointing this route at the Director's live plan** (2026-08-21), which holds
+    sixteen seams outside assembly's tolerance. Fifteen of them are overlaps — authored
+    transitions under R-3 — and those are now snapped as units rather than refused. The
+    sixteenth is a real 22 ms hole, and a hole still refuses: `assembly.tiling_refusals`
+    refuses the export for it too, and there is no seam in a stretch with no picture in it.
+
+    Same fixture, same route, one shot moved a quarter second one way or the other. That is
+    what makes this a test about the *sign* of the disagreement rather than about two
+    unrelated plans.
+    """
+    holed = tiled(measured_project())
+    # A quarter-second hole: shot 4 starts after shot 3 ends, and nothing covers the gap.
+    holed.shots[3].start += 0.25
+    holed.shots[3].duration -= 0.25
+    client, saved, comfy = standalone_line_up_client(tmp_path, holed)
 
     response = client.post(
         f"/api/projects/{saved.id}/timeline/line-up", json={"confirm_apply": True}
     )
     assert response.status_code == 422
     detail = response.json()["detail"]
-    assert "not a contiguous tiling" in detail
+    assert "has a hole in it" in detail
     assert "SHOT 03" in detail and "SHOT 04" in detail
     assert [
         (shot.start, shot.duration) for shot in ProjectStore(tmp_path).get(saved.id).shots
     ] == [(shot.start, shot.duration) for shot in saved.shots]
     assert comfy.prompts == []
 
+    # An overlap in the same plan is lined up rather than refused, and the blend is exactly as
+    # long afterwards as the Director made it — asserted on the manifest, through the route.
+    overlapped = tiled(measured_project(), OVERLAPPING_WINDOWS)
+    client, saved, comfy = standalone_line_up_client(tmp_path / "overlap", overlapped)
+
+    applied = client.post(
+        f"/api/projects/{saved.id}/timeline/line-up",
+        json={"confirm_apply": True, "tolerance": 0.75},
+    )
+    assert applied.status_code == 200, applied.text
+    body = applied.json()
+    assert body["applied"] is True and body["moved"] > 0
+    # The wire says which of its moves is a transition and how wide the blend is, so a reader
+    # knows the instant it names is a centre rather than a clip edge.
+    assert [row["overlap"] for row in body["moves"] if row["overlap"]] == [1.0]
+    assert [row["boundary"] for row in body["moves"] if row["overlap"]] == [20.5]
+    shots = sorted(
+        ProjectStore(tmp_path / "overlap").get(saved.id).shots, key=lambda shot: shot.start
+    )
+    assert shots[3].end - shots[4].start == pytest.approx(1.0, abs=1e-9)
+    assert shots[0].start == 0.0
+    assert shots[-1].end == pytest.approx(PHRASE_SONG_DURATION, abs=1e-9)
+    assert comfy.prompts == []
+
 
 def test_a_lay_out_report_with_a_hole_in_it_is_refused_rather_than_lined_up(tmp_path: Path):
-    """The same refusal on the plan-carrying door: no shared boundary, no cut.
+    """The same refusal on the plan-carrying door: no picture in the hole, no seam to place.
 
     `lay_out_shots` tiles contiguously and the digest stops a report being edited on its way
     back, so this is a body no ordinary path produces — which is exactly why it is answered
@@ -1291,7 +1467,7 @@ def test_a_lay_out_report_with_a_hole_in_it_is_refused_rather_than_lined_up(tmp_
         f"/api/projects/{project_id}/timeline/line-up", json={"plan": plan}
     )
     assert response.status_code == 422
-    assert "not a contiguous tiling" in response.json()["detail"]
+    assert "has a hole in it" in response.json()["detail"]
     assert ProjectStore(tmp_path).get(project_id).shots == []
     assert comfy.prompts == []
 
@@ -1703,3 +1879,476 @@ def test_the_steps_add_no_field_to_a_saved_manifest(tmp_path: Path):
     )
     assert set(manifest["shots"][0]) <= set(Shot.model_fields) | {"end"}
     assert set(manifest) <= set(Project.model_fields)
+
+
+# --------------------------------------------------------------------------------------------
+# The four defects the first live end-to-end run measured, fixed 2026-08-22.
+#
+# Each test below fails on the tree that ran that pass. Nothing here calls a model, renders, or
+# reads the Director's project; `comfy.prompts` is still asserted empty.
+# --------------------------------------------------------------------------------------------
+
+#: Three sections of exactly 20 s over a 60 s song, so a window can be attributed to a section
+#: by eye. Marked by the Director, so `sections_origin` is `"director"` and the tiling is the
+#: per-section one on every roll.
+PAIRING_SECTIONS = [("Alpha", 0.0, 20.0), ("Beta", 20.0, 20.0), ("Gamma", 40.0, 20.0)]
+
+#: Thirteen proposals, deliberately lopsided: six start inside Alpha, **one** inside Beta, six
+#: inside Gamma. `populate_required_shots(60)` is 12, so this is a plan lay-out accepts.
+#:
+#: The tiling then gives Alpha 5 windows, Beta 4 and Gamma 5 — 14 windows against 13 proposals —
+#: which is the shape that made the defect visible: Beta owns one proposal and four windows, and
+#: under the old global-proportion rule its four windows drew proposals 4, 5, 6 and 7 — two of
+#: Alpha's, its own, and one of Gamma's.
+PAIRING_PROPOSAL_STARTS = [
+    ("Alpha", 0.0),
+    ("Alpha", 3.0),
+    ("Alpha", 6.0),
+    ("Alpha", 9.0),
+    ("Alpha", 12.0),
+    ("Alpha", 15.0),
+    ("Beta", 20.0),
+    ("Gamma", 40.0),
+    ("Gamma", 43.0),
+    ("Gamma", 46.0),
+    ("Gamma", 49.0),
+    ("Gamma", 52.0),
+    ("Gamma", 55.0),
+]
+
+
+def pairing_client(tmp_path: Path):
+    """A 60 s project with three marked sections and the lopsided proposal set above."""
+    settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
+    store = ProjectStore(tmp_path)
+    project = Project(
+        id="project_pairing",
+        name="Pairing",
+        song=Song(
+            title="Pairing",
+            source="imported",
+            path="media/song.flac",
+            duration=60.0,
+            # Voice across the middle only, so the outer sections hold real gaps and a cut on a
+            # section boundary has somewhere it could otherwise have travelled to.
+            vocal_spans=[[12.0, 30.0], [34.0, 48.0]],
+        ),
+        sections=[
+            SongSection(id=f"section_{index}", label=label, start=start, duration=length)
+            for index, (label, start, length) in enumerate(PAIRING_SECTIONS)
+        ],
+    )
+    store.save(project)
+    script = [
+        (
+            [
+                {
+                    "start": start,
+                    "duration": 3.0,
+                    "prompt": f"{label} proposal {index}",
+                    "performance": True,
+                    "assets": [],
+                }
+                for index, (label, start) in enumerate(PAIRING_PROPOSAL_STARTS)
+            ],
+            [],
+        )
+    ]
+    comfy = NullComfy()
+    client = TestClient(
+        create_app(
+            settings=settings,
+            store=store,
+            comfy=comfy,
+            director=StepDirector(script=script),
+        )
+    )
+    return client, store, comfy, project.id
+
+
+def section_of(start: float) -> str:
+    """Which of `PAIRING_SECTIONS` a window starting here belongs to."""
+    return next(
+        label for label, at, length in PAIRING_SECTIONS if at <= start < at + length
+    )
+
+
+def test_a_window_only_ever_takes_a_proposal_written_for_its_own_section(tmp_path: Path):
+    """**Defect 1.** The Chorus opener that was dropped, and the Verse line that landed in the
+    Bridge.
+
+    Lay-out tiles per section and tells the model "every shot sits inside one section and takes
+    that section's character"; fill-in used to undo it by mapping proposals to windows by global
+    proportion over the whole song. Measured live on 2026-08-21: P7 (the Chorus opener) unused,
+    P4 and P12 each used twice on adjacent shots, and four windows carrying prose written for a
+    different section — including a Chorus 2 line in the **Bridge**.
+
+    Here Beta owns one proposal and four windows. Every one of its windows must carry Beta's
+    line; on the tree that ran the live pass they carried two of Alpha's, Beta's own, and one of
+    Gamma's.
+    """
+    client, _store, comfy, project_id = pairing_client(tmp_path)
+    body = populate(client, project_id, snap_tolerance=0)
+    shots = body["project"]["shots"]
+
+    assert len(shots) == 14
+    for shot in shots:
+        assert shot["prompt"].startswith(section_of(shot["start"])), shot
+
+    # And the counts, so "never borrows" is not the only thing checked: Beta's single proposal is
+    # reused across all four of its windows, which is the Director's ruling.
+    beta = [shot["prompt"] for shot in shots if section_of(shot["start"]) == "Beta"]
+    assert beta == ["Beta proposal 6"] * 4
+    assert comfy.prompts == []
+
+
+def test_no_proposal_is_dropped_inside_a_section_that_has_windows_to_spare(tmp_path: Path):
+    """**Defect 1, the other half.** P7 was dropped entirely while P4 and P12 were used twice.
+
+    Within a section holding at least as many windows as proposals the pairing is surjective by
+    construction — the rank step is ``p / w <= 1``, so no proposal is skipped. Beta is that reuse
+    case; Alpha and Gamma are the mirror, where the step is at least 1 and nothing repeats.
+    """
+    client, _store, comfy, project_id = pairing_client(tmp_path)
+    shots = populate(client, project_id, snap_tolerance=0)["project"]["shots"]
+
+    used = {
+        label: [shot["prompt"] for shot in shots if section_of(shot["start"]) == label]
+        for label, *_ in PAIRING_SECTIONS
+    }
+    # Alpha: 5 windows against 6 proposals — every window a different proposal, and the one that
+    # goes unused is sampled out of the middle of the section's arc rather than lopped off its
+    # tail. Gamma is the same shape, seven proposals along.
+    assert used["Alpha"] == [f"Alpha proposal {index}" for index in (0, 1, 3, 4, 5)]
+    assert used["Gamma"] == [f"Gamma proposal {index}" for index in (7, 8, 10, 11, 12)]
+    # Beta: 4 windows against 1 proposal — reuse, and the section's only line is used.
+    assert len(set(used["Beta"])) == 1
+    # Nothing anywhere is another section's proposal, which is the ruling stated as a set.
+    for label, prompts in used.items():
+        assert {prompt.split()[0] for prompt in prompts} == {label}
+    assert comfy.prompts == []
+
+
+def test_a_section_the_model_wrote_nothing_for_is_left_empty_rather_than_borrowing(
+    tmp_path: Path,
+):
+    """The ruling's plain reading: a Chorus window may only ever receive a Chorus proposal.
+
+    So a section with no proposal of its own gets no prose at all — an honestly empty prompt,
+    visible in the inspector and in the readiness report, rather than a plausible sentence
+    written for the section next door that nobody can see is wrong until the take comes back.
+    `singing` is left at the Shot default (`unknown`), never `not_singing`: nothing was declared.
+    """
+    client, _store, comfy, project_id = pairing_client(tmp_path)
+    layout = lay_out(client, project_id)
+    # Every proposal Beta owns, removed from the report before the confirm. The digest is
+    # re-minted because this is a deliberately hand-edited plan, which is what the digest exists
+    # to make deliberate.
+    layout["proposals"] = [
+        row for row in layout["proposals"] if not (20.0 <= row["start"] < 40.0)
+    ]
+    layout["plan_id"] = app_module.plan_fingerprint(
+        ProjectStore(tmp_path).get(project_id),
+        app_module.LayOutResponse.model_validate(layout),
+    )
+    applied = client.post(
+        f"/api/projects/{project_id}/timeline/lay-out",
+        json={"confirm_replace": True, "plan": layout},
+    ).json()
+    aligned = line_up(client, project_id, applied, tolerance=0, confirm_apply=True)
+    fill_in(client, project_id, aligned, confirm_apply=True)
+
+    fresh = ProjectStore(tmp_path).get(project_id)
+    for shot in fresh.shots:
+        if section_of(shot.start) == "Beta":
+            assert shot.prompt == "", shot
+            assert shot.citations == []
+            assert shot.singing == "unknown"
+            # Still riding its window of the master: `use_song_audio` is a fact about the
+            # window, not a content decision, and the Director's ruling is that every shot
+            # gets its piece of the track.
+            assert shot.use_song_audio is True
+            assert shot.seed != 0
+        else:
+            assert shot.prompt.startswith(section_of(shot.start)), shot
+    assert comfy.prompts == []
+
+
+def test_a_layout_with_no_sections_at_all_still_maps_by_global_proportion():
+    """The compatibility half, and why both chained digests could move without alarm.
+
+    "No sections" in those two arms means *the Director* marked none — `lay_out_shots` adopts
+    whatever structure the shots call volunteered, so they tile per section anyway. A layout with
+    a genuinely empty section layer is the path `timeline.layout_spans` answers `[]` for, and it
+    must go on drawing prompts by proportion over the whole song, exactly as populate always has.
+    Asserted on the pure function, because reaching this branch through a route means persuading
+    the model to volunteer no structure at all.
+    """
+    proposals = tuple(
+        app_module.ShotProposal(start=index * 10.0, duration=10.0, prompt=f"P{index}")
+        for index in range(4)
+    )
+    layout = app_module.ShotLayout(
+        project=Project(id="project_bare", name="Bare"),
+        duration=40.0,
+        required=4,
+        proposals=proposals,
+        windows=(),
+        sections=(),
+        sections_origin="",
+        message="",
+    )
+    midpoints = [2.0, 12.0, 15.0, 22.0, 39.0]
+    assert (
+        app_module.paired_proposals(layout, midpoints)
+        == [
+            timeline_module.proposal_for_position(position, 40.0, 4)
+            for position in midpoints
+        ]
+        == [0, 1, 1, 2, 3]
+    )
+
+
+def test_layout_spans_cuts_the_song_exactly_where_the_section_layer_does():
+    """The decomposition both steps now share, asserted on its own rather than through a tiling.
+
+    Lay-out has tiled these spans since sections existed; what is new on 2026-08-22 is that
+    fill-in reads the same list, so a disagreement about what a section *is* would put content in
+    the wrong window rather than merely tiling oddly. Every branch is here: the unmarked stretch
+    before the first section, between two of them, and after the last — each tiled only when it is
+    longer than `SPAN_MIN_SECONDS`, because a shorter one is two boxes the Director dragged
+    together rather than a piece of song with no section on it.
+    """
+    sections = [
+        SongSection(label="A", start=2.0, duration=8.0),
+        SongSection(label="B", start=13.0, duration=7.0),
+        SongSection(label="C", start=20.2, duration=9.8),
+    ]
+
+    assert timeline_module.layout_spans([], 60.0) == [], (
+        "an unmarked project must answer no spans, not one whole-song span"
+    )
+    assert timeline_module.layout_spans(sections, 60.0) == [
+        (0.0, 2.0),      # the leading gap, tiled: 2 s of song with no section on it
+        (2.0, 8.0),
+        (10.0, 3.0),     # the gap between A and B
+        (13.0, 7.0),
+        (20.2, 9.8),     # B ends 0.2 s before C starts, which is under the floor and not a span
+        (30.0, 30.0),    # the trailing gap, tiled
+    ]
+    # The same sections against a song that ends 0.4 s after the last one: under the floor, so no
+    # trailing span at all.
+    assert timeline_module.layout_spans(sections, 30.4) == [
+        (0.0, 2.0), (2.0, 8.0), (10.0, 3.0), (13.0, 7.0), (20.2, 9.8)
+    ]
+
+
+def test_section_edges_names_both_edges_and_lets_a_start_win_a_collision():
+    """What the snapper is handed, and it is **both** edges of every section.
+
+    A section that ends where the next begins is one boundary and is named by the section that
+    opens there, which is how a Director reads a timeline — `song_section` breaks its own tie the
+    same way. A section followed by an unmarked stretch has an *end* that no start covers, and
+    that end is a real cut in the tiling, which is why ends are collected at all.
+    """
+    adjacent = [
+        SongSection(label="Intro", start=0.0, duration=11.0),
+        SongSection(label="Verse", start=11.0, duration=21.0),
+    ]
+    assert timeline_module.section_edges(adjacent) == {
+        0.0: "Intro", 11.0: "Verse", 32.0: "Verse"
+    }
+    # With a gap after it, the section's own end is a boundary nothing else names.
+    spaced = [
+        SongSection(label="Verse", start=0.0, duration=10.0),
+        SongSection(label="Chorus", start=20.0, duration=10.0),
+    ]
+    assert timeline_module.section_edges(spaced) == {
+        0.0: "Verse", 10.0: "Verse", 20.0: "Chorus", 30.0: "Chorus"
+    }
+    assert timeline_module.section_edges([]) == {}
+
+
+def bare_layout(*, duration: float, proposals, sections=()):
+    """A `ShotLayout` carrying only what `paired_proposals` reads."""
+    return app_module.ShotLayout(
+        project=Project(id="project_pairing_unit", name="Pairing"),
+        duration=duration,
+        required=len(proposals),
+        proposals=tuple(
+            app_module.ShotProposal(start=start, duration=3.0, prompt=f"P{index}")
+            for index, start in enumerate(proposals)
+        ),
+        windows=(),
+        sections=tuple(sections),
+        sections_origin="",
+        message="",
+    )
+
+
+def test_pairing_a_layout_that_has_no_proposals_answers_none_rather_than_raising():
+    """The project-sourced line-up builds a layout with **no** proposals (`ShotLayout.proposals`
+    is `()` there, and the emptiness is what stops such a report being fed to fill-in at all).
+    `proposal_for_position` raises on a count of zero, so the guard is what keeps a hand-assembled
+    body from turning that honest emptiness into a 500."""
+    layout = bare_layout(duration=40.0, proposals=[])
+    assert app_module.paired_proposals(layout, [5.0, 15.0]) == [None, None]
+    # And with a section layer, which takes the other branch entirely.
+    marked = bare_layout(
+        duration=40.0,
+        proposals=[],
+        sections=[SongSection(label="A", start=0.0, duration=40.0)],
+    )
+    assert app_module.paired_proposals(marked, [5.0, 15.0]) == [None, None]
+
+
+def test_overlapping_section_boxes_fill_each_window_exactly_once():
+    """Section boxes are dragged by hand and nothing repairs the Director's own overlaps.
+
+    Two boxes over the same seconds would otherwise both offer to fill the windows underneath,
+    and the later one would silently win — so a window is claimed by the first span that contains
+    its midpoint and no other span may reach it. Window 3 is the one in dispute here: claimed by
+    Alpha it takes Alpha's fifth proposal, and unclaimed it would take Beta's second.
+    """
+    layout = bare_layout(
+        duration=50.0,
+        proposals=[0.0, 5.0, 10.0, 15.0, 25.0, 35.0],
+        sections=[
+            SongSection(label="Alpha", start=0.0, duration=30.0),
+            SongSection(label="Beta", start=20.0, duration=30.0),
+        ],
+    )
+    assert app_module.paired_proposals(layout, [5.0, 15.0, 25.0, 35.0, 45.0]) == [
+        0, 2, 4, 4, 5
+    ]
+
+
+def test_a_cut_on_a_section_boundary_is_left_alone_and_says_why(tmp_path: Path):
+    """**Defect 3.** Line-up spending the boundary lay-out was built to protect.
+
+    Measured live on 2026-08-21: 2 of 5 moves crossed a section boundary — 11.000 → 10.850 over
+    Intro/Verse and 103.200 → 103.050 over Chorus 2/Bridge. The realistic fixture reproduces the
+    first exactly: the Intro ends at 11.0 s, the track's first voice starts there, and the
+    nearest voiceless moment is 0.15 s earlier.
+
+    The refusal reads in the Director's own terms, beside `snap_window_plan`'s existing
+    sentences, and it is that one decision rather than a second mechanism bolted on beside it.
+    """
+    client, _store, comfy, _director, project_id = make_client(tmp_path)
+    layout = lay_out(client, project_id)
+    aligned = line_up(client, project_id, layout)
+
+    boundaries = {start for _label, start, _length, _prompt in SECTIONS} | {
+        start + length for _label, start, length, _prompt in SECTIONS
+    }
+    for move in aligned["moves"]:
+        assert not any(abs(move["boundary"] - at) < 0.5 for at in boundaries), move
+
+    refused = [
+        skip for skip in aligned["skips"] if "sits on the boundary of" in skip["reason"]
+    ]
+    assert refused, "no cut was refused for sitting on a section boundary"
+    intro = next(skip for skip in refused if abs(skip["boundary"] - 11.0) < 1e-6)
+    assert intro["reason"] == timeline_module.SNAP_SECTION_BOUNDARY.format(
+        before=intro["before"], after=intro["after"], boundary=11.0, section="Verse"
+    )
+    assert "no shot straddles a section" in intro["reason"]
+    assert comfy.prompts == []
+
+
+def test_both_doors_onto_the_snapper_honour_the_same_section_boundaries(tmp_path: Path):
+    """One decision, two doors — `snap_cut_plan` sees the boundary line-up sees.
+
+    The layout door is where the defect was found; the timeline door reaches the same core, and a
+    boundary protected on a fresh tiling but spendable on a stored one would be the
+    two-implementations-of-one-rule failure this codebase keeps meeting.
+
+    `test_one_snapping_core_serves_both_doors`' fixture and its method, with a section layer laid
+    over it: same song, same tiling, same tolerance, same band, one door from a project's shots
+    and the other from a layout that has no shots at all.
+    """
+    project = measured_project()
+    sections = [
+        SongSection(id="section_0", label="Verse", start=0.0, duration=20.0),
+        SongSection(id="section_1", label="Chorus", start=20.0, duration=20.0),
+        SongSection(id="section_2", label="Outro", start=40.0, duration=20.0),
+    ]
+    stored = tiled(project)
+    stored.sections = sections
+    shot_plan = snap_cut_plan(stored, tolerance=0.75, minimum=4.0, maximum=6.0)
+    alignment = app_module.line_up_shots(
+        layout_of(project, sections=sections), tolerance=0.75, minimum=4.0, maximum=6.0
+    )
+
+    # The cuts at 20.0 s and 40.0 s are section boundaries and are refused on both doors, by the
+    # same sentence bar the window names — which is what `skip_kind` exists to compare.
+    refused = [
+        skip.boundary
+        for skip in shot_plan.skips
+        if skip_kind(skip.reason) == "section-boundary"
+    ]
+    assert refused == [20.0, 40.0]
+    assert [(skip.boundary, skip_kind(skip.reason)) for skip in shot_plan.skips] == [
+        (skip.boundary, skip_kind(skip.reason)) for skip in alignment.skips
+    ]
+    assert [(move.boundary, move.proposed) for move in shot_plan.moves] == [
+        (move.boundary, move.proposed) for move in alignment.moves
+    ]
+    # And with no section layer the very same fixture moves those two cuts, so the refusal above
+    # is the sections doing it rather than the geometry.
+    unmarked = snap_cut_plan(tiled(project), tolerance=0.75, minimum=4.0, maximum=6.0)
+    assert 20.0 in [move.boundary for move in unmarked.moves]
+    assert 40.0 in [move.boundary for move in unmarked.moves]
+
+
+def test_a_line_up_report_carries_the_content_half_and_not_the_manifest(tmp_path: Path):
+    """**Defect 4.** 125 KB of report, 211 KB of applied report, and the lyric sheet twice.
+
+    `LineUpResponse.layout` echoed the whole lay-out *confirm* response, and a confirm carries
+    `project` — a full manifest copy, lyric sheet included. Harmless in what it produced
+    (`layout_from_report` reads the live project) and expensive in every other way: the client had
+    to echo a stale manifest byte for byte or the digest refused the confirm, and the nested
+    `updated_at` was a revision behind with nothing checking it.
+
+    Trimmed to what fill-in actually reads. The digest still covers all of that, which is the
+    second half of this test and the claim that matters.
+    """
+    client, _store, comfy, _director, project_id = make_client(tmp_path)
+    layout = lay_out(client, project_id)
+    applied = client.post(
+        f"/api/projects/{project_id}/timeline/lay-out",
+        json={"confirm_replace": True, "plan": layout},
+    ).json()
+    assert applied["project"] is not None, "the confirm is the response that carried a manifest"
+
+    aligned = line_up(client, project_id, applied)
+    assert set(aligned["layout"]) == {"duration", "proposals", "sections"}
+    # All three still carry what fill-in divides by, matches on and pairs within.
+    assert aligned["layout"]["duration"] == SONG_DURATION
+    assert len(aligned["layout"]["proposals"]) == len(applied["proposals"])
+    assert [row["label"] for row in aligned["layout"]["sections"]] == [
+        label for label, *_ in SECTIONS
+    ]
+    carried = json.dumps(aligned["layout"])
+    assert "Harder faster" not in carried, "the lyric sheet still rides the wire"
+    assert '"shots"' not in carried and '"jobs"' not in carried
+    # Smaller by a multiple even on this small fixture, where the manifest holds six assets and
+    # a four-line sheet; on the Director's own project it was 125 KB against 211 KB.
+    assert len(carried) * 3 < len(json.dumps(applied))
+
+    # The half that must not weaken: every field fill-in reads is still inside the digest.
+    for edit in (
+        lambda plan: plan["layout"]["proposals"][0].__setitem__("prompt", "a substitution"),
+        lambda plan: plan["layout"]["sections"][0].__setitem__("label", "Not the intro"),
+        lambda plan: plan["layout"].__setitem__("duration", 99.0),
+        lambda plan: plan["windows"][0].__setitem__("duration", 9.0),
+    ):
+        tampered = json.loads(json.dumps(aligned))
+        edit(tampered)
+        response = client.post(
+            f"/api/projects/{project_id}/timeline/fill-in",
+            json={"plan": tampered, "confirm_apply": True},
+        )
+        assert response.status_code == 422, response.text
+        assert ProjectStore(tmp_path).get(project_id).shots[0].prompt == ""
+    assert comfy.prompts == []

@@ -1,5 +1,5 @@
 ---
-stepsCompleted: [1]
+stepsCompleted: [1, 2, 3, 4]
 inputDocuments:
   - _bmad-output/planning-artifacts/prds/prd-MusicVideoProducer-effects-2026-08-21/prd.md
   - _bmad-output/planning-artifacts/prds/prd-MusicVideoProducer-effects-2026-08-21/addendum.md
@@ -17,7 +17,13 @@ inputDocuments:
 
 This document breaks down the **Shot Effects and Transitions** feature (25 FX requirements, 6 FX-NFRs) into implementable stories. It is a companion to `epics.md`, which covers Epics 1–7 of the base product and remains authoritative for those; epic numbering continues here at **Epic 8** so the two documents share one numbering space and a story ID is unambiguous across both.
 
-Brownfield, and unusually well-supported: `assembly.py` already re-encodes every clip through a `-vf` chain (so effects are nearly free), already normalizes every intermediate to identical geometry, rate, SAR and pixel format (so `xfade`'s precondition holds by construction), and already resolves clip overlaps (so a transition needs no new timeline geometry). The architecture spine's AD-16…AD-31 fix the invariants; the epics below are its slices A–F from `BUILD-ORDER.md`.
+Brownfield, and unusually well-supported: `assembly.py` already re-encodes every clip through a `-vf` chain (so effects are nearly free), already normalizes every intermediate to identical geometry, rate, SAR and pixel format (so `xfade`'s precondition holds by construction), and already resolves clip overlaps (so a transition needs no new timeline geometry). The architecture spine's AD-16…AD-31 fix the invariants.
+
+**On the relationship to `BUILD-ORDER.md`.** That document's six slices A–F remain the *build* sequence and are unchanged. They are not the epic structure: slices B (chain builder) and D (preview) deliver nothing a Director can see on their own, and slices B, C and D touch the same files end to end — `effects.py`, the effects routes, `app.js`, `styles.css`. Organised by user value and consolidated for file overlap, they collapse into the four epics below. Each story names the slice it implements, so the build order survives the regrouping.
+
+> **Sibling documents.** [`epics.md`](epics.md) holds Epics 1–7 (base product); [`epics-treatment.md`](epics-treatment.md) holds Epics 12–17 (Treatment Planning). One numbering space across all three.
+>
+> **Cross-feature note.** Story 8.1 ships **first** by the Director's decision, so Treatment Planning owns making the two song analyses share one trigger — see its Story 16.2. Nothing in this document changes because of it.
 
 ## Requirements Inventory
 
@@ -100,8 +106,587 @@ UX-DR15: Accessibility floor — state never colour-alone (Overlap carries its t
 
 ### FR Coverage Map
 
-*To be completed in step 2.*
+FX-1: Epic 8 — Song Envelope extraction, cached and fingerprint-invalidated
+FX-2: Epic 8 — beat and onset markers on the waveform
+FX-3: Epic 8 — beat snapping for Shot-boundary edits
+FX-4: Epic 9 — the two-tab shot inspector
+FX-5: Epic 9 — Effect Stack editing
+FX-6: Epic 9 — copying a Stack across Shots
+FX-7: Epic 9 — locked-Shot refusal in the Effects tab
+FX-8: Epic 9 — Grade family
+FX-9: Epic 9 — Texture family
+FX-10: Epic 9 — Stylize family
+FX-11: Epic 9 — Geometry family
+FX-12: Epic 10 — binding a parameter to a Band
+FX-13: Epic 10 — Band selection against the song's spectrum
+FX-14: Epic 10 — punch/sustain Drive with floor and depth
+FX-15: Epic 10 — refusal without a Song Envelope, bindings retained
+FX-16: Epic 11 — Overlap-authored Transitions with the blue band
+FX-17: Epic 11 — the Transition Pair and its auto-match
+FX-18: Epic 11 — one-sided transitions
+FX-19: Epic 11 — the curated transition catalogue
+FX-20: Epic 9 — looping Preview Clip through the real chain
+FX-21: Epic 11 — Transition preview across the boundary
+FX-22: Epic 10 — the Drive readout
+FX-23: Epic 9 — non-destructive, re-derivable Effects
+FX-24: Epic 9 — export refusals naming every Shot and reason
+FX-25: Epic 9 — export provenance records the look
+FX-NFR-1: Epic 11 — the frame grid across every Effect and Transition combination
+FX-NFR-2: Epic 11 — the stream-copy join (guarded in Epic 9, threatened in Epic 11)
+FX-NFR-3: Epic 9 — one engine describes an Effect
+FX-NFR-4: Epic 8, Epic 9 — no new runtime dependency
+FX-NFR-5: Epic 9, Epic 10 — pure, comparable generated render inputs
+FX-NFR-6: Epic 9 — the measured preview budget
 
 ## Epic List
 
-*To be completed in step 2.*
+### Epic 8: The Song Becomes Measurable
+The Director sees where the beats are and can put a cut on one. The song stops being a waveform and becomes a structure with named moments — which is what every later epic binds to, and what makes the standing "snap cuts to phrase boundaries" ruling mean something for the first time.
+**FRs covered:** FX-1, FX-2, FX-3, FX-NFR-4
+
+### Epic 9: One Look Across a Song
+The Director gives a Shot a look and sees it, then carries that look across the whole video. Forty independently generated clips become one film. Consolidates the chain builder, the Effects tab and the preview, which are one component end to end and share every file they touch — the Director cannot judge a grade they cannot see, and a preview of nothing is nothing.
+**FRs covered:** FX-4, FX-5, FX-6, FX-7, FX-8, FX-9, FX-10, FX-11, FX-20, FX-23, FX-24, FX-25, FX-NFR-3, FX-NFR-4, FX-NFR-5, FX-NFR-6
+
+### Epic 10: The Picture Moves With the Music
+The Director ties a parameter to a frequency band and the video answers the track — grain surging on the kick, the frame breathing with the bass — without animating anything by hand. The song becomes the automation.
+**FRs covered:** FX-12, FX-13, FX-14, FX-15, FX-22, FX-NFR-5
+
+### Epic 11: Cuts That Blend
+The Director drags two clips together and the cut between them becomes a transition, visible on the timeline and exactly as long as the overlap. The only epic that touches the cumulative frame grid, and isolated for that reason.
+**FRs covered:** FX-16, FX-17, FX-18, FX-19, FX-21, FX-NFR-1, FX-NFR-2
+
+## Epic 8: The Song Becomes Measurable
+
+The Director sees where the beats are and can put a cut on one. Independent of every other epic — it ships value with zero effects in the project — and it is the prerequisite every reactive binding later resolves against.
+
+### Story 8.1: Analyze the Song into an Envelope
+
+As the Director,
+I want the application to measure my song's levels, onsets, beats and tempo,
+So that later work can be tied to what the music actually does instead of to a guess.
+
+**Acceptance Criteria:**
+
+**Given** a Project with a Song on disk
+**When** analysis runs
+**Then** a Song Envelope is produced carrying, at a recorded analysis rate, RMS, peak, a spectral-flux proxy, per-band level envelopes, onset markers, beat markers, and one estimated BPM (FX-1)
+**And** it also carries a whole-song per-band average as a small fixed-size array, for the band selector to draw (AD-26)
+**And** the analysis rate and band count are recorded fields on the envelope, not constants, so tuning them later is not a migration
+**And** no package is added to the runtime dependency set — decoding goes through the ffmpeg binary already required, and the computation is in the application's own language (FX-NFR-4, AD-25)
+**And** `audio.py` imports neither `app.py`, `batch.py`, nor `assembly.py` (AD-25).
+
+**Given** a Song is imported or generated
+**When** the Song is first stored
+**Then** analysis is produced automatically, and it never blocks the interface, a render, a Batch, or an Assembly (FX-1).
+
+**Given** an envelope for a 3-minute song
+**When** it is persisted
+**Then** it is written as a sidecar file under the project media dir, and the manifest carries only a defaulted `SongAnalysis` record — a pointer, the analysis rate, the band count, the estimated BPM, and the song fingerprint it was computed from (AD-20)
+**And** `SongAnalysis` is the only model entity this story adds, and it carries a default so every existing `project.json` loads unchanged
+**And** the envelope is never embedded in a Project response, and is served by its own read-only endpoint
+**And** a test asserts the manifest's own size is not materially changed by the presence of an envelope.
+
+**Given** a Project whose Song has been replaced
+**When** anything reads the envelope
+**Then** validity is decided by comparing the stored song fingerprint against the current Song's, computed by the one fingerprint function over content — file size and a hash of bytes, never mtime (AD-21, AD-28)
+**And** a mismatch is reported as **absent**, never served as current
+**And** nothing writes an invalidation flag.
+
+**Given** an analysis that fails
+**When** the failure is reported
+**Then** the reason is named, the Project is otherwise unchanged, and nothing downstream treats the failure as an envelope of zeros (FX-1)
+**And** the estimated BPM is presented as an estimate wherever it appears, and nothing refuses on its value.
+
+### Story 8.2: Beats on the Waveform
+
+As the Director,
+I want to see the song's beats and onsets against the waveform,
+So that I can see the structure I am cutting against instead of inferring it.
+
+**Acceptance Criteria:**
+
+**Given** a Project with a valid Song Envelope
+**When** the Timeline workspace is shown
+**Then** beat and onset markers are drawn against the existing waveform (FX-2)
+**And** the markers are display only — nothing about any Shot changes when they are shown or hidden
+**And** they can be turned off, and the setting persists.
+
+**Given** a Project with no Song Envelope, or one invalidated by a song change
+**When** the Timeline workspace is shown
+**Then** no markers are drawn and no error is raised (FX-2, FX-15).
+
+### Story 8.3: Snap Shot Boundaries to Beats
+
+As the Director,
+I want a Shot edge I am dragging to snap to a beat as readily as it snaps to a lyric,
+So that a cut lands on the music instead of near it.
+
+**Acceptance Criteria:**
+
+**Given** a valid Song Envelope and a Shot boundary being dragged
+**When** the boundary passes near a beat marker
+**Then** it snaps to that beat, alongside the existing lyric and phrase boundary targets (FX-3).
+
+**Given** the Director wants a boundary that is not on a beat
+**When** the boundary is placed off every snap target
+**Then** it is accepted, and nothing refuses or warns — snapping is an assist and never a constraint (FX-3, inheriting the trim-nudge posture)
+**And** beat snapping can be disabled independently of the existing snap targets.
+
+**Given** a Project with no Song Envelope
+**When** a Shot boundary is edited
+**Then** boundary editing behaves exactly as it does today (FX-3).
+
+## Epic 9: One Look Across a Song
+
+The Director gives a Shot a look, sees it, and carries it across the whole video. Standalone — it needs no song analysis and no transitions. This is the epic the feature is named for.
+
+### Story 9.1: The Effects Tab, and a Shot That Carries a Grade
+
+As the Director,
+I want a second tab on the shot inspector where I can give a Shot a colour grade,
+So that a Shot stops looking like whatever the model happened to produce.
+
+**Acceptance Criteria:**
+
+**Given** the shot inspector
+**When** a Shot is selected
+**Then** the panel presents two tabs, `Shot Info` and `Effects`, built from a data array in the existing `ASSET_TABS` idiom (FX-4, UX-DR2)
+**And** `Shot Info` contains exactly what the inspector contains today, unchanged in content, order and behaviour
+**And** the strip is a real tablist — `role="tablist"`, arrow-key movement between tabs, `aria-selected`, panels bound by `aria-controls` (UX-DR2, UX-DR15)
+**And** the `Effects` tab shows a trailing count when the Shot carries anything.
+
+**Given** an edit in progress in either tab
+**When** the two-second background reload rebuilds the inspector
+**Then** the active tab and the in-progress edit both survive, through the existing `captureInspectorEdit` / `restoreInspectorEdit` mechanism extended to cover them (FX-4, UX-DR13)
+**And** selecting a different Shot returns to `Shot Info`.
+
+**Given** the `Effects` tab on a Shot with an empty stack
+**When** the Director adds a Grade effect from the picker
+**Then** the picker is a grouped list under Consolas family headers with no thumbnails (UX-DR14)
+**And** an Effect card is rendered with a drag handle, family micro-label, name, enable toggle and remove control (UX-DR3)
+**And** each parameter is a row with a label, slider, Consolas numeric readout and an inert bind glyph at its right edge (UX-DR4).
+
+**Given** the Grade family
+**When** its catalogue is offered
+**Then** it provides at minimum a LUT look, exposure, contrast, saturation, colour temperature, tint, lift/gamma/gain in some exposed form, and monochrome (FX-8)
+**And** every parameter is bounded and every default is a visual no-op
+**And** the same parameters on the same source produce the same output frame on every run
+**And** a LUT is referenced by catalogue id, never by a client-supplied path (AD-27).
+
+**Given** an `EffectSpec` arriving from the client
+**When** it is validated
+**Then** an unknown id, an unknown parameter, or a value outside its declared range is refused with a 422 naming the offender, before anything is stored (AD-27)
+**And** nothing client-supplied is ever interpolated into a filter string.
+
+**Given** a Shot carrying a Grade
+**When** the project is exported
+**Then** the grade is composed into the existing `-vf` chain in `trim_args` by the one pure builder in `effects.py`, which imports neither `app.py`, `batch.py`, nor `assembly.py` (AD-17, AD-25)
+**And** the Shot's Approved Output file is not modified (FX-23)
+**And** a Project with an empty stack everywhere exports byte-identically to the file it produces today (FX-5, FX-23).
+
+**Given** the generic `PUT /api/projects/{project_id}`
+**When** a body is submitted that omits `effects`, or invents them
+**Then** the stored Shot's effects are preserved unchanged, adopted server-side via the established `_adopt_*` idiom (AD-16)
+**And** a test asserts a full-project PUT omitting `effects` leaves every stack intact.
+
+### Story 9.2: See the Grade Before Exporting
+
+As the Director,
+I want the Monitor to play the Shot with its effects applied,
+So that I can judge a grade against the song instead of against my imagination.
+
+**Acceptance Criteria:**
+
+**Given** a Shot carrying an Effect Stack
+**When** it is selected
+**Then** the existing Monitor plays the **effected** picture, looping, produced by the same filter chain the export will run — at reduced dimensions and encoder quality, and differing in nothing else (FX-20, FX-NFR-3)
+**And** the Preview Clip covers the Shot's exposed window, not the whole over-rendered take
+**And** preview never writes to, replaces or modifies the Approved Output, never reaches ComfyUI, and never blocks an export or a Batch (FX-20, AD-24).
+
+**Given** preview geometry must be chosen
+**When** a Preview Clip is rendered
+**Then** it is half the dimensions `assembly_plan` would choose for this project — the largest-area approved take — never half the previewed take's own dimensions, so a Shot whose aspect differs previews with the letterbox it will ship with (AD-29)
+**And** where no export geometry is derivable, preview falls back to the take's own dimensions and says so.
+
+**Given** the Effect Stack changes
+**When** the preview becomes out of date
+**Then** the previous picture continues playing with a Consolas `STALE` corner label — never a frozen frame, never a spinner over black, never a percentage (UX-DR11)
+**And** staleness is decided by recomputing a fingerprint over the take, window, offset, stack, bindings, envelope fingerprint, transition and preview geometry, in that order, by the one fingerprint function — nothing stores a stale flag (AD-23, AD-28).
+
+**Given** a parameter being dragged
+**When** changes arrive faster than renders complete
+**Then** at most one preview render is in flight per project, a new request cancels the in-flight one, and a superseded render is discarded rather than played (FX-20, AD-24)
+**And** a Preview Clip for a Shot of typical length is ready in under one second from the change that invalidated it, measured rather than asserted (FX-NFR-6).
+
+**Given** the preview cache
+**When** it is deleted
+**Then** the only consequence is a re-render; it is never an input to an export (AD-23)
+**And** preview renders use libx264 `ultrafast` CRF 28 and not a hardware encoder, which is slower at these clip lengths (AD-23).
+
+**Given** a preview render that fails
+**When** the failure is reported
+**Then** its reason is named and the Effect Stack is untouched (FX-20).
+
+### Story 9.3: Texture, Stylize and Geometry Families
+
+As the Director,
+I want grain, glitch and camera moves as well as colour,
+So that I can hide the plastic sheen of generated footage and put motion where the model gave me none.
+
+**Acceptance Criteria:**
+
+**Given** the Texture family
+**When** its catalogue is offered
+**Then** it provides at minimum grain, vignette, bloom/halation, soft-focus diffusion and banding suppression (FX-9).
+
+**Given** the Stylize family
+**When** its catalogue is offered
+**Then** it provides at minimum RGB/chroma split, pixel shuffle or sort, posterize, edge treatment and a scanline/CRT look (FX-10)
+**And** every Stylize effect is off by default and none is applied implicitly by any other family.
+
+**Given** the Geometry family
+**When** its catalogue is offered
+**Then** it provides at minimum punch-in, slow zoom, handheld shake, dutch tilt and mirror/flip (FX-11)
+**And** a Geometry effect never changes the Shot's frame count, its window, or its position on the timeline
+**And** geometry that would sample outside the source frame is bounded so it cannot expose an undefined edge.
+
+**Given** the chain builder composing any combination of families
+**When** the filter chain is produced
+**Then** the stage order is exactly `trim, GEOMETRY, scale, TEXTURE, GRADE, STYLIZE, pad, fps, setsar, format` (AD-17)
+**And** a test asserts geometry precedes `scale`, so a punch-in samples the take's own pixels
+**And** a test asserts every treatment precedes `pad`, by sampling the letterbox bar of a padded export and requiring it to be pure black — measured 2026-08-21, texture after `pad` leaves it at RGB (1,1,5) and before `pad` at (0,0,0) (FX-9, AD-17).
+
+**Given** any effect chain
+**When** it is built
+**Then** it is asserted in tests by string comparison, in the same way `assembly.py` already pins its argv (FX-NFR-5).
+
+### Story 9.4: Stack Editing, Reordering and Disabling
+
+As the Director,
+I want to reorder my effects and switch one off without losing it,
+So that I can experiment without rebuilding a stack I spent time on.
+
+**Acceptance Criteria:**
+
+**Given** a Shot with several Effects
+**When** the Director reorders them
+**Then** reordering works by drag on the card handle and by `Alt+Up` / `Alt+Down` when a card is focused (FX-5, UX-DR15)
+**And** an order the render chain forbids is not offered — the picker and drop targets respect family ordering, so an illegal order cannot be expressed rather than being expressed and then rejected (FX-5).
+
+**Given** an Effect Stack stored out of family order — by a copy, a hand edit, or an older client
+**When** the chain is built
+**Then** the builder sorts the stack by family before composing and preserves the Director's order within each family, so storage order is never load-bearing (AD-31).
+
+**Given** an Effect the Director wants to silence
+**When** it is disabled
+**Then** it is retained with all its parameters and contributes nothing to preview or export (FX-5)
+**And** the card drops to 45% opacity with its controls still readable (UX-DR3).
+
+**Given** a Shot whose every Effect is removed
+**When** the stack is empty
+**Then** the Shot returns to the empty state and not to a residual one, and exports byte-identically to today (FX-5, FX-23).
+
+### Story 9.5: Copy a Look Across the Video
+
+As the Director,
+I want to apply one Shot's look to every other Shot,
+So that forty independently generated clips read as one film.
+
+**Acceptance Criteria:**
+
+**Given** a Shot with an Effect Stack the Director is happy with
+**When** `Copy stack to…` is used
+**Then** the target set is explicit — named Shots or the current Section, never a bare "all" (FX-6, UX-DR14)
+**And** the control states what will happen before it runs, naming replacement rather than merge
+**And** the report names the count applied and every Shot refused, by ID (FX-6).
+
+**Given** a locked Shot in the target set
+**When** the copy runs
+**Then** that Shot is refused by name and left unchanged (FX-6, FX-7).
+
+**Given** a locked Shot
+**When** its Effects tab is opened
+**Then** every writing control is disabled, the panel states the lock as the reason, and the stack remains readable (FX-7)
+**And** unlocking restores editing with the stack intact.
+
+**Given** a completed clip on the timeline carrying Effects
+**When** the timeline is scanned
+**Then** the clip shows a Consolas effects corner chip in the existing 14px idiom, reading order approved-effects-flagged (UX-DR9)
+**And** the chip is a glyph and not a tint, so the state is never colour-alone (UX-DR15).
+
+### Story 9.6: Honest Export with Effects
+
+As the Director,
+I want an export to refuse loudly rather than quietly drop an effect I configured,
+So that what I see is what ships, and a six-month-old project still tells me what it was built from.
+
+**Acceptance Criteria:**
+
+**Given** an Effect that cannot be applied — a missing LUT file, an unresolvable binding, a transition type not valid for its boundary
+**When** an export is requested
+**Then** it refuses and names the Shot and the reason, in one report covering every such problem rather than one at a time (FX-24)
+**And** an export never silently drops an Effect the Director configured
+**And** the report is built as an extensible list of checks, so the binding case (Epic 10) and the transition case (Epic 11) register into it later without reshaping it — this story ships the missing-LUT case and the report itself, and is complete without either later epic.
+
+**Given** a completed export
+**When** its provenance is read
+**Then** it records the Effect and Transition state it was built from (FX-25)
+**And** an export made before this feature existed is reported as carrying no Effects, not as carrying unknown ones.
+
+**Given** a Project with Effects on some Shots and none on others
+**When** it is exported
+**Then** clips carrying no Effects are not re-encoded a second time on account of anything elsewhere in the timeline (FX-NFR-2)
+**And** export wall-clock for a Project with no Effects is unchanged from today's, measured rather than asserted.
+
+**Given** a Project manifest
+**When** it is read on another machine or after a reload
+**Then** everything needed to reproduce the export's look is present in it, and nothing about an Effect lives only in the interface (FX-23).
+
+## Epic 10: The Picture Moves With the Music
+
+The Director ties a parameter to a frequency band and the video answers the track. Builds on Epics 8 and 9; requires neither Epic 11 nor anything later.
+
+### Story 10.1: Bind a Parameter to a Band
+
+As the Director,
+I want any effect parameter to be driven by the music instead of held at a number,
+So that the video moves with the track without my animating anything.
+
+**Acceptance Criteria:**
+
+**Given** any parameter of any Effect in any family
+**When** its bind glyph is clicked
+**Then** a band panel opens inline beneath that row, with a `--blue` left edge marking it as reactive (FX-12, UX-DR5)
+**And** `ParameterBinding` is added to the model as the only entity this story creates, defaulted so every existing manifest loads unchanged, and written only by the dedicated binding route (AD-16)
+**And** only one band panel is open at a time; opening another closes the first
+**And** no parameter is specially privileged and none is excluded by category (FX-12).
+
+**Given** a parameter being bound
+**When** the binding is configured
+**Then** the Drive is `punch` or `sustain`, chosen explicitly with neither preselected, because nothing infers a drive mode (FX-14)
+**And** a Trigger Floor is settable, below which the Drive contributes nothing
+**And** Depth is settable and bounded so a binding cannot drive a parameter outside its own declared range
+**And** the parameter's manual value becomes its resting value, and the binding moves it from there by Depth (FX-12).
+
+**Given** `punch` drive on a heavily limited master
+**When** the drive is computed
+**Then** it responds to transients rather than absolute level — measured as level above its own running average — so it flashes on hits rather than sitting pinned high (FX-14)
+**And** `sustain` engages only after its band holds above a level for a hold time, and survives dips for a sustain time.
+
+**Given** a binding
+**When** the render input is generated
+**Then** it compiles to a `sendcmd` commands file produced by a pure function of (Song Envelope, binding, Shot window), asserted in tests by string comparison exactly as ffmpeg argv already is (AD-22, FX-NFR-5)
+**And** the file is passed to ffmpeg as a **bare relative filename with the process cwd set to its directory** — an absolute Windows path's drive-letter colon parses as a filter option separator and fails naming a filter that is not the problem (AD-22)
+**And** there is exactly one mechanism; no expression-based second path is introduced (FX-NFR-3).
+
+**Given** a bound parameter
+**When** the binding is removed
+**Then** the parameter returns to its resting value with no residue (FX-12)
+**And** a Shot with no bindings exports identically to one where the feature does not exist.
+
+### Story 10.2: Choose the Band Against the Song's Spectrum
+
+As the Director,
+I want to pick a frequency band by seeing it on my song's own spectrum,
+So that a band is something I look at rather than three numbers I guess at.
+
+**Acceptance Criteria:**
+
+**Given** an open band panel
+**When** the spectrum strip is drawn
+**Then** it renders the song's **whole-song** per-band average as `--dim` bars, identical in every Shot's panel, with the selected Band drawn over it as a `--blue` region whose edges fall off according to softness (FX-13, UX-DR6, AD-26)
+**And** per-Shot spectra are not stored or drawn, so a binding copied to another Shot keeps its meaning.
+
+**Given** the spectrum strip
+**When** the Director adjusts the Band
+**Then** dragging the region body moves centre, dragging its edges sets width, and a handle sets softness (FX-13)
+**And** two Effects on the same Shot may listen to different Bands independently.
+
+**Given** a Director working without a mouse or with a screen reader
+**When** the band panel is used
+**Then** centre, width and softness are also exposed as three labelled numeric inputs, arrow-key adjustable and readable, as the canvas's equivalent (UX-DR6, UX-DR15).
+
+### Story 10.3: See What Is Driving
+
+As the Director,
+I want to see the envelope that is moving a parameter,
+So that I can tell whether it is firing on the hits or flickering on noise.
+
+**Acceptance Criteria:**
+
+**Given** a Shot carrying at least one Parameter Binding
+**When** it is selected
+**Then** a Drive readout is drawn immediately beneath the Monitor, spanning the Shot's window (FX-22, UX-DR7)
+**And** the envelope is drawn in `--blue`, the Trigger Floor as a `--dim` hairline, and the existing `--acid` playhead through it, so envelope and picture read against one time axis
+**And** where the envelope falls below the floor it draws `--dim`, so a silenced passage looks silenced rather than merely low
+**And** the signal drawn is the same one the export will use, not an illustration of one (FX-22, FX-NFR-3).
+
+**Given** a Shot with no bindings
+**When** it is selected
+**Then** the readout is absent, not empty (FX-22).
+
+**Given** a screen reader
+**When** the readout is encountered
+**Then** the canvas is `aria-hidden` and the facts it conveys — where the drive peaks, and whether it fires at all — are also stated in text on the band panel (UX-DR7, UX-DR15).
+
+### Story 10.4: Bindings Survive a Song Change
+
+As the Director,
+I want a song change to disable my bindings honestly rather than delete them,
+So that re-analyzing brings my work back instead of my having to rebuild it.
+
+**Acceptance Criteria:**
+
+**Given** a Project with no Song Envelope
+**When** the Director clicks a bind glyph
+**Then** the glyph is present but inert, and clicking it opens a one-line refusal naming the reason with an action — `No song analysis yet — bands need it. [Analyze song]` (FX-15, UX-DR12)
+**And** the glyph is never hidden, because a hidden control teaches nothing about what the product can do.
+
+**Given** a Project whose Song has been replaced, invalidating the envelope
+**When** its Shots' bindings are read
+**Then** the bindings are **retained and reported unresolvable**, never dropped and never silently zeroed (FX-15)
+**And** re-analyzing the Song makes them live again with their stored values intact.
+
+**Given** an unresolvable binding
+**When** an export is requested
+**Then** the export refuses, naming the Shot and the reason alongside every other such problem in one report (FX-24, FX-15).
+
+## Epic 11: Cuts That Blend
+
+Two clips dragged together become a transition. The only epic touching `assembly_plan` and the cumulative frame grid — it merges alone, behind its own verification pass.
+
+### Story 11.1: An Overlap Becomes a Transition
+
+As the Director,
+I want two overlapping clips to blend rather than hard-cut,
+So that a cut the song does not accent stops jarring.
+
+**Acceptance Criteria:**
+
+**Given** two Shots whose windows overlap and a Transition type set on the boundary
+**When** the project is assembled
+**Then** `assembly_plan` emits three entries — A truncated to the Overlap's start, a transition segment, and B from the Overlap's end (AD-18)
+**And** the transition segment is rendered by its own pinned argv from A's and B's overlapping frames through `xfade`, at the same normalized geometry, rate, SAR and pixel format as every other intermediate
+**And** the concat list joins them with `-c:v copy` unchanged, so no clip is re-encoded a second time (FX-NFR-2, AD-18).
+
+**Given** any combination of Overlaps and Transitions
+**When** the export is verified
+**Then** the assembled file's duration matches the Song within one frame (FX-NFR-1)
+**And** the transition segment's frame count is exactly the Overlap's frames on the existing cumulative grid, with `clip_frames_on_grid` unmodified
+**And** the existing grid assertions pass unchanged and gain cases for: no overlap, one overlap, adjacent overlaps, an overlap at the song's start, an overlap at its end, and a one-sided transition beside a paired one (FX-NFR-1).
+
+**Given** an Overlap with no Transition type set
+**When** the project is assembled
+**Then** it resolves exactly as it does today — a hard cut, later Shot on top (FX-16).
+
+**Given** the transition catalogue
+**When** it is offered
+**Then** it is a curated subset named in the Director's language, covering at minimum dissolve, fade through black, fade through white, blur, and directional wipes and slides (FX-19)
+**And** an entry that is pair-only appears in the list and refuses one-sided use with its reason, rather than being silently absent.
+
+**Given** more than two Shots overlapping at one point
+**When** assembly runs
+**Then** the case is refused with a stated reason rather than left undefined (FX-16).
+
+**Given** a Transition has to be stored before it can be assembled
+**When** the model is extended
+**Then** `TransitionSpec` is added along with `Shot.transition_in` and `Shot.transition_out`, all defaulted so every existing manifest loads unchanged (AD-16)
+**And** they are written only by a dedicated `.../shots/{shot_id}/transitions` route, and `replace_project` adopts them from the stored Shot via the same `_adopt_*` idiom that protects `effects` (AD-16)
+**And** a test asserts a full-project PUT omitting the transition fields leaves them intact
+**And** the route is sufficient to set and clear a Transition without any interface, so this story is completable and testable before Story 11.3 exists.
+
+### Story 11.2: The Overlap on the Timeline
+
+As the Director,
+I want to see the transition on the timeline as a region I created by dragging,
+So that its length is something I set by hand and can see.
+
+**Acceptance Criteria:**
+
+**Given** the design token set
+**When** the overlap treatment is implemented
+**Then** `--blue: #5b9bd5` is added as the sixth and final accent, reserved to transitions and reactive bindings, and DESIGN.md's "no new accent colors" anti-goal is amended in place with the argument for the exception (UX-DR1).
+
+**Given** two clips dragged until they overlap, with a Transition type set
+**When** the timeline is drawn
+**Then** the overlapping region shows a `--blue` fill at 22% with 1px `--blue` top and bottom edges and a centred Consolas type label (FX-16, UX-DR8)
+**And** the band draws **behind** clip content, so state borders and the corner chips stay fully legible on top of it
+**And** the band is not a drag target, so the existing clip edges remain the only handles.
+
+**Given** an Overlap with no Transition type set
+**When** the timeline is drawn
+**Then** it shows a `--line-strong` hatch and a Consolas `CUT` label, with no blue — an untyped overlap is still a hard cut and must not borrow the transition's treatment (UX-DR8).
+
+**Given** the application's error states are outlines
+**When** the overlap band is reviewed against them
+**Then** it is a soft fill and carries its type as text, so it cannot be misread as an error and its state is never colour-alone (UX-DR8, UX-DR15).
+
+**Given** an Overlap that is removed by dragging a clip away
+**When** the timeline redraws
+**Then** the band disappears and the Transition Pair's stored types are retained (FX-16).
+
+### Story 11.3: The Transition Pair
+
+As the Director,
+I want setting one side of a blend to set the other,
+So that the two Shots describing one transition can never disagree.
+
+**Acceptance Criteria:**
+
+**Given** the Effects tab on a Shot
+**When** the transition controls are shown
+**Then** two rows are presented, `Transition in` and `Transition out`, each selecting from the catalogue (FX-17, UX-DR10)
+**And** where an Overlap exists the row carries a `--blue` left edge and the Overlap's length in Consolas.
+
+**Given** Shot A overlapping Shot B
+**When** the Director sets A's `Transition out`
+**Then** B's `Transition in` is set to match, and the interface says so in the existing toast idiom, in the past tense, naming both Shots (FX-17, UX-DR12)
+**And** the reverse holds when B's `Transition in` is set first
+**And** a Transition Pair across an Overlap can never hold two different types.
+
+**Given** a manifest whose pair disagrees — hand-edited, or a partially applied write
+**When** the project is exported
+**Then** the outgoing Shot's `transition_out` is authoritative and is used, and the divergence is reported once (AD-30)
+**And** the export is not refused, so an editable manifest cannot produce an undecidable export.
+
+### Story 11.4: One-Sided Transitions
+
+As the Director,
+I want a transition out on a clip with nothing to blend into to still do something deliberate,
+So that a blur-out before a hard cut is an editorial choice rather than a broken pair.
+
+**Acceptance Criteria:**
+
+**Given** a Shot with a Transition set and no Overlap on that boundary
+**When** the project is assembled
+**Then** the transition treats that clip's own final frames — a blur out blurs, a fade out fades — followed by a hard cut, applied as a single-input filter on the clip's own intermediate with no `xfade` (FX-18, AD-19)
+**And** the named type is honoured and never quietly substituted
+**And** it consumes no timeline length, borrows no frames from a neighbour, and changes no Shot's window or frame count (FX-18, FX-NFR-1).
+
+**Given** the transition rows on a Shot with no Overlap
+**When** they are shown
+**Then** the row carries a `--dim` left edge and states what will actually happen — `No overlap — this treats shot 04's last frames, then cuts.` (FX-18, UX-DR10)
+**And** the control is live rather than disabled
+**And** its length is bounded by the Shot's own duration and by nothing invisible.
+
+### Story 11.5: Preview a Transition
+
+As the Director,
+I want to see the blend before I export,
+So that I choose a transition by looking at it rather than by its name.
+
+**Acceptance Criteria:**
+
+**Given** a Shot with a Transition, paired or one-sided
+**When** the boundary is previewed
+**Then** the Preview Clip covers a window spanning the boundary, so the outgoing Shot, the Transition and the incoming Shot play as one continuous piece (FX-21)
+**And** the Transition previewed is the same one the export will build, by name and by duration (FX-NFR-3).
+
+**Given** a one-sided Transition
+**When** it is previewed
+**Then** it previews as what it actually is — the treated frames followed by a hard cut (FX-21, FX-18).
+
+**Given** the Overlap being lengthened by dragging
+**When** the preview updates
+**Then** its Transition length follows the Overlap, and the transition row's length readout follows with it (FX-21, FX-16).
