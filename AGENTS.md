@@ -41,3 +41,10 @@ Local-first studio that turns a song into an AI music video through a user-manag
 - Job refresh reads `/history` only, so an executing render reports `queued`, not `running`. Check `/queue` to tell them apart.
 
 <!-- /bmad:context -->
+
+## Start here for build work
+
+Read **`docs/BUILD-HANDOFF.md`** before starting on Shot Effects and Transitions (Epics 8-11) or Treatment Planning (Epics 12-17). It carries the planning state, the measured facts that must not be re-derived by reasoning, and the process traps -- concurrent agents, the recurring `replace_project` guard hole, and the fact that this repo invalidates its own planning artifacts within about a week.
+
+*(Outside the managed block above, so a `bmad-project-context` refresh does not remove it.)*
+
