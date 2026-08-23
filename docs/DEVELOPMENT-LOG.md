@@ -4,6 +4,138 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-23 — A take records which bundle produced it, and a take that predates the record says so
+
+Source: the entry below made `Project.sampling_profile` the Director's per-project choice, which
+means a project's takes are now a **mixture** — some at 20 steps with no LoRA, some at 8 with one —
+and `RenderJob` carried seed, frames and timing but nothing about how the render was sampled. That
+is unrecoverable after the fact: the project setting is a standing choice that changes underneath
+the library it produced, so reading it later describes the *next* take rather than this one.
+
+**No render, no ComfyUI submission, no model call.** `data/projects/project_59f14d19ff10` was read
+only — its jobs (43 when this work was scoped, 49 by the time it landed; a live app is writing it)
+are the fixture-shaped fact that every existing job carries no `sampling_bundle` key at all.
+
+### The design question: the name, or the values
+
+**Both, and the pairing is the point.** The argument for the values alone is that a name is a
+pointer and pointers drift: retune `H3_REFERENCE_PROFILES["turbo"]` next month and every historical
+job recorded as `turbo` claims a bundle it never ran. The argument for the name alone is that
+`steps: 8, euler, simple, minimax_h3_turbo_v4…` is precise and unreadable in a queue row.
+
+What decided it is that the name is not reliably the whole configuration **today**, never mind
+after a future edit: `H3Request.steps` overrides the bundle's own count on every branch — "the
+profile chooses the graph, the Director chooses the effort" — so a submission recorded as `turbo`
+may have sampled twenty steps. A name-only record is wrong now, from the shipped request model.
+
+So `RenderJob.sampling_bundle` is a `SamplingBundle` carrying `name`, `steps`, `sampler`,
+`scheduler`, `lora` and `lora_strength`. The name is not a pointer to be dereferenced later; it is
+the name the bundle carried *at submission*, filed with the values it then had. That is what makes
+drift **detectable** rather than merely survivable, which is the answer to "how does a reader know
+whether the table still means what it meant": compare the record against
+`H3_REFERENCE_PROFILES[name]`, and a disagreement is the answer. Where they disagree the record
+wins — it is what was submitted. `render_seconds` and `render_seconds_source` are the precedent:
+the number, and what it is a number of.
+
+### An old job reads as unknown, and is never given a value it never had
+
+`None` means no record, and nothing anywhere fills it in. Every job written before this field
+carries it, and defaulting them to `"default"` would be inventing a measurement — the exact sin
+behind the fabricated "221 frames = 2.2 hours" figure this application spent two days retiring.
+The queue column draws the word **`unknown`**, never a blank, and the cell's own sentence is:
+
+> No sampling bundle was recorded for this job. Every H3 submission has recorded one since
+> 2026-08-23; a job submitted before that carries none, and none was invented for it.
+
+That is `render_seconds_source`'s shape and voice — the timing cell already draws `—` and explains
+that a job settled before instrumentation existed carries no time.
+
+**A third state, written positively.** The first/last keyframe and text-only Director graphs load
+different checkpoints, refuse a *named* bundle and render their own way whatever the project is set
+to. Those record `NO_EVIDENCED_BUNDLE` and draw `none`, because a blank there would be
+indistinguishable from an old job — and a Director reading `unknown` beside a turbo project would
+supply the wrong answer themselves. A `flux`, `music`, `post` or `ltx` job draws `—`; `kind`
+answers that without any record, since this application submits no H3 graph for one.
+
+### The write paths, enumerated
+
+Ten routes construct a `RenderJob`. Exactly one constructs a `kind="h3"` one — `generate_h3` — and
+it is the only caller of all three H3 payload builders; `generate_batch` submits through it
+in-closure, and `enhance_with_ltx25` builds a graph with no MiniMax node in it. The value is
+therefore written in one statement, beside `render_frames`, at the one moment it is true.
+
+Within the route the bundle is decided *above* the branches, defaulting to `NO_EVIDENCED_BUNDLE`,
+so a branch that says nothing cannot leave a job submitted today claiming to predate the field.
+`resolved_sampling_profile` is now called once and read twice — the graph is built on it and the
+job records it — and the values come from `workflows.resolved_h3_sampling`, extracted from
+`build_h3_reference_payload`'s own two lines and called by it. So "what was recorded is what was
+submitted", including the step override, is true by construction rather than by two call sites
+agreeing.
+
+**The generic project `PUT` is guarded**, and this is the *eleventh* recorded time that one route
+has been the hole for a field a narrower sibling owns — the tenth was `sampling_profile` itself,
+yesterday. `sampling_bundle` joins `JOB_MEASURED_FIELDS`, so `_adopt_job_measurements` re-adopts
+the stored value for a job the store holds and **forces the default** for one the body invents. It
+fails both ways without that: every client omits the key, so one ordinary save would strip the
+bundle off every job at once; and a body that forged `{"name": "turbo", "steps": 4}` on a job that
+sampled twenty would be planting provenance for a render nobody performed — the fabricated-figure
+failure wearing the costume of the fix.
+
+### The surface
+
+A `Bundle` column beside `Took` in the render queue, because the two are read together: `6m18s`
+means one thing at twenty steps and another at eight. Terse — `default · 20`,
+`turbo-references2v · 8`, `turbo · 12` for an overridden count, `none`, `unknown`, `—` — with the
+full sentence on the cell's `title`. The steps ride the cell rather than only the tooltip because
+they are the number a name alone gets wrong.
+
+The sentence is written once in `batch.sampling_bundle_summary` and mirrored in `app.js`, executed
+against each other under node and compared character for character, exactly as
+`render_timing_summary` already is. `format_lora_strength` exists for the same reason at one field's
+scale: Python's `str(1.0)` is `1.0` and JavaScript's is `1`, so the Python side spells it `%g`.
+
+### Tests
+
+Fifteen new cases. Backend (`tests/test_api.py`): every bundle recorded with the name *and* the
+values, asserted against `H3_REFERENCE_PROFILES` rather than against copied literals so the record
+is provably a copy of the table; a named bundle recorded identically to an inherited one; the batch
+recording it on every job; a step override recorded as the steps actually sampled and read against
+the submitted scheduler node; a graph with no evidenced bundle recording that rather than a blank;
+an old job with the key stripped off disk loading, reading as `unknown`, and never as `default`;
+the generic `PUT` unable to clear it, forge it, or forge a whole job carrying one. Frontend
+(`tests/test_frontend_contract.py`): the two sentences compared character for character across nine
+job shapes, the two strength formatters compared, the column's cells asserted against both
+languages, and an absence test that no surface reads an unrecorded bundle as `default · 20`.
+`tests/test_workflows.py` pins that the resolver the builder uses is the resolver the record uses;
+`tests/test_models.py` pins that no profile may be named what the sentinel is named.
+
+**Submissions are unchanged, digested.** Ten payload digests captured at `cd5c785` — the commit
+before a job recorded anything — and re-produced identically after: all three bundles through both
+doors (stored on the project, named on the request), the same three with an explicit `steps=12`
+override, and the text-only shape. `H3_BUNDLE_PAYLOAD_DIGESTS` and
+`H3_BUNDLE_STEP_OVERRIDE_DIGESTS` pin the six that had no digest before today. This change records
+what was submitted; it does not change it.
+
+**Mutation-checked over five files: 36 real mutants and 5 sentinels, every one killed.** In a git
+worktree with `PYTHONPATH` at its own `src` (verified by printing `music_video_producer.__file__`
+before the baseline), `read_bytes`/`write_bytes` restores, anchors converted to each file's own line
+ending with match counts asserted, `__pycache__` purged per run, time-boxed. The mutants include
+every honesty branch put back the wrong way round: `unknown` drawn as a dash, as `default · 20`, and
+collapsed into `none`; the step count dropped from the record and from the cell; the record built
+from the table rather than from the submission; the sampler and scheduler swapped; the guard tuple
+losing the field; and each JS mirror drifted from its Python original.
+
+Pass one reported three survivors and **two of them were defects in the harness rather than gaps in
+the tests**, which is worth recording because a survivor is only evidence if the mutant is real. One
+was an *equivalent* mutant — a conditional rewritten into a semantically identical form, which
+cannot fail — and one was a sentinel that only added an unused function, which is a no-op and
+rightly survived. Both were replaced with mutants that change behaviour (the conditional's two arms
+swapped; `resolved_sampling_profile` returning a fixed bundle) and both were killed. The third was
+a real gap at the time and is the reason the pass exists: the worktree had been seeded before
+`test_the_two_lora_strength_formatters_agree` grew its non-finite rows, so dropping
+`format_lora_strength`'s `isfinite` guard had nothing to fail against. The rows were added and it
+was killed in pass two against a re-seeded worktree.
+
 ## 2026-08-23 — The sampling bundle becomes a visible choice, and the two render paths stop disagreeing
 
 Source: the Director's ruling on `docs/measurements/2026-08-23-bundle-comparison/index.html` —

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -554,6 +554,39 @@ H3_REFERENCE_PROFILES: dict[str, H3SamplingProfile] = {
 
 #: The profile a caller that names none gets: today's graph, unchanged.
 H3_DEFAULT_PROFILE = "default"
+
+
+def resolved_h3_sampling(profile: str, steps: int | None = None) -> H3SamplingProfile:
+    """The bundle a reference submission actually samples on: the named profile, with an
+    explicit step count substituted where the caller supplied one.
+
+    Extracted from ``build_h3_reference_payload``'s own two lines and called by it, so that
+    "what was recorded is what was submitted" is true by construction rather than by two call
+    sites agreeing — which is `app.resolved_sampling_profile`'s argument one level up, and the
+    reason that function exists at all.
+
+    The substitution is the whole point of returning a profile rather than a name.
+    ``H3Request.steps`` overrides the bundle's own count on every branch — "the profile chooses
+    the graph, the Director chooses the effort" — so a submission whose *name* is ``turbo`` may
+    have sampled twenty steps, and a record carrying only the name would be wrong about the one
+    number the bundle is chosen for.
+
+    An unknown profile is refused here, in the words the builder has always refused it in, and
+    the type is checked as well as the membership for the builder's own reason: a non-string
+    reaches ``profile in {...}`` as a ``TypeError``, which the route's ``except ValueError`` does
+    not translate and which escapes as a 500.
+
+    A supplied count is validated by ``H3SamplingProfile`` itself, on the line that got it wrong:
+    ``steps=0`` would previously have built a graph that samples nothing. ``H3Request`` already
+    bounds the field at 1..100, so no route can reach that; a script or a test can.
+    """
+    if not isinstance(profile, str) or profile not in H3_REFERENCE_PROFILES:
+        raise ValueError(
+            f"Unknown H3 sampling profile: {profile!r}; the profiles are "
+            f"{', '.join(sorted(H3_REFERENCE_PROFILES))}"
+        )
+    sampling = H3_REFERENCE_PROFILES[profile]
+    return sampling if steps is None else replace(sampling, steps=steps)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1123,22 +1156,16 @@ def build_h3_reference_payload(
     while 1056x608 was.
     """
     # Before anything else in this function, so an unknown profile is refused before a
-    # payload is built rather than after the references validate. The type is checked as
-    # well as the membership: a caller that is not the route — a script, a test, a future
-    # batch path — can pass an unhashable value, and `profile in {...}` would raise
-    # `TypeError`, which the route's `except ValueError` does not translate. That escapes
-    # as a 500 instead of the 422 every other bad input here gets.
-    if not isinstance(profile, str) or profile not in H3_REFERENCE_PROFILES:
-        raise ValueError(
-            f"Unknown H3 sampling profile: {profile!r}; the profiles are "
-            f"{', '.join(sorted(H3_REFERENCE_PROFILES))}"
-        )
-    sampling = H3_REFERENCE_PROFILES[profile]
+    # payload is built rather than after the references validate. Both the membership check and
+    # the step substitution live in `resolved_h3_sampling`, which `app.generate_h3` also calls to
+    # *record* what this submission ran on — one resolution, so the graph and the provenance
+    # cannot disagree about the bundle or about its step count.
+    sampling = resolved_h3_sampling(profile, steps)
     # Resolved here, beside the sampling profile and before any reference is looked at, for
     # the same reason: a mistyped backend name must fail on the request rather than on
     # whichever unrelated thing it happens to trip over next.
     attention_profile = resolve_h3_attention(attention)
-    sampled_steps = sampling.steps if steps is None else steps
+    sampled_steps = sampling.steps
     # Geometry, resolved once and before any reference is looked at, so a request carrying
     # two contradictory ways to say how big the frame is fails on that rather than on
     # whichever unrelated thing it happens to trip over next. The rule itself lives in

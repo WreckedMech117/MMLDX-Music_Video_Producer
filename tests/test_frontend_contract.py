@@ -42,8 +42,11 @@ from music_video_producer.app import (
 from music_video_producer.batch import (
     TERMINAL_JOB_STATUSES,
     format_duration,
+    format_lora_strength,
     reconcilable_jobs,
     render_timing_summary,
+    sampling_bundle_cell,
+    sampling_bundle_summary,
 )
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
@@ -13578,13 +13581,19 @@ def test_the_queue_panel_actually_draws_the_column_it_declares():
     header = re.search(r'<div class="queue-header">(.*?)</div>', INDEX_HTML.read_text("utf-8"))
     assert header, "the queue table no longer declares a header row"
     columns = re.findall(r"<span[^>]*>([^<]+)</span>", header.group(1))
-    assert columns == ["Job", "Target", "Status", "Seed", "Took", "Output"]
+    assert columns == ["Job", "Target", "Status", "Seed", "Took", "Bundle", "Output"]
 
     source = without_comments(APP_JS.read_text(encoding="utf-8"))
     row = source.split('list.innerHTML = progress +', 1)[1].split("\n", 1)[0]
     assert 'class="job-took"' in row, "the queue row draws no timing cell under the Took header"
     assert "renderTimingCell(job)" in row
     assert "renderTimingSummary(job)" in row, "the full sentence must ride the cell's title"
+    # Bundle sits beside Took, and in that order: the two are read together, because a duration
+    # means one thing at 20 steps and another at 8.
+    assert 'class="job-bundle"' in row, "the queue row draws no cell under the Bundle header"
+    assert "samplingBundleCell(job)" in row
+    assert "samplingBundleSummary(job)" in row, "the full sentence must ride the cell's title"
+    assert row.index('class="job-took"') < row.index('class="job-bundle"')
 
     grid = re.search(
         r"\.queue-header, \.job-row \{[^}]*grid-template-columns: ([^;]+);",
@@ -13592,6 +13601,138 @@ def test_the_queue_panel_actually_draws_the_column_it_declares():
     )
     assert grid, "the queue grid no longer declares its columns"
     assert len(grid.group(1).split()) == len(columns)
+
+
+# ----------------------------------------------------------------------------------------------
+# Which bundle produced which take, surfaced (2026-08-23).
+#
+# The bundle became a per-project choice, so a project's takes are a mixture. The record is only
+# worth taking if a Director can read it beside the duration it explains — 6m18s means one thing at
+# twenty steps and another at eight — and it is only *honest* if a job that predates the field
+# reads as unknown rather than as a bundle it may never have run.
+#
+# So the sentence is written once, in `batch.sampling_bundle_summary`, and the browser's copy is
+# executed under node against the same jobs and compared character for character, exactly as the
+# timing sentence above it is.
+# ----------------------------------------------------------------------------------------------
+
+#: Every branch of `sampling_bundle_summary` and of `sampling_bundle_cell`, in one table.
+BUNDLE_JOBS = [
+    # The default bundle, applied: no LoRA, and the sentence must say so rather than trailing off.
+    {"kind": "h3", "sampling_bundle": {
+        "name": "default", "steps": 20, "sampler": "res_multistep", "scheduler": "simple",
+        "lora": "", "lora_strength": 0.0}},
+    # The two turbo bundles, each with its own LoRA at its own strength. `1.0` and `0.7` are the
+    # two spellings that made a shared formatter necessary: Python's `str(1.0)` is `1.0` and
+    # JavaScript's is `1`.
+    {"kind": "h3", "sampling_bundle": {
+        "name": "turbo", "steps": 4, "sampler": "euler", "scheduler": "beta",
+        "lora": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "lora_strength": 0.7}},
+    {"kind": "h3", "sampling_bundle": {
+        "name": "turbo-references2v", "steps": 8, "sampler": "euler", "scheduler": "simple",
+        "lora": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+        "lora_strength": 1.0}},
+    # A bundle whose step count the request overrode: the case a name-only record gets wrong.
+    {"kind": "h3", "sampling_bundle": {
+        "name": "turbo", "steps": 12, "sampler": "euler", "scheduler": "beta",
+        "lora": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "lora_strength": 0.7}},
+    # An H3 graph that has no evidenced bundle: the keyframe and text-only paths. Not unknown.
+    {"kind": "h3", "sampling_bundle": {"name": "none"}},
+    # Every H3 job written before 2026-08-23: no record, and none invented.
+    {"kind": "h3"},
+    # And the kinds that submit no H3 graph at all, which `kind` answers without any record.
+    {"kind": "post"},
+    {"kind": "flux"},
+    {"kind": "ltx", "sampling_bundle": {"name": "turbo", "steps": 4}},
+]
+
+
+def test_the_browsers_bundle_sentence_is_the_servers_sentence_character_for_character():
+    jobs = [RenderJob(target_id="shot_a", **fields) for fields in BUNDLE_JOBS]
+    wire = json.dumps([json.loads(job.model_dump_json()) for job in jobs])
+    body = f"""
+      console.log(JSON.stringify({wire}.map(app.samplingBundleSummary)));
+    """
+
+    assert run_workspace(body) == [sampling_bundle_summary(job) for job in jobs]
+
+
+def test_the_two_lora_strength_formatters_agree():
+    """`str(1.0)` is `1.0` in Python and `1` in JavaScript, and the sentence carrying the value is
+    compared character for character. The range is `H3_LORA_STRENGTH_LIMITS`, plus the negative
+    and non-finite values a hand-edited manifest can hold."""
+    table = [0, 0.7, 1.0, 1.5, -1.5, 12.25, 100.0, -100.0, 0.05,
+             # A hand-edited manifest can hold these and Pydantic accepts them on a `float`.
+             # `%g` would print `inf`/`nan` and `String()` would print `Infinity`/`NaN`, so both
+             # sides refuse to render a strength that is not one — the em dash `format_duration`
+             # already draws for the same reason.
+             float("inf"), float("-inf"), float("nan")]
+    body = f"""
+      console.log(JSON.stringify({json.dumps(table)}.map(app.formatLoraStrength)));
+    """
+
+    rendered = run_workspace(body)
+
+    assert rendered == [format_lora_strength(value) for value in table]
+    assert rendered[-3:] == ["—", "—", "—"]
+
+
+def test_the_bundle_column_names_the_bundle_and_marks_an_unrecorded_one_as_unknown():
+    """The terse form, and the one requirement the column was added under: an unknown bundle is
+    visibly unknown rather than blank-and-ambiguous.
+
+    `—` is what a job with no H3 graph draws — a known negative that needs no record. A job whose
+    bundle nobody recorded reads as a word, so a Director scanning the column tells the two apart
+    without hovering and without supplying the answer themselves.
+
+    The steps ride the cell because they are the number a *name alone* gets wrong: rows two and
+    four are the same bundle at four steps and at twelve.
+    """
+    jobs = [json.loads(RenderJob(**fields).model_dump_json()) for fields in BUNDLE_JOBS]
+    body = f"""
+      console.log(JSON.stringify({json.dumps(jobs)}.map(app.samplingBundleCell)));
+    """
+
+    cells = run_workspace(body)
+
+    assert cells == ["default · 20", "turbo · 4", "turbo-references2v · 8", "turbo · 12",
+                     "none", "unknown", "—", "—", "—"]
+    assert cells == [sampling_bundle_cell(RenderJob(**fields)) for fields in BUNDLE_JOBS]
+    # The three that are not a bundle name are three different statements and no two of them
+    # may collapse into one another.
+    assert len({cells[4], cells[5], cells[6]}) == 3
+
+
+def test_no_surface_ever_reads_an_unrecorded_bundle_as_the_default_one():
+    """The constraint that matters most, asserted as an absence on both sides.
+
+    An old job carries no bundle, and every sentence and cell about it must say *unknown*. The
+    failure this pins is not a crash — it is a job silently drawn as `default · 20`, which is a
+    fabricated measurement quoted onward as evidence, and is the exact shape this application
+    spent two days retiring.
+    """
+    unrecorded = RenderJob(kind="h3", target_id="shot_a")
+
+    assert unrecorded.sampling_bundle is None
+    assert sampling_bundle_cell(unrecorded) == "unknown"
+    for text in (sampling_bundle_cell(unrecorded), sampling_bundle_summary(unrecorded)):
+        assert "default" not in text
+        # No step count either, in cell form or in sentence form. The date it names contains
+        # "20" and is not a claim about sampling, so the two spellings are excluded by name.
+        assert "· 20" not in text
+        assert "20 steps" not in text
+    # And the browser agrees, from the same record, through its own two functions.
+    wire = json.dumps(json.loads(unrecorded.model_dump_json()))
+    verdict = run_workspace(f"""
+      console.log(JSON.stringify({{
+        cell: app.samplingBundleCell({wire}),
+        sentence: app.samplingBundleSummary({wire}),
+      }}));
+    """)
+    assert verdict["cell"] == "unknown"
+    assert verdict["sentence"] == sampling_bundle_summary(unrecorded)
 
 
 # --- The sampling bundle control -------------------------------------------------------------

@@ -191,6 +191,11 @@ Messages saved before 2026-08-17 carry no `notices` and still have the old inlin
 - `output_files[]` — an assembly records its export here, media-relative (`exports/assembly_00001.mp4`)
 - `inputs[]` — FR-24 adapted for local work: what the job consumed, as `"<shot_id>=<approved_output>"` pairs, so an export is rebuildable from its record. Empty for every ComfyUI job, whose inputs are the submitted graph `prompt_id` already names
 - exact `error`
+- `sampling_bundle` — which evidenced sampling bundle this job's graph was built on, or **absent**. A record carries the bundle's `name` *and* the `steps`, `sampler`, `scheduler`, `lora` and `lora_strength` it resolved to. Both, because neither alone is the fact: a name is a pointer into `workflows.H3_REFERENCE_PROFILES`, which is a table this application edits, and it is not even the whole configuration today — `H3Request.steps` overrides the bundle's own count, so a submission recorded only as `turbo` may have sampled twenty steps. Holding the two together is what lets a later reader *detect* that the table has moved, by comparing them; where they disagree the record wins, because it is what was submitted.
+
+  Written by `POST .../shots/{id}/generate/h3` alone, at the one moment it is true — `Project.sampling_profile` is a standing choice the Director changes between renders, which is exactly why a project's takes are a mixture — and re-adopted by the generic full-project `PUT` (`app._adopt_job_measurements`) rather than trusted from a body.
+
+  **Absent means unknown and is never filled in.** Every job written before 2026-08-23 carries no bundle; giving those a `"default"` would be inventing a measurement, so the queue column draws the word `unknown` and says so. A *present* record naming `none` is a different statement — an H3 submission through the first/last keyframe or text-only Director graph, neither of which has an evidenced bundle — and a non-`h3` job needs no record at all, because this application submits no H3 graph for one
 - `superseded_by` — the id of the job that replaced this one for the same target, or empty. Written only when a new render is accepted for a target that still had an unsettled record (`batch.supersede_target_jobs`): the leftover settles as `cancelled` and this names its successor, which is what tells a superseded record from one the Director cancelled by hand. Provenance only — nothing reads it for a decision — and the superseded record keeps its `prompt_id`, so a file an already-executing ComfyUI prompt still writes stays traceable to it
 - timestamps
 
@@ -199,3 +204,5 @@ A `running` local job whose process died with the application — a restart's le
 ## Provenance rule
 
 No output is considered reproducible unless the manifest retains the workflow kind/version, prompt ID, seed, semantic target, and output path. Later schema revisions will add explicit workflow hashes and model selections while preserving backward compatibility.
+
+`RenderJob.sampling_bundle` is the first instalment of that model selection, added 2026-08-23 when the bundle became a per-project choice and a project's takes therefore became a mixture. It follows the compatibility rule literally: the field is absent on every job that predates it, absence reads as *unknown* on every surface, and nothing derives a value for a job that has none — an invented default would be a fabricated measurement, which is worse than the gap it fills.

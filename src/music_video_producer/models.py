@@ -1463,6 +1463,69 @@ class TreatmentMessage(BaseModel):
     created_at: datetime = Field(default_factory=now_utc)
 
 
+#: `SamplingBundle.name` for an H3 graph that takes **no** evidenced bundle: the first/last
+#: keyframe and text-only Director graphs, which load different checkpoints and sample their own
+#: way. A word rather than `""`, because `""` is what an unfilled field looks like and this is a
+#: positive statement — "a bundle was decided for this submission, and the decision was that this
+#: graph has none". No profile may ever be named this; `tests/test_models.py` holds that.
+#:
+#: It exists because the alternative is the mis-logging this route already refuses one field over.
+#: A keyframe shot in a `turbo` project renders at 20 steps on its own graph (`generate_h3`'s
+#: keyframe branch says so in full), and a record that left it blank would be indistinguishable
+#: from a job written before any of this existed — so a Director reading the queue would see
+#: "unknown" beside a turbo project and supply the wrong answer themselves.
+NO_EVIDENCED_BUNDLE = "none"
+
+
+class SamplingBundle(BaseModel):
+    """Which sampling bundle a submission actually ran on — the name **and** the values.
+
+    Both, and the reason is that neither alone is the fact.
+
+    The *name* is a pointer, and pointers drift. `workflows.H3_REFERENCE_PROFILES["turbo"]` is a
+    table this application edits: retune it next month and every historical job recorded as
+    `turbo` would claim a bundle it never ran, silently, with nothing on the record able to say
+    so. The name is also not even reliably the whole configuration *today* — `H3Request.steps`
+    overrides the bundle's own count on every branch, so a submission recorded as `turbo` may have
+    sampled 20 steps and not 4. That is not a hypothetical about a future edit; it is reachable
+    from the shipped request model right now.
+
+    The *values* are the fact and cannot rot, but on their own they are unreadable in a queue row
+    and they lose the identity: a Director comparing two takes asks "which bundle?", not "which
+    scheduler?", and a bundle that is later renamed or retired would become unnameable.
+
+    So both are recorded, and the pairing is what makes drift **detectable** rather than merely
+    survivable: a reader who wants to know whether the table still means what it meant compares
+    this record against `H3_REFERENCE_PROFILES[name]`, and a disagreement is the answer. Where
+    they disagree, *this* is authoritative — it is what was submitted. That is the same shape
+    `render_seconds` and `render_seconds_source` already have: the number, and what it is a number
+    of, because a figure with no provenance beside it is the fabrication this application spent
+    two days retiring.
+
+    Copied at submission, by `app.generate_h3`, and never written again. A bundle is a property of
+    a *submission*, not of a project — `Project.sampling_profile` is the standing choice and the
+    Director may change it between two renders, which is exactly why the library became mixed and
+    exactly why this record has to be taken at the one moment it is true.
+
+    `lora` is `""` and `lora_strength` `0.0` on a bundle that applies no LoRA. `H3SamplingProfile`
+    forbids an empty filename, so `""` is unambiguous, and the two travel together there for the
+    same reason they do here: a strength without a LoRA reads as "applied at 0.0", a third state
+    that means nothing.
+    """
+
+    #: One of `SamplingProfile`'s names, or `NO_EVIDENCED_BUNDLE`. Required rather than defaulted:
+    #: a record that exists must say which bundle it is, and there is no half-written state.
+    name: str
+    #: The steps actually submitted — the bundle's own count, or the count the request overrode it
+    #: with. `0` only on a `NO_EVIDENCED_BUNDLE` record, whose graph fixes its own sampling and
+    #: whose values this field does not claim to describe.
+    steps: int = Field(default=0, ge=0)
+    sampler: str = ""
+    scheduler: str = ""
+    lora: str = ""
+    lora_strength: float = 0.0
+
+
 class RenderJob(BaseModel):
     id: str = Field(default_factory=lambda: new_id("job"))
     # `edit` is the H3 image-edit (AI Mod) — an asset-producing GPU render like `flux`
@@ -1562,6 +1625,42 @@ class RenderJob(BaseModel):
     #: frame count off every job at once. That hole has been found in that route seven times;
     #: these three fields are not the eighth.
     render_frames: int = Field(default=0, ge=0)
+    #: Which sampling bundle this job's graph was built on, or `None` for **no record**.
+    #:
+    #: The gap it closes: `Project.sampling_profile` became the Director's per-project choice on
+    #: 2026-08-23, so a project's takes are now a *mixture* — some rendered at 20 steps with no
+    #: LoRA, some at 8 with one — and until this field nothing said which was which. Seed, frames
+    #: and timing were all recorded; the bundle was not, and it is unrecoverable afterwards
+    #: because the project setting is a standing choice that changes underneath the library it
+    #: produced. `render_frames`' argument, one field up, applied to the other half of what makes
+    #: a take interpretable.
+    #:
+    #: **`None` means unknown, and it is never filled in.** Every job written before this field
+    #: existed loads as `None`, and that is the honest reading: nobody recorded a bundle for it,
+    #: and the 49 jobs in the Director's live manifest predate it. Defaulting them to `"default"`
+    #: would be inventing a measurement — the exact sin behind the fabricated "221 frames = 2.2
+    #: hours" figure this instrumentation was written to retire — so no path anywhere derives a
+    #: value for a job that has none, and `batch.sampling_bundle_summary` says *unknown* in the
+    #: Director's own terms instead. `render_seconds_source`'s empty string is the precedent, and
+    #: this is the same distinction: an absent record is not a default one.
+    #:
+    #: `None` on a non-`h3` job means something weaker and needs no record to establish: this
+    #: application submits no H3 graph for a `music`, `flux`, `multiview`, `edit`, `ltx` or `post`
+    #: job, so `kind` already answers the question and the surface reads it from there.
+    #:
+    #: A *present* record with `name == NO_EVIDENCED_BUNDLE` is the third state and is written
+    #: deliberately: an H3 submission through the first/last keyframe or text-only Director graph,
+    #: neither of which has an evidenced bundle. Positively recorded so it can never be read as
+    #: unknown — see that constant.
+    #:
+    #: **Server-owned.** `POST .../shots/{id}/generate/h3` is its one writer, and the generic
+    #: full-project `PUT` re-adopts the stored value (`app._adopt_job_measurements`) rather than
+    #: trusting a body — a defaulted field that any pre-existing client omits arrives as `None`,
+    #: and one ordinary save would otherwise strip the bundle off every job in the project at
+    #: once, while a body that *invented* one would plant provenance for a render that never
+    #: happened. That hole has been found in that route **ten** times; this field is not the
+    #: eleventh.
+    sampling_bundle: SamplingBundle | None = None
     #: Enqueue time — when the *record* was created, which for a ComfyUI job is a moment before
     #: its graph was submitted, not a moment when the GPU started work. See `render_seconds`.
     created_at: datetime = Field(default_factory=now_utc)

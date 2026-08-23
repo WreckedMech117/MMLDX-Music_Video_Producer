@@ -2881,6 +2881,66 @@ export function renderTimingCell(job) {
   return `${bounded ? "≤" : ""}${length}${frames}`;
 }
 
+// The `kind` of job that submits an H3 graph, mirroring `batch.JOB_KIND_WITH_SAMPLING_BUNDLE`.
+// Every other kind needs no record to answer the question: this application submits no MiniMax H3
+// graph for a music, flux, multiview, edit, ltx or post job.
+const JOB_KIND_WITH_SAMPLING_BUNDLE = "h3";
+
+// The name `models.NO_EVIDENCED_BUNDLE` writes for an H3 graph that takes no evidenced bundle.
+const NO_EVIDENCED_BUNDLE = "none";
+
+// A LoRA strength as Python writes it, mirroring `batch.format_lora_strength`. `String(1)` is `1`
+// where Python's `str(1.0)` is `1.0`, so the Python side spells it `%g` and this side does the
+// plain thing; the contract test runs both over the range a strength can hold.
+export function formatLoraStrength(strength) {
+  if (!Number.isFinite(strength)) return "—";
+  return String(strength);
+}
+
+// One honest line about which sampling bundle produced a take, mirroring
+// `batch.sampling_bundle_summary` word for word -- the contract test asserts the two strings are
+// identical, so the sentence cannot drift on the way to the only place a Director reads it.
+//
+// The sentence exists because the bundle became a per-project choice on 2026-08-23: a project's
+// takes are now a mixture of 20-step and 8-step renders, and a take whose bundle is unnamed is as
+// uninterpretable as a duration whose caveat was dropped.
+//
+// An old job reads as *unknown* and is never given a value it never had. Defaulting the jobs that
+// predate this field to "default" would invent a measurement, which is the same fabrication as the
+// "221 frames = 2.2 hours" figure the timing instrumentation one column over exists to retire. A
+// record naming `none` is a different thing entirely and must never read as unknown: it is an H3
+// submission through the keyframe or text-only graph, both of which refuse a named bundle.
+export function samplingBundleSummary(job) {
+  if (job?.kind !== JOB_KIND_WITH_SAMPLING_BUNDLE) {
+    return `A sampling bundle is a MiniMax H3 setting, and this is a ${job?.kind} job; it submitted no H3 graph.`;
+  }
+  if (!job.sampling_bundle) {
+    return "No sampling bundle was recorded for this job. Every H3 submission has recorded one since 2026-08-23; a job submitted before that carries none, and none was invented for it.";
+  }
+  const bundle = job.sampling_bundle;
+  if (bundle.name === NO_EVIDENCED_BUNDLE) {
+    return "No evidenced bundle: this shot rendered through an H3 graph that has none — the first/last keyframe and text-only Director graphs load different checkpoints and sample their own way, whatever the project is set to.";
+  }
+  const lora = bundle.lora
+    ? `${bundle.lora} at ${formatLoraStrength(bundle.lora_strength)}`
+    : "no LoRA";
+  return `Submitted on the ${bundle.name} bundle: ${bundle.steps} steps, ${bundle.sampler} / ${bundle.scheduler}, ${lora}.`;
+}
+
+// The queue column's compact form, mirroring `batch.sampling_bundle_cell`. The step count rides
+// the cell rather than only the tooltip because it is the number the choice is made on and the
+// number a name alone gets wrong -- `H3Request.steps` overrides the bundle's own count, so `turbo`
+// with nothing beside it could be four steps or twenty.
+//
+// Unknown is a word and not a dash. `—` is what a job with no H3 graph draws, and a job whose
+// bundle nobody recorded has to be told from that by reading rather than by hovering.
+export function samplingBundleCell(job) {
+  if (job?.kind !== JOB_KIND_WITH_SAMPLING_BUNDLE) return "—";
+  if (!job.sampling_bundle) return "unknown";
+  if (job.sampling_bundle.name === NO_EVIDENCED_BUNDLE) return "none";
+  return `${job.sampling_bundle.name} · ${job.sampling_bundle.steps}`;
+}
+
 // The bundle select and the comparison's findings, painted from the stored project and from
 // nothing else -- never from what the Director last clicked, which is `renderVramEject`'s rule and
 // for its reason: a select showing a bundle the server did not accept is a control that lies about
@@ -2946,7 +3006,7 @@ export function renderJobs() {
     // measurement rather than interpolating one from a step ratio.
     ? `<div class="batch-progress">Batch: ${batchJobs.length - remaining} of ${batchJobs.length} settled · ${remaining} to go${escapeHtml(batchEtaNote(samplingProfileOf(state.project), remaining))}</div>`
     : "";
-  list.innerHTML = progress + [...jobs].reverse().map((job) => { const to = target(job); return `<div class="job-row ${to.linked ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${escapeHtml(to.shotId)}"><span class="job-kind">${job.kind}</span><span title="${escapeHtml(to.title)}">${escapeHtml(to.label)}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span class="job-took" title="${escapeHtml(renderTimingSummary(job) || "This job has no recorded timing. Every settle path records one since 2026-08-21; a job settled before that carries none, and none was ever invented for it.")}">${escapeHtml(renderTimingCell(job))}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span>${open(job) ? `<button class="job-cancel" data-job-id="${job.id}" title="Cancel this render: dequeued (interrupted when running) on ComfyUI, the job settled, the shot released.">×</button>` : ""}</div>`; }).join("");
+  list.innerHTML = progress + [...jobs].reverse().map((job) => { const to = target(job); return `<div class="job-row ${to.linked ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${escapeHtml(to.shotId)}"><span class="job-kind">${job.kind}</span><span title="${escapeHtml(to.title)}">${escapeHtml(to.label)}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span class="job-took" title="${escapeHtml(renderTimingSummary(job) || "This job has no recorded timing. Every settle path records one since 2026-08-21; a job settled before that carries none, and none was ever invented for it.")}">${escapeHtml(renderTimingCell(job))}</span><span class="job-bundle" title="${escapeHtml(samplingBundleSummary(job))}">${escapeHtml(samplingBundleCell(job))}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span>${open(job) ? `<button class="job-cancel" data-job-id="${job.id}" title="Cancel this render: dequeued (interrupted when running) on ComfyUI, the job settled, the shot released.">×</button>` : ""}</div>`; }).join("");
   $$(".job-row.linked", list).forEach((row) => row.addEventListener("click", () => {
     state.selectedShotId = row.dataset.shotId;
     state.selectedSectionId = null;

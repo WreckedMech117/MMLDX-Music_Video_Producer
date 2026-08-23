@@ -83,6 +83,7 @@ from .models import (
     ASSET_ROLE_LABELS,
     CHARACTER_SLOT_LIMIT,
     NAME_SCAN_MIN_LENGTH,
+    NO_EVIDENCED_BUNDLE,
     NOTICE_RAW_LIMIT,
     SHOT_MODE_SPECS,
     Asset,
@@ -90,6 +91,7 @@ from .models import (
     MessageNotice,
     Project,
     RenderJob,
+    SamplingBundle,
     SamplingProfile,
     Shot,
     ShotStatus,
@@ -207,6 +209,7 @@ from .workflows import (
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
     image_edit_prompt,
+    resolved_h3_sampling,
     song_audio_window,
 )
 
@@ -2166,21 +2169,36 @@ def _adopt_expansion_maps(project: Project, stored: dict[str, Shot]) -> None:
             )
 
 
-#: Everything about a job that this application measured rather than a client supplied. Named
+#: Everything about a job that this application **recorded** rather than a client supplied. Named
 #: as a set so `replace_project`'s guard and the test that proves it cannot drift apart: a field
-#: added to `RenderJob`'s timing block and not to this list is the eighth instance of the hole.
+#: added to `RenderJob`'s provenance block and not to this list is the next instance of the hole.
+#:
+#: "Measured" is the name it was born with and is now the narrower half of what it holds. Two of
+#: these are not measurements at all: `render_frames` and `sampling_bundle` are both written at
+#: *submission*, at the one moment the graph's length and the graph's bundle are true, because
+#: both describe a render that later edits and later settings make unrecoverable. What every
+#: field here shares is that this application produced it and a client must not be able to move
+#: it — in either direction, since forging one plants provenance for a render nobody ran.
 #:
 #: The test that holds it is `test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard`,
 #: which reads `batch.stamp_job_settled`'s own assignments rather than matching field names. An
 #: earlier version derived "measured" as `startswith("render_")`, which a `gpu_seconds` would have
-#: slipped straight through — the same hole one level up from the one this tuple closes.
-JOB_MEASURED_FIELDS = ("render_seconds", "render_seconds_source", "render_frames", "updated_at")
+#: slipped straight through — the same hole one level up from the one this tuple closes. It also
+#: names the submission-written fields explicitly, so adding one is a deliberate act.
+JOB_MEASURED_FIELDS = (
+    "render_seconds",
+    "render_seconds_source",
+    "render_frames",
+    "sampling_bundle",
+    "updated_at",
+)
 
 
 def _adopt_job_measurements(project: Project, stored: dict[str, RenderJob]) -> None:
     """Server-own every measured field on `RenderJob` across the generic whole-project write.
 
-    **The eighth time this exact hole has been found in `replace_project`**, and it fails the
+    **The eighth time this exact hole was found in `replace_project`** when this helper was
+    written — the eleventh as of 2026-08-23, when `sampling_bundle` joined the list — and it fails the
     identical two ways `_adopt_expansion_maps`, `_adopt_song_recovery_slots` and the anchor, slot
     and location adoptions all describe. `render_seconds` and `render_frames` are defaulted
     numbers and `render_seconds_source` a defaulted string, so a client written before they
@@ -2190,6 +2208,15 @@ def _adopt_job_measurements(project: Project, stored: dict[str, RenderJob]) -> N
     through the exact route that has caused it seven times before. And a body that *invented* a
     duration would be planting a measurement nobody took, which is what this whole change is a
     correction of.
+
+    `sampling_bundle` is adopted on the identical argument and fails both ways at once. It is a
+    defaulted `SamplingBundle | None`, so every client omits it, it arrives as `None`, and one
+    ordinary save would strip the bundle off every job in the project — turning a library that had
+    just become interpretable back into an undifferentiated mixture, through the same route. And a
+    body that *invented* one would be worse than a blank: a forged `{"name": "turbo", "steps": 4}`
+    on a job that ran twenty steps is provenance for a render nobody performed, which is the
+    fabricated-figure failure this whole block of fields exists to prevent, wearing the costume of
+    the fix. The default is forced for a record the store does not hold, exactly as below.
 
     `updated_at` is adopted with them because it is now evidence rather than bookkeeping — it is
     the settle moment, and half of the `record`-sourced span — and because a body that omits it
@@ -5735,6 +5762,39 @@ def resolved_sampling_profile(requested: SamplingProfile | None, project: Projec
     return project.sampling_profile if requested is None else requested
 
 
+def submitted_sampling_bundle(profile: str, steps: int | None) -> SamplingBundle:
+    """The provenance record for a reference submission: the bundle's name **and** its values.
+
+    Beside `resolved_sampling_profile` because it is the other half of the same moment. That
+    function decides which bundle a submission renders on; this one writes down what that
+    decision resolved to, at the one instant it is true. `Project.sampling_profile` is a standing
+    choice the Director changes between renders — which is the whole reason a project's takes are
+    now a mixture — so nothing read later can recover what a given take ran on.
+
+    The values come from `workflows.resolved_h3_sampling`, which is the same call
+    `build_h3_reference_payload` makes to build the graph, including the `steps` override. So the
+    record cannot describe a bundle other than the one submitted, and it cannot claim the
+    profile's own step count for a submission that overrode it.
+
+    Why both halves: see `SamplingBundle`. In one line — the name is readable and drifts, the
+    values are the fact and cannot rot, and holding the two together is what lets a later reader
+    *detect* that `H3_REFERENCE_PROFILES` has moved rather than merely hope it has not.
+
+    `lora`/`lora_strength` fall to `""`/`0.0` for a bundle that applies none; `H3SamplingProfile`
+    guarantees the pair is either both set or both `None`, so this cannot record a strength
+    without the LoRA it was applied to.
+    """
+    sampling = resolved_h3_sampling(profile, steps)
+    return SamplingBundle(
+        name=profile,
+        steps=sampling.steps,
+        sampler=sampling.sampler,
+        scheduler=sampling.scheduler,
+        lora=sampling.lora or "",
+        lora_strength=0.0 if sampling.lora_strength is None else sampling.lora_strength,
+    )
+
+
 # A flag a client omits and a flag a client sends as `null` mean the same thing — "I am not
 # asking for this" — but Pydantic reads the second as a type error and 422s the whole turn, so
 # the Director's message is lost over a field whose *absence* is already the safe default. Both
@@ -7143,10 +7203,12 @@ def create_app(
         # The recorded map is server-owned here for the fifth time this exact hole has been found
         # in this exact route. See `_adopt_expansion_maps`.
         _adopt_expansion_maps(project, {shot.id: shot for shot in current.shots})
-        # Every measured render timing is server-owned here for the *eighth* time this hole has
-        # been found in this route. A body carries every field of every job, and the three
-        # timing fields are defaulted, so without this one ordinary save from any existing
-        # client would blank the render costs this application now records. See
+        # Every recorded fact about a job is server-owned here — the *eleventh* time this one
+        # route has been the hole for a field a narrower sibling guards, and the second time this
+        # particular helper has had to grow to close it. A body carries every field of every job,
+        # and all of them are defaulted, so without this one ordinary save from any existing
+        # client would blank the render costs *and* the sampling bundles this application records,
+        # while a body that invented either would plant provenance for a render nobody ran. See
         # `_adopt_job_measurements`.
         _adopt_job_measurements(project, {job.id: job for job in current.jobs})
         # The generic write is the widest citation writer there is: a body carries every field of
@@ -8981,6 +9043,17 @@ def create_app(
         # only when the reference branch extends a song-audio window ahead of the shot.
         # Written onto the Shot with `prompt_id` at submission; see `Shot.latest_take_lead`.
         take_lead = 0.0
+        # What this submission will be recorded as having sampled on, decided here so that no
+        # branch has to remember to write it and a branch that says nothing cannot leave the job
+        # claiming to predate the field — which is what `None` means and would be a lie about a
+        # render submitted today.
+        #
+        # `NO_EVIDENCED_BUNDLE` is the honest default rather than a placeholder: the keyframe and
+        # text-only branches below *refuse* a named bundle and render their own way, so "this
+        # graph has none" is precisely true for both, and it stays true for any fourth adapter,
+        # which cannot reach this route at all until the import-time check beside `H3_ADAPTERS`
+        # is satisfied by a branch someone wrote deliberately.
+        bundle = SamplingBundle(name=NO_EVIDENCED_BUNDLE)
         if spec.adapter == "h3-reference":
             references: list[dict[str, Any]] = []
             tags: list[str] = []
@@ -9122,7 +9195,18 @@ def create_app(
                     f"<Audio {song_audio_tag(project, shot)}> is the master song "
                     "for synchronization"
                 )
+            # The Director's standing choice unless this submission named one, resolved once and
+            # used twice: the graph is built on it and the job records it. Two reads of one
+            # decision rather than two decisions — the shape `resolved_sampling_profile` itself
+            # exists to enforce, applied one level down, so a take's recorded provenance cannot
+            # name a bundle other than the one its graph was built from.
+            profile = resolved_sampling_profile(request.profile, project)
+            # Inside the `try`, with the builder: both call `resolved_h3_sampling`, so both refuse
+            # an unknown profile or a step count below one in the same words, and that refusal has
+            # to reach the Director as this route's 422 rather than as a 500. Before the builder,
+            # so a submission is never recorded as having run a bundle whose graph was refused.
             try:
+                bundle = submitted_sampling_bundle(profile, request.steps)
                 payload = build_h3_reference_payload(
                     prompt=reference_prompt(
                         shot,
@@ -9152,10 +9236,10 @@ def create_app(
                     # "use the profile's own count" — see `H3Request.steps`.
                     steps=request.steps,
                     ref_image_size=request.ref_image_size,
-                    # The Director's standing choice unless this submission named one — the
-                    # single place a bundle is decided, so the batch and "Render Again" cannot
-                    # ship different graphs for the same project. See `resolved_sampling_profile`.
-                    profile=resolved_sampling_profile(request.profile, project),
+                    # Resolved above, and the same value `bundle` records. The single place a
+                    # bundle is decided, so the batch and "Render Again" cannot ship different
+                    # graphs for the same project. See `resolved_sampling_profile`.
+                    profile=profile,
                     prefix=f"music-video-producer/{project_id}/shots/{shot.id}-h3-reference",
                 )
             except ValueError as error:
@@ -9404,6 +9488,13 @@ def create_app(
             # describes a render that never happened. A duration with no frame count beside it
             # is what made the mtime reconstruction of 2026-08-21 as laborious as it was.
             render_frames=over_render_frames(shot.duration),
+            # And what it is being asked for it *with*, recorded at the same one moment and for
+            # the same reason: `Project.sampling_profile` is a standing choice the Director
+            # changes between renders, so a project's takes are a mixture and nothing read later
+            # can say which take ran on which bundle. Never `None` here — a submission this route
+            # accepted always knows its bundle, and `None` is reserved for a job written before
+            # any of this existed. See `RenderJob.sampling_bundle`.
+            sampling_bundle=bundle,
         )
         project.jobs.append(job)
         store.save(project)

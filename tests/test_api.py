@@ -123,6 +123,8 @@ from music_video_producer.batch import (
     readiness_refusal,
     reconcilable_jobs,
     render_timing_summary,
+    sampling_bundle_cell,
+    sampling_bundle_summary,
     shot_label,
 )
 from music_video_producer.comfy import ComfyError
@@ -148,6 +150,7 @@ from music_video_producer.models import (
     INSTRUMENTAL_NOTE,
     KEYFRAME_TAG_ROLES,
     LEGACY_SHOT_MODES,
+    NO_EVIDENCED_BUNDLE,
     NOTICE_RAW_LIMIT,
     SHOT_MODE_SPECS,
     VOCAL_TYPE_SPECS,
@@ -9021,6 +9024,315 @@ def test_an_inherited_bundle_renders_a_keyframe_or_text_shot_while_a_named_one_i
     # The reference graph took the project's bundle.
     assert reference_payload["mvp:scheduler"]["inputs"]["steps"] == 4
     assert reference_payload["mvp:lora"]["inputs"]["strength_model"] == 0.7
+
+
+# --- Which bundle produced which take (2026-08-23) -------------------------------------------
+#
+# The bundle became a per-project choice one commit ago, so a project's takes are now a *mixture*
+# and `RenderJob` recorded seed, frames and timing but nothing about how the render was sampled.
+# After the fact that is unrecoverable: `Project.sampling_profile` is a standing choice the
+# Director changes between renders, so reading it later describes the next take rather than this
+# one — `render_frames`' argument exactly, applied to the other half of what makes a take
+# interpretable.
+#
+# Both halves are recorded, and the tests below are about why. The *name* alone is wrong today,
+# not merely at risk of drifting later: `H3Request.steps` overrides the bundle's own count, so a
+# submission recorded as `turbo` may have sampled twenty steps. The *values* alone lose the
+# identity a Director actually compares takes by. Holding the two together is also what lets a
+# later reader detect that `H3_REFERENCE_PROFILES` has been retuned, by comparing them.
+
+
+def bundle_of_job(store: ProjectStore, project_id: str, job_id: str) -> dict | None:
+    """One job's recorded bundle, read off the manifest as JSON.
+
+    Off the manifest rather than off the route's reply, because the claim is that the provenance
+    was *persisted*: a value that reached the response model and not the file would satisfy
+    anything weaker and would be gone by the next reload.
+    """
+    stored = json.loads(store.get(project_id).model_dump_json())
+    return next(job for job in stored["jobs"] if job["id"] == job_id)["sampling_bundle"]
+
+
+def test_every_bundle_is_recorded_on_the_job_that_submitted_it(tmp_path: Path):
+    """All three bundles, each recorded with the name *and* the values its graph was built from.
+
+    The values are asserted against `H3_REFERENCE_PROFILES` rather than against literals copied
+    into this test, so the record is proved to be a copy of the table as it stood at submission
+    rather than a second, independently maintained spelling of it. That is the whole mechanism by
+    which a future retune becomes *detectable*: the two agree today, and a job recorded before a
+    retune would stop agreeing, which is the answer to "does the table still mean what it meant".
+    """
+    from music_video_producer.workflows import H3_REFERENCE_PROFILES
+
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+
+    for name, profile in H3_REFERENCE_PROFILES.items():
+        rearm_shot(store, project_id, shot_id)
+        assert set_bundle(client, project_id, name).status_code == 200
+        submitted = submit_h3(client, project_id, shot_id)
+        assert submitted.status_code == 202, submitted.text
+
+        assert bundle_of_job(store, project_id, submitted.json()["id"]) == {
+            "name": name,
+            "steps": profile.steps,
+            "sampler": profile.sampler,
+            "scheduler": profile.scheduler,
+            "lora": profile.lora or "",
+            "lora_strength": 0.0 if profile.lora_strength is None else profile.lora_strength,
+        }, name
+        # And the record describes the graph that was actually submitted, not merely the request.
+        assert bundle_of_payload(comfy.prompts[-1]) == (
+            profile.steps, profile.scheduler, profile.sampler, profile.lora
+        ), name
+
+
+def test_a_named_bundle_is_recorded_the_same_as_an_inherited_one(tmp_path: Path):
+    """`resolved_sampling_profile`'s two doors, recorded identically.
+
+    The batch, "Render Again" and a hand-rolled call all resolve through one function, so a
+    submission that *names* turbo and one that *inherits* it render the same graph. If only one of
+    the two doors recorded it, a mixed library would be half-labelled — which is the state this
+    field exists to end rather than to reproduce one route further in.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+
+    named = submit_h3(client, project_id, shot_id, profile="turbo")
+    assert named.status_code == 202, named.text
+    rearm_shot(store, project_id, shot_id)
+    assert set_bundle(client, project_id, "turbo").status_code == 200
+    inherited = submit_h3(client, project_id, shot_id)
+    assert inherited.status_code == 202, inherited.text
+
+    assert bundle_of_job(store, project_id, named.json()["id"]) == bundle_of_job(
+        store, project_id, inherited.json()["id"]
+    )
+    assert bundle_of_job(store, project_id, named.json()["id"])["name"] == "turbo"
+
+
+def test_the_batch_records_the_bundle_on_every_job_it_submits(tmp_path: Path):
+    """FR-4's loop rides `generate_h3` in-closure, so provenance cannot be a per-route feature.
+
+    Asserted through the batch route because that is where a whole plan's worth of takes is
+    produced in one click, and an unlabelled batch is precisely the mixed library the field exists
+    to make readable.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id, _ = h3_reference_project(client, store, tmp_path)
+    assert set_bundle(client, project_id, "turbo-references2v").status_code == 200
+
+    report = client.post(
+        f"/api/projects/{project_id}/generate/batch", json={"confirm_gpu": True}
+    )
+    assert report.status_code == 202, report.text
+    assert report.json()["submitted"]
+
+    for entry in report.json()["submitted"]:
+        recorded = bundle_of_job(store, project_id, entry["job_id"])
+        assert recorded["name"] == "turbo-references2v"
+        assert recorded["steps"] == 8
+
+
+def test_a_step_override_is_recorded_as_the_steps_actually_sampled(tmp_path: Path):
+    """The case a name-only record gets wrong, and it is reachable from the shipped request model.
+
+    "The profile chooses the graph, the Director chooses the effort" — `H3Request.steps` overrides
+    the bundle's own count. A record carrying only `"turbo"` would say four steps about a render
+    that sampled twelve, and would say it in the queue column a Director compares takes in. The
+    recorded count is read against the submitted graph's own scheduler node, so the two cannot
+    disagree.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+
+    submitted = submit_h3(client, project_id, shot_id, profile="turbo", steps=12)
+    assert submitted.status_code == 202, submitted.text
+
+    recorded = bundle_of_job(store, project_id, submitted.json()["id"])
+    assert recorded["name"] == "turbo"
+    assert recorded["steps"] == 12
+    assert comfy.prompts[-1]["mvp:scheduler"]["inputs"]["steps"] == 12
+    # Everything else is still the bundle's, so the override is recorded as an override of one
+    # number rather than as some fourth combination nobody rendered.
+    assert recorded["scheduler"] == "beta"
+    assert recorded["lora_strength"] == 0.7
+
+
+def test_a_graph_with_no_evidenced_bundle_records_that_rather_than_leaving_a_blank(
+    tmp_path: Path,
+):
+    """The third state, and the reason it is written positively rather than left absent.
+
+    The first/last keyframe and text-only Director graphs load different checkpoints, refuse a
+    *named* bundle, and render their own way whatever the project is set to. A blank record there
+    would be indistinguishable from a job written before any of this existed — so a Director
+    reading `unknown` beside a turbo project would supply the wrong answer themselves, which is
+    the silent mis-logging both those branches already refuse one field over.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id, _ = h3_reference_project(client, store, tmp_path)
+    project = store.get(project_id)
+    text = Shot(start=6, duration=5, prompt="A singer", mode="text", status="ready")
+    project.shots = [*project.shots, text]
+    store.save(project)
+    assert set_bundle(client, project_id, "turbo").status_code == 200
+
+    submitted = submit_h3(client, project_id, text.id)
+    assert submitted.status_code == 202, submitted.text
+
+    recorded = bundle_of_job(store, project_id, submitted.json()["id"])
+    assert recorded is not None, "a graph with no bundle must say so, not stay silent"
+    assert recorded["name"] == NO_EVIDENCED_BUNDLE
+    assert recorded["steps"] == 0
+    # And it reads as its own thing on the surface, never as the project's turbo and never as
+    # unknown.
+    job = timing_of(store, project_id, submitted.json()["id"])
+    assert sampling_bundle_cell(job) == "none"
+    assert "No evidenced bundle" in sampling_bundle_summary(job)
+
+
+def test_a_job_written_before_the_field_reads_as_unknown_and_is_never_given_a_bundle(
+    tmp_path: Path,
+):
+    """The constraint that matters most: an old job must not be handed a value it never had.
+
+    The key is removed from the file on disk, which is what all forty-nine jobs in the Director's
+    live manifest look like. Defaulting them to `"default"` would be inventing a measurement — the
+    exact sin behind the fabricated "221 frames = 2.2 hours" figure this application spent two days
+    retiring — so the record stays absent and the surface says so in the Director's own terms.
+
+    Both halves are asserted: the manifest still loads (a required field would have made every
+    existing project unopenable), and every surface reads *unknown* rather than a bundle name.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, _shot_id, job_id = rendered_shot(client, store, comfy, "Legacy")
+    manifest = store.manifest_path(project_id)
+    stored = json.loads(manifest.read_text(encoding="utf-8"))
+    assert stored["jobs"][0].pop("sampling_bundle") is not None
+    assert "sampling_bundle" not in stored["jobs"][0]
+    manifest.write_text(json.dumps(stored), encoding="utf-8")
+
+    job = timing_of(store, project_id, job_id)
+
+    assert job.sampling_bundle is None
+    assert sampling_bundle_cell(job) == "unknown"
+    summary = sampling_bundle_summary(job)
+    assert "No sampling bundle was recorded" in summary
+    assert "none was invented for it" in summary
+    assert "default" not in summary
+    # And it survives a round trip through the route unchanged: nothing fills it in on read.
+    assert client.get(f"/api/projects/{project_id}").json()["jobs"][0]["sampling_bundle"] is None
+    assert bundle_of_job(store, project_id, job_id) is None
+
+
+def test_the_generic_project_put_can_neither_clear_nor_forge_a_recorded_bundle(tmp_path: Path):
+    """`replace_project`'s hole, for the eleventh time, closed by adoption rather than by trust.
+
+    Three bodies, and each is one a real client sends. The first omits the key — every client
+    written before the field existed, and every hand-rolled call — which Pydantic fills with
+    `None`; one ordinary save would strip the bundle off every job in the project and turn a
+    library that had just become interpretable back into an undifferentiated mixture. The second
+    invents one, which is the worse direction: a forged four-step turbo record on a job that
+    sampled twenty is provenance for a render nobody performed, wearing the costume of the fix.
+    The third invents a whole *job* that the store does not hold, which is how the fabricated
+    "2.2 hours" figure was re-injectable through this same route until the guard started forcing
+    the default for an unknown record.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+    assert set_bundle(client, project_id, "turbo-references2v").status_code == 200
+    submitted = submit_h3(client, project_id, shot_id)
+    assert submitted.status_code == 202, submitted.text
+    job_id = submitted.json()["id"]
+    recorded = bundle_of_job(store, project_id, job_id)
+    assert recorded["name"] == "turbo-references2v"
+
+    body = json.loads(store.get(project_id).model_dump_json())
+    body["jobs"][0].pop("sampling_bundle", None)
+    body["name"] = "Renamed by an ordinary save"
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    assert store.get(project_id).name == "Renamed by an ordinary save"
+    assert bundle_of_job(store, project_id, job_id) == recorded
+
+    body = json.loads(store.get(project_id).model_dump_json())
+    body["jobs"][0]["sampling_bundle"] = {
+        "name": "turbo", "steps": 4, "sampler": "euler", "scheduler": "beta",
+        "lora": "forged.safetensors", "lora_strength": 0.7,
+    }
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    assert bundle_of_job(store, project_id, job_id) == recorded
+
+    body = json.loads(store.get(project_id).model_dump_json())
+    forged = json.loads(json.dumps(body["jobs"][0]))
+    forged["id"] = "job_forgedbundle"
+    forged["sampling_bundle"] = {
+        "name": "turbo", "steps": 4, "sampler": "euler", "scheduler": "beta",
+        "lora": "forged.safetensors", "lora_strength": 0.7,
+    }
+    body["jobs"] = [*body["jobs"], forged]
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    assert bundle_of_job(store, project_id, "job_forgedbundle") is None
+    assert bundle_of_job(store, project_id, job_id) == recorded
+
+
+#: The reference payload this application builds on each of the three bundles, digested at
+#: `cd5c785` — the commit before a job recorded anything about how it was sampled. Three more
+#: rows carry an explicit `steps=12` override, which is the one input the recording had to read
+#: and therefore the one most able to disturb a graph on its way past.
+#:
+#: The claim is narrow and it is the whole point: this change records **what was submitted** and
+#: must not change **what is submitted**. A digest is the only assertion strong enough for that —
+#: every behavioural test in this file would still pass if the resolution had quietly moved a
+#: sampler, a scheduler or a step count on its way through the new shared resolver.
+#:
+#: `H3_REFERENCE_PAYLOAD_DIGEST` and `H3_TEXT_PAYLOAD_DIGEST` cover the default and text-only
+#: shapes from the other fixture; these are the same graph under the two turbo bundles, which had
+#: no digest before today.
+H3_BUNDLE_PAYLOAD_DIGESTS = {
+    "default": "6af5e442ca01963ae15f2b062a1f55b90666af15080de5309f051fe4e38c3c86",
+    "turbo": "da307c97c213d73f14ec5b9062ebf03c0af6a0247263000285cb16c566661c4b",
+    "turbo-references2v": "1c01241557d3c274aaf9f645c97d32b9567846cc091e652311714ae119cdf23f",
+}
+H3_BUNDLE_STEP_OVERRIDE_DIGESTS = {
+    "default": "ded6461122860452ee9910dbde4e021e0f6755b47fe3951806d48ead35c26748",
+    "turbo": "8ccf2da12ee7b68e7c63e4f9af9fcb59dccf5b27f333468e912f116602a9fda8",
+    "turbo-references2v": "4d247e1d583e5aacb083a60538bd799c0a7461b5747ed78fa22d1629ae75e4a3",
+}
+
+
+def test_recording_the_bundle_moved_no_payload_on_any_bundle(tmp_path: Path):
+    """Every bundle's graph, byte for byte what it was before anything was recorded.
+
+    Both doors per bundle — stored on the project and named on the request — because the recording
+    is taken from the resolution both share, and a resolver that had started resolving differently
+    on one of them would be invisible to any assertion weaker than this.
+    """
+    for name, digest in H3_BUNDLE_PAYLOAD_DIGESTS.items():
+        for stored in (True, False):
+            root = tmp_path / f"{name}-{stored}"
+            root.mkdir()
+            client, _, comfy = digest_project(root)
+            if stored:
+                assert set_bundle(client, DIGEST_PROJECT_ID, name).status_code == 200
+            body = {} if stored else {"profile": name}
+            assert (
+                submit_h3(client, DIGEST_PROJECT_ID, DIGEST_SHOT_REFERENCE, **body).status_code
+                == 202
+            )
+            assert payload_digest(comfy.prompts[0], root) == digest, (name, stored)
+
+    for name, digest in H3_BUNDLE_STEP_OVERRIDE_DIGESTS.items():
+        root = tmp_path / f"{name}-steps"
+        root.mkdir()
+        client, _, comfy = digest_project(root)
+        assert (
+            submit_h3(
+                client, DIGEST_PROJECT_ID, DIGEST_SHOT_REFERENCE, profile=name, steps=12
+            ).status_code
+            == 202
+        )
+        assert payload_digest(comfy.prompts[0], root) == digest, name
 
 
 # --- LTX 2.5 enhancement -----------------------------------------------------------------
@@ -20234,12 +20546,14 @@ def test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard():
     # The harness reads the real function rather than an empty set that would pass vacuously.
     assert {"render_seconds", "render_seconds_source", "updated_at"} <= written
     assert written <= set(JOB_MEASURED_FIELDS)
-    # `render_frames` is the one measured field no settle path writes: the submission route
-    # records it at the single moment the graph's length is true, because `Shot.duration` is
-    # edited afterwards and re-deriving it later describes a render that never happened. It is
-    # named in the guard for the same reason as the rest, and the test below proves the naming
-    # has teeth rather than merely reciting it.
-    assert set(JOB_MEASURED_FIELDS) - written == {"render_frames"}
+    # Two fields no settle path writes, both recorded by the submission route at the single
+    # moment each is true, and both for the same reason: what they describe is edited or
+    # re-chosen afterwards, so re-deriving either later describes a render that never happened.
+    # `render_frames` — `Shot.duration` moves under an edge drag. `sampling_bundle` —
+    # `Project.sampling_profile` is a standing choice the Director changes between renders, which
+    # is exactly why a project's takes became a mixture. They are named in the guard for the same
+    # reason as the rest, and the test below proves the naming has teeth rather than reciting it.
+    assert set(JOB_MEASURED_FIELDS) - written == {"render_frames", "sampling_bundle"}
 
 
 def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
@@ -20256,6 +20570,13 @@ def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
             "render_seconds": 7920.0,
             "render_seconds_source": "comfy",
             "render_frames": 221,
+            # The forgery this field makes possible, and the reason it is guarded in both
+            # directions: a body claiming a four-step turbo render for a job that sampled twenty
+            # is provenance for a render nobody performed, dressed as the fix for exactly that.
+            "sampling_bundle": {
+                "name": "turbo", "steps": 4, "sampler": "euler", "scheduler": "beta",
+                "lora": "forged.safetensors", "lora_strength": 0.7,
+            },
             "updated_at": "2030-01-01T00:00:00Z",
         }[name]
         body = json.loads(store.get(project_id).model_dump_json())

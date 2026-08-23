@@ -27,7 +27,15 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .comfy import ComfyError, HistoryResult
-from .models import Project, RenderJob, Shot, ShotStatus, now_utc, shot_label
+from .models import (
+    NO_EVIDENCED_BUNDLE,
+    Project,
+    RenderJob,
+    Shot,
+    ShotStatus,
+    now_utc,
+    shot_label,
+)
 from .reference_map import (
     STALE_REFERENCE_MAP_CAUSE,
     STALE_REFERENCE_MAP_CONSEQUENCE,
@@ -47,6 +55,7 @@ from .timeline import (
 #: `from .batch import shot_label`, so the name stays here and there is still exactly one
 #: implementation. See `models.shot_label` for why both halves of the name are carried.
 __all__ = [
+    "JOB_KIND_WITH_SAMPLING_BUNDLE",
     "NEAR_DUPLICATE_OVERLAP",
     "NOTE_KIND_PROMPT",
     "NOTE_KIND_SAMENESS",
@@ -65,6 +74,7 @@ __all__ = [
     "RenderStatusReport",
     "apply_job_history",
     "format_duration",
+    "format_lora_strength",
     "prompt_is_missing",
     "prompt_rejection",
     "queue_locations",
@@ -74,6 +84,8 @@ __all__ = [
     "reconcile_render_jobs",
     "render_status_report",
     "render_timing_summary",
+    "sampling_bundle_cell",
+    "sampling_bundle_summary",
     "shot_label",
     "stamp_job_settled",
     "supersede_target_jobs",
@@ -925,6 +937,108 @@ def render_timing_summary(job: RenderJob) -> str:
         f"{length} from queued to done{frames}; ComfyUI reported no execution clock for this "
         f"prompt, so the wait in the queue is included{queued}"
     )
+
+
+#: The `kind` of job that submits an H3 graph, and therefore the only kind a sampling bundle can
+#: describe. Read from `kind` rather than recorded on the job, because for every other kind the
+#: answer needs no record: this application submits no MiniMax H3 graph for a `music`, `flux`,
+#: `multiview`, `edit`, `ltx` or `post` job, and that is a fact about the routes rather than about
+#: any particular render.
+JOB_KIND_WITH_SAMPLING_BUNDLE = "h3"
+
+
+def sampling_bundle_summary(job: RenderJob) -> str:
+    """One honest line about which sampling bundle produced this take.
+
+    `render_timing_summary`'s shape and its voice, for the same reason: the bundle became a
+    per-project choice on 2026-08-23, so a project's takes are a *mixture*, and a take whose
+    bundle is unnamed is as uninterpretable as a duration whose caveat was dropped. Written once
+    here and mirrored in `app.js`, executed against each other under node, because a sentence
+    written twice in two languages is how the two stop meaning the same thing.
+
+    **An old job reads as unknown and is never given a value it never had.** Every job settled
+    before this field existed carries no bundle, and the 49 in the Director's live manifest are
+    all of them; defaulting those to `"default"` would invent a measurement, which is exactly the
+    sin behind the fabricated "221 frames = 2.2 hours" figure that this application spent two days
+    retiring. So the sentence says nobody recorded one, dates the instrumentation, and states
+    plainly that nothing was invented — the same three things the timing fallback says.
+
+    A record naming `NO_EVIDENCED_BUNDLE` is **not** unknown and must never read as it. It is an
+    H3 submission through the first/last keyframe or text-only Director graph, both of which
+    refuse a named bundle and render their own way; a Director who read "unknown" there while the
+    project was set to turbo would supply the wrong answer themselves.
+
+    Never `""`, unlike `render_timing_summary`. Every job has an answer here — a bundle, no
+    evidenced bundle, no H3 graph, or no record — and a caller drawing a cell needs a sentence for
+    all four rather than a fallback of its own invented at the call site.
+    """
+    if job.kind != JOB_KIND_WITH_SAMPLING_BUNDLE:
+        return (
+            f"A sampling bundle is a MiniMax H3 setting, and this is a {job.kind} job; "
+            f"it submitted no H3 graph."
+        )
+    if job.sampling_bundle is None:
+        return (
+            "No sampling bundle was recorded for this job. Every H3 submission has recorded one "
+            "since 2026-08-23; a job submitted before that carries none, and none was invented "
+            "for it."
+        )
+    bundle = job.sampling_bundle
+    if bundle.name == NO_EVIDENCED_BUNDLE:
+        return (
+            "No evidenced bundle: this shot rendered through an H3 graph that has none — the "
+            "first/last keyframe and text-only Director graphs load different checkpoints and "
+            "sample their own way, whatever the project is set to."
+        )
+    lora = (
+        f"{bundle.lora} at {format_lora_strength(bundle.lora_strength)}"
+        if bundle.lora
+        else "no LoRA"
+    )
+    return (
+        f"Submitted on the {bundle.name} bundle: {bundle.steps} steps, {bundle.sampler} / "
+        f"{bundle.scheduler}, {lora}."
+    )
+
+
+def format_lora_strength(strength: float) -> str:
+    """A LoRA strength as both languages write it: ``1``, ``0.7``, ``-1.5``.
+
+    Its own function because the two renderings have to agree character for character and the
+    obvious spellings do not: Python's `str(1.0)` is ``1.0`` where JavaScript's is ``1``. `%g` is
+    the one format that matches `Number.prototype.toString` across the range a strength can hold
+    (`H3_LORA_STRENGTH_LIMITS` is -100 to 100), and the contract test executes both over it.
+    """
+    if not isfinite(strength):
+        return "—"
+    return f"{strength:g}"
+
+
+def sampling_bundle_cell(job: RenderJob) -> str:
+    """The queue column's compact form: the bundle's name and the steps it actually sampled.
+
+    `render_timing_cell`'s job one column over, and terse for its reason — the column is narrow
+    and a Director comparing two takes reads it by scanning, not by hovering. The full sentence
+    rides the same cell's `title`.
+
+    The step count is in the cell rather than only in the tooltip because it is the number the
+    choice is made on and the number a *name alone* would get wrong: `H3Request.steps` overrides
+    the bundle's own count, so a cell reading `turbo` with nothing beside it could be four steps
+    or twenty. Two takes at `default · 20` and `turbo-references2v · 8` are told apart at a
+    glance, which is the whole of what this column is for.
+
+    **Unknown is a word, not a dash.** `—` is what a *known* negative draws — a job that submitted
+    no H3 graph at all, which `kind` establishes without any record — and `none` is the other one.
+    A job whose bundle nobody recorded has to be distinguishable from both by reading rather than
+    by hovering. That is the one requirement this column was added under.
+    """
+    if job.kind != JOB_KIND_WITH_SAMPLING_BUNDLE:
+        return "—"
+    if job.sampling_bundle is None:
+        return "unknown"
+    if job.sampling_bundle.name == NO_EVIDENCED_BUNDLE:
+        return "none"
+    return f"{job.sampling_bundle.name} · {job.sampling_bundle.steps}"
 
 
 #: The history statuses adopted verbatim onto a job. Anything else ComfyUI invents — it has

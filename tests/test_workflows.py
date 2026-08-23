@@ -2836,6 +2836,49 @@ def test_the_builder_refuses_a_profile_it_has_no_evidence_for():
         h3_reference_payload([], profile="fast")
 
 
+def test_the_resolver_the_builder_uses_is_the_resolver_the_record_uses():
+    """One resolution, so a take's recorded provenance cannot name a bundle other than the one
+    its graph was built from.
+
+    The route records what a submission sampled on by calling `resolved_h3_sampling`, and the
+    builder builds the graph by calling the same function with the same two arguments. This
+    executes it directly and reads the result off the payload, so a second implementation
+    appearing on either side — the shape that made `resolved_sampling_profile` necessary one
+    level up — fails here rather than in a queue row six weeks later.
+
+    The step substitution is the case a name-only record gets wrong and is asserted for every
+    bundle: "the profile chooses the graph, the Director chooses the effort".
+    """
+    from music_video_producer.workflows import resolved_h3_sampling
+
+    for name, profile in H3_REFERENCE_PROFILES.items():
+        assert resolved_h3_sampling(name) is profile, name
+        overridden = resolved_h3_sampling(name, 12)
+        assert overridden.steps == 12
+        # And nothing else moved: an override of one number, never a fourth combination.
+        assert (overridden.lora, overridden.lora_strength) == (profile.lora, profile.lora_strength)
+        assert (overridden.sampler, overridden.scheduler) == (profile.sampler, profile.scheduler)
+        # `None` means "the bundle's own count", which is what the route sends for an omission.
+        assert resolved_h3_sampling(name, None) is profile, name
+
+        payload = h3_reference_payload(h3_references("picture", 1), profile=name, steps=12)
+        assert payload["mvp:scheduler"]["inputs"]["steps"] == overridden.steps
+        assert payload["mvp:scheduler"]["inputs"]["scheduler"] == overridden.scheduler
+        assert payload["mvp:sampler"]["inputs"]["sampler_name"] == overridden.sampler
+
+    # The builder's refusals are this function's refusals, in the same words, because they are
+    # now literally the same lines.
+    for unknown in ("turbo ", "TURBO", "fast", "", None, 4, ["turbo"], {"turbo"}):
+        with pytest.raises(ValueError, match="Unknown H3 sampling profile"):
+            resolved_h3_sampling(unknown)
+    # A step count a profile could not sample is refused on the line that supplied it. The route
+    # bounds the field at 1..100 so this is unreachable from a request; a script can reach it,
+    # and a zero-step graph samples nothing while looking like a render that was asked for.
+    for impossible in (0, -1, True, 2.5):
+        with pytest.raises(ValueError, match="at least one step"):
+            resolved_h3_sampling("turbo", impossible)
+
+
 def test_a_profile_validates_its_own_fields_where_they_are_declared():
     """A profile that cannot produce a submittable graph fails on the line that wrote it.
 
