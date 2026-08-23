@@ -413,7 +413,7 @@
         <div class="plan-readiness" id="plan-readiness" aria-live="polite"></div>
         <div class="queue-layout">
           <div class="queue-table">
-            <div class="queue-header"><span>Job</span><span>Target</span><span>Status</span><span>Seed</span><span title="How long the render took. A bare figure is ComfyUI's own execution clock — the render alone. A figure prefixed with ≤ was measured from this record's enqueue to its settle, so it includes any wait in the queue and is an upper bound.">Took</span><span>Output</span></div>
+            <div class="queue-header"><span>Job</span><span>Target</span><span>Status</span><span>Seed</span><span title="How long the job took. A bare figure is exact: ComfyUI's own execution clock for a render — the render alone, failures included — or, for local work like an export, this record's own span, which covers the whole job because nothing was ever queued. A figure prefixed with ≤ was measured from a queued prompt's enqueue to its settle, so it includes any wait in the queue and is an upper bound. Hover a cell for the sentence behind the figure.">Took</span><span>Output</span></div>
             <div id="job-list"><div class="queue-empty">No render jobs for this project.</div></div>
           </div>
           <aside class="finish-stack">

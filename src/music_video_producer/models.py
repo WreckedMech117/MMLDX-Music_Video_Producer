@@ -1522,7 +1522,12 @@ class RenderJob(BaseModel):
     #: * ``"record"`` — this record's `created_at` to its settle. `created_at` is **enqueue**
     #:   time, not start time, so for a job that waited behind others in a batch this is queue
     #:   wait *plus* render and is only an **upper bound** on the render. Every surface that
-    #:   shows it must say so; `batch.render_timing_summary` is the one that does.
+    #:   shows it must say so; `batch.render_timing_summary` is the one that does. With one
+    #:   exception it also states: a job whose `prompt_id` is empty is local work that was never
+    #:   queued anywhere, so for it this span is exact.
+    #: * ``"unmeasured"`` — the job settled and no length could be taken, because the record's
+    #:   own span ran backwards. Distinct from ``""``, which claims the job predates this
+    #:   instrumentation entirely. See `batch.JOB_TIMING_UNMEASURED`.
     #:
     #: A plain `str` rather than a `Literal` on `superseded_by`'s precedent: a manifest carrying
     #: a value some future build wrote must still load, and the closed set is enforced by there
@@ -1537,11 +1542,13 @@ class RenderJob(BaseModel):
     #: Without this, a recorded duration is uninterpretable, which is half of why the mtime
     #: reconstruction was needed at all.
     #:
-    #: **Server-owned.** `POST .../shots/{id}/render` is its one writer, and the generic
-    #: full-project `PUT` re-adopts it from the store (`app._adopt_job_measurements`) rather than
-    #: trusting a body — a defaulted `int` that any pre-existing client omits arrives as `0`, and
-    #: one ordinary save would otherwise erase the frame count off every job at once. That hole
-    #: has been found in that route seven times; these three fields are not the eighth.
+    #: **Server-owned.** `POST .../shots/{id}/generate/h3` is its one writer — named exactly,
+    #: because an earlier draft of this note pointed at a `.../render` route this application
+    #: does not have — and the generic full-project `PUT` re-adopts it from the store
+    #: (`app._adopt_job_measurements`) rather than trusting a body: a defaulted `int` that any
+    #: pre-existing client omits arrives as `0`, and one ordinary save would otherwise erase the
+    #: frame count off every job at once. That hole has been found in that route seven times;
+    #: these three fields are not the eighth.
     render_frames: int = Field(default=0, ge=0)
     #: Enqueue time — when the *record* was created, which for a ComfyUI job is a moment before
     #: its graph was submitted, not a moment when the GPU started work. See `render_seconds`.

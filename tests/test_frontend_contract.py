@@ -7566,6 +7566,87 @@ def test_apply_render_status_patches_render_facts_and_only_render_facts():
     assert verdict["guardedChanges"]["settled"] == []
 
 
+def test_the_poll_carries_the_measurement_onto_the_job_it_just_settled():
+    """The Took column, blank at the only moment anybody is looking at it.
+
+    `RenderStatusReport.jobs` is a list of whole `RenderJob`s, so the measurement is on the wire on
+    the very tick a render settles -- and the patch copied `status`, `output_files` and `error`
+    and nothing else. Every render the Director actually watches finish therefore drew `—`, under
+    a tooltip saying no timing was ever taken for it, about a job measured 200 ms earlier. Nothing
+    repaired it: the poll stands itself down when the last job settles and never calls
+    `loadProject`, so the blank stood until the next project switch.
+
+    Executed rather than asserted about the field list, because the defect *was* a field list: a
+    test that reads which names appear in the merge is a test that would have been written from
+    the same three names.
+    """
+    measured = json.loads(RenderJob(
+        id="j1", kind="h3", prompt_id="pr1", target_id="s1", status="complete",
+        output_files=["take_00002.mp4"], render_seconds=378.0, render_seconds_source="comfy",
+        render_frames=141,
+    ).model_dump_json())
+    verdict = run_workspace(f"""
+      const held = {{
+        id: 'p1', shots: [], assets: [], song: null,
+        jobs: [{{ id: 'j1', kind: 'h3', status: 'running', prompt_id: 'pr1', target_id: 's1',
+                 output_files: [], error: '', render_seconds: 0, render_seconds_source: '',
+                 render_frames: 0 }}],
+      }};
+      const report = {{ active: false, comfy_online: true, shots: [], assets: [], song: null,
+                       jobs: [{json.dumps(measured)}] }};
+      const moved = contract.applyRenderStatus(held, report);
+      const settled = held.jobs[0];
+      // The second tick learns nothing and must say so, or the panel repaints every two seconds.
+      const again = contract.applyRenderStatus(held, report);
+
+      // Ticks on which *only* the measurement moved, one field at a time. The "did this answer
+      // teach us anything" test has to cover every field the merge writes, or a field can move on
+      // the wire and never reach the screen -- which is the defect above, one level up. One field
+      // at a time because three at once is satisfied by any one of the three comparisons.
+      const openJob = (over) => ({{ id: 'j2', kind: 'h3', status: 'running', prompt_id: 'pr2',
+        target_id: 's2', output_files: [], error: '', render_seconds: 92.5,
+        render_seconds_source: 'comfy', render_frames: 141, ...over }});
+      const answered = {{ active: true, comfy_online: true, shots: [], assets: [], song: null,
+        jobs: [openJob({{}})] }};
+      const late = {{}};
+      for (const [field, stale] of [['render_seconds', 0], ['render_seconds_source', ''],
+                                    ['render_frames', 0]]) {{
+        const open = {{ id: 'p1', shots: [], assets: [], song: null,
+                       jobs: [openJob({{ [field]: stale }})] }};
+        const changes = contract.applyRenderStatus(open, answered);
+        late[field] = {{ moved: changes.jobs, settled: changes.settled.length,
+                        held: open.jobs[0][field] }};
+      }}
+
+      console.log(JSON.stringify({{
+        moved: moved.jobs,
+        again: again.jobs,
+        settled,
+        cell: app.renderTimingCell(settled),
+        sentence: app.renderTimingSummary(settled),
+        late,
+      }}));
+    """)
+
+    assert verdict["moved"] is True
+    assert verdict["again"] is False
+    assert verdict["late"] == {
+        # Each field alone: the tick moved, and the held job carries the report's value after it.
+        # Still `running`, so nothing announces a finished render off a measurement alone.
+        "render_seconds": {"moved": True, "settled": 0, "held": 92.5},
+        "render_seconds_source": {"moved": True, "settled": 0, "held": "comfy"},
+        "render_frames": {"moved": True, "settled": 0, "held": 141},
+    }
+    assert verdict["settled"]["render_seconds"] == 378.0
+    assert verdict["settled"]["render_seconds_source"] == "comfy"
+    assert verdict["settled"]["render_frames"] == 141
+    # And the two surfaces the Director reads, drawn off the patched job rather than off a reload.
+    assert verdict["cell"] == "6m18s · 141f"
+    assert verdict["sentence"] == render_timing_summary(
+        RenderJob.model_validate(measured)
+    ) == "rendered in 6m18s, 141 frames"
+
+
 def test_settled_toasts_name_the_target_and_never_dress_an_error_as_good_news():
     sentences = run_module("""
       import { renderSettledToast } from './src/music_video_producer/web/assets/api.js';
@@ -13225,29 +13306,49 @@ def test_the_inspector_draws_a_rename_box_and_saves_it_through_the_one_route():
 # that drifts on one side fails here rather than in front of the person reading it.
 # ----------------------------------------------------------------------------------------------
 
+#: Every branch of `render_timing_summary`, and every one of them carries a `prompt_id`, a `kind`
+#: and a `status` that a real record would have. That was the fixture gap behind two of the
+#: defects this table now pins: every non-`complete` row was `record`-sourced, so the branch that
+#: described a *ComfyUI-measured* failure as a record span was never executed, and every row
+#: carried the empty `prompt_id` that means "local work" without any row actually being local
+#: work, so the assembly caveat was never read either.
 TIMING_JOBS = [
     # A solo render measured by ComfyUI's own execution clock: a render time, said plainly.
-    {"status": "complete", "render_seconds": 378.0, "render_seconds_source": "comfy",
-     "render_frames": 141, "batch_id": ""},
+    {"kind": "h3", "prompt_id": "pr1", "status": "complete", "render_seconds": 378.0,
+     "render_seconds_source": "comfy", "render_frames": 141, "batch_id": ""},
     # The same length measured off the record, in a batch: the caveat, and the batch named.
-    {"status": "complete", "render_seconds": 1812.0, "render_seconds_source": "record",
-     "render_frames": 226, "batch_id": "batch_1"},
+    {"kind": "h3", "prompt_id": "pr2", "status": "complete", "render_seconds": 1812.0,
+     "render_seconds_source": "record", "render_frames": 226, "batch_id": "batch_1"},
     # Measured off the record but not in a batch: the caveat without the batch claim.
-    {"status": "complete", "render_seconds": 95.0, "render_seconds_source": "record",
-     "render_frames": 0, "batch_id": ""},
+    {"kind": "h3", "prompt_id": "pr3", "status": "complete", "render_seconds": 95.0,
+     "render_seconds_source": "record", "render_frames": 0, "batch_id": ""},
     # Never `rendered in`: a cancellation rendered for some unknown part of the time it stood open.
-    {"status": "cancelled", "render_seconds": 2400.0, "render_seconds_source": "record",
-     "render_frames": 141, "batch_id": ""},
-    {"status": "error", "render_seconds": 3661.0, "render_seconds_source": "record",
-     "render_frames": 277, "batch_id": "batch_1"},
+    {"kind": "h3", "prompt_id": "pr4", "status": "cancelled", "render_seconds": 2400.0,
+     "render_seconds_source": "record", "render_frames": 141, "batch_id": ""},
+    {"kind": "h3", "prompt_id": "pr5", "status": "error", "render_seconds": 3661.0,
+     "render_seconds_source": "record", "render_frames": 277, "batch_id": "batch_1"},
+    # A render ComfyUI itself timed and that then died: the span is `execution_start` to
+    # `execution_error`, so it is time on the GPU and must never be called a record span.
+    {"kind": "h3", "prompt_id": "pr6", "status": "error", "render_seconds": 192.0,
+     "render_seconds_source": "comfy", "render_frames": 141, "batch_id": ""},
+    # A finished export: local work, an empty `prompt_id` by design, never in any queue.
+    {"kind": "post", "prompt_id": "", "status": "complete", "render_seconds": 378.0,
+     "render_seconds_source": "record", "render_frames": 0, "batch_id": ""},
+    # The same export orphaned by a crash and settled at the next boot: the span runs to whenever
+    # somebody restarted the application, so this one *is* an upper bound.
+    {"kind": "post", "prompt_id": "", "status": "error", "render_seconds": 32400.0,
+     "render_seconds_source": "record", "render_frames": 0, "batch_id": ""},
+    # A settle whose clock ran backwards: recorded as a settle, with no length claimed.
+    {"kind": "h3", "prompt_id": "pr7", "status": "cancelled", "render_seconds": 0.0,
+     "render_seconds_source": "unmeasured", "render_frames": 141, "batch_id": ""},
     # Every job written before 2026-08-21: no measurement, and none invented.
-    {"status": "complete", "render_seconds": 0.0, "render_seconds_source": "",
-     "render_frames": 0, "batch_id": ""},
+    {"kind": "h3", "prompt_id": "pr8", "status": "complete", "render_seconds": 0.0,
+     "render_seconds_source": "", "render_frames": 0, "batch_id": ""},
 ]
 
 
 def test_the_browsers_timing_sentence_is_the_servers_sentence_character_for_character():
-    jobs = [RenderJob(kind="h3", target_id="shot_a", **fields) for fields in TIMING_JOBS]
+    jobs = [RenderJob(target_id="shot_a", **fields) for fields in TIMING_JOBS]
     wire = json.dumps([json.loads(job.model_dump_json()) for job in jobs])
     body = f"""
       console.log(JSON.stringify({wire}.map(app.renderTimingSummary)));
@@ -13269,8 +13370,12 @@ def test_the_two_duration_formatters_agree_and_neither_rounds_a_render_up():
 def test_the_queue_column_shows_the_caveat_rather_than_hiding_it_in_a_tooltip():
     """`≤` is the caveat made visible: an enqueue-to-settle span is an upper bound on the
     render and never the render itself, and a reader scanning the column has to see that
-    without hovering. The full sentence rides the same cell's `title`."""
-    jobs = [json.loads(RenderJob(kind="h3", **fields).model_dump_json()) for fields in TIMING_JOBS]
+    without hovering. The full sentence rides the same cell's `title`.
+
+    The two bare `record`-sourced cells are the finished export: local work that was never in a
+    queue, so its span is the whole job and a `≤` would claim a wait that cannot have happened.
+    The crashed one keeps the mark, because that span runs to the next boot."""
+    jobs = [json.loads(RenderJob(**fields).model_dump_json()) for fields in TIMING_JOBS]
     body = f"""
       console.log(JSON.stringify({json.dumps(jobs)}.map(app.renderTimingCell)));
     """
@@ -13278,10 +13383,13 @@ def test_the_queue_column_shows_the_caveat_rather_than_hiding_it_in_a_tooltip():
     cells = run_workspace(body)
 
     assert cells == ["6m18s · 141f", "≤30m12s · 226f", "≤1m35s", "≤40m00s · 141f",
-                     "≤1h01m · 277f", "—"]
-    # Nothing measured by ComfyUI's own clock is marked as an upper bound, and nothing measured
-    # off the record is shown without the mark.
+                     "≤1h01m · 277f", "3m12s · 141f", "6m18s", "≤9h00m", "—", "—"]
+    # Nothing measured by ComfyUI's own clock is marked as an upper bound -- a failure it timed
+    # included, which is the row that used to disagree with the column header above it.
     assert not cells[0].startswith("≤")
+    assert not cells[5].startswith("≤")
+    # A settle with no length draws no number at all: `0s` would be a claim about a render.
+    assert cells[8] == "—"
 
 
 def test_the_queue_panel_actually_draws_the_column_it_declares():

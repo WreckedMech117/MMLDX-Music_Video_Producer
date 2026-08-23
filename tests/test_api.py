@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import copy
 import hashlib
@@ -13694,6 +13695,105 @@ def test_sections_route_sorts_refuses_overlap_and_reaches_the_expansion(tmp_path
     assert "lyrics" not in section
 
 
+def test_the_generic_project_put_holds_sections_to_the_same_rule_as_the_sections_route(
+    tmp_path: Path,
+):
+    """**Finding 7, and the ninth time this route has been the hole for a guarded field.**
+
+    `PUT /sections` sorts and refuses overlaps; the generic `PUT /api/projects/{id}` — the normal
+    save path for every edit the browser makes — validated the field not at all. Everything
+    downstream reads the layer as sorted and disjoint, and an unsorted one used to make
+    `timeline.layout_spans` emit *duplicate* spans: the song tiled twice, `SNAP_NESTED` raised,
+    and populate answered an unhandled 500 after a ~110 s model call.
+
+    Unlike the `_adopt_*` helpers beside it this is validation and not adoption — sections are
+    the Director's own hand-dragged structure and this is where the browser saves them, so taking
+    the stored value back would make the boxes undraggable. Both writers now go through
+    `app.legal_sections`, so the rule cannot drift between them.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Sections via the generic PUT"))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=60.0)
+    stored = store.save(project)
+
+    def save(sections):
+        body = stored.model_dump(mode="json")
+        body["sections"] = sections
+        return client.put(f"/api/projects/{stored.id}", json=body)
+
+    overlapping = save([
+        {"label": "Verse", "start": 0, "duration": 30},
+        {"label": "Chorus", "start": 24, "duration": 20},
+    ])
+    assert overlapping.status_code == 422
+    assert "may not overlap" in overlapping.json()["detail"]
+    # A refusal must not have written anything, or it is not a refusal.
+    assert store.get(stored.id).sections == []
+
+    unsorted_save = save([
+        {"label": "Chorus", "start": 30, "duration": 30},
+        {"label": "Verse", "start": 0, "duration": 30},
+    ])
+    assert unsorted_save.status_code == 200
+    assert [section["label"] for section in unsorted_save.json()["sections"]] == [
+        "Verse", "Chorus"
+    ]
+    assert [section.label for section in store.get(stored.id).sections] == ["Verse", "Chorus"]
+
+    # And the two writers give the same answer to the same body, which is the point of sharing
+    # one implementation rather than writing the rule twice.
+    from music_video_producer.app import SECTIONS_OVERLAP_REFUSAL
+
+    through_the_narrow_route = client.put(
+        f"/api/projects/{stored.id}/sections",
+        json={"sections": [
+            {"label": "Verse", "start": 0, "duration": 30},
+            {"label": "Chorus", "start": 24, "duration": 20},
+        ]},
+    )
+    assert through_the_narrow_route.status_code == 422
+    assert through_the_narrow_route.json()["detail"] == overlapping.json()["detail"]
+    assert through_the_narrow_route.json()["detail"] == SECTIONS_OVERLAP_REFUSAL.format(
+        first="Verse", end=30.0, second="Chorus", start=24.0
+    )
+
+
+def test_a_save_that_does_not_touch_the_sections_is_never_refused_over_them(tmp_path: Path):
+    """The gate is on *changing* the layer, which is the Song guard's shape on this same route.
+
+    This is the normal save path for every edit in the interface. A manifest written before the
+    rule existed can hold an overlapping layer — the generic `PUT` was the only door wide enough
+    to have written one — and refusing an ordinary save over it would make that project
+    unsaveable *and* unfixable, because `PUT /sections` refuses the same body. So a save that
+    round-trips the stored sections passes untouched, and only a save that introduces or edits an
+    overlap is held to the rule.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Legacy overlap"))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=60.0)
+    # Written past the routes, which is the only way this state exists at all.
+    project.sections = [
+        SongSection(id="section_0", label="Verse", start=0.0, duration=30.0),
+        SongSection(id="section_1", label="Chorus", start=24.0, duration=20.0),
+    ]
+    stored = store.save(project)
+
+    body = stored.model_dump(mode="json")
+    body["name"] = "Renamed while the overlap sits there"
+    ordinary = client.put(f"/api/projects/{stored.id}", json=body)
+    assert ordinary.status_code == 200, ordinary.text
+    assert ordinary.json()["name"] == "Renamed while the overlap sits there"
+    # The layer is untouched — not repaired behind the Director's back, and not refused.
+    assert [(s["label"], s["start"]) for s in ordinary.json()["sections"]] == [
+        ("Verse", 0.0), ("Chorus", 24.0)
+    ]
+
+    # And editing the layer to a *different* overlap is still refused.
+    body = store.get(stored.id).model_dump(mode="json")
+    body["sections"][1]["start"] = 20.0
+    assert client.put(f"/api/projects/{stored.id}", json=body).status_code == 422
+
+
 # --------------------------------------------------------------------------------------------
 # Fill section looks. The Director's report (2026-08-20): a Section clicked in the timeline
 # had an empty shared prompt, so nothing of the Treatment reached the shots inside it. The
@@ -19282,6 +19382,92 @@ def test_an_ordinary_full_project_put_cannot_erase_a_recorded_render_timing(tmp_
     assert unmoved.updated_at.year != 2030
 
 
+def test_a_full_project_put_cannot_erase_a_job_record_by_leaving_it_out(tmp_path: Path):
+    """The guard protected fields and left whole records open.
+
+    Its loop read `project.jobs` -- the *body* -- so a job the body simply omits was invisible to
+    it, and `Project.jobs` is defaulted. A `PUT` carrying nothing but `id`, `name` and
+    `updated_at` therefore answered 200 and erased every job record in the project, timings
+    included: the exact loss this instrumentation exists to prevent, arriving through the exact
+    route that has caused it seven times before, and reachable by a body three keys long.
+
+    No route in this application removes a job record. They are appended by the submission paths
+    and settled in place, so the stored list is the authority and a body may only add to it.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, _shot_id, job_id = rendered_shot(client, store, comfy, "Erasable")
+    measured = timing_of(store, project_id, job_id)
+    measured.render_seconds = 378.0
+    measured.render_seconds_source = "comfy"
+    measured.render_frames = 141
+    stored = store.save(store.get(project_id).model_copy(update={"jobs": [measured]}))
+
+    saved = client.put(
+        f"/api/projects/{project_id}",
+        json={
+            "id": project_id,
+            "name": stored.name,
+            "updated_at": stored.updated_at.isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+    assert saved.status_code == 200, saved.text
+    kept = timing_of(store, project_id, job_id)
+    assert (kept.render_seconds, kept.render_seconds_source, kept.render_frames) == (
+        378.0, "comfy", 141,
+    )
+    # The whole record, not only its measurement: the reply the browser adopts holds it too, so
+    # the queue panel does not go empty on the save that was supposed to change a name.
+    assert [job["id"] for job in saved.json()["jobs"]] == [job_id]
+
+
+def test_a_job_the_store_never_saw_arrives_with_no_measurement_however_the_body_dresses_it(
+    tmp_path: Path,
+):
+    """The sibling branch, and the worse one. A job the store does not hold used to keep its
+    *client-supplied* timing -- there was nothing measured to protect, which is true of the
+    record and false of the field. So a body could invent
+
+        {"id": "job_forged", "render_seconds": 7920.0, "render_seconds_source": "comfy",
+         "render_frames": 221}
+
+    and the queue panel drew `2h12m · 221f`, with no `≤`, as a recorded measurement. That is the
+    fabricated "221 frames = 2.2 hours" figure this whole change spent four sites retiring,
+    re-injectable through the generic write. The precedents force the default instead --
+    `stored_anchors.get(id, "")`, `stored_slots.get(id, 0)` -- and so does this now.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, _shot_id, job_id = rendered_shot(client, store, comfy, "Forgeable")
+    body = json.loads(store.get(project_id).model_dump_json())
+    body["jobs"].append({
+        "id": "job_forged",
+        "kind": "h3",
+        "status": "complete",
+        "prompt_id": "pr-forged",
+        "target_id": "shot_take",
+        "render_seconds": 7920.0,
+        "render_seconds_source": "comfy",
+        "render_frames": 221,
+        "created_at": "2026-08-22T01:00:00Z",
+        "updated_at": "2026-08-22T03:12:00Z",
+    })
+
+    saved = client.put(f"/api/projects/{project_id}", json=body)
+
+    assert saved.status_code == 200, saved.text
+    forged = next(job for job in store.get(project_id).jobs if job.id == "job_forged")
+    assert (forged.render_seconds, forged.render_seconds_source, forged.render_frames) == (
+        0.0, "", 0,
+    )
+    # `updated_at` equal to `created_at` is this record's documented way of saying "never
+    # settled", which is the honest thing to say about a job nothing here ever measured.
+    assert forged.updated_at == forged.created_at
+    assert render_timing_summary(forged) == ""
+    # The record itself still lands, and behind the one the store already held: the queue panel
+    # reads this list as chronological, so submission order is preserved rather than body order.
+    assert [job.id for job in store.get(project_id).jobs] == [job_id, "job_forged"]
+
+
 # ---------------------------------------------------------------------------------------------
 # Renaming an asset (2026-08-22).
 #
@@ -19543,14 +19729,76 @@ def test_a_manifest_written_before_the_rename_route_loads_unchanged(tmp_path: Pa
     assert comfy.prompts == []
 
 
-def test_every_measured_field_on_a_job_is_named_in_the_routes_guard():
-    """The drift this pins: a field added to `RenderJob`'s timing block and not to
-    `JOB_MEASURED_FIELDS` is silently writable by any client, which is how this route has been
-    the hole seven times before. Enumerated here so adding the eighth fails loudly."""
-    measured = {
-        name
-        for name in RenderJob.model_fields
-        if name.startswith("render_") or name == "updated_at"
+def _fields_the_settle_path_writes() -> set[str]:
+    """Every attribute `batch.stamp_job_settled` assigns onto the job it settles, from source.
+
+    Read off the *writer* rather than off the shape of a field's name. Every settle path in this
+    application funnels through that one function -- which is the reason it exists as a function
+    -- so what it stamps is, by construction, what this application measures.
+    """
+    tree = ast.parse(
+        Path("src/music_video_producer/batch.py").read_text(encoding="utf-8")
+    )
+    settle = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "stamp_job_settled"
+    )
+    return {
+        target.attr
+        for node in ast.walk(settle)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "job"
     }
 
-    assert measured == set(JOB_MEASURED_FIELDS)
+
+def test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard():
+    """The drift this pins: a field this application measures and `JOB_MEASURED_FIELDS` does not
+    name is silently writable by any client, which is how this route has been the hole seven
+    times before.
+
+    Structural, because the version that came before it was not: it derived "measured" as
+    `name.startswith("render_") or name == "updated_at"`, which a future `gpu_seconds` or
+    `timing_source` satisfies while being wide open -- the same name-shaped hole one level up
+    from the one it was written to close. This reads the settle path's own assignments instead,
+    so a field the application starts measuring and the guard does not adopt fails here.
+    """
+    written = _fields_the_settle_path_writes()
+
+    # The harness reads the real function rather than an empty set that would pass vacuously.
+    assert {"render_seconds", "render_seconds_source", "updated_at"} <= written
+    assert written <= set(JOB_MEASURED_FIELDS)
+    # `render_frames` is the one measured field no settle path writes: the submission route
+    # records it at the single moment the graph's length is true, because `Shot.duration` is
+    # edited afterwards and re-deriving it later describes a render that never happened. It is
+    # named in the guard for the same reason as the rest, and the test below proves the naming
+    # has teeth rather than merely reciting it.
+    assert set(JOB_MEASURED_FIELDS) - written == {"render_frames"}
+
+
+def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
+    """The list, executed. Every field in `JOB_MEASURED_FIELDS` is forged in a whole-project body
+    and every one of them must come back unmoved -- so the tuple is a set of enforced refusals
+    rather than a set of names a test recites back to itself."""
+    client, store, comfy = make_client(tmp_path)
+    project_id, _shot_id, job_id = rendered_shot(client, store, comfy, "Teeth")
+
+    for name in JOB_MEASURED_FIELDS:
+        before = timing_of(store, project_id, job_id)
+        held = getattr(before, name)
+        forged = {
+            "render_seconds": 7920.0,
+            "render_seconds_source": "comfy",
+            "render_frames": 221,
+            "updated_at": "2030-01-01T00:00:00Z",
+        }[name]
+        body = json.loads(store.get(project_id).model_dump_json())
+        body["jobs"][0][name] = forged
+        assert body["jobs"][0][name] != json.loads(before.model_dump_json())[name], name
+
+        assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200, name
+
+        assert getattr(timing_of(store, project_id, job_id), name) == held, name

@@ -369,11 +369,29 @@ def populate(client: TestClient, project_id: str, **body) -> dict:
 #: The other five spans are bounded by their proposal count or by `floor(span/4)`, neither of
 #: which the ceiling touches, and they keep the counts they had. The band goes 4.134–6.000 to
 #: 4.000–6.800.
+#:
+#: **Re-measured once more on 2026-08-23** when `timeline.layout_spans` stopped dropping the
+#: unmarked stretch at the end of the song. The values they replace are kept beside them, as both
+#: pairs above are:
+#:
+#:   marked   ad0f82d0f1e5a84dcb56207e92a4f121b658489329cbbd8cd7918b1c75f53bca
+#:   unmarked 0567041f3746e287411436730e314d9fa8209bf98a506846e6277a245767a434
+#:
+#: **And the move is the trailing stub's and nothing else's, checked shot by shot rather than
+#: assumed.** This fixture's last section ends at 154.640 and the song is 154.644898, so 4.9 ms
+#: of it had no span; that stub is now absorbed into the Outro span, which is the only span whose
+#: length changes. Diffing the two plans field by field, **5 of 27 shots differ and every
+#: difference is geometry** — shots 22–26, the Outro's five windows, each moved by at most 1 ms;
+#: no prompt, seed, mode, citation, `singing` or `use_song_audio` moves on any shot, and the
+#: unmarked arm shows the identical five. Coverage goes 0 → 154.640 to **0 → 154.644**, which is
+#: the song to within the millisecond each span's last window is floored to. Everything else is
+#: unchanged: 27 shots, band 4.000–6.800, worst seam 1 ms, `batch.window_band_note` **0**
+#: warnings, `assembly.tiling_refusals` **0** refusals.
 CHAINED_DIGEST_SECTIONS_MARKED = (
-    "ad0f82d0f1e5a84dcb56207e92a4f121b658489329cbbd8cd7918b1c75f53bca"
+    "e84a8587382283b70dbaa0399a744f8def29a36fcacfb9a4ca288492e895006e"
 )
 CHAINED_DIGEST_NO_SECTIONS = (
-    "0567041f3746e287411436730e314d9fa8209bf98a506846e6277a245767a434"
+    "1607b49e3f452dc39aa15138137ebfad2b23021bf1744d5dac8051b3c41114d0"
 )
 
 
@@ -2228,15 +2246,33 @@ def test_a_layout_with_no_sections_at_all_still_maps_by_global_proportion():
     )
 
 
+def tiles_exactly(spans, song_duration: float) -> bool:
+    """Whether `layout_spans`' answer covers ``[0, song_duration]`` in order with no hole.
+
+    The invariant three separate defects came of not having (2026-08-23), written once so every
+    shape below can be held to it rather than to a list of numbers somebody typed.
+    """
+    cursor = 0.0
+    for start, length in spans:
+        if abs(start - cursor) > 1e-9 or length <= 0:
+            return False
+        cursor = start + length
+    return abs(cursor - song_duration) <= 1e-9
+
+
 def test_layout_spans_cuts_the_song_exactly_where_the_section_layer_does():
     """The decomposition both steps now share, asserted on its own rather than through a tiling.
 
     Lay-out has tiled these spans since sections existed; what is new on 2026-08-22 is that
     fill-in reads the same list, so a disagreement about what a section *is* would put content in
     the wrong window rather than merely tiling oddly. Every branch is here: the unmarked stretch
-    before the first section, between two of them, and after the last — each tiled only when it is
-    longer than `SPAN_MIN_SECONDS`, because a shorter one is two boxes the Director dragged
-    together rather than a piece of song with no section on it.
+    before the first section, between two of them, and after the last — each tiled as *its own*
+    span only when it is longer than `SPAN_MIN_SECONDS`, because a shorter one is two boxes the
+    Director dragged together rather than a piece of song with no section on it.
+
+    **A sub-floor stretch is absorbed rather than dropped (2026-08-23).** The floor decides
+    whether a stretch is worth a span, never whether the song is covered — see `SPAN_MIN_SECONDS`
+    for the false claim that stood here and the three defects it produced.
     """
     sections = [
         SongSection(label="A", start=2.0, duration=8.0),
@@ -2252,14 +2288,96 @@ def test_layout_spans_cuts_the_song_exactly_where_the_section_layer_does():
         (2.0, 8.0),
         (10.0, 3.0),     # the gap between A and B
         (13.0, 7.0),
-        (20.2, 9.8),     # B ends 0.2 s before C starts, which is under the floor and not a span
+        # B ends 0.2 s before C starts. Under the floor, so not a span of its own — and absorbed
+        # forward into C rather than left as a hole, which is what it used to be.
+        (20.0, 10.0),
         (30.0, 30.0),    # the trailing gap, tiled
     ]
+    assert tiles_exactly(timeline_module.layout_spans(sections, 60.0), 60.0)
     # The same sections against a song that ends 0.4 s after the last one: under the floor, so no
-    # trailing span at all.
-    assert timeline_module.layout_spans(sections, 30.4) == [
-        (0.0, 2.0), (2.0, 8.0), (10.0, 3.0), (13.0, 7.0), (20.2, 9.8)
+    # trailing span of its own — the last span grows to the song's end instead. **This assertion
+    # is the reversal**: it pinned `(20.2, 9.8)` and a 0.4 s tail of uncovered song *as intended*
+    # until 2026-08-23, and the intent does not survive. The tiling stays contiguous, so line-up
+    # and populate both report success and the export refuses days later with "The song is
+    # uncovered from 30.000s to 30.400s". Covering the song is not optional; tiling a 0.4 s span
+    # is what the floor was protecting against, and absorbing it does both.
+    trailing = timeline_module.layout_spans(sections, 30.4)
+    assert [(round(s, 6), round(length, 6)) for s, length in trailing] == [
+        (0.0, 2.0), (2.0, 8.0), (10.0, 3.0), (13.0, 7.0), (20.0, 10.4)
     ]
+    assert tiles_exactly(trailing, 30.4)
+
+
+def test_a_section_layer_always_tiles_the_whole_song_whatever_its_shape():
+    """**Findings 1, 3, 4 and 7, one root cause: `layout_spans` did not cover the song.**
+
+    Each shape below was reachable and each produced a hole or a duplicate, and every one is
+    legal input — `PUT /sections` refuses overlaps only and documents gaps as legal, section
+    edges are dragged by hand, and the generic project `PUT` used to validate the field not at
+    all. What they have in common is that the tiling stayed *contiguous within itself*, so
+    nothing downstream noticed until `snap_window_plan` raised or the export refused.
+    """
+    def marked(*rows):
+        return [
+            SongSection(label=label, start=start, duration=length)
+            for label, start, length in rows
+        ]
+
+    # Finding 1 — a sub-floor gap between two sections. Accepted by `PUT /sections` and
+    # reachable by dragging a section edge; it used to emit a 0.3 s hole, which is inside
+    # (BOUNDARY_TOLERANCE_SECONDS, SPAN_MIN_SECONDS] and rejected by assembly *and* by the
+    # snapper.
+    assert timeline_module.layout_spans(
+        marked(("Verse", 0.0, 20.0), ("Chorus", 20.3, 19.7)), 40.0
+    ) == [(0.0, 20.0), (20.0, 20.0)]
+
+    # Finding 3 — a head stub and a tail stub. The first section starting at 0.4 s left the
+    # song uncovered from 0.000s; the last ending 0.4 s early left it uncovered to the end.
+    assert timeline_module.layout_spans(
+        marked(("Verse", 0.4, 19.6), ("Chorus", 20.0, 20.0)), 40.0
+    ) == [(0.0, 20.0), (20.0, 20.0)]
+    assert timeline_module.layout_spans(
+        marked(("Verse", 0.0, 20.0), ("Chorus", 20.0, 19.6)), 40.0
+    ) == [(0.0, 20.0), (20.0, 20.0)]
+
+    # Finding 4 — sections outliving a replaced song. Marked to 180 s, then a 150 s master
+    # imported over them: the spans used to run to 180 and populate tiled windows into seconds
+    # the song does not have, where `workflows.song_audio_window` refuses at submit.
+    assert timeline_module.layout_spans(
+        marked(("Verse", 0.0, 100.0), ("Chorus", 100.0, 80.0)), 150.0
+    ) == [(0.0, 100.0), (100.0, 50.0)]
+    # And a section that begins past the song's end contributes nothing at all — including no
+    # unmarked stretch tiled out to a start that does not exist.
+    assert timeline_module.layout_spans(marked(("Verse", 200.0, 10.0)), 150.0) == [
+        (0.0, 150.0)
+    ]
+
+    # Finding 7 — unsorted and overlapping layers, which only `PUT /sections` ever rejected.
+    # Unsorted sections used to emit a *duplicate* span, tiling the song twice and raising
+    # `SNAP_NESTED`; an overlap is truncated to the section that reached those seconds first.
+    assert timeline_module.layout_spans(
+        marked(("Chorus", 80.0, 70.0), ("Verse", 0.0, 80.0)), 150.0
+    ) == [(0.0, 80.0), (80.0, 70.0)]
+    assert timeline_module.layout_spans(
+        marked(("A", 0.0, 30.0), ("B", 20.0, 30.0)), 50.0
+    ) == [(0.0, 30.0), (30.0, 20.0)]
+
+    for shape, song in (
+        (marked(("Verse", 0.0, 20.0), ("Chorus", 20.3, 19.7)), 40.0),
+        (marked(("Verse", 0.4, 19.6), ("Chorus", 20.0, 20.0)), 40.0),
+        (marked(("Verse", 0.0, 20.0), ("Chorus", 20.0, 19.6)), 40.0),
+        (marked(("Verse", 0.0, 100.0), ("Chorus", 100.0, 80.0)), 150.0),
+        (marked(("Verse", 200.0, 10.0)), 150.0),
+        (marked(("Chorus", 80.0, 70.0), ("Verse", 0.0, 80.0)), 150.0),
+        (marked(("A", 0.0, 30.0), ("B", 20.0, 30.0)), 50.0),
+        # A whole layer of sub-second marks, each too short for a span of its own.
+        (marked(("A", 0.1, 0.2), ("B", 0.4, 0.2), ("C", 0.7, 0.2)), 10.0),
+    ):
+        assert tiles_exactly(timeline_module.layout_spans(shape, song), song), shape
+    # An empty layer still answers `[]` — the emptiness is load-bearing and is not a hole.
+    assert timeline_module.layout_spans([], 40.0) == []
+    # A song whose length was never recorded clamps nothing rather than clamping to zero.
+    assert timeline_module.layout_spans(marked(("Verse", 0.0, 20.0)), 0.0) == [(0.0, 20.0)]
 
 
 def test_section_edges_names_both_edges_and_lets_a_start_win_a_collision():
@@ -2322,12 +2440,18 @@ def test_pairing_a_layout_that_has_no_proposals_answers_none_rather_than_raising
 
 
 def test_overlapping_section_boxes_fill_each_window_exactly_once():
-    """Section boxes are dragged by hand and nothing repairs the Director's own overlaps.
+    """Section boxes are dragged by hand, and an overlap between two of them settles one way.
 
     Two boxes over the same seconds would otherwise both offer to fill the windows underneath,
-    and the later one would silently win — so a window is claimed by the first span that contains
-    its midpoint and no other span may reach it. Window 3 is the one in dispute here: claimed by
-    Alpha it takes Alpha's fifth proposal, and unclaimed it would take Beta's second.
+    and the later one would silently win. **Since 2026-08-23 the dispute is settled a step
+    earlier**: `timeline.layout_spans` truncates a section that starts behind what is already
+    tiled, so Beta's span begins at 30.0 where Alpha's ends rather than at the 20.0 the box
+    claims, and the spans handed to the pairing are disjoint whatever the layer does. Alpha's
+    seconds are Alpha's, which is the same tie-break `song_section` and `section_edges` make.
+
+    `claimed` and `spent` are then belt and braces on top of that, and they stay: a window may be
+    filled once and a proposal read once, which is what "no proposal is used twice" means when
+    the span list is not to be trusted.
     """
     layout = bare_layout(
         duration=50.0,
@@ -2337,9 +2461,45 @@ def test_overlapping_section_boxes_fill_each_window_exactly_once():
             SongSection(label="Beta", start=20.0, duration=30.0),
         ],
     )
+    assert timeline_module.layout_spans(layout.sections, 50.0) == [(0.0, 30.0), (30.0, 20.0)]
+    # Windows 0-2 sit in Alpha and take its five proposals sampled 1st/3rd/5th; windows 3-4 sit
+    # in Beta, which holds only P5, so both take it — the reuse the ruling permits.
     assert app_module.paired_proposals(layout, [5.0, 15.0, 25.0, 35.0, 45.0]) == [
-        0, 2, 4, 4, 5
+        0, 2, 4, 5, 5
     ]
+    # No proposal crosses the seam: Alpha's five are Alpha's alone, and Beta reads only its own.
+    assert 5 not in app_module.paired_proposals(layout, [5.0, 15.0, 25.0])[:3]
+
+
+def test_no_proposal_is_read_twice_even_if_the_spans_handed_in_overlap(monkeypatch):
+    """The `spent` guard, asked the only way it can be asked.
+
+    `claimed` stops a *window* being filled twice and has since overlapping boxes were first
+    considered; nothing stopped a *proposal* being read twice, and "no proposal is used twice" is
+    one of the two properties `paired_proposals`' docstring rests on. Since 2026-08-23
+    `timeline.layout_spans` makes its spans disjoint whatever the section layer does, so the only
+    way to put an overlapping decomposition in front of the pairing is to hand it one — which is
+    exactly what this test is for. The guard exists for the next thing that produces spans, not
+    for a state reachable today, and pinning it is what stops it being deleted as dead.
+    """
+    layout = bare_layout(
+        duration=50.0,
+        proposals=[0.0, 5.0, 10.0, 15.0, 25.0, 35.0],
+        sections=[SongSection(label="Alpha", start=0.0, duration=50.0)],
+    )
+    monkeypatch.setattr(
+        app_module, "layout_spans", lambda sections, duration: [(0.0, 30.0), (20.0, 30.0)]
+    )
+
+    paired = app_module.paired_proposals(layout, [5.0, 15.0, 25.0, 35.0, 45.0])
+
+    # P4 starts at 25.0 s, inside *both* spans. It belongs to the first one that reaches it, and
+    # the second must not read it again: without the guard this answers `[0, 2, 4, 4, 5]` and
+    # windows 2 and 3 come out with the same prose for two different reasons — one because the
+    # section was short of proposals (legitimate reuse, which the ruling permits) and one because
+    # two spans read the same list (not).
+    assert paired == [0, 2, 4, 5, 5]
+    assert paired[3] != paired[2], f"a proposal was read by two spans: {paired}"
 
 
 def test_a_cut_on_a_section_boundary_is_left_alone_and_says_why(tmp_path: Path):
@@ -2369,10 +2529,157 @@ def test_a_cut_on_a_section_boundary_is_left_alone_and_says_why(tmp_path: Path):
     assert refused, "no cut was refused for sitting on a section boundary"
     intro = next(skip for skip in refused if abs(skip["boundary"] - 11.0) < 1e-6)
     assert intro["reason"] == timeline_module.SNAP_SECTION_BOUNDARY.format(
-        before=intro["before"], after=intro["after"], boundary=11.0, section="Verse"
+        before=intro["before"], after=intro["after"], boundary=11.0, section="Verse", at=11.0
     )
     assert "no shot straddles a section" in intro["reason"]
     assert comfy.prompts == []
+
+
+def resection(store: ProjectStore, project_id: str, rows) -> None:
+    """Rewrite a project's section layer directly — the state a Director's edge-drag leaves.
+
+    Written past the routes deliberately: these shapes are what `PUT /sections` *accepts* (it
+    refuses overlaps and nothing else, and documents gaps as legal) and what a stale manifest
+    already holds, so the point is to put the layer on disk and walk the chain over it.
+    """
+    project = store.get(project_id)
+    project.sections = [
+        SongSection(
+            id=f"section_{index}", label=label, start=start, duration=length, prompt="Look."
+        )
+        for index, (label, start, length) in enumerate(rows)
+    ]
+    store.save(project)
+
+
+@pytest.mark.parametrize(
+    "name,rows",
+    [
+        # A legal sub-floor gap between two sections: 0.3 s, which is inside
+        # (`BOUNDARY_TOLERANCE_SECONDS`, `SPAN_MIN_SECONDS`] and a hole to everything that reads
+        # a plan. `PUT /sections` accepts it, and dragging a section edge produces it.
+        ("interior gap", [("Verse", 0.0, 20.0), ("Chorus", 20.3, 134.344898)]),
+        # A head stub: the first section starts 0.4 s in.
+        ("head stub", [("Verse", 0.4, 59.6), ("Chorus", 60.0, 94.644898)]),
+        # A tail stub: the last section ends 0.4 s early.
+        ("tail stub", [("Verse", 0.0, 60.0), ("Chorus", 60.0, 94.244898)]),
+        # Sections outliving a replaced song — marked to 180 s over a 154.6 s master.
+        ("stale sections", [("Verse", 0.0, 90.0), ("Chorus", 90.0, 90.0)]),
+        # Unsorted, which only `PUT /sections` ever rejected; the generic project `PUT` now
+        # does too, but a manifest written before it did still holds this.
+        ("unsorted", [("Chorus", 80.0, 74.644898), ("Verse", 0.0, 80.0)]),
+    ],
+)
+def test_a_legal_section_layer_never_makes_populate_500(
+    tmp_path: Path, name: str, rows
+):
+    """**Findings 1, 3, 4 and 7 through the chain**, which is where they were 500s.
+
+    Each layer here is legal input and each used to break the whole pass. The gap and the
+    unsorted layer raised out of `snap_window_plan` — `SNAP_HOLE` and `SNAP_NESTED` — and
+    populate's `line_up_shots` call had no `except TimelineError` where both standalone siblings
+    do, so the Director spent a ~110 s model call and got an opaque 500. The two stubs and the
+    stale layer were worse than a 500: populate reported *success*, and the export refused days
+    later with "The song is uncovered from …", or with shots past the song's end that
+    `workflows.song_audio_window` refuses at submit.
+
+    What is asserted is the outcome the Director gets, not an intermediate: 200, a plan that
+    covers the song from 0 to its end with no hole assembly would reject, and no window past it.
+    """
+    client, store, comfy, _director, project_id = make_client(tmp_path)
+    resection(store, project_id, rows)
+
+    body = populate(client, project_id, snap_tolerance=0)
+
+    shots = body["project"]["shots"]
+    assert shots, name
+    cursor = 0.0
+    for shot in shots:
+        assert abs(shot["start"] - cursor) <= SNAP_CONTIGUITY_TOLERANCE, (name, shot)
+        cursor = shot["start"] + shot["duration"]
+    assert 0 <= SONG_DURATION - cursor <= SNAP_CONTIGUITY_TOLERANCE, name
+    # Nothing past the song: `workflows.song_audio_window` refuses such a window at submit and
+    # no proposal reaches those seconds, so those shots could never render and never had prose.
+    assert cursor <= SONG_DURATION + 1e-9, name
+    assert comfy.prompts == []
+
+
+def test_a_geometry_the_snapper_refuses_comes_back_in_its_own_words_not_as_a_500(
+    tmp_path: Path,
+):
+    """The other half of finding 1: the chain must **refuse**, never fall through.
+
+    Closing the hole in `layout_spans` is what stops the reachable shapes producing one, but a
+    route that answers 500 for anything its core refuses is a route with no answer for the next
+    shape nobody has thought of yet. Both standalone siblings translate `TimelineError` to a 422
+    carrying the core's own sentence; populate now does too, and the sentence is what the
+    Director reads instead of a stack trace they cannot act on.
+
+    Reached by making `layout_spans` answer a holed decomposition, because after the fix no
+    section layer can — which is exactly the state this assertion should be left in.
+    """
+    client, _store, comfy, _director, project_id = make_client(tmp_path)
+
+    def holed(sections, song_duration):
+        return [(0.0, 20.0), (20.3, song_duration - 20.3)]
+
+    original = app_module.layout_spans
+    app_module.layout_spans = holed
+    try:
+        response = client.post(
+            f"/api/projects/{project_id}/timeline/populate",
+            json={"confirm_replace": True, "snap_tolerance": 0.75},
+        )
+    finally:
+        app_module.layout_spans = original
+
+    assert response.status_code == 422, response.text
+    assert "This plan has a hole in it" in response.json()["detail"]
+    assert comfy.prompts == []
+
+
+def test_the_pairing_spends_a_short_proposal_list_the_way_it_says_it_does():
+    """**Finding 6.** The docstring's two headline clauses were false for reachable ratios.
+
+    Measured rather than argued, because the two claims that were corrected read as if they were
+    measured: "the reuse lands in the middle of the section rather than doubling its first or
+    last line" and "the surplus is sampled across the section's arc". Both hold for the example
+    the docstring gives and for nothing much wider.
+
+    The claims were corrected rather than the arithmetic — `proposal_for_position` is shared with
+    the whole-song path and re-spreading it would move every populate digest for a cosmetic
+    property — so this pins the behaviour the corrected prose now describes, including the two
+    properties that *are* load-bearing.
+    """
+    def pairing(w: int, p: int) -> list[int]:
+        """`paired_proposals`' own arithmetic for one section: w windows, p proposals."""
+        return [timeline_module.proposal_for_position(rank + 0.5, w, p) for rank in range(w)]
+
+    # More windows than proposals: the first is doubled and the last tripled, not the middle.
+    assert pairing(5, 2) == [0, 0, 1, 1, 1]
+    assert pairing(6, 2) == [0, 0, 0, 1, 1, 1]
+    # More proposals than windows: with p >= 2w the opener goes, and so does the closer.
+    assert pairing(2, 5) == [1, 3]
+    assert pairing(2, 4) == [1, 3]
+    # The docstring's own example, which is the case both claims were written from.
+    assert pairing(3, 5) == [0, 2, 4]
+
+    for windows, proposals_count in ((5, 2), (6, 2), (3, 2), (5, 3), (2, 5), (2, 4), (3, 5)):
+        paired = pairing(windows, proposals_count)
+        # The two load-bearing properties, true at every ratio.
+        assert paired == sorted(paired), (windows, proposals_count)
+        if windows >= proposals_count:
+            assert set(paired) == set(range(proposals_count)), (windows, proposals_count)
+        else:
+            assert len(set(paired)) == len(paired), (windows, proposals_count)
+
+    # And the ratio is reachable rather than hypothetical: `populate_windows` clamps a span's
+    # count to at least `ceil(span / maximum)` whatever the proposal count, so a 34 s section
+    # the model wrote two lines for gets five windows.
+    windows = timeline_module.populate_windows(
+        [(0.0, 8.0), (8.0, 9.0)], 34.0, maximum=POPULATE_MAX_WINDOW_SECONDS
+    )
+    assert len(windows) == 5
 
 
 def test_both_doors_onto_the_snapper_honour_the_same_section_boundaries(tmp_path: Path):
@@ -2516,11 +2823,23 @@ def test_a_line_up_report_carries_the_content_half_and_not_the_manifest(tmp_path
 #: expected here and is the same point `test_the_default_variance_widens_a_layout_the_model_made
 #: _uniform` makes in its docstring: this fixture's proposals already cycle 4–8 s, so aligning
 #: the windows to the singing pulls some of them together.
+#:
+#: **Re-measured on 2026-08-23** with the neutral pair above, for the same reason and with the
+#: same proof: `timeline.layout_spans` now absorbs the song's 4.9 ms trailing stub into the Outro
+#: span instead of leaving it uncovered, so the Outro's five windows each move by at most a
+#: millisecond and nothing else does. The values they replace:
+#:
+#:   marked   cbd98720b1d0f2f929d230ce76272cb2f5dd6c10ae12e5aca98c983ac32dc87f
+#:   unmarked dd923601df5d0f5a36f9677de48a10707350a5eb450cdf6270482c7d69f6ea3d
+#:
+#: Every figure in the table above still reads the same except coverage, which goes 0 → 154.640
+#: to **0 → 154.644**: 27 shots, band 4.000–6.800, worst seam 1 ms, 0 window warnings, 0 tiling
+#: refusals.
 VARIED_DIGEST_SECTIONS_MARKED = (
-    "cbd98720b1d0f2f929d230ce76272cb2f5dd6c10ae12e5aca98c983ac32dc87f"
+    "aae1a1e69d406723ccbb4d2ae8bb0882eebc4a79ed06b539dfe92f36d9e8cea4"
 )
 VARIED_DIGEST_NO_SECTIONS = (
-    "dd923601df5d0f5a36f9677de48a10707350a5eb450cdf6270482c7d69f6ea3d"
+    "f3eb2656353ea017029b75b6e7664e4641f19118d4ac14511d26c7551391e3d1"
 )
 
 

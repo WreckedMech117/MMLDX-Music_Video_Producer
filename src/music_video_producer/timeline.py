@@ -622,12 +622,25 @@ def proposal_for_position(
     return min(max(index, 0), proposal_count - 1)
 
 
-#: How long an unmarked stretch of song has to be before a layout tiles it as its own span.
+#: How long an unmarked stretch of song has to be before a layout tiles it as **its own** span.
 #:
 #: Half a second, which is `lay_out_shots`' own literal moved here with `layout_spans`. Shorter
 #: than this and the stretch is a rounding artefact of two section boxes the Director dragged
-#: together rather than a piece of song with no section on it — tiling it would produce a
-#: sub-frame window, and leaving it uncovered leaves a hole assembly already tolerates.
+#: together rather than a piece of song with no section on it — and tiling it on its own would
+#: produce a window shorter than any shot, because `populate_windows` answers a span under its
+#: own minimum with a single whole-span window. A 0.3 s span is a 0.3 s shot.
+#:
+#: **What this floor never licensed is leaving the stretch uncovered, and until 2026-08-23 the
+#: note here claimed it did**: *"leaving it uncovered leaves a hole assembly already tolerates"*.
+#: That was false by more than an order of magnitude. Assembly tolerates
+#: `assembly.BOUNDARY_TOLERANCE_SECONDS` — half a frame, 1/48 s — and `_seam_overlaps` refuses at
+#: exactly the same figure, so every unmarked stretch in ``(1/48 s, 0.5 s]`` was a hole *both* of
+#: them reject: populate's line-up step raised `SNAP_HOLE` on it, and an export refused the plan
+#: days later with "the song is uncovered from …". A sub-floor stretch is therefore **absorbed
+#: into a neighbouring span** rather than dropped. It is absorbed *forward*, into the section
+#: that follows it, which is the tie-break `section_edges` and `song_section` already make (a
+#: boundary belongs to the section that opens there); a trailing stub has no section after it and
+#: is absorbed backward into the last span instead.
 SPAN_MIN_SECONDS = 0.5
 
 
@@ -637,7 +650,8 @@ def layout_spans(
     """The stretches of song a layout tiles **independently**, in order: ``(start, length)``.
 
     One span per marked section, plus every unmarked stretch before, between and after them
-    that is longer than `SPAN_MIN_SECONDS`. Tiling each on its own is what keeps a shot from
+    that is longer than `SPAN_MIN_SECONDS` — a shorter one is absorbed into the span beside it
+    rather than tiled or dropped. Tiling each on its own is what keeps a shot from
     straddling a section boundary — the Director's ask, and the thing the lay-out instruction
     tells the model in words ("every shot sits inside one section and takes that section's
     character").
@@ -651,18 +665,87 @@ def layout_spans(
     An empty section layer answers ``[]`` rather than one whole-song span, and the emptiness is
     load-bearing: it is how a caller tells "no sections were marked" from "one section covers
     the song", and the two want different behaviour in both callers.
+
+    **The spans tile ``[0, song_duration]`` exactly: in order, disjoint, and with no hole of any
+    size.** That is the invariant, and it is stated as one because three separate defects came of
+    its absence (2026-08-23):
+
+    * an unmarked stretch shorter than `SPAN_MIN_SECONDS` between two sections was simply
+      dropped, and every such stretch is a hole `_seam_overlaps` and `assembly.tiling_refusals`
+      both reject — `PUT /sections` accepts exactly this shape and documents gaps as legal;
+    * a first section starting after 0, or a last one ending before the song does, left a head
+      or tail stub uncovered. The tiling stayed *contiguous*, so line-up and populate both
+      reported success and the export refused days later;
+    * sections outliving a replaced song tiled windows past the song's end, where
+      `workflows.song_audio_window` refuses at submit and no proposal can reach.
+
+    So a sub-floor stretch is **absorbed into a neighbour** (see `SPAN_MIN_SECONDS` for which one
+    and why), and every span is **clamped to the song**. A section wholly past the song's end
+    contributes nothing; one that straddles the end is truncated at it.
+
+    **Nothing here trusts the sections to be sorted or disjoint**, and that is deliberate rather
+    than defensive: `PUT /sections` sorts and refuses overlaps, but the generic
+    `PUT /api/projects/{id}` writes the same field, and unsorted sections used to make this
+    function emit *duplicate* spans — the song tiled twice, `SNAP_NESTED` raised, populate 500.
+    A section that starts behind the cursor is truncated to it and one that ends behind it is
+    skipped, so the walk is monotonic whatever order it is handed.
+
+    A span whose section needed neither absorbing nor clamping keeps ``(section.start,
+    section.duration)`` **to the bit**, rather than a recomputed difference of the two: the same
+    reason `snap_window_plan` keeps an untouched window's given floats.
     """
     if not sections:
         return []
+    # A song of unknown length clamps nothing — there is no end to clamp to, and inventing one
+    # would be the fabrication this module refuses everywhere else.
+    limit = song_duration if song_duration > 0 else None
     spans: list[tuple[float, float]] = []
     cursor = 0.0
     for section in sections:
-        if section.start - cursor > SPAN_MIN_SECONDS:
-            spans.append((cursor, section.start - cursor))
-        spans.append((section.start, section.duration))
-        cursor = section.end
-    if song_duration - cursor > SPAN_MIN_SECONDS:
-        spans.append((cursor, song_duration - cursor))
+        start, end, length = section.start, section.end, section.duration
+        if limit is not None:
+            # Both edges, not only the end: a section that begins past the song would otherwise
+            # have the unmarked stretch *before* it tiled out to a start that does not exist.
+            start = min(start, limit)
+            end = min(end, limit)
+        gap = start - cursor
+        if gap > SPAN_MIN_SECONDS:
+            # Long enough to be a piece of song with no section on it: its own span.
+            spans.append((cursor, gap))
+            cursor = start
+        elif gap != 0:
+            # A sub-floor stub is absorbed forward into this section; a section that starts
+            # behind what is already tiled is truncated to the cursor. One assignment covers
+            # both, because both mean "this span begins where the last one ended".
+            start = cursor
+        if end <= start:
+            # Wholly past the song's end, or wholly behind the cursor. Either way it adds no
+            # seconds, and the cursor does not move backwards for it.
+            continue
+        if start != section.start or end != section.end:
+            length = end - start
+        spans.append((start, length))
+        # `end > start >= cursor` by every branch above, so this is monotonic without a `max`
+        # around it — which is why writing one is an equivalent mutant rather than a fix.
+        cursor = end
+    remainder = (limit - cursor) if limit is not None else 0.0
+    # Two guards in one line, and only one of them can fire. An unknown song length has no end
+    # to tile up to, which is the `0.0`. The `<= 0` arm is a **totality guard on a state the
+    # clamp above makes unreachable**: every `end` is clamped to `limit` and `cursor` is only ever
+    # assigned an `end` or a `start` that was itself clamped, so `cursor <= limit` and the
+    # remainder is never negative. It is kept because this function's contract is "tile the song
+    # exactly" and a caller is entitled to hand in any two arguments — and it is recorded here
+    # because it is an **equivalent mutant**: negating it changes nothing, since a zero remainder
+    # falls through to a `length + 0.0` that is a no-op. Do not delete it on a mutation report
+    # alone; the reason it survives is written above it.
+    if remainder <= 0:
+        return spans
+    if remainder > SPAN_MIN_SECONDS or not spans:
+        spans.append((cursor, remainder))
+    else:
+        # A trailing stub has no section after it to absorb it, so the last span grows instead.
+        start, length = spans[-1]
+        spans[-1] = (start, length + remainder)
     return spans
 
 
@@ -2171,10 +2254,32 @@ SNAP_IN_FLIGHT_REFUSAL = (
 #: and choosing which side should give way is an editing decision this pass cannot make. A
 #: section boundary is the music's own switch, so a cut already on one is already where the
 #: phrase changes.
+#:
+#: **The protection is about the whole transition, not only its midpoint (2026-08-23).** It was
+#: keyed on `SEAM_POINT` alone, and a transition is a *span*: drag one of the two edges across a
+#: boundary and the midpoint slides off it, so the protection silently vanished for exactly the
+#: overlapping seams that the midpoint rule had just made snappable. Measured, on sections
+#: `Verse 0–30` / `Chorus 30–60` with a rest at 30.10–30.80: a symmetric 0.6 s transition centred
+#: on 30.000 was correctly skipped, while the same blend authored as `24.0→30.1` against
+#: `29.5→36.0` — midpoint 29.800, and still straddling 30.000 — moved, and left the Verse shot
+#: running 0.550 s into the Chorus where it had run 0.100 s. That re-opens the "2 of 5 cuts
+#: crossed a boundary" defect above on any plan with transitions in it, and the Director's own
+#: timeline has 15.
+#:
+#: So the test is containment: a boundary anywhere between the transition's two edges protects
+#: the seam. A hard cut is the zero-length case and its test is `abs(at - boundary) <= tolerance`
+#: exactly as before, which is what keeps every plan without transitions reading as it did.
+#: **What the midpoint still means is unchanged** — it is where the cut *is*, the position the
+#: report names and the position `_gap_snap_target` is asked about. Only the question "does this
+#: seam touch a section boundary" stopped being asked about a single instant.
+#:
+#: The sentence names the boundary's own second as well as the cut's, because on a transition
+#: they are two different numbers and a Director looking for a boundary at the cut's position
+#: would find nothing there.
 SNAP_SECTION_BOUNDARY = (
     "The cut between {before} and {after} at {boundary:.3f}s sits on the boundary of "
-    "{section}, and the layout put it there so no shot straddles a section. Moving it would "
-    "run one section's shot into the next section's seconds. Left where it was."
+    "{section} at {at:.3f}s, and the layout put it there so no shot straddles a section. "
+    "Moving it would run one section's shot into the next section's seconds. Left where it was."
 )
 #: Not a refusal — the good case where there was nothing to do. Reported rather than dropped,
 #: because "18 cuts already land in silence" is the sentence that tells a Director the plan is
@@ -2254,6 +2359,36 @@ SNAP_OFF_THE_PLAN = (
     "which would carry its {overlap:.3f}s transition {edge}. The assembled video's length "
     "against the song may not change, so a transition may not hang off either end of the "
     "plan. Left where it was."
+)
+#: **This pass may not produce the geometry it refuses as input.** The per-cut refusal that makes
+#: that true, added 2026-08-23 after a measured self-poisoning.
+#:
+#: The band check bounds each neighbour's *length* and says nothing about *order*. A transition
+#: longer than the band's minimum breaks the coupling: with a 6.39 s overlap at the seam beyond,
+#: window *i+1*'s new left edge could travel past window *i+2*'s start and still leave both
+#: windows comfortably over 4 s. Measured on `tolerance=0.75` with `SHOT 01 100.0→105.40`,
+#: `SHOT 02 105.4→111.99`, `SHOT 03 105.6→112.10` and a rest at 105.95–106.60: `SHOT 02` settled
+#: at 106.100 while `SHOT 03` still began at 105.600, so the two came back **out of song order**.
+#: The route applies the plan by shot id and every later read re-sorts by start
+#: (`shot_snap_windows`), which turns that into `SHOT 02` sitting wholly inside `SHOT 03` — so
+#: `SNAP_NESTED` then refused every later Snap Cuts, Line Up and Populate on that project until
+#: the windows were untangled by hand. `DIRECTOR_PLAN`'s only overlap past 4 s sits at the last
+#: seam, where `SNAP_OFF_THE_PLAN` fires first, which is why the tests never saw it.
+#:
+#: **It costs nothing at the tolerances anyone uses, measured on the Director's own 33-shot plan**
+#: (18 overlapping seams, the longest 5.492 s, its one 22 ms hole closed so the question can be
+#: asked): at `SNAP_TOLERANCE_DEFAULT` and at 1.5 s it refuses **0** cuts and the same 5 and 6
+#: moves land as before. At `SNAP_TOLERANCE_MAX` it refuses **3** — and each of those three is the
+#: defect itself, a move that would have left SHOT 05, SHOT 14 or SHOT 22 out of order.
+#:
+#: Refused rather than clamped, `SNAP_HOLE`'s rule: `_gap_snap_target` is the one thing in this
+#: module that decides where a cut goes, and a target trimmed to fit a neighbour would be a
+#: placement nobody chose.
+SNAP_OUT_OF_ORDER = (
+    "The cut between {before} and {after} at {boundary:.3f}s would move to {proposed:.3f}s, "
+    "which would put {moved} {side} {neighbour} and leave the two out of song order. A plan "
+    "whose shots run out of order has no single seam at this point, and every later pass would "
+    "refuse it. Left where it was."
 )
 
 
@@ -2652,8 +2787,9 @@ def snap_window_plan(
 
     **`sections` is the fourth protection and it belongs to the plan rather than to a window**,
     which is why it arrives as its own argument: `section_edges`' mapping of every second a
-    marked section starts or ends at to that section's label. A cut within half a frame of one
-    is skipped with `SNAP_SECTION_BOUNDARY` — see there for the live defect it closes.
+    marked section starts or ends at to that section's label. A seam whose **transition** covers
+    one — which for a hard cut means the cut itself, within half a frame — is skipped with
+    `SNAP_SECTION_BOUNDARY`; see there for the two live defects it closes.
     `None` (the default) is a caller with no section layer to honour, and is the behaviour every
     caller had before 2026-08-22.
 
@@ -2687,6 +2823,14 @@ def snap_window_plan(
     video's length against the song is the number it was. A window no seam of which moved
     keeps its given floats untouched to the bit, which is what stops an ulp of recomputation
     from making an approved shot read as stale to assembly.
+
+    **This pass never produces geometry it would refuse as input, and that is a checked
+    guarantee rather than a consequence of the band (2026-08-23).** The settled windows are in
+    song order and non-nested — a plan `_seam_overlaps` accepts — because every move is held to
+    four order inequalities as well as to the band. The band bounds *lengths*; a transition
+    longer than ``minimum`` breaks the coupling between length and order, and the plan that came
+    out then poisoned the project against every later pass. `SNAP_OUT_OF_ORDER` carries the
+    measurement.
 
     Raises `TimelineError` for the two geometries that have no seam at all: a **hole**
     (`SNAP_HOLE`) and a window laid **wholly over** another (`SNAP_NESTED`). An overlapping
@@ -2744,25 +2888,39 @@ def snap_window_plan(
             skips.append(CutSkip(**names, reason=refusal))
             continue
         # The plan's own protection, asked immediately after the windows' three and before
-        # anything about the track is read: it is structural, it is unconditional, and a cut on
-        # a section boundary will not move whatever the gaps say. Matched within
+        # anything about the track is read: it is structural, it is unconditional, and a seam on
+        # a section boundary will not move whatever the gaps say.
+        #
+        # **Matched against the whole transition, `[boundary - half, boundary + half]`**, not
+        # against `boundary` alone — see `SNAP_SECTION_BOUNDARY` for the measured defect that
+        # cost. A hard cut has `half == 0`, so its test is `abs(at - boundary) <= tolerance`
+        # character for character with what stood here. The tolerance is
         # `SNAP_CONTIGUITY_TOLERANCE` — this module's "the same boundary written twice" number —
         # because a section box the Director dragged and a window rounded to the millisecond
         # describe the same instant without being the same float.
-        edge = next(
-            (
-                label
-                for at, label in (sections or {}).items()
-                if abs(at - boundary) <= SNAP_CONTIGUITY_TOLERANCE
-            ),
-            None,
+        #
+        # A transition wide enough to span two boundaries is named by the one nearest the cut,
+        # because that is the one a Director looking at the seam sees; which is named changes
+        # nothing about the refusal, only about the sentence.
+        touched_edges = [
+            (at, label)
+            for at, label in (sections or {}).items()
+            if boundary - half - SNAP_CONTIGUITY_TOLERANCE
+            <= at
+            <= boundary + half + SNAP_CONTIGUITY_TOLERANCE
+        ]
+        edge = (
+            min(touched_edges, key=lambda found: abs(found[0] - boundary))
+            if touched_edges
+            else None
         )
         if edge is not None:
+            at, label = edge
             skips.append(
                 CutSkip(
                     **names,
                     reason=SNAP_SECTION_BOUNDARY.format(
-                        **labels, boundary=boundary, section=edge
+                        **labels, boundary=boundary, section=label, at=at
                     ),
                 )
             )
@@ -2845,6 +3003,56 @@ def snap_window_plan(
         # transition sits at the seam beyond. A window's length is its own window, overlapped
         # or not, because that is the length H3 has to render.
         left, right = boundaries[index], boundaries[index + 2] + overlaps[index + 2]
+        # **Order before the band**, and it is a *different* question from length — see
+        # `SNAP_OUT_OF_ORDER` for the plan this distinction cost. The move assigns one edge,
+        # `boundaries[index + 1]`, and both windows it belongs to are described by it: window
+        # *index* becomes `[left, proposed + half)` and window *index + 1* becomes
+        # `[proposed - half, right)`. Four inequalities say the result is still a plan
+        # `_seam_overlaps` would accept, in its own tolerance and its own words:
+        #
+        # * window *index + 1* must not start before window *index* does, nor after window
+        #   *index + 2* does — starts stay in song order, which is the order every reader
+        #   re-derives the plan in (`ordered_shots`);
+        # * window *index* must not end before window *index - 1* does, nor window *index + 1*
+        #   after window *index + 2* does — neither becomes a clip laid wholly over another.
+        #
+        # At the two outer seams `boundaries[index]`/`boundaries[index + 2]` are the plan's own
+        # edges and `overlaps` there is 0, so these degenerate to the R-7 check above rather
+        # than saying anything new. For a plan of hard cuts they can never fire at all: the band
+        # already demands `minimum` seconds either side of the seam, and `minimum` is positive.
+        prior_start, prior_end = left, boundaries[index] + overlaps[index]
+        next_start, next_end = boundaries[index + 2], right
+        # Named for the sentence, and "the plan's end" where there is no window there to name:
+        # at the outer seams these comparisons are R-7's, restated, and R-7 has already run.
+        beyond = (
+            ordered[index + 2].label if index + 2 < len(ordered) else "the end of the plan"
+        )
+        behind = ordered[index - 1].label if index > 0 else "the start of the plan"
+        out_of_order = None
+        if proposed - half < prior_start - SNAP_CONTIGUITY_TOLERANCE:
+            out_of_order = (names["after_label"], "in front of", names["before_label"])
+        elif proposed - half > next_start + SNAP_CONTIGUITY_TOLERANCE:
+            out_of_order = (names["after_label"], "after the start of", beyond)
+        elif proposed + half < prior_end - SNAP_CONTIGUITY_TOLERANCE:
+            out_of_order = (names["before_label"], "wholly inside", behind)
+        elif proposed + half > next_end + SNAP_CONTIGUITY_TOLERANCE:
+            out_of_order = (names["before_label"], "wholly over", names["after_label"])
+        if out_of_order is not None:
+            moved_label, side, neighbour_label = out_of_order
+            skips.append(
+                CutSkip(
+                    **names,
+                    reason=SNAP_OUT_OF_ORDER.format(
+                        **labels,
+                        boundary=boundary,
+                        proposed=proposed,
+                        moved=moved_label,
+                        side=side,
+                        neighbour=neighbour_label,
+                    ),
+                )
+            )
+            continue
         # Both neighbours, each named with the length the move would give it and the bound it
         # would break. The nearest gap is the only candidate considered: the ruling is that a
         # move which pushes a neighbour out of the band is rejected *for that cut*, and

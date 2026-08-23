@@ -40,7 +40,10 @@ from music_video_producer.timeline import (
     SNAP_NO_GAP_IN_TOLERANCE,
     SNAP_OFF_THE_PLAN,
     SNAP_OUT_OF_BAND,
+    SNAP_OUT_OF_ORDER,
+    SNAP_SECTION_BOUNDARY,
     SNAP_TOLERANCE_DEFAULT,
+    SNAP_TOLERANCE_MAX,
     SNAP_TOLERANCE_OFF,
     SNAP_UNMEASURED,
     SNAP_WITHOUT_CUTS,
@@ -68,6 +71,7 @@ from music_video_producer.timeline import (
     populate_windows,
     proposal_for_position,
     repair_sections,
+    section_edges,
     section_lyrics,
     shot_expansion_input,
     snap_cut_plan,
@@ -3107,6 +3111,264 @@ def test_a_window_laid_wholly_over_another_is_refused_rather_than_guessed_at():
     assert str(refused.value) == SNAP_NESTED.format(
         before="SHOT 01", after="SHOT 02", start=0.0, end=20.0, inner_start=5.0, inner_end=8.0
     )
+
+
+def test_a_settled_overlapping_plan_is_still_in_song_order_and_still_not_nested():
+    """**The assertion this suite lacked, and the defect it lacked it for.**
+
+    Every overlap fixture above asserts the *windows* the plan settles on. None asserted the one
+    property those windows have to keep for the plan to be re-readable at all: that they are
+    still in song order and still non-nested — that `_seam_overlaps`, the very function whose
+    refusals this module raises on bad *input*, would accept this module's own *output*.
+
+    It would not. The band check bounds each neighbour's length and says nothing about order, and
+    a transition longer than the band's minimum breaks the coupling between the two. Measured on
+    `tolerance=0.75`, sung throughout except a rest at 105.95–106.60:
+
+        SHOT 01  100.000 → 105.400
+        SHOT 02  105.400 → 111.990        the 02/03 seam is a 6.390 s transition
+        SHOT 03  105.600 → 112.100
+
+    The 01/02 cut moved to 106.100, which is a legal cut with both neighbours far inside the
+    band — and left SHOT 02 starting *after* SHOT 03. `snap_timeline_cuts` applies the plan by
+    shot id without re-validating it, so it lands in the manifest, and every later read re-sorts
+    by start (`shot_snap_windows`), which makes SHOT 02 a clip laid wholly inside SHOT 03: from
+    then on Snap Cuts, Line Up and Populate all 422 with `SNAP_NESTED` until the two are
+    untangled by hand. `DIRECTOR_PLAN`'s only overlap past 4 s sits at its last seam, where
+    `SNAP_OFF_THE_PLAN` fires first, which is why no fixture here had ever reached it.
+    """
+    rows = [(100.0, 5.40), (105.4, 6.59), (105.6, 6.50)]
+    song = measured_song(
+        words=[("a", 100.0, 105.95), ("b", 106.60, 112.10)], duration=200.0
+    )
+
+    plan = snap_window_plan(snap_windows_of(rows), song, tolerance=0.75)
+
+    assert plan.status == "ready"
+    assert plan.moves == [], "the only move on offer would have unordered the plan"
+    assert plan.skips[0].reason == SNAP_OUT_OF_ORDER.format(
+        before="SHOT 01",
+        after="SHOT 02",
+        boundary=105.4,
+        proposed=106.1,
+        moved="SHOT 02",
+        side="after the start of",
+        neighbour="SHOT 03",
+    )
+    assert snapped_rows(plan) == rows
+
+    # The property itself, asserted on the settled plan rather than on the numbers: whatever a
+    # fixture's shape, what comes out is something this module would accept going back in.
+    for shape, tolerance in (
+        (rows, 0.75),
+        ([(0.0, 12.0), (10.0, 10.0), (20.0, 6.0), (26.0, 4.0)], 1.0),
+        ([(0.0, 5.0), (3.0, 9.0), (12.0, 6.0)], 0.75),
+        ([(0.0, 5.0), (5.0, 5.0), (8.0, 6.0)], 0.75),
+    ):
+        settled = snapped_rows(
+            snap_window_plan(
+                snap_windows_of(shape),
+                measured_song(
+                    words=[("a", 0.0, 3.0), ("b", 3.65, 5.35), ("c", 5.65, 105.95),
+                           ("d", 106.6, 200.0)],
+                    duration=200.0,
+                ),
+                tolerance=tolerance,
+                maximum=25.0,
+            )
+        )
+        starts = [start for start, _length in settled]
+        ends = [start + length for start, length in settled]
+        assert starts == sorted(starts), settled
+        assert ends == sorted(ends), settled
+        # And the strongest form of it: the settled plan re-enters the snapper without raising.
+        snap_window_plan(
+            snap_windows_of(settled), measured_song(duration=200.0), tolerance=0.75
+        )
+
+
+@pytest.mark.parametrize(
+    "name,rows,gap,moved,side,neighbour,boundary,proposed",
+    [
+        # Each of the four order inequalities, at `SNAP_TOLERANCE_MAX` on four ordinary 4–5 s
+        # shots overlapping by 2 s. None of these needs an exotic geometry: an overlap of 2 s
+        # puts two windows' *starts* 2 s apart, and a 3 s tolerance reaches straight past that.
+        (
+            "the later window would start before the earlier one",
+            [(0.0, 4.0), (2.0, 4.0), (4.0, 4.0), (6.0, 4.0)],
+            (1.5, 2.3),
+            "SHOT 03", "in front of", "SHOT 02", 5.0, 2.15,
+        ),
+        (
+            "the later window would start after the one beyond it",
+            [(0.0, 4.0), (2.0, 4.0), (4.0, 4.0), (6.0, 4.0)],
+            (5.0, 5.8),
+            "SHOT 02", "after the start of", "SHOT 03", 3.0, 5.15,
+        ),
+        (
+            "the earlier window would end inside the one before it",
+            [(0.0, 4.0), (2.0, 5.0), (4.0, 4.0), (6.0, 4.0)],
+            (4.0, 4.8),
+            "SHOT 03", "wholly inside", "SHOT 02", 7.0, 4.65,
+        ),
+        (
+            "the earlier window would end after the one after it",
+            [(0.0, 4.0), (2.0, 5.0), (4.0, 4.0), (6.0, 4.0)],
+            (6.5, 7.3),
+            "SHOT 02", "wholly over", "SHOT 03", 5.5, 6.65,
+        ),
+    ],
+)
+def test_each_way_a_move_could_unorder_the_plan_is_refused_by_name(
+    name, rows, gap, moved, side, neighbour, boundary, proposed
+):
+    """The four inequalities one at a time, each with the sentence it produces.
+
+    The band is a statement about *lengths* and these are statements about *order*; the test
+    above proves the distinction matters, and this one proves all four halves of it are wired.
+    Every fixture here is a plan a Director could author by dragging edges across each other —
+    four shots of 4–5 s overlapping by 2 s — snapped at `SNAP_TOLERANCE_MAX`.
+    """
+    song = measured_song(
+        words=[("a", 0.0, gap[0]), ("b", gap[1], 10.0)], duration=10.0
+    )
+
+    plan = snap_window_plan(
+        snap_windows_of(rows), song, tolerance=SNAP_TOLERANCE_MAX, minimum=4.0, maximum=15.0
+    )
+
+    refused = [skip for skip in plan.skips if "out of song order" in skip.reason]
+    assert len(refused) == 1, (name, plan.skips)
+    assert refused[0].reason == SNAP_OUT_OF_ORDER.format(
+        before=refused[0].before_label,
+        after=refused[0].after_label,
+        boundary=boundary,
+        proposed=proposed,
+        moved=moved,
+        side=side,
+        neighbour=neighbour,
+    ), name
+    settled = snapped_rows(plan)
+    starts = [start for start, _length in settled]
+    ends = [start + length for start, length in settled]
+    assert starts == sorted(starts), (name, settled)
+    assert ends == sorted(ends), (name, settled)
+    # And whatever else the plan did, what came out re-enters the snapper without raising.
+    snap_window_plan(snap_windows_of(settled), measured_song(duration=10.0), tolerance=1.0)
+
+
+def test_a_transition_across_a_section_boundary_is_protected_however_it_was_dragged():
+    """**The midpoint rule's blind spot.** The protection is about the transition, not its centre.
+
+    `section_edges` was matched against `SEAM_POINT` alone — the transition's midpoint — so
+    dragging only *one* of the two edges across a boundary slid the midpoint off it and the
+    protection silently vanished, for exactly the overlapping seams the midpoint rule had just
+    made snappable. Measured on `Verse 0–30` / `Chorus 30–60` with a rest at 30.10–30.80:
+
+        symmetric   A 24.0→30.3, B 29.7→36.0   midpoint 30.000   skipped, correctly
+        asymmetric  A 24.0→30.1, B 29.5→36.0   midpoint 29.800   **moved**
+
+    and the asymmetric one left the Verse shot running 0.550 s into the Chorus where it had run
+    0.100 s. Both blends straddle 30.000; only one of them used to be protected.
+
+    What the midpoint still means is untouched: it is where the cut *is*, the position the report
+    names and the position `_gap_snap_target` is asked about. Only "does this seam touch a
+    boundary" stopped being a question about a single instant.
+    """
+    song = measured_song(
+        words=[("a", 0.0, 30.10), ("b", 30.80, 60.0)], duration=60.0
+    )
+    edges = section_edges(
+        [
+            SongSection(label="Verse", start=0.0, duration=30.0),
+            SongSection(label="Chorus", start=30.0, duration=30.0),
+        ]
+    )
+
+    def snap(a_end, b_start):
+        return snap_window_plan(
+            snap_windows_of([(24.0, a_end - 24.0), (b_start, 36.0 - b_start)]),
+            song,
+            tolerance=0.75,
+            sections=edges,
+        )
+
+    symmetric = snap(30.3, 29.7)
+    asymmetric = snap(30.1, 29.5)
+
+    for plan, boundary in ((symmetric, 30.0), (asymmetric, 29.8)):
+        assert plan.moves == []
+        assert plan.skips[0].reason == SNAP_SECTION_BOUNDARY.format(
+            before="SHOT 01",
+            after="SHOT 02",
+            boundary=boundary,
+            section="Chorus",
+            at=30.0,
+        )
+    # Nothing moved, so the Verse shot ends exactly where the Director left it.
+    assert [
+        (round(start, 9), round(length, 9)) for start, length in snapped_rows(asymmetric)
+    ] == [(24.0, 6.1), (29.5, 6.5)]
+
+    # A hard cut reads exactly as it did — `half` is 0, so the containment test is the old
+    # `abs(at - boundary) <= tolerance` character for character.
+    hard = snap(30.0, 30.0)
+    assert hard.moves == []
+    assert hard.skips[0].reason == SNAP_SECTION_BOUNDARY.format(
+        before="SHOT 01", after="SHOT 02", boundary=30.0, section="Chorus", at=30.0
+    )
+    # And a cut clear of every boundary is still judged on the singing alone.
+    clear = snap(30.4, 30.4)
+    assert "already lands clear" in clear.skips[0].reason
+
+    # **Both halves of the transition, not only the one the first fixture happened to use.**
+    # Above, the boundary sits to the *right* of the midpoint; here it sits to the left — the
+    # same blend dragged the other way, midpoint 30.200, still straddling 30.000. A containment
+    # test that kept only one side would let this one move to 30.250.
+    mirrored = snap(30.5, 29.9)
+    assert mirrored.moves == []
+    assert mirrored.skips[0].reason == SNAP_SECTION_BOUNDARY.format(
+        before="SHOT 01", after="SHOT 02", boundary=30.2, section="Chorus", at=30.0
+    )
+
+    # A transition wide enough to span two boundaries is named by the one nearest the cut, which
+    # is the one a Director looking at the seam sees. Which is named changes nothing about the
+    # refusal — both are inside the blend — only about the sentence.
+    two_edges = snap_window_plan(
+        snap_windows_of([(24.0, 10.0), (28.0, 8.0)]),
+        song,
+        tolerance=0.75,
+        sections=section_edges(
+            [
+                SongSection(label="Verse", start=0.0, duration=30.0),
+                SongSection(label="Chorus", start=30.0, duration=2.0),
+                SongSection(label="Bridge", start=32.0, duration=28.0),
+            ]
+        ),
+    )
+    assert two_edges.moves == []
+    # The blend runs 28.000–34.000, midpoint 31.000; 30.000 and 32.000 are both inside it and
+    # equidistant, so the first one found wins — what matters is that a boundary 1 s away is
+    # named rather than one further off.
+    assert "at 30.000s" in two_edges.skips[0].reason or (
+        "at 32.000s" in two_edges.skips[0].reason
+    )
+    offset = snap_window_plan(
+        snap_windows_of([(24.0, 9.6), (28.0, 7.6)]),
+        song,
+        tolerance=0.75,
+        sections=section_edges(
+            [
+                SongSection(label="Verse", start=0.0, duration=30.0),
+                SongSection(label="Chorus", start=30.0, duration=2.0),
+                SongSection(label="Bridge", start=32.0, duration=28.0),
+            ]
+        ),
+    )
+    # Blend 28.000–33.600, midpoint 30.800: 30.000 is 0.8 away and 32.000 is 1.2, so the
+    # Chorus edge is the one the sentence names.
+    assert offset.moves == []
+    assert "of Chorus at 30.000s" in offset.skips[0].reason
 
 
 def test_an_overlapping_plan_with_an_unmeasured_song_snaps_nothing_and_guesses_nothing():

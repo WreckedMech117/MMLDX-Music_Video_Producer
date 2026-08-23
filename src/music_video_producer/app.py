@@ -2167,6 +2167,11 @@ def _adopt_expansion_maps(project: Project, stored: dict[str, Shot]) -> None:
 #: Everything about a job that this application measured rather than a client supplied. Named
 #: as a set so `replace_project`'s guard and the test that proves it cannot drift apart: a field
 #: added to `RenderJob`'s timing block and not to this list is the eighth instance of the hole.
+#:
+#: The test that holds it is `test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard`,
+#: which reads `batch.stamp_job_settled`'s own assignments rather than matching field names. An
+#: earlier version derived "measured" as `startswith("render_")`, which a `gpu_seconds` would have
+#: slipped straight through — the same hole one level up from the one this tuple closes.
 JOB_MEASURED_FIELDS = ("render_seconds", "render_seconds_source", "render_frames", "updated_at")
 
 
@@ -2195,16 +2200,51 @@ def _adopt_job_measurements(project: Project, stored: dict[str, RenderJob]) -> N
     argument, and widening this beyond the measurements would be a different change hiding
     inside a guard.
 
-    A job in the body that the stored project does not hold keeps its own values, on the
-    anchor's rule inverted: there is nothing measured to protect, and a new record arriving on
-    the generic write is already reported by every other means.
+    Two holes this guard had when it was first written, both of which protected *fields* while
+    leaving whole *records* open, and both closed here.
+
+    **A job the store does not hold gets the defaults, not the body's numbers.** It used to keep
+    its own values, on the reasoning that there was nothing measured to protect — which is true
+    of the record and false of the field. A body inventing `job_forged` with
+    `render_seconds: 7920.0`, `render_seconds_source: "comfy"`, `render_frames: 221` persisted
+    verbatim, and the queue panel drew `2h12m · 221f` with no `≤`: the fabricated "221 frames =
+    2.2 hours" figure this instrumentation exists to retire, re-injectable through the same route,
+    now dressed as a recorded measurement. So the precedents are followed exactly as they are
+    written — `stored_anchors.get(id, "")`, `stored_slots.get(id, 0)` — and the default is forced.
+    A record nobody measured carries no measurement.
+
+    **A job missing from the body is kept.** The loop reads `project.jobs`, which is the *body*,
+    so a job the body simply omits was invisible to it — and `Project.jobs` is defaulted, so a
+    `PUT` carrying nothing but `id`, `name` and `updated_at` answered 200 and erased every job
+    record in the project, timings included. Job records are not editorial content: no route in
+    this application removes one, they are appended by the ten submission paths and settled in
+    place, and the queue panel is the only thing that reads them. So the stored list is the
+    authority for records the store holds, in the store's own order — which is submission order,
+    which is what the panel draws as chronology — and the body may only *add* to it. What the body
+    still decides for a job the store holds is every field above that this guard does not adopt.
     """
-    for job in project.jobs:
-        was = stored.get(job.id)
-        if was is None:
+    kept = []
+    body = {job.id: job for job in project.jobs}
+    for job_id, was in stored.items():
+        offered = body.get(job_id)
+        if offered is None:
+            kept.append(was)
             continue
         for name in JOB_MEASURED_FIELDS:
-            setattr(job, name, getattr(was, name))
+            setattr(offered, name, getattr(was, name))
+        kept.append(offered)
+    for job in project.jobs:
+        if job.id in stored:
+            continue
+        for name in JOB_MEASURED_FIELDS:
+            field = RenderJob.model_fields[name]
+            setattr(job, name, field.get_default(call_default_factory=True))
+        # `updated_at`'s default factory is `now_utc`, which would stamp a settle moment onto a
+        # record that has never settled. Its documented way of saying "never settled" is
+        # equality with `created_at` — see `RenderJob.updated_at` — so that is what it gets.
+        job.updated_at = job.created_at
+        kept.append(job)
+    project.jobs = kept
 
 
 def _require_approval_unchanged(project: Project, shots: list[Shot]) -> None:
@@ -3425,15 +3465,37 @@ def paired_proposals(layout: ShotLayout, midpoints: Sequence[float]) -> list[int
     and for nothing else. Weighting the pairing by window length would give a long window a
     bigger claim on the section's story purely because the tiling repair made it long.
 
-    Two properties follow from the half-rank offset, and both are the point:
+    Two properties follow from the half-rank offset, and they are the load-bearing pair:
 
     * **more windows than proposals** — the step increases by ``p / w ≤ 1``, so no proposal in
-      the section is skipped: every one is used at least once and the reuse lands in the middle
-      of the section rather than doubling its first or last line;
+      the section is skipped: every one is used at least once, and the pairing stays
+      non-decreasing, so nothing arrives out of the order the model wrote it in;
     * **more proposals than windows** — the step is ``≥ 1``, so the pairing is strictly
-      increasing and no proposal is used twice. The surplus is *sampled* across the section's
-      arc rather than truncated off its tail: 3 windows against 5 proposals take the 1st, 3rd
-      and 5th.
+      increasing and no proposal is used twice. The surplus is dropped by *sampling* rather
+      than by truncating the tail: 3 windows against 5 proposals take the 1st, 3rd and 5th.
+
+    **Neither says anything about *where* the reuse or the sampling falls, and two earlier
+    sentences here did — wrongly (corrected 2026-08-23).** "The reuse lands in the middle of the
+    section rather than doubling its first or last line" holds only while ``w < 2p``: measured,
+    ``w=5, p=2`` pairs ``[0, 0, 1, 1, 1]``, doubling the first line *and* tripling the last.
+    "The surplus is sampled across the section's arc" is the docstring's own example and no more:
+    ``w=2, p=5`` pairs ``[1, 3]``, discarding both the opener and the closer, and the opener goes
+    whenever ``p ≥ 2w``.
+
+    Both ratios are **reachable rather than hypothetical**: `timeline.populate_windows` clamps a
+    span's window count to at least ``ceil(span / POPULATE_MAX_WINDOW_SECONDS)`` whatever the
+    proposal count, so a 34 s section the model wrote two lines for gets five windows and pairs
+    ``[0, 0, 1, 1, 1]`` exactly.
+
+    **The claims were corrected rather than the arithmetic, and that is the choice.** Distributing
+    the reuse or the sampling differently would mean a second spelling of `proposal_for_position`
+    — the function this module deliberately shares between the per-section path and the
+    whole-song one — for a purely cosmetic property, and it would move which prose lands in which
+    window on every populate this application has ever laid, byte digests and all. The two
+    properties that *matter* to the ruling ("no proposal skipped", "no proposal used twice")
+    are true as written, and the symptom the false claims were about is already surfaced:
+    `batch.readiness_report` reports identical adjacent prompts as sameness warnings, which is
+    what caught the original defect. A doubled opener shows up there for a rewrite.
 
     **A section the model wrote no proposal for gets `None`**, and the caller writes an empty
     shot for it rather than borrowing from a neighbour. That is the ruling's plain reading and
@@ -3462,12 +3524,19 @@ def paired_proposals(layout: ShotLayout, midpoints: Sequence[float]) -> list[int
         ]
     paired: list[int | None] = [None] * len(midpoints)
     claimed: set[int] = set()
+    spent: set[int] = set()
     for span_start, span_length in spans:
         span_end = span_start + span_length
+        # Spent as it goes, for the reason `claimed` exists below and by the same argument: two
+        # spans that cover the same second would both read the proposals underneath, and "no
+        # proposal is used twice" — the property stated above — would quietly stop being true.
+        # `layout_spans` makes its spans disjoint whatever the section layer does, so this can
+        # only ever be a no-op today; it is here because the guard on the *windows* was written
+        # for exactly this hazard and covering one of the two lists was covering half of it.
         inside = [
             index
             for index, proposal in enumerate(proposals)
-            if span_start <= proposal.start < span_end
+            if index not in spent and span_start <= proposal.start < span_end
         ]
         # Claimed as it goes so a window can only ever be filled once, whatever a hand-marked
         # section layer does: two boxes the Director overlapped would otherwise both offer to
@@ -3478,6 +3547,7 @@ def paired_proposals(layout: ShotLayout, midpoints: Sequence[float]) -> list[int
             if index not in claimed and span_start <= position < span_end
         ]
         claimed.update(windows)
+        spent.update(inside)
         if not inside:
             continue
         for rank, index in enumerate(windows):
@@ -3809,6 +3879,39 @@ SECTIONS_OVERLAP_REFUSAL = (
     "Sections may not overlap: {first} ends at {end:.2f}s but {second} starts at "
     "{start:.2f}s. Adjust the windows so each moment of the song belongs to one section."
 )
+
+
+def legal_sections(sections: Sequence[SongSection]) -> list[SongSection]:
+    """The section layer sorted by start, refused if any two overlap. **Every writer's rule.**
+
+    Extracted 2026-08-23 because it was one route's rule and two routes write the field.
+    `PUT /sections` sorted and refused; the generic `PUT /api/projects/{id}` — the normal save
+    path for every edit the browser makes, and this codebase's recorded sibling-write hole
+    *nine* times over — validated `sections` not at all. Everything downstream reads the layer
+    as sorted and disjoint: `timeline.layout_spans` tiles it, `song_section` breaks a tie by
+    "the later start wins", `section_edges` lets a start win a collision. Three rules that agree
+    on a sorted disjoint layer and on nothing else.
+
+    Unlike the `_adopt_*` helpers beside the generic route, this is **validation and not
+    adoption**: sections are the Director's own hand-dragged structure and that route is where
+    the browser saves them, so taking the stored value would make the boxes undraggable. What it
+    must not do is accept a layer no reader can make sense of.
+
+    Sorting rather than refusing an out-of-order body is `replace_sections`' own long-standing
+    choice, kept: order in the list carries no meaning that time order does not, so a client that
+    sends the boxes in the order they were drawn is not wrong, only unsorted.
+    """
+    ordered = sorted(sections, key=lambda section: section.start)
+    for first, second in itertools.pairwise(ordered):
+        if second.start < first.end - 1e-6:
+            raise HTTPException(
+                status_code=422,
+                detail=SECTIONS_OVERLAP_REFUSAL.format(
+                    first=first.label, end=first.end,
+                    second=second.label, start=second.start,
+                ),
+            )
+    return ordered
 
 
 class SectionListRequest(BaseModel):
@@ -6926,6 +7029,23 @@ def create_app(
         # server-owned field above has been re-adopted, so the map is built from the assets and
         # anchors that are actually being saved rather than from whatever the body claimed.
         refresh_reference_maps(project)
+        # The section layer held to `PUT /sections`' own standard, and this is the **ninth**
+        # recorded time this route has been the hole for a field a narrower sibling guards. It is
+        # a different shape from the `_adopt_*` helpers above — sections are the Director's own
+        # hand-dragged structure and this is where the browser saves them, so the stored value
+        # cannot simply be taken back — but the failure is the same: a body this route accepts
+        # unread is a body every later reader has to survive. Unsorted sections used to make
+        # `timeline.layout_spans` emit *duplicate* spans, tiling the song twice, which raised
+        # `SNAP_NESTED` out of populate as an unhandled 500 after a ~110 s model call.
+        #
+        # **Gated on *changing* the layer**, which is the Song guard's shape above and its
+        # argument: this is the normal save path for every edit in the interface, so refusing an
+        # ordinary save over a layer that was already on disk would make a project written before
+        # this rule existed unsaveable — and unfixable, because the narrow route refuses the same
+        # body. A save that round-trips the stored sections passes untouched; one that introduces
+        # or edits an overlap is held to the rule that every reader of the field depends on.
+        if project.sections != current.sections:
+            project.sections = legal_sections(project.sections)
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -7064,6 +7184,15 @@ def create_app(
             lyrics=song_lyrics,
             caption=song_caption,
         )
+        # **An open Director question, recorded here rather than answered (2026-08-23): should
+        # this repair or warn about sections that outlive the song it replaces?** Nothing here
+        # touches `project.sections`, so a layer marked out to 180 s survives a 150 s master.
+        # The unrenderable half of that is closed — `timeline.layout_spans` clamps every span to
+        # the song, so populate can no longer tile a window into seconds `workflows.
+        # song_audio_window` refuses at submit — but the *boxes* still read 180 s in the
+        # interface. Truncating them, dropping the ones wholly past the end, or warning and
+        # leaving the Director's structure alone are three different editorial answers and this
+        # route may not pick one on its own.
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/song/context", response_model=Project)
@@ -10326,17 +10455,9 @@ def create_app(
         unknown rather than inventing coverage.
         """
         project = get_project(project_id)
-        ordered = sorted(request.sections, key=lambda section: section.start)
-        for first, second in itertools.pairwise(ordered):
-            if second.start < first.end - 1e-6:
-                raise HTTPException(
-                    status_code=422,
-                    detail=SECTIONS_OVERLAP_REFUSAL.format(
-                        first=first.label, end=first.end,
-                        second=second.label, start=second.start,
-                    ),
-                )
-        project.sections = ordered
+        # `legal_sections` since 2026-08-23 — this route's own rule, extracted so the generic
+        # `PUT /api/projects/{id}` cannot go on writing the same field to a different standard.
+        project.sections = legal_sections(request.sections)
         return store.save(project)
 
     @app.post(
@@ -11007,7 +11128,18 @@ def create_app(
         # be about — `lay_out_protections` has already refused if there were. The standalone
         # `line-up` route is where a Director lining up a plan they have been editing reads a
         # report first and confirms it.
-        alignment = line_up_shots(layout, tolerance=request.snap_tolerance)
+        #
+        # **Translated rather than allowed to fall through, which is the half this route was
+        # missing until 2026-08-23.** Both standalone siblings wrap their `line_up_shots` call
+        # and answer 422 in the core's own sentence; this one did not, so a plan geometry the
+        # snapper has no seam for — `SNAP_HOLE`, `SNAP_NESTED` — came back as an opaque 500
+        # *after* the Director had spent a ~110 s model call. There is nothing for a client to
+        # read in a 500 and nothing for the Director to do about it. The refusals name the
+        # shape and say what to fix, so they are what goes on the wire here too.
+        try:
+            alignment = line_up_shots(layout, tolerance=request.snap_tolerance)
+        except TimelineError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         # Fill it in — prompts, citations, singing, seeds.
         shots = fill_in_shots(alignment)
         # The re-read project lay-out returned, carrying the section layer it assigned. One

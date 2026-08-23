@@ -70,9 +70,29 @@ class HistoryResult:
 #: The ``status.messages`` events that end a prompt's execution. `execution_interrupted` is one
 #: of them: a cancel is a real end, and how long a render ran before it was cancelled is a
 #: measurement worth keeping — see `RenderJob.render_seconds` on what it does and does not mean.
+#:
+#: **Reachable only through an interrupt this application did not issue.** Its own cancel route
+#: stamps the record's span and makes the job terminal before anything reads `/history`, and
+#: `stamp_job_settled` is idempotent, so the `comfy` value arrives too late to be adopted. What
+#: reaches this branch is somebody pressing Cancel in ComfyUI's own interface, or another client
+#: calling `/interrupt` — which is exactly the case this application cannot otherwise measure,
+#: and the reason the event stays in the set rather than being dropped as dead.
 _EXECUTION_END_EVENTS = frozenset(
     {"execution_success", "execution_error", "execution_interrupted"}
 )
+
+#: The smallest number that can be a millisecond stamp of a real moment: 2001-09-09, the day the
+#: Unix epoch in milliseconds passed ten to the twelve. It does not pass ten to the thirteen
+#: until 2286.
+#:
+#: The shape this rejects: a build, or a custom node, stamping `status.messages` in **seconds**
+#: instead of milliseconds. Every other malformed shape in this function degrades to `None`, but
+#: that one would divide by a thousand and record a 32 s render as `0.032 s` — sourced `comfy`,
+#: shown without a `≤`, and confidently wrong, which is worse than no measurement at all and is
+#: the precise failure mode this whole module was written to retire. No such build is in hand;
+#: the floor is one comparison and it turns a silent lie into the same `None` everything else
+#: malformed already answers.
+_MILLISECOND_STAMP_FLOOR = 1_000_000_000_000
 
 
 def execution_span_ms(status_data: Any) -> tuple[int | None, int | None]:
@@ -101,9 +121,10 @@ def execution_span_ms(status_data: Any) -> tuple[int | None, int | None]:
 
     Deliberately forgiving, on `progress_from_message`'s rule: this reads a foreign wire format
     from a component the Director upgrades independently, so a missing key, a message that is
-    not a two-element pair, a non-integer timestamp or a shape from some future build answers
-    `None` rather than raising. A timing is an enhancement; nothing about a render may fail
-    because ComfyUI phrased its history differently.
+    not a two-element pair, a non-integer timestamp, a timestamp too small to be milliseconds
+    (`_MILLISECOND_STAMP_FLOOR`) or a shape from some future build answers `None` rather than
+    raising. A timing is an enhancement; nothing about a render may fail because ComfyUI phrased
+    its history differently — and nothing may quietly record the wrong unit as a measurement.
     """
     if not isinstance(status_data, dict):
         return (None, None)
@@ -121,6 +142,10 @@ def execution_span_ms(status_data: Any) -> tuple[int | None, int | None]:
         stamp = data.get("timestamp")
         # `bool` is an `int` in Python and `True` is not a timestamp.
         if not isinstance(stamp, int) or isinstance(stamp, bool):
+            continue
+        # And a number too small to be a millisecond stamp is a build using some other unit,
+        # not a moment in 1970. See `_MILLISECOND_STAMP_FLOOR`.
+        if stamp < _MILLISECOND_STAMP_FLOOR:
             continue
         if event == "execution_start":
             started = stamp

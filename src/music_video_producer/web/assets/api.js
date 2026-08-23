@@ -4384,10 +4384,20 @@ const RENDER_SETTLED_SHOT_STATUSES = ["complete", "error"];
 // editor-wiping defect this application keeps having to fix. So only render-facing fields move,
 // each under its own guard:
 //
-// * jobs are merged by id -- a known job takes the report's status/outputs/error unless it is
-//   already terminal locally (a settled job never regresses under a stale snapshot), an unknown
-//   one is appended, and a local job the report has never heard of is KEPT: it was submitted
-//   after the snapshot was taken, and dropping it would stop the very polling that will see it.
+// * jobs are merged by id -- a known job takes the report's status/outputs/error *and its
+//   recorded timing* unless it is already terminal locally (a settled job never regresses under a
+//   stale snapshot), an unknown one is appended, and a local job the report has never heard of is
+//   KEPT: it was submitted after the snapshot was taken, and dropping it would stop the very
+//   polling that will see it.
+//
+//   The timing is merged here for the same reason it is recorded at all. `RenderStatusReport.jobs`
+//   is a list of whole `RenderJob`s, so the measurement is on the wire on the very tick the render
+//   settles -- and copying only status/outputs/error left the queue panel's "Took" column empty
+//   for every render a Director actually watches finish, with a tooltip saying no timing was ever
+//   taken for it, about a job measured 200 ms earlier. Nothing repaired it either: polling stands
+//   itself down when the last job settles and never calls `loadProject`, so the blank stood until
+//   the next project switch. That is the one surface this whole workstream feeds, blank at the
+//   only moment anyone is looking at it.
 // * shots move only along the render path -- see the status lists above.
 // * an asset adopts a landed file and never un-lands one: `path` is patched only when the report
 //   has one and it differs, because `"" over file` is what a stale snapshot says about an upload
@@ -4411,12 +4421,21 @@ export function applyRenderStatus(project, report) {
     }
     if (TERMINAL_JOB_STATUSES.includes(known.status)) continue;
     const same = known.status === job.status && known.error === job.error
+      && known.render_seconds === job.render_seconds
+      && known.render_seconds_source === job.render_seconds_source
+      && known.render_frames === job.render_frames
       && JSON.stringify(known.output_files || []) === JSON.stringify(job.output_files || []);
     if (same) continue;
     if (RENDER_SETTLED_SHOT_STATUSES.includes(job.status)) changes.settled.push(job);
     known.status = job.status;
     known.output_files = job.output_files || [];
     known.error = job.error || "";
+    // The measurement, adopted with the settle that produced it. `|| default` rather than a
+    // straight copy so a report from a server older than the instrumentation cannot write
+    // `undefined` into a cell that formats numbers.
+    known.render_seconds = job.render_seconds || 0;
+    known.render_seconds_source = job.render_seconds_source || "";
+    known.render_frames = job.render_frames || 0;
     changes.jobs = true;
   }
   for (const entry of report.shots || []) {

@@ -2812,14 +2812,31 @@ export function formatDuration(seconds) {
 // timings at all, and the one figure it acted on -- a 221-frame window at "2.2 hours" -- was a code
 // comment citing itself, wrong by roughly 3.4x. A duration shown without saying whether queue wait
 // is inside it is the same mistake with better provenance.
+//
+// The source is read before the status, and the order is load-bearing: a render that OOMs still
+// carries ComfyUI's execution clock, so calling that span "the time the record was open, not
+// render time" inverted the caveat. A failed render is also the most useful cost datum here.
+// A job with an empty `prompt_id` is local work -- an export -- which was never queued anywhere,
+// so once it has finished its record span is the whole job and the queue caveat would be invented
+// out of nothing. Unfinished, it is still a bound: a crash-orphaned export is settled at the next
+// boot, and that span runs to whenever somebody restarted the application.
 export function renderTimingSummary(job) {
   if (!job?.render_seconds_source) return "";
+  if (job.render_seconds_source === "unmeasured") {
+    return `${job.status}; the clock moved between this record being created and it settling, so no length was measured`;
+  }
   const length = formatDuration(job.render_seconds);
   const frames = job.render_frames ? `, ${job.render_frames} frames` : "";
+  if (job.render_seconds_source === "comfy") {
+    if (job.status === "complete") return `rendered in ${length}${frames}`;
+    return `${job.status} after ${length} of rendering${frames} (ComfyUI's own execution clock, so this is time on the GPU and not queue wait)`;
+  }
   if (job.status !== "complete") {
     return `${job.status} after ${length}${frames} (time the record was open, not render time)`;
   }
-  if (job.render_seconds_source === "comfy") return `rendered in ${length}${frames}`;
+  if (!job.prompt_id) {
+    return `${length} start to finish${frames}; local work that never went to ComfyUI, so this is the whole job rather than an upper bound`;
+  }
   const queued = job.batch_id ? " — this job was submitted in a batch" : "";
   return `${length} from queued to done${frames}; ComfyUI reported no execution clock for this prompt, so the wait in the queue is included${queued}`;
 }
@@ -2828,11 +2845,20 @@ export function renderTimingSummary(job) {
 // a `record`-sourced span runs from enqueue, so it is an upper bound on the render and never the
 // render itself, and a reader scanning the column has to be able to see that without hovering.
 // The full sentence rides the same cell's `title`.
+//
+// Two things it does not mark, both mirroring `batch.render_timing_summary`'s own branches.
+// A *finished* piece of local work -- an empty `prompt_id`, an export -- was never in a queue, so
+// its record span is the whole job and a `≤` would claim a wait that cannot have happened; an
+// unfinished one is still bounded, because a crash-orphaned export is settled at the next boot.
+// And a settle whose clock ran backwards has no length at all: `render_seconds` is 0.0 there, so
+// formatting it would draw `0s` over a render that certainly was not instant.
 export function renderTimingCell(job) {
-  if (!job?.render_seconds_source) return "—";
+  if (!job?.render_seconds_source || job.render_seconds_source === "unmeasured") return "—";
   const length = formatDuration(job.render_seconds);
   const frames = job.render_frames ? ` · ${job.render_frames}f` : "";
-  return `${job.render_seconds_source === "comfy" ? "" : "≤"}${length}${frames}`;
+  const exactLocal = job.status === "complete" && !job.prompt_id;
+  const bounded = job.render_seconds_source !== "comfy" && !exactLocal;
+  return `${bounded ? "≤" : ""}${length}${frames}`;
 }
 
 function renderJobs() {

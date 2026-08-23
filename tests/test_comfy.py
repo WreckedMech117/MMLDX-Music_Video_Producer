@@ -792,6 +792,44 @@ def test_a_fully_cached_prompt_reports_zero_seconds_and_not_nothing():
     assert result.elapsed_seconds == 0.0
 
 
+def test_a_build_stamping_seconds_records_nothing_rather_than_a_render_a_thousand_times_too_fast():
+    """The one malformed shape that did not degrade to `None`.
+
+    Every other thing this function does not recognise answers `(None, None)` and the job falls
+    back to its own record span, labelled as such. A build -- or a custom node -- stamping
+    `status.messages` in *seconds* instead of milliseconds passed every check, divided by a
+    thousand, and recorded a 32 s render as `0.032 s`: sourced `comfy`, drawn with no `≤`, and
+    confidently wrong, which is worse than no measurement at all and is the failure mode this
+    whole module exists to retire.
+
+    No such build is in hand; this is a floor against the shape, not a bug report about one.
+    """
+    ran = execution_span_ms(
+        {
+            "messages": [
+                ["execution_start", {"timestamp": 1_755_000_000}],
+                ["execution_success", {"timestamp": 1_755_000_032}],
+            ]
+        }
+    )
+
+    assert ran == (None, None)
+    assert HistoryResult(
+        prompt_id="p-1", status="complete", started_ms=ran[0], finished_ms=ran[1]
+    ).elapsed_seconds is None
+    # And the floor is nowhere near a real stamp: milliseconds passed it in 2001 and stay past
+    # it until 2286, so nothing ComfyUI can legitimately report is refused by it.
+    live = 1_755_000_000_000
+    assert execution_span_ms(
+        {
+            "messages": [
+                ["execution_start", {"timestamp": live}],
+                ["execution_success", {"timestamp": live + 32_431}],
+            ]
+        }
+    ) == (live, live + 32_431)
+
+
 def test_the_last_ending_wins_when_a_history_carries_more_than_one():
     """A prompt emits one ending. Reading the last of whatever is there cannot be wrong where
     reading the first can."""

@@ -16,6 +16,7 @@ from music_video_producer.batch import (
     JOB_SUPERSEDED,
     JOB_TIMING_FROM_COMFY,
     JOB_TIMING_FROM_RECORD,
+    JOB_TIMING_UNMEASURED,
     MISSING_TICKS_LIMIT,
     NEAR_DUPLICATE_OVERLAP,
     NOTE_KIND_PROMPT,
@@ -1659,15 +1660,37 @@ def test_a_settle_is_idempotent_so_a_second_look_cannot_overwrite_the_real_measu
 
 
 def test_a_clock_that_ran_backwards_still_settles_the_job_but_claims_no_length():
-    job = RenderJob(kind="h3", target_id="shot_a")
+    """No length, but the settle is still *recorded* as one.
+
+    Leaving the source empty here was a half-stamped record: the field's empty value already
+    means "settled before this application measured anything, and nothing was ever invented for
+    it", which the queue panel says out loud -- about a job that settled just now. And because
+    the idempotence guard keys on the source rather than on the stamp, the record stayed
+    re-stampable forever, so any later settle path moved `updated_at` again.
+    """
+    job = RenderJob(kind="h3", target_id="shot_a", status="cancelled", prompt_id="pr1")
     job.created_at = job.created_at + timedelta(hours=1)
 
     assert stamp_job_settled(job) is True
 
     assert job.updated_at != job.created_at
     assert job.render_seconds == 0.0
-    assert job.render_seconds_source == ""
-    assert render_timing_summary(job) == ""
+    assert job.render_seconds_source == JOB_TIMING_UNMEASURED
+    # Distinguishable from a job that predates the instrumentation, which is the whole point.
+    assert render_timing_summary(RenderJob(kind="h3", target_id="shot_b")) == ""
+    line = render_timing_summary(job)
+    assert line == (
+        "cancelled; the clock moved between this record being created and it settling, "
+        "so no length was measured"
+    )
+    # And no number is invented on the way out: `0s` would be a claim about a render.
+    assert "0s" not in line
+
+    # Idempotent now, which it was not: the second call left the record alone entirely.
+    stamped = job.updated_at - timedelta(days=3)
+    job.updated_at = stamped
+    assert stamp_job_settled(job) is False
+    assert job.updated_at == stamped
 
 
 def test_a_negative_or_non_finite_measurement_is_refused_in_favour_of_the_records_own_span():
@@ -1682,12 +1705,15 @@ def test_a_negative_or_non_finite_measurement_is_refused_in_favour_of_the_record
 def test_the_surfaced_line_is_a_render_time_for_a_solo_job_and_carries_the_caveat_otherwise():
     """The caveat travels with the number, because a number read without it is how a 221-frame
     render came to be recorded as taking 2.2 hours."""
-    solo = RenderJob(kind="h3", target_id="shot_a", status="complete", render_frames=141)
+    solo = RenderJob(
+        kind="h3", target_id="shot_a", status="complete", prompt_id="pr1", render_frames=141
+    )
     stamp_job_settled(solo, elapsed_seconds=378.0)
     assert render_timing_summary(solo) == "rendered in 6m18s, 141 frames"
 
     queued = RenderJob(
-        kind="h3", target_id="shot_b", status="complete", batch_id="batch_1", render_frames=226
+        kind="h3", target_id="shot_b", status="complete", prompt_id="pr2",
+        batch_id="batch_1", render_frames=226,
     )
     queued.created_at = queued.created_at - timedelta(seconds=1812)
     stamp_job_settled(queued)
@@ -1698,7 +1724,7 @@ def test_the_surfaced_line_is_a_render_time_for_a_solo_job_and_carries_the_cavea
 
     # Measured off the record but *not* part of a batch: the queue wait is still inside the
     # number and still said so, without claiming a batch that did not happen.
-    alone = RenderJob(kind="h3", target_id="shot_c", status="complete")
+    alone = RenderJob(kind="h3", target_id="shot_c", status="complete", prompt_id="pr3")
     alone.created_at = alone.created_at - timedelta(seconds=95)
     stamp_job_settled(alone)
     assert "submitted in a batch" not in render_timing_summary(alone)
@@ -1708,7 +1734,9 @@ def test_the_surfaced_line_is_a_render_time_for_a_solo_job_and_carries_the_cavea
 def test_a_job_that_did_not_complete_is_never_described_as_having_rendered():
     """A cancellation that stood open for forty minutes rendered for some unknown part of that.
     "rendered in 40m" would be a fabrication."""
-    job = RenderJob(kind="h3", target_id="shot_a", status="cancelled", render_frames=141)
+    job = RenderJob(
+        kind="h3", target_id="shot_a", status="cancelled", prompt_id="pr1", render_frames=141
+    )
     job.created_at = job.created_at - timedelta(seconds=2400)
     stamp_job_settled(job)
 
@@ -1718,6 +1746,70 @@ def test_a_job_that_did_not_complete_is_never_described_as_having_rendered():
         "cancelled after 40m00s, 141 frames (time the record was open, not render time)"
     )
     assert "rendered" not in line
+
+
+def test_a_failure_comfyui_itself_timed_is_reported_as_render_time_and_not_as_a_record_span():
+    """The inversion this branch order corrects.
+
+    The status was consulted before the source, so a job that ComfyUI's *own execution clock*
+    measured -- `execution_start` to `execution_error`, which is time on the GPU and nothing else
+    -- was described as "the time the record was open, not render time". The exact opposite of
+    what the number is, and on the one row a Director most needs to read: a 141-frame render that
+    OOMs after three minutes is the cheapest cost datum this instrumentation can capture, and it
+    was the one it mislabelled. The queue cell drew it with no `≤` all along, so the sentence
+    also contradicted the column header it sat under.
+    """
+    died = RenderJob(
+        kind="h3", target_id="shot_a", status="error", prompt_id="pr1", render_frames=141
+    )
+    # Enqueued three hours before it ran: none of that wait is in ComfyUI's measurement, which
+    # is exactly why this job must not be described as a record span.
+    died.created_at = died.created_at - timedelta(hours=3)
+    stamp_job_settled(died, elapsed_seconds=192.0)
+
+    line = render_timing_summary(died)
+
+    assert died.render_seconds_source == JOB_TIMING_FROM_COMFY
+    assert line == (
+        "error after 3m12s of rendering, 141 frames (ComfyUI's own execution clock, so this is "
+        "time on the GPU and not queue wait)"
+    )
+    assert "not render time" not in line
+    # And the same job measured off the record keeps the old, correct sentence: there the span
+    # really is only how long the record stood open.
+    unmeasured = RenderJob(
+        kind="h3", target_id="shot_a", status="error", prompt_id="pr1", render_frames=141
+    )
+    unmeasured.created_at = unmeasured.created_at - timedelta(hours=3)
+    stamp_job_settled(unmeasured)
+    assert "not render time" in render_timing_summary(unmeasured)
+
+
+def test_a_finished_export_is_not_given_a_caveat_about_a_queue_it_was_never_in():
+    """An assembly has an empty `prompt_id` by design -- it is local work and never goes near
+    ComfyUI -- so "ComfyUI reported no execution clock for this prompt, so the wait in the queue
+    is included" was a caveat invented out of nothing, about a component the job never touched,
+    and it turned an exact export time into an apparent upper bound."""
+    export = RenderJob(kind="post", target_id="assembly", prompt_id="", status="complete")
+    export.created_at = export.created_at - timedelta(seconds=378)
+    stamp_job_settled(export)
+
+    line = render_timing_summary(export)
+
+    assert export.render_seconds_source == JOB_TIMING_FROM_RECORD
+    assert line == (
+        "6m18s start to finish; local work that never went to ComfyUI, so this is the whole job "
+        "rather than an upper bound"
+    )
+    assert "ComfyUI reported no execution clock" not in line
+
+    # But only once it has finished. An export orphaned by a crash is settled at the next boot,
+    # so its span runs to whenever somebody restarted the application -- a machine switched off
+    # overnight, not a very slow export -- and that one is still reported as a record span.
+    orphan = RenderJob(kind="post", target_id="assembly", prompt_id="", status="error")
+    orphan.created_at = orphan.created_at - timedelta(hours=9)
+    stamp_job_settled(orphan)
+    assert "not render time" in render_timing_summary(orphan)
 
 
 def test_a_job_with_no_recorded_timing_surfaces_nothing_rather_than_a_guess():

@@ -1172,6 +1172,16 @@ def test_a_finished_export_records_how_long_it_took_and_a_progress_tick_does_not
     assert settled.render_seconds > 0
     assert settled.render_seconds_source == "record"
     assert settled.updated_at > settled.created_at
+    # The *sentence*, read rather than assumed. This assertion did not exist, and in its absence
+    # a completed export was described as "ComfyUI reported no execution clock for this prompt,
+    # so the wait in the queue is included" -- about a job that never went near ComfyUI and was
+    # never in any queue, which made an exact number look like an upper bound. See the comment
+    # at the `complete` patch in the assemble route, which argues precisely the opposite.
+    line = render_timing_summary(settled)
+    assert "start to finish" in line
+    assert "local work that never went to ComfyUI" in line
+    assert "ComfyUI reported no execution clock" not in line
+    assert "queue" not in line.replace("never went to ComfyUI", "")
     # Every write before the settlement carried the *same* `updated_at`: a hundred progress
     # ticks moved the percentage and nothing else, which is what keeps the duration a duration.
     during = {stamp for percent, stamp in stamps if percent < 100}

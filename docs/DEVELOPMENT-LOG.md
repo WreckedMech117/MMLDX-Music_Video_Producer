@@ -4,6 +4,386 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-23 — The render-timing instrument, corrected: a blank Took column, three inverted captions, and a guard that protected fields but not records
+
+Source: the adversarial review of the render-timing instrumentation that landed 2026-08-21. **No
+render, no ComfyUI submission, no model call** — the GPU was busy with a comparison render
+throughout, and `data/projects/project_59f14d19ff10` was opened once, read, and never written; the
+only thing taken from it is the table at the end. Every defect below was **reproduced by execution
+before it was touched**, and every reproduction is now a test.
+
+### 1. The column the whole workstream exists to feed was blank at the only moment anyone looks at it
+
+`applyRenderStatus` — the two-second patch that deliberately does *not* reload the project, so the
+Director's typing survives — merged `status`, `output_files` and `error` onto a held job and nothing
+else. `RenderStatusReport.jobs` is a list of whole `RenderJob`s, so `render_seconds`,
+`render_seconds_source` and `render_frames` were on the wire on the very tick the render settled;
+they were simply not copied. Executed under node: `378 → 0`, `"comfy" → ""`. The cell then drew `—`
+under the title *"This job has no recorded timing … a job settled before that carries none, and
+none was ever invented for it"* — about a job ComfyUI had measured 200 ms earlier. Nothing repaired
+it, either: polling stands itself down when the last job settles and never calls `loadProject`, so
+the blank stood until the next project switch. **Every render a Director actually watches finish is
+this case**; only ones they walked away from and came back to showed a number.
+
+The three fields are merged now, and they also joined the "did this answer teach us anything" test
+beside `status`/`error`/`output_files` — a merge that compares fewer fields than it writes is the
+same defect one level up. Pinned by *executing* the merge under node and reading the cell and the
+sentence off the patched job, rather than by asserting which names appear in the source: the defect
+**was** a field list, and a test written from the same three names would have passed.
+
+### 2, 3. Three captions that described the number as the opposite of what it was
+
+`render_timing_summary` consulted `status` before `render_seconds_source`, so:
+
+* A render ComfyUI itself timed and that then **failed** — `execution_start` to `execution_error`,
+  which is time on the GPU and nothing else — was captioned *"(time the record was open, not render
+  time)"*. Exactly inverted, and on the most useful row the instrument can produce: a 141-frame
+  window that OOMs after 3m12s is precisely what you want to know before asking for it again. The
+  queue cell drew that same job with **no `≤`**, correctly, so the sentence also contradicted the
+  column header above it. The source is read first now.
+* A finished **export** — local work, an empty `prompt_id` by design, never within reach of ComfyUI
+  — read *"ComfyUI reported no execution clock for this prompt, so the wait in the queue is
+  included"* and drew `≤6m18s`. A caveat invented out of nothing about a component the job never
+  touched, and it turned an exact number into an apparent upper bound. The assemble route's own
+  comment argues the opposite in as many words. Local work that has run to `complete` now says so,
+  and loses the `≤`.
+* **But only when complete**, which the review's framing did not distinguish and the existing
+  suite did: an export orphaned by a crash is settled by `heal_orphaned_local_jobs` at the *next
+  boot*, so its span runs to whenever somebody restarted the application — a machine switched off
+  overnight, not a slow export. That one is still reported as a record span, which is what it is.
+
+The fixture gap behind both: every non-`complete` row in the shared timing table was
+`record`-sourced, so the first branch was never executed, and every row carried the empty
+`prompt_id` that *means* local work without any row actually being local work. The table now
+carries a `kind`, a `prompt_id` and a `status` a real record would have, plus rows for the
+ComfyUI-timed failure, the finished export, the crashed export and the unmeasured settle.
+
+### 4. `_adopt_job_measurements` protected fields and left whole records open
+
+The guard iterated `project.jobs` — the **body**. Two holes followed, both executed against the
+real route with a stubbed ComfyUI before either was touched:
+
+* A job the body **omits** was invisible to it, and `Project.jobs` is defaulted. A
+  `PUT /api/projects/{id}` carrying nothing but `id`, `name` and `updated_at` answered **200 and
+  erased every job record in the project** — the exact loss this instrumentation exists to prevent,
+  through the exact route that has caused it seven times before, reachable by a body three keys
+  long. No route in this application removes a job record; they are appended by the submission
+  paths and settled in place. The stored list is the authority now, in the store's own order, which
+  is submission order, which is what the queue panel draws as chronology. A body may only add.
+* A job the store does **not** hold kept its **client-supplied** timing. So
+  `{"id": "job_forged", "render_seconds": 7920.0, "render_seconds_source": "comfy",
+  "render_frames": 221}` persisted verbatim and the panel drew `2h12m · 221f`, with no `≤`, as a
+  recorded measurement — **the fabricated "221 frames = 2.2 hours" figure this instrumentation
+  spent four sites retiring, re-injectable through the generic write**. The precedents
+  (`stored_anchors.get(id, "")`, `stored_slots.get(id, 0)`) force the default, and so does this
+  now; `updated_at` is set equal to `created_at`, which is this record's documented way of saying
+  "never settled" and the honest thing to say about a job nothing here measured.
+
+### 5. A clock adjustment left a job half-stamped
+
+A negative record span wrote `updated_at`, returned `True` and left `render_seconds_source` empty —
+so the panel told the Director a job settled *today* had "settled before 2026-08-21", and because
+the idempotence guard keys on the source rather than the stamp, every later call moved `updated_at`
+again. Both executed. There is a third source value now, `JOB_TIMING_UNMEASURED`: the settle is
+recorded as a settle, no length is claimed, the cell draws `—` rather than `0s`, and the second
+call leaves the record entirely alone.
+
+### 6. A build stamping seconds would have recorded a confidently wrong number
+
+`execution_span_ms` accepted any two ints, so a build or custom node stamping `status.messages` in
+**seconds** would divide by a thousand and record a 32 s render as `0.032 s` — sourced `comfy`,
+drawn with no `≤`, where every other malformed shape correctly degrades to `None`. No such build is
+in hand and this is a hypothesis, but the branch is one comparison and the argument for it is the
+module's own: a timing is an enhancement, and the one thing worse than no measurement is a
+confident wrong one. `_MILLISECOND_STAMP_FLOOR` is `1e12` — milliseconds passed it in 2001 and stay
+past it until 2286 — so nothing ComfyUI can legitimately report is refused by it.
+
+### 7. Four notes that did not match the code
+
+`RenderJob.render_frames` named `POST …/shots/{id}/render` as its one writer; the route is
+`…/generate/h3`. `execution_interrupted`'s rationale is unreachable through this application's own
+cancel route — that route stamps the record span and makes the job terminal before any `/history`
+read, so the idempotent stamp refuses the `comfy` value — and only an **external** interrupt reaches
+it, which is now what the comment says and also the argument for keeping the event. The idempotence
+docstring's second justification was untrue of the code (`reconcile_project_jobs`'s change test
+reads `status`/`output_files`/`error`, and never reaches a settled job); it is gone and the first
+stands alone.
+
+And the drift test that guarded `JOB_MEASURED_FIELDS` derived "measured" as
+`name.startswith("render_") or name == "updated_at"` — which a future `gpu_seconds` or
+`timing_source` satisfies while being wide open, the same name-shaped hole one level up from the
+one it was written to close. It is structural now: it parses `batch.stamp_job_settled` and asserts
+that every attribute the settle path assigns onto a job is covered by the guard. `render_frames` is
+the one measured field no settle path writes — the submission route records it at the single moment
+the graph's length is true — so it is called out explicitly, and a second test *executes* the guard
+over every field the tuple names, forging each one in a whole-project body and reading it back
+unmoved. The tuple is a set of enforced refusals now rather than a set of names a test recites.
+
+### The instrument's own readings disagree by 13.7×, and the surface says nothing about it
+
+Read-only from the live manifest, every instrumented job it held at the time of reading. The review
+that prompted this work cited two of them; there are six, and the four it did not cite make the
+picture worse rather than better:
+
+| job | frames | comfy span | record span |
+|---|---|---|---|
+| `job_5813fc1ccc14` | 141 | 214.060 s | 216.1 s |
+| `job_3a177562476c` | 141 | 240.321 s | 242.8 s |
+| `job_fbd3a5376c2c` | 141 | 707.478 s | 710.5 s |
+| `job_65d6bf903e55` | 141 | 2929.499 s | 2931.1 s |
+| `job_361741db4625` | 158 | 236.597 s | 241.2 s |
+| `job_bd9f832450cb` | 158 | 479.129 s | 481.9 s |
+
+Four 141-frame renders on the same machine spanning **13.7×**, and two 158-frame renders **2.0×**
+apart. A 158-frame render is the *cheapest* row in the table and also the third most expensive. So
+the frame count — the one thing recorded beside the duration precisely so a duration would be
+interpretable — does not predict cost within an order of magnitude, and every row above draws as a
+bare "rendered in" figure: honest about provenance, silent about the only thing that explains the
+spread. We independently know `job_65d6bf903e55` ran under VRAM starvation.
+
+**No contention heuristic was invented**, deliberately. The surface would then be guessing, and a
+wrong guess about why a render was slow is the same class of error as the "2.2 hours" figure this
+whole workstream exists to retire. The question is left for the Director and recorded here: *should
+a render whose median power draw or VRAM headroom says it was starved carry a marker beside its
+figure — and is that sampled during the render or read back from something afterwards?* Until it is
+answered, `214s` and `2929s` sit in the same column, at the same frame count, looking like two
+comparable renders. (The manifest is being written by a running instance, so this is a snapshot;
+the numbers here were read once and nothing was written back.)
+
+### Verification
+
+Every gate green: `uv run pytest` (**1824 passing**, 0 failed, 0 errors), `uv run ruff check .`, and
+`node --check` on both `app.js` and `api.js`.
+
+**Mutation-checked, 21 mutants over every new branch, all 21 killed.** Run in its own `git
+worktree` with `PYTHONPATH` at that tree's `src`, byte-level `read_bytes`/`write_bytes` restores,
+line-ending-converted anchors with the match count asserted as exactly 1 before each mutant was
+applied, and `__pycache__` purged either side. The mutants: the unmeasured source written as
+`record` and as `""`; the unmeasured branch keyed on the wrong constant; the `complete` test inside
+the ComfyUI branch inverted; the ComfyUI failure caption swapped back for the record caption; the
+local-work test inverted; the local-work branch moved back above the status test; the millisecond
+floor lowered to zero; the record-keeping guard's three arms (drop an omitted job, keep the body's
+values for an unknown one, stamp `now()` on it); each of the three merged timing fields zeroed on
+the wire; each of the three terms deleted from the merge's change test; and four ways of getting
+the queue cell's `≤` wrong.
+
+Two of the first round's mutants were the harness's fault rather than the suite's and are recorded
+because they changed what got written. One was a no-op — it inserted `if X and False: pass` and
+therefore could not be killed by anything; it was rewritten as the real branch-order swap and died
+in 2 s. The other three deleted one term each from the merge's change test and survived, because
+the test written for them moved all three timing fields at once and any surviving term caught it.
+That is a real gap in the test, not in the harness: the test now moves **one field at a time**, and
+each term is individually load-bearing.
+
+## 2026-08-23 — The section layer stops leaving holes in the song, and snapping stops producing the geometry it refuses
+
+Seven findings from an adversarial review of the day's work. **No render, no ComfyUI submission,
+no model call** — every number here is arithmetic over fixtures. Each finding was reproduced before
+it was touched, and every reproduction is now a test.
+
+### One root cause under four of them: `layout_spans` did not cover the song
+
+`timeline.layout_spans` tiled one span per marked section plus every *unmarked* stretch longer than
+`SPAN_MIN_SECONDS` (0.5 s), and dropped anything shorter. The note on the constant justified that
+with "leaving it uncovered leaves a hole assembly already tolerates". **That was false by more than
+an order of magnitude.** Assembly tolerates `BOUNDARY_TOLERANCE_SECONDS` — half a frame, 1/48 s —
+and `timeline._seam_overlaps` refuses at exactly the same figure, so every stretch in
+`(0.0208 s, 0.5 s]` was a hole *both* of them reject.
+
+Four reachable shapes, each reproduced through the populate route:
+
+* **A sub-floor gap between two sections** (`Verse 0.0–20.0` / `Chorus 20.3–40.0`). `PUT /sections`
+  accepts it — it refuses overlaps only, and its own docstring says gaps are legal — and dragging a
+  section edge produces it. Lay-out emitted a 0.3 s hole and `snap_window_plan` raised `SNAP_HOLE`.
+* **A head or tail stub** — a first section starting at 0.4 s, a last ending 0.4 s early. Worse than
+  a refusal: the tiling stayed *contiguous within itself*, so line-up passed, populate reported
+  success, and the export refused days later with "The song is uncovered from 0.000s to 0.400s".
+  `repair_sections` dropping a truncated sub-1 s section reaches the same state.
+* **Sections outliving a replaced song.** Mark to 180 s, import a 150 s master: populate laid a
+  window at `(173.25, 6.75)`. `fill_in_shots` sets `use_song_audio=True` unconditionally and
+  `workflows.song_audio_window` refuses such a window *at submit*, so those shots could never
+  render — and no proposal starts past 150 s, so they carried empty prompts too.
+* **An unsorted section layer**, which made the walk emit a **duplicate** span: the song tiled
+  twice, `SNAP_NESTED` raised.
+
+**The fix, and the decision inside it.** The floor stays — it decides whether a stretch is worth a
+span of its own, and it is a real concern, because `populate_windows` answers a whole span under
+its own minimum with a single window, so a 0.3 s span is a 0.3 s shot. What goes is the *dropping*.
+A sub-floor stretch is now **absorbed into a neighbouring span**: forward into the section that
+follows it, which is the tie-break `section_edges` and `song_section` already make (a boundary
+belongs to the section that opens there), and backward into the last span for a trailing stub,
+which has no section after it. Every span is clamped to `[0, song_duration]`. And the walk is
+monotonic whatever it is handed — a section starting behind the cursor is truncated to it, one
+ending behind it contributes nothing — so the function no longer *depends* on sorted disjoint
+input. The invariant is now stated and asserted: **the spans tile `[0, song_duration]` exactly, in
+order, with no hole of any size.**
+
+Reversed along the way: `test_layout_spans_cuts_the_song_exactly_where_the_section_layer_does`
+pinned a 0.4 s uncovered tail *as intended*. That intent does not survive — covering the song is
+not optional, and absorbing the stub achieves both halves of what the floor was for.
+
+### And the chain must refuse rather than 500
+
+Populate's `line_up_shots` call had no `except TimelineError` where both standalone siblings
+(`lay-out` and `line-up`) do. So a geometry the snapper has no seam for came back as an opaque 500
+*after* a ~110 s model call, with nothing in it for the Director to act on. It now answers 422
+carrying the core's own sentence. Closing the `layout_spans` hole is what stops the reachable
+shapes producing one; the translation is what gives the next unforeseen shape an answer.
+
+### Snapping could produce the geometry it refuses as input
+
+`snap_window_plan`'s band check bounds each neighbour's **length** and says nothing about **order**.
+A transition longer than the band's 4 s minimum breaks the coupling between the two. Measured at
+`tolerance=0.75`, sung throughout except a rest at 105.95–106.60:
+
+```
+SHOT 01  100.000 → 105.400
+SHOT 02  105.400 → 111.990     the 02/03 seam is a 6.390 s transition
+SHOT 03  105.600 → 112.100
+```
+
+The 01/02 cut settled at 106.100 — a legal cut with both neighbours far inside the band — and left
+SHOT 02 starting *after* SHOT 03. `snap_timeline_cuts` applies the plan by shot id without
+re-validating, so it lands in the manifest; every later read re-sorts by start
+(`shot_snap_windows`), which makes SHOT 02 a clip laid wholly inside SHOT 03, and from then on
+**every** Snap Cuts, Line Up and Populate on that project 422s with `SNAP_NESTED` until the two are
+untangled by hand. `DIRECTOR_PLAN`'s only overlap past 4 s sits at its last seam, where
+`SNAP_OFF_THE_PLAN` fires first, which is why no fixture had ever reached it.
+
+Four inequalities now say the settled plan is one `_seam_overlaps` would accept — starts stay in
+song order, and neither window becomes a clip laid wholly over another — refused per cut with
+`SNAP_OUT_OF_ORDER` rather than clamped, on `SNAP_HOLE`'s rule that `_gap_snap_target` is the one
+thing here that decides where a cut goes. At the two outer seams they degenerate to `R-7`'s existing
+check; on a plan of hard cuts they can never fire, because the band already demands 4 s either side.
+The suite gained the assertion it lacked: for an **overlapping** fixture the settled plan is still
+ordered, non-nested, and re-enters the snapper without raising.
+
+**It costs nothing at the tolerances anyone uses, measured on the Director's own 33-shot plan** —
+18 overlapping seams, the longest 5.492 s, its one 22 ms hole closed so the order question can be
+asked at all. At `SNAP_TOLERANCE_DEFAULT` (0.75) and at 1.5 s the new check refuses **0** cuts and
+the same 5 and 6 moves land as before. At `SNAP_TOLERANCE_MAX` (3.0) it refuses **3**, and each of
+those three is the defect itself: a move that would have left SHOT 05, SHOT 14 or SHOT 22 out of
+song order and poisoned the project against every later pass.
+
+### The section-boundary protection was keyed on the midpoint, so asymmetric transitions escaped it
+
+`SNAP_SECTION_BOUNDARY` matched `section_edges` against the transition's **midpoint**. A transition
+is a *span*: drag one of its two edges across a boundary and the midpoint slides off it, and the
+protection silently vanished — for exactly the overlapping seams the midpoint rule had just made
+snappable. Measured on `Verse 0–30` / `Chorus 30–60` with a rest at 30.10–30.80:
+
+```
+symmetric   A 24.0→30.3, B 29.7→36.0   midpoint 30.000   skipped, correctly
+asymmetric  A 24.0→30.1, B 29.5→36.0   midpoint 29.800   moved
+```
+
+and the asymmetric one left the Verse shot running **0.550 s** into the Chorus where it had run
+0.100 s. That re-opens the "2 of 5 cuts crossed a boundary" defect of 2026-08-21 on any plan with
+transitions in it, and the Director's own timeline has 15. The test is now containment — a boundary
+anywhere between the transition's two edges protects the seam — and a hard cut is the zero-length
+case, so its test is `abs(at - boundary) <= SNAP_CONTIGUITY_TOLERANCE` character for character with
+what stood there. **What the midpoint means is unchanged**: it is still where the cut *is*, the
+position the report names and the position `_gap_snap_target` is asked about. That is a settled
+ruling and this does not touch it. Only "does this seam touch a boundary" stopped being a question
+about a single instant. The refusal now names the boundary's own second as well as the cut's,
+because on a transition they are two different numbers.
+
+### The generic project `PUT` gets the section rule the narrow route always had
+
+`PUT /sections` sorts by start and refuses overlaps. `PUT /api/projects/{id}` — the normal save path
+for every edit the browser makes, and this repository's recorded sibling-write hole **nine** times
+over — validated `sections` not at all. Both now go through one `app.legal_sections`. Unlike the
+`_adopt_*` helpers beside it this is **validation and not adoption**, and the difference is
+argued rather than assumed: sections are the Director's own hand-dragged structure and that route is
+where the browser saves them, so taking the stored value back would make the boxes undraggable. It
+is also **gated on *changing* the layer**, which is the Song guard's own shape a hundred lines
+above — a manifest written before this rule could hold an overlapping layer (this route was the only
+door wide enough to write one), and refusing every ordinary save over it would make that project
+unsaveable *and* unfixable, because the narrow route refuses the same body.
+`paired_proposals` also gained a `spent` set beside its `claimed` one — the guard on windows was
+written for exactly the overlapping-span hazard, and covering one of the two lists was covering half
+of it.
+
+### Two false headline claims in the pairing docstring, corrected rather than implemented
+
+`paired_proposals` claimed "the reuse lands in the middle of the section rather than doubling its
+first or last line" and "the surplus is sampled across the section's arc". Measured: `w=5,p=2` pairs
+`[0, 0, 1, 1, 1]` — first doubled, last tripled — and `w=2,p=5` pairs `[1, 3]`, discarding both the
+opener and the closer. The first holds only while `w < 2p`; the opener goes whenever `p ≥ 2w`. Both
+ratios are reachable, not hypothetical: `populate_windows` clamps a span's count to at least
+`ceil(span / POPULATE_MAX_WINDOW_SECONDS)` whatever the proposal count, so a 34 s section the model
+wrote two lines for gets five windows.
+
+**The claims were corrected, not the arithmetic**, and the argument is that re-spreading would mean
+a second spelling of `proposal_for_position` — deliberately shared between the per-section path and
+the whole-song one — for a purely cosmetic property, while moving which prose lands in which window
+on every populate this application has ever laid. The two properties the ruling actually rests on,
+"no proposal skipped" and "no proposal used twice", are true as written and are now asserted at
+every ratio. And the symptom is already surfaced: `batch.readiness_report` reports identical
+adjacent prompts as sameness warnings, which is what caught the original defect.
+
+### An open question for the Director, recorded rather than decided
+
+**Should importing a new song repair or warn about sections that outlive it?** `upload_song` writes
+a new `Song` and leaves `project.sections` exactly as they were, so a 180 s section layer survives a
+150 s master. The clamp above means such a layer can no longer produce unrenderable shots — the
+spans stop at the song — but the *boxes* still say 180 s in the interface, and whether the right
+answer is to truncate them, to drop the ones wholly past the end, or to warn and leave the
+Director's structure alone is an editorial decision this pass will not make. Not decided here.
+
+### Digests moved, and the delta is proved rather than asserted
+
+All four populate byte digests moved, because this fixture's last section ends at 154.640 against a
+154.644898 s song and that 4.9 ms stub is now absorbed into the Outro span. Diffing the two plans
+field by field: **5 of 27 shots differ and every difference is geometry** — the Outro's five
+windows, each moved by at most 1 ms. No prompt, seed, mode, citation, `singing` or `use_song_audio`
+moves on any shot, and the unmarked arm shows the identical five. Coverage goes `0 → 154.640` to
+`0 → 154.644`. Unchanged: 27 shots, band 4.000–6.800, worst seam 1 ms, `batch.window_band_note` 0
+warnings, `assembly.tiling_refusals` 0 refusals. Old values are recorded beside the new ones, as
+this file's convention requires.
+
+```
+CHAINED marked    ad0f82d0…  →  e84a8587…
+CHAINED unmarked  0567041f…  →  1607b49e…
+VARIED  marked    cbd98720…  →  aae1a1e6…
+VARIED  unmarked  dd923601…  →  f3eb2656…
+```
+
+### Mutation: 24/26 killed, and both survivors are provably equivalent
+
+Swept in a `git worktree` with `PYTHONPATH` at that tree's own `src` (the editable `.pth` otherwise
+imports the live checkout and everything "survives"), byte-level `read_bytes`/`write_bytes`
+restores, `__pycache__` purged either side of every mutant, anchors line-ending-converted with the
+match count asserted as exactly 1 before each was applied, and a green baseline proved before the
+first mutant and again after the last.
+
+The mutants: the span floor removed, raised, and its absorb turned back into a drop; the trailing
+stub tiled, dropped, and its absorb neutered; each edge of the song clamp; a zero-length section
+admitted; each of the four order inequalities disabled one at a time; the left neighbour's
+transition dropped from the order test; the next window's start read as its end; each half of the
+section-boundary containment collapsed back to the midpoint; the nearest boundary swapped for the
+furthest; `legal_sections` stripped of its sort and of its refusal; the generic `PUT`'s section
+check removed *and* un-gated; `PUT /sections`' check removed; the `spent` guard removed; and
+populate's `TimelineError` translation turned back into a 500.
+
+**Two rounds.** The first killed 16 of 25 and the nine survivors were the report: four of them were
+real gaps — three of the four order inequalities and one half of the boundary containment had no
+fixture, and the `spent` guard had none at all. Each now has one, including four fixtures found by
+search rather than by hand, all at `SNAP_TOLERANCE_MAX` on ordinary 4–5 s shots overlapping by 2 s
+(an overlap of 2 s puts two windows' *starts* 2 s apart, and a 3 s tolerance reaches straight past
+that — none of these needs an exotic geometry). The second round killed 24 of 26.
+
+The two survivors are equivalent mutants and are argued as such in the source beside the lines they
+mutate, so they are not re-litigated from a future report: `cursor = end` cannot be improved by a
+`max(cursor, end)` because `end > start >= cursor` holds on every branch above it, and the
+remainder's `<= 0` arm is a totality guard on a state the clamp makes unreachable — negating it
+changes nothing, because a zero remainder falls through to a `length + 0.0` that is a no-op.
+
+### Gates
+
+`uv run pytest` 1824 passed; `uv run ruff check .` clean; `node --check` clean on `app.js` and
+`api.js`. The two known load-flaky tests were not chased.
+
 ## 2026-08-23 — Layout variance becomes a redistribution: one saturated window no longer freezes its span
 
 Spec: `_bmad-output/planning-artifacts/three-step-populate-2026-08-21.md`, Phase D, and the open

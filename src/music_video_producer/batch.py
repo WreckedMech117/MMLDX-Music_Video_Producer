@@ -765,7 +765,24 @@ JOB_TIMING_FROM_COMFY = "comfy"
 #: `render_seconds` came from this record: `created_at` (enqueue) to the settle. It therefore
 #: includes any time the prompt spent **waiting** behind other prompts, and is only an upper
 #: bound on the render. Every surface that shows it has to say so.
+#:
+#: One exception, and it is the reason `render_timing_summary` reads `prompt_id` as well as this
+#: field: a job with an **empty** `prompt_id` is local work (an export; see that field's note
+#: below), started the moment its record was created and never queued anywhere, so its span is
+#: exact rather than an upper bound. The label still says `record`, because it names where the
+#: span came from and not how much to trust it in one case.
 JOB_TIMING_FROM_RECORD = "record"
+
+#: The job settled, and no length could be measured for it. Reached one way only: the record's
+#: own span ran **backwards**, which is a clock adjustment between `created_at` and the settle
+#: rather than a render that finished before it started.
+#:
+#: A third value rather than leaving the field empty, because empty already means something
+#: else and something false here — "settled before this application measured anything, and
+#: nothing was ever invented for it", which is what every surface says about a job that carries
+#: it. It also restores idempotence: the guard in `stamp_job_settled` keys on this field, so a
+#: settle that left it empty could be stamped again and again, moving `updated_at` each time.
+JOB_TIMING_UNMEASURED = "unmeasured"
 
 
 def format_duration(seconds: float) -> str:
@@ -805,9 +822,16 @@ def stamp_job_settled(job: RenderJob, *, elapsed_seconds: float | None = None) -
 
     **Idempotent, and that is load-bearing.** A job that already carries a source is left
     entirely alone, `updated_at` included: terminal is terminal, so a second call can only be a
-    later clock overwriting the real measurement — and it would also make a re-read of an
-    already-settled record look like a change to the reconciler, which would rewrite the
-    manifest on a tick that learned nothing and collide with whatever the Director is editing.
+    later clock overwriting the real measurement. That reason stands alone — an earlier draft of
+    this docstring also claimed the guard kept a re-read from looking like a change to the
+    reconciler, which is not true of the code: `reconcile_project_jobs`'s change test reads
+    `status`, `output_files` and `error` and nothing else, and it never reaches a settled job in
+    the first place.
+
+    Which is why a span that runs backwards still writes a *source* — `JOB_TIMING_UNMEASURED`.
+    Leaving it empty left the job stamped but sourceless, so the guard above did not hold it and
+    every later call moved `updated_at` again, while every surface described a job settled today
+    as one settled before this application measured anything.
 
     What it does **not** do: touch `status`, `error`, or the target. Those are each caller's own
     decision and settling is not one act — see `apply_job_history` and `supersede_target_jobs`.
@@ -821,10 +845,15 @@ def stamp_job_settled(job: RenderJob, *, elapsed_seconds: float | None = None) -
         return True
     span = (job.updated_at - job.created_at).total_seconds()
     # A negative span is a clock that moved, not a render that finished before it started. The
-    # stamp still lands — the job did settle — but nothing is claimed about its length.
+    # stamp still lands — the job did settle — and nothing is claimed about its length, but the
+    # settle is still *recorded* as one: `JOB_TIMING_UNMEASURED` rather than the empty string,
+    # which means "settled before this application measured anything" and would be a lie about a
+    # job that settled just now. See that constant.
     if span >= 0:
         job.render_seconds = round(span, 3)
         job.render_seconds_source = JOB_TIMING_FROM_RECORD
+    else:
+        job.render_seconds_source = JOB_TIMING_UNMEASURED
     return True
 
 
@@ -837,9 +866,32 @@ def render_timing_summary(job: RenderJob) -> str:
     a reader who is not told will read it as render cost. That misreading is precisely how a
     221-frame render came to be recorded as taking 2.2 hours.
 
-    A non-`complete` job is never described as having rendered: a cancellation that stood open
-    for forty minutes rendered for some unknown part of that, and "rendered in 40m" would be a
-    fabrication. It is reported as what it is — how long the record was open.
+    **The source is read before the status**, and that order is the correction of a real defect.
+    A job that failed or was interrupted still has ComfyUI's execution clock on it — the span runs
+    `execution_start` → `execution_error`/`execution_interrupted`, which is time on the GPU and
+    nothing else — and describing it as "the time the record was open, not render time" inverted
+    the one caveat this function exists to carry. A failed render is also the most useful cost
+    datum here: a 226-frame window that OOMs after three minutes is exactly what a Director needs
+    to know before asking for it again. So a `comfy`-sourced non-`complete` job is reported as
+    time spent rendering, and only a `record`-sourced one is reported as a record span.
+
+    A `record`-sourced non-`complete` job is never described as having rendered: a cancellation
+    that stood open for forty minutes rendered for some unknown part of that, and "rendered in
+    40m" would be a fabrication. It is reported as what it is — how long the record was open.
+
+    **A finished piece of local work is not a queue.** A job with an empty `prompt_id` never went
+    near ComfyUI (an export; see `PENDING_SUBMISSION_PROMPT_ID` for why the empty string is that
+    marker and not "unsubmitted"), so `created_at` really is when the work started and, once it
+    has run to `complete`, the record's span is the whole of it. Telling the Director that
+    "ComfyUI reported no execution clock for this prompt, so the wait in the queue is included"
+    about an assembly was a caveat invented out of nothing, about a component the job never
+    touched, and it made an exact number look like an upper bound.
+
+    `complete` and not merely local, because the exactness comes from both ends of the span being
+    real. An export orphaned by a crash is settled by `heal_orphaned_local_jobs` at the next boot,
+    so its span runs from enqueue to whenever somebody restarted the application — which can be a
+    machine that was switched off overnight, and is emphatically not how long the export ran. That
+    one takes the branch above and is reported as a record span, which is what it is.
 
     The frame count is included when there is one, because a duration without it is
     uninterpretable: 6m18s is unremarkable at 141 frames and impossible at 277. Empty string
@@ -847,12 +899,27 @@ def render_timing_summary(job: RenderJob) -> str:
     """
     if not job.render_seconds_source:
         return ""
+    if job.render_seconds_source == JOB_TIMING_UNMEASURED:
+        return (
+            f"{job.status}; the clock moved between this record being created and it settling, "
+            f"so no length was measured"
+        )
     length = format_duration(job.render_seconds)
     frames = f", {job.render_frames} frames" if job.render_frames else ""
+    if job.render_seconds_source == JOB_TIMING_FROM_COMFY:
+        if job.status == "complete":
+            return f"rendered in {length}{frames}"
+        return (
+            f"{job.status} after {length} of rendering{frames} (ComfyUI's own execution clock, "
+            f"so this is time on the GPU and not queue wait)"
+        )
     if job.status != "complete":
         return f"{job.status} after {length}{frames} (time the record was open, not render time)"
-    if job.render_seconds_source == JOB_TIMING_FROM_COMFY:
-        return f"rendered in {length}{frames}"
+    if not job.prompt_id:
+        return (
+            f"{length} start to finish{frames}; local work that never went to ComfyUI, so this "
+            f"is the whole job rather than an upper bound"
+        )
     queued = " — this job was submitted in a batch" if job.batch_id else ""
     return (
         f"{length} from queued to done{frames}; ComfyUI reported no execution clock for this "
