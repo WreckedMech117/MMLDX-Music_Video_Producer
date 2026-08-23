@@ -1930,13 +1930,15 @@ def test_the_attention_harness_crosses_sampling_bundles_with_backends():
     # An arm is a *triple*: frame count, sampling bundle, attention backend. All three are
     # live variables in this experiment and each must be holdable still while the others move.
     backends = harness.parse_and_gate([*base, "--sampling", "default", "--profiles", "default,pytorch"])
-    assert backends.arms == [(226, "default", "default"), (226, "default", "pytorch")]
+    assert backends.arms == [
+        (226, "default", "default", None), (226, "default", "pytorch", None)
+    ]
 
     bundles = harness.parse_and_gate(
         [*base, "--sampling", "turbo-references2v,turbo", "--profiles", "default"]
     )
     assert bundles.arms == [
-        (226, "turbo-references2v", "default"), (226, "turbo", "default")
+        (226, "turbo-references2v", "default", None), (226, "turbo", "default", None)
     ]
     # Every list at once is the cross product, and the cost line has to say so.
     both = harness.parse_and_gate([*base, "--sampling", "default,turbo", "--profiles", "default,pytorch"])
@@ -1948,7 +1950,7 @@ def test_the_attention_harness_crosses_sampling_bundles_with_backends():
         [*base, "--sampling", "turbo-references2v", "--profiles", "default",
          "--frames", "158,175,192,209"]
     )
-    assert [count for count, _, _ in band.arms] == [158, 175, 192, 209]
+    assert [count for count, _, _, _ in band.arms] == [158, 175, 192, 209]
     # Bound first and checked on the next line, deliberately. This module is scanned by
     # `test_nothing_in_the_enhancement_path_claims_the_frame_count_is_preserved`, a coarse
     # text guard against ever claiming an output frame count equals an input's on the LTX
@@ -2028,8 +2030,16 @@ def test_the_attention_harness_leaves_preview_frames_alone_by_default():
     harness = importlib.import_module("measure_h3_attention")
     base = ["--project", "p", "--shot", "s", "--confirm-gpu", "--profiles", "default,pytorch"]
 
-    assert harness.parse_and_gate(base).preview_frames is None
-    assert harness.parse_and_gate([*base, "--preview-frames", "1"]).preview_frames == 1
+    assert harness.parse_and_gate(base).preview_list == [None]
+    assert harness.parse_and_gate([*base, "--preview-frames", "1"]).preview_list == [1]
+    # As an arm axis, so 12 and 1 interleave in one run rather than four invocations — any
+    # residual drift then falls across both conditions instead of on one of them.
+    paired = harness.parse_and_gate([*base, "--preview-frames", "12,1", "--repeats", "2"])
+    assert [preview for _, _, _, preview in paired.arms] == [12, 1, 12, 1, 12, 1, 12, 1][:4]
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--preview-frames", "0"])
+    with pytest.raises(SystemExit):
+        harness.parse_and_gate([*base, "--preview-frames", "12,12"])
 
     # The builders still emit the export's own value, whatever the flag says — the flag
     # cannot reach them.

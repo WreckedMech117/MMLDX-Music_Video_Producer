@@ -843,12 +843,40 @@ resized and WebP-encoded, on every sampling step, for an audience of nobody** du
 On a 20-step render that is 240 decode-and-encode operations per shot; across a 33-shot batch,
 roughly eight thousand.
 
-**Not changed, and not measured yet.** Changing any of the three sites moves every H3 payload
-digest and deviates from audited evidence — a Director decision with its own change.
-`tests/measure_h3_attention.py --preview-frames N` patches the value at *submission* for
-measurement only; with the flag absent nothing is patched and the payload is byte-identical.
-The measurement itself — 12 against the node's default of 1, same bundle, seed and fixture,
-back to back, with host RAM recorded either side — is **deferred to the next GPU window**.
+**MEASURED 2026-08-22, and it is a NULL. There is no optimisation here.** Two interleaved
+pairs at 158 frames on `turbo-references2v`, warmup discarded, no `/free`:
+
+| arm | `preview_frames` | sampling | s/it |
+|---|---|---|---|
+| p12-r1 | 12 | 218 s | 27.37 |
+| p1-r1 | 1 | 223 s | 27.89 |
+| p12-r2 | 12 | **154 s** | 19.36 |
+| p1-r2 | 1 | **154 s** | 19.27 |
+
+Pair 1 has 12 previews coming out **2.2% faster** than 1 — noise, and both arms sat in the slow
+power regime. Pair 2 is the clean pair, both arms in the fast regime, and they are
+**identical**: 154 s against 154 s, 0.09 s/it apart.
+
+**Per 158-frame shot the measured cost of `preview_frames: 12` is zero seconds.** The control's
+2.5% warm reproducibility (§6.19) bounds anything undetected below **~3.9 s per shot**, so
+across a 33-shot batch the preview cost is **bounded under ~2 minutes and measured at zero.**
+
+So the ~8,000 decode-and-encode operations per batch are real arithmetic and **not on the
+critical path** in any way this can detect — most likely overlapped with GPU work, or trivial
+beside it. **`preview_frames: 12` stays exactly as the export has it, and this should not be
+raised with the Director as an opportunity at all.**
+
+This retires an earlier claim in this document, which called it "a real optimisation, unlike
+everything else tonight". It was not. The arithmetic was persuasive and the measurement
+disagreed — which is the entire reason it was measured rather than acted on.
+
+**Limitation:** this run predates the per-arm power instrumentation, so regime membership is
+inferred from the timings clustering at 218/223 and 154/154 rather than recorded. Pair 2 is
+treated as the clean pair on that basis.
+
+**Nothing was changed to measure it.** `--preview-frames` patches the value at *submission*
+only; with the flag absent nothing is patched and every payload stays byte-identical to what
+the builders emit.
 
 A second question rides on it for free: thousands of PIL allocations and WebP encodes per
 render is the shape of workload that fragments a host heap, and this machine has an
@@ -1004,14 +1032,214 @@ its own arm" is exactly the sort of thing that becomes true in a retelling.
 
 **Open, with the next step named:**
 
-* **The window ceiling.** `POPULATE_MAX_WINDOW_SECONDS = 6.0` maps to 158 frames, the largest
-  count ever measured successfully, and it stays where it is. Two attempts at a cost curve
-  across the unmeasured band disagreed by up to 63% at the same frame count. **Next step: the
-  reproducibility control above**, not another curve.
-* **Two operational findings needing the Director's decision, neither a defect.** `POST /free`
-  releases VRAM between renders but does **not** stop host-memory accumulation (48.58 → 8.11 GiB
-  across four arms that each called it; only a restart recovers it) — that is the direct answer
-  to the Manager/Crystools "Unload Models" question. And `preview_frames: 12`, faithful to their
-  own audited export, makes ComfyUI decode, resize and WebP-encode twelve frames **per sampling
-  step** whether or not anyone is watching — ~8,000 operations across a 33-shot batch. A
-  **batch-mode option**, not a bug, and its cost is not yet measured.
+* **The window ceiling — now MEASURED, and the answer is a shape rather than a number**
+  (§6.20). Per-frame cost is **flat out to 175 frames / 6.79 s** — a 6.79 s window is
+  marginally *cheaper* per frame than the 6.083 s the current ceiling produces — and then
+  climbs steeply: **+48%** at 7.50 s, **+184%** at 8.21 s, **+264%** at 8.92 s. **Linearity
+  ends between 6.79 s and 7.50 s.** So roughly 0.7 s of extra window is free and the fourth
+  second beyond that is not. `POPULATE_MAX_WINDOW_SECONDS` stays the Director's to set: this
+  is what each length *costs*, and the picture quality of a long take is unmeasured.
+* **`/free` / Manager's "Unload Models": do not use it as render hygiene.** It frees memory
+  from *torch's bookkeeping*, not from the device — `nvidia-smi` still showed 27 GB in use at
+  the moment a render began right after one — and it pays for that by pushing ~8–12 GiB into
+  host RAM per call, driving a 61.6 GiB machine toward zero. It made a 226-frame render **25%
+  slower**, not faster (§6.21). Only a **full ComfyUI restart** produces a genuinely clean card.
+  It remains the right button for freeing VRAM for a *different* workflow.
+* **`preview_frames: 12` costs nothing — no action** (§6.14). It looked like a real
+  optimisation (~8,000 encode operations per batch) and measured at **zero seconds per shot**,
+  bounded under ~4 s. Left exactly as the audited export has it.
+
+### 6.18 Known differences between measurement sessions
+
+Recorded because unrecorded differences between runs cost this experiment four corrections.
+**These are differences, not explanations** — none is asserted as causal.
+
+**ComfyUI launch argv changed between sessions:**
+
+| session | argv |
+|---|---|
+| band sweeps A and B, and everything before them | `main.py --use-sage-attention --fast` |
+| repeat control (after the Director's second restart) | `main.py --windows-standalone-build --use-sage-attention --fast` |
+
+The acceleration flags are identical and `--windows-standalone-build` concerns launcher
+behaviour rather than kernels, so it is not a plausible cause of a timing difference. What it
+does record is that ComfyUI was started a **different way** — the `.bat` rather than directly.
+ComfyUI 0.33.3 and torch 2.7.0+cu128 in both.
+
+**Machine load during the repeat control**, checked rather than assumed: GPU 6% / 48.8 W /
+7275 MiB / 54 °C between arms, SM clock 967 MHz,
+`clocks_throttle_reasons.active = 0x0` — nothing throttling. Compute clients were ComfyUI,
+LM Studio holding a context with **no model loaded**, and TrackIR5 (head tracking, trivial).
+**No competing GPU load.**
+
+**A 158-frame render now occupies nearly the whole card.** Measured during the repeat
+control's second arm: `memory.used = 31056 MiB` of 32607. For comparison, the 226-frame renders
+that defined the memory wall sat at ~31700 MiB. **A 158-frame render is at nearly the same
+occupancy as a 226-frame one**, in a session where the identical fixture costs 224 s against
+the 137 s and 140 s measured before.
+
+If that holds, "near the wall" may be a property of the **session** rather than of the frame
+count — which would dissolve the band question rather than answer it, because the wall would
+not sit at a frame count at all. Recorded as an **observation**. Whether it is ComfyUI caching
+more aggressively after this restart, allocator state, or something else is not established.
+
+**And the two sessions ran in different power regimes.** During this control's arm 2 the card
+sat at **476–502 W with `clocks_throttle_reasons.active = 0x4` (SW Power Cap)**, SM 2745–2782
+MHz, memory 13801 MHz, 71→80 °C. The band sweep's 209-frame arm, by contrast, logged **284 W
+and no throttling at all**.
+
+**That is backwards from any simple story and is the strongest single reason to distrust
+cross-session comparison.** The earlier, *faster* arms drew moderate power and were not
+power-capped; these slower arms are pinned at the cap. High power at the cap is the opposite of
+the low-power-at-high-utilisation signature that characterised the memory-stalled PyTorch arm
+(§6.9) — so the slower session is working *harder*, not less. `clocks.sm`, `clocks.mem` and
+`clocks_throttle_reasons.active` are now captured per arm; they were not when the band sweeps
+ran, which is why that difference went unrecorded until it was sampled by hand.
+
+**Sessions are not interchangeable, and that is the point of §6.19.** Every cross-session
+comparison in this document — including the drift-versus-clean disagreement of §6.16 — spans a
+ComfyUI restart. If between-session variance is large, those comparisons were never valid, and
+the disagreement they show is a property of the sessions rather than of the frame counts.
+
+### 6.19 MEASURED: warm consecutive renders reproduce to 2.5% — and `/free` is what eats the host
+
+Five identical 158-frame renders, one bundle, one seed, one fixture, one session,
+`/free` before each.
+
+| repeat | sampling | s/it | VRAM before | host RAM free **after** its `/free` |
+|---|---|---|---|---|
+| 1 | **224 s** | 28.01 | 2132 MiB | 44.44 GiB |
+| 2 | 157 s | 19.66 | 27557 MiB | 0.78 GiB |
+| 3 | 158 s | 19.82 | 27617 MiB | 0.86 GiB |
+| 4 | 161 s | 20.16 | 27640 MiB | 0.84 GiB |
+| 5 | **220 s** | 27.59 | 27679 MiB | **0.01 GiB** |
+
+**n=5 · min 157 · max 224 · median 161 · range 42.7%.**
+
+**Read the shape, not the range.** 42.7% says "nothing is reproducible" and that is not what was
+measured. The distribution is **bimodal**: {224, 220} and {157, 158, 161}. **Warm consecutive
+renders reproduce to 2.5%.** That is the finding, and it is what makes any future measurement
+on this machine possible.
+
+r1 is explained: it began with an empty card (2132 MiB) and paid a cold start — which costs
+**sampling** time, not merely load. **r5 is an anomaly and stays one.** It is the only arm that
+began with host RAM at 0.01 GiB, which is a candidate; but r1 was equally slow with 44 GiB free,
+so memory pressure cannot be the whole story. n=1 on a bimodal distribution is exactly where a
+tidy explanation would be wrong.
+
+#### `/free` offloads to host RAM — it does not free memory
+
+The measurement that was not asked for, and the most useful thing in this document.
+
+`/free` genuinely releases VRAM in torch's view: `comfy vram_free` went 4.7 → 21.5 GiB on every
+call. But its **host RAM deltas were −11.98, −10.95, −9.68 and −9.22 GiB.** It does not discard
+the weights; **it moves them from VRAM into system RAM.** Host free fell 44.43 → 12.76 → 11.81 →
+10.52 → 9.23 GiB across the run and sat at ~0.8 GiB — finally 0.01 GiB — immediately after each
+call.
+
+**So `/free` is the cause of the host-memory pressure, not a failed mitigation for it.** That
+retracts this document's earlier reading in §6.15 and explains the clean band sweep's 48.58 →
+8.11 GiB decline, which also ran `--free-between-arms`. **The instruction to add
+`--free-between-arms` came from the coordinator, and it made that sweep worse rather than
+cleaner** — recorded because a mitigation that harms is worth more as a warning than as a
+footnote.
+
+**The Director's actual question, answered directly.** Manager/Crystools **"Unload Models"
+offloads the model stack to system RAM rather than freeing it.** On this machine — 61.6 GiB of
+RAM against a ~20 GB model stack — repeated use drives host memory to zero. It is the right
+button when you need VRAM headroom for a *different* workflow, and the wrong one as a general
+hygiene habit between renders of the same one. **Only a full ComfyUI restart actually recovers
+the memory** (48.58 GiB free after the Director's restart).
+
+#### What this settles about the band work
+
+**The band sweeps' 63% disagreement cannot be within-session noise**, because within-session
+warm consecutive renders reproduce to 2.5%. It is therefore real, or it is between-session — and
+it is now **undiagnosable**, because those arms carry no state capture: no VRAM occupancy, no
+power, no throttle state, no host RAM. §6.18 records what was sampled by hand afterwards and it
+is not enough.
+
+That is the honest close on the ceiling question, and it is also the specification for what
+would answer it: **one session, warm, state on every arm, and the first arm discarded.** Nothing
+measured before this section met all four conditions.
+
+### 6.20 MEASURED: the band curve, and it is believable
+
+Fifth attempt, and the first that answers the question. **One session, warm, warmup discarded on
+the arms' own bundle, no `/free`, state and mid-render power on every arm, and — the change that
+made it readable — a render order chosen so that position and frame count are uncorrelated**
+(158, 226, 209, 192, 175; Spearman ρ between execution slot and frame count = **0.0**, against
+**1.0** for the ascending order both failed sweeps used).
+
+`turbo-references2v`, 8 steps, n=1 per point:
+
+| frames | window | exec# | sampling | s/it | **s/frame** | power median | VRAM before |
+|---|---|---|---|---|---|---|---|
+| 158 | 6.083 s | 1 | 162 s | 20.27 | 1.025 | 460.5 W | 2233 MiB |
+| 175 | 6.792 s | **5** | 171 s | 21.46 | **0.977** | **478.5 W** | 27085 MiB |
+| 192 | 7.500 s | 4 | 278 s | 34.76 | 1.448 | 373.4 W | 27165 MiB |
+| 209 | 8.208 s | 3 | 580 s | 72.57 | 2.775 | 254.7 W | 27042 MiB |
+| 226 | 8.917 s | 2 | 804 s | 100.52 | 3.558 | 226.6 W | 27749 MiB |
+
+**Monotonic in frame count; not monotonic in execution order (1, 5, 4, 3, 2). The order effect
+is dead.** The decisive point is **175**: it rendered **last**, on an occupied card, and was the
+**cheapest per frame of all five** at the **highest median power**. Under any "later is slower"
+or "residency degrades" story it should have been among the worst.
+
+**This also refines the VRAM-inheritance model rather than confirming it.** 175, 192, 209 and
+226 all began with residency within 2.6% of each other (27042–27749 MiB) and their costs span
+**3.6×**. At roughly constant resident weight, **frame count alone predicts cost**. Only the 158
+arm started on a nearly-clean card, so that single point stays confounded; the other four are a
+controlled series.
+
+**The mechanism is visible for the first time.** Median power falls monotonically —
+478 → 460 → 373 → 255 → 227 W — while **maximum power stays ~576 W throughout**. The card keeps
+its full capability and progressively spends more of each step waiting on memory. That is §6.9's
+memory-stall signature measured directly rather than inferred from a failure.
+
+**There is a sharp knee between 175 and 192 frames.** Local exponents across consecutive points:
+
+| step | cost ratio | frame ratio | exponent |
+|---|---|---|---|
+| 158 → 175 | 1.06× | 1.108× | **0.53** |
+| 175 → 192 | 1.63× | 1.097× | **5.24** |
+| 192 → 209 | 2.09× | 1.089× | **8.67** |
+| 209 → 226 | 1.39× | 1.081× | 4.18 |
+
+Per-frame cost is **flat to 175 frames** and climbs steeply after.
+
+**In the Director's units — reported, not recommended.** A 6.083 s window costs 1.025 s/frame; a
+6.792 s window costs **0.977 s/frame**, marginally *cheaper*. So the current 6.0 s ceiling sits
+comfortably inside the flat region, and roughly **0.7 s of extra window appears to be free**.
+Beyond that: 7.50 s is **+48%** per frame, 8.21 s **+184%**, 8.92 s **+264%**. **Linearity ends
+between 6.79 s and 7.50 s.** `POPULATE_MAX_WINDOW_SECONDS` is the Director's to set and the
+picture-quality half of that decision is unmeasured.
+
+### 6.21 `/free` does NOT mitigate the wall — and it never cleaned the card
+
+Prediction under the VRAM-inheritance model: if a 226-frame render is slow because it inherits
+the previous arm's residency, then running it after a `/free` should be dramatically faster.
+Tested as its own labelled run — 158 then 226, `/free` before each, so 226 starts "clean":
+
+| ex | frames | sampling | s/it | s/frame | power median | VRAM before |
+|---|---|---|---|---|---|---|
+| 1 | 158 | 141 s | 17.74 | 0.892 | 500.8 W | 27087 MiB |
+| 2 | 226 | **1004 s** | 125.53 | 4.442 | 213.3 W | 27126 MiB |
+
+**226 after a `/free` cost 1004 s against 804 s on an occupied card — 24.9% SLOWER, not faster.
+The prediction is disconfirmed.**
+
+**And the reason matters more than the result: the card was never actually cleaned.** `/free`
+reported releasing 14.25 GiB in torch's view, but `nvidia-smi` still showed **27126 MiB in use**
+at the moment the render began — essentially identical to the 27749 MiB of the "occupied" arm.
+Torch's caching allocator holds the driver-level allocation regardless. **The only thing that
+ever produced a genuinely clean card in this entire run was a full ComfyUI restart** (2233 MiB).
+
+So `/free` frees memory *from torch's bookkeeping*, not from the device, and it pays for that
+bookkeeping by pushing ~8–10 GiB into host RAM (deltas of −8.35 and −9.66 GiB here, consistent
+with §6.19). **It buys nothing at large frame counts and costs host memory. It should not be
+recommended as a mitigation for the wall.**
+
+Caveat, stated because cross-run comparison is what has burned this experiment repeatedly: the
+804 s and 1004 s figures come from **different invocations**. Both are n=1 and the difference is
+far outside the 2.5% warm reproducibility of §6.19, but a same-session A/B was not run.

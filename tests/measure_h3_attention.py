@@ -103,6 +103,7 @@ import contextlib
 import json
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -617,15 +618,27 @@ def gpu_state(comfy_url: str) -> dict[str, Any]:
                     smi,
                     (
                         "--query-gpu=memory.used,memory.total,temperature.gpu,power.draw,"
-                        "utilization.gpu,clocks.current.sm"
+                        "utilization.gpu,clocks.current.sm,clocks.current.memory,"
+                        "clocks_throttle_reasons.active"
                     ),
                     "--format=csv,noheader,nounits",
                 ],
                 capture_output=True, text=True, timeout=30, check=True,
             )
             fields = [item.strip() for item in result.stdout.strip().splitlines()[0].split(",")]
-            names = ("vram_used_mib", "vram_total_mib", "temp_c", "power_w", "util_pct", "sm_mhz")
+            # `throttle_hex` is the one most likely to differ silently between sessions and
+            # never be recorded: 0x0 is unthrottled, 0x4 is SW Power Cap. Two sessions of this
+            # experiment ran in different regimes — one at ~284 W and unthrottled, another
+            # pinned at the ~500 W cap — and nothing captured it at the time.
+            names = (
+                "vram_used_mib", "vram_total_mib", "temp_c", "power_w", "util_pct",
+                "sm_mhz", "mem_mhz", "throttle_hex",
+            )
             for name, raw in zip(names, fields, strict=False):
+                if name == "throttle_hex":
+                    # Kept as the string nvidia-smi prints; it is a bit field, not a quantity.
+                    state[name] = raw or None
+                    continue
                 try:
                     state[name] = float(raw)
                 except ValueError:
@@ -827,6 +840,7 @@ def wait_for(
     prompt_id: str,
     poll: float = 5.0,
     watchdog: Callable[[float], list[str] | None] | None = None,
+    power_samples: list[float] | None = None,
 ) -> dict | None:
     """Block until this prompt leaves the queue, then return its history entry.
 
@@ -840,8 +854,17 @@ def wait_for(
     alternative is hours of a card doing memory traffic to re-confirm a pattern already
     characterised.
     """
+    power_samples = [] if power_samples is None else power_samples
     started = time.monotonic()
     while True:
+        # **Sampled mid-render, because the idle snapshots either side cannot see this.**
+        # Arms of this experiment have landed in two distinct regimes — some drawing ~500 W
+        # power-capped, others ~200-280 W — and the fast ones are the high-power ones. Nothing
+        # recorded before this could tell them apart after the fact, because state_before and
+        # state_after are both taken while the card is idle at ~40 W.
+        watts = gpu_power_watts()
+        if watts is not None:
+            power_samples.append(watts)
         entry = get_json(f"{comfy_url}/history/{urllib.parse.quote(prompt_id)}").get(prompt_id)
         if entry and entry.get("outputs"):
             return entry
@@ -1178,7 +1201,7 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
     # `self.sockets`, and the previewer is built from `args.preview_method` rather than from
     # client count. So a batch pays for twelve decoded, resized, WebP-encoded frames per
     # sampling step for an audience of nobody.
-    parser.add_argument("--preview-frames", type=int, default=None)
+    parser.add_argument("--preview-frames", default=None)
     # Which evidence directory this invocation belongs to. Defaults to today, and `resolve_run_dir`
     # refuses rather than guesses when today is not where the run lives.
     parser.add_argument("--run-dir", default=None)
@@ -1248,11 +1271,28 @@ def parse_and_gate(argv: list[str]) -> argparse.Namespace:
     # it, and the arms would silently render a neighbouring length instead.
     for count in frame_counts:
         duration_for_frames(count)
+    # `None` is the "patch nothing" axis value and is the only one by default, so a run that
+    # does not ask for a preview comparison emits exactly what the builders emit.
+    if args.preview_frames is None:
+        previews: list[int | None] = [None]
+    else:
+        try:
+            previews = [int(i.strip()) for i in str(args.preview_frames).split(",") if i.strip()]
+        except ValueError:
+            abort(f"--preview-frames takes whole numbers, not {args.preview_frames!r}")
+            raise AssertionError("unreachable")
+        if not previews:
+            abort("--preview-frames needs at least one value")
+        if len(set(previews)) != len(previews):
+            abort(f"A preview value is named twice in {previews}")
+        if any(value < 1 for value in previews):
+            abort(f"preview_frames must be at least 1, not {previews}")
     arms = [
-        (count, sampling, attention)
+        (count, sampling, attention, preview)
         for count in frame_counts
         for sampling in samplings
         for attention in attentions
+        for preview in previews
     ]
     # Two *renders*, not two distinct arms. One arm repeated is a legitimate experiment and
     # an important one: with frame count held constant, any rise across repeats is render
@@ -1271,7 +1311,7 @@ def parse_and_gate(argv: list[str]) -> argparse.Namespace:
     # arms vary: quoting 30 minutes for a 4-step bundle would misprice the run by 5x in the
     # direction that matters — a Director declining a measurement that is actually cheap.
     minutes = round(
-        sum(RECORDED_SECONDS_PER_FRAME * count * args.repeats for count, _, _ in arms) / 60
+        sum(RECORDED_SECONDS_PER_FRAME * count * args.repeats for count, _, _, _ in arms) / 60
     ) + (0 if args.no_warmup else 6)
     if not args.confirm_gpu:
         print(USAGE, file=sys.stderr)
@@ -1280,12 +1320,13 @@ def parse_and_gate(argv: list[str]) -> argparse.Namespace:
             f"(roughly {minutes} minutes at the last recorded 20-step cost; the turbo bundles "
             f"sample fewer steps and come in well under it) to the user-managed ComfyUI at "
             f"{args.comfy_url}.\n"
-            f"Arms: {', '.join(f'{s}+{a}@{c}f' for c, s, a in arms)}\n"
+            f"Arms: {', '.join(f'{s}+{a}@{c}f' + (f'/p{p}' if p else '') for c, s, a, p in arms)}\n"
             f"It refuses to submit anything without --confirm-gpu.",
             file=sys.stderr,
         )
         raise SystemExit(2)
     args.arms = arms
+    args.preview_list = previews
     args.attention_list = attentions
     args.sampling_list = samplings
     args.frame_counts = frame_counts
@@ -1434,7 +1475,7 @@ def main() -> None:
     for count in frame_counts:
         span, _, _, refs = fixtures[count]
         for sampling in args.sampling_list:
-            group = [a for c, s_, a in arms if c == count and s_ == sampling]
+            group = [a for c, s_, a, pv in arms if c == count and s_ == sampling and pv is None]
             if H3_DEFAULT_ATTENTION in group and len(group) > 1:
                 only_the_attention_node_differs(
                     {
@@ -1478,12 +1519,19 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     log_offset = comfy_log.stat().st_size
+    # Which render this was, in submission order, counting only arms this invocation actually
+    # rendered. **Position is a variable in this experiment** — two band sweeps ran ascending
+    # frame counts and so could never separate "bigger render" from "later render". Recording
+    # it lets a shuffled order answer that: if cost tracks frames regardless of position, the
+    # curve is real; if it tracks position under a shuffled order, the order effect is.
+    executed = 0
 
     def run_one(
         frames: int, sampling: str, name: str, repeat: int, payload: dict, label: str,
-        adopt: str | None = None,
+        adopt: str | None = None, preview: int | None = None,
     ) -> dict[str, Any]:
-        nonlocal log_offset
+        nonlocal log_offset, executed
+        executed += 1
         # The log window opens immediately before the submission and closes after the render
         # settles, so every line in it belongs to this render and no other. Serial by
         # construction — this harness submits one prompt at a time and waits — which is the
@@ -1493,7 +1541,7 @@ def main() -> None:
         # started from rather than the state it inherited.
         # Patched here rather than in the builder, so the *builder* still emits the export's
         # own value and only this measurement's submission differs. `None` patches nothing.
-        apply_preview_override(payload, args.preview_frames)
+        apply_preview_override(payload, preview)
         freed = free_memory(args.comfy_url) if (args.free_between_arms and not adopt) else None
         state_before = gpu_state(args.comfy_url)
         started = time.monotonic()
@@ -1554,7 +1602,11 @@ def main() -> None:
             ]
             return cut_evidence
 
-        entry = wait_for(args.comfy_url, prompt_id, watchdog=None if adopt else watchdog)
+        power_samples: list[float] = []
+        entry = wait_for(
+            args.comfy_url, prompt_id,
+            watchdog=None if adopt else watchdog, power_samples=power_samples,
+        )
         wall = time.monotonic() - started
         if entry is None:
             record = {
@@ -1600,6 +1652,7 @@ def main() -> None:
             # the variable the ceiling turns on and the one nobody was tracking.
             **bundle_facts(sampling),
             "repeat": repeat,
+            "execution_index": executed,
             "label": label,
             "prompt_id": prompt_id,
             "wall_seconds": round(wall, 2),
@@ -1624,10 +1677,17 @@ def main() -> None:
             "timing_source": "comfy" if execution else "wall-clock-upper-bound",
             "engagement": verdict,
             "engagement_evidence": evidence,
-            "preview_frames": args.preview_frames,
+            "preview_frames": preview,
             # Conditions at submission, recorded and not interpreted. See `gpu_state`.
             "state_before": state_before,
             "state_after": gpu_state(args.comfy_url),
+            # The regime this arm actually ran in. A median near 500 W and one near 250 W are
+            # different machines as far as a timing is concerned.
+            "power_w_samples": len(power_samples),
+            "power_w_median": (
+                round(statistics.median(power_samples), 1) if power_samples else None
+            ),
+            "power_w_max": round(max(power_samples), 1) if power_samples else None,
             "free_before_arm": freed,
             "output": str(kept),
         }
@@ -1663,7 +1723,14 @@ def main() -> None:
     if not args.no_warmup and not args.adopt:
         print("Warmup (excluded from comparison; it exists so the first arm does not pay "
               "the model load):")
-        warm = payload_for(H3_DEFAULT_ATTENTION, warmup_duration(), "mvp/attention-warmup")
+        # **The warmup uses the first arm's own bundle**, not the default one. Its whole job
+        # is to leave resident exactly what the measured arms will use — and a bundle carries
+        # a LoRA, so warming on `default` would leave the first real arm still paying for a
+        # LoRA load. "Warm" has to mean warm for the thing being measured.
+        _, warm_sampling, warm_attention, _ = arms[0]
+        warm = payload_for(
+            warm_attention, warmup_duration(), "mvp/attention-warmup", warm_sampling,
+        )
         started = time.monotonic()
         response = post_json(f"{args.comfy_url}/prompt", {"prompt": warm})
         wait_for(args.comfy_url, response["prompt_id"])
@@ -1674,13 +1741,16 @@ def main() -> None:
     adopt = args.adopt
     for repeat in range(1, args.repeats + 1):
         print(f"Repeat {repeat} of {args.repeats}:")
-        for count, sampling, name in arms:
+        for count, sampling, name, preview in arms:
             # The frame count is part of the identity, not just of the numbers. Without it a
             # 107-frame screen and a 226-frame promotion of the same arm share a label, and
             # the resume logic would "reuse" the screen as though it answered the cliff
             # question. Labels are how arms are told apart; anything that changes what an arm
             # measured belongs in one.
-            label = f"{sampling}+{name}-f{count}-r{repeat}"
+            # The preview value joins the label only when it is being varied, so every
+            # label written before this axis existed keeps its exact name.
+            tag = f"-p{preview}" if preview is not None else ""
+            label = f"{sampling}+{name}-f{count}{tag}-r{repeat}"
             if label in existing:
                 results.append(existing[label])
                 print(f"  {label}: reused from disk")
@@ -1691,7 +1761,7 @@ def main() -> None:
                     count, sampling, name, repeat,
                     payload_for(name, span, f"mvp/attention-{label}", sampling, refs),
                     label,
-                    adopt=adopt,
+                    adopt=adopt, preview=preview,
                 )
             )
             # An adoption applies to exactly one arm: the one the killed run was on.
