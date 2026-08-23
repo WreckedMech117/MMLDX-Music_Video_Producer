@@ -1,0 +1,1227 @@
+{
+  "shots": {
+    "closeup": {
+      "meta": {
+        "id": "shot_f82bf42e3abc",
+        "title": "Close-up, singing",
+        "prose": "Lucy's face, sweating and intense under flickering lights.",
+        "start": 66.58,
+        "duration": 5.11,
+        "lead": 0.25,
+        "take_t0": 66.33,
+        "frames": 141,
+        "trim": [
+          66.33,
+          72.205
+        ],
+        "lyric": "(lyric line redacted - copyrighted; see the project manifest)",
+        "points": [
+          [
+            67.16,
+            "/m/ \u2014 onset of \u201cmy\u201d",
+            "bilabial nasal: lips fully closed"
+          ],
+          [
+            67.36,
+            "/p/ \u2014 onset of \u201cpulsing\u201d",
+            "bilabial plosive: lips closed, then burst"
+          ],
+          [
+            68.26,
+            "/m/ \u2014 onset of \u201cmake\u201d",
+            "bilabial nasal: lips fully closed"
+          ],
+          [
+            70.6,
+            "/\u0254\u02d0/ \u2014 sustained vowel of \u201clong\u201d",
+            "open control: mouth should be wide, not closed"
+          ]
+        ]
+      },
+      "arms": {
+        "default": {
+          "job_id": "job_fbd3a5376c2c",
+          "prompt_id": "e512649f-cb41-4c40-8b43-e7b8a388313a",
+          "seed": 14,
+          "frames": 141,
+          "comfy_seconds": 707.478,
+          "comfy_seconds_source": "comfy",
+          "sampling_seconds": 644.875,
+          "sampling_seconds_observed": 644.875,
+          "seconds_per_step": 32.244,
+          "steps": 20,
+          "output": "J:\\Hermes-Remote\\comfyui\\ComfyUI_windows_portable\\ComfyUI\\output\\music-video-producer\\project_59f14d19ff10\\shots\\shot_f82bf42e3abc-h3-reference_00001-audio.mp4",
+          "output_files": [
+            "music-video-producer/project_59f14d19ff10/shots/shot_f82bf42e3abc-h3-reference_00001-audio.mp4"
+          ],
+          "graph": {
+            "lora": null,
+            "lora_strength": null,
+            "scheduler": "simple",
+            "steps": 20,
+            "sampler": "res_multistep",
+            "noise_seed": 14,
+            "length": 141,
+            "width": 1056,
+            "height": 608,
+            "prompt": "Reference map: <Picture 1> is Lucy, a woman with long wild blonde curls in a black studded leather corset with oxblood panels; <Picture 2> is Dusk Warehouse Bed; <Audio 1> is the master song for synchronization. Lucy's face, sweating and intense under flickering lights. The character from the reference sheet sings to camera. Stable face and wardrobe, one continuous take. Section look: Vast empty warehouse floor; aggressive, handheld, shaky, low-angle camera work and an animalistic mood."
+          },
+          "stills": [
+            {
+              "file": "closeup-default-0.jpg",
+              "song_second": 67.16,
+              "take_offset": 0.83,
+              "take_frame": 20,
+              "label": "/m/ \u2014 onset of \u201cmy\u201d",
+              "note": "bilabial nasal: lips fully closed"
+            },
+            {
+              "file": "closeup-default-1.jpg",
+              "song_second": 67.36,
+              "take_offset": 1.03,
+              "take_frame": 25,
+              "label": "/p/ \u2014 onset of \u201cpulsing\u201d",
+              "note": "bilabial plosive: lips closed, then burst"
+            },
+            {
+              "file": "closeup-default-2.jpg",
+              "song_second": 68.26,
+              "take_offset": 1.93,
+              "take_frame": 46,
+              "label": "/m/ \u2014 onset of \u201cmake\u201d",
+              "note": "bilabial nasal: lips fully closed"
+            },
+            {
+              "file": "closeup-default-3.jpg",
+              "song_second": 70.6,
+              "take_offset": 4.27,
+              "take_frame": 102,
+              "label": "/\u0254\u02d0/ \u2014 sustained vowel of \u201clong\u201d",
+              "note": "open control: mouth should be wide, not closed"
+            }
+          ],
+          "audio": {
+            "correlation": 0.8454,
+            "lag_ms": 24.3,
+            "basis": "amplitude envelope, 20 ms window",
+            "waveform_correlation": 0.57,
+            "waveform_lag_ms": 25.0
+          },
+          "cuts": {
+            "threshold": 0.35,
+            "count": 0,
+            "times": []
+          },
+          "strip": [
+            {
+              "file": "closeup-default-strip00.jpg",
+              "take_offset": 0.245,
+              "take_frame": 6,
+              "song_second": 66.57
+            },
+            {
+              "file": "closeup-default-strip01.jpg",
+              "take_offset": 0.734,
+              "take_frame": 18,
+              "song_second": 67.06
+            },
+            {
+              "file": "closeup-default-strip02.jpg",
+              "take_offset": 1.224,
+              "take_frame": 29,
+              "song_second": 67.55
+            },
+            {
+              "file": "closeup-default-strip03.jpg",
+              "take_offset": 1.714,
+              "take_frame": 41,
+              "song_second": 68.04
+            },
+            {
+              "file": "closeup-default-strip04.jpg",
+              "take_offset": 2.203,
+              "take_frame": 53,
+              "song_second": 68.53
+            },
+            {
+              "file": "closeup-default-strip05.jpg",
+              "take_offset": 2.693,
+              "take_frame": 65,
+              "song_second": 69.02
+            },
+            {
+              "file": "closeup-default-strip06.jpg",
+              "take_offset": 3.182,
+              "take_frame": 76,
+              "song_second": 69.51
+            },
+            {
+              "file": "closeup-default-strip07.jpg",
+              "take_offset": 3.672,
+              "take_frame": 88,
+              "song_second": 70.0
+            },
+            {
+              "file": "closeup-default-strip08.jpg",
+              "take_offset": 4.161,
+              "take_frame": 100,
+              "song_second": 70.49
+            },
+            {
+              "file": "closeup-default-strip09.jpg",
+              "take_offset": 4.651,
+              "take_frame": 112,
+              "song_second": 70.98
+            },
+            {
+              "file": "closeup-default-strip10.jpg",
+              "take_offset": 5.141,
+              "take_frame": 123,
+              "song_second": 71.47
+            },
+            {
+              "file": "closeup-default-strip11.jpg",
+              "take_offset": 5.63,
+              "take_frame": 135,
+              "song_second": 71.96
+            }
+          ],
+          "picture": {
+            "frames": 141,
+            "detail": 166.22,
+            "flicker": 5.8596,
+            "mean_luma": 24.69,
+            "bytes_per_frame": 14494.9,
+            "shot": "closeup",
+            "profile": "default"
+          }
+        },
+        "turbo-references2v": {
+          "job_id": "job_3a177562476c",
+          "prompt_id": "71de8e17-293e-4c58-8a55-9bb069bf1e61",
+          "seed": 14,
+          "frames": 141,
+          "comfy_seconds": 240.321,
+          "comfy_seconds_source": "comfy",
+          "sampling_seconds": 167.125,
+          "sampling_seconds_observed": 167.125,
+          "seconds_per_step": 20.891,
+          "steps": 8,
+          "output": "J:\\Hermes-Remote\\comfyui\\ComfyUI_windows_portable\\ComfyUI\\output\\music-video-producer\\project_59f14d19ff10\\shots\\shot_f82bf42e3abc-h3-reference_00002-audio.mp4",
+          "output_files": [
+            "music-video-producer/project_59f14d19ff10/shots/shot_f82bf42e3abc-h3-reference_00002-audio.mp4"
+          ],
+          "graph": {
+            "lora": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+            "lora_strength": 1.0,
+            "scheduler": "simple",
+            "steps": 8,
+            "sampler": "euler",
+            "noise_seed": 14,
+            "length": 141,
+            "width": 1056,
+            "height": 608,
+            "prompt": "Reference map: <Picture 1> is Lucy, a woman with long wild blonde curls in a black studded leather corset with oxblood panels; <Picture 2> is Dusk Warehouse Bed; <Audio 1> is the master song for synchronization. Lucy's face, sweating and intense under flickering lights. The character from the reference sheet sings to camera. Stable face and wardrobe, one continuous take. Section look: Vast empty warehouse floor; aggressive, handheld, shaky, low-angle camera work and an animalistic mood."
+          },
+          "stills": [
+            {
+              "file": "closeup-turbo-references2v-0.jpg",
+              "song_second": 67.16,
+              "take_offset": 0.83,
+              "take_frame": 20,
+              "label": "/m/ \u2014 onset of \u201cmy\u201d",
+              "note": "bilabial nasal: lips fully closed"
+            },
+            {
+              "file": "closeup-turbo-references2v-1.jpg",
+              "song_second": 67.36,
+              "take_offset": 1.03,
+              "take_frame": 25,
+              "label": "/p/ \u2014 onset of \u201cpulsing\u201d",
+              "note": "bilabial plosive: lips closed, then burst"
+            },
+            {
+              "file": "closeup-turbo-references2v-2.jpg",
+              "song_second": 68.26,
+              "take_offset": 1.93,
+              "take_frame": 46,
+              "label": "/m/ \u2014 onset of \u201cmake\u201d",
+              "note": "bilabial nasal: lips fully closed"
+            },
+            {
+              "file": "closeup-turbo-references2v-3.jpg",
+              "song_second": 70.6,
+              "take_offset": 4.27,
+              "take_frame": 102,
+              "label": "/\u0254\u02d0/ \u2014 sustained vowel of \u201clong\u201d",
+              "note": "open control: mouth should be wide, not closed"
+            }
+          ],
+          "audio": {
+            "correlation": 0.8404,
+            "lag_ms": 24.4,
+            "basis": "amplitude envelope, 20 ms window",
+            "waveform_correlation": 0.5658,
+            "waveform_lag_ms": 25.0
+          },
+          "cuts": {
+            "threshold": 0.35,
+            "count": 0,
+            "times": []
+          },
+          "strip": [
+            {
+              "file": "closeup-turbo-references2v-strip00.jpg",
+              "take_offset": 0.245,
+              "take_frame": 6,
+              "song_second": 66.57
+            },
+            {
+              "file": "closeup-turbo-references2v-strip01.jpg",
+              "take_offset": 0.734,
+              "take_frame": 18,
+              "song_second": 67.06
+            },
+            {
+              "file": "closeup-turbo-references2v-strip02.jpg",
+              "take_offset": 1.224,
+              "take_frame": 29,
+              "song_second": 67.55
+            },
+            {
+              "file": "closeup-turbo-references2v-strip03.jpg",
+              "take_offset": 1.714,
+              "take_frame": 41,
+              "song_second": 68.04
+            },
+            {
+              "file": "closeup-turbo-references2v-strip04.jpg",
+              "take_offset": 2.203,
+              "take_frame": 53,
+              "song_second": 68.53
+            },
+            {
+              "file": "closeup-turbo-references2v-strip05.jpg",
+              "take_offset": 2.693,
+              "take_frame": 65,
+              "song_second": 69.02
+            },
+            {
+              "file": "closeup-turbo-references2v-strip06.jpg",
+              "take_offset": 3.182,
+              "take_frame": 76,
+              "song_second": 69.51
+            },
+            {
+              "file": "closeup-turbo-references2v-strip07.jpg",
+              "take_offset": 3.672,
+              "take_frame": 88,
+              "song_second": 70.0
+            },
+            {
+              "file": "closeup-turbo-references2v-strip08.jpg",
+              "take_offset": 4.161,
+              "take_frame": 100,
+              "song_second": 70.49
+            },
+            {
+              "file": "closeup-turbo-references2v-strip09.jpg",
+              "take_offset": 4.651,
+              "take_frame": 112,
+              "song_second": 70.98
+            },
+            {
+              "file": "closeup-turbo-references2v-strip10.jpg",
+              "take_offset": 5.141,
+              "take_frame": 123,
+              "song_second": 71.47
+            },
+            {
+              "file": "closeup-turbo-references2v-strip11.jpg",
+              "take_offset": 5.63,
+              "take_frame": 135,
+              "song_second": 71.96
+            }
+          ],
+          "picture": {
+            "frames": 141,
+            "detail": 376.82,
+            "flicker": 10.9769,
+            "mean_luma": 27.84,
+            "bytes_per_frame": 18137.2,
+            "shot": "closeup",
+            "profile": "turbo-references2v"
+          }
+        }
+      }
+    },
+    "wide": {
+      "meta": {
+        "id": "shot_740424ff5d2a",
+        "title": "Wider performance, singing",
+        "prose": "Aggressive handheld shot of Lucy lunging toward the microphone.",
+        "start": 56.36,
+        "duration": 5.11,
+        "lead": 0.25,
+        "take_t0": 56.11,
+        "frames": 141,
+        "trim": [
+          56.11,
+          61.985
+        ],
+        "lyric": "(lyric line redacted - copyrighted; see the project manifest)",
+        "points": [
+          [
+            57.14,
+            "/\u00f0/ \u2014 onset of \u201cthose\u201d",
+            "dental: tongue tip at the teeth"
+          ],
+          [
+            58.94,
+            "/w/ \u2014 onset of \u201cwolf\u201d",
+            "labio-velar: lips rounded and pushed forward"
+          ],
+          [
+            60.24,
+            "/m/ \u2014 onset of \u201cmoon\u201d",
+            "bilabial nasal: lips fully closed"
+          ],
+          [
+            60.55,
+            "/u\u02d0/ \u2014 sustained vowel of \u201cmoon\u201d",
+            "open control: lips rounded and open"
+          ]
+        ]
+      },
+      "arms": {
+        "default": {
+          "job_id": "job_65d6bf903e55",
+          "prompt_id": "9caa5739-71f7-470e-98da-72986e59274c",
+          "seed": 12,
+          "frames": 141,
+          "comfy_seconds": 2929.499,
+          "comfy_seconds_source": "comfy",
+          "sampling_seconds": null,
+          "sampling_seconds_observed": null,
+          "seconds_per_step": null,
+          "steps": 20,
+          "output": "J:\\Hermes-Remote\\comfyui\\ComfyUI_windows_portable\\ComfyUI\\output\\music-video-producer\\project_59f14d19ff10\\shots\\shot_740424ff5d2a-h3-reference_00001-audio.mp4",
+          "output_files": [
+            "music-video-producer/project_59f14d19ff10/shots/shot_740424ff5d2a-h3-reference_00001-audio.mp4"
+          ],
+          "graph": {
+            "lora": null,
+            "lora_strength": null,
+            "scheduler": "simple",
+            "steps": 20,
+            "sampler": "res_multistep",
+            "noise_seed": 12,
+            "length": 141,
+            "width": 1056,
+            "height": 608,
+            "prompt": "Reference map: <Picture 1> is Lucy, a woman with long wild blonde curls in a black studded leather corset with oxblood panels; <Picture 2> is Vintage Chrome Mic; <Picture 3> is Gritty Warehouse Floor; <Audio 1> is the master song for synchronization. Aggressive handheld shot of Lucy lunging toward the microphone. The character from the reference sheet sings to camera. Stable face and wardrobe, one continuous take. Section look: Vast empty warehouse floor; aggressive, handheld, shaky, low-angle camera work and an animalistic mood."
+          },
+          "stills": [
+            {
+              "file": "wide-default-0.jpg",
+              "song_second": 57.14,
+              "take_offset": 1.03,
+              "take_frame": 25,
+              "label": "/\u00f0/ \u2014 onset of \u201cthose\u201d",
+              "note": "dental: tongue tip at the teeth"
+            },
+            {
+              "file": "wide-default-1.jpg",
+              "song_second": 58.94,
+              "take_offset": 2.83,
+              "take_frame": 68,
+              "label": "/w/ \u2014 onset of \u201cwolf\u201d",
+              "note": "labio-velar: lips rounded and pushed forward"
+            },
+            {
+              "file": "wide-default-2.jpg",
+              "song_second": 60.24,
+              "take_offset": 4.13,
+              "take_frame": 99,
+              "label": "/m/ \u2014 onset of \u201cmoon\u201d",
+              "note": "bilabial nasal: lips fully closed"
+            },
+            {
+              "file": "wide-default-3.jpg",
+              "song_second": 60.55,
+              "take_offset": 4.44,
+              "take_frame": 107,
+              "label": "/u\u02d0/ \u2014 sustained vowel of \u201cmoon\u201d",
+              "note": "open control: lips rounded and open"
+            }
+          ],
+          "audio": {
+            "correlation": 0.9876,
+            "lag_ms": 0.1,
+            "basis": "amplitude envelope, 20 ms window",
+            "waveform_correlation": 0.8849,
+            "waveform_lag_ms": 0.0
+          },
+          "cuts": {
+            "threshold": 0.35,
+            "count": 0,
+            "times": []
+          },
+          "strip": [
+            {
+              "file": "wide-default-strip00.jpg",
+              "take_offset": 0.245,
+              "take_frame": 6,
+              "song_second": 56.35
+            },
+            {
+              "file": "wide-default-strip01.jpg",
+              "take_offset": 0.734,
+              "take_frame": 18,
+              "song_second": 56.84
+            },
+            {
+              "file": "wide-default-strip02.jpg",
+              "take_offset": 1.224,
+              "take_frame": 29,
+              "song_second": 57.33
+            },
+            {
+              "file": "wide-default-strip03.jpg",
+              "take_offset": 1.714,
+              "take_frame": 41,
+              "song_second": 57.82
+            },
+            {
+              "file": "wide-default-strip04.jpg",
+              "take_offset": 2.203,
+              "take_frame": 53,
+              "song_second": 58.31
+            },
+            {
+              "file": "wide-default-strip05.jpg",
+              "take_offset": 2.693,
+              "take_frame": 65,
+              "song_second": 58.8
+            },
+            {
+              "file": "wide-default-strip06.jpg",
+              "take_offset": 3.182,
+              "take_frame": 76,
+              "song_second": 59.29
+            },
+            {
+              "file": "wide-default-strip07.jpg",
+              "take_offset": 3.672,
+              "take_frame": 88,
+              "song_second": 59.78
+            },
+            {
+              "file": "wide-default-strip08.jpg",
+              "take_offset": 4.161,
+              "take_frame": 100,
+              "song_second": 60.27
+            },
+            {
+              "file": "wide-default-strip09.jpg",
+              "take_offset": 4.651,
+              "take_frame": 112,
+              "song_second": 60.76
+            },
+            {
+              "file": "wide-default-strip10.jpg",
+              "take_offset": 5.141,
+              "take_frame": 123,
+              "song_second": 61.25
+            },
+            {
+              "file": "wide-default-strip11.jpg",
+              "take_offset": 5.63,
+              "take_frame": 135,
+              "song_second": 61.74
+            }
+          ],
+          "picture": {
+            "frames": 141,
+            "detail": 130.05,
+            "flicker": 7.2907,
+            "mean_luma": 37.92,
+            "bytes_per_frame": 13843.0,
+            "shot": "wide",
+            "profile": "default"
+          }
+        },
+        "turbo-references2v": {
+          "job_id": "job_5813fc1ccc14",
+          "prompt_id": "1b3ce048-a11f-4ed1-8eb4-f6f62532c917",
+          "seed": 12,
+          "frames": 141,
+          "comfy_seconds": 214.06,
+          "comfy_seconds_source": "comfy",
+          "sampling_seconds": 174.594,
+          "sampling_seconds_observed": 174.594,
+          "seconds_per_step": 21.824,
+          "steps": 8,
+          "output": "J:\\Hermes-Remote\\comfyui\\ComfyUI_windows_portable\\ComfyUI\\output\\music-video-producer\\project_59f14d19ff10\\shots\\shot_740424ff5d2a-h3-reference_00002-audio.mp4",
+          "output_files": [
+            "music-video-producer/project_59f14d19ff10/shots/shot_740424ff5d2a-h3-reference_00002-audio.mp4"
+          ],
+          "graph": {
+            "lora": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+            "lora_strength": 1.0,
+            "scheduler": "simple",
+            "steps": 8,
+            "sampler": "euler",
+            "noise_seed": 12,
+            "length": 141,
+            "width": 1056,
+            "height": 608,
+            "prompt": "Reference map: <Picture 1> is Lucy, a woman with long wild blonde curls in a black studded leather corset with oxblood panels; <Picture 2> is Vintage Chrome Mic; <Picture 3> is Gritty Warehouse Floor; <Audio 1> is the master song for synchronization. Aggressive handheld shot of Lucy lunging toward the microphone. The character from the reference sheet sings to camera. Stable face and wardrobe, one continuous take. Section look: Vast empty warehouse floor; aggressive, handheld, shaky, low-angle camera work and an animalistic mood."
+          },
+          "stills": [
+            {
+              "file": "wide-turbo-references2v-0.jpg",
+              "song_second": 57.14,
+              "take_offset": 1.03,
+              "take_frame": 25,
+              "label": "/\u00f0/ \u2014 onset of \u201cthose\u201d",
+              "note": "dental: tongue tip at the teeth"
+            },
+            {
+              "file": "wide-turbo-references2v-1.jpg",
+              "song_second": 58.94,
+              "take_offset": 2.83,
+              "take_frame": 68,
+              "label": "/w/ \u2014 onset of \u201cwolf\u201d",
+              "note": "labio-velar: lips rounded and pushed forward"
+            },
+            {
+              "file": "wide-turbo-references2v-2.jpg",
+              "song_second": 60.24,
+              "take_offset": 4.13,
+              "take_frame": 99,
+              "label": "/m/ \u2014 onset of \u201cmoon\u201d",
+              "note": "bilabial nasal: lips fully closed"
+            },
+            {
+              "file": "wide-turbo-references2v-3.jpg",
+              "song_second": 60.55,
+              "take_offset": 4.44,
+              "take_frame": 107,
+              "label": "/u\u02d0/ \u2014 sustained vowel of \u201cmoon\u201d",
+              "note": "open control: lips rounded and open"
+            }
+          ],
+          "audio": {
+            "correlation": 0.9825,
+            "lag_ms": 0.1,
+            "basis": "amplitude envelope, 20 ms window",
+            "waveform_correlation": 0.882,
+            "waveform_lag_ms": 0.0
+          },
+          "cuts": {
+            "threshold": 0.35,
+            "count": 0,
+            "times": []
+          },
+          "strip": [
+            {
+              "file": "wide-turbo-references2v-strip00.jpg",
+              "take_offset": 0.245,
+              "take_frame": 6,
+              "song_second": 56.35
+            },
+            {
+              "file": "wide-turbo-references2v-strip01.jpg",
+              "take_offset": 0.734,
+              "take_frame": 18,
+              "song_second": 56.84
+            },
+            {
+              "file": "wide-turbo-references2v-strip02.jpg",
+              "take_offset": 1.224,
+              "take_frame": 29,
+              "song_second": 57.33
+            },
+            {
+              "file": "wide-turbo-references2v-strip03.jpg",
+              "take_offset": 1.714,
+              "take_frame": 41,
+              "song_second": 57.82
+            },
+            {
+              "file": "wide-turbo-references2v-strip04.jpg",
+              "take_offset": 2.203,
+              "take_frame": 53,
+              "song_second": 58.31
+            },
+            {
+              "file": "wide-turbo-references2v-strip05.jpg",
+              "take_offset": 2.693,
+              "take_frame": 65,
+              "song_second": 58.8
+            },
+            {
+              "file": "wide-turbo-references2v-strip06.jpg",
+              "take_offset": 3.182,
+              "take_frame": 76,
+              "song_second": 59.29
+            },
+            {
+              "file": "wide-turbo-references2v-strip07.jpg",
+              "take_offset": 3.672,
+              "take_frame": 88,
+              "song_second": 59.78
+            },
+            {
+              "file": "wide-turbo-references2v-strip08.jpg",
+              "take_offset": 4.161,
+              "take_frame": 100,
+              "song_second": 60.27
+            },
+            {
+              "file": "wide-turbo-references2v-strip09.jpg",
+              "take_offset": 4.651,
+              "take_frame": 112,
+              "song_second": 60.76
+            },
+            {
+              "file": "wide-turbo-references2v-strip10.jpg",
+              "take_offset": 5.141,
+              "take_frame": 123,
+              "song_second": 61.25
+            },
+            {
+              "file": "wide-turbo-references2v-strip11.jpg",
+              "take_offset": 5.63,
+              "take_frame": 135,
+              "song_second": 61.74
+            }
+          ],
+          "picture": {
+            "frames": 141,
+            "detail": 327.34,
+            "flicker": 10.0309,
+            "mean_luma": 33.62,
+            "bytes_per_frame": 18916.8,
+            "shot": "wide",
+            "profile": "turbo-references2v"
+          }
+        }
+      }
+    },
+    "broll": {
+      "meta": {
+        "id": "shot_8cf8e6490471",
+        "title": "B-roll, not singing",
+        "prose": "Thick blue smoke drifts slowly across the damp, cracked ground in the shadows.",
+        "start": 5.5,
+        "duration": 5.5,
+        "lead": 0.25,
+        "take_t0": 5.25,
+        "frames": 158,
+        "trim": [
+          5.25,
+          11.8333
+        ],
+        "lyric": "(measured-voiceless window \u2014 first vocal onset is 11.00 s)",
+        "points": [
+          [
+            6.4,
+            "picture only",
+            "no vocal in this window"
+          ],
+          [
+            7.8,
+            "picture only",
+            "no vocal in this window"
+          ],
+          [
+            9.2,
+            "picture only",
+            "no vocal in this window"
+          ],
+          [
+            10.6,
+            "picture only",
+            "no vocal in this window"
+          ]
+        ]
+      },
+      "arms": {
+        "default": {
+          "job_id": "job_bd9f832450cb",
+          "prompt_id": "aa0ddf29-d338-458c-ba47-953bf2bbd9c2",
+          "seed": 2,
+          "frames": 158,
+          "comfy_seconds": 479.129,
+          "comfy_seconds_source": "comfy",
+          "sampling_seconds": 412.828,
+          "sampling_seconds_observed": 412.828,
+          "seconds_per_step": 20.641,
+          "steps": 20,
+          "output": "J:\\Hermes-Remote\\comfyui\\ComfyUI_windows_portable\\ComfyUI\\output\\music-video-producer\\project_59f14d19ff10\\shots\\shot_8cf8e6490471-h3-reference_00001-audio.mp4",
+          "output_files": [
+            "music-video-producer/project_59f14d19ff10/shots/shot_8cf8e6490471-h3-reference_00001-audio.mp4"
+          ],
+          "graph": {
+            "lora": null,
+            "lora_strength": null,
+            "scheduler": "simple",
+            "steps": 20,
+            "sampler": "res_multistep",
+            "noise_seed": 2,
+            "length": 158,
+            "width": 1056,
+            "height": 608,
+            "prompt": "Reference map: <Picture 1> is Blue Haze Atmosphere; <Picture 2> is Gritty Warehouse Floor; <Audio 1> is the master song for synchronization. Thick blue smoke drifts slowly across the damp, cracked ground in the shadows. Stable face and wardrobe, one continuous take. Section look: Empty, moonlit warehouse; lonely, industrial atmosphere heavy with anticipation."
+          },
+          "stills": [
+            {
+              "file": "broll-default-0.jpg",
+              "song_second": 6.4,
+              "take_offset": 1.15,
+              "take_frame": 28,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            },
+            {
+              "file": "broll-default-1.jpg",
+              "song_second": 7.8,
+              "take_offset": 2.55,
+              "take_frame": 61,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            },
+            {
+              "file": "broll-default-2.jpg",
+              "song_second": 9.2,
+              "take_offset": 3.95,
+              "take_frame": 95,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            },
+            {
+              "file": "broll-default-3.jpg",
+              "song_second": 10.6,
+              "take_offset": 5.35,
+              "take_frame": 128,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            }
+          ],
+          "audio": {
+            "correlation": 0.9664,
+            "lag_ms": -4.1,
+            "basis": "amplitude envelope, 20 ms window",
+            "waveform_correlation": 0.8643,
+            "waveform_lag_ms": -4.1
+          },
+          "cuts": {
+            "threshold": 0.35,
+            "count": 0,
+            "times": []
+          },
+          "strip": [
+            {
+              "file": "broll-default-strip00.jpg",
+              "take_offset": 0.274,
+              "take_frame": 7,
+              "song_second": 5.52
+            },
+            {
+              "file": "broll-default-strip01.jpg",
+              "take_offset": 0.823,
+              "take_frame": 20,
+              "song_second": 6.07
+            },
+            {
+              "file": "broll-default-strip02.jpg",
+              "take_offset": 1.372,
+              "take_frame": 33,
+              "song_second": 6.62
+            },
+            {
+              "file": "broll-default-strip03.jpg",
+              "take_offset": 1.92,
+              "take_frame": 46,
+              "song_second": 7.17
+            },
+            {
+              "file": "broll-default-strip04.jpg",
+              "take_offset": 2.469,
+              "take_frame": 59,
+              "song_second": 7.72
+            },
+            {
+              "file": "broll-default-strip05.jpg",
+              "take_offset": 3.017,
+              "take_frame": 72,
+              "song_second": 8.27
+            },
+            {
+              "file": "broll-default-strip06.jpg",
+              "take_offset": 3.566,
+              "take_frame": 86,
+              "song_second": 8.82
+            },
+            {
+              "file": "broll-default-strip07.jpg",
+              "take_offset": 4.115,
+              "take_frame": 99,
+              "song_second": 9.36
+            },
+            {
+              "file": "broll-default-strip08.jpg",
+              "take_offset": 4.663,
+              "take_frame": 112,
+              "song_second": 9.91
+            },
+            {
+              "file": "broll-default-strip09.jpg",
+              "take_offset": 5.212,
+              "take_frame": 125,
+              "song_second": 10.46
+            },
+            {
+              "file": "broll-default-strip10.jpg",
+              "take_offset": 5.76,
+              "take_frame": 138,
+              "song_second": 11.01
+            },
+            {
+              "file": "broll-default-strip11.jpg",
+              "take_offset": 6.309,
+              "take_frame": 151,
+              "song_second": 11.56
+            }
+          ],
+          "picture": {
+            "frames": 158,
+            "detail": 20.46,
+            "flicker": 0.8701,
+            "mean_luma": 23.51,
+            "bytes_per_frame": 5656.9,
+            "shot": "broll",
+            "profile": "default"
+          }
+        },
+        "turbo-references2v": {
+          "job_id": "job_361741db4625",
+          "prompt_id": "95d84c9d-3d3c-404a-8c3c-c4539763db51",
+          "seed": 2,
+          "frames": 158,
+          "comfy_seconds": 236.597,
+          "comfy_seconds_source": "comfy",
+          "sampling_seconds": 182.438,
+          "sampling_seconds_observed": 182.438,
+          "seconds_per_step": 22.805,
+          "steps": 8,
+          "output": "J:\\Hermes-Remote\\comfyui\\ComfyUI_windows_portable\\ComfyUI\\output\\music-video-producer\\project_59f14d19ff10\\shots\\shot_8cf8e6490471-h3-reference_00002-audio.mp4",
+          "output_files": [
+            "music-video-producer/project_59f14d19ff10/shots/shot_8cf8e6490471-h3-reference_00002-audio.mp4"
+          ],
+          "graph": {
+            "lora": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+            "lora_strength": 1.0,
+            "scheduler": "simple",
+            "steps": 8,
+            "sampler": "euler",
+            "noise_seed": 2,
+            "length": 158,
+            "width": 1056,
+            "height": 608,
+            "prompt": "Reference map: <Picture 1> is Blue Haze Atmosphere; <Picture 2> is Gritty Warehouse Floor; <Audio 1> is the master song for synchronization. Thick blue smoke drifts slowly across the damp, cracked ground in the shadows. Stable face and wardrobe, one continuous take. Section look: Empty, moonlit warehouse; lonely, industrial atmosphere heavy with anticipation."
+          },
+          "stills": [
+            {
+              "file": "broll-turbo-references2v-0.jpg",
+              "song_second": 6.4,
+              "take_offset": 1.15,
+              "take_frame": 28,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            },
+            {
+              "file": "broll-turbo-references2v-1.jpg",
+              "song_second": 7.8,
+              "take_offset": 2.55,
+              "take_frame": 61,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            },
+            {
+              "file": "broll-turbo-references2v-2.jpg",
+              "song_second": 9.2,
+              "take_offset": 3.95,
+              "take_frame": 95,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            },
+            {
+              "file": "broll-turbo-references2v-3.jpg",
+              "song_second": 10.6,
+              "take_offset": 5.35,
+              "take_frame": 128,
+              "label": "picture only",
+              "note": "no vocal in this window"
+            }
+          ],
+          "audio": {
+            "correlation": 0.9638,
+            "lag_ms": -4.1,
+            "basis": "amplitude envelope, 20 ms window",
+            "waveform_correlation": 0.8665,
+            "waveform_lag_ms": -4.1
+          },
+          "cuts": {
+            "threshold": 0.35,
+            "count": 0,
+            "times": []
+          },
+          "strip": [
+            {
+              "file": "broll-turbo-references2v-strip00.jpg",
+              "take_offset": 0.274,
+              "take_frame": 7,
+              "song_second": 5.52
+            },
+            {
+              "file": "broll-turbo-references2v-strip01.jpg",
+              "take_offset": 0.823,
+              "take_frame": 20,
+              "song_second": 6.07
+            },
+            {
+              "file": "broll-turbo-references2v-strip02.jpg",
+              "take_offset": 1.372,
+              "take_frame": 33,
+              "song_second": 6.62
+            },
+            {
+              "file": "broll-turbo-references2v-strip03.jpg",
+              "take_offset": 1.92,
+              "take_frame": 46,
+              "song_second": 7.17
+            },
+            {
+              "file": "broll-turbo-references2v-strip04.jpg",
+              "take_offset": 2.469,
+              "take_frame": 59,
+              "song_second": 7.72
+            },
+            {
+              "file": "broll-turbo-references2v-strip05.jpg",
+              "take_offset": 3.017,
+              "take_frame": 72,
+              "song_second": 8.27
+            },
+            {
+              "file": "broll-turbo-references2v-strip06.jpg",
+              "take_offset": 3.566,
+              "take_frame": 86,
+              "song_second": 8.82
+            },
+            {
+              "file": "broll-turbo-references2v-strip07.jpg",
+              "take_offset": 4.115,
+              "take_frame": 99,
+              "song_second": 9.36
+            },
+            {
+              "file": "broll-turbo-references2v-strip08.jpg",
+              "take_offset": 4.663,
+              "take_frame": 112,
+              "song_second": 9.91
+            },
+            {
+              "file": "broll-turbo-references2v-strip09.jpg",
+              "take_offset": 5.212,
+              "take_frame": 125,
+              "song_second": 10.46
+            },
+            {
+              "file": "broll-turbo-references2v-strip10.jpg",
+              "take_offset": 5.76,
+              "take_frame": 138,
+              "song_second": 11.01
+            },
+            {
+              "file": "broll-turbo-references2v-strip11.jpg",
+              "take_offset": 6.309,
+              "take_frame": 151,
+              "song_second": 11.56
+            }
+          ],
+          "picture": {
+            "frames": 158,
+            "detail": 31.08,
+            "flicker": 0.6703,
+            "mean_luma": 24.94,
+            "bytes_per_frame": 5151.1,
+            "shot": "broll",
+            "profile": "turbo-references2v"
+          }
+        }
+      }
+    }
+  },
+  "renders": [
+    {
+      "label": "closeup",
+      "shot_id": "shot_f82bf42e3abc",
+      "profile": "default",
+      "job_id": "job_fbd3a5376c2c",
+      "prompt_id": "e512649f-cb41-4c40-8b43-e7b8a388313a",
+      "status": "complete",
+      "seed": 14,
+      "render_frames": 141,
+      "render_seconds": 707.478,
+      "render_seconds_source": "comfy",
+      "output_files": [
+        "music-video-producer/project_59f14d19ff10/shots/shot_f82bf42e3abc-h3-reference_00001-audio.mp4"
+      ],
+      "error": "",
+      "wall_seconds": 710.58,
+      "sampler_first_t": 234160.515,
+      "sampler_last_t": 234805.39,
+      "sampler_first_step": 0.0,
+      "sampler_last_step": 20.0,
+      "sampler_steps_max": 20,
+      "ws_execution_seconds": null,
+      "sampling_seconds_observed": 644.875,
+      "sampling_steps_observed": 20.0,
+      "seconds_per_step": 32.244,
+      "sampling_seconds_full": 644.875
+    },
+    {
+      "label": "closeup",
+      "shot_id": "shot_f82bf42e3abc",
+      "profile": "turbo-references2v",
+      "job_id": "job_3a177562476c",
+      "prompt_id": "71de8e17-293e-4c58-8a55-9bb069bf1e61",
+      "status": "complete",
+      "seed": 14,
+      "render_frames": 141,
+      "render_seconds": 240.321,
+      "render_seconds_source": "comfy",
+      "output_files": [
+        "music-video-producer/project_59f14d19ff10/shots/shot_f82bf42e3abc-h3-reference_00002-audio.mp4"
+      ],
+      "error": "",
+      "wall_seconds": 242.89,
+      "sampler_first_t": 238418.296,
+      "sampler_last_t": 238585.421,
+      "sampler_first_step": 0.0,
+      "sampler_last_step": 8.0,
+      "sampler_steps_max": 8,
+      "ws_execution_seconds": null,
+      "sampling_seconds_observed": 167.125,
+      "sampling_steps_observed": 8.0,
+      "seconds_per_step": 20.891,
+      "sampling_seconds_full": 167.125
+    },
+    {
+      "label": "wide",
+      "shot_id": "shot_740424ff5d2a",
+      "profile": "default",
+      "job_id": "job_65d6bf903e55",
+      "prompt_id": "9caa5739-71f7-470e-98da-72986e59274c",
+      "status": "complete",
+      "seed": 12,
+      "render_frames": 141,
+      "render_seconds": 2929.499,
+      "render_seconds_source": "comfy",
+      "output_files": [
+        "music-video-producer/project_59f14d19ff10/shots/shot_740424ff5d2a-h3-reference_00001-audio.mp4"
+      ],
+      "error": "",
+      "sampling_seconds_full": null,
+      "sampling_seconds_observed": null,
+      "seconds_per_step": null,
+      "sampler_steps_max": 20,
+      "note": "harness process was killed mid-render, so the sampler step clock was lost; ComfyUI exec seconds come from the job record. This render also ran during a VRAM-pressure episode (measured 148-185 s/step against 17-22 s/step for every other arm)."
+    },
+    {
+      "label": "wide",
+      "shot_id": "shot_740424ff5d2a",
+      "profile": "turbo-references2v",
+      "job_id": "job_5813fc1ccc14",
+      "prompt_id": "1b3ce048-a11f-4ed1-8eb4-f6f62532c917",
+      "status": "complete",
+      "seed": 12,
+      "render_frames": 141,
+      "render_seconds": 214.06,
+      "render_seconds_source": "comfy",
+      "output_files": [
+        "music-video-producer/project_59f14d19ff10/shots/shot_740424ff5d2a-h3-reference_00002-audio.mp4"
+      ],
+      "error": "",
+      "wall_seconds": 216.16,
+      "sampler_first_t": 238627.531,
+      "sampler_last_t": 238802.125,
+      "sampler_first_step": 0.0,
+      "sampler_last_step": 8.0,
+      "sampler_steps_max": 8,
+      "ws_execution_seconds": null,
+      "sampling_seconds_observed": 174.594,
+      "sampling_steps_observed": 8.0,
+      "seconds_per_step": 21.824,
+      "sampling_seconds_full": 174.594
+    },
+    {
+      "label": "broll",
+      "shot_id": "shot_8cf8e6490471",
+      "profile": "default",
+      "job_id": "job_bd9f832450cb",
+      "prompt_id": "aa0ddf29-d338-458c-ba47-953bf2bbd9c2",
+      "status": "complete",
+      "seed": 2,
+      "render_frames": 158,
+      "render_seconds": 479.129,
+      "render_seconds_source": "comfy",
+      "output_files": [
+        "music-video-producer/project_59f14d19ff10/shots/shot_8cf8e6490471-h3-reference_00001-audio.mp4"
+      ],
+      "error": "",
+      "wall_seconds": 481.98,
+      "sampler_first_t": 237929.328,
+      "sampler_last_t": 238342.156,
+      "sampler_first_step": 0.0,
+      "sampler_last_step": 20.0,
+      "sampler_steps_max": 20,
+      "ws_execution_seconds": null,
+      "sampling_seconds_observed": 412.828,
+      "sampling_steps_observed": 20.0,
+      "seconds_per_step": 20.641,
+      "sampling_seconds_full": 412.828
+    },
+    {
+      "label": "broll",
+      "shot_id": "shot_8cf8e6490471",
+      "profile": "turbo-references2v",
+      "job_id": "job_361741db4625",
+      "prompt_id": "95d84c9d-3d3c-404a-8c3c-c4539763db51",
+      "status": "complete",
+      "seed": 2,
+      "render_frames": 158,
+      "render_seconds": 236.597,
+      "render_seconds_source": "comfy",
+      "output_files": [
+        "music-video-producer/project_59f14d19ff10/shots/shot_8cf8e6490471-h3-reference_00002-audio.mp4"
+      ],
+      "error": "",
+      "wall_seconds": 241.23,
+      "sampler_first_t": 238858.343,
+      "sampler_last_t": 239040.781,
+      "sampler_first_step": 0.0,
+      "sampler_last_step": 8.0,
+      "sampler_steps_max": 8,
+      "ws_execution_seconds": null,
+      "sampling_seconds_observed": 182.438,
+      "sampling_steps_observed": 8.0,
+      "seconds_per_step": 22.805,
+      "sampling_seconds_full": 182.438
+    }
+  ]
+}

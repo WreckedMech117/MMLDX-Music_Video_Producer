@@ -1,0 +1,301 @@
+<title>8-step turbo vs 20-step default</title>
+<style>
+:root{--bg:#12131a;--panel:#1b1d27;--line:#2e3140;--ink:#e8eaf2;--dim:#9aa0b4;
+--good:#7ddc9a;--warn:#ffcf6b;--bad:#ff8b8b;--acc:#8ab4ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1600px;margin:0 auto;padding:32px 24px 80px}
+h1{font-size:26px;margin:0 0 6px}
+h2{font-size:21px;margin:0 0 4px}
+h3{font-size:15px;margin:26px 0 10px;color:var(--dim);text-transform:uppercase;
+letter-spacing:.09em;font-weight:600}
+.sub{color:var(--dim);margin:0 0 26px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+padding:22px;margin:0 0 28px}
+.meta{display:flex;flex-wrap:wrap;gap:8px 22px;color:var(--dim);font-size:13px;margin:8px 0 0}
+.meta b{color:var(--ink);font-weight:600}
+.prose{margin:12px 0 0;padding:11px 14px;background:#0e0f16;border-left:3px solid var(--acc);
+border-radius:0 6px 6px 0;font-style:italic}
+.lyric{margin:8px 0 0;padding:11px 14px;background:#0e0f16;border-left:3px solid #c9a227;
+border-radius:0 6px 6px 0;font-size:13px;color:var(--dim)}
+.scroll{overflow-x:auto;padding-bottom:6px}
+.grid{display:grid;gap:14px;min-width:min-content}
+.col h4{margin:0 0 8px;font-size:13px;font-weight:600}
+.col .tick{color:var(--acc);font-variant-numeric:tabular-nums}
+.col .note{display:block;color:var(--dim);font-weight:400;font-size:12px;margin-top:2px}
+.rowlab{display:flex;align-items:center;font-size:12px;font-weight:600;color:var(--dim);
+writing-mode:vertical-rl;transform:rotate(180deg);justify-content:center;letter-spacing:.06em}
+img{display:block;width:100%;height:auto;border-radius:7px;border:1px solid var(--line);
+background:#000}
+table{border-collapse:collapse;width:100%;font-size:13.5px;
+font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;
+letter-spacing:.06em}
+td.n{text-align:right}
+.tag{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11.5px;
+font-weight:600;letter-spacing:.03em}
+.tag.d{background:#243049;color:#a8c6ff}
+.tag.t{background:#3a2b18;color:#ffcf6b}
+.caveat{background:#1a1520;border:1px solid #3a2b3f;border-radius:10px;padding:16px 20px;
+margin:0 0 28px;font-size:13.5px;color:#d8c7dd}
+.caveat b{color:#fff}
+.caveat ul{margin:8px 0 0;padding-left:20px}
+.caveat li{margin:4px 0}
+</style><div class='wrap'>
+<h1>Does the 8-step bundle hold up?</h1>
+<p class='sub'>Three shots from <b>Harder Faster — Third Video</b>, each rendered twice at the same seed: once on <b>default</b> (20 steps, res_multistep, no LoRA) and once on <b>turbo-references2v</b> (8 steps, euler, minimax_h3_turbo_v4 @ 1.0). Same prompt, same references, same song window.</p>
+<div class='caveat'><b>Read this first.</b><ul><li>A bundle change <b>re-rolls the take</b>. Same seed, same prompt, but a <i>different performance</i> — not the same one rendered better or worse. Nothing here is a frame-by-frame diff, and comparing frame N to frame N would be meaningless.</li><li>Stills for the two singing shots are sampled <b>on named consonants</b>, at the song second the word begins, because that is where mouth shape is legible. Each column states its song second. The last column of each singing shot is an <b>open-vowel control</b>: the mouth should be open there, not closed.</li><li>Audio numbers are <b>comparative, not absolute</b>. H3 regenerates its own audio rather than copying the song, so a correlation well below 1 is correct behaviour. Lag <b>aliases on periodic material</b> — read a difference between arms as signal, an absolute value as a hint. A silent track is reported as absent, never scored.</li></ul></div>
+<div class='card'><h2>The analyst's read</h2><p class='sub' style='margin:6px 0 14px'>Evidence, not a recommendation. The ruling is the Director's and belongs to the pictures above.</p><h3 style='margin-top:0'>Lip-sync — the two singing shots</h3><p>Neither bundle is systematically better, and neither is precise. Across the six consonant samples the result is mixed: at <b>67.16 s</b> (/m/ of “my”) default has the lips together and turbo has the jaw dropped — default is right there. At <b>58.94 s</b> (/w/ of “wolf”) turbo shows clear lip rounding and default barely parts the lips — turbo is right there. At <b>68.26 s</b> (/m/ of “make”) both close the lips; at <b>60.24 s</b> (/m/ of “moon”) neither does. That is approximate bilabial timing in <i>both</i> arms, not a turbo regression.</p><p>The audio agrees and is the stronger evidence, because it is measured rather than eyeballed: envelope correlation differs by <b>0.005 or less</b> on every shot (0.8454 / 0.8404 close-up, 0.9876 / 0.9825 wide, 0.9664 / 0.9638 b-roll) and the lag is identical to <b>0.1 ms</b> in all three pairs. Whatever H3 is doing to lock its regenerated vocal to the song, 8 steps does it as well as 20.</p><h3>Picture</h3><p>Turbo is <b>not softer</b> — it is sharper and punchier. Measured high-frequency energy is <b>higher</b> on every shot (+127%, +152%, +52%), encoded bytes per frame are higher on both singing shots, and the look is more contrast, more saturation, stronger edges. The cost is texture realism: at high zoom turbo's skin reads waxier and its mid-tone micro-texture is flatter, the familiar few-step-LoRA trade of acutance for grain. Eyes and irises are coherent in both. No hands are clearly in frame in any of the six takes, so <b>hands are untested</b>.</p><p>Turbo's frame-to-frame change is higher on the two singing shots (+87%, +38%) and <b>lower</b> on the b-roll (−23%). Read that carefully: turbo also held a tighter, more active framing on both singing shots, so some of that is real motion rather than instability. The b-roll — where both arms hold the same slow drift — is the fair comparison, and there turbo is the <i>steadier</i> of the two.</p><h3>What both bundles do wrong, equally</h3><p>The two singing shots do not stay on their subject. Both arms hold the requested framing for roughly the first half, then pull back, let the character walk out, and spend the remainder on the empty warehouse — despite the submitted prompt asking for “one continuous take”. Scene-change detection finds <b>zero hard cuts</b> in all six takes, so this is a continuous camera drift, not a cut. It is an H3-and-prompt problem and it is <b>present in the 20-step baseline too</b>; switching bundles neither causes nor fixes it. At the same seed the two arms converge on strikingly similar compositions — compare the 70.60 s pair, which is the same empty warehouse twice.</p></div>
+<div class='card'><h2>Cost</h2>
+<table><tr><th>Shot</th><th>Bundle</th><th class='n'>Frames</th><th class='n'>Steps</th><th class='n'>ComfyUI exec (s)</th><th class='n'>Sampling (s)</th><th class='n'>s / step</th><th>Seed</th></tr>
+<tr><td>Close-up, singing</td><td><span class='tag d'>default</span></td><td class='n'>141</td><td class='n'>20</td><td class='n'>707.478</td><td class='n'>644.875</td><td class='n'>32.244</td><td>14</td></tr>
+<tr><td>Close-up, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>141</td><td class='n'>8</td><td class='n'>240.321</td><td class='n'>167.125</td><td class='n'>20.891</td><td>14</td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag d'>default</span></td><td class='n'>141</td><td class='n'>20</td><td class='n'>2929.499</td><td class='n'>None</td><td class='n'>None</td><td>12</td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>141</td><td class='n'>8</td><td class='n'>214.06</td><td class='n'>174.594</td><td class='n'>21.824</td><td>12</td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag d'>default</span></td><td class='n'>158</td><td class='n'>20</td><td class='n'>479.129</td><td class='n'>412.828</td><td class='n'>20.641</td><td>2</td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>158</td><td class='n'>8</td><td class='n'>236.597</td><td class='n'>182.438</td><td class='n'>22.805</td><td>2</td></tr>
+</table>
+<p class='sub' style='margin:12px 0 0;font-size:12.5px'>ComfyUI exec is ComfyUI's own <code>execution_start</code>→<code>execution_success</code> clock, queue wait excluded. Sampling is the sampler node's own step clock off the progress socket, extrapolated to the full step count from the observed per-step rate; it excludes model load, conditioning and VAE decode. The <b>first render of each bundle pays a model/LoRA load</b> the rest do not.</p><div class='caveat' style='margin:16px 0 0'><b>The measured saving is smaller than 4.62×.</b><ul><li>Per <i>step</i> the two bundles cost the same: 20.6 s (default, b-roll) against 22.8 s (turbo, b-roll) — turbo is marginally <i>dearer</i> per step, for the LoRA. The saving is therefore the step count, 20 → 8, and nothing else.</li><li>On the one pair where both arms ran clean and back to back — the b-roll, 158 frames — it is <b>479.1 s vs 236.6 s = 2.0× on ComfyUI exec</b>, or 2.26× on sampling alone. Fixed overhead (model load, conditioning, VAE decode; ~65–75 s a render) dilutes the 2.5× step ratio to about 2×.</li><li>The turbo half of the original estimate checks out exactly: the archived synthetic probe for 158 frames read 236.8 s and this run measured 236.6 s. It is the <i>default</i> half that looks overstated — 4.62× would put a 158-frame default render near 1094 s, and it measured 479.1 s.</li><li><b>wide/default's 2929.5 s is not a bundle number.</b> It ran during a VRAM pressure episode (148–185 s/step against 17–22 s/step everywhere else, power down to ~160 W at 99% utilisation, 631 MiB free). Its sampler clock was also lost when the harness process was killed. Excluded from every ratio above.</li></ul></div></div>
+<div class='card'><h2>What ComfyUI actually ran</h2><p class='sub' style='margin:0 0 14px;font-size:12.5px'>Read back off <code>/history</code> after the fact, not assumed from the request.</p>
+<table><tr><th>Shot</th><th>Bundle</th><th class='n'>Steps</th><th>Sampler</th><th>Scheduler</th><th>LoRA</th><th class='n'>Strength</th><th class='n'>Noise seed</th><th class='n'>Length</th><th>Frame</th></tr>
+<tr><td>Close-up, singing</td><td><span class='tag d'>default</span></td><td class='n'>20</td><td>res_multistep</td><td>simple</td><td style='font-size:11.5px'>— none —</td><td class='n'>—</td><td class='n'>14</td><td class='n'>141</td><td>1056×608</td></tr>
+<tr><td>Close-up, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>8</td><td>euler</td><td>simple</td><td style='font-size:11.5px'>minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors</td><td class='n'>1.0</td><td class='n'>14</td><td class='n'>141</td><td>1056×608</td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag d'>default</span></td><td class='n'>20</td><td>res_multistep</td><td>simple</td><td style='font-size:11.5px'>— none —</td><td class='n'>—</td><td class='n'>12</td><td class='n'>141</td><td>1056×608</td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>8</td><td>euler</td><td>simple</td><td style='font-size:11.5px'>minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors</td><td class='n'>1.0</td><td class='n'>12</td><td class='n'>141</td><td>1056×608</td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag d'>default</span></td><td class='n'>20</td><td>res_multistep</td><td>simple</td><td style='font-size:11.5px'>— none —</td><td class='n'>—</td><td class='n'>2</td><td class='n'>158</td><td>1056×608</td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>8</td><td>euler</td><td>simple</td><td style='font-size:11.5px'>minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors</td><td class='n'>1.0</td><td class='n'>2</td><td class='n'>158</td><td>1056×608</td></tr>
+</table></div>
+<div class='card'><h2>Audio: each take against the song window it was given</h2>
+<table><tr><th>Shot</th><th>Bundle</th><th class='n'>Envelope r</th><th class='n'>Lag (ms)</th><th class='n'>Waveform r</th><th>Note</th></tr>
+<tr><td>Close-up, singing</td><td><span class='tag d'>default</span></td><td class='n'>0.8454</td><td class='n'>24.3</td><td class='n'>0.57</td><td style='font-size:12px;color:var(--dim)'></td></tr>
+<tr><td>Close-up, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>0.8404</td><td class='n'>24.4</td><td class='n'>0.5658</td><td style='font-size:12px;color:var(--dim)'></td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag d'>default</span></td><td class='n'>0.9876</td><td class='n'>0.1</td><td class='n'>0.8849</td><td style='font-size:12px;color:var(--dim)'></td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>0.9825</td><td class='n'>0.1</td><td class='n'>0.882</td><td style='font-size:12px;color:var(--dim)'></td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag d'>default</span></td><td class='n'>0.9664</td><td class='n'>-4.1</td><td class='n'>0.8643</td><td style='font-size:12px;color:var(--dim)'></td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>0.9638</td><td class='n'>-4.1</td><td class='n'>0.8665</td><td style='font-size:12px;color:var(--dim)'></td></tr>
+</table>
+<p class='sub' style='margin:12px 0 0;font-size:12.5px'>Basis: amplitude envelope, 20 ms window, ±1 s search — the same method that produced this project's 0.3399 (default) / 0.2491 (4-step turbo) figures, so these numbers sit on that scale. Each take is measured against <i>its own</i> over-rendered song window, never another shot's.</p></div>
+<div class='card'><h2>Picture, measured</h2><p class='sub' style='margin:0 0 14px;font-size:12.5px'>A bundle change re-rolls the take, so no fixed crop compares the same thing twice. These do not depend on what is in frame. <b>detail</b> = mean Laplacian energy (fine texture and edge acutance). <b>flicker</b> = mean absolute luma change between consecutive frames — it rises with real motion as well as instability, so read it only within a shot. <b>B/frame</b> = encoded bytes per frame, how much the encoder found worth keeping.</p>
+<table><tr><th>Shot</th><th>Bundle</th><th class='n'>Detail</th><th class='n'>Flicker</th><th class='n'>Mean luma</th><th class='n'>B/frame</th><th class='n'>Frames</th></tr>
+<tr><td>Close-up, singing</td><td><span class='tag d'>default</span></td><td class='n'>166.22</td><td class='n'>5.8596</td><td class='n'>24.69</td><td class='n'>14494.9</td><td class='n'>141</td></tr>
+<tr><td>Close-up, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>376.82</td><td class='n'>10.9769</td><td class='n'>27.84</td><td class='n'>18137.2</td><td class='n'>141</td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag d'>default</span></td><td class='n'>130.05</td><td class='n'>7.2907</td><td class='n'>37.92</td><td class='n'>13843.0</td><td class='n'>141</td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>327.34</td><td class='n'>10.0309</td><td class='n'>33.62</td><td class='n'>18916.8</td><td class='n'>141</td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag d'>default</span></td><td class='n'>20.46</td><td class='n'>0.8701</td><td class='n'>23.51</td><td class='n'>5656.9</td><td class='n'>158</td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag t'>turbo-references2v</span></td><td class='n'>31.08</td><td class='n'>0.6703</td><td class='n'>24.94</td><td class='n'>5151.1</td><td class='n'>158</td></tr>
+</table>
+<p class='sub' style='margin:12px 0 0;font-size:12.5px'>turbo against default, same shot: 
+<b>Close-up, singing</b> detail +127%, flicker +87% &nbsp;·&nbsp; <b>Wider performance, singing</b> detail +152%, flicker +38% &nbsp;·&nbsp; <b>B-roll, not singing</b> detail +52%, flicker -23%</p></div>
+<div class='card'>
+<h2>Close-up, singing</h2>
+<div class='meta'><span><b>shot_f82bf42e3abc</b></span><span>window <b>66.58–71.69 s</b> (5.110 s)</span><span>picture <b>141 frames</b> @24fps (5.875 s, over-rendered)</span><span>take frame 0 = song <b>66.33 s</b> (lead 0.25 s)</span></div>
+<div class='prose'>Lucy&#x27;s face, sweating and intense under flickering lights.</div>
+<div class='lyric'>(lyric line redacted &mdash; copyrighted)</div>
+<h3>Same song seconds, both bundles</h3>
+<div class='scroll'><div class='grid' style='grid-template-columns:28px minmax(300px,1fr) minmax(300px,1fr) minmax(300px,1fr) minmax(300px,1fr)'>
+<div></div>
+<div class='col'><h4><span class='tick'>67.16 s</span> · /m/ — onset of “my”<span class='note'>bilabial nasal: lips fully closed · take frame 20</span></h4></div>
+<div class='col'><h4><span class='tick'>67.36 s</span> · /p/ — onset of “pulsing”<span class='note'>bilabial plosive: lips closed, then burst · take frame 25</span></h4></div>
+<div class='col'><h4><span class='tick'>68.26 s</span> · /m/ — onset of “make”<span class='note'>bilabial nasal: lips fully closed · take frame 46</span></h4></div>
+<div class='col'><h4><span class='tick'>70.60 s</span> · /ɔː/ — sustained vowel of “long”<span class='note'>open control: mouth should be wide, not closed · take frame 102</span></h4></div>
+<div class='rowlab'><span class='tag d'>default</span></div>
+<img src='stills/closeup-default-0.jpg' alt='default 67.16s' loading='lazy'>
+<img src='stills/closeup-default-1.jpg' alt='default 67.36s' loading='lazy'>
+<img src='stills/closeup-default-2.jpg' alt='default 68.26s' loading='lazy'>
+<img src='stills/closeup-default-3.jpg' alt='default 70.60s' loading='lazy'>
+<div class='rowlab'><span class='tag t'>turbo-references2v</span></div>
+<img src='stills/closeup-turbo-references2v-0.jpg' alt='turbo-references2v 67.16s' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-1.jpg' alt='turbo-references2v 67.36s' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-2.jpg' alt='turbo-references2v 68.26s' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-3.jpg' alt='turbo-references2v 70.60s' loading='lazy'>
+</div></div>
+<h3>Whole take, evenly sampled — continuity check</h3>
+<p class='sub' style='margin:-4px 0 10px;font-size:12.5px'>12 frames spread across the full 5.88 s picture. Read across a row: a jump in framing, wardrobe or identity is a shot-internal cut, which the prompt asked not to happen (“one continuous take”).</p>
+<div class='scroll'><div class='grid' style='grid-template-columns:28px minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr)'>
+<div></div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>66.57s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>67.06s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>67.55s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>68.04s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>68.53s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>69.02s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>69.51s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>70.00s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>70.49s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>70.98s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>71.47s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>71.96s</div>
+<div class='rowlab'><span class='tag d'>default</span></div>
+<img src='stills/closeup-default-strip00.jpg' alt='default strip 0' loading='lazy'>
+<img src='stills/closeup-default-strip01.jpg' alt='default strip 1' loading='lazy'>
+<img src='stills/closeup-default-strip02.jpg' alt='default strip 2' loading='lazy'>
+<img src='stills/closeup-default-strip03.jpg' alt='default strip 3' loading='lazy'>
+<img src='stills/closeup-default-strip04.jpg' alt='default strip 4' loading='lazy'>
+<img src='stills/closeup-default-strip05.jpg' alt='default strip 5' loading='lazy'>
+<img src='stills/closeup-default-strip06.jpg' alt='default strip 6' loading='lazy'>
+<img src='stills/closeup-default-strip07.jpg' alt='default strip 7' loading='lazy'>
+<img src='stills/closeup-default-strip08.jpg' alt='default strip 8' loading='lazy'>
+<img src='stills/closeup-default-strip09.jpg' alt='default strip 9' loading='lazy'>
+<img src='stills/closeup-default-strip10.jpg' alt='default strip 10' loading='lazy'>
+<img src='stills/closeup-default-strip11.jpg' alt='default strip 11' loading='lazy'>
+<div class='rowlab'><span class='tag t'>turbo-references2v</span></div>
+<img src='stills/closeup-turbo-references2v-strip00.jpg' alt='turbo-references2v strip 0' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip01.jpg' alt='turbo-references2v strip 1' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip02.jpg' alt='turbo-references2v strip 2' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip03.jpg' alt='turbo-references2v strip 3' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip04.jpg' alt='turbo-references2v strip 4' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip05.jpg' alt='turbo-references2v strip 5' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip06.jpg' alt='turbo-references2v strip 6' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip07.jpg' alt='turbo-references2v strip 7' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip08.jpg' alt='turbo-references2v strip 8' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip09.jpg' alt='turbo-references2v strip 9' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip10.jpg' alt='turbo-references2v strip 10' loading='lazy'>
+<img src='stills/closeup-turbo-references2v-strip11.jpg' alt='turbo-references2v strip 11' loading='lazy'>
+</div></div>
+</div>
+<div class='card'>
+<h2>Wider performance, singing</h2>
+<div class='meta'><span><b>shot_740424ff5d2a</b></span><span>window <b>56.36–61.47 s</b> (5.110 s)</span><span>picture <b>141 frames</b> @24fps (5.875 s, over-rendered)</span><span>take frame 0 = song <b>56.11 s</b> (lead 0.25 s)</span></div>
+<div class='prose'>Aggressive handheld shot of Lucy lunging toward the microphone.</div>
+<div class='lyric'>(lyric line redacted &mdash; copyrighted)</div>
+<h3>Same song seconds, both bundles</h3>
+<div class='scroll'><div class='grid' style='grid-template-columns:28px minmax(300px,1fr) minmax(300px,1fr) minmax(300px,1fr) minmax(300px,1fr)'>
+<div></div>
+<div class='col'><h4><span class='tick'>57.14 s</span> · /ð/ — onset of “those”<span class='note'>dental: tongue tip at the teeth · take frame 25</span></h4></div>
+<div class='col'><h4><span class='tick'>58.94 s</span> · /w/ — onset of “wolf”<span class='note'>labio-velar: lips rounded and pushed forward · take frame 68</span></h4></div>
+<div class='col'><h4><span class='tick'>60.24 s</span> · /m/ — onset of “moon”<span class='note'>bilabial nasal: lips fully closed · take frame 99</span></h4></div>
+<div class='col'><h4><span class='tick'>60.55 s</span> · /uː/ — sustained vowel of “moon”<span class='note'>open control: lips rounded and open · take frame 107</span></h4></div>
+<div class='rowlab'><span class='tag d'>default</span></div>
+<img src='stills/wide-default-0.jpg' alt='default 57.14s' loading='lazy'>
+<img src='stills/wide-default-1.jpg' alt='default 58.94s' loading='lazy'>
+<img src='stills/wide-default-2.jpg' alt='default 60.24s' loading='lazy'>
+<img src='stills/wide-default-3.jpg' alt='default 60.55s' loading='lazy'>
+<div class='rowlab'><span class='tag t'>turbo-references2v</span></div>
+<img src='stills/wide-turbo-references2v-0.jpg' alt='turbo-references2v 57.14s' loading='lazy'>
+<img src='stills/wide-turbo-references2v-1.jpg' alt='turbo-references2v 58.94s' loading='lazy'>
+<img src='stills/wide-turbo-references2v-2.jpg' alt='turbo-references2v 60.24s' loading='lazy'>
+<img src='stills/wide-turbo-references2v-3.jpg' alt='turbo-references2v 60.55s' loading='lazy'>
+</div></div>
+<h3>Whole take, evenly sampled — continuity check</h3>
+<p class='sub' style='margin:-4px 0 10px;font-size:12.5px'>12 frames spread across the full 5.88 s picture. Read across a row: a jump in framing, wardrobe or identity is a shot-internal cut, which the prompt asked not to happen (“one continuous take”).</p>
+<div class='scroll'><div class='grid' style='grid-template-columns:28px minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr)'>
+<div></div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>56.35s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>56.84s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>57.33s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>57.82s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>58.31s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>58.80s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>59.29s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>59.78s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>60.27s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>60.76s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>61.25s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>61.74s</div>
+<div class='rowlab'><span class='tag d'>default</span></div>
+<img src='stills/wide-default-strip00.jpg' alt='default strip 0' loading='lazy'>
+<img src='stills/wide-default-strip01.jpg' alt='default strip 1' loading='lazy'>
+<img src='stills/wide-default-strip02.jpg' alt='default strip 2' loading='lazy'>
+<img src='stills/wide-default-strip03.jpg' alt='default strip 3' loading='lazy'>
+<img src='stills/wide-default-strip04.jpg' alt='default strip 4' loading='lazy'>
+<img src='stills/wide-default-strip05.jpg' alt='default strip 5' loading='lazy'>
+<img src='stills/wide-default-strip06.jpg' alt='default strip 6' loading='lazy'>
+<img src='stills/wide-default-strip07.jpg' alt='default strip 7' loading='lazy'>
+<img src='stills/wide-default-strip08.jpg' alt='default strip 8' loading='lazy'>
+<img src='stills/wide-default-strip09.jpg' alt='default strip 9' loading='lazy'>
+<img src='stills/wide-default-strip10.jpg' alt='default strip 10' loading='lazy'>
+<img src='stills/wide-default-strip11.jpg' alt='default strip 11' loading='lazy'>
+<div class='rowlab'><span class='tag t'>turbo-references2v</span></div>
+<img src='stills/wide-turbo-references2v-strip00.jpg' alt='turbo-references2v strip 0' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip01.jpg' alt='turbo-references2v strip 1' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip02.jpg' alt='turbo-references2v strip 2' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip03.jpg' alt='turbo-references2v strip 3' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip04.jpg' alt='turbo-references2v strip 4' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip05.jpg' alt='turbo-references2v strip 5' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip06.jpg' alt='turbo-references2v strip 6' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip07.jpg' alt='turbo-references2v strip 7' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip08.jpg' alt='turbo-references2v strip 8' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip09.jpg' alt='turbo-references2v strip 9' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip10.jpg' alt='turbo-references2v strip 10' loading='lazy'>
+<img src='stills/wide-turbo-references2v-strip11.jpg' alt='turbo-references2v strip 11' loading='lazy'>
+</div></div>
+</div>
+<div class='card'>
+<h2>B-roll, not singing</h2>
+<div class='meta'><span><b>shot_8cf8e6490471</b></span><span>window <b>5.50–11.00 s</b> (5.500 s)</span><span>picture <b>158 frames</b> @24fps (6.583 s, over-rendered)</span><span>take frame 0 = song <b>5.25 s</b> (lead 0.25 s)</span></div>
+<div class='prose'>Thick blue smoke drifts slowly across the damp, cracked ground in the shadows.</div>
+<div class='lyric'>(lyric line redacted &mdash; copyrighted)</div>
+<h3>Same song seconds, both bundles</h3>
+<div class='scroll'><div class='grid' style='grid-template-columns:28px minmax(300px,1fr) minmax(300px,1fr) minmax(300px,1fr) minmax(300px,1fr)'>
+<div></div>
+<div class='col'><h4><span class='tick'>6.40 s</span> · picture only<span class='note'>no vocal in this window · take frame 28</span></h4></div>
+<div class='col'><h4><span class='tick'>7.80 s</span> · picture only<span class='note'>no vocal in this window · take frame 61</span></h4></div>
+<div class='col'><h4><span class='tick'>9.20 s</span> · picture only<span class='note'>no vocal in this window · take frame 95</span></h4></div>
+<div class='col'><h4><span class='tick'>10.60 s</span> · picture only<span class='note'>no vocal in this window · take frame 128</span></h4></div>
+<div class='rowlab'><span class='tag d'>default</span></div>
+<img src='stills/broll-default-0.jpg' alt='default 6.40s' loading='lazy'>
+<img src='stills/broll-default-1.jpg' alt='default 7.80s' loading='lazy'>
+<img src='stills/broll-default-2.jpg' alt='default 9.20s' loading='lazy'>
+<img src='stills/broll-default-3.jpg' alt='default 10.60s' loading='lazy'>
+<div class='rowlab'><span class='tag t'>turbo-references2v</span></div>
+<img src='stills/broll-turbo-references2v-0.jpg' alt='turbo-references2v 6.40s' loading='lazy'>
+<img src='stills/broll-turbo-references2v-1.jpg' alt='turbo-references2v 7.80s' loading='lazy'>
+<img src='stills/broll-turbo-references2v-2.jpg' alt='turbo-references2v 9.20s' loading='lazy'>
+<img src='stills/broll-turbo-references2v-3.jpg' alt='turbo-references2v 10.60s' loading='lazy'>
+</div></div>
+<h3>Whole take, evenly sampled — continuity check</h3>
+<p class='sub' style='margin:-4px 0 10px;font-size:12.5px'>12 frames spread across the full 6.58 s picture. Read across a row: a jump in framing, wardrobe or identity is a shot-internal cut, which the prompt asked not to happen (“one continuous take”).</p>
+<div class='scroll'><div class='grid' style='grid-template-columns:28px minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr) minmax(130px,1fr)'>
+<div></div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>5.52s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>6.07s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>6.62s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>7.17s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>7.72s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>8.27s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>8.82s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>9.36s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>9.91s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>10.46s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>11.01s</div>
+<div class='col' style='font-size:11px;color:var(--dim);text-align:center'>11.56s</div>
+<div class='rowlab'><span class='tag d'>default</span></div>
+<img src='stills/broll-default-strip00.jpg' alt='default strip 0' loading='lazy'>
+<img src='stills/broll-default-strip01.jpg' alt='default strip 1' loading='lazy'>
+<img src='stills/broll-default-strip02.jpg' alt='default strip 2' loading='lazy'>
+<img src='stills/broll-default-strip03.jpg' alt='default strip 3' loading='lazy'>
+<img src='stills/broll-default-strip04.jpg' alt='default strip 4' loading='lazy'>
+<img src='stills/broll-default-strip05.jpg' alt='default strip 5' loading='lazy'>
+<img src='stills/broll-default-strip06.jpg' alt='default strip 6' loading='lazy'>
+<img src='stills/broll-default-strip07.jpg' alt='default strip 7' loading='lazy'>
+<img src='stills/broll-default-strip08.jpg' alt='default strip 8' loading='lazy'>
+<img src='stills/broll-default-strip09.jpg' alt='default strip 9' loading='lazy'>
+<img src='stills/broll-default-strip10.jpg' alt='default strip 10' loading='lazy'>
+<img src='stills/broll-default-strip11.jpg' alt='default strip 11' loading='lazy'>
+<div class='rowlab'><span class='tag t'>turbo-references2v</span></div>
+<img src='stills/broll-turbo-references2v-strip00.jpg' alt='turbo-references2v strip 0' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip01.jpg' alt='turbo-references2v strip 1' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip02.jpg' alt='turbo-references2v strip 2' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip03.jpg' alt='turbo-references2v strip 3' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip04.jpg' alt='turbo-references2v strip 4' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip05.jpg' alt='turbo-references2v strip 5' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip06.jpg' alt='turbo-references2v strip 6' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip07.jpg' alt='turbo-references2v strip 7' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip08.jpg' alt='turbo-references2v strip 8' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip09.jpg' alt='turbo-references2v strip 9' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip10.jpg' alt='turbo-references2v strip 10' loading='lazy'>
+<img src='stills/broll-turbo-references2v-strip11.jpg' alt='turbo-references2v strip 11' loading='lazy'>
+</div></div>
+</div>
+<div class='card'><h2>The takes</h2><p class='sub' style='margin:0 0 12px;font-size:12.5px'>Stills only go so far — lip-sync is a moving judgement. These are the six rendered files; <code>_00001</code> is default, <code>_00002</code> is turbo, and the <code>-audio</code> file is the one carrying H3's regenerated audio. Nothing was overwritten: both takes of every shot are on disk.</p>
+<table><tr><th>Shot</th><th>Bundle</th><th>File</th></tr>
+<tr><td>Close-up, singing</td><td><span class='tag d'>default</span></td><td style='font-size:11.5px'><code>J:\Hermes-Remote\comfyui\ComfyUI_windows_portable\ComfyUI\output\music-video-producer\project_59f14d19ff10\shots\shot_f82bf42e3abc-h3-reference_00001-audio.mp4</code></td></tr>
+<tr><td>Close-up, singing</td><td><span class='tag t'>turbo-references2v</span></td><td style='font-size:11.5px'><code>J:\Hermes-Remote\comfyui\ComfyUI_windows_portable\ComfyUI\output\music-video-producer\project_59f14d19ff10\shots\shot_f82bf42e3abc-h3-reference_00002-audio.mp4</code></td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag d'>default</span></td><td style='font-size:11.5px'><code>J:\Hermes-Remote\comfyui\ComfyUI_windows_portable\ComfyUI\output\music-video-producer\project_59f14d19ff10\shots\shot_740424ff5d2a-h3-reference_00001-audio.mp4</code></td></tr>
+<tr><td>Wider performance, singing</td><td><span class='tag t'>turbo-references2v</span></td><td style='font-size:11.5px'><code>J:\Hermes-Remote\comfyui\ComfyUI_windows_portable\ComfyUI\output\music-video-producer\project_59f14d19ff10\shots\shot_740424ff5d2a-h3-reference_00002-audio.mp4</code></td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag d'>default</span></td><td style='font-size:11.5px'><code>J:\Hermes-Remote\comfyui\ComfyUI_windows_portable\ComfyUI\output\music-video-producer\project_59f14d19ff10\shots\shot_8cf8e6490471-h3-reference_00001-audio.mp4</code></td></tr>
+<tr><td>B-roll, not singing</td><td><span class='tag t'>turbo-references2v</span></td><td style='font-size:11.5px'><code>J:\Hermes-Remote\comfyui\ComfyUI_windows_portable\ComfyUI\output\music-video-producer\project_59f14d19ff10\shots\shot_8cf8e6490471-h3-reference_00002-audio.mp4</code></td></tr>
+</table></div>
+</div>
