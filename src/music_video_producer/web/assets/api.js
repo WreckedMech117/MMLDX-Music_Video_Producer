@@ -3068,6 +3068,54 @@ export function consistencyAnchorPlan(asset, draft) {
   };
 }
 
+// `app.ASSET_NAME_LIMIT`. Held to the route's number by a contract test, on the anchor's own
+// argument: a client that shortens silently and a route that 422s the same text are two rules
+// wearing one number.
+export const ASSET_NAME_LIMIT = 80;
+
+export const ASSET_NAME_LABEL = "Name";
+
+// Said on screen because a rename is the one asset edit with consequences the Director cannot
+// see in the panel: what it cannot break, and what it does not touch. The route's own message
+// says the same thing after the fact; this says it before.
+export const ASSET_NAME_HELP =
+  "What this asset is called everywhere — the library, the reference map a render is " +
+  "conditioned on, and the roster the planner is shown. Shots keep their references when you " +
+  "rename, but prompts already written keep the old name until they are re-expanded.";
+
+// The one decision behind the name editor: what is stored, what is in the box, and whether it can
+// be saved.
+//
+// Offered for every asset, unlike the anchor — a sound has no appearance but it does have a name.
+// `draft` defaults to the stored value so a plan built for a freshly selected asset reports the
+// truth, and both the change test and the bound are measured on the TRIMMED text, because the
+// route trims before it stores and before it measures.
+//
+// Empty is unsavable rather than a clear, which is the route's rule: an anchor's empty box means
+// "no anchor", and a name has no such meaning.
+export function assetNamePlan(asset, draft) {
+  if (!asset) return null;
+  const stored = String(asset.name ?? "");
+  const text = String(draft ?? stored);
+  const trimmed = text.trim();
+  const over = trimmed.length > ASSET_NAME_LIMIT;
+  const empty = trimmed.length === 0;
+  const changed = trimmed !== stored.trim();
+  const counted = `${trimmed.length.toLocaleString("en-US")} / ${ASSET_NAME_LIMIT.toLocaleString("en-US")}`;
+  return {
+    stored,
+    draft: text,
+    length: trimmed.length,
+    over,
+    empty,
+    changed,
+    // Savable only when it is a real change, non-empty and inside the bound, so the button
+    // cannot send a request the route is certain to refuse.
+    savable: changed && !over && !empty,
+    count: over ? `${counted} — too long to save` : empty ? `${counted} — a name cannot be empty` : counted,
+  };
+}
+
 // -------------------------------------------------------------------------------------------
 // Replace With / Cancel: the way through the delete refusal. The Director's own ask
 // (2026-08-20) -- "a nice Replace With/Cancel option set would be nice so then i could select
@@ -4667,6 +4715,13 @@ export const api = {
   // the stored slot per asset id and can never write this field, so no ordinary save can un-slot
   // the cast and leave every `(S1)` in the sheet resolving to nothing.
   saveCharacterSlot: (projectId, assetId, character_slot) => request(`/api/projects/${projectId}/assets/${assetId}/character-slot`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ character_slot }) }),
+  // The display name's one door, on the same argument as the two above — and here the hazard runs
+  // the other way: `name` is required, so a stale tab does not omit it, it *reasserts* it, and one
+  // ordinary save would undo a rename. The whole-project PUT re-adopts the stored name per asset
+  // id, so this is the only call that can change one. Answers `{project, name, previous, prompts,
+  // maps, message}` rather than a bare project: a rename has consequences that are invisible in
+  // the manifest, and the message is where they are said.
+  renameAsset: (projectId, assetId, name) => request(`/api/projects/${projectId}/assets/${assetId}/name`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ name }) }),
   analyzeLatestTake: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/analyze-latest`, { method: "POST" }),
   compileTimeline: (id, body) => request(`/api/projects/${id}/timeline/compile`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // A GET, and nothing is cached from it: readiness is derived from the prompts on every call, so

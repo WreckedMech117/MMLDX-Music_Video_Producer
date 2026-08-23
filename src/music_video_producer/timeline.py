@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
@@ -232,13 +232,84 @@ def proposal_for_position(
     """Which proposal a tiled window draws its prompt from: the one whose *proportional*
     span of the song contains this position. Repairing the count must not orphan a window
     from the story — a segment in the song's second quarter takes the prompt the model
-    wrote for the second quarter, whether the repair split, merged, or kept its windows."""
+    wrote for the second quarter, whether the repair split, merged, or kept its windows.
+
+    **The extent this divides is the caller's, and since 2026-08-22 it is usually a section
+    rather than the song.** `app.paired_proposals` calls it twice over: once over the whole
+    song for a layout with no section layer (the behaviour this function shipped with, byte
+    for byte), and once per section over *ranks* — ``position`` a window's zero-based rank
+    plus a half, ``song_duration`` how many windows that section holds — so the arithmetic
+    that spreads proposals across an extent has one implementation whichever extent it is.
+    """
     if proposal_count <= 0:
         raise TimelineError("No proposals to draw prompts from")
     if song_duration <= 0:
         return 0
     index = int(position / song_duration * proposal_count)
     return min(max(index, 0), proposal_count - 1)
+
+
+#: How long an unmarked stretch of song has to be before a layout tiles it as its own span.
+#:
+#: Half a second, which is `lay_out_shots`' own literal moved here with `layout_spans`. Shorter
+#: than this and the stretch is a rounding artefact of two section boxes the Director dragged
+#: together rather than a piece of song with no section on it — tiling it would produce a
+#: sub-frame window, and leaving it uncovered leaves a hole assembly already tolerates.
+SPAN_MIN_SECONDS = 0.5
+
+
+def layout_spans(
+    sections: Sequence[Any], song_duration: float
+) -> list[tuple[float, float]]:
+    """The stretches of song a layout tiles **independently**, in order: ``(start, length)``.
+
+    One span per marked section, plus every unmarked stretch before, between and after them
+    that is longer than `SPAN_MIN_SECONDS`. Tiling each on its own is what keeps a shot from
+    straddling a section boundary — the Director's ask, and the thing the lay-out instruction
+    tells the model in words ("every shot sits inside one section and takes that section's
+    character").
+
+    **Extracted so the two steps that must agree about sections cannot disagree.** Lay-out
+    tiles these spans; fill-in pairs proposals to windows inside them (`app.paired_proposals`).
+    Until 2026-08-22 only lay-out knew about them, and fill-in mapped content to windows by
+    global proportion — which undid the boundaries lay-out had just built, measured live on a
+    31-window plan as four windows carrying prose written for a different section.
+
+    An empty section layer answers ``[]`` rather than one whole-song span, and the emptiness is
+    load-bearing: it is how a caller tells "no sections were marked" from "one section covers
+    the song", and the two want different behaviour in both callers.
+    """
+    if not sections:
+        return []
+    spans: list[tuple[float, float]] = []
+    cursor = 0.0
+    for section in sections:
+        if section.start - cursor > SPAN_MIN_SECONDS:
+            spans.append((cursor, section.start - cursor))
+        spans.append((section.start, section.duration))
+        cursor = section.end
+    if song_duration - cursor > SPAN_MIN_SECONDS:
+        spans.append((cursor, song_duration - cursor))
+    return spans
+
+
+def section_edges(sections: Sequence[Any]) -> dict[float, str]:
+    """Every second a marked section starts or ends at, mapped to the section's label.
+
+    What `snap_window_plan` is handed so a cut sitting on one of these is left alone — see
+    `SNAP_SECTION_BOUNDARY`. Both doors onto the snapper build it from the same function, so
+    a boundary that is protected on a fresh layout is protected on a stored timeline.
+
+    **A start wins a collision**, which is the ordinary case: a section that ends where the
+    next begins is one boundary, and naming it by the section that *opens* there reads the way
+    a Director reads a timeline. `song_section` breaks its own tie the same way.
+    """
+    edges: dict[float, str] = {}
+    for section in sections:
+        edges.setdefault(section.end, section.label)
+    for section in sections:
+        edges[section.start] = section.label
+    return edges
 
 
 def over_render_lead(
@@ -1714,6 +1785,24 @@ SNAP_IN_FLIGHT_REFUSAL = (
     "would change. Wait for it, or refresh the render queue if it has already finished and "
     "this project has not been told yet."
 )
+#: The layout's own boundary, protected from the step that comes after it.
+#:
+#: **The defect this closes, measured live 2026-08-21.** Lay-out tiles each section separately so
+#: no shot straddles a boundary, and then line-up — which knew nothing about sections — moved 2 of
+#: 5 cuts *across* one: 11.000 → 10.850 over the Intro/Verse switch and 103.200 → 103.050 over
+#: Chorus 2/Bridge. Step 2 was quietly spending the boundary step 1 exists to protect, and the
+#: 0.15 s it bought was a phrase edge the section switch already is.
+#:
+#: A protection rather than a preference, and refused rather than clamped, for `SNAP_HOLE`'s
+#: reason: moving such a cut *anywhere* runs one section's shot into the next section's seconds,
+#: and choosing which side should give way is an editing decision this pass cannot make. A
+#: section boundary is the music's own switch, so a cut already on one is already where the
+#: phrase changes.
+SNAP_SECTION_BOUNDARY = (
+    "The cut between {before} and {after} at {boundary:.3f}s sits on the boundary of "
+    "{section}, and the layout put it there so no shot straddles a section. Moving it would "
+    "run one section's shot into the next section's seconds. Left where it was."
+)
 #: Not a refusal — the good case where there was nothing to do. Reported rather than dropped,
 #: because "18 cuts already land in silence" is the sentence that tells a Director the plan is
 #: healthier than they feared.
@@ -2145,6 +2234,11 @@ def snap_cut_plan(
     — see `SNAP_HOLE` — or when one shot is laid wholly over another (`SNAP_NESTED`). An
     **overlapping** plan is snapped, not refused: an overlap is an authored transition and it
     moves as a unit.
+
+    The Director's own section marks travel with the windows (`section_edges`), so a cut sitting
+    on a section boundary is refused here exactly as it is on populate's line-up step. Both
+    doors observe the one decision; a boundary that is protected on a fresh layout cannot be
+    spent on a stored timeline.
     """
     return snap_window_plan(
         shot_snap_windows(project, rendering=rendering),
@@ -2152,6 +2246,7 @@ def snap_cut_plan(
         tolerance=tolerance,
         minimum=minimum,
         maximum=maximum,
+        sections=section_edges(project.sections),
     )
 
 
@@ -2162,6 +2257,7 @@ def snap_window_plan(
     tolerance: float = SNAP_TOLERANCE_DEFAULT,
     minimum: float = H3_MIN_SHOT_SECONDS,
     maximum: float = H3_MAX_SHOT_SECONDS,
+    sections: Mapping[float, str] | None = None,
 ) -> CutSnapPlan:
     """Propose a new position for every cut in a plan. The one implementation.
 
@@ -2180,6 +2276,13 @@ def snap_window_plan(
     `windows` arrive **in song order** — the caller's ordering is the one used, unchanged —
     and each carries its own `refusal`, so this function decides nothing about protections
     beyond honouring them.
+
+    **`sections` is the fourth protection and it belongs to the plan rather than to a window**,
+    which is why it arrives as its own argument: `section_edges`' mapping of every second a
+    marked section starts or ends at to that section's label. A cut within half a frame of one
+    is skipped with `SNAP_SECTION_BOUNDARY` — see there for the live defect it closes.
+    `None` (the default) is a caller with no section layer to honour, and is the behaviour every
+    caller had before 2026-08-22.
 
     **The band.** ``minimum``/``maximum`` default to `H3_MIN_SHOT_SECONDS` and
     `H3_MAX_SHOT_SECONDS` — 4–15 s — which is the band `populate_windows` itself defaults to,
@@ -2266,6 +2369,30 @@ def snap_window_plan(
         refusal = before.refusal or after.refusal
         if refusal:
             skips.append(CutSkip(**names, reason=refusal))
+            continue
+        # The plan's own protection, asked immediately after the windows' three and before
+        # anything about the track is read: it is structural, it is unconditional, and a cut on
+        # a section boundary will not move whatever the gaps say. Matched within
+        # `SNAP_CONTIGUITY_TOLERANCE` — this module's "the same boundary written twice" number —
+        # because a section box the Director dragged and a window rounded to the millisecond
+        # describe the same instant without being the same float.
+        edge = next(
+            (
+                label
+                for at, label in (sections or {}).items()
+                if abs(at - boundary) <= SNAP_CONTIGUITY_TOLERANCE
+            ),
+            None,
+        )
+        if edge is not None:
+            skips.append(
+                CutSkip(
+                    **names,
+                    reason=SNAP_SECTION_BOUNDARY.format(
+                        **labels, boundary=boundary, section=edge
+                    ),
+                )
+            )
             continue
         # A measured track with no usable gap inside the plan's window — every second of it
         # sung, or every rest under `SNAP_MINIMUM_GAP_SECONDS`. There is nothing to be nearest

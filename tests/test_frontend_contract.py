@@ -16,6 +16,7 @@ from test_workflows import PANEL_COUNT_PATTERN
 
 from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
+    ASSET_NAME_LIMIT,
     CONSISTENCY_PROMPT_LIMIT,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
@@ -13062,13 +13063,153 @@ def test_the_client_calls_the_one_writer_for_each_new_field():
         return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({}) }); };
       await api.saveVocalType('p1', 'duet');
       await api.saveCharacterSlot('p1', 'a1', 2);
+      await api.renameAsset('p1', 'a1', 'Lucy');
       console.log(JSON.stringify(seen));
     """)
 
     assert calls == [
         ["/api/projects/p1/song/vocal-type", "PUT", '{"vocal_type":"duet"}'],
         ["/api/projects/p1/assets/a1/character-slot", "PUT", '{"character_slot":2}'],
+        ["/api/projects/p1/assets/a1/name", "PUT", '{"name":"Lucy"}'],
     ]
+
+
+# ----------------------------------------------------------------------------------------------
+# Renaming an asset (2026-08-22).
+#
+# The Director's fix for the internal label leaking into shot prose. The client half is the
+# anchor editor's shape with one rule inverted: an empty box is unsavable rather than a clear.
+# ----------------------------------------------------------------------------------------------
+
+
+def test_the_name_editor_decides_every_state_from_one_executed_rule():
+    """Executed, kind by kind and state by state, and the bound is compared to the route's.
+
+    Offered for **every** kind including `audio`, which is where this parts from the anchor: a
+    sound has no appearance but it does have a name. And the empty box is not a clear — the
+    route refuses a blank name by name, so the button must not be able to send one.
+    """
+    kinds = list(get_args(AssetKind))
+    executed = run_module(f"""
+      import {{ ASSET_NAME_LIMIT, assetNamePlan }}
+        from './src/music_video_producer/web/assets/api.js';
+      const kinds = {json.dumps(kinds)};
+      const offered = {{}};
+      for (const kind of kinds) {{
+        offered[kind] = assetNamePlan({{ id: 'a', kind, name: 'Anything' }}) !== null;
+      }}
+      const stored = {{ id: 'a', kind: 'character', name: 'HarderFaster \\u00b7 multiview' }};
+      console.log(JSON.stringify({{
+        limit: ASSET_NAME_LIMIT,
+        offered,
+        nothingSelected: assetNamePlan(null),
+        untouched: assetNamePlan(stored),
+        whitespaceOnly: assetNamePlan(stored, '  HarderFaster \\u00b7 multiview  '),
+        renamed: assetNamePlan(stored, 'Lucy'),
+        emptied: assetNamePlan(stored, '   '),
+        overLong: assetNamePlan(stored, 'z'.repeat(ASSET_NAME_LIMIT + 1)),
+        atLimit: assetNamePlan(stored, 'z'.repeat(ASSET_NAME_LIMIT)),
+      }}));
+    """)
+
+    assert executed["limit"] == ASSET_NAME_LIMIT
+    assert all(executed["offered"][kind] for kind in kinds)
+    assert executed["nothingSelected"] is None
+
+    assert executed["untouched"]["stored"] == "HarderFaster · multiview"
+    assert executed["untouched"]["savable"] is False
+    # Trailing whitespace is not an edit, because the route trims before it stores.
+    assert executed["whitespaceOnly"]["savable"] is False
+
+    # The whole name is replaced — the promotion suffix is not preserved by either side.
+    assert executed["renamed"]["savable"] is True
+    assert executed["renamed"]["draft"] == "Lucy"
+
+    # Emptying the box is a change and still unsavable, and the count says why in words rather
+    # than only in a colour.
+    assert executed["emptied"]["changed"] is True
+    assert executed["emptied"]["savable"] is False
+    assert "cannot be empty" in executed["emptied"]["count"]
+
+    assert executed["overLong"]["savable"] is False
+    assert "too long to save" in executed["overLong"]["count"]
+    assert executed["atLimit"]["savable"] is True
+
+
+def test_the_inspector_draws_a_rename_box_and_saves_it_through_the_one_route():
+    """Rendered and clicked, not read as text — `renderAssetInspector`'s own markup.
+
+    The box sits above the appearance anchor and the read-only generation prompt: the name is
+    what the rest of the panel is about, and it is the field the Director renames to keep an
+    internal label out of shot prose. The save goes to the dedicated route carrying the trimmed
+    name and nothing else; folded into the whole-project PUT it would be silently re-adopted.
+    """
+    fired = run_workspace("""
+      state.project = { id: 'p1', shots: [], jobs: [], assets: [{
+        id: 'a1', kind: 'character', path: 'out/a.png', name: 'HarderFaster \\u00b7 multiview',
+        source: 'krea-multiview', prompt: 'a woman in a blue dress',
+        consistency_prompt: '', created_at: '2026-08-20T00:00:00Z',
+      }] };
+      state.selectedAssetId = 'a1';
+      app.renderAssetInspector();
+      const markup = at('#asset-inspector').innerHTML;
+
+      const before = markup.includes('id="save-asset-name" disabled');
+      at('#asset-name').value = '   ';
+      await fire('#asset-name:input', {});
+      const afterEmptying = {
+        disabled: at('#save-asset-name').disabled,
+        count: at('#asset-name-count').textContent,
+      };
+      at('#asset-name').value = '  Lucy  ';
+      await fire('#asset-name:input', {});
+      const afterTyping = { disabled: at('#save-asset-name').disabled };
+      requests.length = 0;
+      await fire('#save-asset-name:click', {});
+      const saved = requests.map((sent) => ({ path: sent.path, method: sent.method, body: sent.body }));
+
+      console.log(JSON.stringify({
+        drawn: markup.includes('id="asset-name"'),
+        holdsStored: markup.includes('HarderFaster'),
+        nameBeforeAnchor: markup.indexOf('id="asset-name"') < markup.indexOf('Generation prompt'),
+        noMaxlength: !markup.includes('maxlength'),
+        before, afterEmptying, afterTyping, saved,
+        adopted: state.project.id,
+      }));
+    """, responses={
+        "/api/projects/p1/assets/a1/name": {
+            "body": {
+                "project": {"id": "p2", "shots": [], "jobs": [], "assets": []},
+                "name": "Lucy",
+                "previous": "HarderFaster · multiview",
+                "prompts": 0,
+                "maps": 0,
+                "message": "Renamed HarderFaster · multiview to Lucy.",
+            },
+        },
+    })
+
+    assert fired["drawn"] is True
+    assert fired["holdsStored"] is True
+    assert fired["nameBeforeAnchor"] is True
+    # No `maxlength`, the anchor's rule: it truncates an oversized paste silently.
+    assert fired["noMaxlength"] is True
+
+    assert fired["before"] is True
+    assert fired["afterEmptying"]["disabled"] is True
+    assert "cannot be empty" in fired["afterEmptying"]["count"]
+    assert fired["afterTyping"]["disabled"] is False
+
+    assert fired["saved"] == [
+        {
+            "path": "/api/projects/p1/assets/a1/name",
+            "method": "PUT",
+            "body": json.dumps({"name": "Lucy"}, separators=(",", ":")),
+        }
+    ]
+    # The reply is a report, so the client has to reach through `project` — adopting the body
+    # itself would replace the manifest on screen with a rename report.
+    assert fired["adopted"] == "p2"
 
 
 # ----------------------------------------------------------------------------------------------

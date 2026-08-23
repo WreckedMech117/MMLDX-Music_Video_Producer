@@ -21,6 +21,9 @@ from music_video_producer.app import (
     APPROVAL_FIELDS,
     APPROVE_IN_FLIGHT_REFUSAL,
     APPROVE_NO_TAKE_REFUSAL,
+    ASSET_NAME_EMPTY,
+    ASSET_NAME_LIMIT,
+    ASSET_NAME_TOO_LONG,
     CHAT_EMPTY_MESSAGE,
     CONSISTENCY_PROMPT_LIMIT,
     CONSISTENCY_PROMPT_TOO_LONG,
@@ -98,6 +101,7 @@ from music_video_producer.app import (
     heal_orphaned_local_jobs_at_startup,
     multiview_refusal,
     prose_claims_shots,
+    reference_map_sentence,
     reference_map_tag_lines,
     reference_prompt,
     reference_slot_counts,
@@ -17874,8 +17878,16 @@ def test_an_appearance_anchor_re_expands_every_map_that_names_it(tmp_path: Path)
 
 def test_the_whole_project_put_re_expands_and_cannot_clear_the_recorded_map(tmp_path: Path):
     """The widest sibling write path there is: one body carries every field of every Shot *and*
-    every Asset. It can move a citation and it can rename an asset, so it re-derives -- and a
-    body that has never heard of `h3_prompt_map` must not clear the record on its way past."""
+    every Asset. It can move a citation, so it re-derives -- and a body that has never heard of
+    `h3_prompt_map` must not clear the record on its way past.
+
+    **This route could also rename an asset until 2026-08-22**, and that was the second
+    re-derivation trigger this test used to demonstrate. It no longer can: `PUT
+    .../assets/{id}/name` is the one door and this route re-adopts the stored name per asset id,
+    because `name` is required and a stale tab therefore *reasserts* the old one rather than
+    omitting it. Both halves are asserted below — the citation move still re-derives, and the
+    rename in the same body is ignored.
+    """
 
     client, store, comfy, director, project_id, bed, lead = map_project(tmp_path)
     prose_shot = write_shot(
@@ -17894,15 +17906,24 @@ def test_the_whole_project_put_re_expands_and_cannot_clear_the_recorded_map(tmp_
     # A client written before the field existed: it simply omits it, on every shot.
     for shot in body["shots"]:
         shot.pop("h3_prompt_map", None)
+    # The gesture this route really is: a citation moved off the lead and onto the bed.
+    for shot in body["shots"]:
+        if shot["id"] == prose_shot:
+            shot["citations"] = [{"asset_id": bed["id"], "role": "reference", "order": 0}]
+            shot["asset_ids"] = [bed["id"]]
+    # And a rename in the very same body, which this route must now ignore.
     for asset in body["assets"]:
         if asset["id"] == lead["id"]:
             asset["name"] = "HarderFaster Krea multiview"
     assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
 
     saved = store.get(project_id)
-    renamed = next(shot for shot in saved.shots if shot.id == prose_shot)
-    assert "<Picture 1> is HarderFaster Krea multiview" in renamed.h3_prompt
-    assert renamed.h3_prompt == song_audio_prose(saved, renamed)
+    moved = next(shot for shot in saved.shots if shot.id == prose_shot)
+    assert f"<Picture 1> is {bed['name']}" in moved.h3_prompt
+    assert moved.h3_prompt == song_audio_prose(saved, moved)
+    assert next(a for a in saved.assets if a.id == lead["id"]).name == lead["name"], (
+        "an ordinary save renamed an asset"
+    )
     kept = next(shot for shot in saved.shots if shot.id == document_shot)
     assert kept.h3_prompt_map == recorded, "an ordinary save cleared the recorded map"
     assert kept.h3_prompt == GOOD_EXPANSION
@@ -19247,6 +19268,267 @@ def test_an_ordinary_full_project_put_cannot_erase_a_recorded_render_timing(tmp_
     assert unmoved.render_seconds == 378.0
     assert unmoved.render_frames == 141
     assert unmoved.updated_at.year != 2030
+
+
+# ---------------------------------------------------------------------------------------------
+# Renaming an asset (2026-08-22).
+#
+# The Director's chosen fix for the name leak: 9-10 prompts per populate roll carried the literal
+# internal label `HarderFaster · multiview`, and the ruling was to rename the asset rather than
+# hide its name from the model — "the HarderFaster image is a picture of a Woman named Lucy".
+#
+# `consistency_prompt`'s sibling-write suite applied to `Asset.name`, plus the two things a
+# rename has to be honest about: what it cannot break (citations) and what it does not touch
+# (prose already written).
+# ---------------------------------------------------------------------------------------------
+
+
+def rename_asset(client, project_id: str, asset_id: str, name):
+    return client.put(
+        f"/api/projects/{project_id}/assets/{asset_id}/name", json={"name": name}
+    )
+
+
+def leaky_project(store) -> Project:
+    """A character asset, its promoted multiview sheet, and shots whose prose spells the label."""
+    project = store.create(Project(name="Harder Faster"))
+    project.assets = [
+        Asset(id="asset_source", name="HarderFaster", kind="character", path="media/l.png"),
+        Asset(
+            id="asset_sheet",
+            name="HarderFaster · multiview",
+            kind="character",
+            source="krea-multiview",
+            parent_id="asset_source",
+            path="media/l-mv.png",
+        ),
+    ]
+    project.shots = [
+        Shot(
+            id="shot_leak",
+            start=0,
+            duration=5,
+            prompt="HarderFaster · multiview screams into the polished metal stand.",
+            mode="references",
+            citations=[AssetCitation(asset_id="asset_sheet", role="reference", order=0)],
+        ),
+        Shot(id="shot_clean", start=5, duration=5, prompt="A wide shot of the empty floor."),
+    ]
+    store.save(project)
+    return project
+
+
+def test_renaming_an_asset_replaces_the_whole_display_name(tmp_path: Path):
+    """The ` · multiview` suffix is a derivation, not a decoration to be preserved.
+
+    `generate_multiview` appends it when it mints the child; a rename that edited around it would
+    leave the Director unable to remove the very label they are renaming to get rid of, which is
+    the whole ask. The name that lands is exactly what was sent, trimmed.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+
+    response = rename_asset(client, project.id, "asset_sheet", "  Lucy  ")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "Lucy" and body["previous"] == "HarderFaster · multiview"
+    saved = store.get(project.id)
+    assert [asset.name for asset in saved.assets] == ["HarderFaster", "Lucy"]
+    # Nothing else on the asset moved — the write is onto the stored Asset, so `path`, `source`
+    # and `parent_id` cannot be defaulted away by an edit that was only ever about one string.
+    sheet = saved.assets[1]
+    assert (sheet.kind, sheet.source, sheet.parent_id, sheet.path) == (
+        "character", "krea-multiview", "asset_source", "media/l-mv.png"
+    )
+    assert comfy.prompts == []
+
+
+def test_a_rename_cannot_break_a_citation_and_does_not_rewrite_prose(tmp_path: Path):
+    """The two halves the response has to say out loud.
+
+    Citations resolve by id, so no shot can lose its reference to a rename. Prose already written
+    keeps the old spelling, because those are words a person or a model wrote and no route edits
+    them on a rename's behalf — and a Director not told that will read the first prompt they open
+    as evidence the rename failed.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+
+    body = rename_asset(client, project.id, "asset_sheet", "Lucy").json()
+    saved = store.get(project.id)
+
+    assert [
+        (citation.asset_id, citation.role) for citation in saved.shots[0].citations
+    ] == [("asset_sheet", "reference")]
+    assert saved.shots[0].asset_ids == ["asset_sheet"]
+    assert saved.shots[0].prompt.startswith("HarderFaster · multiview screams")
+    assert body["prompts"] == 1
+    assert "still spell HarderFaster · multiview" in body["message"]
+    assert "no shot lost its reference" in body["message"]
+    assert comfy.prompts == []
+
+
+def test_an_asset_is_renamed_by_one_route_and_nothing_else(tmp_path: Path):
+    """`consistency_prompt`'s sibling-write suite, for the field that is **not** defaulted.
+
+    A different hazard from the anchor's and worse in one direction: `name` is required, so no
+    client omits it — every client sends back whatever name it was holding, and a browser tab
+    left open across a rename reasserts the old one on its next ordinary save. That is a silent
+    undo of a decision the Director made on the route that makes it, and the generic full-project
+    `PUT` has been this hole seven times for other fields.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+    assert rename_asset(client, project.id, "asset_sheet", "Lucy").status_code == 200
+
+    # The stale-tab save: a body still carrying the old name must not put it back.
+    body = client.get(f"/api/projects/{project.id}").json()
+    for asset in body["assets"]:
+        if asset["id"] == "asset_sheet":
+            asset["name"] = "HarderFaster · multiview"
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert store.get(project.id).assets[1].name == "Lucy", "an ordinary save undid the rename"
+
+    # And in the other direction: an ordinary save cannot rename an asset either.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["assets"][0]["name"] = "Somebody Else"
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    assert store.get(project.id).assets[0].name == "HarderFaster"
+
+    # An asset the stored project does not hold keeps the body's name, and that is where this
+    # parts from the anchor's `.get(id, "")` rule: there is no stored name to adopt, and blanking
+    # it would produce a library row nobody can read.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["assets"].append(
+        {"id": "asset_new", "name": "Newcomer", "kind": "prop", "path": "media/n.png"}
+    )
+    assert client.put(f"/api/projects/{project.id}", json=body).status_code == 200
+    introduced = next(a for a in store.get(project.id).assets if a.id == "asset_new")
+    assert introduced.name == "Newcomer"
+    assert comfy.prompts == []
+
+
+def test_the_rename_routes_refusals_match_its_siblings(tmp_path: Path):
+    """404, empty and too-long — each before anything is assigned, so a refused rename leaves the
+    asset exactly as it was. `replace_consistency_prompt`'s and `replace_character_slot`'s shape,
+    with the one deliberate difference: a name cannot be cleared."""
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+
+    missing = rename_asset(client, project.id, "asset_nope", "Lucy")
+    assert missing.status_code == 404 and missing.json()["detail"] == "Asset not found"
+
+    for blank in ("", "   "):
+        empty = rename_asset(client, project.id, "asset_sheet", blank)
+        assert empty.status_code == 422
+        assert empty.json()["detail"] == ASSET_NAME_EMPTY
+
+    long = rename_asset(client, project.id, "asset_sheet", "L" * (ASSET_NAME_LIMIT + 1))
+    assert long.status_code == 422
+    assert long.json()["detail"] == ASSET_NAME_TOO_LONG.format(
+        name="HarderFaster · multiview", length=ASSET_NAME_LIMIT + 1, limit=ASSET_NAME_LIMIT
+    )
+    # Measured after trimming, exactly as the anchor's bound is.
+    assert rename_asset(
+        client, project.id, "asset_sheet", "  " + "L" * ASSET_NAME_LIMIT + "  "
+    ).status_code == 200
+
+    # A body with no `name` at all is refused by the schema, `SongVocalTypeRequest`'s rule: the
+    # omitted value would be `""`, and `""` is not a name a caller could have meant.
+    assert client.put(
+        f"/api/projects/{project.id}/assets/asset_sheet/name", json={}
+    ).status_code == 422
+
+    # Nothing survived any of the refusals except the one 200.
+    assert store.get(project.id).assets[1].name == "L" * ASSET_NAME_LIMIT
+    assert store.get(project.id).assets[0].name == "HarderFaster"
+    assert comfy.prompts == []
+
+
+def test_a_rename_re_derives_the_reference_maps_the_name_is_written_into(tmp_path: Path):
+    """`replace_consistency_prompt`'s line and its argument: the name is **in** the map.
+
+    `timeline.anchored_label` composes it into every tag line, so a rename changes what every
+    citing shot's map says about this picture. Free to re-derive for the deterministic song-audio
+    prose shots, recorded as stale for the rest — and the count is reported, because "8 maps were
+    rewritten" is a thing the Director is entitled to know a rename did.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+    project.song = Song(title="Harder", source="imported", path="media/h.mp3", duration=60.0)
+    shot = project.shots[0]
+    shot.use_song_audio = True
+    shot.h3_prompt = song_audio_prose(project, shot)
+    shot.h3_prompt_map = reference_map_sentence(reference_map_tag_lines(project, shot))
+    store.save(project)
+    assert "HarderFaster · multiview" in store.get(project.id).shots[0].h3_prompt_map
+
+    body = rename_asset(client, project.id, "asset_sheet", "Lucy").json()
+    refreshed = store.get(project.id).shots[0]
+    assert "Lucy" in refreshed.h3_prompt_map
+    assert "· multiview" not in refreshed.h3_prompt_map
+    assert body["maps"] == 1 and "reference map(s) were re-derived" in body["message"]
+    assert comfy.prompts == []
+
+
+def test_every_write_path_for_an_assets_name_is_enumerated():
+    """The enumeration the sibling-write rule asks for, grepped rather than argued.
+
+    `Asset.name` has five *creation* sites and exactly one *edit* site. The failure this pins is
+    the one this repository keeps meeting from the other end: a second writer added later by
+    someone who did not read the route's docstring, or the generic `PUT` quietly becoming one
+    again. Creation is listed by its own construction (`Asset(`), so a sixth creation route also
+    fails here and has to be named deliberately.
+    """
+    source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
+
+    # Exactly two assignments of the attribute anywhere: the rename route's own write, and the
+    # generic full-project PUT re-adopting the stored value so it can never write one. A third is
+    # a second door, which is the failure this pins.
+    assert source.count("asset.name = ") == 2
+    assert source.count("asset.name = name\n") == 1
+    assert source.count("asset.name = stored_names.get(asset.id, asset.name)") == 1
+    assert source.count("stored_names = {asset.id: asset.name for asset in current.assets}") == 1
+
+    # The creation sites, named. Two of them derive a child's name from its source's, which is
+    # why a rename has to replace the whole string rather than edit around a suffix.
+    assert source.count("Asset(") == 5
+    assert source.count('name=f"{source.name} · multiview"') == 1
+    assert source.count('name=f"{source.name} · edit"') == 1
+    assert source.count("name=name.strip() or target.stem") == 1  # upload
+    assert source.count("name=request.name,") == 1  # generate/flux
+    assert source.count("name=proposal.name,") == 1  # assets/fill
+
+    # No model can reach the field: it is not on any tool schema, and the only routes that write
+    # it are the five creations and the one rename above.
+    assert '"name"' not in Path(
+        "src/music_video_producer/director.py"
+    ).read_text(encoding="utf-8").split("def _tool_schemas")[-1].split("def ")[0]
+
+
+def test_a_manifest_written_before_the_rename_route_loads_unchanged(tmp_path: Path):
+    """No field was added, so nothing on disk changes shape and no old manifest needs migrating.
+
+    Pinned rather than argued: the rename writes an existing required field, and a project saved
+    before the route existed reads back with the names it had, byte for byte.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+    before = (tmp_path / "projects" / project.id / "project.json").read_text(encoding="utf-8")
+
+    reloaded = client.get(f"/api/projects/{project.id}").json()
+    assert [asset["name"] for asset in reloaded["assets"]] == [
+        "HarderFaster", "HarderFaster · multiview"
+    ]
+    assert set(json.loads(before)["assets"][0]) <= set(Asset.model_fields)
+    # And the round trip through the route leaves every other asset alone.
+    assert rename_asset(client, project.id, "asset_sheet", "Lucy").status_code == 200
+    after = json.loads(
+        (tmp_path / "projects" / project.id / "project.json").read_text(encoding="utf-8")
+    )
+    assert set(after) == set(json.loads(before))
+    assert after["assets"][0] == json.loads(before)["assets"][0]
+    assert comfy.prompts == []
 
 
 def test_every_measured_field_on_a_job_is_named_in_the_routes_guard():

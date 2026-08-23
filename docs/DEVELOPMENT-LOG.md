@@ -4,6 +4,224 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-22 — The three-step populate's first live run: four measured defects fixed, and an asset can be renamed
+
+Spec: none — this is remedial work against a measured run rather than a planned feature. The
+run itself is written up in `_bmad-output/planning-artifacts/three-step-populate-2026-08-21.md`
+(Phases A and B); the four defects below were found by walking that pipeline end to end on the
+Director's own project for the first time, and were deliberately left unfixed so the untouched
+behaviour could be measured.
+
+**It works.** 30 shots, no empty-shots failure, every window inside H3's band and under the 6 s
+cap, zero tiling refusals where the old plan had a hole, and report-then-confirm proved to be an
+*apply* rather than a re-generation. What follows is the four things that were wrong with it.
+
+### 1. Fill-in dragged content across section boundaries
+
+Lay-out tiles windows **per section** and tells the model in words: *"Shots must respect these
+boundaries — every shot sits inside one section and takes that section's character."* Fill-in
+then mapped proposals to windows by **global proportion over the whole song**, which undid it.
+Measured on a 31-window / 30-proposal roll:
+
+* **P7, the Chorus opener, was never used** — dropped entirely;
+* **P4 and P12 were each used twice**, producing identical adjacent prompts on shots 5+6 and
+  13+14;
+* **4 windows carried prose written for a different section** — window 7 (Chorus) got a Verse
+  prompt written at 27.0 s, window 21 (**Bridge**) got a Chorus 2 line, window 25 (Outro) got a
+  Bridge prompt.
+
+Latent whenever the window count differs from the proposal count, which per-section tiling makes
+the normal case. `batch.readiness_report` caught it independently, as adjacent-sameness warnings.
+
+**The Director's ruling, 2026-08-22:** *"map within section, and when a section has more windows
+than proposals, reuse within that section. A Chorus window may only ever receive a Chorus
+proposal. Duplicates are acceptable."*
+
+`app.paired_proposals` is the new decision, and `timeline.layout_spans` is lay-out's own span
+decomposition extracted so the two steps cannot disagree about what a section is. A proposal
+belongs to the span containing its `start` — lay-out's filter verbatim — and a window to the span
+containing its midpoint, which is `song_section`'s rule and the one `ShotPlacement.section`
+already reports.
+
+**How a pair is made, and why by rank.** Inside a span, window *j* of *w* takes proposal
+`proposal_for_position(j + 0.5, w, p)` — the same proportional arithmetic, applied to *ranks*
+rather than to seconds. Rank because a window's length is not evidence of anything the model
+said: `populate_windows` states that a local model's layout is "treated as *shape*, never as
+arithmetic", so weighting the pairing by window length would give a long window a bigger claim on
+the section's story purely because the tiling repair made it long. Time-overlap matching was
+rejected for the same reason — it would give arithmetic authority to numbers this codebase
+explicitly refuses to trust.
+
+Two properties follow from the half-rank offset and both are the point. **More windows than
+proposals:** the step is `p / w ≤ 1`, so no proposal in the section is skipped and the reuse lands
+in the middle of the section rather than doubling its first or last line. **More proposals than
+windows** — the mirror case: the step is `≥ 1`, so the pairing is strictly increasing, nothing
+repeats, and the surplus is *sampled* across the section's arc rather than truncated off its tail
+(3 windows against 5 proposals take the 1st, 3rd and 5th).
+
+**A section the model wrote no proposal for gets an empty shot**, not a neighbour's prose. That is
+the ruling's plain reading and this codebase's standing rule for an absent answer: an honestly
+empty prompt is visible in the readiness report and the inspector, where a plausible sentence
+written for a different section is invisible until the take comes back wrong. `singing` is left at
+the `Shot` default — `unknown`, never `not_singing`.
+
+**A layout with a genuinely empty section layer keeps the global rule byte for byte.**
+`layout_spans` answers `[]` for one and the whole song is one extent again.
+
+**Both chained byte digests in `tests/test_populate_steps.py` moved, and both had to.** The
+per-section pairing deliberately changes which prompt a window carries — a digest that did not
+move would mean the fix did nothing. Note that the *unmarked* arm moved too, and that is worth
+understanding: "no sections" there means the **Director** marked none, and `lay_out_shots` adopts
+whatever structure the shots call volunteered, so that arm tiles per section as well. The
+pre-2026-08-22 values are recorded in the constants' own comment rather than deleted.
+
+### 2. Asset rename — a new capability, and the Director's chosen fix for the name leak
+
+9–10 prompts per roll contained the literal internal label `HarderFaster · multiview`, e.g.
+*"HarderFaster · multiview screams into the polished metal stand."* The existing defence in
+`lay_out_shots` — *"A name never shown cannot be echoed"* — only applies once an identity sheet is
+**promoted**, and nothing on this project is.
+
+**The Director explicitly rejected hiding names from the model:** *"we dont want to lose the
+models ability to identify assets its using or that could get bad. If the assets name is a
+problem then we could rename it. Renaming assets may be useful anyway as the HarderFaster image
+is a picture of a Woman named Lucy, the song i made the image for is Harder Faster."*
+
+So `PUT /api/projects/{project_id}/assets/{asset_id}/name` was built, in
+`replace_consistency_prompt`'s and `replace_character_slot`'s shape: one field on the request
+(`AssetNameRequest.name`, **no default** — `SongVocalTypeRequest`'s rule, because an omitted name
+would arrive as `""` and `""` is not a name a caller could have meant), written onto the *stored*
+Asset, every refusal taken before anything is assigned.
+
+* 404 `"Asset not found"` — the siblings' wording;
+* 422 `ASSET_NAME_EMPTY` — a name cannot be cleared, and that is the one place this parts from the
+  siblings. An empty anchor means "no anchor" and slot `0` means "not one of the singers"; an
+  asset with no name is a library row nobody can pick and a reference map line that names nothing;
+* 422 `ASSET_NAME_TOO_LONG` at `ASSET_NAME_LIMIT` (80), measured after trimming, which is the
+  anchor's bound check verbatim.
+
+**A duplicate name is not refused**, and that is a decision: `models.assets_for_proposal` already
+documents and resolves the case — first occurrence in library order wins — so two assets under one
+name is a deterministic state, not the ambiguity `CHARACTER_SLOT_TAKEN` refuses. A slot is a
+*link*; a name is a label, and citations do not travel on it.
+
+**The whole display name is replaced, never edited around.** ` · multiview` is appended by
+`generate_multiview` when it mints the child (and ` · edit` by the image-edit route); both are
+derivations, and preserving them would leave the Director unable to remove the very label they are
+renaming to get rid of.
+
+**What a rename does not touch, said on the wire.** Citations resolve by id, so no shot can lose
+its reference. Prose already written — a shot's `prompt`, a per-shot `reference_labels` rename —
+keeps the old spelling, because those are words a person or a model wrote and no route edits them
+on a rename's behalf. The route therefore answers `AssetRenameResponse` (`SnapCutsResponse`'s
+shape: the project a client adopts beside a message a person reads) rather than a bare `Project`,
+counting the shots still spelling the old name and saying so. Reference maps *are* re-derived, on
+`replace_consistency_prompt`'s own argument — the name is **in** the map, because
+`timeline.anchored_label` composes it into every tag line.
+
+**Write paths for `Asset.name`, enumerated** — the generic full-project `PUT` has been the hole in
+a guard seven times, and this is the eighth field to be closed there:
+
+| Path | Writes the name? |
+|---|---|
+| `POST /assets/upload` | creation (`name.strip() or target.stem`) |
+| `POST /generate/flux` | creation (`request.name`) |
+| `POST /assets/fill` | creation (`proposal.name`) |
+| `POST /assets/{id}/multiview` | creation of the child (`f"{source.name} · multiview"`) |
+| `POST /assets/{id}/edit` | creation of the child (`f"{source.name} · edit"`) |
+| `PUT /assets/{id}/name` | **the one editor** |
+| `PUT /projects/{id}` | **re-adopts the stored name per asset id** — cannot write it |
+| `PUT /projects/{id}/shots` | carries no asset at all |
+| any tool schema | the field is not exposed to a model anywhere |
+
+The generic route's hazard here runs the *opposite* way to the anchor's and is worse in one
+direction: `name` is required, so no client omits it — every client sends back whatever name it
+was holding, and a browser tab left open across a rename **reasserts** the old one on its next
+ordinary save. The adoption is `stored_names.get(asset.id, asset.name)` rather than the anchor's
+`.get(asset.id, "")`: an asset the stored project does not hold has no stored name to adopt, and
+blanking it would produce a library row nobody can read.
+
+One existing test changed as a consequence.
+`test_the_whole_project_put_re_expands_and_cannot_clear_the_recorded_map` used a rename through
+the generic `PUT` as its example of a map-changing gesture; it now uses the citation move it also
+names, and asserts that the rename in the same body is ignored.
+
+Frontend: a Name box at the top of the Assets inspector, above the appearance anchor, decided by
+`api.assetNamePlan` (contract-tested and executed under node) exactly as the anchor is by
+`consistencyAnchorPlan`. No `maxlength` — it truncates an oversized paste silently — and the empty
+box is unsavable rather than a clear, matching the route.
+
+### 3. `line_up_shots` was blind to `layout.sections`
+
+It snapped against vocal gaps with no knowledge of section boundaries and **moved 2 of 5 cuts
+across one**: 11.000 → 10.850 (Intro/Verse) and 103.200 → 103.050 (Chorus 2/Bridge). Step 2
+quietly spending the boundary step 1 was built to protect, for 0.15 s of phrase edge that the
+section switch already is.
+
+Fixed inside `snap_window_plan` — the single decision — as a new keyword, `sections`, carrying
+`timeline.section_edges`' mapping of every second a marked section starts or ends at to that
+section's label. Both doors pass it: `snap_cut_plan` from `project.sections`, `line_up_shots` from
+`layout.sections`. Matched within `SNAP_CONTIGUITY_TOLERANCE` — this module's "the same boundary
+written twice" number — because a section box the Director dragged and a window rounded to the
+millisecond describe the same instant without being the same float.
+
+Asked immediately after the three window protections and before anything about the track is read:
+it is structural and unconditional. The refusal reads in the existing vocabulary
+(`SNAP_SECTION_BOUNDARY`):
+
+> The cut between SHOT 02 and SHOT 03 at 11.000s sits on the boundary of Verse, and the layout put
+> it there so no shot straddles a section. Moving it would run one section's shot into the next
+> section's seconds. Left where it was.
+
+Refused rather than clamped, on `SNAP_HOLE`'s reason: moving such a cut *anywhere* runs one
+section's shot into the next section's seconds, and choosing which side gives way is an editing
+decision this pass cannot make.
+
+### 4. Payload bloat and a stale nested revision
+
+`LineUpResponse.layout` echoed the lay-out **confirm** response, and a confirm carries `project` —
+a full manifest copy. `lineup_report.json` was **125 KB** and `lineup_applied.json` **211 KB**, the
+copyrighted lyric sheet rode the wire twice per step, and the nested `layout.updated_at` was a
+revision behind with nothing validating it. Harmless in what it produced — `layout_from_report`
+has always read the *live* project — but the client had to echo that stale manifest byte for byte
+or `plan_fingerprint` refused the confirm.
+
+Trimmed to `LayOutContent`: `duration`, `proposals`, `sections`. Those three are the entire input
+`fill_in_shots` reads, and `sections` became load-bearing today for defect 1.
+
+**What the digest covers, before and after.** `plan_fingerprint` hashes every field of the response
+except `applied`, `project` and `plan_id`, and `PLAN_DIGEST_EXCLUDE` applies **at the top level
+only**. So *before*, the nested layout's `project`, `plan_id`, `applied` and stale `updated_at`
+were all inside the digest, along with `required`, `proposed`, `created`, `windows`,
+`sections_origin` and `message`. *After*, the nested digest covers `duration`, `proposals` and
+`sections`. **Nothing the next step consumes left the digest.** Window geometry is covered as fully
+as it ever was by the top-level `LineUpResponse.windows` — the *moved* tiling, which is what
+fill-in is matched against shot by shot before anything is written. What left is a project snapshot
+nothing reads, a digest for a different report, a flag, a stale revision, and six counts and labels
+no downstream step consults.
+
+### Verification
+
+20 new cases across `tests/test_populate_steps.py`, `tests/test_api.py` and
+`tests/test_frontend_contract.py`, plus assertions folded into two existing ones; each fails on
+the tree that ran the live pass. Suite 1721 passing; `ruff check .` and both `node --check` gates
+clean.
+
+A **41-mutant sweep killed all 41**, with a failing sentinel in each of the three changed files.
+Swept in a `git worktree` (`PYTHONPATH` at its own `src`, or the editable `.pth` imports the live
+checkout and everything "survives"), calling `.venv/Scripts/python.exe -m pytest` directly rather
+than `uv run` — a second `uv run` blocks on the environment lock — restoring by
+`read_bytes`/`write_bytes` with `__pycache__` purged between runs, every anchor converted to its
+file's own line ending with the match count asserted, and each run time-boxed. Six mutants
+survived the first pass, every one of them a branch reachable only through geometry the fixtures
+did not have: an unmarked stretch of song *after* the last section, a section end that no other
+section's start covers, a layout with no proposals at all, two section boxes the Director
+overlapped, `use_song_audio` on an unpaired window, and the carried `duration`. Five unit cases and
+two extra assertions closed all six.
+
+Nothing rendered, nothing was submitted to ComfyUI, and no model was called: every fix is testable
+with the stubs the populate suite already has.
+
 ## 2026-08-21 — The accelerator was never off: the attention backend becomes a profile, and the cliff turns out to have been measured on SageAttention
 
 Spec: `_bmad-output/planning-artifacts/h3-attention-backend-experiment.md` (extended, §6 — that
@@ -253,17 +471,41 @@ was wrong. It was stopped before a record was written. `resolve_run_dir` now ref
 today's directory holds no arms and another one does, naming both and making the operator
 choose — two defensible answers is a refusal, not a coin toss.
 
-**The reproducibility control was never run, and it is the first thing to run next.** Three
-identical 158-frame renders in one invocation — frame count held constant, so any rise is
-render order and only order. It is the one measurement that would make the band data
-conclusive rather than inconclusive, and at ~12 minutes it is cheaper than any of the sweeps
-that failed to settle it. It must not get lost behind the more interesting preview finding.
+**The reproducibility control was run, and renders DO reproduce.** Five identical
+158-frame renders: 224, 157, 158, 161, 220 s. The 42.7% range is the wrong headline — the
+distribution is **bimodal**, and **warm consecutive renders reproduce to 2.5%** (157/158/161).
+r1 is a cold start, which costs *sampling* time and not merely load; r5 is an unexplained
+anomaly and stays one. The consequence for the band work is decisive: **its 63% disagreement
+cannot be within-session noise**, so it is real or between-session — and it is now
+undiagnosable, because those arms carry no state capture. What would answer it is specified in
+spec §6.19: one session, warm, state on every arm, first arm discarded. Nothing measured
+before that section met all four.
 The in-sweep 226 point was **cancelled by the operator** to release the GPU, at step 5 of 8,
 and is recorded with no timing fields — a partial render's elapsed time in a cost column is
 worse than an absent one. The harness's own watchdog did not fire and could not have: the arm
 had logged `loaded completely`, one of the four signals `should_cut` requires together.
 
-**The band sweep was run twice and produced no usable curve, which is itself the result.**
+**The band question is answered on the fifth attempt, and the answer is a shape.** With the
+render order chosen so position and frame count are uncorrelated (ρ=0.0 against the failed
+sweeps' 1.0), warm, no `/free`, and mid-render power recorded per arm, the curve is monotonic
+in frame count and *not* in execution order: **158 → 1.025 s/frame, 175 → 0.977, 192 → 1.448,
+209 → 2.775, 226 → 3.558.** The decisive point is 175 — it rendered **last**, on an occupied
+card, and was the **cheapest per frame** at the **highest median power**, which no order or
+degradation story survives. **Per-frame cost is flat to 175 frames / 6.79 s and climbs steeply
+after: +48% at 7.50 s, +184% at 8.21 s, +264% at 8.92 s.** The mechanism is visible for the
+first time: median power falls 478 → 227 W across the band while *maximum* power stays ~576 W,
+so the card keeps its capability and spends progressively more of each step waiting on memory.
+**`POPULATE_MAX_WINDOW_SECONDS` still gets no recommendation** — this is what each length costs,
+and the picture quality of a long take is unmeasured. Spec §6.20.
+
+**And `/free` does not mitigate it — it never cleaned the card.** A 226-frame render run
+immediately after one cost **1004 s against 804 s occupied, 25% slower**, and `nvidia-smi` showed
+27126 MiB still in use when it began: `/free` releases memory from torch's bookkeeping, not from
+the device, while pushing ~8–12 GiB into host RAM. Only a full ComfyUI restart produces a clean
+card. Spec §6.21.
+
+**The two earlier band sweeps produced no usable curve, and that history is kept because it is
+the reason the fifth attempt was designed the way it was.**
 `turbo-references2v` at 158/175/192/209 frames, once warm and once with `POST /free` between
 arms: the two runs disagree by up to **63% at the same frame count**, and in *shape* — one
 climbs monotonically, the other jumps and then plateaus downward. Both designs render ascending
@@ -277,22 +519,31 @@ this work**, and what the run established instead is that cost measurements at t
 counts are not currently reproducible on this machine. Spec §6.16.
 
 **Two things measured on the way that matter beyond this experiment.** `POST /free`
-(`unload_models` + `free_memory`) releases VRAM between renders but **does not stop host-memory
-accumulation** — host RAM free fell 48.58 → 8.11 GiB across four arms that each called it,
-where a full ComfyUI restart recovers it; a previous session reached 94.75 GiB committed against
-61.6 GiB physical. And `ModelPreviewOverrideKJ` — emitted at all three H3 sites with the audited
-export's own `preview_frames: 12` — makes ComfyUI decode, resize and WebP-encode **twelve frames
-per sampling step whether or not anyone is watching**, because `send_image` encodes before
-`send_bytes` consults its socket list. That is ~240 operations per 20-step shot and ~8,000
-across a 33-shot batch, paid on every production render. **Neither is changed here**: the
-preview values are the Director's export's, so any change is a batch-mode option for them to
-decide, not a defect to correct. Spec §6.14 and §6.15.
+(`unload_models` + `free_memory`) **offloads the model stack to host RAM rather than freeing
+it** — measured deltas of −11.98, −10.95, −9.68 and −9.22 GiB of host memory per call, against
+a genuine VRAM release of ~17 GiB in torch's view. So it is the *cause* of the host-memory
+pressure, not a mitigation: host free fell 44.43 → 9.23 GiB across five renders that each
+called it, sitting at ~0.8 GiB immediately after each. That answers the Director's
+Manager/Crystools "Unload Models" question directly — right button for freeing VRAM for a
+*different* workflow, wrong one as hygiene between renders of the same one, and **only a
+restart actually recovers the memory**. An earlier reading in this entry had it as a failed
+mitigation; it is worse than that. And `ModelPreviewOverrideKJ` — emitted at all three H3 sites with the audited
+export's own `preview_frames: 12` — makes ComfyUI decode, resize and WebP-encode twelve frames
+per sampling step whether or not anyone is watching, because `send_image` encodes before
+`send_bytes` consults its socket list: ~240 operations per 20-step shot, ~8,000 across a
+33-shot batch. **That looked like a real optimisation and it is not.** Measured 2026-08-22, two
+interleaved pairs at 158 frames: the clean pair (both arms in the fast power regime) came in at
+**154 s against 154 s** — `preview_frames: 12` costs **zero seconds per shot**, bounded under
+~3.9 s by the control's reproducibility and therefore under ~2 minutes across a whole batch.
+The previews are not on the critical path. **Nothing to change, and not worth raising with the
+Director as an opportunity.** Neither `/free` nor the preview values are altered here. Spec
+§6.14 and §6.15.
 
 **Not done, and named.** Nothing is exposed in the UI or the API, and no manifest field
 exists; if a backend is ever adopted, that is its own change with its own digest. The
-batch/Render-Again profile split is recorded above and **not** reconciled. The preview cost is
-**not measured** — `--preview-frames` exists to measure it without touching a builder, and the
-12-versus-1 run is deferred to a future GPU window. The Comfy Kitchen
+batch/Render-Again profile split is recorded above and **not** reconciled. The preview cost **was** measured and is
+zero; `--preview-frames` patches only the submitted payload, so no builder and no digest moved
+to find that out. The Comfy Kitchen
 graph is cited by path rather than copied into
 `workflow_templates/reference_exports/` — adding audited evidence is a separate ceremony. And
 `MVP_SAGE_ATTENTION`'s submission-time choke point rewrites every `PathchSageAttentionKJ` and

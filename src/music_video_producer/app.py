@@ -159,6 +159,7 @@ from .timeline import (
     assistant_input,
     build_director_timeline,
     expansion_input,
+    layout_spans,
     lyric_blocks,
     ordered_shots,
     over_render_frames,
@@ -168,6 +169,7 @@ from .timeline import (
     proposal_for_position,
     proposed_sections_from_alignment,
     repair_sections,
+    section_edges,
     section_looks_input,
     shot_expansion_input,
     shot_snap_windows,
@@ -3149,15 +3151,10 @@ async def lay_out_shots(
     # the plan still covers the whole song and assembly's gap refusal stays silent.
     # Without sections, the whole song tiles as one span, exactly as before.
     if project.sections:
-        spans: list[tuple[float, float]] = []
-        cursor = 0.0
-        for section in project.sections:
-            if section.start - cursor > 0.5:
-                spans.append((cursor, section.start - cursor))
-            spans.append((section.start, section.duration))
-            cursor = section.end
-        if duration - cursor > 0.5:
-            spans.append((cursor, duration - cursor))
+        # `timeline.layout_spans` since 2026-08-22, character for character what stood here:
+        # extracted so the fill-in step can cut the song into the *same* stretches instead of
+        # ignoring them. See `paired_proposals`.
+        spans = layout_spans(project.sections, duration)
         windows = []
         for span_start, span_length in spans:
             inside = [
@@ -3249,7 +3246,11 @@ def line_up_shots(
       voiceless, by `timeline.snap_window_plan` — the same core the snap-cuts route reaches
       through `snap_cut_plan`, with the same clearance clamp, the same band check and the same
       per-cut refusals. Populate used to produce its layout blind to phrase boundaries and
-      leave the fix to a manual snap afterwards; it no longer does.
+      leave the fix to a manual snap afterwards; it no longer does. **A cut sitting on a
+      section boundary is left alone** — the layout put it there so no shot straddles a
+      section, and until 2026-08-22 this step spent 2 of every 5 moves undoing that. The
+      boundaries travel into `snap_window_plan` as `sections`, which is where both doors onto
+      the snapper ask the question.
     * **What each window covers.** The seconds of measured voice inside it (the fact that
       downgrades `singing`), the section it falls in, and — new — the lyric lines sung across
       it with the singer slots their `(S1)` marks name. See `ShotPlacement`.
@@ -3279,7 +3280,19 @@ def line_up_shots(
     song = project.song
     offered = list(line_up_windows(layout) if windows is None else windows)
     plan = snap_window_plan(
-        offered, song, tolerance=tolerance, minimum=minimum, maximum=maximum
+        offered,
+        song,
+        tolerance=tolerance,
+        minimum=minimum,
+        maximum=maximum,
+        # The layout's own section marks, handed to the one decision rather than checked
+        # afterwards by a second mechanism. **This is the fix for the live defect of
+        # 2026-08-21**: lining up a fresh layout moved 2 of 5 cuts *across* a section
+        # boundary (11.000 → 10.850, 103.200 → 103.050), spending in step 2 the boundary
+        # step 1 tiles per section to protect. `snap_cut_plan` — the other door — passes
+        # the same mapping from `project.sections`, so a cut protected here is protected
+        # there. See `timeline.SNAP_SECTION_BOUNDARY`.
+        sections=section_edges(layout.sections),
     )
     # Every sung line of the sheet, timed once for the whole plan rather than per window: the
     # alignment is over the song, not over a shot, and asking it 30 times would be 30 chances
@@ -3335,6 +3348,98 @@ def line_up_shots(
     )
 
 
+def paired_proposals(layout: ShotLayout, midpoints: Sequence[float]) -> list[int | None]:
+    """Which proposal each window takes its content from — **within its own section**.
+
+    **The defect this closes, measured live 2026-08-21 on a 31-window / 30-proposal roll.**
+    Lay-out tiles the windows per section and tells the model in words that "every shot sits
+    inside one section and takes that section's character"; fill-in then mapped proposals to
+    windows by global proportion over the whole song, which undid it. P7 — the Chorus opener —
+    was never used at all, P4 and P12 were each used twice (two pairs of adjacent shots came
+    out with identical prompts), and four windows carried prose written for a different
+    section: window 7 (Chorus) got a Verse line, window 21 (**Bridge**) got a Chorus 2 line,
+    window 25 (Outro) got a Bridge line. Latent whenever the window count differs from the
+    proposal count, which per-section tiling makes the normal case.
+
+    **The Director's ruling (2026-08-22): map within section, and reuse within the section when
+    it has more windows than proposals.** A Chorus window may only ever receive a Chorus
+    proposal. Duplicates are acceptable and deliberately visible — `batch.readiness_report`
+    surfaces identical adjacent prompts as sameness warnings, and it is what independently
+    caught this defect — so a reused proposal shows up for a rewrite rather than hiding. No
+    second model call is spent; this is arithmetic over the one reply lay-out already has.
+
+    **How a pair is made, and why by rank.** Inside a span, the section's windows and the
+    section's proposals are both in song order, and window *j* of *w* takes proposal
+    ``proposal_for_position(j + 0.5, w, p)`` — the same proportional arithmetic this module
+    has always used, applied to *ranks* rather than to seconds. Rank rather than time because
+    a window's length is not evidence of anything the model said: `populate_windows` states
+    that a local model's layout is "treated as *shape*, never as arithmetic", so its proposed
+    seconds are used to decide which section a proposal belongs to (lay-out's own rule, below)
+    and for nothing else. Weighting the pairing by window length would give a long window a
+    bigger claim on the section's story purely because the tiling repair made it long.
+
+    Two properties follow from the half-rank offset, and both are the point:
+
+    * **more windows than proposals** — the step increases by ``p / w ≤ 1``, so no proposal in
+      the section is skipped: every one is used at least once and the reuse lands in the middle
+      of the section rather than doubling its first or last line;
+    * **more proposals than windows** — the step is ``≥ 1``, so the pairing is strictly
+      increasing and no proposal is used twice. The surplus is *sampled* across the section's
+      arc rather than truncated off its tail: 3 windows against 5 proposals take the 1st, 3rd
+      and 5th.
+
+    **A section the model wrote no proposal for gets `None`**, and the caller writes an empty
+    shot for it rather than borrowing from a neighbour. That is the ruling's plain reading and
+    this codebase's standing rule for an absent answer: an honestly empty prompt is visible in
+    the readiness report and in the inspector, where a plausible sentence written for a
+    different section is invisible until the take comes back wrong.
+
+    **A layout with no section layer keeps the global rule, byte for byte** — `layout_spans`
+    answers `[]` for one, and the whole song is one extent again. That path is what the
+    unmarked-sections byte digest in `tests/test_populate_steps.py` still pins.
+
+    A proposal belongs to the span containing its `start`, which is `lay_out_shots`' own
+    filter verbatim: a proposal lay-out did not tile into a span is a proposal fill-in does not
+    read into one. A window belongs to the first span containing its **midpoint**, which is
+    `song_section`'s rule for a shot and the rule `ShotPlacement.section` already reports;
+    lay-out's windows never straddle a span, so the two never disagree.
+    """
+    proposals = layout.proposals
+    if not proposals:
+        return [None] * len(midpoints)
+    spans = layout_spans(layout.sections, layout.duration)
+    if not spans:
+        return [
+            proposal_for_position(position, layout.duration, len(proposals))
+            for position in midpoints
+        ]
+    paired: list[int | None] = [None] * len(midpoints)
+    claimed: set[int] = set()
+    for span_start, span_length in spans:
+        span_end = span_start + span_length
+        inside = [
+            index
+            for index, proposal in enumerate(proposals)
+            if span_start <= proposal.start < span_end
+        ]
+        # Claimed as it goes so a window can only ever be filled once, whatever a hand-marked
+        # section layer does: two boxes the Director overlapped would otherwise both offer to
+        # fill the windows underneath, and the later one would silently win.
+        windows = [
+            index
+            for index, position in enumerate(midpoints)
+            if index not in claimed and span_start <= position < span_end
+        ]
+        claimed.update(windows)
+        if not inside:
+            continue
+        for rank, index in enumerate(windows):
+            paired[index] = inside[
+                proposal_for_position(rank + 0.5, len(windows), len(inside))
+            ]
+    return paired
+
+
 def fill_in_shots(alignment: ShotAlignment) -> list[Shot]:
     """Step three — fill it in. What each window contains, and nothing about where it sits.
 
@@ -3343,6 +3448,13 @@ def fill_in_shots(alignment: ShotAlignment) -> list[Shot]:
     the single call lay-out spent. Windows are read and never written — this step is the one
     that will later be re-runnable against timing the Director has already approved, and that
     promise starts by it having no way to move anything.
+
+    **Which proposal a window takes is decided within that window's own section**
+    (`paired_proposals`, 2026-08-22). This step used to map content to windows by global
+    proportion over the song, which undid the per-section tiling lay-out had just built; a
+    section with no proposal of its own now produces an honestly empty shot rather than
+    borrowing a neighbour's prose. Everything below is what happens *once* a window has its
+    proposal, and is unchanged.
 
     The mechanical fills the first run needed a hand-run script for, now populate's own act
     (the run-2 audit's items 4 and 5):
@@ -3400,15 +3512,36 @@ def fill_in_shots(alignment: ShotAlignment) -> list[Shot]:
         )
         return prefer_identity_sheets(located, sheets)
 
+    # Which proposal each window takes, decided **within its section** since 2026-08-22 — see
+    # `paired_proposals` for the live defect that bought the change and for how a pair is made.
+    # Taken for the whole plan in one call rather than per window, because "the third window of
+    # the Chorus" is a fact about the section's list and not about one window.
+    paired = paired_proposals(
+        layout,
+        [
+            placement.start + placement.duration / 2
+            for placement in alignment.placements
+        ],
+    )
     shots: list[Shot] = []
-    for placement in alignment.placements:
-        proposal = proposals[
-            proposal_for_position(
-                placement.start + placement.duration / 2,
-                layout.duration,
-                len(proposals),
+    for placement, chosen in zip(alignment.placements, paired, strict=True):
+        if chosen is None:
+            # A window in a section the model wrote no shot for. Left honestly empty rather than
+            # given a neighbouring section's prose: the Director's ruling is that a Chorus window
+            # may only ever receive a Chorus proposal, and an empty prompt is visible in the
+            # readiness report and the inspector where a sentence written for the wrong section
+            # is invisible until the take comes back wrong. `singing` is left at the Shot default
+            # — `unknown`, which is not `not_singing` — because nothing was declared about it.
+            shots.append(
+                Shot(
+                    start=placement.start,
+                    duration=placement.duration,
+                    use_song_audio=True,
+                    seed=1 + placement.index,
+                )
             )
-        ]
+            continue
+        proposal = proposals[chosen]
         # Mapped from the model's own `performance` declaration — a dedicated strict-
         # schema field the instruction explicitly asks for — never inferred from
         # prose. The nothing-infers-singing guard permits exactly this mapping and
@@ -4188,6 +4321,44 @@ class LayOutSectionRow(BaseModel):
     prompt: str = ""
 
 
+class LayOutContent(BaseModel):
+    """The half of a lay-out report the **fill-in step reads**, and nothing else.
+
+    What `LineUpResponse.layout` carries, and it is a trim rather than a new fact: every field
+    here is `LayOutResponse`'s own, unchanged, and `fill_in_shots` reads all three of them and
+    none of the rest.
+
+    **The defect this closes, measured live 2026-08-21.** `LineUpResponse.layout` echoed the
+    whole lay-out *confirm* response, and a confirm carries `project` — a complete manifest
+    copy. `lineup_report.json` came back at **125 KB** and `lineup_applied.json` at **211 KB**,
+    the copyrighted lyric sheet rode the wire twice per step, and the nested `updated_at` was
+    stale by one revision with nothing validating it. Harmless in what it produced —
+    `layout_from_report` has always read the **live** project and ignored the carried one — but
+    the client had to echo that stale manifest byte for byte or `plan_fingerprint` refused the
+    confirm.
+
+    **What the digest covers, before and after.** `plan_fingerprint` hashes every field of the
+    response except `applied`, `project` and `plan_id`, and `PLAN_DIGEST_EXCLUDE` applies at the
+    top level only — so *before*, the nested layout's `project`, `plan_id`, `applied` and stale
+    `updated_at` were all inside the digest, along with `required`, `proposed`, `created`,
+    `windows`, `sections_origin` and `message`. *After*, the digest covers `duration`,
+    `proposals` and `sections`. **Nothing the next step consumes left the digest**: those three
+    are the entire input `layout_from_content` gives `fill_in_shots`, and the geometry is
+    covered as fully as it ever was by `LineUpResponse.windows`, which is the moved tiling
+    fill-in is actually matched against shot by shot. What left is a project snapshot nothing
+    reads, a digest for a different report, a flag, a stale revision, and six fields no
+    downstream step consults.
+    """
+
+    #: The song length this layout was tiled across — what `paired_proposals` divides when a
+    #: project has no section layer, so it must be the number the layout was computed with.
+    duration: float = 0
+    proposals: list[LayOutProposalRow] = Field(default_factory=list)
+    #: Load-bearing since 2026-08-22: `paired_proposals` cuts the plan into these sections and
+    #: pairs a window only with a proposal from its own one.
+    sections: list[LayOutSectionRow] = Field(default_factory=list)
+
+
 class LayOutResponse(BaseModel):
     """Step one's report, and — only on a confirmed call — the saved project.
 
@@ -4348,11 +4519,13 @@ class LineUpResponse(BaseModel):
     moves: list[SnapCutMove] = Field(default_factory=list)
     skips: list[SnapCutSkip] = Field(default_factory=list)
     windows: list[LineUpWindowRow] = Field(default_factory=list)
-    #: The lay-out report this was lined up from, echoed whole so fill-in needs only this
-    #: one body. Its own `plan_id` still has to check out. `None` on the project-sourced
-    #: path, and that absence is what makes such a report unusable as a fill-in input —
-    #: correctly, because it describes windows rather than content.
-    layout: LayOutResponse | None = None
+    #: The content half of the lay-out report this was lined up from, carried so fill-in needs
+    #: only this one body. **Trimmed to `LayOutContent` on 2026-08-22** — it used to be the
+    #: whole `LayOutResponse`, manifest copy and all; see there for the sizes and for what the
+    #: digest covers before and after. `None` on the project-sourced path, and that absence is
+    #: what makes such a report unusable as a fill-in input — correctly, because it describes
+    #: windows rather than content.
+    layout: LayOutContent | None = None
     message: str = ""
     project: Project | None = None
     plan_id: str = ""
@@ -4483,6 +4656,61 @@ def layout_report(layout: ShotLayout) -> LayOutResponse:
     )
 
 
+def layout_content(plan: LayOutResponse) -> LayOutContent:
+    """A lay-out report trimmed to what the fill-in step reads. The one projection.
+
+    Built here rather than at the two `alignment_report` call sites so "what travels to fill-in"
+    has a single spelling: a field added to `LayOutContent` and forgotten here would ship empty
+    on every path at once rather than on one of them.
+    """
+    return LayOutContent(
+        duration=plan.duration,
+        proposals=[row.model_copy(deep=True) for row in plan.proposals],
+        sections=[row.model_copy(deep=True) for row in plan.sections],
+    )
+
+
+def layout_from_content(project: Project, content: LayOutContent) -> ShotLayout:
+    """The trimmed lay-out content back into the intermediate the fill-in step reads.
+
+    `layout_from_report`'s sibling for the smaller body, and its rule verbatim: `project` is the
+    **live** project, never one carried on a report, and the revision check every route runs
+    before calling this is what makes that safe.
+
+    `required`, `windows`, `sections_origin` and `message` come back empty, and the emptiness is
+    a statement rather than a loss — `fill_in_shots` reads none of them, and the geometry it is
+    matched against is `LineUpResponse.windows` (the *moved* tiling), which the route compares
+    to the live timeline row by row before anything is written.
+    """
+    return ShotLayout(
+        project=project,
+        duration=content.duration,
+        required=0,
+        proposals=tuple(
+            ShotProposal(
+                start=row.start,
+                duration=row.duration,
+                prompt=row.prompt,
+                performance=row.performance,
+                assets=tuple(row.assets),
+            )
+            for row in content.proposals
+        ),
+        windows=(),
+        sections=tuple(
+            SongSection(
+                label=row.label,
+                start=row.start,
+                duration=row.duration,
+                prompt=row.prompt,
+            )
+            for row in content.sections
+        ),
+        sections_origin="",
+        message="",
+    )
+
+
 def layout_from_report(project: Project, plan: LayOutResponse) -> ShotLayout:
     """A lay-out report back into the intermediate the next steps read.
 
@@ -4524,10 +4752,13 @@ def layout_from_report(project: Project, plan: LayOutResponse) -> ShotLayout:
 def alignment_report(
     alignment: ShotAlignment, layout: LayOutResponse | None
 ) -> LineUpResponse:
-    """`ShotAlignment` as a report, with the lay-out report it was computed from echoed on it.
+    """`ShotAlignment` as a report, with the lay-out report's *content half* carried on it.
 
     `layout` is `None` for a line-up sourced from the project's own timeline: there was no
     lay-out report, and inventing one would hand fill-in a plan with no proposals in it.
+
+    Trimmed through `layout_content` since 2026-08-22 — the whole report used to travel, a
+    manifest copy with it. See `LayOutContent`.
     """
     voiced = sum(1 for placement in alignment.placements if not placement.voiceless)
     lined = sum(1 for placement in alignment.placements if placement.lines)
@@ -4582,7 +4813,7 @@ def alignment_report(
             )
             for placement in alignment.placements
         ],
-        layout=layout,
+        layout=layout_content(layout) if layout is not None else None,
         message=(
             f"{len(alignment.placements)} windows measured against the track, "
             f"{voiced} carrying voice, {lined} carrying lyric lines, "
@@ -4603,7 +4834,7 @@ def alignment_from_report(project: Project, plan: LineUpResponse) -> ShotAlignme
     the pass did, and fill-in decides nothing from them.
     """
     return ShotAlignment(
-        layout=layout_from_report(project, plan.layout or LayOutResponse()),
+        layout=layout_from_content(project, plan.layout or LayOutContent()),
         placements=tuple(
             ShotPlacement(
                 index=row.index,
@@ -4818,6 +5049,86 @@ class AssetConsistencyRequest(BaseModel):
     """
 
     consistency_prompt: str = ""
+
+
+#: The longest display name an asset may be renamed to.
+#:
+#: Short on purpose, and shorter than `CONSISTENCY_PROMPT_LIMIT` by an order of magnitude
+#: because the two are different kinds of text: an anchor is a sentence describing an
+#: appearance, a name is what the Director calls this picture out loud. The name is also the
+#: token the prose scan matches on (`models.assets_for_proposal`) and the label
+#: `timeline.anchored_label` composes into every reference map, so a name long enough to be a
+#: description would be a second anchor written in the wrong box.
+ASSET_NAME_LIMIT = 80
+
+#: A name cannot be cleared, which is the one place this route parts company with its siblings.
+#: An empty anchor means "no anchor" and an empty slot means "not one of the singers", but an
+#: asset with no name is a row in the library nobody can pick, a citation nobody can read back,
+#: and a reference map line that names nothing. Refused before anything is assigned.
+ASSET_NAME_EMPTY = (
+    "An asset needs a name — it is what the library lists, what a reference map line calls "
+    "this picture, and what you type to find it. Send the name you want; there is no way to "
+    "leave one blank."
+)
+ASSET_NAME_TOO_LONG = (
+    "{name} would be renamed to {length} characters, and a display name is bounded at "
+    "{limit:g}. A name is what you call this picture, not a description of it — the "
+    "appearance anchor is the box for that."
+)
+#: What a rename does, and — the half worth saying — what it does not. The Director's ask
+#: (2026-08-22), because the two halves are easy to assume wrongly in *either* direction: that a
+#: rename breaks the shots citing this asset (it cannot — a citation is by id), and that a
+#: rename rewrites the prose that already spells the old name (it does not — those are words a
+#: model or a person wrote, and this route does not edit anybody's prose).
+ASSET_RENAME_APPLIED = (
+    "Renamed {previous} to {name}. Every citation follows the asset by id, so no shot lost its "
+    "reference{maps}.{prompts}"
+)
+ASSET_RENAME_MAPS = ", and {count} reference map(s) were re-derived under the new name"
+ASSET_RENAME_PROMPTS = (
+    " {count} shot prompt(s) still spell {previous}: a rename does not rewrite prose that was "
+    "already written, so those keep the old name until they are re-expanded or cleaned."
+)
+
+
+class AssetNameRequest(BaseModel):
+    """This asset's display name. One field, `AssetConsistencyRequest`'s argument verbatim.
+
+    A general "update this asset" body would carry `kind`, `path` and `prompt` beside it, each
+    defaulted, and the route binding it could not tell an edit of one from an omission of the
+    rest — the exact shape that made the generic full-project `PUT` a data-loss hole seven
+    times. One field means the body says one thing.
+
+    **No default**, which is where this parts from the anchor and follows `SongVocalTypeRequest`:
+    an omitted name would arrive as `""`, and `""` is not a name a caller could have meant. A
+    body without one is a 422 from the schema, which is the loud version of the same mistake.
+    """
+
+    name: str
+
+
+class AssetRenameResponse(BaseModel):
+    """The saved project, plus the sentence saying what the rename touched and what it did not.
+
+    `SnapCutsResponse`' shape — the project a client adopts, beside a message a person reads —
+    rather than the bare `Project` its two sibling asset routes return, and the difference is
+    earned: setting an anchor or a slot has no consequence outside the field, while a rename
+    has three, two of which are invisible from the manifest. Citations survive (they are by id),
+    reference maps are re-derived where they can be for free, and **prose already written keeps
+    the old name**. A Director who is not told the third will read the first prompt they open as
+    evidence the rename failed.
+    """
+
+    project: Project
+    #: The name as stored — trimmed, so a client sees what actually landed.
+    name: str = ""
+    previous: str = ""
+    #: Shots whose `prompt` still contains the old name. Counted on the prose the Director and
+    #: the model wrote, which this route deliberately does not edit.
+    prompts: int = 0
+    #: Reference maps `refresh_reference_maps` was able to re-derive for free under the new name.
+    maps: int = 0
+    message: str = ""
 
 
 class DefaultSettingRequest(BaseModel):
@@ -6502,6 +6813,21 @@ def create_app(
         stored_slots = {asset.id: asset.character_slot for asset in current.assets}
         for asset in project.assets:
             asset.character_slot = stored_slots.get(asset.id, 0)
+        # Every Asset's display name is server-owned here too, and this is the **eighth** time
+        # this exact route has been the hole for an asset field. It is a different hazard from
+        # the two above and worse in one direction: `name` is *required*, so no client omits it
+        # — every client sends back whatever name it was holding, and a browser tab left open
+        # across a rename reasserts the old one on its next ordinary save. That is a silent undo
+        # of a decision the Director made on the route that makes it, and `PUT .../assets/{id}/name`
+        # is that one door.
+        #
+        # `.get(asset.id, asset.name)` rather than the anchor's `.get(asset.id, "")`, and the
+        # difference follows from the field: an asset the stored project does not hold has no
+        # stored name to adopt, and blanking it would produce a library row nobody can read.
+        # The body is the only source there, so the body is used there and nowhere else.
+        stored_names = {asset.id: asset.name for asset in current.assets}
+        for asset in project.assets:
+            asset.name = stored_names.get(asset.id, asset.name)
         # The declared location is server-owned on the same argument, and it is the *fourth*
         # time this route has been the hole: `default_setting_id` is a defaulted `str`, so
         # every client written before it existed sends `""` and one ordinary save would clear
@@ -6954,6 +7280,105 @@ def create_app(
         # it. Free to re-derive for the prose shots, and recorded as stale for the rest.
         refresh_reference_maps(project)
         return store.save(project)
+
+    @app.put(
+        "/api/projects/{project_id}/assets/{asset_id}/name",
+        response_model=AssetRenameResponse,
+    )
+    def rename_asset(
+        project_id: str, asset_id: str, request: AssetNameRequest
+    ) -> AssetRenameResponse:
+        """Rename one Asset — the whole display name, and the one route that edits it.
+
+        **The Director's chosen fix for the name leak (2026-08-22).** 9–10 prompts per populate
+        roll contained the literal internal label `HarderFaster · multiview` — *"HarderFaster ·
+        multiview screams into the polished metal stand."* The existing defence in
+        `lay_out_shots` ("A name never shown cannot be echoed") only applies once an identity
+        sheet is *promoted*, and nothing on the live project is. The Director ruled against
+        hiding names from the model: *"we dont want to lose the models ability to identify
+        assets its using or that could get bad. If the assets name is a problem then we could
+        rename it. Renaming assets may be useful anyway as the HarderFaster image is a picture
+        of a Woman named Lucy, the song i made the image for is Harder Faster."* Renaming that
+        asset to `Lucy` turns the leak into correct prose.
+
+        **The whole name, never an edit around the suffix.** ` · multiview` is appended by
+        `generate_multiview` when it mints the child, and ` · edit` by the image-edit route;
+        both are *derivations*, not decorations this route should preserve. A rename that kept
+        them would leave the Director unable to remove the very label they are renaming to get
+        rid of, which is the entire ask.
+
+        Three refusals, each before anything is assigned, so a refused rename leaves the asset
+        exactly as it was:
+
+        * the asset is not in this project — 404, `replace_consistency_prompt`'s wording;
+        * the name is empty after trimming (`ASSET_NAME_EMPTY`) — a name has no meaningful
+          blank, unlike an anchor or a slot;
+        * the name is longer than `ASSET_NAME_LIMIT`, measured after trimming
+          (`ASSET_NAME_TOO_LONG`), which is `replace_consistency_prompt`'s bound check verbatim.
+
+        **A duplicate name is not refused**, and that is a decision rather than an oversight.
+        `models.assets_for_proposal` already documents and resolves the case — first occurrence
+        in library order wins — so two assets sharing a name is a deterministic state this
+        application handles, not the ambiguity `CHARACTER_SLOT_TAKEN` refuses. A slot is a
+        *link* and two holders would make a tagged line point at two references; a name is a
+        label, and citations do not travel on it.
+
+        **What a rename does not touch, and it is said on the wire.** Citations resolve by id
+        (`AssetCitation.asset_id`), so no shot can lose its reference to a rename. Prose already
+        written — a shot's `prompt`, a reference label the Director typed per shot — keeps the
+        old spelling, because those are words a person or a model wrote and no route edits them
+        on a rename's behalf. `AssetRenameResponse.prompts` counts the shots in that state and
+        the message names it, so "the rename did not work" cannot be the reading.
+
+        Reference maps *are* re-derived, `replace_consistency_prompt`'s line and its argument:
+        the name is **in** the map — `timeline.anchored_label` composes it into every tag line —
+        so a rename changes what every citing shot's map says about this picture. Free to
+        re-derive for the prose shots, recorded as stale for the rest.
+
+        Nothing renders, arms, queues or approves; `comfy` is not touched on any path.
+        """
+        project = get_project(project_id)
+        asset = next((item for item in project.assets if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        name = request.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail=ASSET_NAME_EMPTY)
+        if len(name) > ASSET_NAME_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSET_NAME_TOO_LONG.format(
+                    name=asset.name, length=len(name), limit=ASSET_NAME_LIMIT
+                ),
+            )
+        previous = asset.name
+        # Counted *before* the write, against the old spelling, because that is the question
+        # being answered: how much prose in this plan still says the word the Director is
+        # renaming away from. `NAME_SCAN_MIN_LENGTH` is not applied — this is a report about
+        # exact text, not the substring scan that has to defend itself against short names.
+        prompts = sum(1 for shot in project.shots if previous and previous in shot.prompt)
+        # Written onto the *stored* Asset rather than a rebuilt one, `replace_consistency_prompt`'s
+        # rule: there is no construction site here where `path`, `source`, `parent_id` or
+        # `prompt_id` could be defaulted away by an edit that was only ever about one string.
+        asset.name = name
+        maps = refresh_reference_maps(project)
+        return AssetRenameResponse(
+            project=store.save(project),
+            name=name,
+            previous=previous,
+            prompts=prompts,
+            maps=len(maps),
+            message=ASSET_RENAME_APPLIED.format(
+                previous=previous or "this asset",
+                name=name,
+                maps=ASSET_RENAME_MAPS.format(count=len(maps)) if maps else "",
+                prompts=(
+                    ASSET_RENAME_PROMPTS.format(count=prompts, previous=previous)
+                    if prompts
+                    else ""
+                ),
+            ),
+        )
 
     @app.put(
         "/api/projects/{project_id}/assets/{asset_id}/character-slot",
