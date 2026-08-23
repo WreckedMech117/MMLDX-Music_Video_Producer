@@ -21,6 +21,7 @@ from music_video_producer.batch import (
     NEAR_DUPLICATE_OVERLAP,
     NOTE_KIND_PROMPT,
     NOTE_KIND_SAMENESS,
+    NOTE_KIND_SETTING_CONFLICT,
     NOTE_KIND_STALE_MAP,
     NOTE_KIND_TAKE_UNCOVERED,
     NOTE_KIND_WINDOW_LONG,
@@ -30,6 +31,7 @@ from music_video_producer.batch import (
     PLAN_WITHOUT_SHOTS,
     READINESS_REFUSAL,
     REFUSAL_NAME_LIMIT,
+    SHOT_SETTING_FIGHTS_SECTION,
     SHOT_WINDOW_ABOVE_BAND,
     SHOT_WINDOW_BEFORE_TAKE,
     SHOT_WINDOW_BELOW_BAND,
@@ -59,6 +61,7 @@ from music_video_producer.batch import (
     reconcile_render_jobs,
     render_status_report,
     render_timing_summary,
+    setting_conflict_note,
     shot_label,
     stamp_job_settled,
     supersede_target_jobs,
@@ -75,6 +78,7 @@ from music_video_producer.models import (
     RenderJob,
     Shot,
     Song,
+    SongSection,
     VisionInspectionRecord,
 )
 from music_video_producer.reference_map import (
@@ -871,6 +875,279 @@ def test_the_coverage_check_writes_nothing_back_onto_the_shot():
     readiness_report(project)
 
     assert project.model_dump(mode="json") == before
+
+
+# --------------------------------------------------------------------------------------------
+# Two sources of location. The Director's report of 2026-08-23, and the one rule in this module
+# that was **measured before it was written**: the naive reading of the same idea ("cites a
+# setting, and the section has a look prompt") fires on 30 of 30 shots of the live plan and is
+# noise, while the rule that shipped fires on 5 — the five the Director named.
+# --------------------------------------------------------------------------------------------
+
+#: The two settings the live project holds, and the section looks it carries, verbatim. They are
+#: quoted rather than invented because the whole rule turns on the vocabulary a real Director used:
+#: both names share "warehouse", and only "bed" and "floor" tell the two locations apart.
+BED = "Dusk Warehouse Bed"
+FLOOR = "Gritty Warehouse Floor"
+FLOOR_LOOK = (
+    "Vast empty warehouse floor; aggressive, handheld, shaky, low-angle camera work and an "
+    "animalistic mood."
+)
+BED_LOOK = "Black draped canopy bed; slow, sweeping, cinematic glides with a sensual, posed mood."
+#: The Outro's, and the reason a tie has to be silent: it names the shared word and neither
+#: distinguishing one, so it describes no location either setting is named after.
+NEUTRAL_LOOK = "Empty warehouse under cold moonlight; haunting, cinematic stillness."
+
+
+def located(
+    *,
+    look: str = FLOOR_LOOK,
+    cites: str = BED,
+    settings: tuple[str, ...] = (BED, FLOOR),
+) -> tuple[Project, Shot]:
+    """One shot inside one section, citing one asset. Returns the project and the shot.
+
+    The shot also cites a character, always, because every shot on the live plan does and the rule
+    has to walk past it rather than be confused by it.
+    """
+    project = Project(name="Two locations")
+    project.assets = [
+        Asset(id=f"asset_{index}", name=name, kind="setting", path=f"assets/{index}.png")
+        for index, name in enumerate(settings)
+    ]
+    project.assets.append(Asset(id="asset_lucy", name="Lucy", kind="character", path="a/l.png"))
+    project.sections = [SongSection(id="section_0", label="Verse", start=0.0, duration=20.0)]
+    project.sections[0].prompt = look
+    named = {asset.name: asset.id for asset in project.assets}
+    shot = Shot(
+        id="shot_0",
+        start=5.0,
+        duration=5.0,
+        prompt="She braces against the low angle.",
+        citations=[
+            AssetCitation(asset_id="asset_lucy", role="reference", order=0),
+            *(
+                [AssetCitation(asset_id=named[cites], role="reference", order=1)]
+                if cites
+                else []
+            ),
+        ],
+    )
+    project.shots = [shot]
+    return project, shot
+
+
+def test_a_shot_whose_setting_fights_its_sections_look_warns_and_names_both():
+    """The live case, exactly: a bed cited under a look prompt that reads "Vast empty warehouse
+    floor". The note names the two things that disagree and the word that decided it, so a Director
+    can check the finding rather than take it."""
+    project, shot = located()
+
+    kind, reason = setting_conflict_note(project, shot)
+
+    assert kind == NOTE_KIND_SETTING_CONFLICT
+    assert reason == SHOT_SETTING_FIGHTS_SECTION.format(
+        cited=BED, label="Verse", rival=FLOOR, words='"floor"'
+    )
+    # Both names, and the evidence, in the sentence the Director reads.
+    assert BED in reason and FLOOR in reason and '"floor"' in reason
+    # And it warns. `ready` is untouched, nothing is blocked, and the sentence says so — this is
+    # the Director's ruling in full: "populate still writes it, readiness flags it, and the
+    # Director keeps the ability to do it deliberately."
+    report = readiness_report(project)
+    assert report.ready is True
+    assert report.blocking == []
+    assert "does not block submission" in reason
+    assert [note.kind for note in report.window_warnings] == [NOTE_KIND_SETTING_CONFLICT]
+    assert report.window_warnings[0].shot_ids == ["shot_0"]
+    assert report.window_warnings[0].labels == [shot_label(project, shot)]
+
+
+def test_the_shot_that_cites_the_setting_its_section_describes_says_nothing():
+    """The normal case, and the one the rule exists to stay quiet about: citing a setting is
+    correct, every section has a look prompt, and neither is a problem."""
+    assert setting_conflict_note(*located(cites=FLOOR)) == ("", "")
+    # And the same pair the other way round, in the section the bed really is the location of.
+    assert setting_conflict_note(*located(look=BED_LOOK, cites=BED)) == ("", "")
+    assert setting_conflict_note(*located(look=BED_LOOK, cites=FLOOR))[0] == (
+        NOTE_KIND_SETTING_CONFLICT
+    )
+
+
+def test_a_look_that_matches_both_settings_equally_or_neither_is_silent():
+    """Ambiguity answers nothing, deliberately. The Outro's look names the word both settings are
+    named after and neither word that tells them apart, so no rival is *better* and no note is
+    invented; a rule that fired on a tie would fire on most of a plan."""
+    assert setting_conflict_note(*located(look=NEUTRAL_LOOK)) == ("", "")
+    assert setting_conflict_note(*located(look=NEUTRAL_LOOK, cites=FLOOR)) == ("", "")
+    # A look prompt about light and camera and no place at all — the live Bridge.
+    assert setting_conflict_note(
+        *located(look="Flickering, erratic lighting and blurry, disorienting camera work.")
+    ) == ("", "")
+
+
+def test_a_shot_with_one_source_of_location_or_none_is_never_in_two_places():
+    """Three ways to have fewer than two locations, and each answers silence rather than a guess."""
+    # A shot citing only a character. Location is the whole subject of this note.
+    assert setting_conflict_note(*located(cites="")) == ("", "")
+    # A section with no look prompt: a blank look describes no place.
+    assert setting_conflict_note(*located(look="")) == ("", "")
+    assert setting_conflict_note(*located(look="   ")) == ("", "")
+    # A project holding one setting, which is every project until the Director makes a second.
+    assert setting_conflict_note(*located(settings=(BED,))) == ("", "")
+    # And a shot in no section at all — `song_section` returns nothing rather than guessing one.
+    project, shot = located()
+    project.sections = []
+    assert setting_conflict_note(project, shot) == ("", "")
+
+
+def test_the_best_rival_is_named_and_a_tie_between_rivals_is_broken_by_library_order():
+    """Which setting the sentence names is a **decision**, not whichever the loop saw last.
+
+    Two questions, and both need three settings to be asked at all:
+
+    * the *best* rival wins, not the first that beats the cited one — a look prompt matching one
+      rival on one word and another on two must name the second;
+    * two rivals matching equally are broken by the project's own asset order, so the note reads
+      the same on two calls over one project. A report that reworded itself between fetches would
+      be a report the Director cannot quote back.
+    """
+    project, shot = located(settings=(BED, FLOOR, "Rain-Slick Loading Dock"))
+    project.sections[0].prompt = "A vast rain-slick warehouse floor beyond the loading bay."
+
+    # "floor" and "slick"/"rain" for the dock: the dock matches two telling words, the floor one.
+    kind, reason = setting_conflict_note(project, shot)
+    assert kind == NOTE_KIND_SETTING_CONFLICT
+    assert "Rain-Slick Loading Dock" in reason, reason
+    assert FLOOR not in reason, "the first rival to beat the cited setting won over the best one"
+
+    # Now make them tie on one word each. The earlier asset in the library is named, both times.
+    project.sections[0].prompt = "A vast warehouse floor beside the loading bay."
+    first = setting_conflict_note(project, shot)[1]
+    assert FLOOR in first and "Rain-Slick Loading Dock" not in first, first
+    assert setting_conflict_note(project, shot)[1] == first
+    # And reversing the library reverses the answer, which is what makes the order the rule.
+    project.assets = [project.assets[2], project.assets[1], project.assets[0], project.assets[3]]
+    reversed_reason = setting_conflict_note(project, shot)[1]
+    assert "Rain-Slick Loading Dock" in reversed_reason and FLOOR not in reversed_reason
+
+
+def test_a_shot_already_citing_the_look_s_setting_is_never_told_to_cite_it():
+    """A note whose remedy is "cite the one you are already citing" is a note a Director learns to
+    skip. Such a shot does name two places, but that is a different fact with a different fix and
+    this sentence would describe neither — so it is silent.
+
+    Asserted in **both citation orders**, because the walk reports the first cited setting that
+    disagrees: with the floor cited second, the bed is reached first and the floor is the better
+    rival, which is how a shot gets told to cite what it already holds.
+    """
+    project, shot = located(cites=BED)
+    floor = next(asset for asset in project.assets if asset.name == FLOOR)
+
+    shot.citations.append(AssetCitation(asset_id=floor.id, role="reference", order=2))
+    assert setting_conflict_note(project, shot) == ("", "")
+
+    shot.citations = [
+        AssetCitation(asset_id=floor.id, role="reference", order=0),
+        AssetCitation(asset_id=shot.citations[1].asset_id, role="reference", order=1),
+    ]
+    assert setting_conflict_note(project, shot) == ("", "")
+    # And the guard has not silenced the case it exists beside: drop the floor and it fires again.
+    shot.citations = [shot.citations[1]]
+    assert setting_conflict_note(project, shot)[0] == NOTE_KIND_SETTING_CONFLICT
+
+
+def test_the_note_is_derived_on_every_call_and_never_written_back():
+    """AD-5's rule, asserted for the new note as it is for the coverage one: a stored verdict goes
+    stale the moment a citation changes, and this is computable from the manifest."""
+    project, _ = located()
+    before = project.model_dump(mode="json")
+
+    readiness_report(project)
+    readiness_report(project, include_warnings=False)
+
+    assert project.model_dump(mode="json") == before
+
+
+def test_the_note_survives_the_submission_routes_hot_path():
+    """`include_warnings=False` skips the pairwise pass and keeps every per-shot note, for the
+    band's reason: this is one comparison per shot and the route is the surface that most needs
+    to have said it before the GPU time is spent."""
+    project, _ = located()
+
+    report = readiness_report(project, include_warnings=False)
+
+    assert report.warnings_computed is False
+    assert [note.kind for note in report.window_warnings] == [NOTE_KIND_SETTING_CONFLICT]
+
+
+def test_the_rule_flags_five_of_thirty_and_the_naive_reading_flags_all_thirty():
+    """**The measurement this shipped on**, reproduced as a regression.
+
+    The live 30-shot plan's own shape: seven sections with the Director's own look prompts, and the
+    setting each of its thirty shots really cites. The rule reports the five the Director named and
+    stays silent on the other twenty-five. The naive reading of the same idea — "cites a setting,
+    and the section has a look prompt" — is counted alongside it and reaches thirty, which is what
+    makes it noise: a warning that fires on every shot trains a Director to skip the list that
+    carries the ones that matter.
+    """
+    #: (section label, look prompt, the settings its shots cite in order) — the live plan.
+    structure = [
+        ("Intro", "Empty, moonlit warehouse; lonely, industrial atmosphere.", [FLOOR, FLOOR]),
+        ("Verse", FLOOR_LOOK, [FLOOR, BED, BED, BED, BED]),
+        ("Chorus", BED_LOOK, [BED, BED, BED, BED]),
+        ("Verse 2", FLOOR_LOOK, [FLOOR, FLOOR, BED, FLOOR]),
+        ("Chorus 2", BED_LOOK, [BED, BED, BED, BED, BED]),
+        ("Bridge", "Flickering, erratic lighting mirroring ecstasy and madness.", [BED] * 4),
+        ("Outro", NEUTRAL_LOOK, [BED, FLOOR, FLOOR, FLOOR, FLOOR, FLOOR]),
+    ]
+    project = Project(name="Harder Faster")
+    project.assets = [
+        Asset(id="asset_bed", name=BED, kind="setting", path="assets/bed.png"),
+        Asset(id="asset_floor", name=FLOOR, kind="setting", path="assets/floor.png"),
+    ]
+    ids = {BED: "asset_bed", FLOOR: "asset_floor"}
+    clock = 0.0
+    naive = 0
+    for index, (label, look, cited) in enumerate(structure):
+        length = 5.0 * len(cited)
+        section = SongSection(
+            id=f"section_{index}", label=label, start=clock, duration=length
+        )
+        section.prompt = look
+        project.sections.append(section)
+        for offset, name in enumerate(cited):
+            project.shots.append(
+                Shot(
+                    id=f"shot_{index}_{offset}",
+                    start=clock + offset * 5.0,
+                    duration=5.0,
+                    prompt=f"{label} beat {offset}: she turns into the light.",
+                    citations=[AssetCitation(asset_id=ids[name], role="reference", order=0)],
+                )
+            )
+            # The naive rule, counted on the same plan rather than argued about: this shot cites a
+            # setting and its section has a look prompt, which is true of every shot here.
+            naive += bool(look.strip())
+        clock += length
+
+    report = readiness_report(project)
+    flagged = [
+        shot_id
+        for note in report.window_warnings
+        if note.kind == NOTE_KIND_SETTING_CONFLICT
+        for shot_id in note.shot_ids
+    ]
+
+    assert len(project.shots) == 30
+    assert naive == 30, "the naive rule stopped firing on everything, so it is no longer the foil"
+    assert len(flagged) == 5, flagged
+    # The five are the bed-citing shots of the two floor sections, and nothing else.
+    assert flagged == [
+        "shot_1_1", "shot_1_2", "shot_1_3", "shot_1_4", "shot_3_2",
+    ], flagged
+    # Still a warning across the whole plan, exactly as it is for one shot.
+    assert report.ready is True
 
 
 def test_timeline_does_not_import_batch_so_the_window_math_stays_a_pure_leaf():

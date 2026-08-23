@@ -11322,6 +11322,167 @@ def test_the_uncovered_clip_is_a_warning_and_not_a_block_anywhere():
 
 
 # --------------------------------------------------------------------------------------------
+# Two sources of location, drawn. The Director's report of 2026-08-23: five shots on the live plan
+# cite `Dusk Warehouse Bed` while their section's look prompt reads "Vast empty warehouse floor".
+#
+# It composes exactly as the coverage note did, and for the same reason: the same `window_warnings`
+# list, the same `readinessLines` reader, the same amber, one more `kind`. What it deliberately does
+# **not** do is paint the clip -- see the test below for the argument.
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_two_locations_note_the_browser_draws_is_the_one_the_server_answers_with():
+    """End to end over a real report, on the coverage verdict's own argument: a kind renamed on
+    either side leaves the Director's list silent for ever with the whole suite green. The Python
+    sentence is never rewritten here -- it is passed through node and asserted to arrive whole."""
+    from music_video_producer.batch import NOTE_KIND_SETTING_CONFLICT, readiness_report
+    from music_video_producer.models import SongSection
+
+    project = Project(
+        name="Harder Faster",
+        assets=[
+            Asset(id="bed", name="Dusk Warehouse Bed", kind="setting", path="assets/bed.png"),
+            Asset(id="floor", name="Gritty Warehouse Floor", kind="setting", path="a/f.png"),
+            Asset(id="lucy", name="Lucy", kind="character", path="assets/lucy.png"),
+        ],
+        shots=[
+            # The live case: a bed cited inside a section whose look prompt is a floor.
+            Shot(
+                id="two", start=11.0, duration=5.0, prompt="She braces at the low angle.",
+                citations=[AssetCitation(asset_id="bed", role="reference", order=0)],
+            ),
+            # And the same section's other shots, citing the location it describes.
+            Shot(
+                id="one", start=17.0, duration=5.0, prompt="A wide of the empty concrete.",
+                citations=[AssetCitation(asset_id="floor", role="reference", order=0)],
+            ),
+            # A shot citing only a character has no location of its own to disagree with.
+            Shot(
+                id="none", start=23.0, duration=5.0, prompt="A close on her hands.",
+                citations=[AssetCitation(asset_id="lucy", role="reference", order=0)],
+            ),
+        ],
+    )
+    project.sections = [SongSection(id="verse", label="Verse", start=11.0, duration=21.54)]
+    project.sections[0].prompt = (
+        "Vast empty warehouse floor; aggressive, handheld, shaky, low-angle camera work."
+    )
+    report = readiness_report(project)
+    payload = json.loads(json.dumps(asdict(report)))
+    drawn = run_module(
+        f"const report = {json.dumps(payload)};"
+        """
+      import { NOTE_KIND_SETTING_CONFLICT, READINESS_BLOCKING_LABEL,
+               READINESS_SAMENESS_LABEL, READINESS_SETTING_CONFLICT_LABEL,
+               READINESS_STALE_MAP_LABEL, READINESS_TAKE_UNCOVERED_LABEL,
+               READINESS_WINDOW_LONG_LABEL, READINESS_WINDOW_SHORT_LABEL,
+               clipWindowState, readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const byShot = windowWarningsByShot(report);
+      console.log(JSON.stringify({
+        kind: NOTE_KIND_SETTING_CONFLICT,
+        label: READINESS_SETTING_CONFLICT_LABEL,
+        others: [READINESS_BLOCKING_LABEL, READINESS_SAMENESS_LABEL, READINESS_STALE_MAP_LABEL,
+                 READINESS_TAKE_UNCOVERED_LABEL, READINESS_WINDOW_LONG_LABEL,
+                 READINESS_WINDOW_SHORT_LABEL],
+        byShot,
+        drawnOnClip: clipWindowState(byShot.two, 'She braces at the low angle.'),
+        lines: readinessLines(report),
+      }));
+        """
+    )
+    # The heading is pinned to its own words, and asserted to be **nobody else's**. Reading it back
+    # out of the same module it labels the line with proves only that the file is self-consistent:
+    # rewrite the constant to "Short window" and every other assertion here still passes while the
+    # Director reads a two-locations sentence under the band's name.
+    assert drawn["label"] == "Two locations"
+    assert drawn["label"] not in drawn["others"], (
+        "the two-locations heading is another readiness kind's name, so two different problems "
+        "reach the Director's list under one heading"
+    )
+    # One kind, spelled the same in both languages, and the server decided which shot has it.
+    assert drawn["kind"] == NOTE_KIND_SETTING_CONFLICT == "setting_conflict"
+    assert drawn["byShot"] == {"two": "setting_conflict"}
+    # One line, under its own heading, carrying the server's whole sentence unreworded.
+    assert len(drawn["lines"]) == 1, drawn["lines"]
+    line = drawn["lines"][0]
+    assert line["kind"] == "setting-conflict"
+    assert line["reason"] == report.window_warnings[0].reason
+    assert line["text"].startswith(f"{drawn['label']} - SHOT 01 (two): ")
+    # The two things that disagree, and the evidence, reaching the Director whole.
+    assert "Dusk Warehouse Bed" in line["reason"]
+    assert "Gritty Warehouse Floor" in line["reason"]
+    assert '"floor"' in line["reason"]
+    assert "does not block submission" in line["reason"]
+    # The same amber the band and the coverage note read in, in the stylesheet the Director sees.
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".plan-readiness li.setting-conflict { color: var(--amber); }" in styles
+
+
+def test_the_two_locations_note_never_paints_a_clip_and_never_hides_one_that_should_be():
+    """A fourth border colour on the timeline would be a state the Director has to learn to read
+    for a problem the timeline cannot fix: where a shot is set is changed in the inspector, not by
+    dragging. So it draws no clip state -- and, because it shares `windowWarningsByShot` with the
+    states that do, it must also be ranked, or a shot carrying both would keep whichever note the
+    server listed first and a real amber border would be lost to one that paints none."""
+    verdicts = run_module("""
+      import { clipWindowState, readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const both = [
+        { shot_ids: ['both'], labels: ['SHOT 01'], reason: 'in two places', kind: 'setting_conflict' },
+        { shot_ids: ['both'], labels: ['SHOT 01'], reason: 'off the end', kind: 'take_uncovered' },
+      ];
+      const alone = { window_warnings: [both[0]] };
+      console.log(JSON.stringify({
+        alone: windowWarningsByShot(alone),
+        aloneDrawn: clipWindowState(windowWarningsByShot(alone).both, 'A push-in.'),
+        byShot: windowWarningsByShot({ window_warnings: both }),
+        reversed: windowWarningsByShot({ window_warnings: [...both].reverse() }),
+        lines: readinessLines({ window_warnings: both }).map((line) => line.kind),
+      }));
+    """)
+    # On its own it puts nothing on the clip: no class, no words, and the label untouched.
+    assert verdicts["alone"] == {"both": "setting_conflict"}
+    assert verdicts["aloneDrawn"] == {"className": "", "note": "", "label": "A push-in."}
+    # Beside a window state it loses, in either order — the coverage amber is not swallowed.
+    assert verdicts["byShot"] == {"both": "take_uncovered"}
+    assert verdicts["reversed"] == verdicts["byShot"], (
+        "the clip's state depends on the order the server listed two notes in, which is not a "
+        "decision anyone made"
+    )
+    # And both lines are still printed, each under its own kind.
+    assert verdicts["lines"] == ["setting-conflict", "take-uncovered"], verdicts["lines"]
+
+
+def test_the_two_locations_note_is_a_warning_and_not_a_block_anywhere():
+    """The band's negative scan, run again for the third amber. The Director's ruling is that this
+    warns and never blocks -- "the Director keeps the ability to do it deliberately, because
+    sometimes a contradiction is the shot you want" -- so what must not exist is a branch in the
+    client that reads this kind and shuts something."""
+    for source, name in ((API_JS, "api.js"), (APP_JS, "app.js")):
+        for line in source.read_text(encoding="utf-8").splitlines():
+            if "setting_conflict" not in line and "SETTING_CONFLICT" not in line:
+                continue
+            if line.strip().startswith(("//", "//:", "*")):
+                continue
+            assert "disabled" not in line, f"{name} shuts a control from the setting note: {line}"
+            assert "refus" not in line.lower(), f"{name} refuses from the setting note: {line}"
+    # And the server never lets it reach `blocking`, which is the list every refusal is read from.
+    # Read off the source rather than off one report, because a report only proves it for the
+    # project that report was built from; this proves no branch exists that could.
+    batch_source = Path("src/music_video_producer/batch.py").read_text(encoding="utf-8")
+    blocked_kinds = [
+        segment.split(")", 1)[0]
+        for segment in batch_source.split("blocking.append(")[1:]
+    ]
+    assert blocked_kinds, "no blocking path found, so this scan is passing vacuously"
+    for segment in blocked_kinds:
+        assert "SETTING_CONFLICT" not in segment, (
+            f"the two-locations note reaches `blocking`, which is a refusal: {segment}"
+        )
+
+
+# --------------------------------------------------------------------------------------------
 # The music lock, beside the trim nudge. The Director's ask, 2026-08-21: "Perhaps a lock/unlock
 # from timeline toggle in the shots info panel may be useful next to that nudge input so that
 # dragging a b-roll clip would be easier (default locked)."

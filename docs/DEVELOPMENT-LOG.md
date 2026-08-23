@@ -4,6 +4,168 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-23 — A shot in two places warns, measured at 5 of 30 before it was built; and the slow-render marker is declined
+
+Two Director rulings. The first is the work; the second is a decision recorded so it is not
+re-proposed.
+
+**No render, no ComfyUI submission, no model call.** `data/projects/project_59f14d19ff10` was read
+**read-only**, as the plan the rule was measured against.
+
+### The observation, and why it could not be answered semantically
+
+On the live 30-shot plan, five shots (`shot_b2b662a46ce0`, `shot_ad72d083abfa`,
+`shot_25a37f47456c`, `shot_a0878d933a30`, `shot_f82bf42e3abc`) cite the asset **`Dusk Warehouse
+Bed`** while their section's look prompt reads **"Vast empty warehouse floor"**. `song_audio_prose`
+appends the section look verbatim, so the submitted text hands H3 a bed reference and then tells it
+the location is an empty floor. It is baked into what gets rendered, and nothing said so.
+
+The Director's ruling is **warn, don't block**: "populate still writes it, readiness flags it, and
+the Director keeps the ability to do it deliberately, because sometimes a contradiction is the shot
+you want." That is sameness' side of this module's split — emptiness blocks, sameness warns — and
+for sameness' exact reason: there is a reading of this state under which the render is the right
+thing to spend, and a gate over a legitimate state is a gate that gets worked around.
+
+"Contradicts" is semantic, and **`readiness_report` may not make a model call**: it runs on every
+render submission and must stay pure, offline and deterministic. So the rule had to be structural.
+
+### The rule was measured before it was written, and the naive one was rejected on the number
+
+The most promising structural reading is *a shot with two sources of location*: it cites a
+`setting` Asset, and its section's look prompt also describes a place. The naive form of that —
+"cites a setting, and the section has a look prompt" — was measured against the live plan first and
+fires on **30 of 30 shots**. That is not a warning, it is noise, and noise is worse than nothing
+here: the readiness list is a list the Director reads, and one entry that always fires trains them
+to skip all of them.
+
+What separates the real case from the normal one is that the project holds **two** settings, and
+the section look matches the one that was *not* cited. So the rule is: the shot cites a setting
+Asset, and some **other** setting this project holds matches the section's look prompt strictly
+better, by word overlap, than the cited one does. The project's own asset names supply the entire
+vocabulary — nothing in the check knows what a warehouse is.
+
+Words carried by more than one setting name are dropped before the comparison
+(`batch._telling_words`). That is self-calibrating rather than a stop-word table: on this plan it
+discards `"warehouse"`, which both settings are named after, leaving `{dusk, bed}` against
+`{gritty, floor}` — the words a Director would point at. Shared articles and house terms fall out
+of it for free.
+
+**Measured on the live plan: 5 of 30, and they are the five the Director named** — no misses, no
+false positives, verified through `readiness_report` itself rather than a script approximating it.
+The threshold is asserted at its edge: a margin of one distinguishing word is required and
+sufficient (a margin of two flags nothing at all here), so the rule is pinned where it actually
+sits rather than in the middle of a range where any threshold would pass. The measurement is
+carried into the suite as a regression over a 30-shot fixture reproducing the plan's shape, which
+also counts the naive rule alongside it and asserts it still reaches thirty — a foil that stopped
+firing on everything would stop being a foil.
+
+**Every ambiguity answers silence.** Fewer than two settings; no section or a blank look prompt; a
+look that matches both settings equally (the live Outro, "Empty warehouse under cold moonlight" —
+it names no floor and no bed) or neither (the Bridge, which is about light and camera); a shot
+citing only a character. There is no stemming and no synonym list, so a project that words its look
+prompts away from its asset names gets **no** warning rather than a guessed one. That is the price
+of refusing a model call inside readiness, it is stated in the function's docstring rather than
+hidden, and it fails towards silence — the only direction a warning is allowed to fail in.
+
+One more silence was added after the rule was first working, because the note's remedy has to be
+true: a shot that **already cites the setting the look describes**, alongside another one, is not
+told to "cite the one you are already citing". It does name two places, but that is a different
+fact with a different fix and this sentence describes neither. It is reachable by citation *order*
+rather than only by a double citation — the walk reports the first cited setting that disagrees, so
+a shot citing the floor and then the bed would otherwise have been sent to fix what it had already
+done. It changes nothing on the live plan, where every shot cites exactly one setting.
+
+### It is one more kind in the list that already exists
+
+`NOTE_KIND_SETTING_CONFLICT`, in `batch.readiness_report`'s `window_warnings`, beside the band's
+two kinds and `NOTE_KIND_TAKE_UNCOVERED`: the same list, the same `readinessLines` reader, the same
+amber, its own heading ("Two locations"). No fourth list and no second mechanism for one sentence a
+Director reads exactly as they read the others. That list's name is the window notes it was built
+for and is kept because it is on the wire; its membership rule was always the broader one — per
+shot, never moves `ready`, drawn under its own kind — and the docstring now says so.
+
+The note **names the two things that disagree and the word that decided it**, so the finding can be
+checked rather than taken: "This shot cites the setting Dusk Warehouse Bed, and the Verse section's
+look prompt matches a different setting this project holds: Gritty Warehouse Floor, on "floor"…"
+It offers all three fixes, the third being to leave it, and it ends by saying it does not block
+submission, as every warning in this module does.
+
+**It deliberately paints no clip.** The band and the coverage note colour a clip because they are
+properties of the window the Director is dragging; where a shot is set is fixed in the inspector,
+and a fourth border colour on the timeline would be a state to learn for a problem the timeline
+cannot fix. Because it nonetheless shares `windowWarningsByShot` with the states that do, it is
+*ranked* below them rather than left out of the table: an unranked kind makes the comparison
+order-dependent in JavaScript (`undefined > 1` and `1 > undefined` are both false), so a shot that
+is in two places *and* has outgrown its take would have kept whichever note the server listed first
+and lost a real amber border to one that paints none.
+
+The likely author of the state is `models.with_default_setting`, which attaches the project's
+declared location to any shot that named none — correct in general, and wrong for a shot sitting in
+a section whose look describes the other one. Left as it is: the ruling is to warn about the
+result, not to change what populate writes.
+
+### The slow-render marker: declined
+
+The Director was asked whether a render slowed by the card running out of memory should be marked
+in the timing column, given six instrumented jobs where the four at **141 frames span 13.7x**.
+**They ruled: no marker, just show the time.** Nothing was built, and this is recorded here and in
+`batch.render_timing_summary`'s docstring so it is not re-proposed.
+
+The reason it is the right call is that `render_timing_summary`'s whole discipline is saying only
+what was measured. Nothing on a `RenderJob` records VRAM pressure — ComfyUI's execution clock is a
+duration and nothing else — so a marker would be *inferred* from the duration being long, which is
+a restatement of the number dressed as a cause; that is the same move behind the fabricated
+"221 frames = 2.2 hours" figure this application spent two days retiring. Establishing the cause
+would need a memory reading this application does not take and **must not start taking: no
+`nvidia-smi` dependency belongs anywhere in this codebase**, on the standing rule that keeps
+ComfyUI user-managed. A 13.7x spread is already visible in the column to a reader who has the frame
+count beside it, which is what the column is for.
+
+### Tests
+
+Twelve cases. Nine in `tests/test_batch.py`: the live case warns and names both assets and the
+deciding word; the correct citation says nothing, in both directions; a tie or a placeless look is
+silent; one location or none is silent, across four ways of having fewer than two; with three
+settings, the *best* rival is named rather than the first that beats the cited one, and two rivals
+matching equally are broken by library order — twice over one project, and reversed when the
+library is; a shot already citing the look's setting is silent, in both citation orders, and the
+case beside it still fires; the note is derived and never written back; it survives
+`include_warnings=False`, which is the submission route's hot path; and the 30-shot measurement,
+asserting 5 against the naive rule's 30. Three in
+`tests/test_frontend_contract.py`, executed against `api.js` under node: a real `readiness_report`
+crosses into JavaScript and comes back as one amber line under its own heading with the server's
+sentence unreworded; the clip stays plain and the ranking holds in both list orders; and the
+negative scan, that no branch in either module shuts or refuses anything from this kind and that no
+`blocking.append` in `batch.py` can reach it.
+
+### Mutation sweep: 19 of 22 killed, and the three survivors are equivalent
+
+Every new branch in both files, swept in a `git worktree` with `PYTHONPATH` at its own `src`
+(verified by printing `music_video_producer.__file__` before a single mutant was applied — the
+editable install's `.pth` otherwise imports the live checkout and reports everything as survived),
+byte restores between runs, each anchor converted to its file's own line ending with the match
+count asserted, and one sentinel per mutated file that must fail. Both sentinels were killed, so
+the sweep was genuinely exercising both languages.
+
+Two survivors were **real findings and were fixed**, which is the point of running it:
+
+* the note could tell a Director to "cite {rival} instead" when the shot **already cites** that
+  rival — reachable by citation order, not only by a double citation. Fixed by the `held_ids`
+  guard, and both mutants of that guard are now killed.
+* the readiness heading could be reworded to another kind's name (`"Two locations"` →
+  `"Short window"`) with the whole suite green, because the contract test read the label out of the
+  same module that labels the line with it — self-consistency, not agreement. The test now pins the
+  words and asserts the heading is **nobody else's**.
+
+The three that remain are equivalent mutants rather than gaps, and the argument is written into
+`setting_conflict_note`'s docstring so the next reader does not mistake them for holes: the
+fewer-than-two-settings return and the blank-look-prompt return are **cost, not behaviour**. With
+one setting the rival loop skips it as already held and with none the outer loop has nothing to
+walk; with a blank look prompt `_words("")` is the empty set, so every `matched` is empty and
+firing needs `len(matched) > held` with `held >= 0`, which the empty set cannot satisfy. Both were
+kept for the cost saving `readiness_report` claims in its own docstring. `section is None` is *not*
+in that category and its mutant is killed — without it, `section.prompt` raises.
+
 ## 2026-08-23 — A take records which bundle produced it, and a take that predates the record says so
 
 Source: the entry below made `Project.sampling_profile` the Director's per-project choice, which

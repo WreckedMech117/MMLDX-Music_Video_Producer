@@ -1259,10 +1259,12 @@ far outside the 2.5% warm reproducibility of §6.19, but a same-session A/B was 
 
 ---
 
-## 8. The "soft skin" prompt clause: SPECIFIED, NOT RUN
+## 8. The "soft skin" prompt clause: RUN — and the answer is "we cannot tell"
 
-**Status: specified 2026-08-23. Nothing was rendered, no prompt clause was added anywhere in the
-application, and no GPU time was spent writing this section.**
+**Status: specified 2026-08-23, run 2026-08-23 on the Director's authorisation. §8.1–§8.7 below
+are the specification as written *before* the run and are left unedited; §8.8 is the result.
+Three renders, ~9.5 minutes of GPU. No prompt clause was added anywhere in the application, and
+§8.7 still stands.**
 
 The Director, reading the 8-step-vs-20-step comparison
 (`docs/measurements/2026-08-23-bundle-comparison/index.html`):
@@ -1368,3 +1370,291 @@ hour; that is the escalation, and it is the Director's to authorise.
 this section.** Not in `SONG_AUDIO_CONTINUITY_CLAUSE`, not in the expansion prompts, not in a
 section look, not as a default. This is a specified test, and the whole point of writing it down
 instead of doing it is that the effect is **unmeasured**.
+
+### 8.8 MEASURED 2026-08-23: the clause moves nothing that a re-rolled take does not move more
+
+**Run on the Director's authorisation. Three renders, one session, warm, consecutive, no `/free`,
+first render discarded, state and mid-render power on every arm — §6.19 and §6.20's protocol, all
+four conditions met. Pictures and stills:
+`docs/measurements/2026-08-23-soft-skin-clause/index.html`.**
+
+**The answer to the Director's question is "we cannot tell from this", and that is the true
+answer rather than a hedge.**
+
+#### What was run, and what it cost
+
+| ex# | arm | prose | seed | comfy exec | sampling | s/step | VRAM before | host RAM free | power median | power max | temp max | throttle |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | **warmup / noise floor** | control | 15 | 212.5 s | 169.9 s | 21.23 | **2165 MiB** | 20.36 GiB | 506.6 W | 584.2 W | 82 °C | SW power cap |
+| 2 | **A — control** | control | 14 | 133.3 s | 133.3 s | 16.66 | 27170 MiB | 12.12 GiB | 520.7 W | 575.5 W | 85 °C | SW power cap |
+| 3 | **B — treatment** | control + `soft skin` | 14 | 221.2 s | 183.2 s | 22.90 | **8976 MiB** | 28.03 GiB | 484.0 W | 575.5 W | 83 °C | SW power cap |
+
+All three ran **compute-bound** — 484–521 W median at 99–100% utilisation, against §6.20's
+~250 W memory-starved signature. Nine and a half minutes of GPU in total.
+
+**The timings are recorded and are not comparable, and the reason is a finding.** Arm B began
+with **8976 MiB** resident where arm A began with **27170 MiB**: between the two arms ComfyUI
+released ~18 GiB of VRAM *and* ~16 GiB of host RAM (host free rose 12.12 → 28.02 GiB during arm
+A), so arm B paid a model reload arm A did not. **This is not `/free` — nothing called it, and
+`/free` moves weights to host RAM rather than releasing them (§6.19).** Something in ComfyUI's own
+memory management evicted the stack unprompted. The consequence for method is direct: **"warm and
+consecutive" is not guaranteed by running arms back to back**, and residency has to be read per
+arm rather than assumed. It was read here, which is the only reason the 66% timing spread between
+arms 2 and 3 is explicable rather than mysterious.
+
+#### The measure
+
+The §8.4 instrument, unchanged, plus two additions that are named as additions.
+
+| arm | `detail` | skin detail | skin, normalised | `flicker` | `bytes_per_frame` |
+|---|---|---|---|---|---|
+| **A — control, seed 14** | 369.08 | 140.36 | 0.0503 | 11.3339 | 20133.5 |
+| **B — + "soft skin", seed 14** | 335.68 | 124.84 | 0.0534 | 9.7944 | 17853.3 |
+| noise floor — control, seed 15 | 484.39 | 118.91 | 0.0675 | 8.0678 | 14666.3 |
+| archived arm A — same payload, previous session | **376.82** | 147.19 | 0.0615 | 10.9769 | 18137.2 |
+| 20-step default — the bundle comparison's soft arm | 166.22 | 65.22 | 0.0373 | 5.8596 | 14494.9 |
+
+**skin detail** is the same Laplacian statistic over the face rectangle only and over the first
+2.58 s. That restriction is load-bearing: **past ~2.6 s each take makes its own camera move to its
+own destination** — the seed-15 take cuts to a bright static wide, the seed-14 takes keep a moving
+figure in a dark room — so the whole-take `detail` figure past that point is comparing *content*,
+not texture. **skin, normalised** divides out each take's own contrast, which separates "more
+grain" from "flatter picture".
+
+#### The result, against two floors
+
+| measure | A | B | change | re-roll floor | same-payload floor | read |
+|---|---|---|---|---|---|---|
+| skin detail | 140.36 | 124.84 | **−11.1%** | **15.3%** | 4.9% | inside the noise |
+| skin, normalised | 0.0503 | 0.0534 | **+6.2%** | 34.2% | 22.3% | inside, and the wrong way |
+| `detail`, whole take | 369.08 | 335.68 | −9.0% | 31.2% | 2.1% | inside the noise |
+| `flicker` | 11.3339 | 9.7944 | −13.6% | 28.8% | 3.1% | inside the noise |
+| `bytes_per_frame` | 20133.5 | 17853.3 | −11.3% | 27.2% | 9.9% | inside the noise |
+
+**Two floors, and only one of them applies.** The *same-payload* floor is what a byte-identical
+graph at a byte-identical seed produces in a different session: **2.1% on `detail`**, which is
+essentially §6.19's 2.5% warm reproducibility appearing in a picture statistic. The *re-roll*
+floor is what a different take of the **unchanged** prose produces. **A prompt change is a
+re-roll (§6.13, §8.7), so the re-roll floor is the bar, and nothing clears it.**
+
+**Every measure moves less than re-rolling the take moves it.** The primary `detail` figure went
+369.08 → 335.68, which is the direction that would indicate the clause works; re-rolling the seed
+on the control prose moved the same number to 484.39. **The effect is under a third of the
+noise.**
+
+#### Three things that argue further against reading the movement as texture
+
+1. **The normalised measure goes the other way (+6.2%).** The face's contrast fell (std 52.82 →
+   48.36) and its detail fell with it. What little changed is a marginally flatter picture, not
+   micro-texture coming back. Mean face luma is unchanged (53.42 → 53.95), so this is not an
+   exposure artefact either.
+2. **The gap is the wrong size by an order of magnitude.** On this same instrument the 8-step
+   bundle sits at 147.19 skin detail against the 20-step default's 65.22 — **−55.7%**. The clause
+   produced −11.1%, inside a 15.3% floor.
+3. **By eye, arm B's skin is not less waxy.** The sheen on the forehead, the nose and the
+   cheekbone is present in both arms at every matched moment. The stills are on the page; the
+   judgement is the Director's and not this document's.
+
+#### The finding that was not asked for, and matters more than the result
+
+**A byte-identical payload at a byte-identical seed does not reproduce the same take across
+sessions — and the difference is larger than the prompt clause's.**
+
+Arm A here and the archived arm A are the same graph and the same seed, verified node by node.
+Their frames differ by **mean |Δ| = 20.3/255 with pixel correlation 0.48**. Arm A against arm B —
+*different prose* — differs by **18.7/255, correlation 0.55**. **The same payload is less alike to
+itself across sessions than the two arms are to each other.**
+
+Summary statistics reproduce to a few percent; frames do not reproduce at all. **This retracts the
+reuse allowance in §8.3**: "arm A may be reused rather than re-rendered, provided nothing in the
+adapter has moved" is not safe, because a matching payload digest does not buy a matching take.
+The digest check was performed and passed, and it would still have been the wrong control.
+Anything downstream that plans to reuse an old take as a control should re-render instead.
+
+#### What this justifies, read off §8.5's own table
+
+The row that fires is **"`detail` does not move" — the useful null**, with the qualification §8.6
+requires: at n=1 per arm this is *"unresolved at n=1"* rather than a proven zero. A single pair
+can show a large effect or a flat null; it cannot size a small one, and −11.1% against a 15.3%
+floor is exactly the ambiguous landing §8.6 anticipated.
+
+**So: nothing here justifies adding the clause anywhere, and §8.7 stands unchanged.** No "soft
+skin" clause exists in `SONG_AUDIO_CONTINUITY_CLAUSE`, in the expansion prompts, in a section
+look, or as a default, and this section is not grounds to add one. The escalation §8.6 named —
+**three seeds per arm, under half an hour of GPU** — remains the Director's to authorise, and it
+is the only thing that would turn this null into a measurement.
+
+#### Method notes for the next person
+
+* **The arms differ in the prompt clause and in nothing else**, verified rather than asserted: the
+  control payload rebuilt for this run is byte-identical to the archived arm A submission
+  (`71de8e17-293e-4c58-8a55-9bb069bf1e61`, recovered from ComfyUI's own `/history`) in every node
+  and every input except the output filename prefix; control and treatment differ in exactly one
+  input, `mvp:condition.prompt`, by the ten characters `" soft skin"`.
+* **The renders bypassed the application deliberately.** The payload was rebuilt read-only from
+  the manifest through the route's own helpers and submitted straight to ComfyUI, so no job, take,
+  status or prompt was written into `project_59f14d19ff10`. The project was digested before the
+  GPU was touched and verified byte-identical afterwards (`project.json`
+  `b15efc116073158e31d376a8ceba211c2857ac346619f6f2e1089d86fda5035f`, unchanged).
+* **A specular-highlight proxy was tried and discarded.** Share of face pixels above 200/255 read
+  1.61% on arm A and 0.59% on arm B — a −63% "effect" that looks decisive. It is not: the same
+  payload in the previous session read 0.605%, so that statistic's own same-payload noise is
+  **±165%**, far larger than the effect it appears to show. Recorded because it is exactly the
+  shape of number that would otherwise have been reported as a finding.
+* **The window's usable span is 0.00–2.58 s.** Anything measured or shown past that is comparing
+  two different camera moves.
+
+#### FOLLOW-UP MEASURED 2026-08-23: it reproduces **bit-exactly** — until ComfyUI reloads the model
+
+**Run on the Director's authorisation to separate *time* from *session* in the finding above.
+Four renders of the identical payload at the identical seed, one session, back to back, no
+`/free`, first render discarded for timing, state read per arm. ~12.5 minutes of GPU. No job,
+take, status or prompt was written into `project_59f14d19ff10`.**
+
+**The answer is the first of the two outcomes, and it lands harder than "correlation near 1.0":
+two of the four repeats are bit-identical to each other, and the other two are bit-identical to
+each other, and the two pairs are different takes. H3 at fixed seed is deterministic. What
+re-rolls the take is not time, not the session, and not the seed — it is ComfyUI reloading the
+model between renders.**
+
+##### What was run, and what it cost
+
+Every arm is the *same* graph at seed 14 — the control payload of §8.8, rebuilt read-only through
+the route's own helpers and verified against ComfyUI's `/history` copy of the archived arm A
+submission (`71de8e17-…`): identical in all 19 nodes and every input except the output filename
+prefix.
+
+| ex# | arm | comfy exec | sampling | s/step | VRAM before | host RAM free | power median | power max | temp max | util | `mvp:model` re-run? |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | **R0 — warmup / discard** | 219.1 s | 190.2 s | 23.77 | **8344 MiB** | 22.25 GiB | 475.4 W | 574.7 W | 81 °C | 99% | **yes — loaded** |
+| 2 | *(first submission — see below)* | **1.2 s** | — | — | 28014 MiB | 12.98 GiB | — | — | — | — | *cache hit, no render* |
+| 2 | **R1** | 152.2 s | 152.1 s | 19.01 | **28013 MiB** | 13.04 GiB | 489.5 W | 571.0 W | 84 °C | 99% | no — resident |
+| 3 | **R2** | 229.2 s | 190.7 s | 23.83 | **9760 MiB** | 27.00 GiB | 481.6 W | 575.2 W | 84 °C | 99% | **yes — reloaded** |
+| 4 | **R3** | 152.9 s | 152.9 s | 19.11 | **28040 MiB** | 11.07 GiB | 488.6 W | 578.5 W | 84 °C | 99% | no — resident |
+
+All four ran compute-bound, 475–490 W median at 99% utilisation under the SW power cap, exactly
+as §8.8's arms did.
+
+**Residency did *not* hold across the repeats, and that is the whole result.** Between R1 and R2
+ComfyUI again released ~18 GiB of VRAM and ~14 GiB of host RAM unprompted — host free rose
+13.04 → 27.00 GiB — reproducing §8.8's eviction on a second occasion, this time between two
+submissions of a *byte-identical* graph. "Warm and consecutive" is not a property of running back
+to back; it is a condition that has to be read per arm. It was read here, node by node.
+
+##### The result
+
+Matched-frame mean absolute difference and Pearson correlation over 8-bit luma at 528×304 — the
+same frame reader the picture metrics use — reported overall and at fifteen matched frame indices
+so the spread is visible rather than averaged.
+
+| pair | what it is | mean \|Δ\|/255 | r | per-frame \|Δ\| range | per-frame r range |
+|---|---|---|---|---|---|
+| **R0 vs R1** | same payload, model stayed resident | **0.00** | **1.0000** | 0.0 – 0.0 | 1.000 – 1.000 |
+| **R2 vs R3** | same payload, model stayed resident | **0.00** | **1.0000** | 0.0 – 0.0 | 1.000 – 1.000 |
+| R0/R1 vs R2/R3 | same payload, **across one model reload** | 16.73 | 0.580 | 1.6 – 33.9 | 0.352 – 0.992 |
+| R0/R1 vs archived 03:11 | same payload, earlier agent session | 16.59 | 0.541 | 1.3 – 41.1 | 0.131 – 0.993 |
+| R2/R3 vs archived 03:11 | same payload, earlier agent session | 16.25 | 0.583 | 1.2 – 37.5 | 0.061 – 0.994 |
+| archived 03:11 vs arm A 16:16 | **§8.8's cross-session pair, re-read** | 20.69 | 0.470 | 1.4 – 49.2 | 0.117 – 0.990 |
+| arm A 16:16 vs arm B 16:19 | §8.8's *prompt change* | 19.19 | 0.538 | 2.0 – 43.2 | 0.268 – 0.981 |
+
+`bit_identical` is literal: every one of the 141 frames of R1 is byte-for-byte the decoded frame
+of R0, and the same for R3 against R2. The §8 summary statistics agree to the last digit printed
+— `detail` 381.26 / 381.26 for the first pair and 348.36 / 348.36 for the second, `flicker`
+10.2116 / 10.2116 and 10.5493 / 10.5493.
+
+**Cross-reload divergence is the same size as cross-session divergence, and the same size as a
+prompt change.** 16.7 against 20.7 and 19.2, on one instrument, with overlapping per-frame ranges.
+
+*Instrument note:* this re-read of §8.8's own cross-session pair gives 20.69 / 0.470 where §8.8
+recorded 20.3 / 0.48, and 19.19 / 0.538 where it recorded 18.7 / 0.55 — a ~2% difference on \|Δ\|
+and ~0.01 on r, from a slightly different decode of the same videos. Every figure in the table
+above is on the one instrument, so the rows are comparable to each other.
+
+##### The mechanism, read off ComfyUI's own cached-node lists
+
+ComfyUI reports which nodes it served from its execution cache. The correlation with the pixels is
+perfect:
+
+| arm | nodes ComfyUI re-executed (of the model chain) | pixels |
+|---|---|---|
+| R0 | `mvp:model`, `mvp:lora`, `mvp:shift`, `mvp:attention`, `mvp:condition`, `mvp:split` | **episode 1** |
+| R1 | none of them — 12 nodes served from cache | **identical to R0** |
+| R2 | `mvp:model`, `mvp:lora`, `mvp:shift`, `mvp:attention`, `mvp:condition`, `mvp:clip`, `mvp:references`, `mvp:split` | **episode 2** |
+| R3 | none of them — 12 nodes served from cache | **identical to R2** |
+
+**Given identical input tensors and identical resident weights, the sampler is bit-deterministic
+on this card.** The non-reproducibility does not live in sampling. It lives in the load-and-encode
+path: two executions of that path produce tensors that differ enough to send the sample somewhere
+else, and every observed re-roll of an unchanged payload sits exactly on a boundary where that
+path re-ran.
+
+**Which node in that set carries it is not resolved here** — R0 and R2 both re-ran the UNET
+loader, the LoRA, the sigma shift, the attention patch *and* the conditioning encode, so n=2
+cannot separate them. One further render would: re-execute `mvp:condition` while `mvp:model` stays
+resident, and see whether the take moves. That is the next cheap experiment and it is not run.
+
+##### An inert variable, and why it is in the payloads
+
+ComfyUI serves an unchanged graph from its execution cache. The first submission of R1 was
+byte-identical to R0 and came back **in 1.157 seconds with `mvp:sample` reported cached** — no
+sampling, no power draw, the previous file re-saved under a new name. **That is not a render, and
+anything that re-submits an unchanged payload expecting a new take will get this instead.**
+
+So R1, R2 and R3 were re-keyed by decrementing `mvp:preview.jpeg_quality` (80 → 79 → 78 → 77).
+KJNodes documents that input as "JPEG quality for the live preview transport"; it cannot reach
+sampling arithmetic, and **the run proves it rather than asserting it** — R0 at quality 80 and R1
+at quality 79 are bit-identical, as are R2 at 78 and R3 at 77. The variable that changed inside
+each episode changed nothing; the reload between episodes changed everything.
+
+##### What this corrects in §8.8 above
+
+* **"Frames do not reproduce at all" is wrong as written.** Frames reproduce *exactly* within a
+  residency episode and not at all across one. The sentence should read: a byte-identical payload
+  at a byte-identical seed reproduces the take bit-for-bit while ComfyUI keeps the model resident,
+  and re-rolls it when the model is reloaded.
+* **The retraction of §8.3's reuse allowance stands, but for a different reason.** Not "a matching
+  payload digest does not buy a matching take" — it does, conditionally. It is that *nothing in a
+  digest tells you whether a reload happened in between*, and ComfyUI evicts unprompted. Reuse of
+  an archived take as a control is unsafe because the condition is unobservable after the fact, not
+  because rendering is random.
+* **The "same-payload floor" column is a cross-reload floor.** §8.8's 2.1% on `detail` was measured
+  across a model reload (arm A at 27170 MiB resident, the archived take from a separate load). The
+  true same-payload floor, within one residency episode, is **exactly 0.0% on every statistic**.
+* **§8.8's arms A and B were themselves in different residency episodes** — A began at 27170 MiB
+  resident, B at 8976 MiB after an eviction. So the clause effect there is not separable from a
+  reload. A bare reload on this shot moved `detail` −8.6% (381.26 → 348.36); §8.8 measured the
+  clause at −9.0% (369.08 → 335.68). The sizes and signs coincide. `flicker` and `bytes_per_frame`
+  do not line up the same way, so this is suggestive rather than an accounting — but it removes any
+  remaining reason to read §8.8's −9.0% as texture. **The null stands, and stands more firmly.**
+* **§6.19's "warm consecutive renders reproduce to 2.5%" is a timing figure and is unaffected.**
+  On pixels, warm consecutive renders reproduce to zero.
+
+##### What this buys the next experiment
+
+The escalation §8.6 named — three seeds per arm — can now be run with an **exact** control instead
+of a noise floor. Two arms rendered inside one residency episode differ only by the treatment, and
+any pixel difference at all is the treatment, because the floor is zero. The conditions are:
+
+1. Warm the model with a discarded render.
+2. Render control and treatment consecutively, and **read `execution_cached` on both**.
+3. If either arm re-executed `mvp:model`, `mvp:lora` or `mvp:condition`, the pair crossed a reload
+   — discard it and render the pair again. Do not average over it.
+
+Eviction cannot be prevented from here, but it is fully observable, and an arm that crossed one is
+a void arm rather than a noisy one.
+
+##### Method notes
+
+* **ComfyUI was never restarted, and it never had been.** The server process has been up since
+  2026-08-22 14:09:49 — it spans the archived 03:11 take, §8.8's 16:16 arm A, and this run.
+  "Cross-session" in §8.8 meant a different *agent* session; the divergence it found happened
+  inside one continuous ComfyUI process, which is why the answer turned out to be residency rather
+  than anything about process start-up.
+* **The project is untouched.** `data/projects/project_59f14d19ff10` was digested file by file
+  before the GPU was touched and verified byte-identical afterwards — `project.json`
+  `b15efc116073158e31d376a8ceba211c2857ac346619f6f2e1089d86fda5035f`, aggregate
+  `7ae3a765e2d825d2ec4a75cee44871dd42cf622554d63a1a77dac23e4f046fb1`, unchanged.
+* **No contact sheet was produced**, deliberately: two of the four takes are bit-identical to the
+  other two, so there is nothing a picture shows that the zero does not show better.
+* **No code was changed.** The claims in the application that this bears on are listed in the
+  handover; none were edited under this task's authorisation.

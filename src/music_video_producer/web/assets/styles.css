@@ -569,6 +569,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .plan-readiness li.window-short { color: var(--muted); }
 /* And the coverage line, in the clip's own amber for the clip's own reason. */
 .plan-readiness li.take-uncovered { color: var(--amber); }
+/* The two-locations line: the same amber, because it is the same kind of thing to a Director --
+   something is wrong with this shot and they may carry on. It has no matching .shot-clip rule and
+   is not meant to grow one: where a shot is set is fixed in the inspector rather than by dragging
+   the clip, and a fourth border colour on the timeline would be a state the Director has to learn
+   to read for a problem the timeline cannot fix. */
+.plan-readiness li.setting-conflict { color: var(--amber); }
 .mix-take-audio-line { display: block; margin: 8px 0 0; font-size: 12px; color: var(--muted); }
 .replace-existing-line { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 /* The bundle select and the comparison's findings beneath it. The note sits above .plan-readiness

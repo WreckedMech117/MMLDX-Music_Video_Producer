@@ -18,6 +18,7 @@ dependency runs one way so the window math stays a pure leaf.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -29,11 +30,13 @@ from pydantic import BaseModel, Field
 from .comfy import ComfyError, HistoryResult
 from .models import (
     NO_EVIDENCED_BUNDLE,
+    Asset,
     Project,
     RenderJob,
     Shot,
     ShotStatus,
     now_utc,
+    numbered_references,
     shot_label,
 )
 from .reference_map import (
@@ -48,6 +51,7 @@ from .timeline import (
     H3_MIN_SHOT_SECONDS,
     ordered_shots,
     over_render_frames,
+    song_section,
 )
 
 #: Re-exported, not redefined. `shot_label` moved to `models.py` when `timeline.assistant_input`
@@ -59,12 +63,14 @@ __all__ = [
     "NEAR_DUPLICATE_OVERLAP",
     "NOTE_KIND_PROMPT",
     "NOTE_KIND_SAMENESS",
+    "NOTE_KIND_SETTING_CONFLICT",
     "NOTE_KIND_STALE_MAP",
     "NOTE_KIND_TAKE_UNCOVERED",
     "NOTE_KIND_WINDOW_LONG",
     "NOTE_KIND_WINDOW_SHORT",
     "PLACEHOLDER_PROMPT",
     "READINESS_REFUSAL",
+    "SHOT_SETTING_FIGHTS_SECTION",
     "SHOT_WITH_STALE_REFERENCE_MAP",
     "TERMINAL_JOB_STATUSES",
     "JobProgress",
@@ -86,6 +92,7 @@ __all__ = [
     "render_timing_summary",
     "sampling_bundle_cell",
     "sampling_bundle_summary",
+    "setting_conflict_note",
     "shot_label",
     "stamp_job_settled",
     "supersede_target_jobs",
@@ -264,6 +271,13 @@ NOTE_KIND_WINDOW_LONG = "window_long"
 #: exists, and can only be asked of a shot that has one — so it is its own kind, drawn in the same
 #: amber and never folded into `window_long`.
 NOTE_KIND_TAKE_UNCOVERED = "take_uncovered"
+#: The fourth non-blocking kind, and the only one that is not about a window at all: this shot has
+#: **two sources of location**. It rides in `window_warnings` because that list's real membership
+#: rule is "per-shot, never blocks, drawn under its own name" — see `ReadinessReport` — and the
+#: alternative was a fourth list for one sentence a Director reads exactly as they read the others.
+#: It is its own kind, and never folded into another, because the fix is a different action: not a
+#: drag and not a re-render, but a citation or a section prompt.
+NOTE_KIND_SETTING_CONFLICT = "setting_conflict"
 
 #: How far a window may sit outside its take before it is reported: half a frame at H3's rate.
 #: Both sides of the comparison are manifest floats and one of them is a division, so an exact
@@ -299,6 +313,45 @@ SHOT_WINDOW_PAST_TAKE = (
     "offset plus a {duration:.3f}s window. Drag the window back over the take, ease the trim "
     "nudge back, or render the shot again for the window it has now. This does not block "
     "submission."
+)
+
+# --------------------------------------------------------------------------------------------
+# Two sources of location. The Director's report (2026-08-23), on the live 30-shot plan: five
+# shots cite `Dusk Warehouse Bed` while their section's look prompt reads "Vast empty warehouse
+# floor". The section look reaches the render layered over the shot's own references —
+# `app.song_audio_prose` appends it verbatim, and the document expansions are handed it — so the
+# submitted text gives H3 a bed to look at and then tells it the location is an empty floor. It is
+# baked into what gets rendered, and nothing said so.
+#
+# **It warns and never blocks**, and that is the Director's ruling in their own words: "populate
+# still writes it, readiness flags it, and the Director keeps the ability to do it deliberately,
+# because sometimes a contradiction is the shot you want." It lands on sameness' side of this
+# module's split, and for sameness' exact reason — there is a reading of this state under which the
+# render is the right thing to spend, so a gate over it is a gate that gets worked around.
+#
+# **The rule is structural, because readiness may not think.** This report runs on every render
+# submission and must stay pure, offline and deterministic, so "contradicts" cannot be asked of a
+# model here. What is decidable without understanding either string is *two sources of location*:
+# the shot cites a `setting` Asset, and the section's look prompt matches a **different** setting
+# this project holds better than it matches the one that was cited. The project's own asset names
+# supply the whole vocabulary; nothing here knows what a warehouse is.
+#
+# The naive reading of the same idea — "cites a setting, and the section has a look prompt" — was
+# measured on that live plan before this was built and fires on **30 of 30 shots**, which is noise,
+# and noise is worse than nothing: a warning that always fires teaches a Director to skip the list
+# that carries the ones that matter. The rule below was measured on the same plan at **5 of 30**,
+# and they are the five the Director named. That measurement is what this ships on.
+#
+# The likely author of the state is `models.with_default_setting`, which attaches the project's
+# declared location to any shot that named none — correct in general, and wrong for a shot sitting
+# in a section whose look describes the other one.
+SHOT_SETTING_FIGHTS_SECTION = (
+    "This shot cites the setting {cited}, and the {label} section's look prompt matches a "
+    "different setting this project holds: {rival}, on {words}. The section look reaches the "
+    "render layered over this shot's own references, so H3 is handed {cited}'s picture and then "
+    "told the location is somewhere else. Cite {rival} instead, reword the section's look, or "
+    "leave it as it is, because a contradiction is sometimes the shot you want. This does not "
+    "block submission."
 )
 
 # The one refusal wording, used by every path that can submit a Shot: the single-Shot route and
@@ -381,10 +434,13 @@ class ReadinessReport:
     says whether the pairwise pass ran at all: a caller that only needs the blocking answer skips
     it, and an empty `warnings` list must not then be read as "this plan has no duplicates".
 
-    `window_warnings` is everything warned about a shot's *window*: the shot-length band
-    (`SHOT_WINDOW_BELOW_BAND`, `SHOT_WINDOW_ABOVE_BAND`) and, for a shot whose take carries a
-    window snapshot, whether that window still sits inside the take (`take_coverage_note`). It is
-    a **third list rather than more entries in
+    `window_warnings` is every **per-shot warning that never blocks**: the shot-length band
+    (`SHOT_WINDOW_BELOW_BAND`, `SHOT_WINDOW_ABOVE_BAND`); for a shot whose take carries a window
+    snapshot, whether that window still sits inside the take (`take_coverage_note`); and whether
+    the shot is being given two locations at once (`setting_conflict_note`). The name is the
+    window notes it was built for and is kept because it is on the wire — a client reads
+    `report.window_warnings` — while the membership rule was always the broader one: per shot,
+    never `ready`, drawn under its own kind. It is a **third list rather than more entries in
     `warnings`** for one concrete reason: `warnings` has exactly one meaning to every reader it
     already has. `api.js` labels every note in it `READINESS_SAMENESS_LABEL` ("Near-duplicate")
     and `readinessSummary` counts its length as "N near-duplicate pairs" — so a window note
@@ -393,10 +449,10 @@ class ReadinessReport:
     unconditionally, unlike sameness: it is per-shot rather than pairwise, so it costs one
     comparison per shot and there is nothing for an `include_warnings=False` caller to save.
 
-    A shot can carry **two** notes in this list — a long window over a take it has outgrown is
-    both — which is why nothing keys this list by shot id. The client's `windowWarningsByShot`
-    reduces it to the one state a clip can wear and says which wins; every note is still printed,
-    in full, in the readiness list.
+    A shot can carry **several** notes in this list — a long window over a take it has outgrown
+    is two of them — which is why nothing keys this list by shot id. The client's
+    `windowWarningsByShot` reduces it to the one state a clip can wear and says which wins; every
+    note is still printed, in full, in the readiness list.
     """
 
     ready: bool = False
@@ -548,6 +604,132 @@ def take_coverage_note(shot: Shot) -> tuple[str, str]:
     return "", ""
 
 
+def _telling_words(settings: list[Asset]) -> dict[str, set[str]]:
+    """Each setting Asset's name reduced to the words that tell it apart from the others.
+
+    A word carried by **more than one** of these names distinguishes none of them and is dropped.
+    On the live plan that is exactly `"warehouse"`, which both settings are named after, leaving
+    `{"dusk", "bed"}` against `{"gritty", "floor"}` — the words a Director would point at.
+
+    Self-calibrating, which is the point: it needs no stop-word list, because the words worth
+    ignoring are decided by this project's own library rather than by a table someone has to keep.
+    A shared article or preposition falls out of it for free, and so does a house term every
+    location in the project is named with. Two settings that share a name reduce to two empty sets
+    and can never disagree with anything, which is the honest answer for a pair nothing separates.
+    """
+    per_asset = {asset.id: _words(asset.name) for asset in settings}
+    seen: Counter[str] = Counter()
+    for words in per_asset.values():
+        seen.update(words)
+    shared = {word for word, count in seen.items() if count > 1}
+    return {asset_id: words - shared for asset_id, words in per_asset.items()}
+
+
+def _quoted_words(words: set[str]) -> str:
+    """`"floor"`, or `"bed" and "dusk"` — the evidence, listed for a sentence.
+
+    Sorted, so one project produces one wording: the set is a set, and a note whose text depends on
+    iteration order is a note two runs of the same pure report disagree about.
+    """
+    listed = [f'"{word}"' for word in sorted(words)]
+    if len(listed) == 1:
+        return listed[0]
+    return f"{', '.join(listed[:-1])} and {listed[-1]}"
+
+
+def setting_conflict_note(project: Project, shot: Shot) -> tuple[str, str]:
+    """Whether this shot has two sources of location: ``(kind, sentence)``, or ``("", "")``.
+
+    `window_band_note`'s shape and `take_coverage_note`'s terms — it never blocks, and the sentence
+    says so. See `SHOT_SETTING_FIGHTS_SECTION` for the Director's report, the ruling, and the
+    measurement (5 of 30 on the live plan, against 30 of 30 for the naive form of the same idea).
+
+    **Structural, and it never reads for meaning.** The comparison is word overlap between the
+    section's look prompt and the *names of this project's own setting Assets*, through `_words` —
+    the same tokeniser the sameness check already scores prompts with. It fires when some setting
+    the shot did **not** cite matches that look better than the one it did. Nothing here knows what
+    a warehouse is, and nothing may: this report runs on every render submission and stays pure,
+    offline and deterministic.
+
+    **Silence is the answer to every ambiguity**, deliberately, because this is a warning and a
+    warning that fires on a maybe is the noise that empties the list:
+
+    * Fewer than two settings, and there is no second location to disagree with.
+    * No section, or a section with no look prompt — `song_section` returns nothing rather than
+      guessing, and a blank look describes no place.
+    * A look prompt that matches both settings equally, or neither. The live Outro
+      ("Empty warehouse under cold moonlight") matches both on the shared word and is silent, which
+      is right: it names no floor and no bed. A strictly better rival is required, not a tie.
+    * A shot citing only a character, a prop or a style. Location is the whole subject here.
+    * A shot that **already cites the setting the look describes**, alongside another one. Its
+      remedy would be "cite the one you are already citing", and a note whose fix is a no-op is a
+      note a Director learns to skip. Such a shot does have a problem — it names two places itself
+      — but that is a different fact, with a different fix, and this sentence would describe
+      neither of them. Reachable by citation *order* rather than only by a double citation: the
+      walk reports the first cited setting that disagrees, so a shot citing the floor and then the
+      bed would otherwise be told to cite the floor.
+
+    No stemming and no synonyms: `"floors"` does not match `"floor"`, and a project that words its
+    look prompts away from its asset names gets no warning rather than a guessed one. That is the
+    cost of refusing a model call in here, it is stated rather than hidden, and it fails towards
+    silence — which is the direction a warning is allowed to fail in.
+
+    The **first** cited setting that disagrees is reported, and against its **best** rival, so one
+    shot yields at most one note: this is one fact about the shot ("it is in two places"), and
+    listing it once per pairing would count a single problem several times.
+
+    **Two of the guards below are cost rather than behaviour**, and it is written down because a
+    mutation sweep found them (2026-08-23) and the next reader would otherwise take their survival
+    for a hole in the tests. Neither changes an answer:
+
+    * the fewer-than-two-settings return — with one setting the rival loop skips it as already
+      held, and with none the outer loop has nothing to walk, so no rival can be found either way;
+    * the blank-look-prompt return — `_words("")` is the empty set, every `matched` is then empty,
+      and firing needs `len(matched) > held` with `held >= 0`, which the empty set cannot satisfy.
+
+    They stay because they are what makes this cheap on the plans it says nothing about, which is
+    most of them, and `readiness_report` claims that cost in its own docstring. **`section is None`
+    is not one of them** — without it, `section.prompt` raises on a shot in no section.
+    """
+    settings = [asset for asset in project.assets if asset.kind == "setting"]
+    if len(settings) < 2:
+        return "", ""
+    section = song_section(project, shot)
+    if section is None or not section.prompt.strip():
+        return "", ""
+    look = _words(section.prompt)
+    telling = _telling_words(settings)
+    # `numbered_references` rather than a second walk of `citations`: it is **the** reference
+    # numbering, it drops a citation whose Asset this project no longer holds, and a warning about
+    # a reference must be reading the same references the payload will wire.
+    cited_settings = [
+        entry.asset
+        for entry in numbered_references(project, shot)
+        if entry.asset is not None and entry.asset.kind == "setting"
+    ]
+    held_ids = {asset.id for asset in cited_settings}
+    for cited in cited_settings:
+        held = len(telling[cited.id] & look)
+        best: tuple[Asset, set[str]] | None = None
+        for other in settings:
+            # `held_ids` rather than `cited.id`, so a rival this shot already holds is never the
+            # remedy. It covers the self-comparison too — a setting is always in its own shot's set.
+            if other.id in held_ids:
+                continue
+            matched = telling[other.id] & look
+            if len(matched) > held and (best is None or len(matched) > len(best[1])):
+                best = (other, matched)
+        if best is not None:
+            rival, matched = best
+            return NOTE_KIND_SETTING_CONFLICT, SHOT_SETTING_FIGHTS_SECTION.format(
+                cited=cited.name,
+                label=section.label,
+                rival=rival.name,
+                words=_quoted_words(matched),
+            )
+    return "", ""
+
+
 def _words(prompt: str) -> set[str]:
     """The prompt's distinct words, lowercased, for the overlap comparison.
 
@@ -626,9 +808,17 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
     to say "1 cannot be submitted" — which is the true statement about it, in the sentence that
     already existed for it.
 
+    A **setting that fights its section's look** warns, in `window_warnings`, and is the one check
+    here that reads the project's Assets rather than the Shot alone — see `setting_conflict_note`
+    for the rule and for the hit rate it was measured at before it was built. It is offline and
+    deterministic like everything else in this function; it must be, because this runs on every
+    render submission.
+
     Still pure and still cheap: no model, no file, no ComfyUI, and nothing written back. The one
     added cost is one `models.numbered_references` walk per **expanded** shot; an unexpanded shot
-    returns before walking anything.
+    returns before walking anything. The setting check walks the references of a shot whose section
+    carries a look prompt, and returns before walking anything for a project holding fewer than two
+    settings — which is every project until the Director makes a second one.
     """
     shots = ordered_shots(project)
     if not shots:
@@ -673,6 +863,22 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
                     labels=[shot_label(project, shot)],
                     reason=coverage_reason,
                     kind=coverage_kind,
+                )
+            )
+        # And whether this shot is being given two locations at once. Third in the list for this
+        # shot, on the same terms as the two above: per-shot, never blocking, its own kind. Asked
+        # of **every** shot on `window_band_note`'s argument — it is a fact about this one shot's
+        # citations and its section, just as true of a shot whose prompt is still blank, and
+        # hiding it until the prompt was written would make it appear only once the Director had
+        # stopped thinking about where the shot is.
+        conflict_kind, conflict_reason = setting_conflict_note(project, shot)
+        if conflict_kind:
+            window_warnings.append(
+                ReadinessNote(
+                    shot_ids=[shot.id],
+                    labels=[shot_label(project, shot)],
+                    reason=conflict_reason,
+                    kind=conflict_kind,
                 )
             )
         rejection = prompt_rejection(shot.prompt)
@@ -908,6 +1114,23 @@ def render_timing_summary(job: RenderJob) -> str:
     The frame count is included when there is one, because a duration without it is
     uninterpretable: 6m18s is unremarkable at 141 frames and impossible at 277. Empty string
     for an unmeasured job rather than "unknown", so a caller can simply not draw the line.
+
+    **A slow render is never marked as one, and that is a decision rather than an omission.**
+    The evidence that prompted the question (2026-08-23): of six instrumented jobs, the four at
+    141 frames span **13.7x** end to end, which is far too wide to be sampler variance and is the
+    signature of the card spilling out of VRAM part-way through. It was proposed that such a job
+    carry a marker in the timing column so the number could be read as "slow because it ran out of
+    memory" rather than as this configuration's cost.
+    **The Director declined it: no marker, just show the time.** Not to be re-proposed.
+
+    The reason it is the right call is that this function's whole discipline is that it says only
+    what was measured. Nothing on a `RenderJob` records VRAM pressure — ComfyUI's execution clock
+    is a duration and nothing else — so any marker would be *inferred* from the duration being
+    long, which is a restatement of the number dressed as a cause. Establishing the cause would
+    need a memory reading this application does not take and must not start taking; **no
+    `nvidia-smi` dependency belongs anywhere in this codebase**, which is the same standing rule
+    that keeps ComfyUI user-managed. A 13.7x spread is visible in the column already, to a reader
+    who has the frame count beside it, and that is exactly what the column is for.
     """
     if not job.render_seconds_source:
         return ""

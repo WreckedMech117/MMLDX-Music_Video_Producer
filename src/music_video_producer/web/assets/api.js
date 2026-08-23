@@ -1656,6 +1656,13 @@ export const READINESS_WINDOW_SHORT_LABEL = "Short window";
 //: stretched off the picture its own take holds. Named for what a Director sees rather than for
 //: the arithmetic -- the clip's bounds have gone past what the clip covers.
 export const READINESS_TAKE_UNCOVERED_LABEL = "Past the take";
+//: The fourth, and the only one in this list that is not about a window: the shot has been given
+//: two sources of location, its own cited setting and a section look that describes a different
+//: one. Named for the state rather than for the rule -- "Two locations" is the Director's own
+//: reading of it, and a heading naming the word-overlap test would describe the arithmetic instead
+//: of the problem. Amber, never a block; the server's sentence carries the two names and the
+//: evidence.
+export const READINESS_SETTING_CONFLICT_LABEL = "Two locations";
 
 // ------------------------------------------------------------------------------------------
 // The shot-length band, as the *server* judges it. `batch.NOTE_KIND_WINDOW_SHORT` and
@@ -1687,10 +1694,19 @@ export const NOTE_KIND_WINDOW_LONG = "window_long";
 //: A client-side coverage check would need the take's own window, and the *live* window is not
 //: it: a shot that has been edited since its render is precisely the case this reports on.
 export const NOTE_KIND_TAKE_UNCOVERED = "take_uncovered";
+//: `batch.NOTE_KIND_SETTING_CONFLICT`, pinned by a contract test. The Director's report of
+//: 2026-08-23: five shots on the live plan cite a bed while their section's look prompt reads
+//: "Vast empty warehouse floor", so the render is handed one place and told the location is
+//: another. The server decides it -- structurally, from word overlap between the section look and
+//: this project's own setting-asset names, because readiness may not make a model call -- and
+//: nothing here re-derives it. A client-side version would need the asset library and the sections
+//: together, and would be a second opinion about a rule that already has one.
+export const NOTE_KIND_SETTING_CONFLICT = "setting_conflict";
 
 function windowNoteKind(note) {
   if (note?.kind === NOTE_KIND_WINDOW_LONG) return NOTE_KIND_WINDOW_LONG;
   if (note?.kind === NOTE_KIND_TAKE_UNCOVERED) return NOTE_KIND_TAKE_UNCOVERED;
+  if (note?.kind === NOTE_KIND_SETTING_CONFLICT) return NOTE_KIND_SETTING_CONFLICT;
   return NOTE_KIND_WINDOW_SHORT;
 }
 
@@ -1704,7 +1720,17 @@ function windowNoteKind(note) {
 //: *happened* to this take under a gesture the Director made a second ago, and it is the one they
 //: can undo. The unranked list order would have made the answer depend on which check the server
 //: ran first, which is not a decision anyone made.
+//:
+//: The setting conflict ranks **below every window state** and draws nothing on the clip. It is
+//: ranked rather than omitted because an unranked kind would make the answer order-dependent
+//: again -- `undefined > 1` and `1 > undefined` are both false, so a shot that is in two places
+//: *and* has outgrown its take would keep whichever note the server happened to list first, and a
+//: real amber border would be lost to a note that paints none. Below, and not merely last, because
+//: a clip's one border is about the clip: the band and the coverage are properties of the window
+//: the Director is dragging, and where the shot is set is a property of its references, fixed in
+//: the inspector. The readiness list prints its whole sentence either way.
 const WINDOW_KIND_RANK = {
+  [NOTE_KIND_SETTING_CONFLICT]: -1,
   [NOTE_KIND_WINDOW_SHORT]: 0,
   [NOTE_KIND_WINDOW_LONG]: 1,
   [NOTE_KIND_TAKE_UNCOVERED]: 2,
@@ -1788,11 +1814,13 @@ const WINDOW_LINE_KINDS = {
   [NOTE_KIND_WINDOW_LONG]: "window-long",
   [NOTE_KIND_WINDOW_SHORT]: "window-short",
   [NOTE_KIND_TAKE_UNCOVERED]: "take-uncovered",
+  [NOTE_KIND_SETTING_CONFLICT]: "setting-conflict",
 };
 const WINDOW_LINE_LABELS = {
   [NOTE_KIND_WINDOW_LONG]: READINESS_WINDOW_LONG_LABEL,
   [NOTE_KIND_WINDOW_SHORT]: READINESS_WINDOW_SHORT_LABEL,
   [NOTE_KIND_TAKE_UNCOVERED]: READINESS_TAKE_UNCOVERED_LABEL,
+  [NOTE_KIND_SETTING_CONFLICT]: READINESS_SETTING_CONFLICT_LABEL,
 };
 
 //: The heading each blocking kind reads under. Only the kinds that have a name of their own appear;
@@ -1820,9 +1848,11 @@ export function readinessLines(report) {
     // `readinessSummary`'s "N near-duplicate pairs" -- so a window note posted into it would
     // reach the Director under a name that is not what it says, counted as a pair it is not.
     //
-    // Each of the three window kinds under its own name and its own list-marker class, decided
-    // from the note's `kind` in one place: a line that read "Long window" over a coverage
-    // sentence would be describing a rule the server does not have.
+    // Each kind in that list under its own name and its own list-marker class, decided from the
+    // note's `kind` in one place: a line that read "Long window" over a coverage sentence, or
+    // "Short window" over a two-locations one, would be describing a rule the server does not
+    // have -- which is exactly what `windowNoteKind`'s fallback does to any kind nobody adds a
+    // branch for, so every kind the server sends gets one.
     ...(report?.window_warnings || []).map((note) => {
       const kind = windowNoteKind(note);
       return render(WINDOW_LINE_KINDS[kind], WINDOW_LINE_LABELS[kind])(note);

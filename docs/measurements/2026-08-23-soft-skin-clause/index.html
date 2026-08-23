@@ -1,0 +1,165 @@
+<title>Soft skin clause</title>
+<style>
+:root{--bg:#12131a;--panel:#1b1d27;--line:#2e3140;--ink:#e8eaf2;--dim:#9aa0b4;
+--good:#7ddc9a;--warn:#ffcf6b;--bad:#ff8b8b;--acc:#8ab4ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1600px;margin:0 auto;padding:32px 24px 80px}
+h1{font-size:26px;margin:0 0 6px}
+h2{font-size:21px;margin:0 0 4px}
+h3{font-size:15px;margin:26px 0 10px;color:var(--dim);text-transform:uppercase;
+letter-spacing:.09em;font-weight:600}
+.sub{color:var(--dim);margin:0 0 26px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+padding:22px;margin:0 0 28px}
+.lyric{margin:14px 0 0;padding:11px 14px;background:#0e0f16;border-left:3px solid #c9a227;
+border-radius:0 6px 6px 0;font-size:13px;color:var(--dim)}
+.scroll{overflow-x:auto;padding-bottom:6px}
+.grid{display:grid;gap:14px;min-width:min-content}
+.col h4{margin:0 0 8px;font-size:13px;font-weight:600}
+.col .tick{color:var(--acc);font-variant-numeric:tabular-nums}
+.col .note{display:block;color:var(--dim);font-weight:400;font-size:12px;margin-top:2px}
+.rowlab{display:flex;align-items:center;font-size:12px;font-weight:600;color:var(--dim);
+writing-mode:vertical-rl;transform:rotate(180deg);justify-content:center;letter-spacing:.06em}
+img{display:block;width:100%;height:auto;border-radius:7px;border:1px solid var(--line);
+background:#000}
+table{border-collapse:collapse;width:100%;font-size:13.5px;
+font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;
+letter-spacing:.06em}
+td.n{text-align:right}
+.tag{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11.5px;
+font-weight:600;letter-spacing:.03em}
+.tag.d{background:#243049;color:#a8c6ff}
+.tag.t{background:#3a2b18;color:#ffcf6b}
+.tag.n{background:#22302a;color:#7ddc9a}
+.tag.r{background:#2a2431;color:#c9b6e0}
+.caveat{background:#1a1520;border:1px solid #3a2b3f;border-radius:10px;padding:16px 20px;
+margin:0 0 28px;font-size:13.5px;color:#d8c7dd}
+.caveat b{color:#fff}
+.caveat ul{margin:8px 0 0;padding-left:20px}
+.caveat li{margin:5px 0}
+.verdict{background:#151d26;border:1px solid #2b3f4e;border-radius:10px;padding:20px 24px;
+margin:0 0 28px}
+.verdict h2{margin:0 0 10px}
+.verdict p{margin:0 0 10px}
+.verdict p:last-child{margin:0}
+.verdict b{color:#a8c6ff}
+.inside{color:var(--good);font-weight:600}
+.outside{color:var(--warn);font-weight:600}
+</style><div class='wrap'>
+<h1>Does &ldquo;soft skin&rdquo; change the waxiness?</h1>
+<p class='sub'>One shot &mdash; <b>Close-up, singing</b>, 141 frames, seed 14, song window 66.58&ndash;71.69&nbsp;s with a 0.25&nbsp;s lead &mdash; rendered on <b>turbo-references2v</b> (8 steps, euler, minimax_h3_turbo_v4 @ 1.0) three times in one warm session. Arm A is the shot's prose verbatim. Arm B is that prose with two words appended and nothing else changed. The third arm is the control prose at a different seed, and it is there to say how far this measurement moves when <i>nothing</i> changes.</p>
+<div class='caveat'><b>Read this first.</b><ul><li><b>A prompt change re-rolls the take.</b> Same seed, same bundle, different prose gives a <i>different performance</i> &mdash; not the same performance rendered differently. There is no frame-by-frame before/after here. Stills are cut at matched <b>song seconds</b>; the acting underneath them differs.</li><li><b>n is 1 per arm.</b> A single pair can show a large effect or a flat null. It cannot size a small one.</li><li><b>Nothing was added to the application.</b> The clause exists only inside this experiment's own submissions. No prompt, project, adapter or default was written, and this page is not a recommendation to add it anywhere.</li><li>The lyric under this window is copyrighted and is not reproduced. Sung words are named by their first letter only.</li></ul></div>
+<div class='verdict'><h2>The answer: we cannot tell from this.</h2><p>The clause moves the skin measure <b>-11.1%</b> &mdash; in the direction that would mean it works. But re-rolling the take with the <i>unchanged</i> prose moves the same number <b>15.3%</b>. <b>The effect is a third of the noise, and a prompt change is a re-roll.</b></p><p>Two things argue further against reading the movement as texture. The contrast-normalised version of the same measure goes the <i>other</i> way (<b>+6.2%</b>): what little changed is a slightly flatter face overall, not micro-texture coming back. And the gap the clause would have to close is <b>&minus;55.9%</b> &mdash; the distance from the 8-step bundle to the 20-step one on this same instrument.</p><p>By eye, arm B's skin is not less waxy. The sheen on the forehead, the nose and the cheekbone is present in both arms at every matched moment. <b>Judge that yourself from the stills below &mdash; the number is not the verdict, and neither is this paragraph.</b></p><p>What would settle it is three seeds per arm, about half an hour of GPU. That is not run here.</p></div>
+<div class='card'><h2>The measure</h2>
+<p class='sub'><b>detail</b> is mean Laplacian energy &mdash; high-frequency content, the same instrument the bundle comparison used, so these land on that table's scale. <b>skin detail</b> is that same statistic over the face rectangle only and over the first 2.58&nbsp;s, which is the span where the face fills the frame in every arm; after that each take makes its own camera move to its own destination and the whole-take figure starts comparing content instead of texture. <b>skin detail, normalised</b> divides out each take's own contrast, which separates &ldquo;more grain&rdquo; from &ldquo;flatter picture&rdquo;.</p>
+<div class='scroll'><table><tr><th>arm</th><th class='n'>detail</th><th class='n'>skin detail</th><th class='n'>skin, normalised</th><th class='n'>flicker</th><th class='n'>bytes/frame</th></tr>
+<tr><td><span class='tag d'>Arm A — control</span><span class='note' style='display:block;color:var(--dim);font-size:12px;margin-top:3px'>the shot's prose, verbatim · seed 14</span></td><td class='n'>369.08</td><td class='n'>140.36</td><td class='n'>0.0503</td><td class='n'>11.3339</td><td class='n'>20133.5</td></tr>
+<tr><td><span class='tag t'>Arm B — + “soft skin”</span><span class='note' style='display:block;color:var(--dim);font-size:12px;margin-top:3px'>the same prose, two words appended · seed 14</span></td><td class='n'>335.68</td><td class='n'>124.84</td><td class='n'>0.0534</td><td class='n'>9.7944</td><td class='n'>17853.3</td></tr>
+<tr><td><span class='tag n'>Noise floor — control, seed 15</span><span class='note' style='display:block;color:var(--dim);font-size:12px;margin-top:3px'>control prose, re-rolled take · how much this moves when nothing changes</span></td><td class='n'>484.39</td><td class='n'>118.91</td><td class='n'>0.0675</td><td class='n'>8.0678</td><td class='n'>14666.3</td></tr>
+<tr><td><span class='tag n'>Same payload, previous session</span><span class='note' style='display:block;color:var(--dim);font-size:12px;margin-top:3px'>byte-identical graph and seed to arm A · from the bundle comparison</span></td><td class='n'>376.82</td><td class='n'>147.19</td><td class='n'>0.0615</td><td class='n'>10.9769</td><td class='n'>18137.2</td></tr>
+<tr><td><span class='tag r'>Reference — 20-step default</span><span class='note' style='display:block;color:var(--dim);font-size:12px;margin-top:3px'>what the bundle comparison's softer arm looks like · different bundle</span></td><td class='n'>166.22</td><td class='n'>65.22</td><td class='n'>0.0373</td><td class='n'>5.8596</td><td class='n'>14494.9</td></tr>
+</table></div>
+<h3>Arm B against arm A, with the floor beside it</h3>
+<div class='scroll'><table><tr><th>measure</th><th class='n'>arm A</th><th class='n'>arm B</th><th class='n'>change</th><th class='n'>re-roll floor</th><th class='n'>same-payload floor</th><th>read</th></tr>
+<tr><td>skin detail</td><td class='n'>140.4</td><td class='n'>124.8</td><td class='n'>-11.1%</td><td class='n'>15.3%</td><td class='n'>4.9%</td><td class='inside'>inside the noise</td></tr>
+<tr><td>skin detail, normalised</td><td class='n'>0.0503</td><td class='n'>0.0534</td><td class='n'>+6.2%</td><td class='n'>34.2%</td><td class='n'>22.3%</td><td class='inside'>inside the noise</td></tr>
+<tr><td>detail, whole take</td><td class='n'>369.1</td><td class='n'>335.7</td><td class='n'>-9.0%</td><td class='n'>31.2%</td><td class='n'>2.1%</td><td class='inside'>inside the noise</td></tr>
+<tr><td>flicker</td><td class='n'>11.33</td><td class='n'>9.794</td><td class='n'>-13.6%</td><td class='n'>28.8%</td><td class='n'>3.1%</td><td class='inside'>inside the noise</td></tr>
+<tr><td>bytes/frame</td><td class='n'>2.013e+04</td><td class='n'>1.785e+04</td><td class='n'>-11.3%</td><td class='n'>27.2%</td><td class='n'>9.9%</td><td class='inside'>inside the noise</td></tr>
+</table></div>
+<p class='sub' style='margin-top:16px'><b>Two floors, and the re-roll one is the one that applies.</b> The <i>same-payload</i> floor is what a byte-identical graph at a byte-identical seed produces in a different session &mdash; small, 2.1% on <code>detail</code>, which is about the 2.5% these renders reproduce to. The <i>re-roll</i> floor is what a different take of the same prose produces, and a prompt change is a re-roll, so that is the bar. A number has to clear the re-roll floor before it means anything about the clause.</p>
+<p class='sub'><b>One thing worth knowing that this run turned up.</b> The archived arm A and this run's arm A are the same graph at the same seed, and their pixels are not the same picture: mean absolute difference 20.3/255, pixel correlation 0.48. That is <i>less</i> alike than arm A is to arm B (18.7/255, correlation 0.55). The summary statistics reproduce to a few percent; the frames do not reproduce at all. Anything that plans to reuse an old take as a control should know that.</p>
+</div>
+<div class='card'><h2>Per-arm state</h2>
+<p class='sub'>One session, warm, consecutive, <b>no <code>/free</code></b>, and the first render after the cold start discarded. Median power is the diagnostic: ~470&nbsp;W is compute-bound, ~250&nbsp;W at high utilisation is memory-starved, and max power is the same either way. All three arms ran compute-bound.</p>
+<div class='scroll'><table><tr><th>ex#</th><th>arm</th><th class='n'>comfy exec</th><th class='n'>sampling</th><th class='n'>s/step</th><th class='n'>VRAM before</th><th class='n'>host RAM free</th><th class='n'>power median</th><th class='n'>power max</th><th class='n'>temp max</th><th>throttle</th></tr>
+<tr><td class='n'>1</td><td>warmup-C15 <span style='color:var(--dim);font-size:12px'>&mdash; cold start, timing discarded</span></td><td class='n'>212.5 s</td><td class='n'>169.9 s</td><td class='n'>21.23</td><td class='n'>2165 MiB</td><td class='n'>20.36 GiB</td><td class='n'>506.6 W</td><td class='n'>584.2 W</td><td class='n'>82 &deg;C</td><td>none, 0x0000000000000004</td></tr>
+<tr><td class='n'>2</td><td>A14</td><td class='n'>133.3 s</td><td class='n'>133.3 s</td><td class='n'>16.66</td><td class='n'>27170 MiB</td><td class='n'>12.12 GiB</td><td class='n'>520.7 W</td><td class='n'>575.5 W</td><td class='n'>85 &deg;C</td><td>none, 0x0000000000000004</td></tr>
+<tr><td class='n'>3</td><td>B14</td><td class='n'>221.2 s</td><td class='n'>183.2 s</td><td class='n'>22.90</td><td class='n'>8976 MiB</td><td class='n'>28.03 GiB</td><td class='n'>484.0 W</td><td class='n'>575.5 W</td><td class='n'>83 &deg;C</td><td>none, 0x0000000000000004</td></tr>
+</table></div>
+<p class='sub' style='margin-top:16px'>The timings are recorded, not compared. Arm B began with <b>8976&nbsp;MiB</b> resident where arm A began with <b>27170&nbsp;MiB</b> &mdash; something evicted the model stack between the two arms without being asked to &mdash; so arm B paid a reload that arm A did not. That is why the two differ by more than the 2.5% warm renders reproduce to, and it is not a property of the clause.</p>
+</div>
+<div class='card'><h2>Skin, at zoom</h2><p class='sub'>One rectangle per column, the same pixels in every row. This is where waxiness lives: look at the mid-tone micro-texture across the cheek and the forehead, and at the specular sheen, not at the edges. The bottom row is the 20-step default, for what &ldquo;less waxy&rdquo; looks like on this face.</p>
+<div class='scroll'><div class='grid' style='grid-template-columns:26px repeat(5,minmax(280px,1fr))'>
+<div></div>
+<div class='col'><h4><span class='tick'>+0.40s</span><span class='note'>song 66.73s &middot; on &ldquo;I‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+0.85s</span><span class='note'>song 67.18s &middot; on &ldquo;m‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+1.30s</span><span class='note'>song 67.63s &middot; on &ldquo;p‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+1.80s</span><span class='note'>song 68.13s &middot; on &ldquo;v‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+2.35s</span><span class='note'>song 68.68s &middot; on &ldquo;l‑&hellip;&rdquo;</span></h4></div>
+<div class='rowlab'>Arm A — control</div>
+<img src='zoom-A14-0.jpg' alt='Arm A — control, moment 1'>
+<img src='zoom-A14-1.jpg' alt='Arm A — control, moment 2'>
+<img src='zoom-A14-2.jpg' alt='Arm A — control, moment 3'>
+<img src='zoom-A14-3.jpg' alt='Arm A — control, moment 4'>
+<img src='zoom-A14-4.jpg' alt='Arm A — control, moment 5'>
+<div class='rowlab'>Arm B — + “soft skin”</div>
+<img src='zoom-B14-0.jpg' alt='Arm B — + “soft skin”, moment 1'>
+<img src='zoom-B14-1.jpg' alt='Arm B — + “soft skin”, moment 2'>
+<img src='zoom-B14-2.jpg' alt='Arm B — + “soft skin”, moment 3'>
+<img src='zoom-B14-3.jpg' alt='Arm B — + “soft skin”, moment 4'>
+<img src='zoom-B14-4.jpg' alt='Arm B — + “soft skin”, moment 5'>
+<div class='rowlab'>Noise floor — control, seed 15</div>
+<img src='zoom-warmup-C15-0.jpg' alt='Noise floor — control, seed 15, moment 1'>
+<img src='zoom-warmup-C15-1.jpg' alt='Noise floor — control, seed 15, moment 2'>
+<img src='zoom-warmup-C15-2.jpg' alt='Noise floor — control, seed 15, moment 3'>
+<img src='zoom-warmup-C15-3.jpg' alt='Noise floor — control, seed 15, moment 4'>
+<img src='zoom-warmup-C15-4.jpg' alt='Noise floor — control, seed 15, moment 5'>
+<div class='rowlab'>Same payload, previous session</div>
+<img src='zoom-archived-turbo-0.jpg' alt='Same payload, previous session, moment 1'>
+<img src='zoom-archived-turbo-1.jpg' alt='Same payload, previous session, moment 2'>
+<img src='zoom-archived-turbo-2.jpg' alt='Same payload, previous session, moment 3'>
+<img src='zoom-archived-turbo-3.jpg' alt='Same payload, previous session, moment 4'>
+<img src='zoom-archived-turbo-4.jpg' alt='Same payload, previous session, moment 5'>
+<div class='rowlab'>Reference — 20-step default</div>
+<img src='zoom-archived-default-0.jpg' alt='Reference — 20-step default, moment 1'>
+<img src='zoom-archived-default-1.jpg' alt='Reference — 20-step default, moment 2'>
+<img src='zoom-archived-default-2.jpg' alt='Reference — 20-step default, moment 3'>
+<img src='zoom-archived-default-3.jpg' alt='Reference — 20-step default, moment 4'>
+<img src='zoom-archived-default-4.jpg' alt='Reference — 20-step default, moment 5'>
+</div></div></div>
+<div class='card'><h2>The whole frame</h2><p class='sub'>The same five moments, whole. The judgement that matters is whether the shot is acceptable, not only whether a number moved.</p>
+<div class='scroll'><div class='grid' style='grid-template-columns:26px repeat(5,minmax(280px,1fr))'>
+<div></div>
+<div class='col'><h4><span class='tick'>+0.40s</span><span class='note'>song 66.73s &middot; on &ldquo;I‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+0.85s</span><span class='note'>song 67.18s &middot; on &ldquo;m‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+1.30s</span><span class='note'>song 67.63s &middot; on &ldquo;p‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+1.80s</span><span class='note'>song 68.13s &middot; on &ldquo;v‑&hellip;&rdquo;</span></h4></div>
+<div class='col'><h4><span class='tick'>+2.35s</span><span class='note'>song 68.68s &middot; on &ldquo;l‑&hellip;&rdquo;</span></h4></div>
+<div class='rowlab'>Arm A — control</div>
+<img src='full-A14-0.jpg' alt='Arm A — control, moment 1'>
+<img src='full-A14-1.jpg' alt='Arm A — control, moment 2'>
+<img src='full-A14-2.jpg' alt='Arm A — control, moment 3'>
+<img src='full-A14-3.jpg' alt='Arm A — control, moment 4'>
+<img src='full-A14-4.jpg' alt='Arm A — control, moment 5'>
+<div class='rowlab'>Arm B — + “soft skin”</div>
+<img src='full-B14-0.jpg' alt='Arm B — + “soft skin”, moment 1'>
+<img src='full-B14-1.jpg' alt='Arm B — + “soft skin”, moment 2'>
+<img src='full-B14-2.jpg' alt='Arm B — + “soft skin”, moment 3'>
+<img src='full-B14-3.jpg' alt='Arm B — + “soft skin”, moment 4'>
+<img src='full-B14-4.jpg' alt='Arm B — + “soft skin”, moment 5'>
+<div class='rowlab'>Noise floor — control, seed 15</div>
+<img src='full-warmup-C15-0.jpg' alt='Noise floor — control, seed 15, moment 1'>
+<img src='full-warmup-C15-1.jpg' alt='Noise floor — control, seed 15, moment 2'>
+<img src='full-warmup-C15-2.jpg' alt='Noise floor — control, seed 15, moment 3'>
+<img src='full-warmup-C15-3.jpg' alt='Noise floor — control, seed 15, moment 4'>
+<img src='full-warmup-C15-4.jpg' alt='Noise floor — control, seed 15, moment 5'>
+<div class='rowlab'>Same payload, previous session</div>
+<img src='full-archived-turbo-0.jpg' alt='Same payload, previous session, moment 1'>
+<img src='full-archived-turbo-1.jpg' alt='Same payload, previous session, moment 2'>
+<img src='full-archived-turbo-2.jpg' alt='Same payload, previous session, moment 3'>
+<img src='full-archived-turbo-3.jpg' alt='Same payload, previous session, moment 4'>
+<img src='full-archived-turbo-4.jpg' alt='Same payload, previous session, moment 5'>
+<div class='rowlab'>Reference — 20-step default</div>
+<img src='full-archived-default-0.jpg' alt='Reference — 20-step default, moment 1'>
+<img src='full-archived-default-1.jpg' alt='Reference — 20-step default, moment 2'>
+<img src='full-archived-default-2.jpg' alt='Reference — 20-step default, moment 3'>
+<img src='full-archived-default-3.jpg' alt='Reference — 20-step default, moment 4'>
+<img src='full-archived-default-4.jpg' alt='Reference — 20-step default, moment 5'>
+</div></div></div>
+<div class='card'><h3>Provenance</h3><table><tr><th>shot</th><td>shot_f82bf42e3abc &mdash; Close-up, singing &mdash; Harder Faster, Third Video</td></tr><tr><th>bundle</th><td>turbo-references2v &mdash; 8 steps, euler, simple, minimax_h3_turbo_v4_step600_ema_pruned @ 1.0</td></tr><tr><th>geometry</th><td>1056 &times; 608, 141 frames, 24 fps, seed 14 (15 on the noise-floor arm)</td></tr><tr><th>the change</th><td>ten characters appended to the end of the submitted prose, after the reference map and the section look. The reference map was not edited and no section look was touched.</td></tr><tr><th>payload check</th><td>the control payload rebuilt for this run is byte-identical to the archived arm&nbsp;A submission (<code>71de8e17</code>) in every node and every input except the output filename; control and treatment differ in exactly one input, <code>mvp:condition.prompt</code>.</td></tr><tr><th>the project</th><td>read only. <code>data/projects/project_59f14d19ff10</code> was digested before the GPU was touched and verified byte-identical afterwards; the renders went straight to ComfyUI, so no job, take, status or prompt was written into it.</td></tr><tr><th>protocol</th><td>&sect;6.19 / &sect;6.20 of the H3 attention-backend experiment: one session, warm, consecutive, cold start discarded, no <code>/free</code>, state and mid-render power on every arm.</td></tr></table><p class='lyric'>The lyric under this window is copyrighted and is not reproduced on this page. Sung words appear as their first letter only.</p></div>
+</div>
