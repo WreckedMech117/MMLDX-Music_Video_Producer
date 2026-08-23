@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from bisect import bisect_left
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
@@ -131,12 +132,351 @@ def over_render_frames(duration: float) -> int:
     return max(H3_MIN_RENDER_FRAMES, margin_frames(duration))
 
 
+# ------------------------------------------------------------------------------------------
+# Layout variance — Phase D of the three-step populate, and the Director's standing complaint:
+# *"shot lengths all look the exact same"*. Measured on their real song, a freshly populated
+# 30-shot plan had a standard deviation of 0.507 s and **five identical 4.308 s windows in a
+# row** through the Verse. The model is not the culprit: it proposes one length per section and
+# repeats it, and `populate_windows` had no reason to disagree.
+#
+# **What drives it is measured, not declared.** The signal is the *word-onset rate* read off
+# `Song.lyric_words` — Whisper's own word times, the same source `vocal_gaps` reads and for the
+# same reason: it is the only description of the song that knows the difference between a
+# rapid-fire line and a held note. Dense stretch, shorter shot; sparse stretch, longer hold.
+# That is the Director's own gap taxonomy (2026-08-20 — *"a 1 second gap may just be an extended
+# shot where a 4 second gap would be great for a b-roll"*) turned into layout arithmetic, and it
+# is the plan artifact's "energy-biased per section" with the energy *measured* rather than
+# inferred from a section's name.
+#
+# Three drivers were considered and rejected, and the reasons are worth keeping:
+#
+# * **Section identity** ("a chorus cuts faster than a verse"). A section's label is free text
+#   the Director typed on their sheet — `Chorus 2`, `Hook`, `Post-Chorus`, `Drop` — so behaviour
+#   keyed to it is a string taxonomy that fails on the first unusual sheet. Worse, it cannot
+#   vary *within* a section, and within-section uniformity is the whole of the complaint: the
+#   live plan already spreads 4.308 s to 5.986 s *between* sections. And a section's window
+#   count is fixed before any of this runs, so making one section's shots shorter than another's
+#   is a change to the count, not to the shape — see `populate_required_shots`.
+# * **The gap structure** (long instrumental stretches inviting long holds). Real, but it is
+#   `snap_window_plan`'s fact, not this one's: gaps say where a cut *may* land, and there are 12
+#   of them on the Director's song against 29 cuts, so they cannot decide 29 lengths. A layout
+#   that placed cuts at gaps would also be a second snapper, which is the defect this codebase
+#   keeps finding. Density subsumes what is usable of it — an instrumental stretch is a stretch
+#   with no word onsets in it.
+# * **A declared per-section intent.** A new persisted field, a new write-path enumeration and a
+#   new thing for the Director to fill in before the button works. It is a good Phase C/E idea
+#   and it is not needed to answer "why is every shot the same length".
+# ------------------------------------------------------------------------------------------
+
+#: The resolution `populate_windows` lays a window at — see the `round(..., 3)` calls in it.
+#:
+#: The variance step stops this far short of the band's ends rather than reaching them, because
+#: the rounding that follows can move a window by half of it: a step that put a window at
+#: *exactly* `minimum` could be laid at `minimum - 0.0005`, and the readiness report's
+#: shot-length warning would then fire for a band the step had honoured.
+WINDOW_LAY_RESOLUTION = 0.001
+
+#: How much of the room the band leaves a layout may spend on variance, by default.
+#:
+#: The parameter is a **fraction of what is available**, never a number of seconds: the transfer
+#: is already capped at the whole of what the span's windows can give and take without leaving
+#: the band. So 1.0 is not "a lot of variance", it is *all of the room there is*.
+#:
+#: **All of it, and the first draft of this constant said half — the measurement is why it
+#: moved.** The argument for half was that the driver is an inference from Whisper word times
+#: while the band's ends are hard costs, so a plan should not be moved the whole way to a limit
+#: on the strength of a measurement. That argument does not survive contact with two numbers.
+#:
+#: * **The guarantee here is structural, not statistical.** `_varied_durations` cannot put a
+#:   window outside the band whatever the density says, so a mis-timed line produces a
+#:   differently *shaped* legal layout, never an illegal one. The worst case of a bad density is
+#:   a shot length the Director disagrees with and drags — which is the state of every window
+#:   today. Half was buying insurance against a risk the arithmetic had already removed.
+#: * **There is far less room than the caution assumed.** Measured on the Director's song
+#:   (2026-08-23): the largest standard deviation any legal tiling of it can reach, with these
+#:   section counts and the 6 s ceiling of the time, was **0.919**; the plan as populate lays it
+#:   without variance is **0.507**; this mechanism at 1.0 reached **0.589**. Spending half of
+#:   that leaves 0.522 — a 3% change in the number the complaint is stated in, which is not a
+#:   feature, it is a rounding error with a parameter attached.
+#:
+#: **The ceiling moved to 6.8 later the same day and the argument only got stronger.**
+#: Re-measured read-only on the same song at `app.POPULATE_MAX_WINDOW_SECONDS = 6.8`: the same
+#: 30 windows, the reachable bound 0.919 → **1.280**, and this mechanism at 1.0 reaching
+#: **0.692** laid and 0.680 after line-up, against 0.589/0.567 at 6.0. Within-section spread —
+#: the part of the statistic this mechanism can actually move — goes 0.353 → **0.507**, and the
+#: Chorus, the one section that was pressed flat against the old cap, goes from
+#: 5.874/5.974/5.974/5.999 to 5.386/5.920/5.920/6.595. Coverage, contiguity, the zero window
+#: warnings and the zero tiling refusals are unchanged.
+#:
+#: So the band is where the costs were decided, and a second conservatism layered on top of it
+#: is one nobody argued for. 0 remains the feature off and a genuine no-op, and every value
+#: between is available to a Director who wants less than the music is asking for.
+#:
+#: **Fixed 2026-08-23, and it is the wider band that exposed it.** Until then `_varied_durations`
+#: moved a whole span by one scalar step capped by the *tightest* headroom any single window in
+#: it had, so one window already pinned at the band end its density wanted to push it past froze
+#: every other window in the section — a single saturated window vetoing its neighbours. A wider
+#: band lets the water-fill saturate both ends more often, so the collapse got *worse* as the
+#: ceiling grew: on the populate fixture, whose proposals cycle 4–8 s, 3 of its 7 spans froze at
+#: 6.0 and 6 of 7 at 6.8, and Phase D there laid a tiling byte-identical to neutral. The step is
+#: now a per-window redistribution (see `_varied_durations`), and the fixture's saturation-frozen
+#: count goes 3 → **0** at 6.0 and 6 → **2** at 6.8. The two that remain are the honest last
+#: resort rather than a veto: in each, *every* window on one side of the transfer is already on
+#: its band end, so there is nobody to give to or nobody to take from and no legal move exists.
+#:
+#: **The Director's real song was never frozen at all**, measured read-only the same day: 0 of the
+#: 6 spans that have a density signal, and 5 of those 6 were already at the band-width cap rather
+#: than at the tightest-window one. So the live plan moves only a little — whole-song stdev 0.692
+#: → 0.697 laid, within-section 0.507 → 0.513, one section (the Verse) reshaped and the other six
+#: byte-identical. **This fix is for other material, not for that song**, which is a smaller claim
+#: than the fixture's numbers make it look and is the honest one.
+POPULATE_VARIANCE_DEFAULT = 1.0
+
+#: The most variance a caller may ask for: the whole of the room the band leaves. Past it the
+#: transfer would put a window outside the band, and this parameter's entire guarantee is that it
+#: cannot — so a larger value is **refused rather than clamped**, because a request that has to
+#: be quietly reinterpreted was a request nobody answered.
+#:
+#: The default now sits *on* this bound, which is deliberate and is not the same as having no
+#: parameter: the dial exists to be turned **down**, and 0 is a genuine no-op the byte digests
+#: are pinned through. See `POPULATE_VARIANCE_DEFAULT` for the measurement that moved it here.
+POPULATE_VARIANCE_MAX = 1.0
+
+POPULATE_VARIANCE_REFUSAL = (
+    "Layout variance is {variance}, and it is a fraction of the room H3's band leaves rather "
+    "than a number of seconds: 0 lays every window the length the proposals shaped, and "
+    "{maximum:g} spends the whole band. Nothing was laid out."
+)
+
+
+def vocal_density(song) -> Callable[[float, float], float] | None:
+    """How busy the singing is, as a function of any window of the song. ``None`` unmeasured.
+
+    The answer for ``[start, end)`` is **how many words start inside it, against the most any
+    window of the same length holds anywhere in this song** — so 1.0 is the busiest the track
+    ever gets over that span of seconds and 0.0 is an instrumental stretch. Bounded by
+    construction: shifting a window right until it begins on its own first onset can only add
+    onsets, so no window holds more than the busiest one of its length.
+
+    **Word onsets, not `Song.vocal_spans`, and that is the same choice `vocal_gaps` makes.**
+    The merged spans are a *display* decision — `transcription.merge_vocal_spans` bridges every
+    rest under 0.75 s so the timeline's vocal band does not flicker on a breath — and a merged
+    span is uniformly "voice" from end to end, so it cannot tell a rapid-fire line from a held
+    note. Reading it here would give the whole of a sung verse one density and the layout
+    nothing to vary against. Measured on the Director's own track: the merged view leaves 5
+    stretches to distinguish across 154.6 s, the word times distinguish every window.
+
+    ``None`` for a song with no word times at all, on `shot_vocal_overlap`'s rule: an
+    unmeasured track is unmeasured, not uniformly silent, and a layout offered a fabricated
+    density would vary its windows against a measurement nobody took. `populate_windows` then
+    lays exactly what it laid before this existed. **`Song.vocal_spans` is deliberately not a
+    fallback here** — it is the wrong instrument for this question, and half a signal would be
+    worse than the honest absence.
+
+    The probe is returned as a closure rather than computed per window because the onsets are
+    sorted once and every query is two binary searches against that one list.
+    """
+    if song is None or not song.lyric_words:
+        return None
+    onsets = sorted(float(word[1]) for word in song.lyric_words)
+
+    def density(start: float, end: float) -> float:
+        length = end - start
+        if length <= 0:
+            return 0.0
+        busiest = max(
+            bisect_left(onsets, at + length) - index for index, at in enumerate(onsets)
+        )
+        here = bisect_left(onsets, end) - bisect_left(onsets, start)
+        return here / busiest
+
+    return density
+
+
+#: How far apart the two halves of a span's transfer may drift before the reshape is abandoned.
+#:
+#: The givers and the takers are allocated to the *same* figure, so the only thing that can
+#: separate them is float summation noise — parts in 1e16 of a few seconds, twelve orders of
+#: magnitude under this. Anything larger means a side ran out of passes with seconds still
+#: unplaced, and unplaced seconds are a hole in the tiling: the span is handed back untouched
+#: instead. It is a tripwire, not a working tolerance, and nothing measured has ever tripped it.
+VARIANCE_BALANCE_TOLERANCE = 1e-9
+
+
+def _spend_room(
+    room: dict[int, float], weight: dict[int, float], total: float
+) -> tuple[dict[int, float], float]:
+    """Hand ``total`` seconds out across windows in proportion to ``weight``, none past its
+    ``room``. Answers what each window took and what could not be placed.
+
+    A water-fill, and the same shape as `populate_windows`' own: split what is left over the
+    windows that still have room, freeze whichever the split would carry past theirs, repeat
+    with the rest. **Bounded by construction** — every pass either places the whole remainder
+    (and stops) or freezes at least one window (and shrinks the active set) — so a span of *n*
+    windows needs at most *n* passes, and the `range` below is that bound written down rather
+    than a hopeful iteration limit. Callers pass a ``total`` no larger than ``sum(room)``, so
+    the unplaced remainder it returns is zero in every reachable case; it is returned at all so
+    that a float pathology surfaces as a refusal to reshape rather than as a shortened span.
+
+    Proportional to ``weight`` — the window's distance from its span's mean density — is what
+    keeps this a *density* mechanism after clamping: a window twice as far from the mean still
+    moves twice as far, right up until it meets the band.
+    """
+    took = dict.fromkeys(room, 0.0)
+    # A window with no room is already on its band end and a window with no weight is one the
+    # density is not asking to move; neither can take anything, and the weight half also keeps
+    # the division below from meeting an all-zero denominator. **Both survived the 2026-08-23
+    # mutation sweep as equivalents when removed one at a time** — a zero-room window would
+    # simply freeze on the first pass and leave — and the weight half is killed by
+    # `test_spend_room_hands_out_everything_it_is_given_and_nothing_more`'s last case.
+    active = [index for index in room if room[index] > 0 and weight[index] > 0]
+    remaining = total
+    for _ in range(len(room) + 1):
+        # `remaining <= 0.0` is an early exit rather than a rule: with nothing left, the pass
+        # below would compute a zero share, freeze nobody and assign zero. It survived the sweep
+        # as an equivalent for exactly that reason, and is kept because a loop that keeps going
+        # after it has finished reads as one that has not finished.
+        if not active or remaining <= 0.0:
+            break
+        share = remaining / sum(weight[index] for index in active)
+        frozen = [index for index in active if share * weight[index] >= room[index]]
+        if not frozen:
+            for index in active:
+                took[index] = share * weight[index]
+            remaining = 0.0
+            break
+        for index in frozen:
+            took[index] = room[index]
+            remaining -= room[index]
+        active = [index for index in active if index not in frozen]
+    # The remainder cannot go negative — a frozen window's room is bounded by the remainder that
+    # froze it, so the whole frozen set's room is too — and `max` is a tripwire on that rather
+    # than arithmetic. It survived the sweep as an equivalent, which is what "unreachable" means
+    # here; the caller reads this value and refuses to reshape when it is not zero.
+    return took, max(remaining, 0.0)
+
+
+def _varied_durations(
+    durations: list[float],
+    *,
+    minimum: float,
+    maximum: float,
+    density: Callable[[float, float], float],
+    variance: float,
+) -> list[float]:
+    """Reshape one span's windows around how busy the singing is inside each of them.
+
+    **A transfer, not a step.** Every window busier than its span's mean *gives* seconds up;
+    every quieter one *takes* them. One figure — the transfer — is given and taken, so the
+    span's total is the number it was, the tiling stays contiguous and coverage is unchanged.
+    Each side then spreads its half over its own windows in proportion to how far from the mean
+    each one sits, stopping each at its own band end (`_spend_room`).
+
+    **That per-window clamp is the whole of the 2026-08-23 fix, and it is worth naming what it
+    replaced.** This used to move the whole span by a single scalar step capped by the *tightest*
+    headroom any one window had, which meant one window already sitting on the band end its
+    density wanted to push it past froze every other window in the section — measured as 6 of the
+    populate fixture's 7 spans at a 6.8 s ceiling, a Phase D output byte-identical to no Phase D
+    at all. **One saturated window no longer vetoes its neighbours**: it simply contributes no
+    room, keeps its length, and the seconds it cannot give are never promised in the first place.
+
+    Four things hold for every span, and by construction rather than by repair:
+
+    * **The band is inviolable.** A window only ever moves in one direction and only ever by as
+      much room as it has in that direction, which is its distance to the band end less
+      `WINDOW_LAY_RESOLUTION` — so ``minimum <= new <= maximum`` even after the millisecond
+      rounding `populate_windows` applies next.
+    * **Deviations sum to zero.** Given and taken are allocated to the same figure, checked
+      against `VARIANCE_BALANCE_TOLERANCE`, and the span is handed back untouched if they ever
+      disagree.
+    * **Direction follows density.** Givers only shrink and takers only grow, whatever the
+      clamping does to the magnitudes. Redistribution cannot turn a busy window into a long one.
+    * **It terminates.** `_spend_room`'s pass count is bounded by the window count, and there is
+      no outer loop. Freezing is what happens when a side has no room at all — a legitimate,
+      *last* answer (a span every window of which is already at the ceiling cannot grow anyone,
+      so nobody can shrink either) rather than the first one.
+
+    **Magnitude is respected, not just shape.** The transfer is capped at the band's own width
+    times the deviations being spread, so a section whose density barely varies gets barely any
+    variance. Normalising the deviations to ±1 first would have given a metronomically even verse
+    the same visible spread as a section that swings from a held note to a rapid-fire line, which
+    would be variance invented rather than measured.
+
+    Returns the durations unchanged when there is nothing to say: fewer than two windows, or a
+    span every window of which is equally busy (an instrumental intro, where every density is
+    0). Both are the honest answer rather than a fallback.
+    """
+    if len(durations) < 2:
+        return durations
+    measured: list[float] = []
+    cursor = 0.0
+    for length in durations:
+        measured.append(density(cursor, cursor + length))
+        cursor += length
+    mean = sum(measured) / len(measured)
+    deviations = [value - mean for value in measured]
+    # A window busier than its span's mean gives seconds up; a quieter one takes them. The two
+    # lists are what makes give and take separately clampable — the thing one shared step could
+    # not do. Either being empty is the equally-busy span, and it is left exactly as it came.
+    #
+    # The `1e-9` filters and this guard both survived the 2026-08-23 mutation sweep as
+    # equivalents, and for the same reason: a deviation under 1e-9 buys a movement under a
+    # nanosecond, six orders below `WINDOW_LAY_RESOLUTION`, and an empty side sums to zero room
+    # and is caught again by the `transfer <= 0` return below. Kept as the statement of intent —
+    # "an equally-busy span is not reshaped" should be readable here, not inferred three lines on.
+    giving = {index: d for index, d in enumerate(deviations) if d > 1e-9}
+    taking = {index: -d for index, d in enumerate(deviations) if d < -1e-9}
+    if not giving or not taking:
+        return durations
+    # Each window's own room, in seconds, in the one direction its density asks it to move.
+    # `max(..., 0.0)` is the window the water-fill already pushed onto that band end: it has
+    # nothing to contribute and it will not be asked to.
+    give_room = {
+        index: max(durations[index] - minimum - WINDOW_LAY_RESOLUTION, 0.0)
+        for index in giving
+    }
+    take_room = {
+        index: max(maximum - durations[index] - WINDOW_LAY_RESOLUTION, 0.0)
+        for index in taking
+    }
+    # The deviations sum to zero, so the two sides pull equally; `min` is float hygiene and the
+    # near-zero windows dropped by the filters above, not a real asymmetry — replacing it with
+    # `max` survives the mutation sweep, which is the measurement of how equal they are. Capping
+    # the transfer at the band's width times that pull is what keeps the old "magnitude is
+    # respected" rule: small deviations buy a small transfer however much room the span has.
+    pull = min(sum(giving.values()), sum(taking.values()))
+    transfer = variance * min(
+        (maximum - minimum) * pull, sum(give_room.values()), sum(take_room.values())
+    )
+    # Nothing to move: a span with a saturated side, or one whose densities differ by less than
+    # float noise. Spending a zero transfer would produce the same numbers in a new list (the
+    # sweep's equivalent), and returning the caller's own list is how "this span was not
+    # reshaped" stays a statement rather than a coincidence of arithmetic.
+    if transfer <= 0.0:
+        return durations
+    given, unplaced_give = _spend_room(give_room, giving, transfer)
+    taken, unplaced_take = _spend_room(take_room, taking, transfer)
+    balance = sum(given.values()) - sum(taken.values())
+    if (
+        unplaced_give > VARIANCE_BALANCE_TOLERANCE
+        or unplaced_take > VARIANCE_BALANCE_TOLERANCE
+        or abs(balance) > VARIANCE_BALANCE_TOLERANCE
+    ):
+        return durations
+    return [
+        length - given.get(index, 0.0) + taken.get(index, 0.0)
+        for index, length in enumerate(durations)
+    ]
+
+
 def populate_windows(
     proposals: list[tuple[float, float]],
     song_duration: float,
     *,
     minimum: float = H3_MIN_SHOT_SECONDS,
     maximum: float = H3_MAX_SHOT_SECONDS,
+    density: Callable[[float, float], float] | None = None,
+    variance: float = 0.0,
 ) -> list[tuple[float, float]]:
     """Tile the whole song with shot windows shaped by the model's proposals.
 
@@ -150,7 +490,28 @@ def populate_windows(
     the song and water-filled into the per-window clamps until the total is exact. A song
     shorter than one minimum window is a single whole-song shot. The output starts at
     exactly 0 and ends at exactly ``song_duration``, by construction.
+
+    **`variance` and `density` are Phase D**, and 0 — the default — is the whole of this
+    function as it stood before them: the pass below is not entered, and every window is the
+    float the water-fill produced. With both supplied, the tiling is reshaped around how busy
+    the singing is inside each window (`_varied_durations`), which preserves the total exactly
+    and cannot put a window outside ``[minimum, maximum]``. `density` speaks **this call's own
+    coordinates** — 0 to ``song_duration`` — so a caller tiling one section of a song closes
+    over that section's start; see `app.lay_out_shots`.
+
+    Raises `TimelineError` for a `variance` outside ``[0, POPULATE_VARIANCE_MAX]``, refused
+    rather than clamped: the parameter's guarantee is that the band holds, and a value that had
+    to be quietly reinterpreted was a request nobody answered.
     """
+    # `nan` and both infinities fail this comparison too — every ordering against `nan` is
+    # False and `inf` is outside any finite bound — so there is deliberately no `isfinite`
+    # call here. One that could never change an answer would be a guard in name only.
+    if not 0 <= variance <= POPULATE_VARIANCE_MAX:
+        raise TimelineError(
+            POPULATE_VARIANCE_REFUSAL.format(
+                variance=variance, maximum=POPULATE_VARIANCE_MAX
+            )
+        )
     if not math.isfinite(song_duration) or song_duration <= 0:
         raise TimelineError("A song must have a positive length to populate against")
     if song_duration <= minimum:
@@ -180,6 +541,18 @@ def populate_windows(
         share = residual / len(adjustable)
         for index in adjustable:
             durations[index] += share
+    # Phase D, and the only thing between the water-fill and the laying. Entered only when a
+    # caller asked for variance *and* the song was actually heard: `vocal_density` answers
+    # `None` for a track with no word times, and an unmeasured song is laid exactly as it
+    # always was.
+    if variance > 0 and density is not None:
+        durations = _varied_durations(
+            durations,
+            minimum=minimum,
+            maximum=maximum,
+            density=density,
+            variance=variance,
+        )
     windows: list[tuple[float, float]] = []
     cursor = 0.0
     for index, duration in enumerate(durations):
@@ -2287,13 +2660,13 @@ def snap_window_plan(
     **The band.** ``minimum``/``maximum`` default to `H3_MIN_SHOT_SECONDS` and
     `H3_MAX_SHOT_SECONDS` — 4–15 s — which is the band `populate_windows` itself defaults to,
     the band `expansion_input` flags a shot against as `outside_h3_window`, and the band
-    `build_director_timeline` warns about. `app.POPULATE_MAX_WINDOW_SECONDS` (6 s) is tighter
-    but is an *argument the populate route passes at layout time*, not an invariant on stored
-    windows: a Director may deliberately edit a shot to 9 s, and enforcing 6 s here would
-    refuse every cut in such a plan for a rule it was never held to. Both are parameters, so
-    a caller that does want the tighter ceiling asks for it — and populate's line-up step
-    does, because a lay-out that capped its windows at 6 s must not be undone by the step
-    after it.
+    `build_director_timeline` warns about. `app.POPULATE_MAX_WINDOW_SECONDS` (6.8 s since the
+    Director's ruling of 2026-08-23; 6.0 before it) is tighter but is an *argument the populate
+    route passes at layout time*, not an invariant on stored windows: a Director may deliberately
+    edit a shot to 9 s, and enforcing the tighter ceiling here would refuse every cut in such a
+    plan for a rule it was never held to. Both are parameters, so a caller that does want the
+    tighter ceiling asks for it — and populate's line-up step does, because a lay-out that capped
+    its windows there must not be undone by the step after it.
 
     **Why the band check is exact and not provisional.** Cuts are decided left to right. When
     cut *i* is judged, the left edge of window *i* is a boundary already settled, so window

@@ -4,6 +4,567 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-23 — Layout variance becomes a redistribution: one saturated window no longer freezes its span
+
+Spec: `_bmad-output/planning-artifacts/three-step-populate-2026-08-21.md`, Phase D, and the open
+ruling the entry below left behind. **No render, no ComfyUI submission, no model call** — every
+number here is arithmetic over fixtures plus one read-only replay of the Director's own plan.
+`data/projects/project_59f14d19ff10` was opened for reading only and its manifest was hashed before
+and after every run; each run reports the same digest either side. (It changes *between* runs, by
+`updated_at` alone — a running instance of the app is touching it. Nothing else in it moved, and
+the backup taken at the start was deliberately **not** restored for that reason: restoring it would
+roll the Director's live session back.)
+
+### The defect
+
+`_varied_durations` moved a whole span by one scalar `step`, and that step was capped by the
+**tightest** headroom any single window in the span had. A window already sitting *on* the band end
+its density wanted to push it past has zero headroom, so `max(min(room), 0.0)` was 0 and **every
+other window in that section stayed flat even when it had room**. One window vetoed its neighbours.
+
+It got worse when the band widened, which is how it was found: a wider band lets the water-fill
+saturate *both* ends, so on the populate fixture — whose proposals cycle 4–8 s — **3 of 7 spans
+froze at a 6.0 ceiling and 6 of 7 at 6.8**, and Phase D there laid a tiling byte-identical to no
+Phase D at all. Two of its examples: `[4.000, 4.666, 5.613, 6.561]`, where the 4.000 wants to
+shrink, and `[4.757, 5.673, 6.589, 6.800]`, where the 6.800 wants to grow.
+
+### The design: a transfer, not a step
+
+The windows busier than their span's mean **give** seconds up; the quieter ones **take** them. One
+figure is given and taken, and each side spreads its half over its own windows in proportion to
+their distance from the mean, water-filled so that a window meeting its band end freezes *at* it
+while the rest carry on (`timeline._spend_room`, a second use of the shape `populate_windows`
+already tiles with). The transfer is
+`variance × min(band_width × pull, Σ giver room, Σ taker room)`, which is what keeps `variance` a
+fraction of what is available and keeps the old "magnitude is respected" rule — small deviations
+buy a small transfer however much room the span happens to have.
+
+Four invariants, structural rather than repaired:
+
+* **The band is inviolable.** A window moves in one direction only and only by the room it has in
+  that direction — its distance to the band end less `WINDOW_LAY_RESOLUTION`, clamped at zero, so a
+  saturated window contributes nothing rather than a debt.
+* **Deviations sum to zero.** Both sides are allocated the same figure; a mismatch beyond
+  `VARIANCE_BALANCE_TOLERANCE` (1e-9) hands the span back untouched rather than laying it short.
+  Measured on the 30-window live span, the reshaper's own zero-sum error is **2.8e-14 s**.
+* **Direction follows density.** Givers only shrink, takers only grow, whatever the clamping does
+  to the magnitudes. A redistribution that let a busy window grow because its neighbour ran out of
+  room would preserve the total, stay in band, and no longer be measuring anything.
+* **It terminates.** Each `_spend_room` pass either places the whole remainder or freezes at least
+  one window, so a span of *n* windows takes at most *n* passes; there is no outer loop. Bounded in
+  the source and asserted by counting the calls, not by trusting the `range`.
+
+**Freezing survives as the last resort.** A span whose *every* giver is on the floor has nothing to
+hand over, and because the total is preserved that means nobody can take either; the mirror holds
+at the ceiling. That is arithmetic, not caution, and it is what
+`test_layout_variance_cannot_spend_room_the_band_does_not_have` now pins — same original intent
+(the band is never exceeded), new rule about who pays for it.
+
+| fixture spans frozen | at 6.0 | at 6.8 |
+|---|---|---|
+| before | 3 of 7 | 6 of 7 |
+| after | **0 of 7** | **2 of 7** |
+
+Both survivors at 6.8 are one-sided saturation: **Verse 2**'s only above-mean window is already at
+4.000 and **Chorus 2**'s only below-mean window is already at 6.800.
+
+### On the Director's real song it barely moves, and that is the honest claim
+
+Replayed read-only through `lay_out_shots` → `line_up_shots` with their own 30-shot plan's shape as
+the model's proposals — the same method the entry below used, and the old code reproduces that
+entry's 6.8 row exactly, which is what makes the comparison a measurement.
+
+| ceiling 6.8 | n | min | max | mean | stdev laid | after line-up | within-section | between-section | warnings | `tiling_refusals` | cuts moved |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| variance 0 | 30 | 4.308 | 5.986 | 5.155 | 0.507 | 0.507 | 0.185 | 0.472 | 0 | 0 | 0 |
+| variance 1.0, **before** | 30 | 4.001 | 6.595 | 5.155 | 0.692 | 0.680 | 0.507 | 0.472 | 0 | 0 | 4 |
+| variance 1.0, **after** | 30 | 4.001 | 6.595 | 5.155 | **0.697** | **0.685** | **0.513** | 0.472 | 0 | 0 | 4 |
+
+Coverage is 0 → 154.640 on every row and the worst seam is 1 ms against
+`assembly.BOUNDARY_TOLERANCE_SECONDS` of 20.8 ms — unchanged throughout.
+
+**The Chorus is byte-identical**: `5.386 / 5.920 / 5.920 / 6.595` laid and
+`5.130 / 6.540 / 5.555 / 6.595` after line-up, section stdev **0.495** against a reachable 1.153,
+before and after. So is the Intro, Verse 2, Chorus 2, Bridge and Outro. **Exactly one of seven
+sections reshapes** — the Verse, `4.001 / 4.405 / 4.324 / 4.163 / 4.647` →
+`4.001 / 4.440 / 4.330 / 4.001 / 4.769`, section stdev 0.245 → 0.324.
+
+Why so little: **0 of the song's 6 signal-carrying spans were frozen at all**, and 5 of those 6
+were already capped by the band's width rather than by the tightest window. Only the Verse, whose
+first window lands on the floor margin, was being held back. **This fix is for other material, not
+for this song** — which is a smaller claim than the fixture's numbers make it look, and it is the
+one the measurement supports.
+
+### The digests, moved a third time, and the proof the move is only this fix
+
+`VARIED_DIGEST_SECTIONS_MARKED` `a2e805cf…` → **`cbd98720…`** and `VARIED_DIGEST_NO_SECTIONS`
+`5b545807…` → **`dd923601…`**, both previous values recorded beside the new ones in
+`tests/test_populate_steps.py`. Both had been measured at the 6.0 ceiling and neither survived the
+ceiling ruling; these are the first values the assertions have actually reached at 6.8.
+
+Checked on both arms against the neutral figures they are pinned against: coverage **0 → 154.640**
+unchanged; worst seam **0.0010 s** unchanged, inside the 20.8 ms tolerance; band **4.000 – 6.800**
+unchanged and the band's own ends; **0** `batch.window_band_note` warnings and **0**
+`assembly.tiling_refusals`, both unchanged; shot count **27** unchanged — the reshape moves seconds
+*between* windows that already exist and cannot change how many there are, so no count can move for
+this reason and none did. Within-section stdev goes 1.003 → **0.902** and five of seven spans
+reshape where none did. The narrowing is expected on this fixture and is the same point the Phase D
+entry already makes: its proposals cycle 4–8 s, so aligning the windows to the singing pulls some
+of them together.
+
+One other assertion moved and it is a tolerance, not a pin.
+`test_variance_reaches_a_layout_with_no_section_layer_at_all` compared the varied and neutral
+*sums of durations* within 2 ms. `populate_windows` rounds each duration to the millisecond
+independently, so 30 windows can sum up to 15 ms either side of the span whatever the reshaper did
+— measured, the neutral arm overshoots the 154.644898 s song by 4 ms and the varied one by 6 ms,
+and **the last window ends at 154.644 in both**. The tolerance is now the tiling's own precision
+(`len × WINDOW_LAY_RESOLUTION / 2`) and the coverage claim it was standing in for is asserted
+directly beside it, which is stronger than what it replaced.
+
+### Verification
+
+48 new cases in `tests/test_timeline.py`: one saturated window no longer freezing its neighbours;
+a one-sidedly saturated span frozen *and* a control that differs by one window having two
+milliseconds of room; the zero-sum invariant across 8 span shapes × 5 variances × 3 songs, with the
+band checked in the same breath; direction checked window by window against the deviations; the
+pass bound counted rather than trusted; `_spend_room` on its own for room-to-spare, exact-fit,
+over-large and zero-weight totals; the balance tripwire forced by a stand-in that swallows a tenth
+of a second; and the saturated-headroom clamp pinned at the millisecond in both directions.
+`test_layout_variance_cannot_spend_room_the_band_does_not_have` keeps its intent and states the new
+rule. **Suite 1805 passing** (1757 before), ruff clean, both `node --check` gates clean.
+
+**A 30-mutant sweep in a `git worktree` killed 22.** Sentinel first and it died, so the harness
+reaches the code; restores by `read_bytes`/`write_bytes` with SHA-256 verified against the
+pre-run digest, anchors converted to the file's own CRLF with the match count asserted before every
+write, `__pycache__` purged between mutants, `PYTHONPATH` at the worktree's own `src`, each run
+time-boxed at 300 s. The first pass killed 19 and named two real gaps, both now closed: the
+zero-weight guard in `_spend_room` (whose absence divides by zero when every active window has no
+weight) and the `max(…, 0.0)` on each side's room (whose absence lets a saturated window's negative
+headroom shrink the pool its neighbours draw from by exactly one lay-resolution — the old veto in
+miniature, and visible at the millisecond the tiling lays at).
+
+**The eight survivors are equivalent mutants and each is now named in the source**, because an
+undocumented survivor is indistinguishable from an untested branch: a zero-room window kept active
+freezes on the first pass and leaves; the remaining-exhausted early exit only saves a pass that
+would assign zero; the unplaced remainder cannot go negative (a frozen window's room is bounded by
+the remainder that froze it); a deviation under 1e-9 buys a movement six orders under
+`WINDOW_LAY_RESOLUTION`, so the two near-zero filters are cosmetic; an empty give or take side sums
+to zero room and is caught again by the `transfer <= 0` return; `min` and `max` over the two sides'
+pull agree to float precision because the deviations are mean-centred; and spending a zero transfer
+rebuilds the same floats in a new list.
+
+### Found and not fixed
+
+`POPULATE_VARIANCE_DEFAULT`'s docstring still carries the 6.8 ceiling entry's "0.692 laid and 0.680
+after line-up" as the measurement that justified the default. Those are now 0.697 and 0.685. The
+paragraph is a dated record of *that* ruling's evidence and the new paragraph below it states the
+supersession explicitly rather than editing history in place; the argument it makes (the room the
+band leaves is small, so spending half of it is a rounding error with a parameter attached) is
+unaffected by 5 thousandths.
+
+## 2026-08-23 — `POPULATE_MAX_WINDOW_SECONDS` moves 6.0 → 6.8 on the Director's ruling, and the digests that moved with it
+
+Spec: `_bmad-output/planning-artifacts/three-step-populate-2026-08-21.md`. **No render, no ComfyUI
+submission, no model call** — every number here is arithmetic over fixtures and one read-only
+replay of the Director's own plan. `data/projects/project_59f14d19ff10` was opened for reading
+only; its manifest SHA-256 is `93301f3e…dd30f0` before and after.
+
+**The ruling and the evidence.** The enforced tiling ceiling is now **6.8 s**. Per-frame sampling
+cost on `turbo-references2v` is flat to ~6.79 s — 175 frames at **0.977 s/frame**, marginally
+*cheaper* than 158 frames (6.08 s) at 1.025 — and then climbs **+48%** at 7.50 s, **+184%** at
+8.21 s and **+264%** at 8.92 s. 6.8 is the top of the flat region rather than a round number. The
+constant's own docstring now carries that curve and the three false rationales it replaces (the
+unsourced "2.2 hours", "acceleration is off so the cliff is unmeasured", and a table measured on
+the wrong workflow bundle). **The 4 s floor does not move**: `over_render_frames` floors at 107
+frames, so everything under ~3.271 s costs what a 3.271 s window costs.
+
+**What it does to the Director's real song**, replayed read-only through `lay_out_shots` →
+`line_up_shots` with their own 30-shot plan's shape as the model's proposals — the same method the
+Phase D entry below used, and it reproduces that entry's 6.0 row exactly:
+
+| ceiling | variance | n | min | max | mean | stdev laid | after line-up | within-section | between-section | window warnings | `tiling_refusals` | cuts moved |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 6.0 | 0 | 30 | 4.308 | 5.986 | 5.155 | 0.507 | 0.507 | 0.185 | 0.472 | 0 | 0 | 0 |
+| 6.0 | 1.0 | 30 | 4.001 | 5.999 | 5.155 | **0.589** | **0.567** | 0.353 | 0.472 | 0 | 0 | 2 |
+| **6.8** | **1.0** | **30** | **4.001** | **6.595** | 5.155 | **0.692** | **0.680** | **0.507** | 0.472 | **0** | **0** | 4 |
+
+Coverage is 0 → 154.640 on every row, unchanged; the worst seam disagreement is 1 ms against
+`assembly.BOUNDARY_TOLERANCE_SECONDS` of 20.8 ms. **The window count does not move on this song**
+— 30 before and after — so `between-section` (fixed by the per-section counts) is 0.472
+throughout and the whole of the gain is within-section, which is where the Director's complaint
+lives.
+
+**The Chorus, which is why the ruling was made.** It holds 4 windows over 23.82 s, so it averages
+5.955 s — 45 ms under the old cap. The largest stdev *any* legal tiling of it could reach was
+**0.078** at 6.0 against **1.153** at 6.8. Measured, it goes
+
+| | laid | after line-up | section stdev |
+|---|---|---|---|
+| 6.0 | 5.874 / 5.974 / 5.974 / 5.999 | unchanged | 0.055 |
+| 6.8 | 5.386 / 5.920 / 5.920 / **6.595** | 5.130 / 6.540 / 5.555 / 6.595 | **0.495** |
+
+A section that was four near-identical windows pressed against the ceiling is now the section with
+the widest spread in the plan, and nothing about it became illegal.
+
+### The thirteen pins that moved, and the proof each moved only because of the band
+
+`populate_windows` clamps a span's window count to `[ceil(span/maximum), floor(span/minimum)]` and
+takes the proposal count inside it. **Only the lower clamp depends on the ceiling**, so a count can
+only ever *fall*, and only in a span whose count was set by that clamp. Every count change below is
+that arithmetic and nothing else.
+
+* **`tests/test_api.py::test_populate_timeline_lays_out_the_whole_song_from_the_models_shape`** —
+  the band literal `<= 6.0` → `<= 6.8`. The count does **not** move: 12 proposals against
+  `[ceil(60/6.0)=10, 15]` and `[ceil(60/6.8)=9, 15]` is 12 either way. What moved is the
+  water-fill's clamp — the two windows the 30 s proposal pinned to the cap go 6.0 → 6.8, the ten
+  absorbing the residual go 4.8 → 4.64, coverage 0 → 60 exactly on both. The `>= 10` floor became
+  `>= 9` (it is the ceiling's own consequence) and the exact count 12 is now asserted beside it, so
+  nothing was lost by relaxing the floor.
+* **`CHAINED_DIGEST_SECTIONS_MARKED`** `74af40ec…` → `ad0f82d0…` and **`CHAINED_DIGEST_NO_SECTIONS`**
+  `4accf454…` → `0567041f…`, both previous values recorded beside the new ones in the test.
+  29 → 27 windows, and exactly two spans lose one each because `ceil(span/ceiling)` drops:
+  **Chorus 2** 26.00 s, `ceil(26.00/6.0)=5 → 4`, four windows of 6.500 s; **Outro** 30.54 s,
+  `ceil(30.54/6.0)=6 → 5`, five of 6.108 s. The other five spans are bounded by their proposal
+  count or by `floor(span/4)` and keep what they had. Band 4.134–6.000 → 4.000–6.800; coverage
+  0 → 154.640 unchanged; worst seam 1 ms; **0** window warnings and **0** tiling refusals, both
+  unchanged. These digests reach four parametrisations, which is 4 of the 13 failures.
+* **`test_a_song_nobody_transcribed_is_laid_out_the_same_at_every_variance`** (2 params) — reads the
+  two constants above and needed no other change. **The property it asserts still holds and was
+  checked directly, not inferred**: at 6.8, `variance=1.0` on the word-time-less fixture produces
+  `ad0f82d0…`/`0567041f…` — byte for byte the neutral digests. No word times, no density, no
+  variance, exactly as before.
+* **`test_a_window_only_ever_takes_a_proposal_written_for_its_own_section`** — 14 → 13 shots, and
+  the whole of it is Beta's. Beta is the one section here whose count comes from the ceiling: it
+  has a single proposal, so the count is the lower clamp, `ceil(20/6.0)=4 → ceil(20/6.8)=3`, and
+  its windows go 5.000 s to 6.667 s — inside the new band. Alpha and Gamma are pinned by
+  `floor(20/4)=5` against six proposals each; their new lower clamp of 3 is below that and never
+  binds. **The property was verified rather than the numbers**: the per-shot loop asserting that no
+  window carries another section's prose is unchanged and passes over all 13, and the sibling test
+  `test_no_proposal_is_dropped_inside_a_section_that_has_windows_to_spare` never failed at all.
+* **Three tests that assert `moved > 0`** — `test_each_step_reports_without_writing_and_the_confirm_persists`,
+  `test_a_chained_populate_moves_its_cuts_onto_phrase_boundaries` and
+  `test_the_chain_asks_for_no_second_confirmation_to_move_a_cut` — now run the fixture's
+  **word-timed** arm. This is the one change here that is not a re-baseline, and the measurement
+  behind it: at 6.8 the `words=False` arm offers **no movable cut at all**. That arm falls back to
+  `merge_vocal_spans`' *display* view, which has 5 gaps in 154.6 s, and of the 26 cuts a 6.8 cap
+  lays exactly two come within the 0.75 s tolerance of one — 89.635 s, whose move to 88.990 s would
+  leave the next window **7.410 s**, and 119.862 s, whose move to 120.250 s would leave the previous
+  one **3.850 s**. Both are refused **by the band, correctly**. (At 6.0 that arm saw exactly one
+  move, 87.466 → 87.870, so it was already threadbare.) The word-timed arm is what production takes
+  — `vocal_gaps` has read `Song.lyric_words` since Phase B and the Director's song carries 262 of
+  them — and there 8 of 26 cuts move at 6.8 against 12 of 28 at 6.0. **No assertion was relaxed**:
+  every moved boundary is still required to sit `SNAP_CLEARANCE_SECONDS` inside a measured
+  voiceless stretch, and the ceiling assertion on the same test is not vacuous at 6.8 (five of the
+  27 windows sit exactly on the cap).
+
+### Not re-baselined, and the reason the Director needs to hear it
+
+> **Answered later the same day** — see the entry above. The open ruling this section leaves was
+> taken: `_varied_durations` now spends the room its unsaturated windows have. The diagnosis below
+> stands as written; only the "left failing" disposition is superseded.
+
+**`test_the_default_variance_reshapes_a_word_timed_song_and_stays_legal` fails at 6.8 in both
+parametrisations, and it is left failing.** Its first assertion is `digest != neutral` — "the
+default variance laid something other than the neutral value" — and at a 6.8 ceiling, on that
+fixture, **it did not**. The varied digest is byte-identical to the neutral one. Phase D does
+nothing there.
+
+Diagnosed rather than guessed, by instrumenting `_varied_durations` over all seven spans. Its step
+is a single number per span, capped by the tightest headroom any window in that span has; a window
+already sitting **on** the band end its density wants to push it past has zero headroom, so
+`max(min(room), 0.0)` is 0 and the whole span freezes. That is the documented design — and
+`test_layout_variance_cannot_spend_room_the_band_does_not_have` pins it. What the ruling changed is
+how often it fires: this fixture's proposals cycle 4–8 s, a 2:1 ratio, and a wider band lets the
+water-fill saturate *both* ends. **At 6.0 three of the seven spans were frozen by saturation; at
+6.8 six are** — e.g. `[4.000, 4.666, 5.613, 6.561]` with the 4.000 wanting to shrink, and
+`[4.757, 5.673, 6.589, 6.800]` with the 6.800 wanting to grow. The seventh, the Intro, is frozen at
+both ceilings for an unrelated and correct reason: it is two windows of equal density, so there is
+no deviation to spend. Seven of seven silent is what makes the digest identical.
+
+**Everything else that test asserts still holds at 6.8**, checked directly with the digest line
+lifted out: contiguous, `4.0 ≤ d ≤ 6.8`, zero `window_band_note` warnings, 21 distinct lengths of
+27, no shot straddling a section, coverage short of the song by 4.898 ms against a 7 ms allowance,
+`comfy.prompts == []`. Only the "the feature did something" half fails.
+
+**This is not a reason to reverse the ruling, and it is a reason to look at Phase D.** On the
+Director's real song the ruling *helps* variance substantially — 0.589 → 0.692 laid, within-section
+0.353 → 0.507 — because their model's proposals do not saturate the band. The fixture's do. So the
+open question is whether `_varied_durations` should spend the room its *unsaturated* windows have
+instead of freezing the span, which would change every Phase D digest and is a separate ruling.
+Inverting this test's assertion to make the suite green would have absorbed a live feature going
+silent into "expected churn", which is exactly what a digest re-baseline is dangerous for.
+
+## 2026-08-23 — The cuts really have nowhere to go, and shot length becomes a parameter driven by how busy the singing is (Phase D)
+
+Spec: `_bmad-output/planning-artifacts/three-step-populate-2026-08-21.md`, Phase D. Two pieces of
+work in one pass, because the first had to be answered before the second could be designed:
+whether the mid-word cuts line-up refuses are a defect in the snapper, and what layout variance
+should be driven by. **No render was submitted, no model was called, and the Director's project
+was read only** — backed up with a verified SHA-256 first, manifest and media both.
+
+### Part 1 — the refusals are genuine, and the merge threshold is not the culprit
+
+The lead was a coincidence worth chasing: `transcription.merge_vocal_spans` bridges any rest
+under **0.75 s**, `SNAP_TOLERANCE_DEFAULT` is **0.75 s**, and a previously recorded finding says a
+0.75 s *display* merge once hid more than half the usable cut points from cut placement. If
+`snap_window_plan` were still reading the merged view, half the refusals would be invisible
+rather than absent.
+
+**It is not.** `timeline.vocal_gaps` has read `Song.lyric_words` in preference to
+`Song.vocal_spans` since Phase B, and `snap_window_plan` is its only caller in this path. The
+numbers, measured on the Director's live 30-shot timeline against
+`data/projects/project_59f14d19ff10` (154.645 s, 262 aligned words):
+
+| view | source | gaps ≥ `SNAP_MINIMUM_GAP_SECONDS` |
+|---|---|---|
+| merged (display) | `Song.vocal_spans` | **5** |
+| word-level | `Song.lyric_words` | **12** |
+
+Both computed over the whole song; interior-only, that is 3 against 10, and 3 against 7 at the
+0.6 s threshold the `vocal_gaps` docstring quotes — the same measurement, still true.
+`timeline.vocal_gaps(song, start=0, end=duration)` returns the word-level 12, asserted against an
+independently computed complement rather than trusted. Voiceless total: **44.4 s, 29% of the
+track** at the clearance floor, 46.9 s / 30% without it.
+
+**Of the refused cuts, none is invisible and all are genuine.** The live plan has 29 cuts: 6
+refused on section boundaries, 9 already landing clear of every phrase, 13 refused as
+`SNAP_NO_GAP_IN_TOLERANCE`, and 1 refused by the band. For each of the 13, the nearest word-level
+gap and how far away it is:
+
+| cut at | nearest gap ≥ 0.30 s | width | distance | nearest gap of *any* width | width | distance |
+|---|---|---|---|---|---|---|
+| 15.308 | 18.700–19.020 | 0.320 | 3.542 | 17.740–17.940 | 0.200 | 2.532 |
+| 23.924 | 18.700–19.020 | 0.320 | 5.054 | 18.700–19.020 | 0.320 | 5.054 |
+| 28.232 | 37.340–37.820 | 0.480 | 9.258 | 33.540–33.680 | 0.140 | 5.378 |
+| 38.526 | 37.340–37.820 | 0.480 | **0.856** | 37.340–37.820 | 0.480 | 0.856 |
+| 50.499 | 44.060–44.800 | 0.740 | 5.849 | 53.380–53.420 | 0.040 | 2.901 |
+| 61.470 | 44.060–44.800 | 0.740 | 16.820 | 61.940–62.080 | 0.140 | **0.540** |
+| 66.580 | 87.720–89.140 | 1.420 | 21.290 | 69.300–69.460 | 0.160 | 2.800 |
+| 71.689 | 87.720–89.140 | 1.420 | 16.181 | 72.780–73.020 | 0.240 | 1.211 |
+| 82.400 | 87.720–89.140 | 1.420 | 5.470 | 80.460–80.580 | 0.120 | 1.880 |
+| 92.800 | 89.660–90.580 | 0.920 | 2.370 | 89.660–90.580 | 0.920 | 2.370 |
+| 98.000 | 99.200–103.200 | 4.000 | 1.350 | 96.920–96.940 | 0.020 | 1.070 |
+| 113.357 | 108.020–108.660 | 0.640 | 4.847 | 115.360–115.400 | 0.040 | 2.023 |
+| 129.322 | 125.000–126.260 | 1.260 | 3.212 | 126.460–126.540 | 0.080 | 2.822 |
+
+**0 of 13 have a usable gap inside the 0.75 s tolerance.** The closest miss is 0.856 s — a tenth
+of a second past the bound — and the next is 1.350 s; everything else is 1.9 s or further. One
+cut (61.470) has a 0.140 s micro-pause 0.540 s away, and that is the pause *between two
+syllables* which `SNAP_MINIMUM_GAP_SECONDS` exists to refuse: it cannot hold
+`SNAP_CLEARANCE_SECONDS` at both ends, and offering it would be strictly worse than not moving.
+Snapping the same plan against the merged view moves 0 cuts and skips 29 — identical — because
+none of the seven gaps the merge hides is near a cut either.
+
+**The clearance interaction, since it hides points for a different reason.** The word-level
+complement holds **33** voiceless stretches; **21 of them are under 0.30 s** (0.020 s to
+0.240 s), which is `2 × SNAP_CLEARANCE_SECONDS` and the width below which no cut can be placed at
+all. Those 21 are inter-syllable pauses, not rests, and exactly one refused cut is within
+tolerance of one. So the two thresholds hide points for different reasons and neither is hiding
+anything usable here: the merge threshold hides seven real rests, none of them near a cut; the
+clearance floor hides 21 syllable gaps, all of which it should.
+
+**Nothing was fixed in Part 1, because nothing is broken.** The tolerance is the only lever on
+these 13 cuts, and it is the Director's — raising it means "cuts may travel further", never "cuts
+may land closer to a syllable". What this does establish is the premise Phase D was designed
+against: cut placement cannot rescue a layout that puts its boundaries in the wrong seconds, so
+the layout is where the seconds should be decided.
+
+Two things found and deliberately **not** changed, recorded so they are not re-discovered:
+
+* **`shot_vocal_overlap` reads the merged spans** while `vocal_gaps` reads the words. That is the
+  same shape as the defect this investigation went looking for, and it is *deliberate there*: the
+  question it answers is "is there a mouth to sync to", the merged view over-counts voice, and
+  `MIN_SINGING_VOCAL_SECONDS` was tuned against it. Changing it would flip `singing` marks on a
+  reasoning that has not been made.
+* **`SNAP_NO_GAP_IN_TOLERANCE` does not say how far the nearest gap was.** It tells the Director
+  to raise the tolerance without telling them whether that would help. On this song one cut is
+  0.856 s from a gap and the rest are unreachable at any sane tolerance; the sentence cannot
+  distinguish them. Worth a number, and it is a wording change to a shipped refusal rather than a
+  defect.
+
+### Part 2 — Phase D: variance is a fraction of the room the band leaves, spent on word-onset density
+
+**The complaint, measured.** 30 windows, mean 5.155 s, **stdev 0.507**, min 4.308, max 5.986 —
+and the shape of it matters more than the number: the Verse is **five identical 4.308 s windows**
+and the Chorus **three identical 5.986 s windows**. The model does vary *between* sections and
+never *within* one. The old hand-made plan's stdev of 1.78 is not a target: with mean 5.155 the
+largest standard deviation reachable with every window inside 4–6 s is **0.988**, and inside
+4–6.8 s it is **1.37**, so 1.78 was bought with windows outside the band, which is why the band
+exists.
+
+**What drives it: the word-onset rate, read off `Song.lyric_words`.** `timeline.vocal_density`
+answers, for any window, how many words start inside it against the most any window of the same
+length holds anywhere in the song — 0 for an instrumental stretch, 1 for the busiest the track
+ever gets over that many seconds. Dense window, shorter shot; sparse window, longer hold. It is
+the Director's own gap taxonomy as arithmetic, and it is the plan's "energy-biased per section"
+with the energy *measured*.
+
+Three alternatives were considered and are recorded on the constant:
+
+* **Section identity** — a label is free text on the Director's sheet, so keying behaviour to it
+  is a string taxonomy that breaks on the first `Hook` or `Drop`; and it cannot vary *within* a
+  section, which is where the whole complaint lives. Making one section cut faster than another
+  is a change to its window *count*, not to its shape, and that is a change to GPU spend.
+* **The gap structure from Part 1** — real, but it is the snapper's fact. There are 12 gaps
+  against 29 cuts, so gaps cannot decide 29 lengths, and a layout that placed cuts at gaps would
+  be a second snapper. Density subsumes what is usable of it: an instrumental stretch is a
+  stretch with no onsets in it.
+* **A declared per-section intent** — a new persisted field, a new write-path enumeration, and
+  something more for the Director to fill in before the button works. A good Phase C/E idea.
+
+**The mechanism, and why it cannot break the tiling.** `timeline._varied_durations` takes the
+durations the water-fill already produced for one span, measures each window's density, and moves
+every window by `step × (its density − the span's mean)`. The deviations sum to zero, so the
+span's **total is the number it was** — no water-fill afterwards, no residual, no hole. The single
+`step` is capped by the tightest headroom any window in the span has, so **no window can leave the
+band**, and it is also capped by the band's own width so a section whose density barely varies
+gets barely any variance rather than the same spread as one that swings. `variance` scales that
+step from 0 to 1.
+
+**Measured on the Director's real song**, replaying their own plan's shape as the model's
+proposals through `lay_out_shots` → `line_up_shots` (read-only, nothing saved):
+
+| variance | ceiling | stdev laid | stdev after line-up | min | max | window warnings | holes | cuts moved | no-gap refusals |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 (today) | 6.0 | 0.507 | 0.507 | 4.308 | 5.986 | 0 | 0 | 0 | 13 |
+| 0.5 | 6.0 | 0.522 | 0.562 | 4.154 | 5.980 | 0 | 0 | 3 | 13 |
+| **1.0 (default)** | 6.0 | **0.589** | **0.567** | 4.001 | 5.999 | **0** | **0** | 2 | 14 |
+| 0.5 | *6.8 hypothetical* | 0.549 | 0.605 | 4.154 | 6.540 | 0 | 0 | 4 | 13 |
+| 1.0 | *6.8 hypothetical* | 0.692 | 0.680 | 4.001 | 6.595 | 0 | 0 | 4 | 14 |
+
+The 6.8 rows are **computed as a hypothetical; `POPULATE_MAX_WINDOW_SECONDS` was not changed.**
+Coverage is 0 → 154.640 on every row, which is what it was, and contiguity, the zero window
+warnings and the zero tiling refusals all survive. Line-up's book changes by one cut at the top
+of the dial (13 no-gap refusals become 14, and a second cut refuses on the band) — the windows
+moved, so some cuts left the gaps they happened to sit in. Nothing became illegal.
+
+### The number the complaint is stated in is mostly a number Phase D cannot move
+
+A 0.507 → 0.567 change is a 12% move in a statistic, and nobody looking at a row of blocks will
+see 12%. Before defending a default, the honest question is *how much is reachable at all*. Three
+bounds, all arithmetic over this song's own section counts (7 spans, 30 windows, mean 5.155 s):
+
+| bound | [4.0, 6.0] | [4.0, 6.8] |
+|---|---|---|
+| naive two-point, sections ignored | 1.005 | 1.402 |
+| **largest stdev any legal tiling can reach** (integral, counts as laid) | **0.919** | **1.280** |
+| what this mechanism reaches at variance 1.0 | 0.589 | 0.692 |
+| what populate lays today | 0.507 | 0.507 |
+
+**So the band is not the binding constraint at 6.0** — 0.919 is available and the dial reaches
+0.589, which is 64% of it against today's 55%. The old hand-made plan's 1.78 remains unreachable
+in band (it needed windows outside it), but 0.919 is a lot more room than Phase D is using.
+
+**What limits it is the statistic, not the mechanism.** Decompose the variance into the part
+*between* sections — fixed by how many windows each section gets, which no reshaping can touch —
+and the part *within* them:
+
+| | whole-song stdev | between-section | within-section |
+|---|---|---|---|
+| today | 0.507 | 0.472 | **0.185** |
+| variance 1.0 | 0.589 | 0.472 (fixed) | **0.352** |
+| the ceiling at 6.0 | 0.919 | 0.472 (fixed) | 0.789 |
+
+**93% of the baseline statistic is between-section and immovable here.** The thing the Director
+actually described — *five identical 4.308 s windows in a row* — is the within-section spread,
+and that is what nearly doubles: the Verse goes from `4.308 × 5` to
+`4.001 / 4.405 / 4.324 / 4.163 / 4.647`, the Outro from six near-equal windows to
+`4.407 … 5.565`. Reported as a whole-song standard deviation that reads as "0.507 → 0.589",
+which undersells it, and this is the decomposition that says why.
+
+**One section of seven is genuinely band-bound, and it is the ceiling argument located exactly.**
+The Chorus holds 4 windows over 23.82 s, so it averages 5.955 s — **45 ms** below a 6.0 s cap. The
+largest stdev *any* legal tiling of that section can reach at 6.0 is **0.078**; at 6.8 it is
+**1.153**. Measured, the Chorus comes out 5.874/5.974/5.974/5.999 at the current ceiling and
+5.686/5.953/5.953/6.228 at 6.8.
+
+**`POPULATE_MAX_WINDOW_SECONDS` should be 6.8, and that is the Director's ruling to make — but it
+is worth more than the variance dial.** The measured per-frame sampling cost on
+`turbo-references2v` is flat to 6.79 s (158 frames 1.025 s/frame, 175 frames **0.977** — cheaper
+per frame than 6.08 s) and then climbs steeply (192 frames 1.448, +48%; 209 frames 2.775, +184%).
+Raising the ceiling to the top of that flat region lifts the *reachable* ceiling from 0.919 to
+1.280 and the delivered figure from 0.567 to 0.680, at no measured cost per frame. **At the short
+end nothing is free:** `over_render_frames` floors at 107 frames, so every window under ~3.271 s
+renders the same 107 frames as a 3.271 s one — a micro-cut costs what a short shot costs, which is
+a second reason the 4 s floor should not move. So the Director's real lever is the ceiling; the
+variance dial is what lets the layout *use* whatever band they choose.
+
+**The default is 1.0 — all of the room — and the first draft of it said 0.5.** The argument for
+half was that the driver is an inference from Whisper word times while the band's ends are hard
+costs. Two numbers retired it. The guarantee here is **structural**: `_varied_durations` cannot
+put a window outside the band whatever the density says, so a mis-timed line produces a
+differently *shaped* legal layout, never an illegal one — the worst case is a length the Director
+drags, which is the state of every window today. And half of a 0.589 ceiling is 0.522, a 3% move
+on the baseline: a rounding error with a parameter attached. The band is where the costs were
+decided; a second conservatism layered on top of it is one nobody argued for. **0 remains the
+feature off and a genuine no-op**, every value between is available, and a value past 1.0 is
+**refused, not clamped**, at the route and in the tiler.
+
+**What Phase D does not claim.** Variance does not always widen a spread and is not trying to:
+the ordinary populate fixture proposes 4 s to 8 s windows, and aligning those to the singing pulls
+some of them *together* (stdev 0.719 → 0.695). What the parameter does is make length follow the
+music. A wider spread is what that produces when the music has more to say than the model did,
+which is the case the Director complained about — pinned on a double that reproduces exactly that
+layout. **And it does not claim the Director will call this fixed**: within sections the plan is
+visibly no longer uniform, but as one number it moves 0.507 → 0.567, and the two changes that
+would move it further are the ceiling (worth 0.113 on its own) and the per-section window counts,
+neither of which is a variance dial.
+
+### Verification
+
+36 new cases across `tests/test_timeline.py` and `tests/test_populate_steps.py`. Suite **1757
+passing**; `ruff check .` and both `node --check` gates clean.
+
+**The neutral pin is the acceptance criterion and it is a byte digest.** Both chained digests now
+run in four arms — sections marked or not, word times present or not — and `variance=0` reproduces
+the values measured before Phase D was written, exactly. The `word-timed` arm is what makes that a
+claim rather than an accident: without word times "the digest did not move" would only say the
+driver was missing. The default over the same word-timed song is pinned to its own two digests,
+asserted *different* from the neutral ones, and checked for contiguity, band, zero shot-length
+warnings and no shot straddling a section.
+
+A **45-mutant sweep**, swept in a `git worktree` with `PYTHONPATH` at its own `src`, calling
+`.venv/Scripts/python.exe -m pytest -o addopts=""` directly, restoring by `read_bytes`/
+`write_bytes` with `__pycache__` purged between runs, every anchor converted to its file's own
+line ending with the match count asserted, and each run time-boxed.
+
+**The first pass is worth recording, because its sentinels were wrong.** Both were *additive*
+edits — a new unused function beside `populate_windows`, and a `windows = []` two lines above the
+statement that reassigns it — so both passed, and a sweep whose sentinels cannot die proves
+nothing about whether the harness ran the tests at all. They were replaced with edits to values
+the suite reads (`step = 0.123456`; a constant-valued density probe) and both then died.
+
+That pass also left **six survivors**, every one of them a real gap rather than an equivalent
+mutant, and each was closed by argument rather than by an assertion bolted on. A seventh appeared
+on the second pass for a reason worth stating: the first fix for `len(durations) < 2` tested the
+**empty** list, and `< 1` catches an empty list too — only the *single-window* case differs, and
+both versions return that list unchanged. What separates the guard from its absence is a
+measurement nobody needed, so it is a counting probe that pins it, not a returned value.
+
+* **two provably redundant guards were deleted, not tested** — `math.isfinite(variance)` (every
+  ordering against `nan` is already False and both infinities are outside a finite bound) and an
+  empty-onsets check in `vocal_density` that cannot be reached after an empty `lyric_words` has
+  been refused;
+* **`WINDOW_LAY_RESOLUTION` on the shrinking side** was only exercised at the ceiling. Now
+  asserted as the invariant it exists for, directly on `_varied_durations`, at both band ends
+  with a probe whose contrast makes the *room* cap bind rather than the band-width one;
+* **`len(durations) < 2`** is what stops a single-window span being measured for a deviation it
+  cannot have — pinned by a probe that must not be called, after the first attempt (an empty-list
+  case) turned out not to discriminate;
+* **`variance > 0` short-circuits the measurement**, and at 0 the arithmetic would produce the
+  same floats anyway, so the guard was invisible. Now a counting probe asserts the song is *not
+  measured at all* at 0 — `SNAP_TOLERANCE_OFF`'s rule, that a switched-off feature which still
+  runs is not switched off;
+* **the section-free tiling branch** (`lay_out_spans` answering `[]`) needed the Director to have
+  marked nothing *and* the model to have volunteered nothing, which no fixture did by accident;
+* **`layout_from_report`'s carried variance** is read by nothing downstream, so it is pinned on
+  the translation function itself — those four translations are "the only place either shape is
+  built".
+
+**All 45 are killed and both sentinels die.**
+
+Nothing rendered, nothing was submitted to ComfyUI, and no model was called.
+
 ## 2026-08-22 — The three-step populate's first live run: four measured defects fixed, and an asset can be renamed
 
 Spec: none — this is remedial work against a measured run rather than a planned feature. The

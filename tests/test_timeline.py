@@ -4,6 +4,7 @@ from itertools import pairwise
 
 import pytest
 
+from music_video_producer import timeline as timeline_module
 from music_video_producer.assembly import ClipWindow, assembly_plan, tiling_refusals
 from music_video_producer.models import (
     CHARACTER_SLOT_LIMIT,
@@ -25,6 +26,8 @@ from music_video_producer.timeline import (
     H3_MIN_SHOT_SECONDS,
     OVER_RENDER_LEAD_SECONDS,
     OVER_RENDER_SECONDS,
+    POPULATE_VARIANCE_DEFAULT,
+    POPULATE_VARIANCE_MAX,
     SNAP_ALREADY_SILENT,
     SNAP_APPROVED_REFUSAL,
     SNAP_CLEARANCE_SECONDS,
@@ -41,12 +44,14 @@ from music_video_producer.timeline import (
     SNAP_TOLERANCE_OFF,
     SNAP_UNMEASURED,
     SNAP_WITHOUT_CUTS,
+    WINDOW_LAY_RESOLUTION,
     LyricTagError,
     SnapWindow,
     TimelineError,
     _asset_description,
     _gap_snap_target,
     _lyric_tokens,
+    _varied_durations,
     align_h3_frames,
     align_lyric_blocks,
     anchored_label,
@@ -69,6 +74,7 @@ from music_video_producer.timeline import (
     snap_window_plan,
     song_section,
     tag_lyric_line,
+    vocal_density,
     vocal_gaps,
 )
 from music_video_producer.transcription import merge_vocal_spans
@@ -1051,7 +1057,9 @@ def test_populate_windows_output_is_pinned_value_for_value():
         (124.645, 15.0),
         (139.645, 14.999),
     ]
-    # And populate's own call shape: the enforced 6 s ceiling, twelve proposals for 60 s.
+    # And populate's own call shape: an explicit 6 s ceiling, twelve proposals for 60 s. The
+    # number is this test's, not `app.POPULATE_MAX_WINDOW_SECONDS` (6.8 since 2026-08-23) —
+    # `populate_windows` takes the band as an argument and that is what is under test here.
     assert populate_windows(
         [(index * 5.0, 5.0) for index in range(12)], 60.0, maximum=6.0
     ) == [(index * 5.0, 5.0) for index in range(12)]
@@ -1083,6 +1091,565 @@ def test_populate_windows_handles_the_tiny_song_and_refuses_the_impossible_one()
     # No proposals at all still tiles: the default count aims at ~9.5 s windows.
     bare = populate_windows([], 60.0)
     assert sum(duration for _, duration in bare) == pytest.approx(60.0)
+
+
+# --- Phase D: layout variance as a parameter ----------------------------------------------
+
+
+def worded_song(onsets, *, duration=60.0):
+    """A song whose only measured fact is where words *started*. Nothing here is a lyric."""
+    return Song(
+        title="t",
+        source="imported",
+        path="media/s.flac",
+        duration=duration,
+        lyric_words=[("la", round(at, 3), round(at + 0.2, 3)) for at in onsets],
+    )
+
+
+def test_vocal_density_is_none_when_nothing_was_heard():
+    """The absent-analysis convention, and **`vocal_spans` is deliberately not a fallback.**
+
+    A merged span is uniformly "voice" from end to end — it bridges every rest under 0.75 s so
+    the drawn vocal band does not flicker — so it cannot tell a rapid-fire line from a held
+    note, which is the only question this probe asks. Half a signal here would vary a layout
+    against a measurement that cannot support the distinction, so the honest answer is none.
+    """
+    assert vocal_density(None) is None
+    assert vocal_density(worded_song([])) is None
+    spans_only = Song(
+        title="t", source="imported", path="media/s.flac", duration=60.0,
+        vocal_spans=[(0.0, 30.0)],
+    )
+    assert vocal_density(spans_only) is None
+
+
+def test_vocal_density_reads_a_window_against_the_busiest_one_of_its_length():
+    """0 is an instrumental stretch, 1 is the busiest the track ever gets over that many
+    seconds, and nothing can exceed 1 — shifting a window right onto its own first onset can
+    only add onsets, so no window holds more than the busiest one of its length."""
+    # Four words in the first two seconds, one word per second afterwards.
+    song = worded_song([0.0, 0.5, 1.0, 1.5] + [4.0 + index for index in range(10)])
+    density = vocal_density(song)
+    assert density(0.0, 2.0) == 1.0
+    assert density(4.0, 6.0) == pytest.approx(0.5)
+    assert density(20.0, 22.0) == 0.0
+    assert density(5.0, 5.0) == 0.0
+    for low in (0.0, 3.3, 7.7, 19.0):
+        assert 0.0 <= density(low, low + 5.0) <= 1.0
+
+
+def test_layout_variance_at_zero_is_the_tiling_that_shipped_before_it():
+    """**The acceptance criterion.** The neutral value is not "almost the same": with a probe
+    in hand and `variance=0`, the floats are the ones the tiler produced before Phase D."""
+    song = worded_song([index * 0.4 for index in range(80)])
+    density = vocal_density(song)
+    proposals = [(index * 5.0, 4.0 + index % 3) for index in range(12)]
+    plain = populate_windows(proposals, 60.0, maximum=6.0)
+    assert populate_windows(proposals, 60.0, maximum=6.0, density=density, variance=0.0) == plain
+    # And the probe alone changes nothing: it is the variance that spends it.
+    assert populate_windows(proposals, 60.0, maximum=6.0, density=density) == plain
+
+
+def test_layout_variance_keeps_the_tiling_contiguous_and_in_band():
+    """Contiguous 0 → song end, every window inside the band, the total exact — at every
+    variance the parameter admits, not merely at its default.
+
+    Seams are asserted within `SNAP_CONTIGUITY_TOLERANCE`, this module's own "the same boundary
+    written twice": `populate_windows` rounds each start and each duration independently to the
+    millisecond, so two neighbours can name their shared boundary a millisecond apart, and they
+    could before Phase D as well — the Director's live plan carries 0.002 s and 0.004 s seams.
+    """
+    song = worded_song([index * 0.3 for index in range(40)] + [30.0, 44.0, 44.2, 44.4])
+    density = vocal_density(song)
+    proposals = [(index * 5.0, 5.0) for index in range(12)]
+    for variance in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
+        windows = populate_windows(
+            proposals, 60.0, maximum=6.0, density=density, variance=variance
+        )
+        assert windows[0][0] == 0.0
+        cursor = 0.0
+        for start, duration in windows:
+            assert abs(start - cursor) <= SNAP_CONTIGUITY_TOLERANCE
+            assert 4.0 <= duration <= 6.0, f"{duration} left the band at variance {variance}"
+            cursor = start + duration
+        assert cursor == pytest.approx(60.0, abs=2e-3)
+        assert cursor <= 60.0 + 1e-9
+
+
+def test_layout_variance_shortens_the_busy_windows_and_holds_the_quiet_ones():
+    """The whole point: identical proposals stop producing identical windows, and which way
+    each one moves is decided by the singing rather than by its position in the list."""
+    # Words crowd the first half of the song; the second half is instrumental.
+    song = worded_song([index * 0.25 for index in range(120)])
+    density = vocal_density(song)
+    proposals = [(index * 5.0, 5.0) for index in range(12)]
+    plain = populate_windows(proposals, 60.0, maximum=6.0)
+    varied = populate_windows(
+        proposals, 60.0, maximum=6.0, density=density, variance=0.5
+    )
+    assert {round(duration, 6) for _, duration in plain} == {5.0}
+    assert len({round(duration, 3) for _, duration in varied}) > 1
+    assert varied[0][1] < plain[0][1], "the sung half should cut faster"
+    assert varied[-1][1] > plain[-1][1], "the instrumental half should hold"
+
+
+def test_layout_variance_respects_how_much_the_density_actually_varies():
+    """Magnitude, not just shape. A span whose density barely moves gets barely any variance;
+    normalising the deviations away would give a metronomic verse the same visible spread as a
+    section that swings from a held note to a rapid-fire line."""
+    proposals = [(index * 5.0, 5.0) for index in range(12)]
+
+    def spread(song):
+        windows = populate_windows(
+            proposals, 60.0, maximum=6.0, density=vocal_density(song), variance=1.0
+        )
+        return max(d for _, d in windows) - min(d for _, d in windows)
+
+    even = worded_song([index * 0.5 for index in range(120)] + [7.0, 17.0, 27.0])
+    swinging = worded_song([index * 0.2 for index in range(150)])
+    assert spread(even) < spread(swinging)
+
+
+def test_layout_variance_says_nothing_where_the_music_says_nothing():
+    """A span every window of which is equally busy has no variance in it, and an
+    all-instrumental one is the sharpest case: every density is 0, so the deviations are 0 and
+    the windows are the ones the proposals shaped."""
+    song = worded_song([100.0, 100.5, 101.0], duration=200.0)
+    density = vocal_density(song)
+    proposals = [(index * 5.0, 5.0) for index in range(12)]
+    assert populate_windows(
+        proposals, 60.0, maximum=6.0, density=density, variance=1.0
+    ) == populate_windows(proposals, 60.0, maximum=6.0)
+    # One window has no other window to differ from, whatever the song does.
+    assert populate_windows(
+        [(0.0, 5.0)], 5.5, minimum=4.0, maximum=6.0, density=density, variance=1.0
+    ) == populate_windows([(0.0, 5.0)], 5.5, minimum=4.0, maximum=6.0)
+
+
+def test_layout_variance_cannot_spend_room_the_band_does_not_have():
+    """The band is never exceeded, and **that is now the only thing a saturated window costs.**
+
+    Original intent, kept: a tiling the water-fill has already pressed against a band end cannot
+    be reshaped past it. What changed on 2026-08-23 is *who* pays. This used to be a whole-span
+    veto — one window on the edge froze every other window in the section — and it is now a
+    per-window clamp: the span below still cannot move because **every** window in it is at the
+    ceiling, so the quiet ones have nothing to grow into and the busy ones therefore have nobody
+    to give their seconds to. The zero-sum rule is what makes the second half of that sentence
+    follow from the first; see `test_a_span_saturated_on_one_side_only_is_the_last_resort`.
+    """
+    song = worded_song([index * 0.25 for index in range(120)])
+    density = vocal_density(song)
+    # 12 windows over 72 s against a 6 s ceiling: every one is pinned at 6 s.
+    proposals = [(index * 6.0, 6.0) for index in range(12)]
+    windows = populate_windows(
+        proposals, 72.0, maximum=6.0, density=density, variance=1.0
+    )
+    assert {round(duration, 3) for _, duration in windows} == {6.0}
+    # And the reshaper says so on its own terms, on the same durations: the span comes back
+    # identical rather than approximately identical.
+    pinned = [6.0] * 12
+    assert (
+        _varied_durations(
+            list(pinned), minimum=4.0, maximum=6.0, density=density, variance=1.0
+        )
+        == pinned
+    )
+
+
+def test_one_saturated_window_no_longer_freezes_the_windows_that_have_room():
+    """**The 2026-08-23 defect, pinned.** One window sitting on the band end its density wants to
+    push it past used to cap the single step that moved the whole span, so the section went flat
+    — measured as 6 of the populate fixture's 7 spans at a 6.8 s ceiling, where Phase D then laid
+    a tiling byte-identical to no Phase D at all.
+
+    The fixture is the defect's own example: the busiest window is already at the 4.000 s floor
+    and cannot shrink a millisecond further. Every *other* window must still move, the saturated
+    one must not move at all, and the span's total must be what it was.
+    """
+    # Busy at the front, quiet behind it, so window 0 is the one the density wants to shorten.
+    probe = vocal_density(worded_song([index * 0.25 for index in range(40)]))
+    durations = [4.0, 4.666, 5.613, 6.561]
+    varied = _varied_durations(
+        list(durations), minimum=4.0, maximum=6.8, density=probe, variance=1.0
+    )
+    assert varied[0] == 4.0, "the saturated window moved off the floor"
+    moved = [
+        index
+        for index, (new, old) in enumerate(zip(varied, durations))
+        if abs(new - old) > 1e-9
+    ]
+    assert moved, "one saturated window still froze the whole span"
+    assert 0 not in moved
+    assert sum(varied) == pytest.approx(sum(durations), abs=1e-9)
+    assert min(varied) >= 4.0 and max(varied) <= 6.8
+
+
+def test_a_span_saturated_on_one_side_only_is_the_last_resort():
+    """**Frozen is still an answer — the last one.** A span whose every giver is on the floor has
+    no seconds to hand over, and since the total is preserved that means nobody can take any
+    either. Same the other way up. Both are refusals the arithmetic *forces*, not the old
+    tightest-window caution, and the difference is that here every window on the side is pinned
+    rather than one of them.
+
+    Checked in both directions and against a control that differs by one window having room —
+    otherwise "it did not move" would be indistinguishable from a reshaper that does nothing.
+    """
+    probe = vocal_density(worded_song([index * 0.25 for index in range(40)]))
+    # Every quiet window at the ceiling: nobody can take, so nobody may give.
+    ceiling = [6.0, 6.0, 6.0, 6.0]
+    assert (
+        _varied_durations(
+            list(ceiling), minimum=4.0, maximum=6.0, density=probe, variance=1.0
+        )
+        == ceiling
+    )
+    # Every busy window at the floor: nobody can give, so nobody may take. This song's words all
+    # fall inside the first four seconds, so window 0 is the span's only above-mean window — and
+    # it is on the floor.
+    short = vocal_density(worded_song([index * 0.25 for index in range(16)]))
+    floor = [4.0, 5.5, 5.5, 5.5]
+    assert (
+        _varied_durations(
+            list(floor), minimum=4.0, maximum=6.0, density=short, variance=1.0
+        )
+        == floor
+    )
+    # The control: give that one window two milliseconds over the floor and the span moves. The
+    # difference between a forced freeze and a reshaper that does nothing is exactly this line.
+    loosened = [4.0 + 2 * WINDOW_LAY_RESOLUTION, 5.5, 5.5, 5.5]
+    assert _varied_durations(
+        list(loosened), minimum=4.0, maximum=6.0, density=short, variance=1.0
+    ) != loosened
+
+
+@pytest.mark.parametrize(
+    "durations",
+    [
+        [5.0] * 6,
+        [4.3] * 5,
+        [5.9] * 4,
+        [4.0, 4.666, 5.613, 6.561],
+        [6.8, 5.635, 6.765, 6.8],
+        [4.0, 6.8],
+        [4.001, 6.799, 4.5, 6.5, 5.0],
+        [6.0] * 12,
+    ],
+)
+@pytest.mark.parametrize("variance", [0.05, 0.25, 0.5, 0.75, 1.0])
+def test_the_reshaper_preserves_every_spans_total_at_every_variance(durations, variance):
+    """**Zero-sum is the invariant the tiling rests on**: the deviations sum to zero, so the span
+    keeps its length, the next span still starts where it started, and coverage is byte-stable.
+    Asserted on the function rather than inferred from a laid tiling, and across the shapes the
+    clamping actually reaches — nothing saturated, one end saturated, both ends saturated, and
+    the two spans the populate fixture froze at 6.8.
+
+    The band is checked in the same breath, because the two are what the redistribution trades
+    against each other: a reshaper could always preserve the total by refusing to clamp.
+    """
+    for probe in (
+        vocal_density(worded_song([index * 0.25 for index in range(40)])),
+        vocal_density(worded_song([index * 0.2 for index in range(150)])),
+        vocal_density(worded_song([0.5, 12.0, 12.2, 12.4, 30.0])),
+    ):
+        varied = _varied_durations(
+            list(durations), minimum=4.0, maximum=6.8, density=probe, variance=variance
+        )
+        assert len(varied) == len(durations)
+        assert sum(varied) == pytest.approx(sum(durations), abs=1e-9)
+        assert min(varied) >= 4.0 - 1e-12
+        assert max(varied) <= 6.8 + 1e-12
+
+
+def test_the_reshaper_moves_every_window_the_way_its_density_asks():
+    """**Direction is not negotiable.** Clamping decides how far a window moves; the singing
+    decides which way. A redistribution that let a busy window grow because its neighbour ran out
+    of room would preserve the total and stay in band and still be the wrong mechanism — it would
+    no longer be measuring anything.
+
+    Checked window by window against the deviations the reshaper itself computes, on a span where
+    the clamping definitely bites (one window on the floor, one on the ceiling).
+    """
+    probe = vocal_density(worded_song([index * 0.25 for index in range(40)]))
+    durations = [4.001, 5.2, 6.799, 5.8, 4.6]
+    varied = _varied_durations(
+        list(durations), minimum=4.0, maximum=6.8, density=probe, variance=1.0
+    )
+    cursor, measured = 0.0, []
+    for length in durations:
+        measured.append(probe(cursor, cursor + length))
+        cursor += length
+    mean = sum(measured) / len(measured)
+    for index, (new, old) in enumerate(zip(varied, durations)):
+        deviation = measured[index] - mean
+        if deviation > 1e-9:
+            assert new <= old + 1e-12, f"window {index} is busier than the span and grew"
+        elif deviation < -1e-9:
+            assert new >= old - 1e-12, f"window {index} is quieter than the span and shrank"
+        else:
+            assert new == old
+
+
+def test_the_redistribution_terminates_within_one_pass_per_window():
+    """**Bounded, and the bound is written down rather than hoped for.** Each pass of
+    `_spend_room` either places the whole remainder or freezes at least one window, so a span of
+    *n* windows takes at most *n* passes. Asserted by counting the passes on the worst shape
+    available — every window a different distance from its band end, so they saturate one at a
+    time — rather than by trusting the `range` in the source.
+    """
+    passes = 0
+    original = timeline_module._spend_room
+
+    def counting(room, weight, total):
+        nonlocal passes
+        passes += 1
+        return original(room, weight, total)
+
+    probe = vocal_density(worded_song([index * 0.2 for index in range(150)]))
+    # A staircase: each window has strictly more room than the last, so the water-fill freezes
+    # them one at a time instead of all at once.
+    durations = [4.0 + index * 0.35 for index in range(8)]
+    timeline_module._spend_room = counting
+    try:
+        varied = _varied_durations(
+            list(durations), minimum=4.0, maximum=6.8, density=probe, variance=1.0
+        )
+    finally:
+        timeline_module._spend_room = original
+    # Two calls — one per side — and neither is allowed to iterate without a bound.
+    assert passes == 2
+    assert sum(varied) == pytest.approx(sum(durations), abs=1e-9)
+
+
+def test_spend_room_hands_out_everything_it_is_given_and_nothing_more():
+    """`_spend_room` on its own, because the two properties the caller relies on are properties
+    of *it*: nothing exceeds its room, and the whole total lands somewhere.
+
+    The three cases are the three the caller can produce — room to spare, an exact fit, and a
+    total larger than the room there is. The last one cannot be reached through
+    `_varied_durations` (the transfer is capped at the room's sum), and it is asked here because
+    the unplaced remainder it returns is what makes that unreachability *checked* rather than
+    assumed: the caller refuses to reshape when it comes back non-zero.
+    """
+    room = {0: 1.0, 1: 0.25, 2: 4.0}
+    weight = {0: 1.0, 1: 1.0, 2: 1.0}
+    took, unplaced = timeline_module._spend_room(room, weight, 1.5)
+    assert unplaced == 0.0
+    assert sum(took.values()) == pytest.approx(1.5, abs=1e-12)
+    assert took[1] == 0.25, "the tightest window took its whole room and no more"
+    assert all(took[index] <= room[index] + 1e-12 for index in room)
+
+    took, unplaced = timeline_module._spend_room(room, weight, 5.25)
+    assert unplaced == 0.0
+    assert took == pytest.approx(room)
+
+    took, unplaced = timeline_module._spend_room(room, weight, 9.0)
+    assert unplaced == pytest.approx(3.75, abs=1e-12)
+    assert took == pytest.approx(room), "an over-large total still respects every room"
+
+    # A window with no *weight* is a window the density is not asking to move, and it must leave
+    # the active set rather than sit in it dividing by zero. `_varied_durations` filters those
+    # out before it calls, so this is the guard's only door.
+    took, unplaced = timeline_module._spend_room({0: 1.0}, {0: 0.0}, 0.5)
+    assert took == {0: 0.0}
+    assert unplaced == pytest.approx(0.5, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    "durations,onsets,pinned,expected,edge",
+    [
+        # One giver already on the floor, one with room, and the givers' total room is what caps
+        # the transfer — so the giver that *has* room spends all of it and lands exactly on the
+        # floor's margin. If the saturated window's negative headroom leaked into that total the
+        # transfer would be a millisecond smaller and this window would stop a millisecond high.
+        (
+            [4.0, 4.5, 6.0, 6.0],
+            [index * 0.25 for index in range(40)],
+            0,
+            1,
+            4.0 + WINDOW_LAY_RESOLUTION,
+        ),
+        # The same thing at the ceiling: one taker pinned at 6.8, one with room, take-side bound.
+        (
+            [6.8, 6.3, 4.4, 4.4],
+            [12.0 + index * 0.25 for index in range(40)],
+            0,
+            1,
+            6.8 - WINDOW_LAY_RESOLUTION,
+        ),
+    ],
+)
+def test_a_saturated_windows_headroom_is_zero_and_not_negative(
+    durations, onsets, pinned, expected, edge
+):
+    """**A window past its band end contributes nothing, not a debt.** The room each window has
+    is clamped at zero, so a saturated one neither moves nor shrinks the pool its neighbours draw
+    from. Without the clamp its negative headroom would be subtracted from the span's total room
+    and every other window would come up a millisecond short — which is the old veto in miniature,
+    and at exactly the resolution `populate_windows` lays at.
+
+    Asserted at the millisecond because that is where it is visible: the window with room lands
+    *on* `WINDOW_LAY_RESOLUTION` from the band's end, which is the whole of what it had.
+    """
+    probe = vocal_density(worded_song(onsets))
+    varied = _varied_durations(
+        list(durations), minimum=4.0, maximum=6.8, density=probe, variance=1.0
+    )
+    assert varied[pinned] == durations[pinned], "the saturated window moved"
+    assert varied[expected] == pytest.approx(edge, abs=1e-9)
+    assert sum(varied) == pytest.approx(sum(durations), abs=1e-9)
+
+
+def test_a_reshape_that_cannot_balance_is_refused_rather_than_laid_short():
+    """The tripwire, forced. `VARIANCE_BALANCE_TOLERANCE` guards the one thing the caller cannot
+    check for itself — that both sides of the transfer placed the same number of seconds — and
+    an unbalanced reshape would shorten the span and open a hole in the tiling.
+
+    Unreachable by construction (the transfer is capped at each side's own room), so it is
+    reached by standing in a `_spend_room` that swallows a tenth of a second. The span must come
+    back **exactly** as it went in, not approximately.
+    """
+    probe = vocal_density(worded_song([index * 0.25 for index in range(40)]))
+    durations = [4.5, 5.0, 5.5, 6.0]
+    original = timeline_module._spend_room
+    calls = []
+
+    def leaky(room, weight, total):
+        took, unplaced = original(room, weight, total)
+        calls.append(total)
+        if len(calls) == 1:
+            index = next(iter(took))
+            took[index] = max(took[index] - 0.1, 0.0)
+        return took, unplaced
+
+    timeline_module._spend_room = leaky
+    try:
+        assert (
+            _varied_durations(
+                list(durations), minimum=4.0, maximum=6.8, density=probe, variance=1.0
+            )
+            == durations
+        )
+    finally:
+        timeline_module._spend_room = original
+
+
+def test_varied_durations_answers_the_two_spans_that_have_no_variance_in_them():
+    """The reshaper itself, on the two inputs where there is nothing to reshape.
+
+    An **empty** list matters more than it looks: the guard is what stops `sum([]) / len([])`,
+    and a reshaper that divided by zero on the way to saying "nothing to do" would be a crash
+    hiding behind a no-op. `populate_windows` never hands it one — the count is clamped to at
+    least 1 — so this is asked here, of the function that owns the rule.
+
+    **The song is not measured for either**, and that is the half the returned list cannot
+    show: a lone window would come back unchanged anyway, through the "no window differs from
+    the span's mean" path further down, so what distinguishes the guard from its absence is
+    that the probe is never called. Same rule as `test_variance_zero_does_not_even_measure_the
+    _song`, and it is the only thing separating "there is nothing to do here" from "there was
+    nothing to do here, discovered the long way".
+    """
+    calls: list[tuple[float, float]] = []
+    probe = vocal_density(worded_song([index * 0.3 for index in range(40)]))
+
+    def counting(start: float, end: float) -> float:
+        calls.append((start, end))
+        return probe(start, end)
+
+    for durations in ([], [5.0]):
+        assert _varied_durations(
+            list(durations), minimum=4.0, maximum=6.0, density=counting, variance=1.0
+        ) == durations
+    assert calls == [], "a span with nothing to reshape was measured anyway"
+
+
+@pytest.mark.parametrize(
+    "durations,edge",
+    [
+        # The tightest window is one that must *shrink*: it stops a millisecond above the floor.
+        ([4.3] * 5, "floor"),
+        # ...and one that must *grow*: a millisecond below the ceiling.
+        ([5.9] * 4, "ceiling"),
+    ],
+)
+def test_varied_durations_stops_a_millisecond_short_of_the_band(durations, edge):
+    """`WINDOW_LAY_RESOLUTION`, asserted as the invariant it exists for rather than inferred
+    from a laid tiling. At the maximum variance the tightest window in a span lands *on* the
+    limit the step was capped by — and that limit is the band's end pulled in by one
+    millisecond, because `populate_windows` lays a window to the millisecond afterwards and a
+    window placed exactly on the floor could be laid a half-millisecond under it.
+
+    Both ends are checked, and separately: the floor is reached by a span whose windows must
+    shrink and the ceiling by one whose windows must grow, so a margin applied to only one of
+    the two branches is a failure rather than a silent asymmetry.
+    """
+    # A busy first ten seconds and silence after it, so the deviations are large enough that
+    # the *room* cap binds rather than the band-width one — which is what puts a window on the
+    # margin at all. A metronomic probe would leave every window near the span's mean and prove
+    # nothing about the edge.
+    probe = vocal_density(worded_song([index * 0.25 for index in range(40)]))
+    varied = _varied_durations(
+        list(durations), minimum=4.0, maximum=6.0, density=probe, variance=1.0
+    )
+    assert len(varied) == len(durations)
+    assert sum(varied) == pytest.approx(sum(durations), abs=1e-9)
+    assert min(varied) >= 4.0 + WINDOW_LAY_RESOLUTION - 1e-9
+    assert max(varied) <= 6.0 - WINDOW_LAY_RESOLUTION + 1e-9
+    reached = min(varied) if edge == "floor" else max(varied)
+    wanted = 4.0 + WINDOW_LAY_RESOLUTION if edge == "floor" else 6.0 - WINDOW_LAY_RESOLUTION
+    assert reached == pytest.approx(wanted, abs=1e-6), "the step did not spend the whole room"
+
+
+def test_variance_zero_does_not_even_measure_the_song():
+    """**Off means nothing was examined**, which is `SNAP_TOLERANCE_OFF`'s rule applied here: a
+    switched-off feature that still runs its measurement is not switched off, and the byte
+    identity at 0 would then rest on `x - 0.0 == x` rather than on the pass not happening."""
+    calls: list[tuple[float, float]] = []
+    probe = vocal_density(worded_song([index * 0.3 for index in range(40)]))
+
+    def counting(start: float, end: float) -> float:
+        calls.append((start, end))
+        return probe(start, end)
+
+    proposals = [(index * 5.0, 5.0) for index in range(12)]
+    populate_windows(proposals, 60.0, maximum=6.0, density=counting, variance=0.0)
+    assert calls == [], "variance 0 measured the song it was told not to look at"
+    populate_windows(proposals, 60.0, maximum=6.0, density=counting, variance=1.0)
+    assert len(calls) == 12
+
+
+def test_layout_variance_leaves_a_millisecond_so_the_rounding_cannot_break_the_band():
+    """The tiler lays a window to the millisecond, so the step stops a millisecond short of the
+    band's ends. Without that a window placed at exactly the floor could be *laid* half a
+    millisecond under it and earn a shot-length warning for a band the step had honoured."""
+    song = worded_song([index * 0.2 for index in range(150)])
+    density = vocal_density(song)
+    proposals = [(index * 5.0, 5.0) for index in range(12)]
+    windows = populate_windows(
+        proposals, 60.0, maximum=6.0, density=density, variance=1.0
+    )
+    assert min(duration for _, duration in windows) >= 4.0
+    assert max(duration for _, duration in windows) <= 6.0
+
+
+@pytest.mark.parametrize("variance", [-0.001, -1.0, 1.001, 2.0, float("nan"), float("inf")])
+def test_layout_variance_outside_its_range_is_refused_rather_than_clamped(variance):
+    """The parameter's whole guarantee is that the band holds; a value that had to be quietly
+    reinterpreted was a request nobody answered. Refused before the song length is even read."""
+    with pytest.raises(TimelineError) as error:
+        populate_windows([(0.0, 5.0)], 60.0, variance=variance)
+    assert "Layout variance is" in str(error.value)
+    assert "Nothing was laid out" in str(error.value)
+
+
+def test_layout_variance_constants_are_pinned():
+    """The default spends **all** the room the band leaves, and that is the whole of the
+    maximum — see `POPULATE_VARIANCE_DEFAULT` for the measurement that moved it there from an
+    earlier 0.5. Both are read by `app`'s request models as their field bounds, and the dial
+    exists to be turned down: 0 is the feature off and is pinned by the byte digests."""
+    assert POPULATE_VARIANCE_DEFAULT == 1.0
+    assert POPULATE_VARIANCE_MAX == 1.0
+    assert POPULATE_VARIANCE_DEFAULT == POPULATE_VARIANCE_MAX
 
 
 def test_proposal_for_position_maps_by_proportional_span():

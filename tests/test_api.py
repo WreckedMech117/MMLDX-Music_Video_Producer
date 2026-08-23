@@ -3972,20 +3972,32 @@ def test_populate_timeline_lays_out_the_whole_song_from_the_models_shape(tmp_pat
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["proposed"] == 12
-    assert body["created"] >= 10  # 60 s at <=6 s per window (the enforced speed ceiling)
+    # `ceil(60 / 6.8) = 9` is what the enforced speed ceiling alone forces; the proposal count
+    # sits above it, so 12 is what is actually laid. Both are asserted — the floor because it is
+    # the ceiling's own consequence (it read `>= 10` against a 6.0 cap until 2026-08-23), and the
+    # count because it is the number that did *not* move when the cap did.
+    assert body["created"] >= 9
+    assert body["created"] == 12
     saved = store.get(project.id)
     assert all(shot.id != "shot_old" for shot in saved.shots)
     cursor = 0.0
     for shot in sorted(saved.shots, key=lambda item: item.start):
         assert shot.start == pytest.approx(cursor, abs=1e-6)
         # POPULATE_MAX_WINDOW_SECONDS: the enforced speed ceiling, tighter than H3's 15 s
-        # legality. The measured cliff (corrected 2026-08-21, from mtimes over the 2026-08-19/20
-        # batch): flat at 2.6–2.9 s/frame out to 158 frames — 141 frames is a median 6.3 min —
-        # then ~8 s/frame at 226+, where 226 frames measured 30.2 min and 277 measured 39.1 min.
-        # The "2.2 hours" this comment used to cite had no primary record and was wrong by ~3.4x;
-        # the constant's own docstring carries the table and the three caveats (n=1 at the cliff,
-        # acceleration never enabled, mtimes rather than instrumentation).
-        assert 4.0 - 1e-9 <= shot.duration <= 6.0 + 1e-9
+        # legality. **6.0 until 2026-08-23, 6.8 since** (Director's ruling): per-frame sampling
+        # cost on `turbo-references2v` is flat out to 6.79 s — 175 frames at 0.977 s/frame,
+        # marginally *cheaper* than 158 frames at 1.025 — and then climbs +48% at 7.50 s, +184%
+        # at 8.21 s and +264% at 8.92 s. 6.8 is the top of the flat region rather than a round
+        # number; the constant's own docstring carries the curve and the three false rationales
+        # it replaced. The 4 s floor did not move.
+        #
+        # **The shot count here does not move with the ceiling and that is checked arithmetic,
+        # not luck.** `populate_windows` clamps the count to `[ceil(song/max), floor(song/min)]`
+        # and takes the proposal count inside it: 12 proposals against `[ceil(60/6.0)=10, 15]`
+        # and against `[ceil(60/6.8)=9, 15]` is 12 either way. What moved is the water-fill's
+        # clamp — the two windows the 30 s proposal pinned to the ceiling go 6.0 -> 6.8, and the
+        # ten that absorb the residual go 4.8 -> 4.64. Coverage is 0 -> 60 exactly on both.
+        assert 4.0 - 1e-9 <= shot.duration <= 6.8 + 1e-9
         assert shot.status == "draft"
         assert shot.prompt
         assert shot.seed > 0  # distinct seeds; a shared seed correlates NaN failures

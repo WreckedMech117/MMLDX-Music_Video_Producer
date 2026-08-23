@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 from itertools import pairwise
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from music_video_producer.app import (
     PROJECT_CHANGED_REFUSAL,
     create_app,
 )
+from music_video_producer.batch import window_band_note
 from music_video_producer.config import Settings
 from music_video_producer.models import (
     Asset,
@@ -45,9 +47,12 @@ from music_video_producer.models import (
 )
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import (
+    POPULATE_VARIANCE_DEFAULT,
+    POPULATE_VARIANCE_MAX,
     SNAP_CLEARANCE_SECONDS,
     SNAP_CONTIGUITY_TOLERANCE,
     SNAP_LOCKED_REFUSAL,
+    WINDOW_LAY_RESOLUTION,
     snap_cut_plan,
     vocal_gaps,
 )
@@ -67,6 +72,22 @@ SONG_DURATION = 154.644898
 #: Whisper's measured voice on the real track: an instrumental intro, a gap, and a long silent
 #: outro. The intro and outro are what make `fill_in_shots`' voiceless downgrade fire.
 VOCAL_SPANS = [[11.0, 87.72], [89.14, 99.2], [103.2, 120.1], [123.2, 134.56]]
+
+#: Where words were *heard*, for the Phase D variance driver — timings only, never a lyric.
+#:
+#: One "word" every 0.30 s to 0.75 s inside each measured vocal span, on a four-step cycle
+#: offset per span, so the onset rate rises and falls across every section the way a sung line
+#: does. Deterministic to the millisecond: the byte digests below are pinned through it.
+def lyric_word_times() -> list[tuple[str, float, float]]:
+    words: list[tuple[str, float, float]] = []
+    for index, (low, high) in enumerate(VOCAL_SPANS):
+        at, step = low, 0
+        while at + 0.2 <= high:
+            words.append(("la", round(at, 2), round(at + 0.2, 2)))
+            at += 0.30 + 0.15 * ((step + index) % 4)
+            step += 1
+    return words
+
 
 SECTIONS = [
     ("Intro", 0.0, 11.0, "Empty, moonlit warehouse."),
@@ -90,8 +111,16 @@ ASSETS = [
 ]
 
 
-def realistic_project(store: ProjectStore, *, sections: bool = True) -> str:
-    """The project every test here populates. Deterministic down to the ids."""
+def realistic_project(
+    store: ProjectStore, *, sections: bool = True, words: bool = False
+) -> str:
+    """The project every test here populates. Deterministic down to the ids.
+
+    `words` adds Whisper's word *times*, which is what Phase D's variance driver reads. Off by
+    default so every test written before it keeps the song it was written against — and because
+    a song with no word times is itself a case worth having: the driver is absent, so the layout
+    is the one this application laid before variance existed, whatever the parameter says.
+    """
     project = Project(
         id="project_threestep",
         name="Harder Faster",
@@ -105,6 +134,7 @@ def realistic_project(store: ProjectStore, *, sections: bool = True) -> str:
             duration=SONG_DURATION,
             lyrics="[Intro]\n\n[Verse]\nHarder faster\n",
             vocal_spans=VOCAL_SPANS,
+            lyric_words=lyric_word_times() if words else [],
         ),
         sections=(
             [
@@ -235,13 +265,21 @@ class NullComfy:
         self.uploads: list = []
 
 
-def make_client(tmp_path: Path, director=None, *, sections: bool = True):
+def make_client(
+    tmp_path: Path, director=None, *, sections: bool = True, words: bool = False
+):
     settings = Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy")
     store = ProjectStore(tmp_path)
     comfy = NullComfy()
     director = director or StepDirector()
     app = create_app(settings=settings, store=store, comfy=comfy, director=director)
-    return TestClient(app), store, comfy, director, realistic_project(store, sections=sections)
+    return (
+        TestClient(app),
+        store,
+        comfy,
+        director,
+        realistic_project(store, sections=sections, words=words),
+    )
 
 
 def plan_digest(project: dict) -> str:
@@ -310,14 +348,36 @@ def populate(client: TestClient, project_id: str, **body) -> dict:
 #: What these two now pin is that the pairing, the tiling and everything fill-in writes are
 #: deterministic for a given model reply — the property the split was built for — not that they
 #: agree with a populate that predates the fix.
+#:
+#: **Re-measured again on 2026-08-23** when the Director ruled `POPULATE_MAX_WINDOW_SECONDS` from
+#: 6.0 to 6.8. A wider band is a different tiling, so both had to move; the values they replace
+#: are kept beside them, as the pair above is:
+#:
+#:   marked   74af40ecc06c295923c4aef2517d9d22f1d2e5c1b4a0aee7584b7dd03194ede6
+#:   unmarked 4accf454c1424d4fbd6d3a77ba41aecf95cf66120af5e759990d8549d3ab914c
+#:
+#: **And the move is the ceiling's and nothing else's, checked rather than assumed.** Coverage is
+#: 0 → 154.640 on both, exactly what it was; the worst seam disagreement is 1 ms, inside
+#: `assembly.BOUNDARY_TOLERANCE_SECONDS` (20.8 ms); every window is ≥ 4.000 and ≤ 6.800;
+#: `batch.window_band_note` raises **0** warnings and `assembly.tiling_refusals` **0** refusals,
+#: both of which were 0 before. The count goes **29 → 27**, and only two spans lose a window,
+#: each because `ceil(span / ceiling)` — `populate_windows`' own lower clamp — drops by one:
+#:
+#:   Chorus 2  26.00 s  ceil(26.00/6.0)=5 → ceil(26.00/6.8)=4   4 windows of 6.500 s
+#:   Outro     30.54 s  ceil(30.54/6.0)=6 → ceil(30.54/6.8)=5   5 windows of 6.108 s
+#:
+#: The other five spans are bounded by their proposal count or by `floor(span/4)`, neither of
+#: which the ceiling touches, and they keep the counts they had. The band goes 4.134–6.000 to
+#: 4.000–6.800.
 CHAINED_DIGEST_SECTIONS_MARKED = (
-    "74af40ecc06c295923c4aef2517d9d22f1d2e5c1b4a0aee7584b7dd03194ede6"
+    "ad0f82d0f1e5a84dcb56207e92a4f121b658489329cbbd8cd7918b1c75f53bca"
 )
 CHAINED_DIGEST_NO_SECTIONS = (
-    "4accf454c1424d4fbd6d3a77ba41aecf95cf66120af5e759990d8549d3ab914c"
+    "0567041f3746e287411436730e314d9fa8209bf98a506846e6277a245767a434"
 )
 
 
+@pytest.mark.parametrize("words", [False, True], ids=["no-word-times", "word-timed"])
 @pytest.mark.parametrize(
     "marked,expected",
     [
@@ -326,7 +386,7 @@ CHAINED_DIGEST_NO_SECTIONS = (
     ],
 )
 def test_a_chained_populate_with_snapping_off_writes_what_the_single_route_wrote(
-    tmp_path: Path, marked: bool, expected: str
+    tmp_path: Path, marked: bool, expected: str, words: bool
 ):
     """**Determinism, to the byte.** Same shots, same windows, same citations, same prompts,
     same `singing`, same seeds, given the same model reply.
@@ -339,9 +399,18 @@ def test_a_chained_populate_with_snapping_off_writes_what_the_single_route_wrote
     and fill-in's content. **Re-measured 2026-08-22** when the per-section pairing changed which
     proposal a window takes — see the constants above for both values and for why the older
     pair is no longer the right claim.
+
+    **`variance=0` joined it on 2026-08-23, and the `word-timed` arm is what makes that a
+    claim.** Phase D reshapes a section's windows around how busy the singing is, so the neutral
+    arm has to be run against a song that *has* word times — otherwise "the digest did not move"
+    would only say the driver was missing. Both arms are here: with no word times the layout is
+    the old one whatever the parameter says, and with them it is the old one because the
+    parameter is 0. The default is pinned separately, and to a different digest.
     """
-    client, _store, comfy, _director, project_id = make_client(tmp_path, sections=marked)
-    body = populate(client, project_id, snap_tolerance=0)
+    client, _store, comfy, _director, project_id = make_client(
+        tmp_path, sections=marked, words=words
+    )
+    body = populate(client, project_id, snap_tolerance=0, variance=0)
 
     assert body["proposed"] == 34
     assert body["moved"] == 0 and body["skipped"] == 0, "tolerance 0 examined a cut"
@@ -438,8 +507,17 @@ def test_each_step_reports_without_writing_and_the_confirm_persists(tmp_path: Pa
     Lay-out's report asks the model and writes nothing; its confirm writes windows and only
     windows. Line-up never writes at all. Fill-in's report shows the content and writes
     nothing; its confirm lands it.
+
+    **`words=True` since 2026-08-23**, because the line-up half of this test asserts `moved > 0`
+    and needs a cut that can actually move. The word-timed arm is also the production path:
+    `vocal_gaps` has read `Song.lyric_words` since Phase B and the Director's song carries 262 of
+    them, where the `words=False` arm falls back to `merge_vocal_spans`' *display* view. On that
+    fallback the whole 154.6 s song offers five gaps, only one of them interior to a sung
+    stretch, and at the 6.8 s ceiling the single cut in reach of it is refused by the band — see
+    `test_a_chained_populate_moves_its_cuts_onto_phrase_boundaries` for the measurement. Nothing
+    else in this test depends on the arm.
     """
-    client, _store, comfy, _director, project_id = make_client(tmp_path)
+    client, _store, comfy, _director, project_id = make_client(tmp_path, words=True)
     # The revision is the proof, not the shot count: a report that saved an unchanged project
     # would leave no shots behind either, and would still have written.
     untouched = ProjectStore(tmp_path).get(project_id).updated_at
@@ -1090,19 +1168,23 @@ def test_line_up_keeps_the_layouts_own_window_ceiling(tmp_path: Path):
     """A step that nudges a cut may not undo the length decision of the step before it.
 
     Lay-out caps its windows at `POPULATE_MAX_WINDOW_SECONDS` on a measured render-cost
-    decision — a 5.2 s window is 141 frames at a median 6.3 min, where a 9.5 s one is 226+
-    frames at 30–39 min, per-frame cost tripling across that step (measured from output-file
-    mtimes over the 2026-08-19/20 batch; the "took hours" this docstring used to say came from
-    a claim of 2.2 hours that had no primary record and was wrong by ~3.4x — see the constant's
-    own docstring for the table and its caveats). So a move that
-    would push a window past 6 s is refused *there*, by the band, and named as such. A caller
-    lining up stored windows passes the wider 4–15 s band instead, which is
-    `snap_window_plan`'s own argument.
+    decision — per-frame sampling cost on `turbo-references2v` is flat out to 175 frames
+    (6.79 s) and then climbs +48%, +184% and +264% over the next three steps, so the ceiling is
+    the top of the flat region. See the constant's own docstring for the curve and for the three
+    earlier justifications it replaced. A move that would push a window past that ceiling is
+    refused *there*, by the band, and named as such. A caller lining up stored windows passes
+    the wider 4–15 s band instead, which is `snap_window_plan`'s own argument.
+
+    **6.0 is passed here as a literal and is deliberately not the constant.** What is under test
+    is that `line_up_shots` honours *whatever* band it is given, so the number has to be the
+    test's rather than the application's — and the geometry below is tuned to it. The constant
+    moved to 6.8 on 2026-08-23 and this test did not, which is the point: it would have to keep
+    passing at any ceiling.
     """
     project = measured_project()
     # The cut at 10.6 s sits inside the second sung phrase; the rest at 7.9–10.0 is in reach
-    # and would take it to 9.85 s — leaving the first window 9.85 s long, well over the
-    # layout's 6 s ceiling and comfortably inside H3's own 15 s one.
+    # and would take it to 9.85 s — leaving the first window 9.85 s long, well over the 6 s
+    # ceiling passed below and comfortably inside H3's own 15 s one.
     windows = ((0.0, 10.6), (10.6, 7.4), (18.0, 42.0))
     tight = app_module.line_up_shots(
         layout_of(project, windows), tolerance=0.75, minimum=4.0, maximum=6.0
@@ -1201,10 +1283,25 @@ def test_a_chained_populate_moves_its_cuts_onto_phrase_boundaries(tmp_path: Path
     the byte, and one at the default tolerance. Every boundary that differs is checked to sit
     at least `SNAP_CLEARANCE_SECONDS` inside a stretch the track is *measured* to leave
     voiceless — the property the feature exists for, rather than merely "some numbers moved".
+
+    **Run on the word-timed arm since 2026-08-23, and the reason is a measurement.** When
+    `POPULATE_MAX_WINDOW_SECONDS` moved 6.0 → 6.8 this test's `words=False` fixture stopped
+    offering any movable cut at all: on the merged *display* view of the voice there are five
+    gaps in 154.6 s, and of the 26 cuts a 6.8 s ceiling lays, exactly two come within the 0.75 s
+    tolerance of one — 89.635 s, whose move to 88.990 s would leave the next window **7.410 s**,
+    and 119.862 s, whose move to 120.250 s would leave the previous one **3.850 s**. Both are
+    refused by the band, correctly, so `moved` was 0 and the test could no longer see what it is
+    about. (At 6.0 it saw exactly one move, 87.466 → 87.870, so the arm was already threadbare.)
+    The word-timed arm is the path production takes — `vocal_gaps` reads `Song.lyric_words` and
+    the Director's song has 262 of them — and there 8 of 26 cuts move at 6.8, against 12 of 28 at
+    6.0. **Nothing in the claim below was relaxed**; every moved boundary is still required to
+    sit `SNAP_CLEARANCE_SECONDS` inside a measured voiceless stretch.
     """
-    still_client, _s, _c, _d, still_id = make_client(tmp_path / "still")
+    still_client, _s, _c, _d, still_id = make_client(tmp_path / "still", words=True)
     populate(still_client, still_id, snap_tolerance=0)
-    snapped_client, _store, comfy, _director, snapped_id = make_client(tmp_path / "snapped")
+    snapped_client, _store, comfy, _director, snapped_id = make_client(
+        tmp_path / "snapped", words=True
+    )
     body = populate(snapped_client, snapped_id)
 
     still = ProjectStore(tmp_path / "still").get(still_id)
@@ -1230,8 +1327,10 @@ def test_a_chained_populate_moves_its_cuts_onto_phrase_boundaries(tmp_path: Path
     for previous, current in pairwise(snapped.shots):
         assert abs(current.start - previous.end) <= SNAP_CONTIGUITY_TOLERANCE
     # Lay-out's window ceiling survives the step after it. Line-up nudges cuts; it is not the
-    # place a 5.2 s window becomes a 6.2 s one, and the measured render cost of that
-    # difference is the whole reason `POPULATE_MAX_WINDOW_SECONDS` exists.
+    # place a window grows past the cap lay-out laid it under, and the measured render cost past
+    # that cap is the whole reason `POPULATE_MAX_WINDOW_SECONDS` exists. Asserted against the
+    # constant rather than a literal, so it followed the 6.0 -> 6.8 ruling without an edit —
+    # and it is not vacuous at 6.8: five of the 27 windows here sit within 5 ms of the cap.
     assert max(shot.duration for shot in snapped.shots) <= POPULATE_MAX_WINDOW_SECONDS + 1e-9
     assert comfy.prompts == []
 
@@ -1244,8 +1343,14 @@ def test_the_chain_asks_for_no_second_confirmation_to_move_a_cut(tmp_path: Path)
     timeline's windows, and the windows being moved were created by the very call it consented
     to. There is no shot on the timeline for a protection to be about — `lay_out_protections`
     has already refused if there were.
+
+    **`words=True` since 2026-08-23**, for the reason given on
+    `test_a_chained_populate_moves_its_cuts_onto_phrase_boundaries`: at a 6.8 s ceiling the
+    merged-span arm offers no cut the band will let move, so `moved > 0` — the precondition this
+    test needs before it can say anything about confirmations — is only true on the word-timed
+    arm, which is the one production takes.
     """
-    client, _store, comfy, _director, project_id = make_client(tmp_path)
+    client, _store, comfy, _director, project_id = make_client(tmp_path, words=True)
     body = populate(client, project_id)
     assert body["moved"] > 0
     assert ProjectStore(tmp_path).get(project_id).shots, "the chain wrote nothing"
@@ -1896,10 +2001,18 @@ PAIRING_SECTIONS = [("Alpha", 0.0, 20.0), ("Beta", 20.0, 20.0), ("Gamma", 40.0, 
 #: Thirteen proposals, deliberately lopsided: six start inside Alpha, **one** inside Beta, six
 #: inside Gamma. `populate_required_shots(60)` is 12, so this is a plan lay-out accepts.
 #:
-#: The tiling then gives Alpha 5 windows, Beta 4 and Gamma 5 — 14 windows against 13 proposals —
-#: which is the shape that made the defect visible: Beta owns one proposal and four windows, and
-#: under the old global-proportion rule its four windows drew proposals 4, 5, 6 and 7 — two of
-#: Alpha's, its own, and one of Gamma's.
+#: The tiling then gives Alpha 5 windows, Beta **3** and Gamma 5 — 13 windows against 13
+#: proposals — which is the shape that made the defect visible: Beta owns one proposal and
+#: several windows, and under the old global-proportion rule its windows drew proposals written
+#: for Alpha and for Gamma as well as its own.
+#:
+#: **Beta held 4 windows until 2026-08-23**, when the Director raised
+#: `POPULATE_MAX_WINDOW_SECONDS` from 6.0 to 6.8. Beta is the one section whose count is set by
+#: the ceiling rather than by its proposals: it has a single proposal, so `populate_windows`
+#: takes the lower clamp `ceil(20 / ceiling)`, which goes 4 → 3, and its windows go 5.000 s to
+#: 6.667 s — inside the new band. Alpha and Gamma are pinned by `floor(20 / 4) = 5` against six
+#: proposals each and are untouched; their new lower clamp of 3 is below that and never binds.
+#: So the whole of the 14 → 13 move is Beta's, and it is the ceiling's arithmetic.
 PAIRING_PROPOSAL_STARTS = [
     ("Alpha", 0.0),
     ("Alpha", 3.0),
@@ -1983,22 +2096,28 @@ def test_a_window_only_ever_takes_a_proposal_written_for_its_own_section(tmp_pat
     P4 and P12 each used twice on adjacent shots, and four windows carrying prose written for a
     different section — including a Chorus 2 line in the **Bridge**.
 
-    Here Beta owns one proposal and four windows. Every one of its windows must carry Beta's
+    Here Beta owns one proposal and three windows. Every one of its windows must carry Beta's
     line; on the tree that ran the live pass they carried two of Alpha's, Beta's own, and one of
     Gamma's.
+
+    **The two counts below read 14 and 4 until 2026-08-23**, when `POPULATE_MAX_WINDOW_SECONDS`
+    moved 6.0 → 6.8 and Beta's window count — the one in this fixture set by the ceiling rather
+    than by proposals — went `ceil(20/6.0)=4` to `ceil(20/6.8)=3`. See `PAIRING_PROPOSAL_STARTS`
+    for the arithmetic. **The property being tested is unchanged and is still checked over every
+    window**: no shot anywhere carries a proposal written for another section.
     """
     client, _store, comfy, project_id = pairing_client(tmp_path)
     body = populate(client, project_id, snap_tolerance=0)
     shots = body["project"]["shots"]
 
-    assert len(shots) == 14
+    assert len(shots) == 13
     for shot in shots:
         assert shot["prompt"].startswith(section_of(shot["start"])), shot
 
     # And the counts, so "never borrows" is not the only thing checked: Beta's single proposal is
-    # reused across all four of its windows, which is the Director's ruling.
+    # reused across all of its windows, which is the Director's ruling.
     beta = [shot["prompt"] for shot in shots if section_of(shot["start"]) == "Beta"]
-    assert beta == ["Beta proposal 6"] * 4
+    assert beta == ["Beta proposal 6"] * 3
     assert comfy.prompts == []
 
 
@@ -2351,4 +2470,287 @@ def test_a_line_up_report_carries_the_content_half_and_not_the_manifest(tmp_path
         )
         assert response.status_code == 422, response.text
         assert ProjectStore(tmp_path).get(project_id).shots[0].prompt == ""
+    assert comfy.prompts == []
+
+
+# --------------------------------------------------------------------------------------------
+# Phase D — layout variance as a parameter.
+#
+# The Director's standing complaint: *"shot lengths all look the exact same."* Measured on their
+# real song, a freshly populated 30-shot plan had a standard deviation of 0.507 s with **five
+# identical 4.308 s windows in a row** through the Verse — the model writes one length per
+# section and repeats it, and the tiling had no reason to disagree.
+# --------------------------------------------------------------------------------------------
+
+#: The default variance over the word-timed song, both section arms. Different from the neutral
+#: digests by construction — a Phase D that reproduced them would have done nothing — and pinned
+#: for the same reason those are: the reshaping is arithmetic over one model reply, so it is
+#: deterministic, and a change to it is a change to the tiling contract.
+#:
+#: **Moved 2026-08-23** by the redistribution fix in `timeline._varied_durations`: one window
+#: sitting on the band end its density wanted to push it past used to freeze its whole span, and
+#: the wider 6.8 s ceiling made that fire in 6 of this fixture's 7 spans — so Phase D was laying
+#: a tiling byte-identical to the neutral one and the two assertions below were red. The values
+#: they replace are kept beside them, as the neutral pair above keeps theirs. Both were measured
+#: at the 6.0 s ceiling and neither survived the ceiling ruling:
+#:
+#:   marked   a2e805cfd29a0ede2c84d7640931c2f4c8ebf3d8a0aa430bc5326931afe24c06
+#:   unmarked 5b545807cf91c99a4b5729adcbd8e584a6b4e589cf4767b823c22928f64965f6
+#:
+#: **And the move is the redistribution's and nothing else's, checked rather than assumed**, on
+#: both arms and against the neutral figures they are pinned against:
+#:
+#:   coverage        0 → 154.640          unchanged
+#:   worst seam      0.0010 s             unchanged, inside `BOUNDARY_TOLERANCE_SECONDS` (20.8 ms)
+#:   band            4.000 – 6.800        unchanged, and the band's own ends
+#:   window warnings 0                    unchanged (`batch.window_band_note`)
+#:   tiling refusals 0                    unchanged (`assembly.tiling_refusals`)
+#:   shot count      27                   unchanged — no span's window count is a function of
+#:                                        the reshape, which only ever moves seconds between
+#:                                        windows that already exist
+#:
+#: What moves is the shape: within-section stdev 1.003 → **0.902**, and five of the seven spans
+#: reshape where none did. The two that do not are the honest last resort rather than the old
+#: veto — Verse 2's only above-mean window is already at 4.000 so nobody can give, and Chorus 2's
+#: only below-mean window is already at 6.800 so nobody can take. The spread *narrowing* is
+#: expected here and is the same point `test_the_default_variance_widens_a_layout_the_model_made
+#: _uniform` makes in its docstring: this fixture's proposals already cycle 4–8 s, so aligning
+#: the windows to the singing pulls some of them together.
+VARIED_DIGEST_SECTIONS_MARKED = (
+    "cbd98720b1d0f2f929d230ce76272cb2f5dd6c10ae12e5aca98c983ac32dc87f"
+)
+VARIED_DIGEST_NO_SECTIONS = (
+    "dd923601df5d0f5a36f9677de48a10707350a5eb450cdf6270482c7d69f6ea3d"
+)
+
+
+@pytest.mark.parametrize(
+    "marked,neutral,varied",
+    [
+        (True, CHAINED_DIGEST_SECTIONS_MARKED, VARIED_DIGEST_SECTIONS_MARKED),
+        (False, CHAINED_DIGEST_NO_SECTIONS, VARIED_DIGEST_NO_SECTIONS),
+    ],
+)
+def test_the_default_variance_reshapes_a_word_timed_song_and_stays_legal(
+    tmp_path: Path, marked: bool, neutral: str, varied: str
+):
+    """The feature does something, and everything the tiling promised still holds.
+
+    Contiguous, in band, zero shot-length warnings, and — the constraint Phase D must not
+    trample — **no shot straddles a section**: the reshaping happens inside each span, so the
+    boundary lay-out tiles per section to protect is still a boundary when it is done.
+    """
+    client, _store, comfy, _director, project_id = make_client(
+        tmp_path, sections=marked, words=True
+    )
+    body = populate(client, project_id, snap_tolerance=0)
+    shots = body["project"]["shots"]
+    digest = plan_digest(body["project"])
+    assert digest != neutral, "the default variance laid the same windows as the neutral value"
+    assert digest == varied
+    assert plan_digest(
+        ProjectStore(tmp_path).get(project_id).model_dump(mode="json")
+    ) == varied
+
+    lengths = [shot["duration"] for shot in shots]
+    assert len({round(length, 3) for length in lengths}) > len(lengths) // 2
+    cursor = 0.0
+    for shot in shots:
+        assert abs(shot["start"] - cursor) <= SNAP_CONTIGUITY_TOLERANCE
+        assert POPULATE_MAX_WINDOW_SECONDS >= shot["duration"] >= 4.0
+        assert window_band_note(Shot(**{k: shot[k] for k in ("start", "duration")})) == ("", "")
+        cursor = shot["start"] + shot["duration"]
+    # Never past the song — a window 0.1 ms over is a shot `song_audio_window` refuses whole —
+    # and short of it by at most the millisecond each span's last window is floored to, which is
+    # the tiling's own arithmetic and is what the neutral arm covers as well.
+    sections = body["project"]["sections"]
+    assert 0 <= SONG_DURATION - cursor <= len(sections) * 1e-3 + 1e-6
+
+    for section in body["project"]["sections"]:
+        edge = section["start"] + section["duration"]
+        for shot in shots:
+            straddles = shot["start"] < edge - SNAP_CONTIGUITY_TOLERANCE and (
+                shot["start"] + shot["duration"] > edge + SNAP_CONTIGUITY_TOLERANCE
+            )
+            assert not straddles, f"{shot} straddles the {section['label']} boundary"
+    assert comfy.prompts == []
+
+
+def test_the_default_variance_widens_a_layout_the_model_made_uniform(tmp_path: Path):
+    """The complaint, answered in the one number that states it — against the layout that
+    *produces* the complaint.
+
+    The model's measured habit is one length per section, repeated: the live 30-shot plan held
+    five identical 4.308 s windows through the Verse and three identical 5.986 s windows through
+    the Chorus. This double reproduces exactly that, and the spread grows with the parameter.
+
+    **Deliberately not a claim that variance always widens a spread.** It does not, and the
+    ordinary fixture is the counter-example: its proposals already run 4 s to 8 s, so aligning
+    the windows to the singing pulls some of them *together*. What the parameter does is make
+    length follow the music; a wider spread is what that produces when the music has more to say
+    than the model did, which is the case the Director complained about.
+    """
+    uniform = [
+        {
+            "start": round(index * 5.0, 3),
+            "duration": 5.0,
+            "prompt": f"Shot {index}: the performer against the dark.",
+            "performance": True,
+            "assets": [],
+        }
+        for index in range(30)
+    ]
+    spreads = {}
+    for variance in (0, 0.5, POPULATE_VARIANCE_DEFAULT):
+        client, _store, _comfy, _director, project_id = make_client(
+            tmp_path / f"v{variance}",
+            director=StepDirector(script=[(uniform, section_rows("u"))]),
+            words=True,
+        )
+        body = populate(client, project_id, snap_tolerance=0, variance=variance)
+        lengths = [shot["duration"] for shot in body["project"]["shots"]]
+        spreads[variance] = statistics.stdev(lengths)
+    # Monotone in the dial, and the default is the top of it — see `POPULATE_VARIANCE_DEFAULT`.
+    assert spreads[0] < spreads[0.5] < spreads[POPULATE_VARIANCE_DEFAULT]
+    assert POPULATE_VARIANCE_DEFAULT == POPULATE_VARIANCE_MAX
+
+
+@pytest.mark.parametrize("marked", [True, False])
+def test_a_song_nobody_transcribed_is_laid_out_the_same_at_every_variance(
+    tmp_path: Path, marked: bool
+):
+    """**The driver absent.** No word times means no density, and an unmeasured song is
+    unmeasured rather than uniformly busy — so the layout is the one this application laid
+    before Phase D existed, whatever the parameter says. The same digests the neutral arm
+    pins, reached with the default and with the maximum."""
+    expected = CHAINED_DIGEST_SECTIONS_MARKED if marked else CHAINED_DIGEST_NO_SECTIONS
+    for variance in (POPULATE_VARIANCE_DEFAULT, POPULATE_VARIANCE_MAX):
+        client, _store, _comfy, _director, project_id = make_client(
+            tmp_path / f"v{variance}", sections=marked, words=False
+        )
+        body = populate(client, project_id, snap_tolerance=0, variance=variance)
+        assert plan_digest(body["project"]) == expected
+
+
+def test_the_lay_out_report_names_the_variance_it_spent_and_the_digest_covers_it(
+    tmp_path: Path,
+):
+    """An input that shaped the windows has to be readable off the report, or the report cannot
+    be accounted for from itself — and it has to be inside `plan_fingerprint`, or a confirm
+    could claim a variance the Director never read."""
+    client, _store, _comfy, _director, project_id = make_client(tmp_path, words=True)
+    report = lay_out(client, project_id, variance=0.25)
+    assert report["variance"] == 0.25
+    assert report["project"] is None
+
+    tampered = json.loads(json.dumps(report))
+    tampered["variance"] = POPULATE_VARIANCE_MAX
+    response = client.post(
+        f"/api/projects/{project_id}/timeline/lay-out",
+        json={"confirm_replace": True, "plan": tampered},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == LAY_OUT_PLAN_MISMATCH
+    assert ProjectStore(tmp_path).get(project_id).shots == []
+
+    # And the untampered report still applies, carrying its own number through the confirm.
+    applied = client.post(
+        f"/api/projects/{project_id}/timeline/lay-out",
+        json={"confirm_replace": True, "plan": report},
+    ).json()
+    assert applied["variance"] == 0.25
+    assert [row["duration"] for row in applied["windows"]] == [
+        shot.duration for shot in ProjectStore(tmp_path).get(project_id).shots
+    ]
+
+
+def test_variance_reaches_a_layout_with_no_section_layer_at_all(tmp_path: Path):
+    """The **other** tiling branch, and the one no fixture reaches by accident.
+
+    `lay_out_shots` tiles per section when there is a section layer and tiles the whole song as
+    one span when there is not — and "there is not" needs both halves: the Director marked none
+    *and* the shots call volunteered none, because the step adopts whatever structure the model
+    hands it. Reached here by scripting the double to return no sections. The variance must be
+    spent on that branch too; a parameter honoured on one of two tilings is a parameter that
+    works until a model drops a field.
+    """
+    uniform = [
+        {
+            "start": round(index * 5.0, 3),
+            "duration": 5.0,
+            "prompt": f"Shot {index}: the performer against the dark.",
+            "performance": True,
+            "assets": [],
+        }
+        for index in range(30)
+    ]
+    lengths = {}
+    bodies = {}
+    for variance in (0, POPULATE_VARIANCE_DEFAULT):
+        client, _store, _comfy, _director, project_id = make_client(
+            tmp_path / f"v{variance}",
+            director=StepDirector(script=[(uniform, [])]),
+            sections=False,
+            words=True,
+        )
+        body = populate(client, project_id, snap_tolerance=0, variance=variance)
+        assert body["project"]["sections"] == [], "this arm needs an empty section layer"
+        bodies[variance] = body
+        lengths[variance] = [shot["duration"] for shot in body["project"]["shots"]]
+    varied = lengths[POPULATE_VARIANCE_DEFAULT]
+    # The neutral arm is uniform to within the millisecond the last window is floored by.
+    assert max(lengths[0]) - min(lengths[0]) <= 1e-3 + 1e-9
+    assert max(varied) - min(varied) > 0.5, "the global branch spent no variance"
+    assert 4.0 <= min(varied)
+    assert max(varied) <= POPULATE_MAX_WINDOW_SECONDS
+    # Total preserved — but asserted against the *tiling's* own precision, not tighter than it.
+    # `populate_windows` rounds each duration to the millisecond independently, so a 30-window
+    # span's durations can sum up to 15 ms either side of the span whatever the reshaper did:
+    # measured, the neutral arm overshoots the 154.644898 s song by 4 ms and the varied one by
+    # 6 ms. The reshaper's own zero-sum is exact to 3e-14 and is pinned on the function in
+    # `test_timeline.py`; what a *laid* tiling can promise is that the last window ends in the
+    # same place, which is the coverage claim and is asserted below.
+    assert sum(varied) == pytest.approx(
+        sum(lengths[0]), abs=len(varied) * WINDOW_LAY_RESOLUTION / 2
+    )
+    starts = {
+        variance: [shot["start"] for shot in body["project"]["shots"]]
+        for variance, body in bodies.items()
+    }
+    assert starts[0][0] == starts[POPULATE_VARIANCE_DEFAULT][0] == 0.0
+    assert (starts[0][-1] + lengths[0][-1]) == pytest.approx(
+        starts[POPULATE_VARIANCE_DEFAULT][-1] + varied[-1], abs=1e-9
+    ), "the variance moved where the song ends"
+
+
+def test_a_lay_out_report_round_trips_its_variance_back_into_the_intermediate(tmp_path: Path):
+    """`layout_from_report` is one of the four translations between a step's intermediate and
+    its wire form, and those are "the only place either shape is built" — so a field that
+    travels out has to travel back. Asserted on the function, because nothing downstream of
+    line-up reads it and a route test would pass with the field dropped."""
+    client, store, _comfy, _director, project_id = make_client(tmp_path, words=True)
+    report = lay_out(client, project_id, variance=0.25)
+    assert report["variance"] == 0.25
+    restored = app_module.layout_from_report(
+        store.get(project_id), app_module.LayOutResponse(**report)
+    )
+    assert restored.variance == 0.25
+    assert app_module.layout_report(restored).variance == 0.25
+
+
+@pytest.mark.parametrize("variance", [-0.1, 1.01, 5])
+@pytest.mark.parametrize("route", ["populate", "lay-out"])
+def test_a_variance_outside_its_range_is_refused_at_the_edge_not_clamped(
+    tmp_path: Path, route: str, variance: float
+):
+    """Both doors, and 422 rather than a quiet reinterpretation: the parameter's guarantee is
+    that H3's band holds, and a request that had to be rewritten to be answerable was a request
+    nobody answered. Nothing is written on either path."""
+    client, _store, comfy, _director, project_id = make_client(tmp_path, words=True)
+    response = client.post(
+        f"/api/projects/{project_id}/timeline/{route}",
+        json={"confirm_replace": True, "variance": variance},
+    )
+    assert response.status_code == 422, response.text
+    assert ProjectStore(tmp_path).get(project_id).shots == []
     assert comfy.prompts == []

@@ -144,6 +144,8 @@ from .timeline import (
     H3_MAX_SHOT_SECONDS,
     H3_MIN_SHOT_SECONDS,
     MIN_SINGING_VOCAL_SECONDS,
+    POPULATE_VARIANCE_DEFAULT,
+    POPULATE_VARIANCE_MAX,
     SNAP_TOLERANCE_DEFAULT,
     SNAP_TOLERANCE_MAX,
     SNAP_UNMEASURED,
@@ -177,6 +179,7 @@ from .timeline import (
     snap_cut_plan,
     snap_window_plan,
     song_section,
+    vocal_density,
 )
 from .transcription import merge_vocal_spans, transcribe_song_words
 from .vram import CliUnloader, LlmEjector
@@ -2494,57 +2497,54 @@ POPULATE_SHORT_PLAN_REFUSAL = (
 )
 
 #: See the populate route's window_mean comment: the creator's "fastest / safest" preset, and
-#: the flat end of a measured per-frame cost curve — 141 frames (~5.1 s) is a median 6.3 min,
-#: where 226 frames is 30 min. The table and its caveats are on `POPULATE_MAX_WINDOW_SECONDS`.
+#: comfortably inside the flat region of the measured per-frame cost curve, which runs flat out
+#: to 6.79 s and only then climbs. The curve is on `POPULATE_MAX_WINDOW_SECONDS`, and so is the
+#: history of the three earlier justifications it replaced. This target does not move with the
+#: ceiling: it is what the model is *steered* toward, where the ceiling is what is enforced.
 POPULATE_TARGET_WINDOW_SECONDS = 5.2
 
-#: The *enforced* ceiling the tiling repair applies, tighter than H3's 15 s legality, and it
-#: rests on two things — one measured, one observed.
+#: The *enforced* ceiling the tiling repair applies, tighter than H3's 15 s legality. It rests
+#: on a measured cost curve and on a Director ruling, and both are recorded here because every
+#: earlier justification for this constant turned out to be false.
 #:
-#: **The render-cost cliff (corrected 2026-08-21).** This comment used to assert that the
-#: 221-frame windows a 9.5 s mean produced "took 2.2 HOURS each on this card". That figure had
-#: **no primary record anywhere in this repository** — it appeared only here, and was quoted
-#: onward into `tests/test_api.py`, `tests/test_populate_steps.py` and `docs/DEVELOPMENT-LOG.md`
-#: as though those were corroboration. It is wrong by roughly 3.4x. What the serial overnight
-#: batch of 2026-08-19/20 actually shows, reconstructed from the mtimes of the `.mp4` files in
-#: ComfyUI's output tree:
+#: **The measured curve (2026-08-22).** `turbo-references2v`, sampling time only, one session,
+#: warm, render order decorrelated from frame count (Spearman rho 0.0). See
+#: `_bmad-output/planning-artifacts/h3-attention-backend-experiment.md` for the protocol.
 #:
-#: ===== ======== == ========= ==========
-#: frames window   n median    sec/frame
-#: ===== ======== == ========= ==========
-#: 107   <=3.3 s   7  4.6 min   2.58
-#: 124   ~4.5 s    4  5.4 min   2.61
-#: 141   ~5.1 s   14  6.3 min   2.68
-#: 158   ~5.8 s    5  7.6 min   2.89
-#: 226    8.75 s   1 30.2 min   8.02
-#: 277   10.38 s   1 39.1 min   8.47
-#: ===== ======== == ========= ==========
+#: ====== ======== ========= ==============
+#: frames window   s/frame   vs 6.08 s
+#: ====== ======== ========= ==============
+#: 158     6.083 s  1.025    —
+#: 175     6.792 s  0.977    marginally *cheaper*
+#: 192     7.500 s  1.448    +48%
+#: 209     8.208 s  2.775    +184%
+#: 226     8.917 s  3.558    +264%
+#: ====== ======== ========= ==============
 #:
-#: **A cliff is real; 2.2 hours is not.** Per-frame cost is flat at 2.6-2.9 s/frame out to 158
-#: frames and then triples to ~8 s/frame at 226+. The measured worst case is 39 minutes.
+#: **Per-frame cost is flat to ~6.79 s and then climbs steeply**, so 6.8 is the top of the free
+#: region rather than a round number. The mechanism is visible rather than inferred: median
+#: power falls 478 -> 227 W across that range while *max* power stays ~576 W, i.e. the card
+#: keeps full capability and spends progressively more time waiting on memory.
 #:
-#: Three caveats, and the bound is not re-derived until they are answered:
+#: **Three false rationales this replaces, kept so they are not re-derived.** (1) A claim that
+#: 221-frame windows "took 2.2 HOURS each" — it had **no primary record anywhere**, appearing
+#: only in this comment and quoted onward as though that were corroboration; measured worst case
+#: was 39 min. (2) "Acceleration is off, so the cliff is unmeasured" — backwards:
+#: `PathchSageAttentionKJ` at `"disabled"` is a passthrough, and ComfyUI runs
+#: `--use-sage-attention`, so SageAttention was on the whole time. (3) The whole original table
+#: came from the **20-step `default` bundle** while the batch and Render Again silently use
+#: different bundles; the curve above is the 8-step one.
 #:
-#: 1. **n=1 at both cliff points.** A single sample is exactly what produced the 2.2-hour claim.
-#: 2. **The acceleration is unmeasured.** Every H3 render this project has ever timed ran with
-#:    `PathchSageAttentionKJ` at `sage_attention: "disabled"` and `allow_compile: False`
-#:    (`workflows.py`, faithful to the Director's 2026-08-17 export). Attention is exactly the
-#:    term that explains a cliff — 158→226 frames is 1.43x, whose quadratic term predicts ~2.05x
-#:    where 3.0x was observed, which points at spilling rather than pure compute. A specified,
-#:    unrun experiment is at `_bmad-output/planning-artifacts/h3-attention-backend-experiment.md`.
-#: 3. **These came from file mtimes, not instrumentation.** They are gaps between consecutive
-#:    output files on a serial batch, so each includes whatever sat between two renders. One
-#:    141-frame outlier at 26.7 min and one 158 at 9.5 min sit outside the pattern and are most
-#:    likely machine contention; they are named rather than smoothed away. Renders now record
-#:    their own elapsed time (`RenderJob.render_seconds`), so the next table is measured.
+#: **Why a bound exists at all, which never depended on the timing.** Guidance alone failed: on
+#: the first 5.2 s-target run the local model simply echoed the previous plan's 9 s windows out
+#: of its own context. The bound is what the target *means*.
 #:
-#: **The second half of the rationale stands on its own and is why the constant did not move.**
-#: Guidance alone is not enough: on the first 5.2 s-target run the local model simply echoed the
-#: previous plan's 9 s windows out of its own context. The bound is what the target means; a
-#: Director who wants longer shots edits them deliberately, one at a time, in the timeline.
-#: What would settle the ceiling: n>=5 at 226 and 277 frames on the shipped graph, then the same
-#: on an accelerated one, timed by the instrumentation rather than by hand.
-POPULATE_MAX_WINDOW_SECONDS = 6.0
+#: **Why 6.8 rather than 6.0 (Director ruling, 2026-08-23).** At 6.0 the Chorus of the live song
+#: averaged 5.955 s — 45 ms under the cap — so the largest variance *any* legal tiling of that
+#: section could reach was 0.078, against 1.153 at a 6.8 cap. One section was pressed flat
+#: against the ceiling, and the headroom that frees it is free. The 4 s floor does **not** move:
+#: `over_render_frames` floors at 107 frames, so everything below ~3.27 s costs the same anyway.
+POPULATE_MAX_WINDOW_SECONDS = 6.8
 
 def populate_required_shots(duration: float) -> int:
     """How many shots a song of ``duration`` seconds needs — computed here, never asked.
@@ -2783,6 +2783,12 @@ class ShotLayout:
     #: The model's narration. Carried for the report only; nothing decides on it — the
     #: recorded failure mode here is a model that narrates fields it did not emit.
     message: str
+    #: How much of the room H3's band leaves this layout spent on length variance
+    #: (`timeline.POPULATE_VARIANCE_DEFAULT`). Carried because it is an *input* that shaped the
+    #: windows and a report that did not name it could not be reproduced from itself. Defaulted
+    #: to 0 — the neutral value — so a layout rebuilt from a report written before Phase D says
+    #: "no variance was spent" rather than claiming today's default was.
+    variance: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -2899,6 +2905,7 @@ async def lay_out_shots(
     director: Any,
     two_stage: bool,
     reread: Callable[[], Project],
+    variance: float = POPULATE_VARIANCE_DEFAULT,
 ) -> ShotLayout:
     """Step one — lay it out. The model call, the count enforcement, and the tiling.
 
@@ -2913,6 +2920,20 @@ async def lay_out_shots(
     `reread` is how this step re-reads the project after its own await — the store lives on
     the app's closure and this function does not — and the fresh project it returns rides out
     on `ShotLayout.project`, because that is the one being written to.
+
+    **`variance` is Phase D**, the Director's standing complaint that shot lengths all look the
+    same answered as a parameter rather than as a hoped-for property of the model's reply. It is
+    a *fraction of the room H3's band leaves*, spent by reshaping each section's windows around
+    how busy the singing is inside each of them — see `timeline.vocal_density` for the driver
+    and the three drivers rejected for it, and `timeline._varied_durations` for the arithmetic.
+    **0 is the feature off and a genuine no-op**, byte for byte the tiling this application laid
+    before Phase D, and it is the control arm the byte digests are pinned through. So is an
+    unmeasured song, on its own terms: no word times, no density, no variance, no guess.
+
+    The probe is built once from the **re-read** project — the song these windows are being
+    tiled against — and each section closes over its own start, because `populate_windows`
+    speaks the coordinates of the span it is tiling and the song's seconds are what the words
+    were heard at.
 
     Nothing here writes. `project.sections` is assigned on the re-read object and the caller
     decides whether that object is saved, which is what makes the report path of the `lay-out`
@@ -2931,15 +2952,15 @@ async def lay_out_shots(
     # The count comes from `POPULATE_TARGET_WINDOW_SECONDS`, the target window populate
     # steers the model toward and thereby the plan's typical shot length. NOT the
     # midpoint of H3's 4–15 s training range: the creator's own preset table calls
-    # 5.17 s (124 frames) "fastest / safest", and the overnight batch of 2026-08-19/20
-    # measured why — a median 5.4 min at 124 frames and 6.3 min at 141, against 30.2 min at
-    # 226 frames and 39.1 min at 277, where per-frame cost triples from ~2.6 s to ~8 s.
+    # 5.17 s (124 frames) "fastest / safest", and the instrumented curve of 2026-08-22
+    # measured why — per-frame sampling cost is flat out to 175 frames (6.79 s) and then
+    # climbs +48% at 192, +184% at 209 and +264% at 226.
     #
-    # **Corrected 2026-08-21.** This comment previously said those long windows "took 2.2
-    # HOURS each"; that claim had no primary record anywhere and is wrong by roughly 3.4x.
-    # The table above was reconstructed from output-file mtimes, is n=1 at both cliff
-    # points, and was measured with attention acceleration disabled. All three caveats, and
-    # what would settle the bound, are on `POPULATE_MAX_WINDOW_SECONDS`.
+    # **Twice corrected, and both corrections are kept on `POPULATE_MAX_WINDOW_SECONDS`.**
+    # This comment once said the long windows "took 2.2 HOURS each" — a claim with no primary
+    # record anywhere, wrong by roughly 3.4x (2026-08-21) — and the mtime table that replaced
+    # it was itself measured on the wrong workflow bundle (2026-08-22). The curve above is the
+    # sampling-time one, and the ceiling it supports is 6.8 s by the ruling of 2026-08-23.
     #
     # ~5 s cuts also edit better for music video than 9 s holds.
     required = populate_required_shots(duration)
@@ -3150,6 +3171,10 @@ async def lay_out_shots(
     # Unmarked stretches (before, between, after sections) tile as their own spans so
     # the plan still covers the whole song and assembly's gap refusal stays silent.
     # Without sections, the whole song tiles as one span, exactly as before.
+    # The density probe, built once over the whole song and handed to every span. `None` for a
+    # track that has never been transcribed, which is `populate_windows`' "lay it as you always
+    # did" and not a fabricated silence.
+    density = vocal_density(project.song)
     if project.sections:
         # `timeline.layout_spans` since 2026-08-22, character for character what stood here:
         # extracted so the fill-in step can cut the song into the *same* stretches instead of
@@ -3163,7 +3188,17 @@ async def lay_out_shots(
                 if span_start <= shot.start < span_start + span_length
             ]
             for start, length in populate_windows(
-                inside, span_length, maximum=POPULATE_MAX_WINDOW_SECONDS
+                inside,
+                span_length,
+                maximum=POPULATE_MAX_WINDOW_SECONDS,
+                # Span-local seconds in, song seconds out: the probe was built over the song and
+                # the tiler counts from this section's start.
+                density=(
+                    None
+                    if density is None
+                    else lambda low, high, at=span_start: density(at + low, at + high)
+                ),
+                variance=variance,
             ):
                 windows.append((round(span_start + start, 3), length))
     else:
@@ -3171,6 +3206,8 @@ async def lay_out_shots(
             [(shot.start, shot.duration) for shot in proposals],
             duration,
             maximum=POPULATE_MAX_WINDOW_SECONDS,
+            density=density,
+            variance=variance,
         )
     return ShotLayout(
         project=project,
@@ -3195,6 +3232,7 @@ async def lay_out_shots(
         sections=tuple(project.sections),
         sections_origin=sections_origin,
         message=(result.message if result else "") or "",
+        variance=variance,
     )
 
 
@@ -3261,10 +3299,19 @@ def line_up_shots(
     nothing to protect.
 
     **The band is the layout's own**, `POPULATE_MAX_WINDOW_SECONDS` at the top rather than
-    `H3_MAX_SHOT_SECONDS`: lay-out capped these windows at 6 s on a measured render-cost
-    decision, and a step whose whole job is to nudge a cut by less than a second must not be
-    the thing that undoes it. A caller lining up stored windows passes the wider band, for the
-    reason `snap_window_plan` gives.
+    `H3_MAX_SHOT_SECONDS`: lay-out capped these windows there on a measured render-cost
+    decision — 6.8 s since the Director's ruling of 2026-08-23, 6.0 before it — and a step whose
+    whole job is to nudge a cut by less than a second must not be the thing that undoes it. A
+    caller lining up stored windows passes the wider band, for the reason `snap_window_plan`
+    gives.
+
+    **The default is bound at import, so the number in the signature is the one this module was
+    loaded with.** That matters only to a harness that reassigns the constant to measure a
+    hypothetical ceiling: `lay_out_shots` reads the module global at call time and follows the
+    reassignment, this default does not, and a measurement that changed one without the other
+    would report a plan laid under one band and lined up under another. The routes take the
+    default and are right to — nothing at runtime reassigns the constant — but a measurement
+    harness that does must pass `maximum` explicitly.
 
     **Tolerance 0 is the feature off and is a genuine no-op** — the core answers `"off"`
     before it examines anything, every window comes back with the floats it went in with, and
@@ -4183,6 +4230,19 @@ class PopulateTimelineRequest(BaseModel):
     snap_tolerance: float = Field(
         default=SNAP_TOLERANCE_DEFAULT, ge=0, le=SNAP_TOLERANCE_MAX
     )
+    #: How much of the room H3's band leaves the lay-out step may spend making its windows
+    #: different lengths — Phase D, and the Director's standing complaint that "shot lengths all
+    #: look the exact same". A **fraction of what is available**, never a number of seconds: the
+    #: step is capped so that at 1.0 one window per section lands exactly on a band end, so 1.0
+    #: is all the variance the band allows rather than merely a lot of it.
+    #:
+    #: **0 is the feature switched off and is a genuine no-op** — the windows are the ones
+    #: `populate_windows` has always tiled, and that arm is what the byte digests are pinned
+    #: through. So is a song nobody has transcribed: no word times, no density, no variance.
+    #: See `timeline.POPULATE_VARIANCE_DEFAULT` for why the default is half.
+    variance: float = Field(
+        default=POPULATE_VARIANCE_DEFAULT, ge=0, le=POPULATE_VARIANCE_MAX
+    )
 
 
 class PopulateTimelineResponse(BaseModel):
@@ -4383,6 +4443,12 @@ class LayOutResponse(BaseModel):
     windows: list[LayOutWindowRow] = Field(default_factory=list)
     proposals: list[LayOutProposalRow] = Field(default_factory=list)
     sections: list[LayOutSectionRow] = Field(default_factory=list)
+    #: How much of the room H3's band leaves this layout spent on length variance — Phase D.
+    #: An *input* rather than a measurement, reported so the windows above can be accounted for
+    #: from the report alone, and inside `plan_fingerprint` so the confirm cannot claim a
+    #: different one than the Director read. 0 is the neutral value and is what a report written
+    #: before Phase D means.
+    variance: float = 0
     #: `"director"`, `"structure"`, `"shots"` or `""` — see `ShotLayout.sections_origin`.
     sections_origin: str = ""
     message: str = ""
@@ -4406,10 +4472,18 @@ class LayOutRequest(BaseModel):
     before asking for the shots. Off by default, and that default is the honest one — the
     split answers a measured single-call failure but has never been run against a live model
     from here, and `false` is byte-for-byte the old behaviour.
+
+    `variance` is `PopulateTimelineRequest`'s field in the same key and with the same bound —
+    how much of the room H3's band leaves the layout may spend making its windows different
+    lengths. 0 is the feature off and a genuine no-op; a value past
+    `timeline.POPULATE_VARIANCE_MAX` is **refused here, at the edge**, rather than clamped.
     """
 
     confirm_replace: bool = False
     two_stage: bool = False
+    variance: float = Field(
+        default=POPULATE_VARIANCE_DEFAULT, ge=0, le=POPULATE_VARIANCE_MAX
+    )
     plan: LayOutResponse | None = None
 
 
@@ -4649,6 +4723,7 @@ def layout_report(layout: ShotLayout) -> LayOutResponse:
             for section in layout.sections
         ],
         sections_origin=layout.sections_origin,
+        variance=layout.variance,
         message=(
             f"{len(layout.windows)} windows laid out from {len(layout.proposals)} "
             f"proposals across {layout.duration:.1f}s"
@@ -4746,6 +4821,7 @@ def layout_from_report(project: Project, plan: LayOutResponse) -> ShotLayout:
         ),
         sections_origin=plan.sections_origin,
         message=plan.message,
+        variance=plan.variance,
     )
 
 
@@ -10543,6 +10619,7 @@ def create_app(
             director=director,
             two_stage=request.two_stage,
             reread=lambda: get_project(project_id),
+            variance=request.variance,
         )
         response = layout_report(layout)
         # Minted over the *re-read* project — the one `lay_out_shots` returned and the one a
@@ -10920,6 +10997,7 @@ def create_app(
             director=director,
             two_stage=request.two_stage,
             reread=lambda: get_project(project_id),
+            variance=request.variance,
         )
         # Line it up — move each cut onto the nearest moment the track leaves voiceless, then
         # measure what each window now covers. **No second confirmation is asked for it**, and
