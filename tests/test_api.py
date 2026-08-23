@@ -8648,7 +8648,14 @@ def test_an_unknown_h3_profile_is_refused_before_any_submission(tmp_path: Path):
     client, store, comfy = make_client(tmp_path)
     project_id, shot_id = h3_reference_project(client, store, tmp_path)
 
-    for unknown in ("fast", "TURBO", "turbo ", "", None, 4):
+    # `None` left this list on 2026-08-23, when the field became `SamplingProfile | None` so that
+    # an omitted profile could mean "this project's standing choice". An explicit `null` and an
+    # absent key are the same instruction — "I am not naming one" — which is the reading
+    # `DeclinedIfNull` already gives the consent flags, and the alternative is a client that
+    # serialises its unset fields losing a whole submission over a key it did not mean to send.
+    # It resolves to the project's bundle, which for an untouched project is `default`; the test
+    # below pins that. Every *unknown* name is still refused before a payload exists.
+    for unknown in ("fast", "TURBO", "turbo ", "", 4):
         response = submit_h3(client, project_id, shot_id, profile=unknown)
         assert response.status_code == 422, (unknown, response.text)
         # A *list* detail is FastAPI's request-validation shape; the builder's own refusal
@@ -8716,13 +8723,28 @@ def test_the_route_offers_every_profile_the_builder_defines(tmp_path: Path):
     render — the story's whole point — and a name offered here that the builder does not
     know would be a 500 on submission instead of a 422 on validation.
     """
-    from music_video_producer.app import H3Request
+    from music_video_producer.app import GenerateBatchRequest, H3Request
+    from music_video_producer.models import Project, SamplingProfile
     from music_video_producer.workflows import H3_DEFAULT_PROFILE, H3_REFERENCE_PROFILES
 
-    offered = set(get_args(H3Request.model_fields["profile"].annotation))
+    # `SamplingProfile | None` since 2026-08-23, so the members are unwrapped through the union
+    # the way `aspect_ratio`'s already are. Three annotations, one source: the two request models
+    # and the manifest field all name `models.SamplingProfile`, so a bundle can no longer be
+    # offered per render and refused per project, or the reverse.
+    def offered(annotation) -> set[str]:
+        return {value for arg in get_args(annotation) for value in get_args(arg)}
 
-    assert offered == set(H3_REFERENCE_PROFILES)
-    assert H3Request().profile == H3_DEFAULT_PROFILE
+    assert offered(H3Request.model_fields["profile"].annotation) == set(H3_REFERENCE_PROFILES)
+    assert offered(GenerateBatchRequest.model_fields["profile"].annotation) == set(
+        H3_REFERENCE_PROFILES
+    )
+    assert set(get_args(SamplingProfile)) == set(H3_REFERENCE_PROFILES)
+    # An omitted profile is `None` — *inherit* — on both request models, and is distinguishable
+    # from a Director who named the 20-step bundle for one submission. The value it inherits is
+    # what a project carries when nobody has chosen: today's behaviour, unchanged.
+    assert H3Request().profile is None
+    assert GenerateBatchRequest().profile is None
+    assert Project(name="Untouched").sampling_profile == H3_DEFAULT_PROFILE
     assert H3Request().steps is None
 
 
@@ -8774,6 +8796,231 @@ def test_a_profile_on_a_text_only_shot_is_refused_rather_than_ignored(tmp_path: 
     reference_id = reference_shot(store, project.id, asset_ids=[lead["id"]])
     assert submit_h3(client, project.id, reference_id, profile="turbo").status_code == 202
     assert "mvp:lora" in comfy.prompts[-1]
+
+
+# --- The project's sampling bundle: one setting, both render paths ----------------------------
+#
+# The defect these close, stated once: `api.generateBatch` sent no profile and fell through to
+# `"default"` (20 steps), while `app.js`'s "Render Again" hardcoded `"turbo"` (4 steps). The same
+# project rendered two different graphs depending on which button was pressed, and nothing told
+# the Director either number. `Project.sampling_profile` is now the one place that is decided,
+# `PUT .../sampling-profile` is its one writer, and both paths resolve it through the same call.
+
+
+def set_bundle(client, project_id: str, profile):
+    return client.put(f"/api/projects/{project_id}/sampling-profile", json={"profile": profile})
+
+
+def bundle_of_payload(payload: dict) -> tuple:
+    """The four values a sampling bundle actually decides, off the submitted graph.
+
+    Read from the payload rather than from the request, because "the setting reached both paths"
+    is a claim about what ComfyUI received. A profile that reached the builder and was dropped, or
+    honoured on one route and not the other, would satisfy anything weaker.
+    """
+    return (
+        payload["mvp:scheduler"]["inputs"]["steps"],
+        payload["mvp:scheduler"]["inputs"]["scheduler"],
+        payload["mvp:sampler"]["inputs"]["sampler_name"],
+        payload.get("mvp:lora", {}).get("inputs", {}).get("lora_name"),
+    )
+
+
+def test_the_projects_bundle_reaches_both_render_paths_and_they_agree(tmp_path: Path):
+    """One setting, the single-shot route and the batch route, and the same graph out of both.
+
+    The two paths are exercised through their real routes rather than through the resolver,
+    because the resolver agreeing with itself proves nothing: the whole defect was two *call
+    sites* disagreeing about what an omitted profile meant. Neither request names a bundle here —
+    that is the point — and the payloads are compared to each other as well as to the table, so a
+    future change that moved one path and not the other fails even if both stay valid graphs.
+    """
+    from music_video_producer.workflows import H3_REFERENCE_PROFILES
+
+    client, store, comfy = make_client(tmp_path)
+    project_id, shot_id = h3_reference_project(client, store, tmp_path)
+    chosen = H3_REFERENCE_PROFILES["turbo-references2v"]
+
+    assert set_bundle(client, project_id, "turbo-references2v").status_code == 200
+    assert store.get(project_id).sampling_profile == "turbo-references2v"
+
+    # Path one: the per-shot re-render, which is what `app.js` now sends — no profile at all.
+    assert submit_h3(client, project_id, shot_id).status_code == 202
+    single = comfy.prompts[-1]
+
+    # Path two: the batch, also with no profile, exactly as both `generateBatch` call sites send.
+    rearm_shot(store, project_id, shot_id)
+    batch = client.post(
+        f"/api/projects/{project_id}/generate/batch", json={"confirm_gpu": True}
+    )
+    assert batch.status_code == 202, batch.text
+    assert len(batch.json()["submitted"]) == 1
+
+    assert bundle_of_payload(single) == bundle_of_payload(comfy.prompts[-1])
+    assert bundle_of_payload(single) == (
+        chosen.steps, chosen.scheduler, chosen.sampler, chosen.lora
+    )
+    assert single["mvp:scheduler"]["inputs"]["steps"] == 8
+    assert single["mvp:lora"]["inputs"]["strength_model"] == chosen.lora_strength
+
+
+def test_an_untouched_project_submits_the_byte_identical_default_payload(tmp_path: Path):
+    """The acceptance criterion: a Director who touches nothing renders exactly as before.
+
+    Digested rather than asserted field by field, and against the digest this repository has
+    carried since `f281606`, because the change reaches the branch that decides what every render
+    *is*: the profile a request omits is now resolved from the manifest instead of from a
+    `Literal`'s default. Every behavioural assertion in this file would still pass if that
+    resolution had quietly moved a step count, a sampler or a LoRA. A digest cannot.
+
+    Both shapes, because the resolution runs on the reference branch and the text-only branch has
+    to be provably untouched by it — an inherited bundle must not reach a graph that has no
+    evidence for one.
+    """
+    client, _, comfy = digest_project(tmp_path)
+
+    for shot_id in (DIGEST_SHOT_REFERENCE, DIGEST_SHOT_TEXT):
+        assert submit_h3(client, DIGEST_PROJECT_ID, shot_id).status_code == 202
+
+    assert payload_digest(comfy.prompts[0], tmp_path) == H3_REFERENCE_PAYLOAD_DIGEST
+    assert payload_digest(comfy.prompts[1], tmp_path) == H3_TEXT_PAYLOAD_DIGEST
+
+
+def test_a_manifest_written_before_the_bundle_existed_loads_and_renders_unchanged(
+    tmp_path: Path,
+):
+    """The key removed from the file on disk, which is what every existing project has.
+
+    Two halves, and the second is the one that matters. The field defaulting to `"default"` is
+    easy; what the digest proves is that a project whose manifest has never heard of a sampling
+    bundle submits the **same bytes** it submitted before the field was added. A defaulted field
+    that changed a payload would be a silent re-render of every shot in the Director's library on
+    their next click.
+    """
+    client, store, comfy = digest_project(tmp_path)
+    manifest = store.manifest_path(DIGEST_PROJECT_ID)
+    stored = json.loads(manifest.read_text(encoding="utf-8"))
+    assert stored.pop("sampling_profile") == "default"
+    assert "sampling_profile" not in stored
+    manifest.write_text(json.dumps(stored), encoding="utf-8")
+
+    assert store.get(DIGEST_PROJECT_ID).sampling_profile == "default"
+    assert submit_h3(client, DIGEST_PROJECT_ID, DIGEST_SHOT_REFERENCE).status_code == 202
+    assert payload_digest(comfy.prompts[0], tmp_path) == H3_REFERENCE_PAYLOAD_DIGEST
+
+
+def test_an_unknown_bundle_is_refused_rather_than_silently_defaulting(tmp_path: Path):
+    """422 from validation on every door, and the stored choice untouched by the attempt.
+
+    "Untouched" is the assertion that matters. A route that answered 422 *after* writing, or that
+    fell back to `"default"` on an unrecognised name, would turn a typo in a hand-rolled call into
+    a silent bundle change — and a bundle change is hours of GPU spent on a graph nobody selected.
+    The empty body is here for its own reason: `profile` is required, so an omission is a refusal
+    rather than a reset to 20 steps.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id, _ = h3_reference_project(client, store, tmp_path)
+    assert set_bundle(client, project_id, "turbo").status_code == 200
+
+    for unknown in ("fast", "TURBO", "turbo ", "", None, 8, "turbo-references2v ", "Default"):
+        response = set_bundle(client, project_id, unknown)
+        assert response.status_code == 422, (unknown, response.text)
+        # A *list* detail is FastAPI's request-validation shape; a route's own refusal arrives as
+        # a string. Asserting the list pins "refused before anything was written".
+        assert isinstance(response.json()["detail"], list), (unknown, response.text)
+        assert store.get(project_id).sampling_profile == "turbo"
+
+    assert client.put(f"/api/projects/{project_id}/sampling-profile", json={}).status_code == 422
+    assert store.get(project_id).sampling_profile == "turbo"
+
+
+def test_the_generic_project_put_can_neither_clear_nor_forge_the_bundle(tmp_path: Path):
+    """The hole this route has now been ten times, closed by adoption rather than by trust.
+
+    Two bodies, both of which a real client sends, and they fail in opposite directions. The first
+    omits the key, which is what every client written before the field existed does and what any
+    hand-rolled API call does: Pydantic fills `"default"`, and one ordinary save would otherwise
+    put a turbo project silently back on 20 steps — the Director's choice of look undone by a
+    rename. The second *invents* one, which is what a browser tab left open across a bundle change
+    reasserts on its next ordinary save, and would spend the next batch on a graph nobody selected.
+
+    A forged value that is not even a real bundle is refused outright at validation, which is a
+    third door and is asserted last.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id, _ = h3_reference_project(client, store, tmp_path)
+    assert set_bundle(client, project_id, "turbo-references2v").status_code == 200
+
+    body = json.loads(store.get(project_id).model_dump_json())
+    body.pop("sampling_profile", None)
+    body["name"] = "Renamed by an ordinary save"
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    saved = store.get(project_id)
+    assert saved.name == "Renamed by an ordinary save"
+    assert saved.sampling_profile == "turbo-references2v"
+
+    body = json.loads(saved.model_dump_json())
+    body["sampling_profile"] = "default"
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    assert store.get(project_id).sampling_profile == "turbo-references2v"
+
+    body = json.loads(store.get(project_id).model_dump_json())
+    body["sampling_profile"] = "fast"
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 422
+    assert store.get(project_id).sampling_profile == "turbo-references2v"
+
+
+def test_an_inherited_bundle_renders_a_keyframe_or_text_shot_while_a_named_one_is_refused(
+    tmp_path: Path,
+):
+    """The scope, and the difference between naming a bundle and inheriting one.
+
+    A bundle names a *reference*-graph configuration. The keyframe and text-only graphs load other
+    checkpoints and have no evidenced bundle, so a profile the Director *names* on one of them is
+    refused — that refusal is unchanged and is what stops a GPU job being logged under a
+    configuration that was never applied.
+
+    An inherited project-wide setting is a different request, and refusing it would be worse than
+    the silence it prevents: choosing turbo would quietly drop every keyframe and text-only shot
+    out of Generate All, one skip line at a time, for a bundle those graphs were never asked to
+    use. So they render their own way, and the control in the browser says so. Asserted through
+    the batch as well as the single route, because the batch is where the whole-plan consequence
+    would land.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, reference = h3_reference_project(client, store, tmp_path)
+    # Appended after the reference shot, because `reference_shot` replaces the whole list.
+    project = store.get(project_id)
+    text = Shot(start=6, duration=5, prompt="A singer", mode="text", status="ready")
+    project.shots = [*project.shots, text]
+    store.save(project)
+    text_shot = text.id
+    assert set_bundle(client, project_id, "turbo").status_code == 200
+
+    # Named on a text-only shot: still refused, in the same words, with nothing queued.
+    refusal = submit_h3(client, project_id, text_shot, profile="turbo")
+    assert refusal.status_code == 422
+    assert "reference shots only" in refusal.json()["detail"]
+    assert comfy.prompts == []
+
+    # Inherited: the batch submits both, and each renders on the graph it has evidence for.
+    report = client.post(
+        f"/api/projects/{project_id}/generate/batch", json={"confirm_gpu": True}
+    )
+    assert report.status_code == 202, report.text
+    assert report.json()["skipped"] == []
+    assert {entry["shot_id"] for entry in report.json()["submitted"]} == {text_shot, reference}
+
+    by_shot = {
+        ("2343" in payload): payload for payload in comfy.prompts
+    }
+    text_payload, reference_payload = by_shot[True], by_shot[False]
+    # The text-only graph keeps its own 20 and grows no LoRA node, whatever the project is set to.
+    assert text_payload["2346"]["inputs"]["steps"] == 20
+    assert all(node["class_type"] != "LoraLoaderModelOnly" for node in text_payload.values())
+    # The reference graph took the project's bundle.
+    assert reference_payload["mvp:scheduler"]["inputs"]["steps"] == 4
+    assert reference_payload["mvp:lora"]["inputs"]["strength_model"] == 0.7
 
 
 # --- LTX 2.5 enhancement -----------------------------------------------------------------
@@ -13282,6 +13529,125 @@ def test_the_take_route_resolves_the_manifest_and_stays_inside_the_output_root(t
     assert response.status_code == 404
     assert "secret.txt" in response.json()["detail"]
     assert "not a take" not in response.text
+
+
+# ---------------------------------------------------------------------------------------------
+# Serving an asset's picture (2026-08-23).
+#
+# The Assets grid pointed every generated thumbnail at ComfyUI's `/view`, so the whole library
+# went blank whenever ComfyUI was down — routine, and down for reasons that have nothing to do
+# with browsing a library. `read_shot_take` above is the precedent for the fix: ids in the URL,
+# the path read from the manifest, and one containment check against the root that `source`
+# allows.
+# ---------------------------------------------------------------------------------------------
+
+
+def get_asset_file(client, project_id: str, asset_id: str, **kwargs):
+    """One asset's bytes. Ids only — the URL carries no path, `get_take`'s own design."""
+    return client.get(f"/api/projects/{project_id}/assets/{asset_id}/file", **kwargs)
+
+
+def project_with_two_asset_files(store, tmp_path: Path) -> tuple[str, bytes, bytes]:
+    """A project holding both asset shapes with real bytes behind each.
+
+    The two `source` values resolve against *different* roots — an upload against the project's
+    own media directory, anything generated against ComfyUI's output directory — so a test that
+    covered only one would not have exercised the fork at all.
+    """
+    project = store.create(Project(name="Library"))
+    project.assets = [
+        Asset(id="asset_up", name="Uploaded", kind="character", path="media/assets/000-up.png"),
+        Asset(
+            id="asset_gen",
+            name="Generated",
+            kind="setting",
+            source="flux-image-gen",
+            path=f"music-video-producer/{project.id}/assets/asset_gen_00001_.png",
+        ),
+        Asset(id="asset_pending", name="Pending", kind="prop", source="flux-image-gen", path=""),
+    ]
+    store.save(project)
+
+    uploaded = b"\x89PNG\r\n\x1a\n" + bytes(range(200))
+    generated = b"\x89PNG\r\n\x1a\n" + bytes(reversed(range(200)))
+    up_target = store.project_dir(project.id) / "media" / "assets" / "000-up.png"
+    up_target.parent.mkdir(parents=True, exist_ok=True)
+    up_target.write_bytes(uploaded)
+    gen_target = tmp_path / "comfy" / "output" / "music-video-producer" / project.id / "assets" / "asset_gen_00001_.png"
+    gen_target.parent.mkdir(parents=True, exist_ok=True)
+    gen_target.write_bytes(generated)
+    return project.id, uploaded, generated
+
+
+def test_an_assets_picture_is_served_by_this_application_without_asking_comfyui(tmp_path: Path):
+    """The library must stay readable while ComfyUI is down, which is its ordinary state.
+
+    Both roots, on the wire, byte for byte — an upload out of the project's media directory and
+    a generated picture out of ComfyUI's *output directory on this same disk*. `comfy.prompts`
+    and the stub's reachability are untouched: this route reads a file and speaks to nothing.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id, uploaded, generated = project_with_two_asset_files(store, tmp_path)
+
+    up = get_asset_file(client, project_id, "asset_up")
+    assert up.status_code == 200, up.text
+    assert up.content == uploaded
+    assert up.headers["content-type"] == "image/png"
+
+    gen = get_asset_file(client, project_id, "asset_gen")
+    assert gen.status_code == 200, gen.text
+    assert gen.content == generated
+
+    # Nothing was submitted, and nothing about the project moved: looking at a picture is not
+    # an edit and is certainly not a render.
+    assert comfy.prompts == []
+    assert [asset.path for asset in ProjectStore(tmp_path).get(project_id).assets] == [
+        "media/assets/000-up.png",
+        f"music-video-producer/{project_id}/assets/asset_gen_00001_.png",
+        "",
+    ]
+
+
+def test_the_asset_file_route_404s_by_name_rather_than_inventing_a_placeholder(tmp_path: Path):
+    """Three misses, each an honest 404.
+
+    An asset with no output yet is *not* special-cased into a placeholder: the browser already
+    decides not to ask when `path` is empty, and a second quieter answer here would be a route
+    disagreeing with the grid about what "no picture yet" looks like.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project_id, _, _ = project_with_two_asset_files(store, tmp_path)
+
+    pending = get_asset_file(client, project_id, "asset_pending")
+    assert pending.status_code == 404
+    assert "Pending" in pending.json()["detail"]
+
+    assert get_asset_file(client, project_id, "asset_absent").status_code == 404
+    assert get_asset_file(client, "proj_absent", "asset_up").status_code == 404
+
+
+def test_the_asset_file_route_stays_inside_the_root_its_source_allows(tmp_path: Path):
+    """`read_shot_take`'s confinement argument, for the other serve-by-ids route.
+
+    The URL cannot carry a path, so the one injection surface left is `Asset.path` — writable
+    through the generic full-project `PUT`. A value that walks out of the root must resolve to
+    the same 404 as a missing file, not to the file it walked to. Both roots, because the fork
+    picks a different one per `source` and a check on only one half is not a check.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project_id, _, _ = project_with_two_asset_files(store, tmp_path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not a picture", encoding="utf-8")
+
+    stored = store.get(project_id)
+    stored.assets[0].path = "../../../secret.txt"
+    stored.assets[1].path = "../../../../secret.txt"
+    store.save(stored)
+
+    for asset_id in ("asset_up", "asset_gen"):
+        response = get_asset_file(client, project_id, asset_id)
+        assert response.status_code == 404, (asset_id, response.text)
+        assert "not a picture" not in response.text
 
 
 def test_approving_writes_the_watched_take_and_the_status_together_from_the_manifest(
@@ -19563,6 +19929,103 @@ def test_a_rename_cannot_break_a_citation_and_does_not_rewrite_prose(tmp_path: P
     assert body["prompts"] == 1
     assert "still spell HarderFaster · multiview" in body["message"]
     assert "no shot lost its reference" in body["message"]
+    assert comfy.prompts == []
+
+
+def test_a_rename_says_that_it_did_not_reach_the_children_derived_from_the_asset(
+    tmp_path: Path,
+):
+    """The consequence the response enumerated three of and missed the fourth.
+
+    `generate_multiview` composes the child's name once, at the moment it mints it, and stores
+    the string — so renaming the parent leaves the child spelling the old name. The measured
+    prose leak was a *child*, and the Director's fix worked only because they renamed the child
+    directly; the same gesture on the parent would have looked like it worked and not have.
+
+    Reported rather than propagated: a child's name is editorial the moment it exists, this
+    route treats a display name as the Director's to set, and edits chain — so a propagating
+    rename would walk an unbounded tree overwriting names somebody may have chosen. The count
+    is what makes "rename the child too" an instruction rather than a guess.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+
+    body = rename_asset(client, project.id, "asset_source", "Lucy").json()
+
+    # The child is untouched on disk, which is the behaviour — the sentence is the fix.
+    saved = store.get(project.id)
+    assert [asset.name for asset in saved.assets] == ["Lucy", "HarderFaster · multiview"]
+    assert body["children"] == 1 and body["children_stale"] == 1
+    assert "1 derived asset(s) keep their own names" in body["message"]
+    assert "1 still spell HarderFaster." in body["message"]
+    assert "rename each child on this same route" in body["message"]
+
+    # Renaming the child itself has nothing below it, so the sentence is absent rather than
+    # printed with a zero — a rename of a leaf must not read like it left work behind.
+    child = rename_asset(client, project.id, "asset_sheet", "Lucy sheet").json()
+    assert child["children"] == 0 and child["children_stale"] == 0
+    assert "derived asset(s)" not in child["message"]
+    assert comfy.prompts == []
+
+
+def test_a_rename_under_the_scan_floor_says_the_prose_fallback_stopped_matching(
+    tmp_path: Path,
+):
+    """`NAME_SCAN_MIN_LENGTH` is a silent cliff a rename can walk a name over.
+
+    `assets_for_proposal` cites what a shot declared (by id or exact name, exact at any length)
+    and then, as a fallback, whether the shot's prose contains the display name. That fallback
+    is a plain substring test, so it is fenced below four characters. Renaming to `Ora` ends the
+    prose half for this picture and nothing breaks — citations resolve by id — which is exactly
+    why nobody would notice.
+    """
+    from music_video_producer.models import NAME_SCAN_MIN_LENGTH
+
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+
+    body = rename_asset(client, project.id, "asset_source", "Ora").json()
+
+    assert body["scannable"] is False
+    assert body["prose_matches"] == 0
+    assert f"under the {NAME_SCAN_MIN_LENGTH}-character floor" in body["message"]
+    assert "Ora is 3 character(s)" in body["message"]
+    # The half that must be said in the same breath, or the sentence reads as a broken rename.
+    assert "match by id or exact name, at any length" in body["message"]
+
+    # A name at the floor says nothing at all: the ordinary case is silent.
+    quiet = rename_asset(client, project.id, "asset_source", "Orav").json()
+    assert quiet["scannable"] is True
+    assert "character floor" not in quiet["message"]
+    assert comfy.prompts == []
+
+
+def test_a_rename_onto_an_ordinary_word_counts_the_prose_it_would_start_matching(
+    tmp_path: Path,
+):
+    """The other direction over the same fence, and the one with no floor to catch it.
+
+    `Rain` is four characters, so the scan trusts it — and it is inside "grain" and "training".
+    Counted against this plan's own prose rather than a dictionary: evidence from the material
+    at hand. Shots that already cite the asset are excluded, because those cite it *declared*
+    and the prose fallback never runs for them.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = leaky_project(store)
+
+    # `shot_clean` reads "A wide shot of the empty floor." and cites nothing.
+    body = rename_asset(client, project.id, "asset_source", "Wide").json()
+    assert body["scannable"] is True
+    assert body["prose_matches"] == 1
+    assert "1 shot prompt(s) in this plan already contain Wide" in body["message"]
+    assert "plain substring test" in body["message"]
+
+    # `shot_leak` reads "... into the polished metal stand." *and* cites the sheet, so a sheet
+    # renamed to `Stand` over-matches nothing: the declared citation already owns that shot.
+    quiet = rename_asset(client, project.id, "asset_sheet", "Stand").json()
+    assert quiet["scannable"] is True
+    assert quiet["prose_matches"] == 0
+    assert "already contain" not in quiet["message"]
     assert comfy.prompts == []
 
 

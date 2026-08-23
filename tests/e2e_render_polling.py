@@ -33,10 +33,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
 from e2e_support import (
@@ -56,8 +59,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 NAME = "render-polling"
 
-#: A 1x1 PNG — the "rendered" output the ComfyUI double serves from /view, so the landed asset
-#: card holds an <img> the browser genuinely fetches and paints.
+#: A 1x1 PNG — the "rendered" output. Since 2026-08-23 the asset card no longer asks ComfyUI for
+#: it: `assetImageUrl` addresses `/api/projects/{id}/assets/{asset_id}/file`, which resolves the
+#: manifest path under `comfy_root/output` and serves it off disk. So this script also writes the
+#: bytes into a throwaway `MVP_COMFY_ROOT` below, and the double keeps serving `/view` for the
+#: clips list, which still needs it. The `<img>` is still genuinely fetched and painted.
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
@@ -248,6 +254,17 @@ def main() -> None:
     double.start()
     previous_comfy_url = os.environ.get("MVP_COMFY_URL")
     os.environ["MVP_COMFY_URL"] = f"http://127.0.0.1:{comfy_port}"
+    # A throwaway output root with the "rendered" file already in it. The asset card is served by
+    # this application now, not by ComfyUI's `/view`, so the bytes have to exist where the route
+    # resolves them: `comfy_root/output/<the manifest's path>`. Pointing the real
+    # `J:\...\ComfyUI` root at this run would put an e2e file in the Director's output directory,
+    # which is why the root moves rather than the file.
+    previous_comfy_root = os.environ.get("MVP_COMFY_ROOT")
+    comfy_root = tempfile.mkdtemp(prefix="mvp-e2e-poll-comfy-")
+    os.environ["MVP_COMFY_ROOT"] = comfy_root
+    landed = Path(comfy_root) / "output" / OUTPUT["subfolder"] / OUTPUT["filename"]
+    landed.parent.mkdir(parents=True, exist_ok=True)
+    landed.write_bytes(PNG)
     try:
         with ManagedServer(port, label=NAME) as server:
             result["server_identity"] = server.evidence
@@ -342,9 +359,14 @@ def main() -> None:
                         )
                     )
                 )
-                assert OUTPUT["filename"] in (image.get_attribute("src") or ""), (
-                    image.get_attribute("src")
-                )
+                # Addressed by the asset's id, not by the landed filename: since 2026-08-23 the
+                # card asks this application for the bytes so the library stays readable while
+                # ComfyUI is down. That the *path* landed is asserted on the manifest below.
+                source = image.get_attribute("src") or ""
+                assert source.endswith(
+                    f"/api/projects/{fixture['active']}/assets/{fixture['asset']}/file"
+                ), source
+                assert "/view?" not in source, source
                 # The browser really fetched and painted the file, not just an <img> tag.
                 wait.until(
                     lambda browser: browser.execute_script(
@@ -388,6 +410,11 @@ def main() -> None:
             os.environ.pop("MVP_COMFY_URL", None)
         else:
             os.environ["MVP_COMFY_URL"] = previous_comfy_url
+        if previous_comfy_root is None:
+            os.environ.pop("MVP_COMFY_ROOT", None)
+        else:
+            os.environ["MVP_COMFY_ROOT"] = previous_comfy_root
+        shutil.rmtree(comfy_root, ignore_errors=True)
 
     report(NAME, result)
 

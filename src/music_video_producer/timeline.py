@@ -325,10 +325,16 @@ def _spend_room(
     took = dict.fromkeys(room, 0.0)
     # A window with no room is already on its band end and a window with no weight is one the
     # density is not asking to move; neither can take anything, and the weight half also keeps
-    # the division below from meeting an all-zero denominator. **Both survived the 2026-08-23
-    # mutation sweep as equivalents when removed one at a time** — a zero-room window would
-    # simply freeze on the first pass and leave — and the weight half is killed by
-    # `test_spend_room_hands_out_everything_it_is_given_and_nothing_more`'s last case.
+    # the division below from meeting an all-zero denominator.
+    #
+    # **The two halves have different standing, and this said they had the same one.** The
+    # *room* half survived the 2026-08-23 sweep as an equivalent — a zero-room window would
+    # simply freeze on the first pass and leave — so it is kept for the reading and not for the
+    # behaviour. The *weight* half is load-bearing and killed by
+    # `test_spend_room_hands_out_everything_it_is_given_and_nothing_more`'s last case, which
+    # raises `ZeroDivisionError` on the `share` line below the moment it is removed. The comment
+    # here claimed both survived and then named the test that kills one of them, in the same
+    # breath; re-executed 2026-08-23 before rewriting, one mutant at a time.
     active = [index for index in room if room[index] > 0 and weight[index] > 0]
     remaining = total
     for _ in range(len(room) + 1):

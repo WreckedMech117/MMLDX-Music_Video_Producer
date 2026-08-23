@@ -1,14 +1,18 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_NAME_HELP, ASSET_NAME_LABEL, assetNamePlan, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, characterSlotPlan, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, INSTRUMENTAL_NOTE, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, VOCAL_TYPES, vocalTaggingPlan, vocalTypeSpec, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_NAME_HELP, ASSET_NAME_LABEL, assetNamePlan, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, characterSlotPlan, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, jobTarget, INSTRUMENTAL_NOTE, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, VOCAL_TYPES, vocalTaggingPlan, vocalTypeSpec, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
+// The sampling bundle: one project-level choice that governs Generate All, Re-queue flagged and
+// Render Again alike, with the step count on the option and the 2026-08-23 comparison's findings
+// underneath it. Every decision is pure and lives in api.js; this module draws it and writes it.
+import { SAMPLING_PROFILE_CONTROL, SAMPLING_PROFILE_NOTE, SAMPLING_PROFILE_NOTE_TEXT, SAMPLING_PROFILE_TITLE, SAMPLING_PROFILES, batchEtaNote, samplingProfileOf, samplingProfileToast } from "./api.js";
 // Fill section looks: the Director's empty shared prompt, read out of the Treatment.
 import { FILL_SECTION_LOOKS_APPLIED, FILL_SECTION_LOOKS_HELP, FILL_SECTION_LOOKS_LABEL, FILL_SECTION_LOOKS_OVERWRITE_QUESTION, FILL_SECTION_LOOKS_RUNNING, sectionLooksConfirmation, sectionLooksReportLines, sectionLooksWritten } from "./api.js";
 import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clampTimelineZoom, timelineWheelPlan, zoomFromSlider, zoomLabelText, zoomSliderValue, zoomViewport } from "./api.js";
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
-import { GAP_FILL_TOAST, MIN_WINDOW_SECONDS, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, anchoredNudge, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, playheadSnap, splitShotPlan, undoControl, undoGestureLabel } from "./api.js";
+import { GAP_FILL_TOAST, MIN_WINDOW_SECONDS, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, anchoredNudge, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, noShotSelectedRefusal, playheadSnap, splitShotPlan, undoControl, undoGestureLabel } from "./api.js";
 // The Clips tab's honest state when ComfyUI is not running, and the Assets panel's named attach
 // target -- two of the four interaction defects cleared on 2026-08-21.
 import { CLIP_RECHECK_LABEL, attachToShotControl, clipCardFace, clipPreviewState } from "./api.js";
@@ -822,11 +826,21 @@ async function runAssistantFill(control, shotIds) {
   finally { shotWriteInFlight = ""; control.textContent = label; syncAssistantControls(); }
 }
 
+// Every asset picture in the workspace, served by this application and addressed by the asset's
+// own id.
+//
+// It used to fork: uploads through `/api/.../media/`, and everything generated through
+// `comfyOutputUrl` — ComfyUI's `/view`, on ComfyUI's origin, falling back to a hardcoded
+// `127.0.0.1:8188` when `/api/health` had not answered yet. So the entire library went blank
+// whenever ComfyUI was down, which is routine and happens for reasons that have nothing to do
+// with browsing a library. The bytes were never ComfyUI's to withhold — the app is running on the
+// same disk — and `read_asset_file` now serves them with the containment check `/view` cannot do.
+//
+// The empty-`path` early return stays exactly where it was: an asset with no output yet is not a
+// request that should be made at all, and the grid already draws `RENDERING`/`NO PREVIEW` for it.
 function assetImageUrl(asset) {
-  if (!asset?.path) return "";
-  if (asset.source === "upload") return `/api/projects/${state.project.id}/media/${encodeURI(asset.path.replace(/^media\//, ""))}`;
-  const comfyUrl = state.health?.comfy?.url || "http://127.0.0.1:8188";
-  return comfyOutputUrl(comfyUrl, asset.path);
+  if (!asset?.path || !asset?.id || !state.project?.id) return "";
+  return `/api/projects/${state.project.id}/assets/${encodeURIComponent(asset.id)}/file`;
 }
 
 // The panel's tab strip, built from api.js's ASSET_TABS rather than written into index.html, so
@@ -2601,7 +2615,13 @@ export function renderShotInspector() {
       // identical take.
       saveShotsSilently();
       await shotSaveChain;
-      await api.generateH3(projectId, shot.id, { profile: "turbo" });
+      // No profile on the wire, and that is the fix rather than an omission. This line read
+      // `{ profile: "turbo" }` until 2026-08-23 -- a hardcoded 4-step bundle, while both
+      // `api.generateBatch` call sites sent nothing and got the 20-step default. The same project
+      // rendered two different graphs depending on which button was pressed, and nothing told the
+      // Director either number. Sending nothing means "this project's bundle", resolved once on
+      // the server, so this button and Generate All cannot disagree again.
+      await api.generateH3(projectId, shot.id, {});
       toast(`${renderAgainNotice(project, shot.id)} A new take is rendering now.`);
       if (state.project?.id === projectId) await loadProject(projectId);
     } catch (error) { toast(error.message, "error"); }
@@ -2861,9 +2881,34 @@ export function renderTimingCell(job) {
   return `${bounded ? "≤" : ""}${length}${frames}`;
 }
 
-function renderJobs() {
+// The bundle select and the comparison's findings, painted from the stored project and from
+// nothing else -- never from what the Director last clicked, which is `renderVramEject`'s rule and
+// for its reason: a select showing a bundle the server did not accept is a control that lies about
+// which graph the next batch will render.
+//
+// The options are written from `SAMPLING_PROFILES` rather than sitting in index.html, so the three
+// names offered are the three the route's `Literal` accepts and a fourth cannot appear on one side
+// only. Disabled with no project, because there is nothing to store the choice on.
+function renderSamplingProfile() {
+  const control = $(SAMPLING_PROFILE_CONTROL);
+  const note = $(SAMPLING_PROFILE_NOTE);
+  if (!control) return;
+  const markup = SAMPLING_PROFILES.map(
+    (entry) => `<option value="${escapeHtml(entry.value)}">${escapeHtml(entry.label)}</option>`
+  ).join("");
+  if (control.innerHTML !== markup) control.innerHTML = markup;
+  control.disabled = !state.project;
+  control.value = samplingProfileOf(state.project);
+  control.title = SAMPLING_PROFILE_TITLE;
+  if (note) note.textContent = SAMPLING_PROFILE_NOTE_TEXT;
+}
+
+export function renderJobs() {
   const jobs = state.project?.jobs || [];
   const list = $("#job-list");
+  // In the same pass the batch button redraws, because they are one decision: the button says how
+  // many shots would queue and the select says which graph they would queue on.
+  renderSamplingProfile();
   // The poll follows the job list, and this is the one place every version of that list passes.
   syncRenderPolling();
   // Generate All's whole state, decided by one contract-tested function: the count the
@@ -2882,9 +2927,11 @@ function renderJobs() {
   if (!jobs.length) { list.innerHTML = `<div class="queue-empty">No render jobs for this project.</div>`; return; }
   // Targets named the way the timeline names them, and a shot row is a link back to its
   // shot — a queue of raw `shot_9f2c…` ids was dead text (analyst finding, 2026-08-20).
-  const target = (job) => job.kind === "h3" && job.target_id
-    ? shotLabel(state.project, job.target_id)
-    : job.target_id || "—";
+  //
+  // `jobTarget` also owns the case that put the dead text back: a job whose shot a populate
+  // replaced. It is labelled and un-linked there rather than dropped — see the constant's own
+  // note for why the record is kept.
+  const target = (job) => jobTarget(state.project, job);
   const open = (job) => job.status === "queued" || job.status === "running";
   // Batch progress, one line: the newest batch's done/open counts. Hours of bare
   // "queued/running" rows carried no sense of position (analyst finding, 2026-08-20).
@@ -2892,9 +2939,14 @@ function renderJobs() {
   const batchJobs = newestBatch ? jobs.filter((job) => job.batch_id === newestBatch) : [];
   const remaining = batchJobs.filter(open).length;
   const progress = remaining
-    ? `<div class="batch-progress">Batch: ${batchJobs.length - remaining} of ${batchJobs.length} settled · ${remaining} to go (~${Math.round(remaining * 2.7)} min on turbo)</div>`
+    // The estimate names the bundle the batch is actually running and quotes a figure only where
+    // one was measured. It read "~2.7 min on turbo" for every batch until 2026-08-23 -- a hardcoded
+    // number attributing every render to a bundle the batch had never used, because `generateBatch`
+    // sent no profile and got the 20-step default. `batchEtaNote` is empty for a bundle with no
+    // measurement rather than interpolating one from a step ratio.
+    ? `<div class="batch-progress">Batch: ${batchJobs.length - remaining} of ${batchJobs.length} settled · ${remaining} to go${escapeHtml(batchEtaNote(samplingProfileOf(state.project), remaining))}</div>`
     : "";
-  list.innerHTML = progress + [...jobs].reverse().map((job) => `<div class="job-row ${job.kind === "h3" && job.target_id ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${job.kind === "h3" ? escapeHtml(job.target_id || "") : ""}"><span class="job-kind">${job.kind}</span><span>${escapeHtml(target(job))}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span class="job-took" title="${escapeHtml(renderTimingSummary(job) || "This job has no recorded timing. Every settle path records one since 2026-08-21; a job settled before that carries none, and none was ever invented for it.")}">${escapeHtml(renderTimingCell(job))}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span>${open(job) ? `<button class="job-cancel" data-job-id="${job.id}" title="Cancel this render: dequeued (interrupted when running) on ComfyUI, the job settled, the shot released.">×</button>` : ""}</div>`).join("");
+  list.innerHTML = progress + [...jobs].reverse().map((job) => { const to = target(job); return `<div class="job-row ${to.linked ? "linked" : ""}" data-job-id="${job.id}" data-shot-id="${escapeHtml(to.shotId)}"><span class="job-kind">${job.kind}</span><span title="${escapeHtml(to.title)}">${escapeHtml(to.label)}</span><span class="job-status ${job.status}">${job.status}</span><span>${job.seed}</span><span class="job-took" title="${escapeHtml(renderTimingSummary(job) || "This job has no recorded timing. Every settle path records one since 2026-08-21; a job settled before that carries none, and none was ever invented for it.")}">${escapeHtml(renderTimingCell(job))}</span><span>${job.output_files?.[0] ? escapeHtml(job.output_files[0]) : job.error ? escapeHtml(job.error) : "—"}</span>${open(job) ? `<button class="job-cancel" data-job-id="${job.id}" title="Cancel this render: dequeued (interrupted when running) on ComfyUI, the job settled, the shot released.">×</button>` : ""}</div>`; }).join("");
   $$(".job-row.linked", list).forEach((row) => row.addEventListener("click", () => {
     state.selectedShotId = row.dataset.shotId;
     state.selectedSectionId = null;
@@ -3988,10 +4040,16 @@ function bindEvents() {
   // subtracting from a clone, so an unclassified field is absent from the copy rather than
   // inherited by it. The original is untouched -- its take, its approval and its pointer all
   // stay exactly where they were.
-  $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); if (!shot) return; const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + shot.duration }); state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently("duplicate"); renderTimeline(); });
+  //
+  // The `!shot` guard used to be a bare `return` on both of these — pressed with nothing
+  // selected, the control did nothing and said nothing, which is `#split-shot`'s 2026-08-21
+  // defect sitting unfixed beside the fix. `noShotSelectedRefusal` supplies the sentence all
+  // three share.
+  $("#duplicate-shot").addEventListener("click", () => { const shot = selectedShot(); const refusal = noShotSelectedRefusal(shot, "duplicate"); if (refusal) return toast(refusal, "error"); const copy = newShotFromPlan(shot, { id: `shot_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`, start: shot.start + shot.duration }); state.project.shots.push(copy); state.selectedShotId = copy.id; saveShotsSilently("duplicate"); renderTimeline(); });
   $("#delete-shot").addEventListener("click", () => {
     const shot = selectedShot();
-    if (!shot) return;
+    const refusal = noShotSelectedRefusal(shot, "delete");
+    if (refusal) return toast(refusal, "error");
     // The one destructive timeline action that had no confirmation (analyst finding,
     // 2026-08-20). Named, because "Delete shot" against the wrong selection is the
     // realistic mistake — and takes on disk survive it either way.
@@ -4234,6 +4292,33 @@ function bindEvents() {
   // The checkbox changes what the button would submit, so the button's own label and
   // count redraw in the same gesture.
   $("#replace-existing").addEventListener("change", renderJobs);
+  // The bundle select's whole behaviour. It sends the select's own value -- never a hardcoded one,
+  // which is the defect this control was built to remove -- and repaints from the server's reply,
+  // so a refused change reverts the select instead of leaving it showing a bundle no render will
+  // honour. The same revert the VRAM eject and the document locks do.
+  //
+  // The reply is the whole project, so `state.project` is replaced from it: the confirmation
+  // Generate All will show and the batch estimate beside it both read `sampling_profile`, and a
+  // select that had changed while the stored project had not would put the wrong bundle in the
+  // sentence the Director confirms.
+  //
+  // Nothing about a render happens here. The setting reaches submissions server-side, where the
+  // profile is resolved, so no failure on this path can reach a render.
+  $(SAMPLING_PROFILE_CONTROL)?.addEventListener("change", async (event) => {
+    if (!requireProject()) return renderSamplingProfile();
+    const control = event.currentTarget;
+    const wanted = control.value;
+    const projectId = state.project.id;
+    control.disabled = true;
+    try {
+      const project = await api.saveSamplingProfile(projectId, wanted);
+      if (state.project?.id === projectId) state.project = project;
+      toast(samplingProfileToast(wanted));
+    } catch (error) {
+      toast(error.message, "error");
+    }
+    renderJobs();
+  });
   // The whole of the control. It sends the box's own value -- never a hardcoded one, which would
   // make the control decorative in one direction and unusable in the other -- and repaints from
   // the server's reply, so a refused change reverts the box instead of leaving it showing a
@@ -4254,6 +4339,10 @@ function bindEvents() {
     }
     renderVramEject();
   });
+  // Once at boot, so the options and the comparison's findings are on screen with no project open
+  // rather than an empty select that appears only after the first project load. `renderJobs`
+  // redraws it from the project every time after that.
+  renderSamplingProfile();
   window.addEventListener("resize", () => { if (state.audioBuffer) { renderSong(); renderTimeline(); } });
   // The same predicate the project switch asks: a tab closed on an unsaved lyric sheet loses it as
   // completely as a project switch does, and the browser's own dialog is the only warning left.

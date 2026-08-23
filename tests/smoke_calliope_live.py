@@ -54,6 +54,7 @@ from music_video_producer.app import (
     DIRECTOR_CONTEXT_EXCLUDE,
     POPULATE_FINAL_CHECK,
     POPULATE_INSTRUCTION,
+    POPULATE_MAX_WINDOW_SECONDS,
     POPULATE_RETRY_PREFIX,
     POPULATE_RETRY_TEMPERATURE,
     POPULATE_SECTIONS_ASK,
@@ -71,7 +72,7 @@ from music_video_producer.director import (
 )
 from music_video_producer.h3_expansion_prompt import APPEARANCE_ANCHOR_RULES, system_prompt
 from music_video_producer.models import Asset, AssetCitation, Project, Shot, Song
-from music_video_producer.timeline import shot_expansion_input
+from music_video_producer.timeline import H3_MIN_SHOT_SECONDS, shot_expansion_input
 
 #: Where the raw evidence lands, matching the dated-directory convention already in
 #: `test-artifacts/`. Written to, and nothing else on disk is.
@@ -183,18 +184,22 @@ def control_instruction(project: Project, count: int) -> str:
       renumbered;
     - `POPULATE_FINAL_CHECK` is not appended.
 
-    Everything else — the coverage sentence, the 4–6 s band, the length-mixing sentence, the
+    Everything else — the coverage sentence, the window band, the length-mixing sentence, the
     asset roster, the camera-variation rules, the sections ask, the surviving constraints —
     is byte-identical to the shipped arm. This is a reconstruction, not a historical text,
     and the report has to say so.
     """
     shipped = shipped_instruction(project, count)
     text = shipped.replace(f"Return EXACTLY {count} shots. ", "", 1)
-    text = text.replace(
-        "each between 4 and 6 seconds.",
-        f"each between 4 and 6 seconds, about {count} shots in total.",
-        1,
+    # The band's own numbers, taken from the shipped constants rather than spelled again: this
+    # anchor was `"each between 4 and 6 seconds."` and silently stopped matching when the
+    # ceiling moved to 6.8, which turns a reconstruction into a copy of the shipped arm without
+    # failing. Asserted below rather than trusted.
+    band = (
+        f"each between {H3_MIN_SHOT_SECONDS:g} and {POPULATE_MAX_WINDOW_SECONDS:g} seconds."
     )
+    assert band in text, "the shipped window-band sentence moved"
+    text = text.replace(band, f"{band[:-1]}, about {count} shots in total.", 1)
     hard_constraint_one = (
         f"1. `shots` must contain EXACTLY {count} entries. Not fewer. A shorter list is a "
         "failed answer, however good the individual shots are.\n"

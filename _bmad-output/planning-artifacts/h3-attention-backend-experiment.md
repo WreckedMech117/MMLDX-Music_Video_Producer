@@ -1015,9 +1015,22 @@ its own arm" is exactly the sort of thing that becomes true in a retelling.
   number at n=1 and not a verdict, but it points the same way caution does:
   **`turbo-references2v` looks the safer of the two on both counts.** The takes are preserved;
   the picture judgement is the Director's.
-* **The batch and "Render Again" already ship different bundles** — batch defaults to `default`
-  (20 steps), `app.js:2575` hardcodes `turbo` (4 steps). Recorded, not reconciled, because
-  whether the batch should move is the same quality decision as above.
+* ~~**The batch and "Render Again" already ship different bundles**~~ — **RECONCILED 2026-08-23.**
+  This bullet stood for two days as "recorded, not reconciled, because whether the batch should
+  move is the same quality decision as above". The Director made that decision on the 8-step
+  comparison — *"both still look good so **up to user**, and perhaps the video style would benefit
+  from it in some cases"* — and the split closed with it. `Project.sampling_profile` is now the one
+  place a bundle is chosen; `H3Request.profile` and `GenerateBatchRequest.profile` are
+  `SamplingProfile | None`, and an omitted profile (which every shipped client sends) resolves to
+  the project's choice in `app.resolved_sampling_profile`. Generate All, Re-queue flagged and
+  Render Again therefore render the same bundle, the browser shows which one with its step count
+  before the batch is confirmed, and the untouched default is digest-proved byte-identical.
+  `app.js`'s hardcoded `profile: "turbo"` is gone.
+
+  **Consequence for every cost figure in this document.** §6.7's observation that "the whole table
+  is a 20-step measurement" is now a statement about the past: from 2026-08-23 a render's bundle is
+  whatever the project is set to, so **no cost number may be quoted without naming the bundle it
+  was taken on**. Every table here is `default` unless its own row says otherwise.
 
 **Settled, and requiring no action:**
 
@@ -1243,3 +1256,115 @@ recommended as a mitigation for the wall.**
 Caveat, stated because cross-run comparison is what has burned this experiment repeatedly: the
 804 s and 1004 s figures come from **different invocations**. Both are n=1 and the difference is
 far outside the 2.5% warm reproducibility of §6.19, but a same-session A/B was not run.
+
+---
+
+## 8. The "soft skin" prompt clause: SPECIFIED, NOT RUN
+
+**Status: specified 2026-08-23. Nothing was rendered, no prompt clause was added anywhere in the
+application, and no GPU time was spent writing this section.**
+
+The Director, reading the 8-step-vs-20-step comparison
+(`docs/measurements/2026-08-23-bundle-comparison/index.html`):
+
+> *"Unknown if 'soft skin' in the prompt would counteract the effect."*
+
+The effect is the one that comparison measured and the report named: `turbo-references2v` is
+**sharper, not softer** — high-frequency energy +127% / +152% / +52% across the three shots — and
+the cost is texture realism, skin that reads waxier at high zoom with flatter mid-tone
+micro-texture. That is the familiar few-step-LoRA trade of acutance for grain. The open question is
+whether a prompt clause can buy some of the grain back.
+
+**It is a cheap, well-formed experiment**, which is exactly why it is written down rather than
+guessed at: one shot, one seed, one bundle, one clause added, two renders.
+
+### 8.1 Why it is worth running at all
+
+The measurement it would settle is not "does turbo look good" — the Director has ruled on that
+("both still look good so up to user"). It is narrower and more useful: **is the waxiness a
+property of the sampling bundle, or of the prompt under that bundle?** If a clause moves it, the
+bundle's one stated cost becomes a thing the Director can dial, and the ruling's "up to user" gains
+a second control. If it does not, the waxiness is a property of 8-step sampling and the answer is
+to stop looking for a prompt fix — which is worth as much, and is the more likely result.
+
+### 8.2 Preconditions
+
+1. ComfyUI up, GPU free, and the Director scheduling it — this is their card.
+2. The shot is `shot_f82bf42e3abc` ("Close-up, singing", 141 frames, seed 14, window 66.58–71.69 s
+   with lead 0.25 s). It is the close-up, because skin texture is only legible on a face filling
+   the frame, and the b-roll's +52% is the weakest signal of the three.
+3. **The arms differ in the prompt clause and in nothing else.** Same seed, same references, same
+   song window, same bundle, same frame count, same resolution. `turbo-references2v` for both arms:
+   the question is about turbo's own texture, so running it against `default` would answer a
+   different question that has already been answered.
+4. Timing from ComfyUI's own execution clock, as everywhere else in this document. It is not the
+   measure here, but it is recorded.
+
+### 8.3 The arms
+
+**Arm A (control):** the shot's existing prompt, verbatim, exactly as
+`docs/measurements/2026-08-23-bundle-comparison/report.json` records it. It is already rendered —
+`job_3a177562476c`, prompt `71de8e17-293e-4c58-8a55-9bb069bf1e61` — so **arm A may be reused rather
+than re-rendered**, provided nothing in the adapter has moved since. Verify by digest of the
+submitted payload before reusing it; if it has moved, re-render.
+
+**Arm B (treatment):** the identical prompt with one clause appended. The clause is the Director's
+own words and must not be paraphrased into a longer instruction: **"soft skin"**. Appended to the
+shot's prose, not inserted into the reference map and not made part of any section look — the
+reference map is machine-numbered, and a hand edit there is a different change.
+
+**Two arms and one variable.** Not three; not "soft skin" plus "film grain" plus a negative prompt.
+Two variables in one experiment measures neither — §4's own rule, and the reason that section's arm
+list stayed at two.
+
+### 8.4 What is measured
+
+**Primary, and it is the same instrument the comparison used**, so the numbers are comparable to
+its table rather than to a new scale:
+
+* **`detail`** — mean Laplacian energy over the take. Arm A read **376.82** on
+  `turbo-references2v` against `default`'s 166.22. A clause that "counteracts the effect" moves arm
+  B's figure **toward** 166 and away from 377.
+* **`bytes_per_frame`** — 18137.2 on arm A against default's 14494.9. It moves with the texture the
+  encoder finds worth keeping, and it is an independent read on the same thing.
+* **`flicker`** — 10.9769 on arm A against 5.8596. Reported, not used as the verdict: it rises with
+  real motion as well as instability, and a re-rolled take has different motion.
+
+**Secondary, and it can veto on its own:** the picture. **A bundle change re-rolls the take, and so
+does a prompt change** — §6.13's finding applies here with full force. Arm B is a *different
+performance*, so there is no frame-to-frame comparison to make and no contact sheet that means what
+one would mean for a post-process. The judgement is "is this shot acceptable, and is its skin less
+waxy", and it is the Director's eye. A number saying the texture moved while the Director says the
+shot got worse is a refusal, not a trade.
+
+**Audio is recorded and is not the question.** Envelope correlation and lag, for consistency with
+every other table here; a prompt clause about skin has no reason to touch the vocal, and a figure
+that moved would be a signal that something else changed.
+
+### 8.5 What each result would justify
+
+| Result | What it justifies |
+|---|---|
+| Arm B's `detail` falls materially toward the default's figure **and** the Director judges the skin better | A recommendation the Director can apply per shot, written up in `docs/WORKFLOW-MAP.md` as a prompt technique. **Not** an automatic clause: nothing in this application may add words to a Director's prompt without them asking. |
+| `detail` falls and the picture is worse — softer everywhere, not just the skin | Recorded as a blunt instrument. The clause trades global acutance, which is not what was asked for, and the waxiness stays a property of the bundle. |
+| `detail` does not move | **The useful null.** The waxiness is a property of 8-step sampling and no prompt clause reaches it. Stop looking for a prompt fix, and read the ruling as final: the trade is the trade, and the choice is the control that now exists. |
+| Arm B's audio numbers move | Something other than the intended variable changed. Investigate before reporting anything about texture. |
+
+### 8.6 Cost, and the honesty constraint on n
+
+**One render** if arm A is reused, two if it is not. At the comparison's measured 240.3 s of ComfyUI
+execution for this shot on `turbo-references2v`, that is **four to eight minutes of GPU** — the
+cheapest experiment in this document by two orders of magnitude.
+
+**It is also n=1**, and this document exists because n=1 produced a claim wrong by 3.4×. A single
+pair can show a large effect or a flat null; it cannot size a small one. If the first pair lands
+ambiguously — `detail` moving by less than the run-to-run variance this machine has shown — the
+answer is "unresolved at n=1", not a number. Three seeds would settle it and cost under half an
+hour; that is the escalation, and it is the Director's to authorise.
+
+### 8.7 What must not happen while this is unrun
+
+**No "soft skin" clause exists anywhere in the application, and none may be added on the strength of
+this section.** Not in `SONG_AUDIO_CONTINUITY_CLAUSE`, not in the expansion prompts, not in a
+section look, not as a default. This is a specified test, and the whole point of writing it down
+instead of doing it is that the effect is **unmeasured**.

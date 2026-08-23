@@ -3094,6 +3094,43 @@ def test_comfy_output_url_preserves_output_subfolder():
     )
 
 
+def test_the_asset_grid_asks_this_application_for_its_pictures_not_comfyui():
+    """The library must stay readable while ComfyUI is down, which is its ordinary state.
+
+    Every generated thumbnail used to be a `/view` URL on ComfyUI's origin, with a hardcoded
+    `127.0.0.1:8188` standing in until `/api/health` answered — so the whole grid went blank
+    whenever ComfyUI was stopped, for reasons that have nothing to do with browsing a library.
+    Driven through the real `renderAssets` with `state.health` deliberately reporting ComfyUI
+    *offline*, because that is exactly the state the old code drew a blank grid in.
+
+    Uploads and generated pictures now take the same route, addressed by asset id: the fork
+    that decided which origin to ask is gone, so a source this test does not enumerate cannot
+    fall through to `/view` either.
+    """
+    drawn = run_workspace("""
+      state.health = { comfy: { online: false, url: 'http://127.0.0.1:8188' } };
+      state.project = { id: 'p1', song: null, messages: [], shots: [], jobs: [], assets: [
+        { id: 'asset_up', name: 'Uploaded', kind: 'character', source: 'upload', path: 'media/assets/000-up.png' },
+        { id: 'asset_gen', name: 'Generated', kind: 'character', source: 'flux-image-gen', path: 'music-video-producer/p1/assets/asset_gen_00001_.png' },
+        { id: 'asset_mv', name: 'Sheet', kind: 'character', source: 'krea-multiview', path: 'music-video-producer/p1/assets/asset_mv_00001_.png' },
+        { id: 'asset_pending', name: 'Pending', kind: 'character', source: 'flux-image-gen', path: '', prompt_id: 'p-9' },
+      ] };
+      state.assetTab = 'characters';
+      app.renderAssets();
+      console.log(JSON.stringify({ grid: at('#asset-grid').innerHTML }));
+    """)
+
+    grid = drawn["grid"]
+    assert "/view?filename=" not in grid, grid
+    assert "127.0.0.1:8188" not in grid, grid
+    for asset_id in ("asset_up", "asset_gen", "asset_mv"):
+        assert f'src="/api/projects/p1/assets/{asset_id}/file"' in grid, (asset_id, grid)
+    # The one card that must *not* ask: an asset with no output yet keeps its own placeholder,
+    # which is a different sentence from "this picture failed to load" and stays that way.
+    assert "assets/asset_pending/file" not in grid, grid
+    assert "RENDERING" in grid, grid
+
+
 def test_remove_song_client_matches_a_route_the_server_actually_exposes():
     """The browser's DELETE path and query key, read off both sides and compared.
 
@@ -3931,7 +3968,14 @@ def test_the_shot_inspector_draws_and_binds_the_render_again_control_it_was_give
     saved = json_module.loads(writes[1]["body"])
     assert saved["shots"][0]["seed"] == rendered["stride"]  # 0 + the server's own stride
     generate = json_module.loads(writes[2]["body"])
-    assert generate["profile"] == "turbo"
+    # **No profile on the wire**, and this assertion is the inversion of what stood here until
+    # 2026-08-23. This line read `== "turbo"`, pinning a hardcoded 4-step bundle on the one-shot
+    # re-render while both `api.generateBatch` call sites sent nothing and got the 20-step
+    # default — the same project rendering two different graphs depending on which button was
+    # pressed, with nothing telling the Director either number. An empty body means "this
+    # project's bundle", resolved once on the server, so this path and Generate All cannot
+    # disagree again. `Project.sampling_profile` is where the choice lives now.
+    assert generate == {}, generate
     assert rendered["queued"]["toasts"] == [
         f"{rendered['notice']} A new take is rendering now."
     ]
@@ -5409,6 +5453,76 @@ def test_the_generate_all_plan_counts_warns_and_never_gates_what_the_server_woul
     button = re.search(r'<button[^>]*id="queue-ready"[^>]*>', markup)
     assert button, "the batch action has no button for app.js to bind"
     assert f'title="{states["emptyWording"]}"' in button.group(0), button.group(0)
+
+
+def test_a_job_whose_shot_a_populate_replaced_is_labelled_rather_than_dropped_or_dead():
+    """43 records on the live project point at shot ids a populate replaced.
+
+    Nothing prunes jobs and nothing should: the takes those renders produced are still on disk,
+    and the record is the only thing linking a file to the render that made it — seed, frames,
+    measured time, batch. `clipLibraryRows` builds the Clips tab straight off the job list, so
+    pruning would delete the provenance of exactly the takes a Director goes looking for after a
+    re-plan; dropping is cheap to do and impossible to undo.
+
+    What was not acceptable is what the panel drew instead. `shotLabel` falls back to the bare
+    id, which is the dead text a 2026-08-20 finding removed from this very panel, and the row
+    stayed marked `linked` — so clicking it set `selectedShotId` to an id no shot has and
+    selected nothing, silently. Driven through the real `renderJobs`.
+    """
+    drawn = run_workspace("""
+      state.project = { id: 'p1', name: 'Replanned', song: null, messages: [], assets: [], shots: [
+        { id: 'shot_live', start: 0, duration: 5, prompt: 'The plan as it stands now.' },
+      ], jobs: [
+        { id: 'j_live', kind: 'h3', status: 'complete', prompt_id: 'pr1', target_id: 'shot_live', seed: 7, output_files: ['takes/live.mp4'], error: '' },
+        { id: 'j_orphan', kind: 'h3', status: 'complete', prompt_id: 'pr0', target_id: 'shot_gone', seed: 11, output_files: ['takes/gone.mp4'], error: '' },
+        { id: 'j_asset', kind: 'flux', status: 'complete', prompt_id: 'pr2', target_id: 'a1', seed: 3, output_files: [], error: '' },
+        { id: 'j_blank', kind: 'h3', status: 'error', prompt_id: '', target_id: '', seed: 0, output_files: [], error: 'never submitted' },
+      ] };
+      app.renderJobs();
+      const rows = [...at('#job-list').innerHTML.matchAll(/<div class="job-row[^]*?<\\/div>/g)].map((m) => m[0]);
+      console.log(JSON.stringify({
+        list: at('#job-list').innerHTML,
+        rows,
+        live: contract.jobTarget(state.project, state.project.jobs[0]),
+        orphan: contract.jobTarget(state.project, state.project.jobs[1]),
+        asset: contract.jobTarget(state.project, state.project.jobs[2]),
+        blank: contract.jobTarget(state.project, state.project.jobs[3]),
+        detached: contract.JOB_TARGET_DETACHED,
+      }));
+    """)
+
+    # The record is still there. Retention is the whole argument, so its absence is the failure.
+    assert "takes/gone.mp4" in drawn["list"], drawn["list"]
+    assert "shot_gone" in drawn["list"]
+
+    # A shot still on the plan is unchanged: named the way the timeline names it, and linked.
+    assert drawn["live"] == {
+        "label": "SHOT 01 (shot_live)", "shotId": "shot_live", "linked": True, "title": ""
+    }
+
+    # The orphan says so in the cell, offers no link, and carries no shot id for a click to use.
+    orphan = drawn["orphan"]
+    assert orphan["linked"] is False
+    assert orphan["shotId"] == ""
+    assert orphan["label"] == f"shot_gone — {drawn['detached']}"
+    assert "populate" in orphan["title"] and "still on disk" in orphan["title"]
+    assert "no shot to open" in orphan["title"]
+
+    # A job targeting an asset is untouched by any of this — `target_id` is polymorphic and only
+    # the h3 rows resolve against `shots` at all.
+    assert drawn["asset"] == {"label": "a1", "shotId": "", "linked": False, "title": ""}
+
+    # An h3 job that never got a target at all — `settle_unsubmitted_jobs`' shape — is the em-dash
+    # this panel has always drawn, *not* "shot no longer on the plan". There is no id to have
+    # lost, so claiming one was removed would be a story about a shot that never existed.
+    assert drawn["blank"] == {"label": "—", "shotId": "", "linked": False, "title": ""}
+    assert drawn["detached"] not in drawn["blank"]["label"]
+
+    # And on the wire: exactly one row is clickable, and it is not the orphan's.
+    linked = [row for row in drawn["rows"] if 'class="job-row linked"' in row]
+    assert len(linked) == 1, drawn["rows"]
+    assert "shot_live" in linked[0]
+    assert 'data-shot-id=""' in next(row for row in drawn["rows"] if "shot_gone" in row)
 
 
 def test_the_near_duplicate_warnings_reach_a_surface_the_director_can_act_on():
@@ -7738,9 +7852,10 @@ def test_a_poll_tick_lands_a_completion_on_every_surface_without_a_click():
     assert landed["polled"] == [{"path": "/api/projects/p1/render-status", "method": "GET"}]
     assert landed["assetPath"] == "music-video-producer/p1/assets/singer_00001_.png"
     # The card now carries the image where RENDERING stood, drawn by the tick and nothing else.
+    # The `src` is the app's own by-id route rather than the landed filename: the tick's proof
+    # that the path arrived is `assetPath` above, and the card only ever needed the asset's id.
     assert "RENDERING" not in landed["grid"]
-    assert "singer_00001_.png" in landed["grid"]
-    assert '<img src=' in landed["grid"]
+    assert '<img src="/api/projects/p1/assets/a1/file" alt="">' in landed["grid"]
     assert 'complete' in landed["jobs"]
     assert landed["toasts"] == ["Render complete: Lead singer is ready"]
 
@@ -12746,6 +12861,70 @@ def test_the_split_button_says_its_refusal_and_writes_nothing():
     assert "0.75s" in said["text"] and "0.375s" in said["text"], said["text"]
 
 
+def test_duplicate_and_delete_refuse_out_loud_with_no_shot_selected():
+    """The defect the split's refusal was written for, still sitting either side of it.
+
+    `#duplicate-shot` and `#delete-shot` both opened with a bare `return` on `!shot`, so a
+    press with nothing selected did nothing and said nothing -- and Delete is the one control
+    here that normally asks a question, so its silence is indistinguishable from a confirmation
+    the Director dismissed. Driven through the real handlers: each raises one error toast, the
+    plan is untouched, nothing is written back, and `window.confirm` is never reached (the
+    harness's throws until a test answers it, so a question asked here fails loudly).
+
+    All three sentences come from one template, asserted here rather than argued: three
+    controls describing one state three ways is the drift this shares a constant to prevent.
+    """
+    driven = run_workspace("""
+      const toasts = [];
+      globalThis.document.createElement = () => {
+        const item = make('<toast>'); toasts.push(item); return item;
+      };
+      state.project = {
+        id: 'p1', song: null, messages: [], assets: [], jobs: [],
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'The one shot on the plan.' }],
+      };
+      // Nothing selected -- the state a fresh load leaves behind, and the state a delete leaves
+      // behind on a plan that had one shot.
+      state.selectedShotId = null;
+      requests.length = 0;
+      fire('#duplicate-shot:click', {});
+      const duplicated = { toasts: toasts.splice(0), shots: state.project.shots.length };
+      fire('#delete-shot:click', {});
+      const deleted = { toasts: toasts.splice(0), shots: state.project.shots.length };
+      console.log(JSON.stringify({
+        duplicated: { ...duplicated, toasts: duplicated.toasts.map((i) => ({ text: i.textContent, kind: i.className })) },
+        deleted: { ...deleted, toasts: deleted.toasts.map((i) => ({ text: i.textContent, kind: i.className })) },
+        wrote: requests.filter((entry) => entry.method === 'PUT').length,
+        split: contract.SPLIT_NO_SHOT_REFUSAL,
+        template: contract.NO_SHOT_SELECTED_REFUSAL,
+        allowed: contract.noShotSelectedRefusal({ id: 'shot_a' }, 'delete'),
+      }));
+    """)
+
+    assert driven["wrote"] == 0, "a refusal wrote the shot list back"
+
+    for control, verb in (("duplicated", "duplicate"), ("deleted", "delete")):
+        outcome = driven[control]
+        assert outcome["shots"] == 1, f"{control}: the refused press changed the plan"
+        assert len(outcome["toasts"]) == 1, outcome["toasts"]
+        said = outcome["toasts"][0]
+        assert "error" in said["kind"], said
+        # The state, and the gesture that fixes it. A refusal naming neither is one nobody
+        # can act on -- `SPLIT_TOO_SHORT_REFUSAL`'s rule, applied to a selection instead of
+        # to arithmetic.
+        assert "No shot is selected" in said["text"], said["text"]
+        assert f"nothing to {verb}" in said["text"], said["text"]
+        assert "Click a clip on the timeline first." in said["text"], said["text"]
+
+    # One template, three instances: the split's own long-standing sentence is now derived from
+    # it, so a reworded refusal cannot land on one control and miss the other two.
+    assert driven["split"] == driven["template"].replace("{verb}", "split")
+    assert "{verb}" in driven["template"]
+    # And a shot that *is* selected refuses nothing at all -- the guard is the selection, not
+    # the verb.
+    assert driven["allowed"] == ""
+
+
 def test_the_seed_randomizer_is_armed_per_shot_and_not_for_the_session():
     """The Director's ruling (2026-08-21): "it should be per shot".
 
@@ -13413,3 +13592,321 @@ def test_the_queue_panel_actually_draws_the_column_it_declares():
     )
     assert grid, "the queue grid no longer declares its columns"
     assert len(grid.group(1).split()) == len(columns)
+
+
+# --- The sampling bundle control -------------------------------------------------------------
+#
+# The Director's ruling of 2026-08-23 made the bundle a visible choice: turbo is "almost sweaty"
+# but "both still look good so up to user". What these pin is the defect the ruling was the
+# occasion to fix -- `api.generateBatch` sent no profile and got 20 steps while "Render Again"
+# hardcoded `turbo` and got 4, and nothing on screen named either number.
+#
+# Every decision here is *executed* rather than read out of the source. A control can be perfectly
+# described in a comment and bound to nothing, and a select that writes the wrong project or sends
+# the wrong body is exactly the failure a source read cannot see.
+
+
+def test_the_bundle_select_offers_the_three_bundles_the_route_accepts():
+    """The select's options and the server's `Literal` must not drift apart.
+
+    A bundle offered here that the route does not know is a 422 the Director cannot avoid; one the
+    route accepts and this does not offer is unreachable, which is the whole point of the control.
+    The step count is asserted to be in the option's own visible text rather than in a tooltip:
+    "8 steps" is the information the ruling turns on, and a Director choosing a look must not have
+    to hover to find out what it costs.
+    """
+    from music_video_producer.models import SamplingProfile
+    from music_video_producer.workflows import H3_REFERENCE_PROFILES
+
+    offered = run_module("""
+      import { SAMPLING_PROFILES, samplingProfileOf, samplingProfileSpec }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        profiles: SAMPLING_PROFILES,
+        unknownStored: samplingProfileOf({ sampling_profile: 'fast' }),
+        missingStored: samplingProfileOf({}),
+        noProject: samplingProfileOf(null),
+        knownStored: samplingProfileOf({ sampling_profile: 'turbo' }),
+        unknownSpec: samplingProfileSpec('fast').value,
+      }));
+    """)
+
+    values = [entry["value"] for entry in offered["profiles"]]
+    assert set(values) == set(get_args(SamplingProfile)) == set(H3_REFERENCE_PROFILES)
+    # Offered default-first, so the option the Director lands on with no choice made is the one
+    # that renders exactly as this application always has.
+    assert values[0] == "default"
+    for entry in offered["profiles"]:
+        assert entry["steps"] == H3_REFERENCE_PROFILES[entry["value"]].steps
+        assert f"{entry['steps']} steps" in entry["label"], entry
+
+    # A stored name this build does not know draws as the default rather than as a blank select or
+    # an invented option: stale storage may cost a default, never a wrong state on screen.
+    assert offered["unknownStored"] == "default"
+    assert offered["missingStored"] == "default"
+    assert offered["noProject"] == "default"
+    assert offered["knownStored"] == "turbo"
+    assert offered["unknownSpec"] == "default"
+
+
+def test_the_comparisons_findings_sit_under_the_control_that_acts_on_them():
+    """The four things the 2026-08-23 comparison actually found, where the choice is made.
+
+    Including the one that reports an *absence*. No hands were in frame in any of the six renders,
+    so a Director reading "sharper, waxier skin" and inferring anything about hands would be
+    inferring it from nothing -- and that is the belief a findings note has to stop rather than the
+    result it reports.
+    """
+    note = run_module("""
+      import { SAMPLING_PROFILE_NOTE_TEXT, SAMPLING_PROFILE_TITLE }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        note: SAMPLING_PROFILE_NOTE_TEXT, title: SAMPLING_PROFILE_TITLE,
+      }));
+    """)
+
+    text = note["note"]
+    # Lip-sync: indistinguishable, with the numbers rather than the adjective alone.
+    assert "lip-sync is indistinguishable" in text
+    assert "within 0.005" in text and "0.1 ms" in text
+    # Picture: sharper, not softer -- the correction that matters, and its cost.
+    assert "sharper rather than softer" in text
+    assert "+52% to +152%" in text
+    assert "waxier" in text
+    # The saving, and where it comes from.
+    assert "~2.0" in text
+    assert "step count, not from per-step speed" in text
+    # The absence.
+    assert "hands are untested" in text
+    # Short enough to be read where it sits, which is the difference between a note and an essay.
+    assert len(text) < 600, len(text)
+
+    # The scope belongs to the hover text, not the note: it is a standing limit of the field
+    # rather than a finding, and it is the clause that stops "I chose turbo" being read as "every
+    # shot renders on turbo".
+    assert "Reference shots only" in note["title"]
+    assert "always render at 20 steps" in note["title"]
+    assert "Render Again" in note["title"] and "Generate All" in note["title"]
+
+
+def test_the_batch_estimate_names_the_chosen_bundle_and_invents_no_figure():
+    """The queue line said "~2.7 min on turbo" for every batch, and the batch never used turbo.
+
+    That is worse than a stale number: it attributed every render to a bundle
+    `api.generateBatch` had never sent, because it sent no profile at all and got the 20-step
+    default. The replacement quotes a measured figure where one exists and says nothing where one
+    does not -- the 4-step bundle was not in the 2026-08-23 comparison, so no minutes are
+    interpolated for it from a step ratio.
+    """
+    notes = run_module("""
+      import { batchEtaNote } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        def: batchEtaNote('default', 6),
+        turbo2v: batchEtaNote('turbo-references2v', 6),
+        turbo: batchEtaNote('turbo', 6),
+        unknown: batchEtaNote('fast', 6),
+        none: batchEtaNote('default', 0),
+      }));
+    """)
+
+    assert notes["def"] == " (~48 min on Default)"
+    assert notes["turbo2v"] == " (~24 min on Turbo References2V)"
+    # Measured on nothing, so it says nothing rather than guessing 6 x 2.7.
+    assert notes["turbo"] == ""
+    # An unrecognised name falls to the default's row rather than to a blank or a crash.
+    assert notes["unknown"] == " (~48 min on Default)"
+    assert notes["none"] == ""
+
+
+def test_the_generate_all_confirmation_names_the_bundle_it_would_spend():
+    """The last moment before hours of GPU, and until now it named no bundle at all.
+
+    The default's own cost sentence is asserted word for word: a Director who has touched nothing
+    must read exactly what they read before this control existed, which is the same promise the
+    payload digest makes on the other side of the wire.
+    """
+    plans = run_module("""
+      import { generateAllPlan } from './src/music_video_producer/web/assets/api.js';
+      const shots = [{ id: 'shot_a', status: 'ready' }, { id: 'shot_b', status: 'ready' }];
+      console.log(JSON.stringify({
+        untouched: generateAllPlan({ shots }, null),
+        turbo2v: generateAllPlan({ shots, sampling_profile: 'turbo-references2v' }, null),
+        turbo: generateAllPlan({ shots, sampling_profile: 'turbo' }, null),
+      }));
+    """)
+
+    assert "Bundle: Default — 20 steps." in plans["untouched"]["confirm"]
+    assert (
+        "A reference shot measured 288-438 s on the default profile."
+        in plans["untouched"]["confirm"]
+    )
+    assert "Bundle: Turbo References2V — 8 steps." in plans["turbo2v"]["confirm"]
+    assert "2.0× faster than default" in plans["turbo2v"]["confirm"]
+    assert "Bundle: Turbo LTX LoRA — 4 steps." in plans["turbo"]["confirm"]
+    assert "not measured" in plans["turbo"]["confirm"]
+    # The button's own title stays about what would queue. The select beside it carries the
+    # bundle, and a second copy in a tooltip is a second thing to keep true.
+    assert plans["turbo"]["title"] == "Generate 2 H3 shots"
+
+
+def test_the_bundle_select_writes_the_project_and_repaints_from_the_reply():
+    """The control, executed: it sends the select's own value to the one route that writes it.
+
+    Three things a source read cannot see, and each has been a real defect in this workspace: that
+    the handler is bound at all; that it sends the *select's* value rather than a hardcoded one;
+    and that a refused change reverts the control instead of leaving it showing a bundle no render
+    will honour.
+    """
+    driven = run_workspace(
+        """
+      state.project = { id: 'p1', name: 'Third Video', shots: [], jobs: [],
+        sampling_profile: 'default' };
+      app.renderJobs();
+      const drawn = {
+        options: at('#sampling-profile').innerHTML,
+        value: at('#sampling-profile').value,
+        note: at('#sampling-profile-note').textContent,
+        title: at('#sampling-profile').title,
+      };
+      // The Director picks the 8-step bundle.
+      at('#sampling-profile').value = 'turbo-references2v';
+      requests.length = 0;
+      await fire('#sampling-profile:change', { currentTarget: at('#sampling-profile') });
+      const accepted = {
+        sent: [...requests],
+        stored: state.project.sampling_profile,
+        value: at('#sampling-profile').value,
+      };
+      // And a refusal: the select must go back to what the server still holds.
+      at('#sampling-profile').value = 'turbo';
+      requests.length = 0;
+      await fire('#sampling-profile:change', { currentTarget: at('#sampling-profile') });
+      const refused = {
+        sent: requests.length,
+        stored: state.project.sampling_profile,
+        value: at('#sampling-profile').value,
+      };
+      console.log(JSON.stringify({ drawn, accepted, refused,
+        toast: contract.samplingProfileToast('turbo-references2v') }));
+    """,
+        {
+            "/api/projects/p1/sampling-profile": {
+                "body": {
+                    "id": "p1", "name": "Third Video", "shots": [], "jobs": [],
+                    "sampling_profile": "turbo-references2v",
+                }
+            }
+        },
+    )
+
+    # Drawn from the stored project: three options, the stored one selected, the findings under it.
+    assert driven["drawn"]["options"].count("<option") == 3
+    assert 'value="turbo-references2v"' in driven["drawn"]["options"]
+    assert driven["drawn"]["value"] == "default"
+    assert "hands are untested" in driven["drawn"]["note"]
+    assert "Reference shots only" in driven["drawn"]["title"]
+
+    # Accepted: one PUT, to the narrow route, carrying the select's own value -- and the state
+    # adopts the server's reply, so the confirmation Generate All shows is the stored bundle.
+    assert len(driven["accepted"]["sent"]) == 1
+    sent = driven["accepted"]["sent"][0]
+    assert sent["method"] == "PUT"
+    assert sent["path"] == "/api/projects/p1/sampling-profile"
+    assert json.loads(sent["body"]) == {"profile": "turbo-references2v"}
+    assert driven["accepted"]["stored"] == "turbo-references2v"
+    assert driven["accepted"]["value"] == "turbo-references2v"
+
+    # Refused (the harness rejects any unlisted path): the attempt was made, and the select is
+    # repainted from what the server still holds rather than left showing the Director's click.
+    assert driven["refused"]["sent"] == 1
+    assert driven["refused"]["stored"] == "turbo-references2v"
+    assert driven["refused"]["value"] == "turbo-references2v"
+
+    assert "Render Again" in driven["toast"] and "Generate All" in driven["toast"]
+
+
+def test_neither_render_path_sends_a_hardcoded_bundle_any_more():
+    """The defect itself, pinned from both ends so it cannot come back on either.
+
+    The batch button is *executed* -- the request it produces is read off the wire -- because that
+    is the half where "sends no profile" is a claim about bytes. "Render Again" is bound per
+    rendered shot rather than once at boot, so its body is asserted from the source; what makes
+    that assertion sound is that the literal it used to carry appears nowhere in the file.
+    """
+    driven = run_workspace(
+        """
+      state.project = { id: 'p1', name: 'Third Video', sampling_profile: 'turbo-references2v',
+        shots: [{ id: 'shot_a', status: 'ready', prompt: 'A singer', start: 0, duration: 5 }],
+        jobs: [] };
+      app.renderJobs();
+      answer(true);
+      requests.length = 0;
+      await fire('#queue-ready:click', {});
+      console.log(JSON.stringify({ asked: [...asked], sent: [...requests] }));
+    """,
+        {
+            "/api/projects/p1/generate/batch": {
+                "body": {"batch_id": "batch_1", "submitted": [], "skipped": []}
+            }
+        },
+    )
+
+    # The confirmation names the bundle the batch is about to spend.
+    assert len(driven["asked"]) == 1
+    assert "Bundle: Turbo References2V — 8 steps." in driven["asked"][0]
+
+    batch = next(sent for sent in driven["sent"] if sent["path"].endswith("/generate/batch"))
+    body = json.loads(batch["body"])
+    # No profile on the wire: the server resolves it from the project, which is what makes this
+    # button and Render Again incapable of disagreeing.
+    assert "profile" not in body, body
+    assert body["confirm_gpu"] is True
+
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "api.generateH3(projectId, shot.id, {})" in source
+    # The two hardcoded spellings that produced the split, gone from the render paths entirely.
+    assert 'profile: "turbo"' not in without_comments(source)
+    assert '{ confirm_gpu: true, scope: "flagged" }' in source
+
+
+def test_the_bundle_control_exists_in_the_queue_panel_and_hardcodes_no_option():
+    """Where the control is, and the one thing its markup must *not* carry.
+
+    The select ships **empty**. Its options are written by `renderSamplingProfile` from api.js's
+    `SAMPLING_PROFILES`, so the three names offered are the three the route's `Literal` accepts and
+    a bundle cannot be added on one side only — an `<option>` in the markup would be a second list
+    to keep true, and the one that drifts. The findings note ships empty for the same reason: a
+    hardcoded fallback sentence would be a second copy of the comparison's results.
+
+    In the render-queue panel, beside Generate All, and **not** in the system state where the VRAM
+    eject sits. That placement is the decision: the eject is a property of the machine, a bundle is
+    a property of this project's look, so it belongs where the batch it governs is launched.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    exports = run_module("""
+      import { SAMPLING_PROFILE_CONTROL, SAMPLING_PROFILE_LABEL, SAMPLING_PROFILE_NOTE }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        control: SAMPLING_PROFILE_CONTROL, label: SAMPLING_PROFILE_LABEL,
+        note: SAMPLING_PROFILE_NOTE,
+      }));
+    """)
+
+    control = re.search(r'<label class="replace-existing-line" id="sampling-profile-line".*?</label>', markup)
+    assert control, "the render queue no longer carries the bundle control"
+    assert 'id="{}"'.format(exports["control"].removeprefix("#")) in control.group(0)
+    assert exports["label"] in control.group(0), exports["label"]
+    # Empty on both counts, so neither list nor sentence exists twice.
+    assert "<option" not in control.group(0), control.group(0)
+    note_id = exports["note"].removeprefix("#")
+    assert f'id="{note_id}"></div>' in markup, "the findings note ships with a hardcoded sentence"
+
+    panel = re.search(r'<section class="panel" id="panel-queue".*?</section>', markup, re.DOTALL)
+    assert panel and f'id="{note_id}"' in panel.group(0)
+    assert 'id="sampling-profile"' in panel.group(0)
+    # Beside the batch button it governs, in the same actions row.
+    actions = re.search(r'<div class="heading-actions">.*?id="queue-ready".*?</div>', panel.group(0), re.DOTALL)
+    assert actions and 'id="sampling-profile"' in actions.group(0)
+
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert re.search(r"\.sampling-profile-note \{", styles), "the findings note has no style"

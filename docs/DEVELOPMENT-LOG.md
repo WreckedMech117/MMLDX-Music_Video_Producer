@@ -4,6 +4,288 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-23 — The sampling bundle becomes a visible choice, and the two render paths stop disagreeing
+
+Source: the Director's ruling on `docs/measurements/2026-08-23-bundle-comparison/index.html` —
+*"i get what you mean by waxy, she almost looks sweaty, but both still look good so up to user and
+perhaps the video style would benefit from it in some cases. … Its not necessarily the per frame
+speed that turbo really grants, its the lora that allows a decent video to be rendered in 4-8
+instead of 20 steps."*
+
+**No render, no ComfyUI submission, no model call.** `data/projects/project_59f14d19ff10` was not
+opened. Concurrent with another agent's small-defect backlog in `app.js`, `api.js`, `app.py` and
+`tests/test_frontend_contract.py`; every shared file was re-read immediately before editing, and no
+function was entered that the other agent was also in.
+
+### The defect, which is not the ruling
+
+The ruling was the occasion. The defect is that the two render paths silently shipped **different
+graphs for the same project**: both `api.generateBatch` call sites sent no `profile`, so
+`GenerateBatchRequest.profile` fell through to `"default"` — 20 steps, `res_multistep`, no LoRA —
+while `app.js`'s Render Again hardcoded `profile: "turbo"` — 4 steps and the `ref2v` LoRA at 0.7.
+Whether a shot rendered at 20 steps or 4 depended on which button was pressed, and nothing on
+screen named either number. This is what §6.7 of the attention experiment recorded and did not
+reconcile, because reconciling it was the same quality decision the Director has now made.
+
+### One setting, resolved once, server-side
+
+`Project.sampling_profile` (`SamplingProfile`, defaulted `"default"`). `H3Request.profile` and
+`GenerateBatchRequest.profile` became `SamplingProfile | None`, and `None` — which every shipped
+client now sends — resolves through `app.resolved_sampling_profile` to the project's choice.
+`generate_batch` submits through `generate_h3`, so the batch and the per-shot re-render ask the
+*same call*: one setting reaches both paths by construction rather than by two call sites agreeing.
+`None` is deliberately not `"default"`: an omitted bundle means *inherit*, a named one means the
+Director chose it for that submission, and the two branches that refuse a bundle they cannot apply
+now test `is not None` so they refuse only the named kind.
+
+**On the project rather than the machine**, which is the opposite of the VRAM eject beside it and
+for a stated reason. The eject is a property of the card — its own note says a shared project
+carrying one "would silently change how someone else's renders behave". A bundle is a property of
+the *look*; the Director's own word was "style". Two videos on one workstation must be able to
+disagree, and the choice must travel with the project directory to another machine. Its one writer
+is `PUT /api/projects/{id}/sampling-profile`; the generic full-project `PUT` re-adopts the stored
+value in both directions, which is the **tenth** recorded time that route has been the hole for a
+field a narrower sibling guards.
+
+### What the Director sees
+
+A `Bundle` select in the render-queue heading, beside Replace existing takes, with the step count
+in the option text rather than in a tooltip — `Default — 20 steps`, `Turbo References2V — 8 steps`,
+`Turbo LTX LoRA — 4 steps` — because "8 steps" is the information the ruling turns on. Underneath
+it, the comparison's findings in four sentences: lip-sync indistinguishable (envelope correlation
+within 0.005, lag within 0.1 ms), sharper rather than softer (+52% to +152% high-frequency energy)
+at the cost of waxier skin, a ~2.0× saving that comes from the step count and not from per-step
+speed, and **no hands in frame in any of the six renders, so hands are untested**. The hover text
+carries the scope: reference shots only. Generate All's confirmation names the bundle it is about
+to spend, which is the last moment before hours of GPU.
+
+Two smaller lies went with it. The batch progress line read `~2.7 min on turbo` for *every* batch —
+a hardcoded figure attributing every render to a bundle the batch had never used; it now names the
+chosen bundle and quotes a measured per-shot figure only where one exists (the 4-step bundle was
+not in the comparison, so it gets none rather than an interpolation from a step ratio).
+
+### Existing behaviour is the default, and it is digested
+
+An untouched project — and a manifest with no `sampling_profile` key at all, which is every
+existing project — submits the **byte-identical** payload, pinned against
+`H3_REFERENCE_PAYLOAD_DIGEST` and `H3_TEXT_PAYLOAD_DIGEST`, the digests this repository has carried
+since `f281606`. Render Again is the one behaviour that changes, and that change *is* the fix: it
+now renders what the project is set to instead of a hardcoded 4-step bundle nobody chose.
+
+**Scope, decided rather than defaulted.** The keyframe and text-only graphs load other checkpoints
+and have no evidenced bundle. A named non-default profile on one is refused exactly as before; an
+*inherited* project setting is not, and those shots render their own 20-step bundle. Refusing an
+inherited one would drop every keyframe and text-only shot out of Generate All the moment turbo was
+chosen — a worse silence than the one the refusal prevents — so the scope is stated on the control
+instead.
+
+### Tests
+
+Six new backend cases in `tests/test_api.py` (one setting reaching both routes with the payloads
+compared to each other as well as to the table; the untouched default digested; a manifest with the
+key stripped off disk loading and digesting unchanged; an unknown bundle refused on every door with
+the stored choice untouched; the generic `PUT` unable to clear *or* forge it; the named-vs-inherited
+scope through the batch) and six executed frontend cases in `tests/test_frontend_contract.py`. Two
+existing assertions were deliberately inverted and say so in place: `profile == "turbo"` on Render
+Again became `== {}`, and `None` left the unknown-profile list because an explicit `null` and an
+absent key now mean the same thing.
+
+**Mutation-checked: 15 mutants, 15 killed, 4 sentinels killed, 0 survivors.** In a git worktree
+with `PYTHONPATH` at its own `src` (verified by printing `music_video_producer.__file__` before the
+baseline — the editable `.pth` would otherwise import the live checkout and every mutant would
+"survive"), `read_bytes`/`write_bytes` restores, anchors converted to each file's own line endings
+with match counts asserted, `__pycache__` purged per run. The mutants include both halves of the
+old defect put back: Render Again re-hardcoding `turbo`, and each scope guard refusing an inherited
+bundle.
+
+### Recorded, not acted on
+
+The Director's *"Unknown if 'soft skin' in the prompt would counteract the effect"* is specified as
+an unrun experiment in §8 of `_bmad-output/planning-artifacts/h3-attention-backend-experiment.md`
+— extended rather than given a second file, because §6.13 and §7 of that document are the same
+thread. Nothing was run and no prompt clause was added anywhere.
+
+## 2026-08-23 — Clearing the found-but-not-fixed backlog: three silent controls, a library that went blank with ComfyUI, a rename that reached one asset, and five documents that contradicted the code
+
+Source: a backlog of items found across several days of work and recorded rather than fixed. **No
+render, no ComfyUI submission, no model call**, and `data/projects/project_59f14d19ff10` was not
+opened at all — the 43 orphaned job records that motivated item 3 were reasoned about from the code
+that produces them, not from that manifest. Concurrent with another agent's sampling-profile work
+in `app.js`, `api.js`, `app.py`, `models.py` and `workflows.py`; every shared file was re-read
+immediately before editing and the edits kept narrow.
+
+Two items were judged and deliberately **not** changed, and those judgements are the substance
+below rather than an omission from it.
+
+### 1. Duplicate and Delete pressed with nothing selected did nothing and said nothing
+
+`#split-shot` got a refusal for exactly this on 2026-08-21 — *"a control that appears to do
+nothing"* — and `#duplicate-shot` and `#delete-shot` sat either side of it still opening with a
+bare `return` on `!shot`. Delete is the worse of the two: it is the one timeline control that
+normally asks a question, so its silence is indistinguishable from a confirmation the Director
+dismissed.
+
+One template for all three (`NO_SHOT_SELECTED_REFUSAL`, verb substituted) rather than three
+sentences, and `SPLIT_NO_SHOT_REFUSAL` is now derived from it — three controls describing one state
+three ways is the drift a shared constant exists to prevent. Driven through the real handlers: one
+error toast each, the plan untouched, nothing written back, `window.confirm` never reached.
+
+**`#add-shot` was checked and is not in this class.** It needs no selection, and its one refusal —
+no project — already speaks through `requireProject`. `projectDuration` floors at 30 s, so there is
+no arithmetic path where it silently produces nothing either. Reported rather than "fixed".
+
+### 2. The Assets grid asked ComfyUI for every generated thumbnail
+
+`assetImageUrl` forked on `source`: uploads through the app, everything generated through
+`comfyOutputUrl` — ComfyUI's `/view`, on ComfyUI's origin, falling back to a hardcoded
+`127.0.0.1:8188` until `/api/health` answered. So the whole library went blank whenever ComfyUI was
+stopped, which is its ordinary state and happens for reasons that have nothing to do with browsing
+a library.
+
+**The honest cost turned out to be one route.** `resolve_asset_path` (`app.py`) already resolves an
+asset to a local file and already containment-checks it against the one root that asset's `source`
+allows; `read_shot_take` beside it already serves a take that way. `GET
+/api/projects/{id}/assets/{asset_id}/file` is `read_shot_take`'s shape with the asset lookup swapped
+in, and the browser now addresses every picture by id. The fork is gone, so a `source` nobody
+enumerated cannot fall through to `/view` either. That is proportionate, so the placeholder
+alternative was not taken.
+
+The empty-`path` early return stays exactly where it was: an asset with no output yet is a request
+that should not be made, and the grid already draws `RENDERING`/`NO PREVIEW` for it. The route 404s
+that case rather than inventing a second, quieter answer to a question the grid has already
+answered.
+
+**Not changed, and named here:** the Clips tab and `songAudioUrl` still use `/view`. The clips list
+is addressable only by path — the one thing ComfyUI serves and this application does not — and it
+already has a three-state online/offline face that says so. That is a different problem with a
+different fix.
+
+### 3. Jobs orphaned by a shot-list replace: retained, and now labelled
+
+A populate and a lay-out confirm both mint new ids for every window, and nothing prunes jobs —
+deliberately: `_adopt_job_measurements` states it as an invariant, *"no route in this application
+removes one"*. So after a re-plan the queue holds records pointing at shot ids that no longer exist.
+
+**Retention wins, and it is not close.** The takes those renders produced are still on disk, and the
+job record is the only thing linking a file to the render that made it: its seed, its frame count,
+its measured time, the batch it belonged to. `clipLibraryRows` builds the Clips tab *from the job
+list*, so pruning would delete the provenance of exactly the takes a Director goes looking for after
+a re-plan. Dropping is cheap to do and impossible to undo, and it would break a stated invariant to
+buy tidiness.
+
+**Left exactly as is was the option actually rejected.** The row fell back to `shotLabel`'s bare id
+— the dead text a 2026-08-20 finding removed from this very panel — and stayed marked `linked`, so
+clicking it set `selectedShotId` to an id no shot has and selected nothing. `jobTarget` now decides
+the label, the link and the carried shot id in one pure function: an orphan reads `shot_9f2c… — shot
+no longer on the plan`, carries the retention argument in its title, and is not clickable.
+
+**Not changed:** `renderSettledToast` and `clipLibraryRows` resolve the same `target_id` the same
+way, so a settle toast and a Clips row can still name a shot that is gone. Same defect class, and
+`jobTarget` is now available to both.
+
+### 4, 5. What a rename does not reach: two more consequences, said on the wire
+
+The response already enumerated three. It now enumerates five, on the same principle its own
+docstring states — *"a Director who is not told will read the first prompt they open as evidence the
+rename failed"*.
+
+**Derived children keep their own names.** `generate_multiview` composes `f"{source.name} ·
+multiview"` and `edit_asset` `f"{source.name} · edit"` **once, at the moment the child is minted**,
+and store the string. There is no live derivation to re-run. So renaming `HarderFaster` to `Lucy`
+leaves `HarderFaster · multiview` in the library and — for an ` · edit` child, which
+`citable_assets` does not hide the way it hides a multiview — on the roster the model reads. The
+measured prose leak was a *child*; the Director's fix worked because they renamed the child
+directly, and the same gesture on the parent would have looked like it worked and not have.
+
+**Reported rather than propagated, and that is the decision.** A child's name is editorial the
+moment it exists — this route treats a display name as the Director's to set, and the Director has
+already exercised that on a child. A propagating rename would silently overwrite exactly such a
+choice, and edits chain, so it would walk an unbounded tree from one gesture in an application with
+no undo for it. It would also have to assume the child's current name is still the derived form; if
+it is not, there is nothing to propagate. The counts (`children`, `children_stale`) are what turn
+"rename the child too" into an instruction rather than a guess. Direct children only: a grandchild's
+name was composed from its own parent's, not from this one's.
+
+**The prose scan's length fence, both directions.** `NAME_SCAN_MIN_LENGTH = 4` fences
+`assets_for_proposal`'s substring fallback. Renaming to `Ora` quietly ends the prose half for that
+picture; renaming to `Rain` starts it matching "grain" and "training". Neither breaks a plan —
+citations resolve by id — which is precisely why nobody would notice. Both are now sentences on the
+response: the short case names the floor and says declared citations are unaffected at any length,
+and the over-match case carries a count measured against **this plan's own prose**, excluding shots
+that already cite the asset (those cite it declared, and the fallback never runs for them). Evidence
+from the material at hand, not a dictionary. Extended rather than refused, as asked.
+
+### 6. Five documents that contradicted the code
+
+* `PopulateTimelineRequest.variance` said *"See `timeline.POPULATE_VARIANCE_DEFAULT` for why the
+  default is half."* The default is **1.0**, and the commit that added the line documents moving it
+  there. Replaced with a pointer to the measurement.
+* The same field claimed the step is *"capped so that at 1.0 one window per section lands exactly on
+  a band end"*. It does not: `_varied_durations` reserves `WINDOW_LAY_RESOLUTION` from every
+  window's room, so a saturated window lands a millisecond inside — and the transfer is the
+  **minimum** of that room and `(maximum - minimum) * pull`, so a section whose density barely
+  varies is capped by magnitude and saturates nobody at all. Both stated now.
+* `POPULATE_INSTRUCTION` still told the model *"each between 4 and 6 seconds"* and *"6-second
+  holds"* a day after the ceiling moved to 6.8. Numerically harmless — `populate_windows` scales
+  every proposal to its span, so only the ratios survive — but steering text that contradicts the
+  enforced band is what a later reader trusts. Both numbers are now read off `H3_MIN_SHOT_SECONDS`
+  and `POPULATE_MAX_WINDOW_SECONDS`, so they cannot drift again. `smoke_calliope_live.py`'s historical
+  reconstruction anchored on the literal `"each between 4 and 6 seconds."` and had silently stopped
+  matching, which turns a reconstruction into a copy of the shipped arm without failing; it now
+  builds the anchor from the same constants and **asserts the match**.
+* `_spend_room` claimed both halves of its `active` filter survived the mutation sweep as
+  equivalents and then, in the same breath, named the test that kills one of them. Re-executed one
+  mutant at a time before rewriting: the *room* half survives (a zero-room window would freeze on
+  the first pass and leave), the *weight* half is load-bearing and raises `ZeroDivisionError` on the
+  `share` line the moment it goes.
+* `docs/ROADMAP.md`'s suite count was stale again — 1805 against 1829 at this work's baseline, and
+  1851 after it and the concurrent sampling-profile stream landed. Re-measured, with the staleness
+  itself recorded on the line, since that paragraph exists to warn about exactly this.
+
+**Every branch added here was mutation-checked** in a `git worktree` with `PYTHONPATH` at its own
+`src`, `read_bytes`/`write_bytes` restores, a sentinel per run and `__pycache__` purged around each
+same-length edit: **14 mutants, 14 killed.** Two process findings worth keeping. Five multi-line
+anchors reported zero matches on the first pass because the checkout is CRLF and the harness's
+literals are LF — normalising the *anchor* to LF fixes nothing; the anchor has to take the file's
+own line ending. And one "SURVIVED" was a badly written mutant rather than a test gap:
+`"" or X if children else ""` parses as `"" or (X if children else "")`, which is a no-op, so it
+measured nothing. Rewritten as `if True`, it is killed. One genuine gap was found and closed: an
+h3 job with an **empty** `target_id` (`settle_unsubmitted_jobs`' shape) must keep the em-dash the
+panel has always drawn rather than claiming a shot was removed — there is no id to have lost.
+
+### 7. Two Outro shots with a byte-identical prompt — judged, not touched
+
+Both are song-audio `references` shots, so `attempt_expansion` takes the **prose** branch:
+`song_audio_prose` makes no model call at all and is pure string assembly, which is the whole reason
+that recipe measures 0.90–0.95 where the H3 document format synthesises its own score at ≤0.43.
+Identical inputs therefore give identical output *by construction*, not by defect.
+
+Its complete input list is the reference-map tag lines, `shot.prompt`, `use_song_audio`, `singing`,
+the section's look prompt, and the measured vocal overlap. **`shot.seed` is not in it** and never has
+been — it enters only the ComfyUI payload. So the two shots are already differentiated at the only
+layer where a difference is visible: one prompt, two takes. Duration enters only as a gate on
+whether the overlap clears `MIN_SINGING_VOCAL_SECONDS`; the section *label* does not enter the prose
+path at all, only the section's look. "Same section" and "same length" are not inputs that could have
+differed.
+
+Short of editing an intent, three things could change one shot's prose, and all three are hand edits
+to that shot's data rather than mechanisms: a different **per-shot `reference_labels` entry** for the
+same picture (`reference_map_tag_lines` applies it unconditionally, so the map moves and the intent
+does not); a different **citation set or role** (both the tag lines and the shot-local `<Picture N>`
+numbering follow it); or **moving the window** until the vocal overlap drops under 0.5 s, which
+removes the sings-to-camera clause but changes the shot's meaning rather than its wording. Taking one
+shot off the prose path would differentiate them for free — the document path reads index,
+neighbours, duration and section label — at the price of the song audio and the measured recipe,
+which is far more than the problem costs.
+
+There is **no variation or continuity hint** in either expansion path. The natural home for one is
+`shot_expansion_input`'s `neighbours` dict, which already carries the sibling intents, plus a clause
+in `h3_expansion_prompt.SEMANTIC_RULES` — but that is the document path, and the prose path has no
+such hook at all. Cross-shot variety is deliberately handled by the whole-plan passes upstream on the
+stated rule that a per-shot call cannot know it just repeated the previous shot. And the state is
+already **reported**: `readiness_report` carries `SHOTS_SHARE_ONE_PROMPT`, warn-only, and it reaches
+the Director through `readinessLines`. Left alone.
+
 ## 2026-08-23 — The render-timing instrument, corrected: a blank Took column, three inverted captions, and a guard that protected fields but not records
 
 Source: the adversarial review of the render-timing instrumentation that landed 2026-08-21. **No

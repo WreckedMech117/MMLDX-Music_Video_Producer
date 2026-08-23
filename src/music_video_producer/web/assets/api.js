@@ -1453,6 +1453,106 @@ export const QUEUE_WITHOUT_READY_SHOTS = "Mark a shot ready to queue H3";
 export const QUEUE_REPLACE_WITHOUT_TARGETS =
   "Mark a shot ready — or render something for Replace existing to re-render";
 
+// -- The sampling bundle: one choice, and both render paths obey it ---------------------------
+//
+// The Director's ruling of 2026-08-23, on the 8-step-vs-20-step comparison: turbo is "almost
+// sweaty" but "both still look good so **up to user**, and perhaps the video style would benefit
+// from it in some cases". Neither bundle is correct, so neither may be a silent default -- which
+// is exactly what both of them were. `api.generateBatch` sent no profile and got 20 steps;
+// "Render Again" hardcoded `turbo` and got 4. The same project rendered two different graphs
+// depending on which button was pressed, and nothing on screen named either number.
+//
+// **The choice is stored on the project, not on the machine.** That is the opposite of the VRAM
+// eject beside it, and deliberately: the eject is a property of the card, so a shared project
+// carrying one would change how someone else's renders behave. A bundle is a property of the
+// *look* -- the Director's own word was "style" -- so two videos on one workstation must be able
+// to disagree, and the choice must travel with the project directory to another machine. It is
+// written by `PUT /projects/{id}/sampling-profile` and by nothing else; the generic full-project
+// save re-adopts the stored value rather than trusting a body.
+//
+// Nothing here submits anything. The select writes the setting; the setting reaches submissions
+// server-side, where the profile is resolved -- so no failure on this path can reach a render,
+// and the worst case is a control that did not change.
+export const SAMPLING_PROFILE_CONTROL = "#sampling-profile";
+export const SAMPLING_PROFILE_NOTE = "#sampling-profile-note";
+export const SAMPLING_PROFILE_LABEL = "Bundle";
+
+//: The three evidenced bundles, in the order they are offered, each carrying the number that
+//: makes the choice mean something. The step count is in the option's own text rather than in a
+//: tooltip: "8 steps" is the information the ruling turns on, and a Director choosing a look must
+//: not have to hover to find out what it costs.
+//:
+//: `minutes` is a *measured* per-shot figure or `null`, never an estimate. Both numbers come from
+//: the one clean back-to-back pair in the 2026-08-23 comparison -- the 158-frame b-roll, 479.1 s
+//: against 236.6 s of ComfyUI execution -- so they are the same shot at the same length on the
+//: same card, which is the only comparison either number is good for. The 4-step `turbo` bundle
+//: was not in that comparison at all, so it carries `null` and this workspace quotes no figure
+//: for it rather than interpolating one from a step ratio.
+//:
+//: The values are the server's `SamplingProfile`, and `tests/test_frontend_contract.py` asserts
+//: this list and that `Literal` hold the same three names, so a select cannot offer a bundle the
+//: route would 422.
+export const SAMPLING_PROFILES = [
+  { value: "default", label: "Default — 20 steps", steps: 20, minutes: 8 },
+  { value: "turbo-references2v", label: "Turbo References2V — 8 steps", steps: 8, minutes: 4 },
+  { value: "turbo", label: "Turbo LTX LoRA — 4 steps", steps: 4, minutes: null },
+];
+
+//: What the comparison found, in the Director's own terms, under the control that acts on it.
+//: Four sentences and no essay -- the full evidence is the report, and this is what someone
+//: choosing needs to know without opening it. The last clause is the one that stops a wrong
+//: belief rather than reporting a result: nothing here is evidence about hands.
+export const SAMPLING_PROFILE_NOTE_TEXT =
+  "Measured 2026-08-23, 8 steps against 20, three shots at one seed: lip-sync is "
+  + "indistinguishable (envelope correlation within 0.005, lag within 0.1 ms) and turbo is "
+  + "sharper rather than softer (high-frequency energy +52% to +152%), at the cost of waxier "
+  + "skin. The saving is ~2.0×, and it comes from the step count, not from per-step speed. "
+  + "No hands were in frame in any of the six renders, so hands are untested.";
+
+//: The hover text: the scope, which is a real limit and not a caveat. A bundle names a
+//: *reference*-graph configuration; the first/last keyframe and text-only graphs load different
+//: checkpoints and have no evidenced bundle, so they go on rendering at 20 steps whatever is
+//: chosen here. Said out loud because the alternative -- a Director picking turbo and quietly
+//: getting 20 steps on some shots -- is the silent disagreement this control exists to end.
+export const SAMPLING_PROFILE_TITLE =
+  "Which evidenced H3 bundle this project renders on. It governs Generate All, Re-queue flagged "
+  + "and Render Again alike — one setting, every path. Reference shots only: first/last keyframe "
+  + "and text-only shots have no evidenced bundle and always render at 20 steps. Existing takes "
+  + "are not touched; a bundle change re-rolls the next take rather than re-rendering this one.";
+
+//: The stored choice, re-validated on every read. A manifest carrying a name this build does not
+//: know draws as `default` rather than as a blank select or an invented option — the same rule
+//: `default_setting_asset` applies server-side, and for the same reason: stale storage may cost a
+//: default, never a wrong state on screen.
+export function samplingProfileOf(project) {
+  const stored = project?.sampling_profile;
+  return SAMPLING_PROFILES.some((entry) => entry.value === stored) ? stored : "default";
+}
+
+//: One bundle's row, or the default's — never `undefined`, so every caller can read `.label`.
+export function samplingProfileSpec(name) {
+  return SAMPLING_PROFILES.find((entry) => entry.value === name) || SAMPLING_PROFILES[0];
+}
+
+//: What just changed, said in renders rather than in a select. Names the step count again,
+//: because the toast is the confirmation that the click did what the label promised.
+export function samplingProfileToast(name) {
+  const spec = samplingProfileSpec(name);
+  return `Reference shots will render on ${spec.label.replace(" — ", ", ")}. `
+    + "Generate All, Re-queue flagged and Render Again all use it.";
+}
+
+//: The batch-progress estimate, and the reason it is a function rather than a constant. The queue
+//: line read "~2.7 min on turbo" for every batch — a hardcoded figure attributing every render to
+//: a bundle the batch had *never* used, since `generateBatch` sent no profile and got 20 steps.
+//: It was not merely stale; it named the wrong graph. Now it names the bundle actually chosen and
+//: quotes a figure only where one was measured.
+export function batchEtaNote(profile, remaining) {
+  const spec = samplingProfileSpec(profile);
+  if (!spec.minutes || !remaining) return "";
+  return ` (~${Math.round(remaining * spec.minutes)} min on ${spec.label.split(" — ")[0]})`;
+}
+
 // Generate All's whole decision (spec-generate-all): the count the confirmation names,
 // the settled shots Replace Existing would re-open (approved and locked excluded — the
 // server names those in its report), and the readiness advisory as a heads-up rather
@@ -1492,14 +1592,31 @@ export function generateAllPlan(project, report = null, replaceExisting = false)
   const skipNote = blocked.length
     ? ` — ${blocked.length} will be skipped (${reasons.join(", ") || BATCH_SKIP_NOUN_UNKNOWN})`
     : "";
+  // The bundle the batch will actually render on, named in the confirmation — because this is the
+  // last moment before hours of GPU are spent, and until 2026-08-23 nothing anywhere told the
+  // Director whether they were about to spend 20 steps a shot or 4. The default's own cost
+  // sentence is kept word for word, so a Director who has touched nothing reads exactly what they
+  // read before; a chosen bundle adds its own measured figure beside it and never replaces it
+  // with an interpolation.
+  const bundle = samplingProfileSpec(samplingProfileOf(project));
+  const bundleNote = ` Bundle: ${bundle.label}.`;
+  const costNote = bundle.value === "default"
+    ? " A reference shot measured 288-438 s on the default profile."
+    : bundle.minutes
+      ? ` Measured ~${bundle.minutes} min a shot, about 2.0× faster than default (2026-08-23).`
+      : " Per-shot cost on this bundle is not measured.";
   return {
     disabled: false,
     count: targets.length,
     blocked,
+    // The button's own title stays about *what would queue* and says nothing about the bundle:
+    // the select sits beside it carrying the bundle's name and step count, and a tooltip
+    // repeating it would be a second copy to keep true. The confirmation is where the bundle
+    // belongs, because that is the click that spends the GPU.
     title: `Generate ${noun(targets.length)}${skipNote}`,
     confirm:
-      `Queue ${noun(targets.length)} as one batch?${skipNote ? `${skipNote}.` : ""} `
-      + "A reference shot measured 288-438 s on the default profile. "
+      `Queue ${noun(targets.length)} as one batch?${skipNote ? `${skipNote}.` : ""}`
+      + `${bundleNote}${costNote} `
       + "One confirmation covers the batch.",
   };
 }
@@ -1830,6 +1947,48 @@ export function shotLabel(project, shotId) {
   const shots = project?.shots || [];
   const index = shots.findIndex((item) => item?.id === shotId);
   return index < 0 ? String(shotId ?? "") : `SHOT ${String(index + 1).padStart(2, "0")} (${shotId})`;
+}
+
+// -- A job whose shot is no longer on the plan -------------------------------------------------
+//
+// A populate, a lay-out confirm and the generic shots `PUT` all replace `project.shots` wholesale,
+// and the first two **mint new ids for every window**. Nothing prunes jobs — deliberately, and
+// `_adopt_job_measurements` says so: "no route in this application removes one". So after a
+// populate the queue holds records pointing at shot ids that do not exist.
+//
+// **Retained rather than dropped, and that is the decision.** The takes those jobs produced are
+// still on disk, and the record is the only thing linking a file to the render that made it — its
+// seed, its frame count, its measured time, the batch it belonged to. `clipLibraryRows` builds the
+// Clips tab *from the job list*, so pruning would delete the provenance of exactly the takes a
+// Director goes looking for after a re-plan. Dropping is cheap to do and impossible to undo.
+//
+// What is **not** acceptable is the state before this: the row fell back to `shotLabel`'s bare id
+// — the dead text a 2026-08-20 finding removed from this very panel — and stayed marked `linked`,
+// so clicking it set `selectedShotId` to an id no shot has and quietly selected nothing.
+export const JOB_TARGET_DETACHED = "shot no longer on the plan";
+export const JOB_TARGET_DETACHED_TITLE =
+  "The shot this render was made for is not on the plan any more — a populate or a lay-out " +
+  "replaces every window and mints new shot ids. The record is kept on purpose: the take it " +
+  "produced is still on disk, and this row is the only thing that says which render made that " +
+  "file, with what seed and how long it took. There is no shot to open.";
+
+//: How the queue panel names one job's target and whether the row is a way back to it. Pure, so
+//: the "is this shot still here" question is answered once rather than three times inside a
+//: template literal.
+export function jobTarget(project, job) {
+  const targetId = job?.target_id || "";
+  if (job?.kind !== "h3" || !targetId) {
+    return { label: targetId || "—", shotId: "", linked: false, title: "" };
+  }
+  if (!(project?.shots || []).some((shot) => shot?.id === targetId)) {
+    return {
+      label: `${targetId} — ${JOB_TARGET_DETACHED}`,
+      shotId: "",
+      linked: false,
+      title: JOB_TARGET_DETACHED_TITLE,
+    };
+  }
+  return { label: shotLabel(project, targetId), shotId: targetId, linked: true, title: "" };
 }
 
 export function renderAgainNotice(project, shotId) {
@@ -3711,6 +3870,28 @@ export const MIN_WINDOW_SECONDS = 0.5;
 //: The shortest window a split can halve, which is twice the floor and nothing more interesting.
 export const SPLIT_MINIMUM_SECONDS = 2 * MIN_WINDOW_SECONDS;
 
+// -- The timeline controls that need a selection ----------------------------------------------
+//
+// One sentence for all three, because it is one situation: the Director pressed a control that
+// operates on *the selected shot* while nothing is selected. `#split-shot` got this sentence in
+// 2026-08-21; `#duplicate-shot` and `#delete-shot` sat beside it still returning on `!shot` and
+// saying nothing, which is the defect that thread was opened about rather than a variant of it.
+//
+// The verb is substituted rather than the whole sentence rewritten per control, so the three
+// cannot drift into three different accounts of the same state — and the second half, the gesture
+// that fixes it, is identical for all of them because the fix genuinely is the same click.
+//
+// `#add-shot` is deliberately **not** here: it needs no selection, and its one refusal (no
+// project) already speaks through `requireProject`.
+export const NO_SHOT_SELECTED_REFUSAL =
+  "No shot is selected, so there is nothing to {verb}. Click a clip on the timeline first.";
+
+//: The refusal one selection-hungry control says, or `""` when it has its shot and may proceed.
+//: Pure and shared, so a fourth control added later cannot invent a fourth wording.
+export function noShotSelectedRefusal(shot, verb) {
+  return shot ? "" : NO_SHOT_SELECTED_REFUSAL.replace("{verb}", verb);
+}
+
 // -- ✂ Split, when the window is too short to halve -------------------------------------------
 //
 // `#split-shot` refused a window under a second and said **nothing at all** — the same shape as
@@ -3718,8 +3899,7 @@ export const SPLIT_MINIMUM_SECONDS = 2 * MIN_WINDOW_SECONDS;
 // sentence, and it explains the arithmetic rather than scolding: a 0.5 s window is a real thing
 // the Director creates deliberately, and the reason it cannot be split is that halving it lands
 // under the floor every drag in this workspace already stops at.
-export const SPLIT_NO_SHOT_REFUSAL =
-  "No shot is selected, so there is nothing to split. Click a clip on the timeline first.";
+export const SPLIT_NO_SHOT_REFUSAL = NO_SHOT_SELECTED_REFUSAL.replace("{verb}", "split");
 export const SPLIT_TOO_SHORT_REFUSAL =
   "{shot} is {seconds}s long. A split halves the window, so each half would be {half}s — under " +
   "the {minimum}s floor a shot window can be dragged to, which is why there is no cut to make " +
@@ -3735,7 +3915,7 @@ function splitSeconds(value) {
 // windows it produces. Pure, so the rule is executed by the contract rather than read out of a
 // one-line click handler.
 export function splitShotPlan(project, shot) {
-  if (!shot) return { ok: false, refusal: SPLIT_NO_SHOT_REFUSAL, halves: [] };
+  if (!shot) return { ok: false, refusal: noShotSelectedRefusal(shot, "split"), halves: [] };
   const duration = Number(shot.duration) || 0;
   if (duration < SPLIT_MINIMUM_SECONDS) {
     return {
@@ -4734,6 +4914,11 @@ export const api = {
   // the stored slot per asset id and can never write this field, so no ordinary save can un-slot
   // the cast and leave every `(S1)` in the sheet resolving to nothing.
   saveCharacterSlot: (projectId, assetId, character_slot) => request(`/api/projects/${projectId}/assets/${assetId}/character-slot`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ character_slot }) }),
+  // The sampling bundle's one door, on the same argument as the two above: the whole-project PUT
+  // re-adopts the stored profile and can never write this field, so a stale tab cannot reassert
+  // the bundle it was holding and spend a batch on a graph nobody selected. The reply is the whole
+  // project, which is what lets the select repaint from the server rather than from the click.
+  saveSamplingProfile: (projectId, profile) => request(`/api/projects/${projectId}/sampling-profile`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ profile }) }),
   // The display name's one door, on the same argument as the two above — and here the hazard runs
   // the other way: `name` is required, so a stale tab does not omit it, it *reasserts* it, and one
   // ordinary save would undo a rename. The whole-project PUT re-adopts the stored name per asset

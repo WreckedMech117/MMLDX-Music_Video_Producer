@@ -82,6 +82,7 @@ from .h3_prompt import check_reference_bounds, normalize_audio_fields
 from .models import (
     ASSET_ROLE_LABELS,
     CHARACTER_SLOT_LIMIT,
+    NAME_SCAN_MIN_LENGTH,
     NOTICE_RAW_LIMIT,
     SHOT_MODE_SPECS,
     Asset,
@@ -89,6 +90,7 @@ from .models import (
     MessageNotice,
     Project,
     RenderJob,
+    SamplingProfile,
     Shot,
     ShotStatus,
     SingingState,
@@ -2616,9 +2618,17 @@ def populate_required_shots(duration: float) -> int:
 POPULATE_INSTRUCTION = (
     "Lay out the complete shot plan for this music video. Return EXACTLY {count} shots. "
     "The song is {duration:.1f} seconds long; cover it entirely from 0 to {duration:.1f} "
-    "with contiguous shots — no gaps, no overlaps — each between 4 and 6 seconds. "
-    "Deliberately mix lengths inside that band: quick 4-second cuts on "
-    "high-energy beats, 6-second holds on glamour or establishing moments; do not make "
+    # The two numbers are read off the enforced band rather than spelled again, because they
+    # have already drifted once: the ceiling moved 6.0 → 6.8 (Director ruling, 2026-08-23) and
+    # this steering text went on saying "4 and 6" for a day. Numerically it was harmless —
+    # `populate_windows` scales every proposal to its span, so only the *ratios* the model
+    # returns survive — but an instruction that contradicts the band it is enforcing against is
+    # the kind of thing a later reader trusts.
+    f"with contiguous shots — no gaps, no overlaps — each between {H3_MIN_SHOT_SECONDS:g} and "
+    f"{POPULATE_MAX_WINDOW_SECONDS:g} seconds. "
+    f"Deliberately mix lengths inside that band: quick {H3_MIN_SHOT_SECONDS:g}-second cuts on "
+    f"high-energy beats, {POPULATE_MAX_WINDOW_SECONDS:g}-second holds on glamour or "
+    "establishing moments; do not make "
     "every shot the same length. Follow the treatment and style bible; use the song's "
     "lyrics to place performance moments where the words are. Every shot carries its own "
     "`performance` flag: answer it on each shot — true where a character sings the song "
@@ -4336,13 +4346,24 @@ class PopulateTimelineRequest(BaseModel):
     #: How much of the room H3's band leaves the lay-out step may spend making its windows
     #: different lengths — Phase D, and the Director's standing complaint that "shot lengths all
     #: look the exact same". A **fraction of what is available**, never a number of seconds: the
-    #: step is capped so that at 1.0 one window per section lands exactly on a band end, so 1.0
-    #: is all the variance the band allows rather than merely a lot of it.
+    #: step is capped at *all* the room there is, so 1.0 is the whole of what the band allows
+    #: rather than merely a lot of it, and `POPULATE_VARIANCE_MAX` refuses anything larger.
+    #:
+    #: **1.0 does not mean any window reaches its band end**, and the earlier wording here said
+    #: it did. Two things stop it, both in `timeline._varied_durations`: each window's room is
+    #: its distance to the band end *less* `WINDOW_LAY_RESOLUTION`, so a saturated window lands
+    #: a millisecond inside rather than exactly on; and the transfer is the **minimum** of that
+    #: room and the band's width times the deviations being spread, so a section whose density
+    #: barely varies is capped by magnitude and saturates nobody at all. That second cap is the
+    #: "magnitude is respected, not just shape" rule, and it binds first far more often than the
+    #: room does.
     #:
     #: **0 is the feature switched off and is a genuine no-op** — the windows are the ones
     #: `populate_windows` has always tiled, and that arm is what the byte digests are pinned
     #: through. So is a song nobody has transcribed: no word times, no density, no variance.
-    #: See `timeline.POPULATE_VARIANCE_DEFAULT` for why the default is half.
+    #: The default is `POPULATE_VARIANCE_MAX` itself; see `timeline.POPULATE_VARIANCE_DEFAULT`
+    #: for the measurement that moved it there, and for why a dial whose default sits on its own
+    #: bound is still a dial — it exists to be turned **down**.
     variance: float = Field(
         default=POPULATE_VARIANCE_DEFAULT, ge=0, le=POPULATE_VARIANCE_MAX
     )
@@ -5178,7 +5199,11 @@ class GenerateBatchRequest(BaseModel):
     confirm_gpu: bool = False
     scope: Literal["ready", "flagged"] = "ready"
     replace_existing: bool = False
-    profile: Literal["default", "turbo", "turbo-references2v"] = "default"
+    # `None` rather than `"default"`, and the distinction is the whole of the fix: an omitted
+    # profile now means "whatever this project is set to", which is how one setting reaches the
+    # batch and the single-shot re-render alike. A named one still overrides for that submission.
+    # See `H3Request.profile`, whose `None` this is handed straight to.
+    profile: SamplingProfile | None = None
 
 
 class BatchSubmittedShot(BaseModel):
@@ -5261,12 +5286,49 @@ ASSET_NAME_TOO_LONG = (
 #: model or a person wrote, and this route does not edit anybody's prose).
 ASSET_RENAME_APPLIED = (
     "Renamed {previous} to {name}. Every citation follows the asset by id, so no shot lost its "
-    "reference{maps}.{prompts}"
+    "reference{maps}.{prompts}{children}{scan}"
 )
 ASSET_RENAME_MAPS = ", and {count} reference map(s) were re-derived under the new name"
 ASSET_RENAME_PROMPTS = (
     " {count} shot prompt(s) still spell {previous}: a rename does not rewrite prose that was "
     "already written, so those keep the old name until they are re-expanded or cleaned."
+)
+#: The fourth consequence, added 2026-08-23: a rename reaches the one asset it was pointed at.
+#:
+#: `generate_multiview` mints its child as `f"{source.name} · multiview"` and `edit_asset` as
+#: `f"{source.name} · edit"`, **frozen at creation** — there is no derivation to re-run, only a
+#: string that was composed once. So renaming a parent leaves the child spelling the old name in
+#: the library, in `citable_assets`, and (for an ` · edit` child, which `citable_assets` does not
+#: hide) on the roster the model reads.
+#:
+#: **Reported rather than propagated, and that is a decision.** A child's name is editorial the
+#: moment it exists: this very route treats the whole display name as the Director's to set, and
+#: the Director's own successful fix was renaming the *child* directly. A parent rename that
+#: rewrote its children would silently overwrite exactly that — and edits chain, so it would walk
+#: an unbounded tree from one gesture, in an application with no undo for it. The count is what
+#: makes the alternative actionable: rename the child on this same route.
+ASSET_RENAME_CHILDREN = (
+    " {count} derived asset(s) keep their own names and this rename did not reach them; {stale} "
+    "still spell {previous}. A ` · multiview` or ` · edit` suffix is frozen into the child's "
+    "name when it is minted, so rename each child on this same route."
+)
+#: The prose fallback, and the two ways a rename walks a name across its fence without saying so.
+#:
+#: `models.assets_for_proposal` cites an asset two ways: what the shot *declared* — by id or by
+#: exact display name, and exact is exact at any length — and, as a fallback, whether the shot's
+#: own prose contains the name. The fallback is a plain case-insensitive substring test, which is
+#: why it is fenced below `NAME_SCAN_MIN_LENGTH`. A rename is the one gesture that can move a name
+#: from one side of that fence to the other, and neither direction breaks anything a Director
+#: would notice at the time: citations resolve by id, so the plan keeps working either way.
+ASSET_RENAME_UNSCANNABLE = (
+    " {name} is {length} character(s), under the {minimum}-character floor the prose scan will "
+    "trust, so a shot that names this picture in its prose without citing it no longer picks it "
+    "up. Declared citations are unaffected — those match by id or exact name, at any length."
+)
+ASSET_RENAME_OVER_MATCHES = (
+    " {count} shot prompt(s) in this plan already contain {name} without citing this picture: "
+    "the prose scan is a plain substring test, so a short name sitting inside an ordinary word "
+    "matches it. Those shots would pick this picture up the next time they are filled in."
 )
 
 
@@ -5292,10 +5354,13 @@ class AssetRenameResponse(BaseModel):
     `SnapCutsResponse`' shape — the project a client adopts, beside a message a person reads —
     rather than the bare `Project` its two sibling asset routes return, and the difference is
     earned: setting an anchor or a slot has no consequence outside the field, while a rename
-    has three, two of which are invisible from the manifest. Citations survive (they are by id),
-    reference maps are re-derived where they can be for free, and **prose already written keeps
-    the old name**. A Director who is not told the third will read the first prompt they open as
-    evidence the rename failed.
+    has five, four of which are invisible from the manifest. Citations survive (they are by id),
+    reference maps are re-derived where they can be for free, **prose already written keeps
+    the old name**, **derived children keep their own names**, and the new spelling may sit on
+    the other side of the prose scan's length fence from the old one. A Director who is not told
+    the third will read the first prompt they open as evidence the rename failed; a Director not
+    told the fourth will believe a leak is closed that is still open on a child; and neither of
+    the fifth's two directions is visible from anywhere.
     """
 
     project: Project
@@ -5307,6 +5372,17 @@ class AssetRenameResponse(BaseModel):
     prompts: int = 0
     #: Reference maps `refresh_reference_maps` was able to re-derive for free under the new name.
     maps: int = 0
+    #: Assets minted *from* this one (`Asset.parent_id`), which this route does not rename.
+    children: int = 0
+    #: How many of those still spell the old name — the ones with something left to do.
+    children_stale: int = 0
+    #: Whether the new name reaches `NAME_SCAN_MIN_LENGTH`, and so whether the prose fallback in
+    #: `assets_for_proposal` will consider it at all. `True` is the ordinary case and says nothing.
+    scannable: bool = True
+    #: Shots whose prose already contains the **new** name without citing this asset — the
+    #: over-match the substring scan would make. Zero when the name is too short to be scanned,
+    #: because a name the scan skips cannot over-match either.
+    prose_matches: int = 0
     message: str = ""
 
 
@@ -5612,11 +5688,51 @@ class H3Request(BaseModel):
     # it defaulted to here before.
     steps: int | None = Field(default=None, ge=1, le=100)
     ref_image_size: Literal["match", "max"] = "match"
-    # The literal is spelled out rather than derived from `H3_REFERENCE_PROFILES`, because
-    # a `Literal` is what puts the choices in `/openapi.json` and turns an unknown value
-    # into a 422 before any payload is built. `tests/test_api.py` asserts the two lists
-    # agree, so a profile added to the builder and not offered here fails loudly.
-    profile: Literal["default", "turbo", "turbo-references2v"] = "default"
+    # `None` rather than `"default"`, for `steps`' reason one field over: an omitted profile has
+    # to be distinguishable from one the Director named. It resolves to `Project.sampling_profile`
+    # — the one place the choice is stored — so the batch, "Render Again" and a hand-rolled API
+    # call all render the bundle the project is set to, instead of the two disagreeing silently
+    # (the batch sent nothing and got 20 steps; `app.js` hardcoded `turbo` and got 4).
+    #
+    # A named profile still wins for that one submission, and it is a *different request* from an
+    # inherited one: the keyframe and text-only branches refuse a named non-default bundle,
+    # because naming a bundle those graphs cannot apply is the silent mis-logging this route
+    # refuses, while a project-wide preference is a standing choice only the reference graph has
+    # evidence for and those branches simply render their own way.
+    #
+    # `SamplingProfile` is imported rather than re-spelled — the `Literal` inside it is still what
+    # puts the choices in `/openapi.json` and turns an unknown value into a 422 before any payload
+    # is built. `tests/test_api.py` asserts it and the builder's table agree, so a profile added to
+    # the builder and not offered here fails loudly.
+    profile: SamplingProfile | None = None
+
+
+class SamplingProfileRequest(BaseModel):
+    """The Director's bundle choice, and deliberately nothing else beside it.
+
+    One field, for `AssetConsistencyRequest`'s reason: a body carrying anything else would make an
+    omission indistinguishable from a clear, which is the exact shape that made the generic
+    full-project `PUT` a data-loss hole nine times. There is no "clear" here — a project always has
+    a bundle — so the field is required rather than defaulted, and a body that omits it is a 422
+    rather than a silent reset to 20 steps.
+    """
+
+    profile: SamplingProfile
+
+
+def resolved_sampling_profile(requested: SamplingProfile | None, project: Project) -> str:
+    """Which bundle a submission renders on: the one it named, or the project's standing choice.
+
+    The one place that decision is made, which is what makes "one setting governs both paths"
+    true by construction rather than by two call sites agreeing. `generate_batch` submits through
+    `generate_h3`, and `generate_h3` asks this — so the batch button, the per-shot re-render and a
+    hand-rolled API call cannot disagree about a project's bundle the way they did until now.
+
+    `None` is not `"default"`. An omitted profile means *inherit*; `"default"` means the Director
+    (or a test) named the 20-step bundle for this submission, which is why the caller keeps
+    `request.profile` around for the branches that refuse a *named* bundle they cannot apply.
+    """
+    return project.sampling_profile if requested is None else requested
 
 
 # A flag a client omits and a flag a client sends as `null` mean the same thing — "I am not
@@ -7013,6 +7129,17 @@ def create_app(
         # the Director's choice. `PUT .../default-setting` is its one writer, which also keeps
         # it out of reach of anything a model can call.
         project.default_setting_id = current.default_setting_id
+        # The chosen sampling bundle is server-owned on the identical argument, and this is the
+        # **tenth** recorded time this one route has been the hole for a field a narrower sibling
+        # guards. `sampling_profile` is a defaulted `Literal`, so every client written before it
+        # existed — and every hand-rolled API call — sends nothing, Pydantic fills `"default"`,
+        # and one ordinary save would put a turbo project silently back on 20 steps: the
+        # Director's choice of look undone by a rename. It fails the *other* way too, which is
+        # the half a bare default would miss: a stale browser tab left open across a bundle
+        # change reasserts the bundle it was holding, so the next Generate All spends hours of
+        # GPU on a graph nobody selected. `PUT .../sampling-profile` is its one writer, which is
+        # also what keeps it out of reach of anything a model can call.
+        project.sampling_profile = current.sampling_profile
         # The recorded map is server-owned here for the fifth time this exact hole has been found
         # in this exact route. See `_adopt_expansion_maps`.
         _adopt_expansion_maps(project, {shot.id: shot for shot in current.shots})
@@ -7540,6 +7667,24 @@ def create_app(
         so a rename changes what every citing shot's map says about this picture. Free to
         re-derive for the prose shots, recorded as stale for the rest.
 
+        **Derived children keep their own names, and it is said on the wire (2026-08-23).** The
+        ` · multiview` and ` · edit` suffixes are composed once, at the moment the child is
+        minted, and stored — there is no live derivation to re-run. Renaming `HarderFaster` to
+        `Lucy` therefore leaves `HarderFaster · multiview` spelling the old name in the library
+        and, for an ` · edit` child, on the roster the model reads (`citable_assets` hides a
+        multiview behind its source; it does not hide an edit). The Director's own fix worked
+        because they renamed the *child*; the same gesture on the parent would not have. See
+        `ASSET_RENAME_CHILDREN` for why this is reported rather than propagated.
+
+        **The prose scan's length fence is named too**, both directions. Under
+        `NAME_SCAN_MIN_LENGTH` the substring fallback stops considering the name at all —
+        renaming to `Ora` quietly ends the prose half of `assets_for_proposal` for this picture.
+        At or over it, a name that is a substring of ordinary English starts matching them —
+        `Rain` is inside "grain" and "training". Neither breaks a plan, because citations resolve
+        by id; both change what a *future* fill cites, which is why the route says so rather than
+        refusing. `ASSET_RENAME_OVER_MATCHES`' count is measured against this plan's own prose:
+        evidence from the material at hand, not a dictionary.
+
         Nothing renders, arms, queues or approves; `comfy` is not touched on any path.
         """
         project = get_project(project_id)
@@ -7562,6 +7707,30 @@ def create_app(
         # renaming away from. `NAME_SCAN_MIN_LENGTH` is not applied — this is a report about
         # exact text, not the substring scan that has to defend itself against short names.
         prompts = sum(1 for shot in project.shots if previous and previous in shot.prompt)
+        # Direct children only, and deliberately not the transitive tree: an edit of an edit is a
+        # child of the picture it was edited from, and its name was composed from *that* one's.
+        # Naming a grandchild here would claim this rename should have reached a string it was
+        # never composed from.
+        children = [item for item in project.assets if item.parent_id == asset.id]
+        children_stale = sum(1 for item in children if previous and previous in item.name)
+        # The prose scan's fence, measured on the name that is landing rather than the one
+        # leaving. `assets_for_proposal` lowercases both sides, so this does too; the over-match
+        # count excludes shots that already cite this asset, because those cite it *declared* and
+        # the fallback never runs for them.
+        scannable = len(name) >= NAME_SCAN_MIN_LENGTH
+        lowered = name.casefold()
+        prose_matches = (
+            sum(
+                1
+                for shot in project.shots
+                if lowered in shot.prompt.casefold()
+                and not any(
+                    citation.asset_id == asset.id for citation in shot.citations
+                )
+            )
+            if scannable
+            else 0
+        )
         # Written onto the *stored* Asset rather than a rebuilt one, `replace_consistency_prompt`'s
         # rule: there is no construction site here where `path`, `source`, `parent_id` or
         # `prompt_id` could be defaulted away by an edit that was only ever about one string.
@@ -7573,6 +7742,10 @@ def create_app(
             previous=previous,
             prompts=prompts,
             maps=len(maps),
+            children=len(children),
+            children_stale=children_stale,
+            scannable=scannable,
+            prose_matches=prose_matches,
             message=ASSET_RENAME_APPLIED.format(
                 previous=previous or "this asset",
                 name=name,
@@ -7580,6 +7753,28 @@ def create_app(
                 prompts=(
                     ASSET_RENAME_PROMPTS.format(count=prompts, previous=previous)
                     if prompts
+                    else ""
+                ),
+                children=(
+                    ASSET_RENAME_CHILDREN.format(
+                        count=len(children),
+                        stale=children_stale,
+                        previous=previous or "the old name",
+                    )
+                    if children
+                    else ""
+                ),
+                # One sentence or the other, never both: a name the scan skips cannot over-match,
+                # and `prose_matches` is already zero in that case.
+                scan=(
+                    ASSET_RENAME_UNSCANNABLE.format(
+                        name=name, length=len(name), minimum=NAME_SCAN_MIN_LENGTH
+                    )
+                    if not scannable
+                    else ASSET_RENAME_OVER_MATCHES.format(
+                        count=prose_matches, name=name
+                    )
+                    if prose_matches
                     else ""
                 ),
             ),
@@ -7687,6 +7882,42 @@ def create_app(
                 ),
             )
         project.default_setting_id = asset_id
+        return store.save(project)
+
+    @app.put("/api/projects/{project_id}/sampling-profile", response_model=Project)
+    def replace_sampling_profile(
+        project_id: str, request: SamplingProfileRequest
+    ) -> Project:
+        """Choose which evidenced H3 bundle this project's reference shots render on.
+
+        The Director's ruling of 2026-08-23, on the 8-step-vs-20-step comparison: turbo is
+        "almost sweaty" but "both still look good so **up to user**, and perhaps the video style
+        would benefit from it in some cases". Neither bundle is correct, so neither may be a
+        silent default — which is what both of them were. `api.generateBatch` sent no profile and
+        got 20 steps; `app.js`'s "Render Again" hardcoded `turbo` and got 4. The same project
+        rendered two different graphs depending on which button was pressed, and nothing on
+        screen named either number. **That** is what this route closes; the ruling is the
+        occasion, not the defect.
+
+        **One door, and every render path comes through it.** Nothing else writes the field —
+        the generic full-project `PUT` re-adopts the stored value in both directions
+        (`replace_default_setting`'s rule, for the reason that route's docstring gives), no tool
+        schema exposes it to a model, and `populate` does not touch it. So a bundle change is
+        always a thing the Director did, on the control that says what it costs.
+
+        **Nothing here renders, and nothing here changes an existing take.** It is a declaration
+        about the next submission. Takes already on disk were rendered on whatever bundle was
+        chosen then, and this route does not relabel them — a bundle change re-rolls the take
+        rather than re-rendering it better, so a sweep over a plan the Director already has would
+        be the silent bulk edit this codebase's report-then-confirm convention forbids.
+
+        **Reference shots only**, which is the field's own scope and not a caveat added here: the
+        keyframe and text-only graphs load different checkpoints and have no evidenced bundle, so
+        they go on rendering at 20 steps whatever is chosen. `generate_h3` implements exactly
+        that, and the control in the browser says it in one clause.
+        """
+        project = get_project(project_id)
+        project.sampling_profile = request.profile
         return store.save(project)
 
     @app.delete("/api/projects/{project_id}/assets/{asset_id}", response_model=Project)
@@ -7996,6 +8227,35 @@ def create_app(
         if media_root not in target.parents or not target.is_file():
             raise HTTPException(status_code=404, detail="Media not found")
         return FileResponse(target)
+
+    @app.get("/api/projects/{project_id}/assets/{asset_id}/file")
+    def read_asset_file(project_id: str, asset_id: str) -> FileResponse:
+        """One asset's bytes, served from disk by this application.
+
+        The Assets grid used to point every generated thumbnail at ComfyUI's `/view`, so the
+        whole library went blank whenever ComfyUI was down — which is routine, and down for
+        reasons that have nothing to do with browsing a library. The bytes were never
+        ComfyUI's to withhold: `resolve_asset_path` already reads them off the same disk this
+        process is running on, and `read_shot_take` beside it already serves a take that way.
+
+        **Addressed by id, never by path**, which is the difference between this and `/view`.
+        The path is read from the manifest, and `resolve_asset_path` containment-checks the
+        result against the one root that asset's `source` allows — so a manifest edited to
+        carry `../../` resolves outside the root and 404s rather than serving it.
+
+        An asset with no output yet 404s here rather than being special-cased: the browser
+        already decides *not to ask* when `path` is empty (it draws `RENDERING`/`NO PREVIEW`
+        instead), and a route that invented a placeholder would be a second, quieter answer to
+        a question the grid has already answered.
+
+        Nothing renders, queues or approves, and `comfy` is not touched on any path — that is
+        the whole point.
+        """
+        project = get_project(project_id)
+        asset = next((item for item in project.assets if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return FileResponse(resolve_asset_path(project_id, asset))
 
     @app.get("/api/workflows")
     def workflows() -> list[dict[str, Any]]:
@@ -8892,7 +9152,10 @@ def create_app(
                     # "use the profile's own count" — see `H3Request.steps`.
                     steps=request.steps,
                     ref_image_size=request.ref_image_size,
-                    profile=request.profile,
+                    # The Director's standing choice unless this submission named one — the
+                    # single place a bundle is decided, so the batch and "Render Again" cannot
+                    # ship different graphs for the same project. See `resolved_sampling_profile`.
+                    profile=resolved_sampling_profile(request.profile, project),
                     prefix=f"music-video-producer/{project_id}/shots/{shot.id}-h3-reference",
                 )
             except ValueError as error:
@@ -8905,7 +9168,16 @@ def create_app(
             # Refused rather than ignored, for the text-only branch's exact reason: a GPU job
             # logged under a configuration that was never applied is worse than a refusal,
             # because only the refusal is visible.
-            if request.profile != H3_DEFAULT_PROFILE:
+            #
+            # `is not None` is the whole of the difference between a *named* profile and an
+            # *inherited* one, and it is deliberate. A named bundle this graph cannot apply is
+            # still refused, word for word as before. A project-wide `sampling_profile` is not a
+            # request about this shot: it is a standing preference that only the reference graph
+            # has evidence for, so a keyframe shot in a turbo project renders on its own bundle
+            # rather than being skipped. Refusing it would make choosing turbo quietly drop every
+            # keyframe shot out of Generate All, which is a worse silence than the one this
+            # branch exists to prevent — and the control names the scope where it is set.
+            if request.profile is not None and request.profile != H3_DEFAULT_PROFILE:
                 raise HTTPException(
                     status_code=422,
                     detail=(
@@ -9026,7 +9298,11 @@ def create_app(
             # default one, with nothing anywhere recording that the request was not
             # honoured. A GPU job logged under a configuration that was never applied is
             # worse than a refusal, because only the refusal is visible.
-            if request.profile != H3_DEFAULT_PROFILE:
+            #
+            # `is not None` for the keyframe branch's reason, which is the same reason here: a
+            # bundle the Director *named* on a text-only Shot is refused exactly as before, and a
+            # project-wide standing choice is not a claim about this Shot. See that branch.
+            if request.profile is not None and request.profile != H3_DEFAULT_PROFILE:
                 raise HTTPException(
                     status_code=422,
                     detail=(
@@ -9245,6 +9521,11 @@ def create_app(
                             candidate.seed += RESUBMIT_SEED_STRIDE
                             store.save(fresh)
                             break
+                # `request.profile` is `None` for every client that does not override, and
+                # `generate_h3` resolves that to `Project.sampling_profile`. So the batch renders
+                # the bundle the Director chose, and it is the *same* resolution the per-shot
+                # re-render gets, because it is the same call. Until 2026-08-23 this route sent
+                # `"default"` (20 steps) while `app.js` hardcoded `"turbo"` (4) one button over.
                 job = await generate_h3(
                     project_id, target.id, H3Request(profile=request.profile)
                 )

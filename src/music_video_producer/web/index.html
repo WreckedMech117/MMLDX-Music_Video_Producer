@@ -402,8 +402,15 @@
       <section class="panel" id="panel-queue" aria-labelledby="queue-heading">
         <div class="workspace-heading">
           <div><span class="eyebrow">ComfyUI orchestration</span><h1 id="queue-heading">Render queue</h1></div>
-          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="quiet-button" id="queue-flagged" hidden title="Resubmit every flagged shot as one batch; each success clears that shot's flag">Re-queue flagged</button><button class="quiet-button" id="mark-all-ready" title="Commit every unlocked draft shot to the render queue in one pass — the per-shot Mark ready, forty times, without forty clicks.">Mark all drafts ready</button><label class="replace-existing-line" title="Also re-render settled shots (complete or error). Approved and locked shots are never touched — the batch report names them."><input type="checkbox" id="replace-existing"> Replace existing takes</label><button class="primary-button" id="queue-ready" disabled title="Mark a shot ready to queue H3">Generate All</button></div>
+          <div class="heading-actions"><button class="quiet-button" id="refresh-jobs">Refresh</button><button class="quiet-button" id="queue-flagged" hidden title="Resubmit every flagged shot as one batch; each success clears that shot's flag">Re-queue flagged</button><button class="quiet-button" id="mark-all-ready" title="Commit every unlocked draft shot to the render queue in one pass — the per-shot Mark ready, forty times, without forty clicks.">Mark all drafts ready</button><label class="replace-existing-line" id="sampling-profile-line">Bundle <select id="sampling-profile"></select></label><label class="replace-existing-line" title="Also re-render settled shots (complete or error). Approved and locked shots are never touched — the batch report names them."><input type="checkbox" id="replace-existing"> Replace existing takes</label><button class="primary-button" id="queue-ready" disabled title="Mark a shot ready to queue H3">Generate All</button></div>
         </div>
+        <!-- What the 8-step-vs-20-step comparison found, under the control that acts on it rather
+             than in a docs folder. The options and this sentence are both written by app.js from
+             api.js's SAMPLING_PROFILES and SAMPLING_PROFILE_NOTE_TEXT, so the choices offered are
+             the same three names the route's Literal accepts and cannot drift into a select
+             offering a bundle the server would refuse. Empty here on purpose: a hardcoded fallback
+             sentence would be a second copy of the findings to keep true. -->
+        <div class="sampling-profile-note" id="sampling-profile-note"></div>
         <!-- The plan's readiness, directly above the batch button that acts on it: how many shots
              carry a prompt, every shot that blocks submission, and every near-duplicate pair the
              server reports. app.js fills it from api.js's readinessLines on project load, so a

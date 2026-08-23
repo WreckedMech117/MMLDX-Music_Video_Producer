@@ -22,6 +22,18 @@ AssetKind = Literal["character", "setting", "prop", "style", "image", "audio", "
 ShotStatus = Literal["draft", "ready", "queued", "running", "complete", "error", "approved"]
 JobStatus = Literal["queued", "running", "complete", "error", "cancelled"]
 
+#: The evidenced H3 sampling bundles, by name. One spelling, imported by the request models, the
+#: manifest field and the route, so the three cannot drift into offering different sets.
+#:
+#: Spelled out here rather than derived from `workflows.H3_REFERENCE_PROFILES` for two reasons.
+#: The direction is impossible — `workflows` imports `timeline`, which imports this module, so a
+#: back-import would cycle. And a literal is what puts the choices into `/openapi.json` and turns
+#: an unknown name into a 422 before any payload is built, which is the same argument
+#: `app.H3Request` already made when it spelled the set out a second time.
+#: `tests/test_api.py` asserts this list and the builder's table agree, so a bundle added to one
+#: and not the other fails loudly rather than becoming unreachable.
+SamplingProfile = Literal["default", "turbo", "turbo-references2v"]
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
@@ -1601,6 +1613,36 @@ class Project(BaseModel):
     #: location declared* — which is a real state, and the state in which every consumer must
     #: produce byte-identical output to what it produced before this field existed.
     default_setting_id: str = ""
+    #: Which evidenced sampling bundle this project's **reference** renders use — the Director's
+    #: choice of look and cost, made once and honoured by every path that submits an H3 reference
+    #: shot. `"default"` is 20 steps and no LoRA; `"turbo-references2v"` is 8; `"turbo"` is 4.
+    #:
+    #: **On the project rather than on the machine, and that is the decision.** The VRAM eject is
+    #: the counter-example and its own note says why it is stored per machine: "a shared project
+    #: carrying 'do not eject' would silently change how someone else's renders behave" — it is a
+    #: property of the card, not of the video. This is the opposite. The Director's ruling was that
+    #: turbo's sharper, waxier look "perhaps … would benefit" some video styles and not others, so
+    #: it is a *style* decision, and a style decision that leaked across every project on the
+    #: machine would be the wrong kind of memory: two videos on one workstation must be able to
+    #: disagree. Stored here, it travels with the project directory, including to another machine.
+    #:
+    #: **Server-owned, and set by `PUT /projects/{id}/sampling-profile` alone**, exactly as
+    #: `default_setting_id` above is and for the identical reason: this is a defaulted field on a
+    #: model the generic full-project `PUT` binds whole, so a client written before it existed
+    #: sends nothing, arrives as `"default"`, and one ordinary save would silently put the whole
+    #: project back on 20 steps. That hole has now been found in that route **nine** times; this
+    #: field is not the tenth, and `replace_project` re-adopts the stored value in both directions.
+    #:
+    #: Defaulted, so every manifest written before it existed loads unchanged and renders exactly
+    #: as it did — which is what makes the control safe to add to a library of existing work.
+    #:
+    #: **Reference shots only, and that scope is enforced, not assumed.** The keyframe and
+    #: text-only graphs load different checkpoints and have no evidenced bundle, so `generate_h3`
+    #: refuses a profile *named* on one of them and renders an *inherited* one at the default.
+    #: The two are different requests: naming a bundle that will not be applied is the silent
+    #: mis-logging this codebase refuses, while a project-wide preference is a standing choice
+    #: that only one of the three graphs has evidence for. The control says so where it is set.
+    sampling_profile: SamplingProfile = "default"
     assets: list[Asset] = Field(default_factory=list)
     shots: list[Shot] = Field(default_factory=list)
     messages: list[TreatmentMessage] = Field(default_factory=list)
