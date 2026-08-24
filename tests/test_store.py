@@ -6,8 +6,14 @@ from pathlib import Path
 import pytest
 
 from music_video_producer import store as store_module
+from music_video_producer.audio import ENVELOPE_REQUIRED_KEYS, ENVELOPE_VERSION
 from music_video_producer.models import Project, Shot
-from music_video_producer.store import ProjectChangedDuringSave, ProjectNotFound, ProjectStore
+from music_video_producer.store import (
+    SONG_ENVELOPE_RELATIVE_PATH,
+    ProjectChangedDuringSave,
+    ProjectNotFound,
+    ProjectStore,
+)
 
 
 def test_store_persists_projects_across_instances(tmp_path: Path):
@@ -746,3 +752,194 @@ def test_store_rejects_project_path_traversal(tmp_path: Path, project_id: str):
 
     with pytest.raises(ProjectNotFound):
         store.get(project_id)
+
+
+# ---------------------------------------------------------------------------
+# The Song Envelope sidecar: a derived file, written atomically, and believed
+# only when it is actually an envelope inside this project's own directory.
+# ---------------------------------------------------------------------------
+
+
+def an_envelope(**overrides) -> dict:
+    """A minimal object carrying exactly the keys a real envelope carries."""
+    envelope = {key: 0 for key in ENVELOPE_REQUIRED_KEYS}
+    envelope["version"] = ENVELOPE_VERSION
+    envelope["bands"] = []
+    envelope.update(overrides)
+    return envelope
+
+
+def test_the_song_envelope_round_trips_through_its_sidecar(tmp_path: Path):
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Sidecar"))
+
+    written = store.write_song_envelope(project.id, an_envelope(bpm=128.3))
+    assert written == SONG_ENVELOPE_RELATIVE_PATH
+    assert store.song_envelope_path(project.id).exists()
+    assert store.read_song_envelope(project.id, written)["bpm"] == 128.3
+
+    # One spelling of where it lives, exported so nothing has to retype the literal.
+    assert store.song_envelope_path(project.id) == (
+        store.project_dir(project.id) / Path(SONG_ENVELOPE_RELATIVE_PATH)
+    )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "../secret.json",
+        "../../secret.json",
+        "media/../../secret.json",
+        "C:/Windows/win.ini",
+        "/etc/passwd",
+    ],
+)
+def test_the_sidecar_reader_refuses_to_leave_the_project_directory(
+    tmp_path: Path, relative_path: str
+):
+    """`SongAnalysis.path` arrives from a manifest, and a manifest is a file a Director can edit.
+
+    `test_store_rejects_project_path_traversal`'s rule applied to the second thing this module now
+    opens by a stored path. Without the containment check a `..` in the record turns a read-only
+    endpoint into "serve me any JSON file on this machine", and the answer would look exactly like
+    a successful read.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Contained"))
+    outside = tmp_path / "secret.json"
+    outside.write_text(json.dumps(an_envelope(bpm=999)), encoding="utf-8")
+
+    assert store.read_song_envelope(project.id, relative_path) is None
+
+
+def test_the_sidecar_reader_refuses_anything_that_is_not_an_envelope(tmp_path: Path):
+    """Parsing as a JSON object is not being an envelope, and the gap is reachable.
+
+    The containment check only proves the file is inside the project directory - `project.json`
+    itself passes it. So did `{}`. Both were served as `present: true` with no `rms`, no `bands`
+    and no `analysis_frames` for a consumer to index.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Shaped"))
+    target = store.song_envelope_path(project.id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    for payload in ("{}", "[1, 2, 3]", '"a string"', "not json at all"):
+        target.write_text(payload, encoding="utf-8")
+        assert store.read_song_envelope(project.id, SONG_ENVELOPE_RELATIVE_PATH) is None
+
+    # The project's own manifest is inside the project directory and is a JSON object.
+    assert store.read_song_envelope(project.id, "project.json") is None
+
+    # An envelope missing one single promised key is not an envelope either.
+    partial = an_envelope()
+    del partial["bands"]
+    target.write_text(json.dumps(partial), encoding="utf-8")
+    assert store.read_song_envelope(project.id, SONG_ENVELOPE_RELATIVE_PATH) is None
+
+    target.write_text(json.dumps(an_envelope()), encoding="utf-8")
+    assert store.read_song_envelope(project.id, SONG_ENVELOPE_RELATIVE_PATH) is not None
+
+
+def test_a_sidecar_from_an_unknown_version_is_not_read(tmp_path: Path):
+    """`ENVELOPE_VERSION` is bumped when the *meaning* of a field changes, and the honest response
+    to a number this build does not recognise is to report the analysis absent so it is taken
+    again - never to read last year's fields as though they meant what they mean today. It was
+    written by the producer and read by nothing until this check, which made it decoration."""
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Versioned"))
+    target = store.song_envelope_path(project.id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    for version in (ENVELOPE_VERSION + 1, ENVELOPE_VERSION - 1, "1", None):
+        target.write_text(json.dumps(an_envelope(version=version)), encoding="utf-8")
+        assert store.read_song_envelope(project.id, SONG_ENVELOPE_RELATIVE_PATH) is None
+
+    target.write_text(json.dumps(an_envelope()), encoding="utf-8")
+    assert store.read_song_envelope(project.id, SONG_ENVELOPE_RELATIVE_PATH) is not None
+
+
+def test_a_failed_sidecar_write_leaves_no_debris(tmp_path: Path):
+    """The temp file outlives its `with` block so it can be renamed, which makes every path out of
+    the writer responsible for it. A full disk fails in `json.dump` rather than in the rename -
+    and "free some disk" is a remedy this application prints, so answering it by leaving an
+    orphaned `.tmp` behind for every attempt would be using more of the thing that ran out."""
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Debris"))
+
+    def no_space(_descriptor):
+        raise OSError(28, "No space left on device")
+
+    # `fsync` is a real failure point, and the one a full disk actually reaches: the temp file
+    # already exists by then, which is precisely what makes it an orphan if nobody removes it.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(store_module.os, "fsync", no_space)
+    try:
+        with pytest.raises(OSError):
+            store.write_song_envelope(project.id, an_envelope())
+    finally:
+        monkeypatch.undo()
+
+    analysis_dir = store.project_dir(project.id) / "media" / "analysis"
+    assert list(analysis_dir.glob("*")) == []
+    assert not store.song_envelope_path(project.id).exists()
+
+    # And the same for a failure raised while the JSON is still being written out.
+    def midway(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(store_module.json, "dump", midway)
+    try:
+        with pytest.raises(OSError):
+            store.write_song_envelope(project.id, an_envelope())
+    finally:
+        monkeypatch.undo()
+
+    assert list(analysis_dir.glob("*")) == []
+
+
+def test_a_non_finite_value_is_refused_rather_than_written_as_a_bare_nan(tmp_path: Path):
+    """`json.dump` defaults to `allow_nan=True` and writes a non-finite float as the bare token
+    `NaN` - which Python reads back happily and every strict parser refuses. `audio._finite` fails
+    the analysis before a value like that could get here; this is the second line of the same
+    defence, at the last point where refusing is still cheap."""
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Not a number"))
+
+    with pytest.raises(ValueError):
+        store.write_song_envelope(project.id, an_envelope(bpm=float("nan")))
+    with pytest.raises(ValueError):
+        store.write_song_envelope(project.id, an_envelope(rms=[0.1, float("inf")]))
+
+    assert not store.song_envelope_path(project.id).exists()
+    assert list((store.project_dir(project.id) / "media" / "analysis").glob("*")) == []
+
+
+def test_the_sidecar_write_survives_a_transient_lock_on_its_destination(tmp_path: Path):
+    """This module already owns an answer to the Windows failure where a scanner or an indexer
+    holds a destination for a moment: `_replace_atomically`, with its bounded backoff. The sidecar
+    writer skipped it, so a transient `PermissionError` silently discarded a completed
+    measurement - a whole song's analysis thrown away by a lock that was gone 50 ms later."""
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Contended"))
+    store.write_song_envelope(project.id, an_envelope(bpm=1))
+
+    attempts = {"count": 0}
+    real_replace = Path.replace
+
+    def flaky(self, target):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(self, target)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(Path, "replace", flaky)
+    try:
+        store.write_song_envelope(project.id, an_envelope(bpm=2))
+    finally:
+        monkeypatch.undo()
+
+    assert attempts["count"] == 2, "the writer gave up on the first transient failure"
+    assert store.read_song_envelope(project.id, SONG_ENVELOPE_RELATIVE_PATH)["bpm"] == 2

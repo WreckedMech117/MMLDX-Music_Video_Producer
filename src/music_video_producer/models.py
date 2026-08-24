@@ -175,6 +175,51 @@ def line_tag_options(vocal_type: VocalType) -> tuple[LineTagOption, ...]:
     return VOCAL_TYPE_SPECS[vocal_type].line_tags
 
 
+class SongAnalysis(BaseModel):
+    """The manifest's pointer at a Song Envelope. Not the envelope — a pointer to one.
+
+    The measurement itself is a sidecar file: a three-minute envelope at 30 Hz with 8 bands is
+    hundreds of kilobytes of JSON against a whole manifest of 110–190 KB, and the manifest rides
+    a two-second poll. Putting it here would multiply every poll, every save and every optimistic
+    concurrency check by the size of the audio. So this record carries only what a *decision*
+    needs — where the file is, what it was taken at, the one number worth showing, and the
+    fingerprint that says whether it still describes this project's song.
+
+    **Every field is defaulted, and an all-default record means no analysis.** That is what lets
+    every `project.json` written before this existed load unchanged, and it is the state in which
+    every consumer must behave exactly as it did before the envelope existed.
+
+    **There is no `valid` flag here, deliberately.** Validity is derived on every read by
+    comparing `song_fingerprint` against the current song's, through
+    `effects.song_fingerprints_match`. A stored flag would be a second truth that can outlive its
+    condition — the song is replaced by a route that never thought about analysis, and the flag
+    still says "current". A mismatch reports the analysis **absent**; nothing is rewritten and
+    nothing is marked.
+
+    `analysis_rate` and `band_count` are recorded rather than read back from `audio.py`'s
+    defaults for the same reason: an envelope on disk was taken at whatever those were on the day
+    it was written, and a consumer that assumed today's constants would silently misread it.
+    """
+
+    #: The sidecar's path, relative to the project directory, posix-slashed — `Song.path`'s own
+    #: convention, so both are joined the same way and neither is an absolute path that would
+    #: break the moment a project directory moved.
+    path: str = ""
+    #: Frames per second the envelope's arrays are sampled at. Zero means no analysis.
+    analysis_rate: float = Field(default=0, ge=0)
+    #: How many per-band envelopes the sidecar carries. Zero means no analysis.
+    band_count: int = Field(default=0, ge=0)
+    #: The estimated tempo. **An estimate wherever it is shown**, and nothing in this application
+    #: refuses on its value — its precision is bounded by `analysis_rate` and cannot be better.
+    #: Zero means "no tempo could be estimated", which a silent or featureless track really does
+    #: produce, and is not an error.
+    bpm: float = Field(default=0, ge=0)
+    #: The content fingerprint of the song this was measured from — size plus a hash of bytes,
+    #: never mtime. `effects.song_fingerprint` is the one function that computes it, on both
+    #: sides of every comparison.
+    song_fingerprint: str = ""
+
+
 class Song(BaseModel):
     """A track and what it is: the audio, its timing spine, and the two context fields.
 
@@ -218,6 +263,19 @@ class Song(BaseModel):
     #: arent is useful for knowing which Shots have words, when the cuts should happen,
     #: when the chorus and verses are".
     lyric_words: list[tuple[str, float, float]] = Field(default_factory=list)
+    #: Where the Song Envelope for this track is, and what it was taken at. See `SongAnalysis` —
+    #: an all-default record means *no analysis*, which is what every manifest written before this
+    #: field existed loads as and is a state every consumer must handle as "behave as before".
+    #:
+    #: **Server-owned, and never written from a client body**, exactly as `vocal_type` and
+    #: `Project.default_setting_id` are, and for the reason those two record: the generic
+    #: full-project `PUT` binds a whole client-supplied `Song`, so a body that simply omits this
+    #: field — which is what every client written before it existed sends — arrives carrying the
+    #: default, and one ordinary save would silently discard the pointer to a measurement that is
+    #: still on disk and still current. A body that *invents* one is worse: it would name a
+    #: sidecar path this application then reads. `app._adopt_song_analysis` re-adopts the stored
+    #: value rather than trusting a body.
+    analysis: SongAnalysis = Field(default_factory=SongAnalysis)
     #: Who sings this track. See `VocalType` — `"unstated"` is the default and asserts nothing.
     #:
     #: **Server-owned, and set by `PUT .../song/vocal-type` alone**, exactly as

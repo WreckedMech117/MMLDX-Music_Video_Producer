@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Any
 
+from .audio import ENVELOPE_REQUIRED_KEYS, ENVELOPE_VERSION
 from .models import Project, now_utc
+
+#: Where a Song Envelope lives, relative to the project directory. Under `media/` because it is
+#: derived from the media rather than authored beside the manifest, and in its own `analysis/`
+#: directory so a second measurement later (a lyric structure pass, a loudness map) lands beside
+#: it rather than loose among songs and takes.
+SONG_ENVELOPE_RELATIVE_PATH = "media/analysis/song-envelope.json"
 
 #: Serialises every manifest read in this process against every manifest write.
 #:
@@ -257,3 +266,123 @@ class ProjectStore:
             except (OSError, ValueError):
                 continue
         return sorted(projects, key=lambda project: project.created_at, reverse=True)
+
+    # ------------------------------------------------------------------
+    # Sidecars
+    #
+    # A sidecar is a derived artefact too large to live in the manifest. There is exactly one
+    # today — the Song Envelope — and the rules are `preferences.MachinePreferences`', which is
+    # this codebase's only other atomic JSON writer outside the manifest itself:
+    #
+    #   * The write is a temp file in the destination directory, flushed, fsynced, then
+    #     `replace`d. A half-written envelope is never visible under the real name.
+    #   * An absent or unreadable file yields *nothing*, never a guessed or zeroed value. The
+    #     caller distinguishes "no analysis" from "an analysis of silence", and collapsing the
+    #     two would let a corrupt file be served as a measurement.
+    #
+    # What a sidecar deliberately does **not** get is the manifest's lock, its generation
+    # counter, or its `updated_at`. It is not the manifest: nothing polls it, no optimistic
+    # concurrency check rides on it, and two writers of it are writing the same measurement of
+    # the same bytes. `_replace_atomically`'s whole argument is about not reverting a *save the
+    # caller was told succeeded*, and there is no such caller here.
+    # ------------------------------------------------------------------
+
+    def song_envelope_path(self, project_id: str) -> Path:
+        return self.project_dir(project_id) / Path(SONG_ENVELOPE_RELATIVE_PATH)
+
+    def write_song_envelope(self, project_id: str, envelope: dict[str, Any]) -> str:
+        """Write one envelope beside the project's media and return its relative path.
+
+        Raises `OSError` if it cannot be written, and `ValueError` if the envelope carries a value
+        JSON cannot represent. The caller must not record a `SongAnalysis` pointing at a file that
+        is not there — a pointer at nothing reports absent on every read, which is correct but
+        wastes the analysis.
+
+        **Nothing is left behind by a failure.** The temp file is created with `delete=False`
+        because it has to outlive its own `with` block to be renamed, which means every path out
+        of this function owns cleaning it up. The whole write is inside one `try` for that reason:
+        a full disk fails in `json.dump`, `flush` or `fsync` rather than in the rename, and those
+        are exactly the failures whose remedy this application names ("free some disk") — so
+        leaving an orphaned `.tmp` beside the manifest for each attempt would be answering "your
+        disk is full" by using more of it.
+
+        `allow_nan=False` because the default is `True` and the default is a trap: `json.dump`
+        writes a non-finite float as the bare token `NaN`, which Python reads back happily and
+        every strict parser refuses. `audio._finite` already fails the analysis before a value like
+        that could get here; this is the second line of the same defence, at the last point where
+        it is still cheap to refuse.
+
+        The rename goes through `_replace_atomically`, this module's own answer to the transient
+        Windows failure where a virus scanner or an indexer holds the destination for a moment.
+        Skipping it meant a completed measurement could be discarded by a lock that would have
+        been gone 50 ms later. The manifest lock is taken for the same reason the helper requires
+        it — it waits on a condition built over that lock — and for no longer than the rename.
+        """
+        target = self.song_envelope_path(project_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                "w", encoding="utf-8", dir=target.parent, delete=False, suffix=".tmp"
+            ) as temp:
+                temporary_path = Path(temp.name)
+                json.dump(envelope, temp, separators=(",", ":"), allow_nan=False)
+                temp.flush()
+                os.fsync(temp.fileno())
+            with _MANIFEST_LOCK:
+                _replace_atomically(temporary_path, target)
+        except BaseException:
+            # `BaseException` deliberately: a cancellation or a KeyboardInterrupt mid-write leaves
+            # exactly the same orphan an OSError does, and this file is a cache nobody would think
+            # to go and sweep.
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+        return SONG_ENVELOPE_RELATIVE_PATH
+
+    def read_song_envelope(self, project_id: str, relative_path: str) -> dict[str, Any] | None:
+        """The envelope at `relative_path`, or `None` when there is nothing this can read.
+
+        `None` covers every way a sidecar can fail to be an envelope — no path recorded, no file,
+        unparseable JSON, JSON that is not an object, an object that is not shaped like an
+        envelope, or one written by a version of `audio.py` this build does not know how to read.
+        The caller's answer to all of them is the same: report the analysis **absent**.
+        Distinguishing them here would invite a caller to treat one as partially usable, and a
+        half-read measurement is exactly the "envelope of zeros" this story forbids.
+
+        **"Parses as an object" is not "is an envelope", and the gap is reachable.** The path
+        comes off the manifest and the containment check below only proves the file is inside the
+        project directory — `project.json` itself passes it. So did `{}`, and both were served as
+        `present: true` with no `rms`, no `bands` and no `analysis_frames` for a consumer to index.
+        Every key `audio.extract_envelope` promises must be there before this is data.
+
+        The version is checked for the reason `ENVELOPE_VERSION` exists at all: it is bumped when
+        the *meaning* of a field changes, and the honest response to a number this build does not
+        recognise is to report the analysis absent so it is taken again — never to read last
+        year's fields as though they meant what they mean today. It was written and read by
+        nothing until this check, which made it decoration.
+
+        The path is contained to the project directory before it is opened. It arrives from a
+        manifest, and a manifest is a file a Director can edit; `..` in it must not become a read
+        of an arbitrary file on this machine.
+        """
+        if not relative_path:
+            return None
+        directory = self.project_dir(project_id).resolve()
+        try:
+            target = (directory / Path(relative_path)).resolve()
+        except OSError:
+            return None
+        if directory not in target.parents:
+            return None
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != ENVELOPE_VERSION:
+            return None
+        if not ENVELOPE_REQUIRED_KEYS <= payload.keys():
+            return None
+        return payload

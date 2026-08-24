@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
@@ -43,6 +44,7 @@ from .assembly import (
     with_progress,
 )
 from .asset_replacement import ReplacementChange, asset_replacement_plan
+from .audio import FfmpegMissing, analyze_song
 from .batch import (
     JOB_NEVER_SUBMITTED,
     NOTE_KIND_PROMPT,
@@ -78,6 +80,7 @@ from .director import (
     document_rejection,
 )
 from .dp_prompt import DP_SYSTEM_PROMPT, dp_input
+from .effects import fingerprint_size, song_fingerprint, song_fingerprints_match
 from .h3_expansion_prompt import system_prompt as h3_system_prompt
 from .h3_prompt import check as h3_check
 from .h3_prompt import check_reference_bounds, normalize_audio_fields
@@ -99,6 +102,7 @@ from .models import (
     ShotStatus,
     SingingState,
     Song,
+    SongAnalysis,
     SongSection,
     TreatmentMessage,
     VisionInspectionRecord,
@@ -399,6 +403,18 @@ SONG_DIRECTOR_WITHHELD = frozenset(
     # they are characters inside `lyrics`, which is already classified visible, so they travel
     # exactly as the sheet travels and there is no second field to classify, withhold, or forget.
     {"vocal_type"}
+) | frozenset(
+    # The Song Envelope's pointer. Withheld on the `vocal_spans`/`lyric_words` grounds, which
+    # this field shares exactly: it is a *measurement*, and the model has no use for a sidecar
+    # path, a sample rate or a content hash. The one part of it a planning turn could ever want
+    # is the tempo — and a tempo is a fact about the whole song that belongs in an instruction
+    # written for it, phrased as the estimate it is, not smuggled in as a bare `"bpm": 128.3`
+    # beside a file path. Adding the estimate to the prompt is a deliberate prompt change with
+    # its own wording, and this story is not it.
+    #
+    # It is also never-been-in: classifying it withheld leaves every existing project's prompt
+    # byte-identical, which is the bar `SHOT_DIRECTOR_WITHHELD` sets for a newly declared field.
+    {"analysis"}
 )
 
 # Every field an `Asset` carries, classified exactly as `Song` and `Shot` are, and for the reason
@@ -6581,6 +6597,59 @@ ALIGN_LYRICS_NOTHING_PLACED = (
     "recording's actual words."
 )
 
+#: Why a song was not measured. These are **reasons, not refusals**: nothing in this story
+#: returns one as an HTTP error. An import whose analysis failed is still an import — the Song is
+#: stored, the Project is otherwise untouched, and the reason is logged and reported by the
+#: envelope endpoint rather than turned into a 500 the Director cannot act on. Named separately
+#: rather than collapsed into one string because the remedies are different: install ffmpeg, fix
+#: the file, free some disk.
+SONG_ANALYSIS_WITHOUT_SONG = "This project has no song audio, so there is nothing to analyze."
+SONG_ANALYSIS_MEDIA_MISSING = (
+    "The song's audio file was not found on disk, so the song was not analyzed."
+)
+SONG_ANALYSIS_FFMPEG_MISSING = (
+    "ffmpeg was not found on PATH, so the song was not analyzed. Install ffmpeg and import "
+    "the song again."
+)
+SONG_ANALYSIS_DECODE_FAILED = (
+    "The song could not be decoded, so it was not analyzed: {reason}. The file must be audio "
+    "ffmpeg can read."
+)
+SONG_ANALYSIS_WRITE_FAILED = (
+    "The song was measured but the analysis could not be written beside the project: {reason}."
+)
+
+#: Why the envelope endpoint has nothing to serve. **Absence is not an error state** — every one
+#: of these rides a 200 with `present: false`, because "this song has not been measured yet" is an
+#: ordinary state of an ordinary project and a consumer that met it as a 404 would draw an error
+#: where it should draw nothing.
+#:
+#: Each is derived at read time. There is no stored flag anywhere that says an envelope is stale,
+#: and there must never be: a flag is a second truth, and the routes that replace a song do not
+#: know this feature exists.
+SONG_ENVELOPE_WITHOUT_SONG = "This project has no song, so there is no analysis of one."
+SONG_ENVELOPE_NOT_TAKEN = "No song analysis yet."
+SONG_ENVELOPE_SONG_CHANGED = (
+    "The song changed after it was analyzed, so the stored analysis describes a track this "
+    "project no longer has."
+)
+SONG_ENVELOPE_FILE_UNREADABLE = (
+    "The song analysis file is missing or unreadable, so there is nothing to serve."
+)
+SONG_ENVELOPE_UNDECODABLE = (
+    "The song file is not audio ffmpeg can read, so it has never been analyzed. Re-import the "
+    "track from a file ffmpeg can decode."
+)
+SONG_ENVELOPE_AUDIO_PENDING = (
+    "This song has no audio yet — its render has not landed. The analysis is taken "
+    "automatically when it does."
+)
+SONG_ENVELOPE_RECORD_DISAGREES = (
+    "The stored analysis record and the analysis file disagree about how the song was "
+    "measured, so the file is not served. It will be replaced the next time the song is "
+    "analyzed."
+)
+
 
 class ShotListRequest(BaseModel):
     shots: list[Shot]
@@ -6824,6 +6893,221 @@ def _adopt_song_vocal_type(incoming: Song | None, stored: Song | None) -> None:
     if incoming is None:
         return
     incoming.vocal_type = stored.vocal_type if stored is not None else "unstated"
+
+
+def _detach_song_analysis(song: Song | None) -> None:
+    """Leave `song` with no analysis at all — `_detach_song_recovery_slots`' argument, measured.
+
+    An envelope describes the audio it was taken from. Carried across a replacement it would name
+    a sidecar full of the *old* track's beats and hand them to the new one, and the pointer would
+    look perfectly healthy doing it. The fingerprint would catch it on the next read — that is the
+    whole point of deriving validity — but leaving a pointer that is known-wrong at the moment it
+    is written is not something to lean on a downstream check for.
+
+    Note what this deliberately does *not* do: it does not delete the sidecar, and that is a
+    statement about tidiness rather than about recovery. The file is at one fixed path, so the
+    next measurement overwrites it and no orphan accumulates; until then the cleared fingerprint
+    means every read reports the analysis absent, which is correct.
+
+    It buys **no** re-import shortcut, and an earlier version of this comment claimed it did. It
+    cannot: clearing the record clears the fingerprint, `song_fingerprints_match` requires both
+    sides non-empty, and `upload_song` builds a fresh `Song` whose record is empty anyway. A
+    Director who re-imports the same file pays for the measurement again — 176 ms — and that is
+    the honest description.
+    """
+    if song is None:
+        return
+    song.analysis = SongAnalysis()
+
+
+def _adopt_song_analysis(incoming: Song | None, stored: Song | None) -> None:
+    """Overwrite `incoming`'s analysis with the stored song's, because a client is never its author.
+
+    `_adopt_song_recovery_slots`' argument again, for the *seventh* field to meet this hole in
+    this one route, and it fails the same two ways. A client written before the field existed
+    omits it, so an ordinary save arrives carrying a default `SongAnalysis` and would silently
+    discard the pointer to a measurement that is still on disk and still current — the envelope
+    would report absent from then on, and nothing would say why. A client that *invents* one is
+    worse: `SongAnalysis.path` is a path this application then reads, and a fabricated fingerprint
+    would make a stale envelope pass the one check that exists to catch it.
+
+    A Song-less body is a no-op, exactly as the other two adoptions are.
+
+    Called *before* the route compares the two songs, so a body differing only here compares equal
+    and an old client's ordinary save is not told it is replacing the song.
+
+    The narrower sibling write path, `PUT .../shots`, needs no counterpart: `ShotListRequest`
+    carries shots and a revision and no Song at all, so there is no client-supplied `analysis` on
+    that wire to adopt. Checked rather than assumed — it is the route this codebase's guard holes
+    keep turning up on.
+    """
+    if incoming is None:
+        return
+    incoming.analysis = (
+        stored.analysis.model_copy(deep=True) if stored is not None else SongAnalysis()
+    )
+
+
+def analyze_project_song(
+    store: ProjectStore,
+    project_id: str,
+    project: Project,
+    source: Path,
+    *,
+    force: bool = False,
+) -> str:
+    """Measure `source` into the project's sidecar and point `Song.analysis` at it.
+
+    Returns `""` when the project now has a current envelope, and a **named reason** when it does
+    not. It never raises and never saves: the caller decides what a failure means for its own
+    route, and every caller so far decides it means "carry on". The Project is mutated only on
+    success, so a failed analysis leaves the manifest byte-identical to what it would have been if
+    this function had never been called — which is what "the Project is otherwise unchanged" means
+    in practice.
+
+    **Module level, with its dependencies passed in.** Treatment Story 16.2 folds this and the
+    lyric-structure pass under one trigger without merging the computations, so it has to be
+    callable from somewhere that is not the import route, and testable without one. The store and
+    the already-resolved path are arguments for exactly that reason.
+
+    **Skippable by fingerprint.** With an envelope already on disk whose stored fingerprint
+    matches the song's current bytes, this returns immediately and re-measures nothing — and
+    returns `""`, because "already done" is a success and must never read as a failure to run.
+    The sidecar is checked as well as the fingerprint, so a record pointing at a deleted file
+    re-measures rather than reporting itself current forever. `force` is for a caller that wants
+    the measurement retaken at a changed rate or band count.
+
+    **Synchronous by design.** A three-minute song measures in **168 ms** end to end on this
+    build — 53 ms of ffmpeg decode and 115 ms of transform and features, against a 245 ms budget
+    measured while the story was planned — which is cheaper than the `ffprobe` call the import
+    route already makes. Peak memory is 27 MB and does not grow with the song: see
+    `audio.TRANSFORM_CHUNK_FRAMES`. There is no background job lane in this application, and inventing one
+    for a fifth of a second of arithmetic would buy a task registry, a polling endpoint and a
+    whole new class of state that can be lost. Being fast satisfies "never blocks" better than being
+    deferred does. Callers on the event loop hand this to the threadpool; callers already in the
+    threadpool call it directly.
+    """
+    song = project.song
+    if song is None:
+        return SONG_ANALYSIS_WITHOUT_SONG
+    fingerprint = song_fingerprint(source)
+    if not fingerprint:
+        return SONG_ANALYSIS_MEDIA_MISSING
+    if (
+        not force
+        and song_fingerprints_match(song.analysis.song_fingerprint, fingerprint)
+        and store.read_song_envelope(project_id, song.analysis.path) is not None
+    ):
+        return ""
+    try:
+        envelope = analyze_song(source)
+    except FfmpegMissing:
+        return SONG_ANALYSIS_FFMPEG_MISSING
+    except Exception as error:
+        # **Deliberately every exception, not the two this module knows how to raise.** The
+        # narrow version was `(SongAnalysisError, ValueError)`, and what it let through was worse
+        # than what it caught: a `MemoryError` on a long track, or an `OSError` reading the file
+        # out from under a decode, escaped this function into `upload_song`, which raised before
+        # `store.save` and answered 500 — leaving the uploaded audio on disk and no Song in the
+        # manifest at all. An import losing its own upload because a *measurement* failed is the
+        # exact outcome the comment at the call site promises cannot happen, and a promise that
+        # depends on having enumerated every exception numpy and ffmpeg can raise is not one.
+        #
+        # This is a measurement. Nothing downstream of it is allowed to fail because of it, so
+        # nothing escapes it. By class as well as by message, because some exceptions in this
+        # codebase stringify to nothing at all and a reason that renders as an empty string reads
+        # to a Director as a bug in the application rather than as a fact about their file.
+        reason = str(error) or type(error).__name__
+        logger.warning("Song analysis failed for %s", project_id, exc_info=True)
+        return SONG_ANALYSIS_DECODE_FAILED.format(reason=reason)
+    try:
+        relative = store.write_song_envelope(project_id, envelope)
+    except Exception as error:
+        # Same rule on the write half, and `ValueError` is a real member of it: the writer refuses
+        # a non-finite value rather than putting a bare `NaN` token in a JSON file.
+        logger.warning("Song analysis could not be written for %s", project_id, exc_info=True)
+        return SONG_ANALYSIS_WRITE_FAILED.format(reason=str(error) or type(error).__name__)
+    # Assigned last, and only here. A record pointing at a sidecar that was never written would
+    # report absent on every read — correct, but it would have thrown the measurement away.
+    song.analysis = SongAnalysis(
+        path=relative,
+        # Read back off the envelope, never off `audio.py`'s defaults. The record has to describe
+        # the file that was actually written, and the effective analysis rate can differ from the
+        # requested one when the hop does not divide the sample rate.
+        analysis_rate=envelope["analysis_rate"],
+        band_count=envelope["band_count"],
+        bpm=envelope["bpm"],
+        song_fingerprint=fingerprint,
+    )
+    return ""
+
+
+def _audio_stream_present(source: Path) -> bool | None:
+    """Whether ffprobe can see an audio stream in `source`. `None` means it could not tell.
+
+    Three answers, not two, and the third one matters. `False` is ffprobe having read the file and
+    refused it — a real verdict about the file. `None` is ffprobe not being on this machine, or
+    timing out: no verdict at all, and reporting "your file is broken" on the strength of a tool
+    that never ran would be exactly the fabricated statement this codebase refuses.
+
+    Reuses `assembly.probe_streams_args` rather than spelling a fourth ffprobe invocation, and
+    borrows `_media_duration`'s tolerant shape. `check=False` because a non-zero exit is the
+    signal here rather than an exception: ffprobe exits non-zero on a file it cannot parse, which
+    is precisely the case being detected.
+    """
+    try:
+        result = subprocess.run(
+            probe_streams_args(source), capture_output=True, check=False, text=True, timeout=15
+        )
+    except Exception:  # noqa: BLE001 - a read-time hint may not raise; see below
+        # Every exception, for the same reason the analysis catches every exception: this runs
+        # inside a **read-only** endpoint that is merely explaining why something is absent, and
+        # there is no failure here worth turning into a 500. `text=True` alone can raise
+        # `UnicodeDecodeError` on a binary-ish stderr, and a locked or unreadable file raises
+        # `PermissionError`, neither of which is a `SubprocessError`. Any of them means the same
+        # thing: this check has no opinion.
+        return None
+    if result.returncode != 0:
+        return False
+    return "audio" in result.stdout.split()
+
+
+def analysis_absence_reason(source: Path) -> str:
+    """Why a song that *is* on disk carries no envelope. Worked out now, never remembered.
+
+    **This is the whole of AD-21 and standing law 5 applied to a failure.** The obvious
+    implementation is a `reason` field on `SongAnalysis` written when an analysis fails — and it
+    is the same mistake as a `valid` flag, one step further removed from the truth. A stored
+    string describes an attempt that happened once, on a machine that may since have had ffmpeg
+    installed, over a file that may since have been replaced. It can only ever get more wrong, and
+    nothing would ever clear it. So the reason is derived at read time from what is true at read
+    time, exactly as validity is.
+
+    Ordered by remedy, cheapest first. `shutil.which` is a PATH lookup and no subprocess at all;
+    the ffprobe only runs when ffmpeg *is* installed and there is still no envelope, which is the
+    genuinely unusual case. Neither cost lands on a common path: this is reached only when a
+    project has a song, has no analysis record, and somebody asked why.
+
+    Read-only, and it must stay that way — nothing here decodes the song, computes an envelope or
+    writes a byte. It answers a question; it does not fix anything.
+    """
+    if shutil.which("ffmpeg") is None:
+        return SONG_ANALYSIS_FFMPEG_MISSING
+    if _audio_stream_present(source) is False:
+        # `is False` rather than `not`: a `None` from the probe is "could not tell", and the
+        # honest answer to that is the plain "not analysed yet" below.
+        return SONG_ENVELOPE_UNDECODABLE
+    return SONG_ENVELOPE_NOT_TAKEN
+
+
+def song_audio_path(project: Project) -> str:
+    """The Song's audio path as it stands right now, or `""` when there is no Song.
+
+    One spelling of "where is this project's audio", because it is read on both sides of a
+    comparison at two different call sites and four hand-written copies of `project.song.path if
+    project.song else ""` is how one of them ends up not handling `None`.
+    """
+    return project.song.path if project.song is not None else ""
 
 
 def _vision_media(path: Path) -> tuple[bytes, str]:
@@ -7125,6 +7409,184 @@ def create_app(
             raise HTTPException(status_code=404, detail="Song media was not found")
         return target
 
+    def analyze_song_for_project(project_id: str, project: Project, *, force: bool = False) -> str:
+        """`analyze_project_song` with this application's song path resolution in front of it.
+
+        The thin half, and the only half that needs the closure: everything about *which file* is
+        the project's song lives in `resolve_song_path`, which is containment-checked, and
+        everything about measuring it lives in the module-level function this delegates to. A
+        missing or out-of-tree song becomes a named reason here rather than the 404 that accessor
+        raises, because nothing in this story turns a missing measurement into a refusal.
+        """
+        song = project.song
+        if song is None or not song.path:
+            return SONG_ANALYSIS_WITHOUT_SONG
+        try:
+            source = resolve_song_path(project_id, song)
+        except (HTTPException, OSError):
+            # `OSError` beside the accessor's own refusal, for `song_envelope_report`'s reason:
+            # `Path.resolve` touches the filesystem and can raise rather than refuse.
+            return SONG_ANALYSIS_MEDIA_MISSING
+        return analyze_project_song(store, project_id, project, source, force=force)
+
+    def _song_bytes_moved(project_id: str, song: Song) -> bool:
+        """Whether the song file's length disagrees with the record that describes it.
+
+        The cheap arm of the landing gate. `False` when there is no record to compare against, or
+        when the file cannot be measured at all — both mean "nothing here says the bytes moved",
+        and neither is worth a re-analysis on a settle.
+        """
+        stored = song.analysis.song_fingerprint
+        if not stored:
+            return False
+        try:
+            measured = resolve_song_path(project_id, song).stat().st_size
+        except (HTTPException, OSError):
+            return False
+        return fingerprint_size(stored) != measured
+
+    async def analyze_a_landed_song(project_id: str, project: Project, before: str) -> bool:
+        """Measure the Song when a finished render has just put audio behind it.
+
+        A generated Song is created with no `path` at all: `generate_music` and the Song Planner
+        both build the record when ComfyUI *accepts* the graph, and the audio only exists minutes
+        later when the render lands. `batch.apply_job_history` is the one writer that fills the
+        path in, so this is where "the song was stored" happens for everything that is not an
+        import — and without it the acceptance criterion's "imported **or generated**" holds for
+        only half of its subject.
+
+        **The trigger is a path change, compared in memory, and that is the whole design.** The
+        obvious alternative — ask the analysis to decide for itself, which it can, by fingerprint
+        — would put a SHA-256 of a multi-megabyte audio file on the two-second `/render-status`
+        poll, every tick, forever, to answer "no" every single time. A string comparison against
+        the path as it stood before reconciliation costs nothing and is exactly as correct: the
+        path is empty until the take lands, and it is `apply_job_history` that changes it.
+
+        Called from the route rather than from `batch.reconcile_render_jobs`, deliberately.
+        `batch.py`'s reconciliation functions are pure — that is stated at the top of the module
+        — and threading a store, a media path and a subprocess through them to save one line here
+        would trade that for nothing.
+
+        **A path that did not change is not proof the audio did not.** A re-render that lands on
+        the same output filename rewrites the bytes underneath an unchanged `Song.path`, and the
+        path comparison alone would never fire again — leaving a stale envelope with nothing in
+        this story able to retake it. So the gate has a second arm: a `stat` of the file against
+        the byte count the stored fingerprint was taken over. That is still not a hash, and it is
+        still not on the ordinary tick — both call sites reach this only when something actually
+        settled — but it catches the case the path cannot see.
+
+        The second arm requires an existing record on purpose. Without one there is nothing to
+        compare against, and firing on "no record" would re-attempt a failing analysis on every
+        settle for the whole life of a project whose song ffmpeg cannot read.
+
+        A failure is logged and swallowed, `upload_song`'s rule: a render that produced real audio
+        must not be reported as failed because the measurement of it did not work.
+
+        Returns whether an envelope was actually written, which the render-status caller needs in
+        order to clean up after a save it could not land.
+        """
+        song = project.song
+        if song is None or not song.path:
+            return False
+        if song.path == before and not _song_bytes_moved(project_id, song):
+            return False
+        if reason := await run_in_threadpool(analyze_song_for_project, project_id, project):
+            logger.warning("Song analysis skipped for %s: %s", project_id, reason)
+            return False
+        return True
+
+    def song_envelope_report(project_id: str, project: Project) -> dict[str, Any]:
+        """What this project's song analysis is, decided entirely at read time.
+
+        One shape, six answers, and **every one of them derived here and now**. `present` is the
+        only thing a consumer branches on; `reason` says why when it is false and is never empty
+        when it is false. There is no seventh answer where an envelope is served *and* something
+        is wrong with it — an envelope that fails any check here is absent, not degraded, because
+        a partly-trusted measurement is how an envelope of zeros gets downstream.
+
+        The six, in the order they are decided:
+
+        * no Song on the project at all;
+        * a Song whose audio is not on disk (no path yet, or the file is gone);
+        * a Song whose bytes no longer match the fingerprint the envelope was taken from;
+        * a record pointing at a sidecar that is missing or is not readable JSON;
+        * a Song that has never been measured, with the specific reason worked out by
+          `analysis_absence_reason` — ffmpeg absent from this machine, or a file ffmpeg will not
+          decode, or simply not yet;
+        * and the envelope itself.
+
+        Nothing above is stored. The fingerprint is recomputed from the song's current bytes, and
+        the failure reason is recomputed from the state of this machine and this file — so no
+        route that replaces a song needs to know this feature exists, and no reason can outlive
+        the condition that produced it. That is AD-21 and standing law 5, and it is why
+        `SongAnalysis` has neither a `valid` flag nor a `reason` string.
+
+        **Read-only in the strong sense:** it computes no envelope, writes no sidecar and saves no
+        manifest, even when it has just worked out exactly why one is missing. Offering the fix is
+        an interface decision with its own route; this endpoint only reports.
+        """
+        song = project.song
+        if song is None:
+            return {"present": False, "reason": SONG_ENVELOPE_WITHOUT_SONG}
+        # Resolved before anything else is decided, because every remaining answer needs the file:
+        # the fingerprint hashes it, and the absence reason probes it. An unresolvable path covers
+        # both "this generated Song has no audio yet" and "the file was deleted", and the sentence
+        # is true of each.
+        if not song.path:
+            # Not the same state as a missing file, and not the same remedy. A generated Song is
+            # recorded when ComfyUI accepts the graph and has no audio until the render lands;
+            # nothing is lost and nothing needs doing. Telling a Director their audio "was not
+            # found on disk" while it is still rendering would send them looking for a file that
+            # was never supposed to exist yet.
+            return {"present": False, "reason": SONG_ENVELOPE_AUDIO_PENDING}
+        try:
+            source = resolve_song_path(project_id, song)
+        except (HTTPException, OSError):
+            # `OSError` as well as the accessor's own refusal: `Path.resolve` touches the
+            # filesystem, and a path on a disconnected drive raises rather than returning
+            # something this can compare. A read-only endpoint may not 500 over that.
+            source = None
+        if source is None:
+            return {"present": False, "reason": SONG_ANALYSIS_MEDIA_MISSING}
+        analysis = song.analysis
+        if not analysis.path or not analysis.song_fingerprint:
+            return {"present": False, "reason": analysis_absence_reason(source)}
+        # The cheap half of the comparison first. A fingerprint carries the byte count it was
+        # taken over precisely so this question can be asked of a file without reading it: a
+        # `stat` is a metadata lookup, where the SHA-256 behind it reads every byte of a master.
+        # A song that was replaced is almost never the same length as the one before it, so this
+        # answers the common case for free and the digest below runs only when the sizes agree.
+        try:
+            measured = source.stat().st_size
+        except OSError:
+            return {"present": False, "reason": SONG_ANALYSIS_MEDIA_MISSING}
+        if fingerprint_size(analysis.song_fingerprint) != measured:
+            return {"present": False, "reason": SONG_ENVELOPE_SONG_CHANGED}
+        # Same size is only a *maybe* — an edit in place, a re-render of the same length — so the
+        # digest still settles it. This is the expensive read, and it is now reached only by a
+        # song whose length is unchanged.
+        current = song_fingerprint(source)
+        if not current:
+            return {"present": False, "reason": SONG_ANALYSIS_MEDIA_MISSING}
+        if not song_fingerprints_match(analysis.song_fingerprint, current):
+            return {"present": False, "reason": SONG_ENVELOPE_SONG_CHANGED}
+        envelope = store.read_song_envelope(project_id, analysis.path)
+        if envelope is None:
+            return {"present": False, "reason": SONG_ENVELOPE_FILE_UNREADABLE}
+        # The record and the file have to agree about how the song was measured. They are written
+        # in the same breath and cannot disagree by any path this application takes — but a
+        # consumer reads `band_count` off the *record* and then indexes `bands` in the *file*, so
+        # a disagreement is an out-of-range read on a screen rather than an error anybody sees.
+        # Checked because it is the manifest that is hand-editable, and because "they cannot
+        # differ" is an argument, not a guarantee.
+        if (
+            envelope.get("band_count") != analysis.band_count
+            or envelope.get("analysis_rate") != analysis.analysis_rate
+            or len(envelope.get("bands") or ()) != analysis.band_count
+        ):
+            return {"present": False, "reason": SONG_ENVELOPE_RECORD_DISAGREES}
+        return {"present": True, "reason": "", "envelope": envelope}
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         return {
@@ -7241,6 +7703,11 @@ def create_app(
         # differs only here must compare equal, or an ordinary save from an old client would be
         # told it is replacing the song.
         _adopt_song_vocal_type(project.song, current.song)
+        # And the envelope pointer, the seventh field to need this in this route. Same hole, same
+        # two failures, same position — ahead of the comparison, or a client that predates the
+        # field sends a default `SongAnalysis`, compares unequal, and is told an ordinary save is
+        # a song replacement. See `_adopt_song_analysis`.
+        _adopt_song_analysis(project.song, current.song)
         if project.song != current.song:
             _require_song_replacement_confirmation(current, confirm_song_replacement)
             # Confirmed: this is a different song, so nothing kept for the old one comes with
@@ -7253,6 +7720,10 @@ def create_app(
             # `import_song` builds a fresh `Song` whose default says the same thing.
             if project.song is not None:
                 project.song.vocal_type = "unstated"
+            # And the measurement goes with the track it measured. The fingerprint would report
+            # the old envelope absent anyway, but writing a pointer already known to be wrong and
+            # relying on a later read to notice is not how this codebase detaches derived state.
+            _detach_song_analysis(project.song)
         # Render state and approval are the dedicated routes', not a save's. Both gates compare
         # the body against the stored Shot and refuse only a *difference*, so an ordinary save --
         # which round-trips both fields on every Shot -- is untouched. After the Song gate rather
@@ -7522,6 +7993,20 @@ def create_app(
         # interface. Truncating them, dropping the ones wholly past the end, or warning and
         # leaving the Director's structure alone are three different editorial answers and this
         # route may not pick one on its own.
+        #
+        # Measured here, before the save, so the pointer and the Song it describes land in the
+        # same manifest — a save between the two would leave a window in which the project has a
+        # song and no analysis and a reader could cache that. On the threadpool because this is
+        # an `async def`: a fifth of a second of numpy on the event loop would stall every request
+        # in the process, which is exactly the "never blocks the interface" this has to keep.
+        #
+        # **A failed analysis does not fail the import.** The Song is already on disk and already
+        # assigned; refusing here would throw away a completed upload over a measurement nobody
+        # asked for. The reason is logged and the envelope endpoint reports the analysis absent,
+        # which is what it would report anyway — the Project is otherwise exactly as it would be
+        # if this call were not here.
+        if reason := await run_in_threadpool(analyze_song_for_project, project_id, project):
+            logger.warning("Song analysis skipped for %s: %s", project_id, reason)
         return store.save(project)
 
     @app.put("/api/projects/{project_id}/song/context", response_model=Project)
@@ -7659,6 +8144,89 @@ def create_app(
                 project.song.duration,
             )
         ]
+        return store.save(project)
+
+    @app.get("/api/projects/{project_id}/song/envelope")
+    def read_song_envelope(project_id: str) -> dict[str, Any]:
+        """The Song Envelope, on its own endpoint. Read-only, and never part of a Project.
+
+        Its own endpoint because of the size: a three-minute envelope at 30 Hz with 8 bands is
+        hundreds of kilobytes against a whole manifest of 110–190 KB, and the manifest rides a
+        two-second poll. Embedding it in the Project response would multiply every poll by the
+        length of the song — so no Project response carries it, here or anywhere.
+
+        No `response_model`, deliberately: the envelope's arrays are the analysis's own recorded
+        shape, and re-declaring them as a pydantic model here would be a second definition of the
+        same thing to keep in step with `audio.py`, plus a validation pass over several thousand
+        floats on every read for no guarantee that is not already true of a file this application
+        wrote itself.
+
+        A sync `def`, so FastAPI runs it in the threadpool: it hashes the whole song file to
+        decide validity, and a multi-megabyte read has no business on the event loop.
+
+        **Absence is a 200.** A project with no song, no analysis, a replaced song or a deleted
+        sidecar all answer `{"present": false, "reason": …}`. None of those is an error and a 404
+        would make consumers draw one. The only 404 here is the project itself not existing.
+        """
+        project = get_project(project_id)
+        return song_envelope_report(project_id, project)
+
+    @app.post("/api/projects/{project_id}/song/analyze", response_model=Project)
+    def analyze_song_now(project_id: str) -> Project:
+        """Measure the song again, now, because the Director asked.
+
+        **The state this exists to leave.** Everything else in this story measures a song as a
+        side effect of storing one, which means a measurement that failed, or one invalidated by a
+        replaced file, was *terminal*: `SONG_ENVELOPE_SONG_CHANGED`, `SONG_ANALYSIS_WRITE_FAILED`
+        and `SONG_ANALYSIS_FFMPEG_MISSING` all describe a condition the Director can fix — put the
+        song back, free the disk, install ffmpeg — and then had no way at all to act on. The only
+        remedy was to re-import the track, which is a destructive gesture behind a confirmation
+        gate, to clear a derived cache file. This is the button that sentence implies.
+
+        It is also `force`'s missing caller. That parameter existed for exactly this and nothing
+        reached it, which is how a parameter becomes decoration; Treatment Story 16.2 calls this
+        same entry point, skippably-by-fingerprint, from its own trigger.
+
+        **`force=True`, so it always re-measures.** A Director who clicks this while the envelope
+        is already current gets a fresh measurement rather than a silent no-op. That is the whole
+        difference between this and the automatic path: the automatic path skips what is already
+        done because it is not the Director asking, and this one is.
+
+        **Not a poll, and not a job lane.** One request, one measurement, one answer — which is
+        what keeps the frozen Never intact rather than bending it. There is no task record, nothing
+        to come back and ask about, and nothing here that a client is expected to call on a timer.
+        A sync `def`, so FastAPI runs it in the threadpool for the reason `align_song_lyrics` is
+        one: 168 ms of ffmpeg and numpy has no business on the event loop.
+
+        **What it does with no song**, stated because it is a decision and not an accident: it
+        refuses, 422, naming the reason. `align_song_lyrics` is the sibling here and this follows
+        it exactly. The distinction from the import path is worth being explicit about — there, the
+        analysis is a bonus riding somebody else's request and may never fail it, so a failure is
+        logged and swallowed. Here the analysis *is* the request, so a failure is the answer to it
+        and is reported rather than hidden. The same split `align_song_lyrics` makes: a
+        precondition nobody can measure past is 422, and a measurement that genuinely failed is
+        502 carrying its own named reason.
+
+        **A refusal changes nothing.** `analyze_project_song` mutates the Project only on success
+        and never saves, and the save below is reached only when it returned no reason — so a
+        failed re-analysis leaves the manifest exactly as it found it, which is the import path's
+        discipline arriving at the same place by a different route.
+        """
+        project = get_project(project_id)
+        song = project.song
+        if song is None or not song.path:
+            # Covers both "no song at all" and a generated Song whose render has not landed. There
+            # is nothing on disk to measure in either case, and the sentence is true of both.
+            raise HTTPException(status_code=422, detail=SONG_ANALYSIS_WITHOUT_SONG)
+        # The containment-checked accessor's own 404 rather than a reason of this route's
+        # invention: every other song route already answers exactly that for a file that is gone,
+        # and a second spelling of it here would be a second thing to keep in step.
+        try:
+            resolve_song_path(project_id, song)
+        except OSError as error:
+            raise HTTPException(status_code=404, detail="Song media was not found") from error
+        if reason := analyze_song_for_project(project_id, project, force=True):
+            raise HTTPException(status_code=502, detail=reason)
         return store.save(project)
 
     @app.post(
@@ -13083,12 +13651,22 @@ def create_app(
         """
         project, generation = get_project_for_update(project_id)
         for attempt in range(RENDER_STATUS_SAVE_ATTEMPTS):
+            # Inside the loop, not above it: a refused save re-reads the project, so a `before`
+            # taken once would be compared against a different object on the second attempt.
+            landed_from = song_audio_path(project)
             outcome = await reconcile_render_jobs(project, comfy)
             if not outcome.changed:
                 # The commonest tick by far, and the cheapest: nothing moved, so nothing is
                 # written and no collision is possible. Left first because it is also the reason
-                # the retry below is rare enough to afford.
+                # the retry below is rare enough to afford. Nothing moved also means the Song's
+                # path did not, so the analysis below cannot have been owed on this tick.
                 break
+            # The other half of "a Song is analysed when it is stored", and the half that covers
+            # every generated track. Gated on the path having actually changed, so the ordinary
+            # tick — the one that fires every two seconds for the length of a render — does a
+            # string comparison and nothing else. **Nothing here may hash the song file on the
+            # unchanged path**; that is what this gate is for.
+            measured = await analyze_a_landed_song(project_id, project, landed_from)
             try:
                 store.save(project, if_generation=generation)
                 break
@@ -13110,6 +13688,14 @@ def create_app(
                         project_id,
                         RENDER_STATUS_SAVE_ATTEMPTS,
                     )
+                    if measured:
+                        # The manifest that would have pointed at this envelope never landed, so
+                        # the file is referenced by nothing: this tick's write already replaced
+                        # whatever was there, and the pointer that would have named it was
+                        # dropped with the save. Removing it leaves the project in the state the
+                        # refused save left everything else in, rather than leaving a measurement
+                        # on disk that no manifest mentions and nothing will ever clean up.
+                        store.song_envelope_path(project_id).unlink(missing_ok=True)
                     break
                 project, generation = get_project_for_update(project_id)
         return render_status_report(
@@ -13138,7 +13724,12 @@ def create_app(
                 history = await comfy.history(job.prompt_id)
             except ComfyError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
+            # Captured before the adoption, because the adoption is the thing that changes it.
+            # See `analyze_a_landed_song`: a generated Song has no audio until a render lands, and
+            # this is one of the two places in the application where that happens.
+            landed_from = song_audio_path(project)
             apply_job_history(project, job, history)
+            await analyze_a_landed_song(project_id, project, landed_from)
             if job.status == "queued":
                 # History is empty for both waiting and executing prompts. Only the live
                 # queue distinguishes them, so a running render is not reported as queued.

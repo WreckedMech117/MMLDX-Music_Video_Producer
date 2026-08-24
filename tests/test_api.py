@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import re
 import subprocess
 import wave
@@ -87,6 +88,11 @@ from music_video_producer.app import (
     SHOT_PLAN_EMPTY_NOTICE,
     SHOT_WINDOW_NOTICE,
     SNAP_CUTS_NO_SONG,
+    SONG_ANALYSIS_DECODE_FAILED,
+    SONG_ANALYSIS_FFMPEG_MISSING,
+    SONG_ANALYSIS_MEDIA_MISSING,
+    SONG_ANALYSIS_WITHOUT_SONG,
+    SONG_ANALYSIS_WRITE_FAILED,
     SONG_CAPTION_LIMIT,
     SONG_CONTEXT_FIELD_NAMES,
     SONG_CONTEXT_LABELS,
@@ -94,6 +100,13 @@ from music_video_producer.app import (
     SONG_CONTEXT_WITHOUT_SONG,
     SONG_DIRECTOR_VISIBLE,
     SONG_DIRECTOR_WITHHELD,
+    SONG_ENVELOPE_AUDIO_PENDING,
+    SONG_ENVELOPE_FILE_UNREADABLE,
+    SONG_ENVELOPE_NOT_TAKEN,
+    SONG_ENVELOPE_RECORD_DISAGREES,
+    SONG_ENVELOPE_SONG_CHANGED,
+    SONG_ENVELOPE_UNDECODABLE,
+    SONG_ENVELOPE_WITHOUT_SONG,
     SONG_LYRICS_LIMIT,
     TAKE_MISSING_FILE_REFUSAL,
     TAKE_NOT_RENDERED_REFUSAL,
@@ -103,6 +116,7 @@ from music_video_producer.app import (
     SongContextField,
     SongContextRequest,
     _withheld_fields,
+    analyze_project_song,
     create_app,
     document_change_notice,
     document_first_draft_notice,
@@ -145,6 +159,7 @@ from music_video_producer.director import (
     PlannedShot,
     ShotExpansion,
 )
+from music_video_producer.effects import song_fingerprint
 from music_video_producer.h3_expansion_prompt import (
     APPEARANCE_ANCHOR_RULES,
 )
@@ -1353,6 +1368,11 @@ def test_a_new_song_field_cannot_be_added_without_deciding_what_the_director_see
         # declared vocal type is withheld until the populate instruction has wording that says
         # what a tagged line means. Named explicitly so removing it is a decision someone makes.
         "vocal_type",
+        # The Song Envelope's pointer, withheld on the `vocal_spans`/`lyric_words` grounds: a
+        # sidecar path, a sample rate and a content hash are of no use to the model, and the one
+        # part a planning turn could want — the tempo — belongs in an instruction phrased as the
+        # estimate it is, not as a bare number beside a file path.
+        "analysis",
     }
     assert not SONG_DIRECTOR_VISIBLE & SONG_DIRECTOR_WITHHELD
 
@@ -21133,3 +21153,1405 @@ def test_the_whole_queue_cancel_is_the_per_job_route_and_not_a_second_settle_pat
         "store.save",
     ):
         assert spelling not in body, spelling
+
+
+# ---------------------------------------------------------------------------
+# Story 8.1 — the Song Envelope
+#
+# One measurement, taken when the song is stored, written beside the project rather than into
+# the manifest, and believed only while a content fingerprint still matches the audio in front
+# of it. Every row of the story's I/O matrix has a test below.
+# ---------------------------------------------------------------------------
+
+
+def click_wav_bytes(bpm: float = 120.0, seconds: float = 4.0, rate: int = 22050) -> bytes:
+    """A real, decodable metronome — the smallest thing that measures as *music*.
+
+    `wav_bytes` above is silence, which is a legitimate measurement and therefore useless for
+    telling "measured" from "not measured". This one has beats in it, so a BPM greater than zero
+    is evidence that the analysis actually ran rather than evidence of a defaulted record.
+    """
+    content = BytesIO()
+    period_frames = max(1, round(60.0 / bpm * rate))
+    burst = int(0.02 * rate)
+    frames = bytearray()
+    for index in range(int(rate * seconds)):
+        into_beat = index % period_frames
+        value = 0
+        if into_beat < burst:
+            moment = into_beat / rate
+            value = int(20000 * math.sin(2 * math.pi * 1000 * moment) * math.exp(-moment * 120))
+        frames += int(value).to_bytes(2, "little", signed=True)
+    with wave.open(content, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(rate)
+        target.writeframes(bytes(frames))
+    return content.getvalue()
+
+
+def import_measured_song(client, project_id: str, *, bpm: float = 120.0, name: str = "beat.wav"):
+    response = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Measured", "duration": "4.0"},
+        files={"file": (name, click_wav_bytes(bpm=bpm), "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+    return response
+
+
+def test_importing_a_song_measures_it_into_a_sidecar_and_records_only_a_pointer(tmp_path: Path):
+    """The first matrix row, and the shape of the whole story.
+
+    The Song is stored, the envelope is written beside the project's media, and the *manifest*
+    gains a pointer and nothing else. Asserted through a fresh `ProjectStore`, because the claim
+    is about what survived to disk rather than about what one response object happened to hold.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Measured"))
+    import_measured_song(client, project.id, bpm=120)
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    analysis = saved.song.analysis
+    assert analysis.path == "media/analysis/song-envelope.json"
+    assert analysis.analysis_rate == 30.0
+    assert analysis.band_count == 8
+    assert analysis.bpm == pytest.approx(120, rel=0.05)
+    assert analysis.song_fingerprint
+
+    # The fingerprint is the one the shared function computes over the song's own bytes — not an
+    # mtime, not a hash of the record, and not something only this route knows how to make.
+    audio = store.project_dir(project.id) / saved.song.path
+    assert analysis.song_fingerprint == song_fingerprint(audio)
+    assert analysis.song_fingerprint.startswith(f"{audio.stat().st_size}-")
+
+    # And the measurement itself is a file, carrying everything the story asks for.
+    envelope = json.loads(
+        (store.project_dir(project.id) / analysis.path).read_text(encoding="utf-8")
+    )
+    for key in ("rms", "peak", "flux", "bands", "band_average", "onsets", "beats", "bpm"):
+        assert key in envelope, key
+    assert len(envelope["bands"]) == envelope["band_count"] == 8
+    assert len(envelope["band_average"]) == 8
+    assert envelope["analysis_rate"] == 30.0
+
+
+def test_the_envelope_is_served_by_its_own_endpoint_and_never_by_a_project_response(
+    tmp_path: Path,
+):
+    """Its own read-only endpoint, and the manifest stays small.
+
+    The size argument is the whole reason for the sidecar: a manifest rides a two-second poll, so
+    an envelope embedded in a Project response would multiply every poll by the length of the
+    song. Both halves are asserted — the endpoint serves the arrays, and no Project response or
+    stored manifest contains them.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Served"))
+    import_measured_song(client, project.id)
+
+    served = client.get(f"/api/projects/{project.id}/song/envelope")
+    assert served.status_code == 200
+    payload = served.json()
+    assert payload["present"] is True
+    assert payload["reason"] == ""
+    assert len(payload["envelope"]["rms"]) == payload["envelope"]["analysis_frames"]
+
+    # No Project response embeds it, and neither does the manifest on disk.
+    read = client.get(f"/api/projects/{project.id}").json()
+    assert read["song"]["analysis"]["path"] == "media/analysis/song-envelope.json"
+    assert "rms" not in json.dumps(read)
+    manifest = (store.project_dir(project.id) / "project.json").read_text(encoding="utf-8")
+    assert "rms" not in manifest
+
+
+def test_an_envelope_does_not_materially_change_the_size_of_the_manifest(tmp_path: Path):
+    """The measurement that decided the sidecar, asserted as a bound.
+
+    A three-minute envelope is hundreds of kilobytes against a whole manifest of 110–190 KB. The
+    pointer that replaces it is five small fields, so the manifest may grow by a line or two and
+    nothing more — this is the test that fails the day somebody "simplifies" the sidecar away.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Sized"))
+    manifest = store.project_dir(project.id) / "project.json"
+
+    plain = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Plain", "duration": "4.0"},
+        files={"file": ("plain.wav", wav_bytes(4.0), "audio/wav")},
+    )
+    assert plain.status_code == 200, plain.text
+    before = manifest.stat().st_size
+
+    import_measured_song(client, project.id)
+    after = manifest.stat().st_size
+    envelope = (
+        store.project_dir(project.id) / "media/analysis/song-envelope.json"
+    ).stat().st_size
+
+    assert after - before < 400, "the manifest grew by more than a pointer"
+    assert envelope > 10 * (after - before), "the envelope is not what is being kept out"
+
+
+def test_a_song_whose_bytes_changed_reports_its_analysis_absent_and_writes_no_flag(
+    tmp_path: Path,
+):
+    """Validity is derived at read time. Nothing marks an envelope stale, ever.
+
+    The song's bytes are replaced under the same path, which is the general case of "the audio
+    this was measured from is not the audio that is here now" — and the one this has to survive,
+    because no route that touches a song file knows this feature exists. The stored fingerprint
+    no longer describes it, so the analysis is **absent**: not degraded, not served with a
+    warning, and above all not repaired by the read.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Changed"))
+    import_measured_song(client, project.id, bpm=120)
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    recorded = saved.song.analysis
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+
+    sidecar = store.project_dir(project.id) / recorded.path
+    envelope_before = sidecar.read_bytes()
+    audio = store.project_dir(project.id) / saved.song.path
+    audio.write_bytes(click_wav_bytes(bpm=100))
+
+    report = client.get(f"/api/projects/{project.id}/song/envelope").json()
+    assert report == {"present": False, "reason": SONG_ENVELOPE_SONG_CHANGED}
+    assert "envelope" not in report
+
+    # Nothing was rewritten and nothing was marked. The record is a pointer, four settings and a
+    # fingerprint — there is no field a "stale" flag could even be written into.
+    after = ProjectStore(tmp_path).get(project.id)
+    assert after.song.analysis == recorded
+    assert sidecar.read_bytes() == envelope_before
+    assert set(json.loads(after.model_dump_json())["song"]["analysis"]) == {
+        "path",
+        "analysis_rate",
+        "band_count",
+        "bpm",
+        "song_fingerprint",
+    }
+
+
+def test_a_project_with_no_song_reports_the_analysis_absent(tmp_path: Path):
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Songless"))
+    report = client.get(f"/api/projects/{project.id}/song/envelope")
+    assert report.status_code == 200, "absence is not an error state"
+    assert report.json() == {"present": False, "reason": SONG_ENVELOPE_WITHOUT_SONG}
+
+
+def test_a_deleted_sidecar_reports_absent_rather_than_a_partial_envelope(tmp_path: Path):
+    """A pointer at a file that is gone. The answer is absent — never a zeroed or half envelope,
+    which is the failure mode this story names explicitly."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Deleted"))
+    import_measured_song(client, project.id)
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    (store.project_dir(project.id) / saved.song.analysis.path).unlink()
+
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json() == {
+        "present": False,
+        "reason": SONG_ENVELOPE_FILE_UNREADABLE,
+    }
+
+
+def test_a_corrupt_sidecar_is_not_treated_as_data(tmp_path: Path):
+    """Unparseable JSON at the pointer: reported absent, and the unreadable bytes are never handed
+    to a consumer as a measurement. A half-read envelope is how zeros get downstream."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Corrupt"))
+    import_measured_song(client, project.id)
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    sidecar = store.project_dir(project.id) / saved.song.analysis.path
+    sidecar.write_text('{"rms": [0.1, 0.2', encoding="utf-8")
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json() == {
+        "present": False,
+        "reason": SONG_ENVELOPE_FILE_UNREADABLE,
+    }
+
+    # And well-formed JSON that is not an object is refused for the same reason.
+    sidecar.write_text("[1, 2, 3]", encoding="utf-8")
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is False
+
+
+def test_an_import_still_succeeds_when_ffmpeg_is_missing(tmp_path: Path, monkeypatch):
+    """The Song is the import's job; the measurement is a bonus it must never be able to refuse.
+
+    ffmpeg absent, so nothing can be decoded. The upload answers 200, the Song is stored whole, no
+    envelope is written, no record is planted, and the reason is named rather than becoming a 500
+    the Director cannot act on.
+    """
+    from music_video_producer import app as app_module
+    from music_video_producer.audio import FfmpegMissing
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="No ffmpeg"))
+
+    def missing(*_args, **_kwargs):
+        raise FfmpegMissing("ffmpeg was not found on PATH")
+
+    monkeypatch.setattr(app_module, "analyze_song", missing)
+    import_measured_song(client, project.id)
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.title == "Measured"
+    assert saved.song.duration == 4.0
+    assert saved.song.path.endswith("beat.wav")
+    assert saved.song.analysis == models.SongAnalysis(), "a failure planted a record"
+    assert not (store.project_dir(project.id) / "media" / "analysis").exists()
+
+    # Read back on a machine where ffmpeg *is* installed and the file *is* decodable — which is
+    # exactly this machine, since only the decode call was stubbed out. So the endpoint says the
+    # plain thing, and that is the point: the reason is a fact about now, not a record of the
+    # failed attempt. The machine-is-missing-ffmpeg reading has its own test below.
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json() == {
+        "present": False,
+        "reason": SONG_ENVELOPE_NOT_TAKEN,
+    }
+    # The reasons are named strings carrying their own remedy, not bare exception text.
+    assert "ffmpeg" in SONG_ANALYSIS_FFMPEG_MISSING
+    assert "{reason}" in SONG_ANALYSIS_DECODE_FAILED
+
+
+def test_an_undecodable_file_leaves_the_song_intact_and_names_why(tmp_path: Path):
+    """The same contract on the other failure: ffmpeg runs, and the file is not audio.
+
+    The import still succeeds and the Song is stored whole. What the endpoint says about it is the
+    specific reason rather than the generic one — worked out at read time by probing the file that
+    is there now, not read back from a note somebody wrote when the import happened.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Not audio"))
+
+    response = client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Broken", "duration": "3.0"},
+        files={"file": ("broken.wav", b"this is not a wave file", "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.title == "Broken"
+    assert saved.song.analysis == models.SongAnalysis()
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json() == {
+        "present": False,
+        "reason": SONG_ENVELOPE_UNDECODABLE,
+    }
+
+
+def test_a_manifest_without_the_analysis_field_loads_and_round_trips(tmp_path: Path):
+    """Every `project.json` written before this story loads unchanged.
+
+    Hand-written without the key, read through a fresh `ProjectStore`, saved back: the record
+    arrives at its default, which means *no analysis*, and nothing else about the manifest moves.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Legacy envelope"))
+    manifest = store.project_dir(project.id) / "project.json"
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["song"] = {
+        "title": "Older",
+        "source": "imported",
+        "path": "media/o.mp3",
+        "duration": 90.0,
+        "lyrics": "[Verse]\nWords\n",
+        "caption": "",
+        "vocal_type": "duet",
+    }
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = ProjectStore(tmp_path).get(project.id)
+    assert loaded.song.analysis == models.SongAnalysis()
+    assert loaded.song.analysis.path == "" and loaded.song.analysis.bpm == 0
+    assert loaded.song.vocal_type == "duet"
+
+    ProjectStore(tmp_path).save(loaded)
+    again = ProjectStore(tmp_path).get(project.id)
+    assert again.song.analysis == models.SongAnalysis()
+    assert again.song.lyrics == "[Verse]\nWords\n"
+
+
+def test_the_analysis_pointer_is_server_owned_on_the_generic_project_put(tmp_path: Path):
+    """The seventh field to meet this route's recurring guard hole, guarded the same way.
+
+    Both directions, because both are real. A client written before the field existed *omits* it,
+    so an ordinary save arrives carrying a default record and would discard the pointer to a
+    measurement that is still on disk and still current. A client that *invents* one names a
+    sidecar path this application then reads, with a fingerprint that would make a stale envelope
+    pass the one check built to catch it.
+
+    Both saves must also answer 200 rather than the song-replacement refusal: the adoption happens
+    ahead of `project.song != current.song`, so a body differing only here compares equal.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Owned"))
+    import_measured_song(client, project.id)
+    stored = ProjectStore(tmp_path).get(project.id).song.analysis
+    assert stored.path and stored.song_fingerprint
+
+    # Omitted entirely — the shape every pre-existing client sends.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["song"].pop("analysis")
+    omitted = client.put(f"/api/projects/{project.id}", json=body)
+    assert omitted.status_code == 200, omitted.text
+    assert ProjectStore(tmp_path).get(project.id).song.analysis == stored
+
+    # Forged — a body inventing a record, pointed at a file of its own choosing.
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["song"]["analysis"] = {
+        "path": "media/analysis/forged.json",
+        "analysis_rate": 999.0,
+        "band_count": 3,
+        "bpm": 200.0,
+        "song_fingerprint": "0-forged",
+    }
+    forged = client.put(f"/api/projects/{project.id}", json=body)
+    assert forged.status_code == 200, forged.text
+    assert ProjectStore(tmp_path).get(project.id).song.analysis == stored, "a save planted a record"
+
+    # And the envelope still reads as the one that was actually measured.
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+
+
+def test_a_confirmed_song_replacement_detaches_the_analysis_with_the_rest(tmp_path: Path):
+    """`_detach_song_recovery_slots`' argument, applied to the measurement.
+
+    An envelope describes the audio it was taken from. Carried across a confirmed replacement it
+    would hand the old track's beats to the new one behind a pointer that looks perfectly healthy.
+    The fingerprint would catch it on the next read; writing a record already known to be wrong
+    and leaning on a downstream check is not how this codebase detaches derived state.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Detached"))
+    import_measured_song(client, project.id)
+    assert ProjectStore(tmp_path).get(project.id).song.analysis.path
+
+    body = client.get(f"/api/projects/{project.id}").json()
+    body["song"] = {
+        "title": "A Different Track",
+        "source": "imported",
+        "path": "media/other.mp3",
+        "duration": 121.0,
+        "lyrics": "",
+        "caption": "",
+    }
+    replaced = client.put(f"/api/projects/{project.id}?confirm_song_replacement=true", json=body)
+    assert replaced.status_code == 200, replaced.text
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.title == "A Different Track"
+    assert saved.song.analysis == models.SongAnalysis(), "the new song kept the old measurement"
+
+
+def test_the_analysis_entry_point_is_callable_and_skippable_from_outside_a_route(tmp_path: Path):
+    """Treatment Story 16.2's requirement, met here rather than promised.
+
+    That story folds this analysis and the lyric-structure pass under one trigger *without*
+    merging the computations, so this half has to be callable from somewhere that is not the
+    import route — and skipped when it is already current, since the common case there is that
+    the song was measured on import. A skip returns the same empty reason a fresh measurement
+    does, because "already done" is a success and must never read as a failure to run.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Callable"))
+    audio = store.media_dir(project.id) / "songs" / "000-beat.wav"
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(click_wav_bytes(bpm=120))
+    project.song = models.Song(
+        title="Callable",
+        source="imported",
+        path=audio.relative_to(store.project_dir(project.id)).as_posix(),
+        duration=4.0,
+    )
+
+    assert analyze_project_song(store, project.id, project, audio) == ""
+    first = project.song.analysis
+    assert first.bpm == pytest.approx(120, rel=0.05)
+    sidecar = store.project_dir(project.id) / first.path
+    written = sidecar.read_bytes()
+    sidecar.write_bytes(written + b"\n")  # a marker only a re-measure would erase
+
+    # Called again over unchanged bytes: skipped, reported as success, and nothing rewritten.
+    assert analyze_project_song(store, project.id, project, audio) == ""
+    assert project.song.analysis == first
+    assert sidecar.read_bytes() == written + b"\n"
+
+    # `force` is the caller that wants it retaken anyway — at a changed rate, and the record says
+    # so, which is the whole reason the rate is a field rather than a constant.
+    assert analyze_project_song(store, project.id, project, audio, force=True) == ""
+    assert sidecar.read_bytes() == written
+
+    # And a record whose sidecar has gone re-measures rather than reporting itself current.
+    sidecar.unlink()
+    assert analyze_project_song(store, project.id, project, audio) == ""
+    assert sidecar.exists()
+
+    # A song-less project is a named reason, never a raise and never an envelope of zeros.
+    project.song = None
+    assert analyze_project_song(store, project.id, project, audio) == SONG_ANALYSIS_WITHOUT_SONG
+
+
+def test_the_shot_list_write_path_carries_no_song_to_adopt():
+    """The narrower sibling, checked rather than assumed.
+
+    `PUT .../shots` is the route this codebase's guard holes keep turning up on, and it re-invokes
+    `_adopt_expansion_maps` for exactly that reason. It needs no song-level adoption because its
+    body cannot carry a Song at all — asserted about the request model, so the day someone widens
+    it, this test is what says a new adoption is owed.
+    """
+    from music_video_producer import app as app_module
+
+    assert set(app_module.ShotListRequest.model_fields) == {"shots", "updated_at"}
+
+
+# ---------------------------------------------------------------------------
+# Story 8.1, Director rulings — a generated song is measured too, and the reason
+# an envelope is missing is worked out at read time rather than remembered.
+# ---------------------------------------------------------------------------
+
+
+def generated_song_take(store, project_id: str, filename: str = "take.wav", bpm: float = 120.0):
+    """Put real audio where a completed music render would have left it.
+
+    A generated Song's audio does not live under the project at all — it is written by ComfyUI
+    into its own output tree, and `resolve_song_path` resolves it against `comfy_root/output`.
+    Writing a genuine click track there is what makes the analysis in these tests a real
+    measurement rather than a stubbed one.
+    """
+    subfolder = f"music-video-producer/{project_id}/songs"
+    target = store.data_root / "comfy" / "output" / Path(subfolder) / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(click_wav_bytes(bpm=bpm))
+    return subfolder, filename, target
+
+
+def test_a_generated_song_is_analysed_when_its_render_lands(tmp_path: Path):
+    """The other half of "imported **or** generated", on the per-job refresh route.
+
+    A generated Song is created with no audio at all: the record is written when ComfyUI accepts
+    the graph, and the file appears minutes later when the render lands. `apply_job_history` is
+    the one writer that fills the path in, so that is where "the Song was stored" happens here —
+    and until this hook existed, a Director who generated their song never got an envelope.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Generated"))
+    job = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Machine made", "caption": "industrial synth rock", "duration": 4},
+    ).json()
+    subfolder, filename, audio = generated_song_take(store, project.id, bpm=120)
+    comfy.history = completed_history_for([{"subfolder": subfolder, "filename": filename}])
+
+    refreshed = client.get(f"/api/projects/{project.id}/jobs/{job['id']}")
+    assert refreshed.status_code == 200, refreshed.text
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.source == "generated"
+    assert saved.song.path == f"{subfolder}/{filename}"
+    # Measured, and measured from the file ComfyUI actually wrote — the fingerprint is taken over
+    # the take in the output tree, not over anything under the project.
+    assert saved.song.analysis.path == "media/analysis/song-envelope.json"
+    assert saved.song.analysis.bpm == pytest.approx(120, rel=0.05)
+    assert saved.song.analysis.song_fingerprint == song_fingerprint(audio)
+    assert saved.song.analysis.band_count == 8
+
+    served = client.get(f"/api/projects/{project.id}/song/envelope").json()
+    assert served["present"] is True
+    assert len(served["envelope"]["bands"]) == 8
+
+
+def test_the_poll_analyses_a_generated_song_when_its_audio_lands(tmp_path: Path):
+    """The same hook on the route the browser actually drives.
+
+    `read_job` is the manual refresh and the smoke scripts' path; `/render-status` is the
+    two-second poll the interface runs while a render is open, and it is the one that will in
+    practice see a music job finish. Both call `apply_job_history`, so both need the hook — a
+    generated song analysed on only one of them is a coin toss.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Polled generation"))
+    client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Polled", "caption": "colder synth rock", "duration": 4},
+    )
+    subfolder, filename, _audio = generated_song_take(store, project.id, bpm=100)
+    comfy.history = completed_history_for([{"subfolder": subfolder, "filename": filename}])
+
+    report = client.get(f"/api/projects/{project.id}/render-status")
+    assert report.status_code == 200, report.text
+    assert report.json()["jobs"][0]["status"] == "complete"
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.path == f"{subfolder}/{filename}"
+    assert saved.song.analysis.bpm == pytest.approx(100, rel=0.05)
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+
+
+def test_an_ordinary_poll_tick_neither_analyses_nor_hashes_the_song(tmp_path: Path):
+    """The Director's constraint on the hook, asserted rather than described.
+
+    The trigger is an **in-memory path comparison**, and it has to be, because the alternative —
+    letting the analysis decide for itself by fingerprint — puts a SHA-256 of a multi-megabyte
+    audio file on a two-second loop, forever, to answer "no" every single time.
+
+    So: a tick that genuinely changes the project (a Flux render settles, an Asset adopts its
+    landed file) while the Song's path is untouched must not reach the analysis and must not read
+    a single byte of the song. Both spies stay at zero.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Quiet tick"))
+    import_measured_song(client, project.id)
+    job = client.post(
+        f"/api/projects/{project.id}/generate/flux",
+        json={
+            "name": "Lead singer",
+            "kind": "character",
+            "prompt": "portrait",
+            "width": 1024,
+            "height": 1024,
+            "steps": 4,
+            "guidance": 4,
+            "seed": 1,
+        },
+    ).json()
+    assert job["prompt_id"]
+
+    # Installed after the import, so the import's own honest measurement is not counted.
+    calls = {"analyze": 0, "fingerprint": 0}
+    real_fingerprint = app_module.song_fingerprint
+
+    def counted_analyze(*args, **kwargs):
+        calls["analyze"] += 1
+        raise AssertionError("an unchanged song path reached the analysis")
+
+    def counted_fingerprint(path):
+        calls["fingerprint"] += 1
+        return real_fingerprint(path)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "analyze_song", counted_analyze)
+    monkeypatch.setattr(app_module, "song_fingerprint", counted_fingerprint)
+    try:
+        comfy.history = completed_history_for(
+            [
+                {
+                    "subfolder": f"music-video-producer/{project.id}/assets",
+                    "filename": "Lead singer_00001_.png",
+                }
+            ]
+        )
+        report = client.get(f"/api/projects/{project.id}/render-status")
+        assert report.status_code == 200, report.text
+        # The tick really did change the project — otherwise this proves nothing at all.
+        assert report.json()["assets"][0]["path"].endswith("Lead singer_00001_.png")
+        assert ProjectStore(tmp_path).get(project.id).assets[0].path
+    finally:
+        monkeypatch.undo()
+
+    assert calls["analyze"] == 0, "the poll re-analysed a song whose path never moved"
+    assert calls["fingerprint"] == 0, "the poll hashed the song file on an ordinary tick"
+
+
+def test_a_landed_song_is_analysed_once_and_not_again_on_later_ticks(tmp_path: Path):
+    """Landing is a one-time event, and the tick after it must be as cheap as the tick before.
+
+    The first tick sees the path change and measures. Every tick after it sees the same path and
+    does nothing — which is the property that makes hooking the poll affordable at all.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Once only"))
+    client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Once", "caption": "industrial synth rock", "duration": 4},
+    )
+    subfolder, filename, _audio = generated_song_take(store, project.id, bpm=120)
+    comfy.history = completed_history_for([{"subfolder": subfolder, "filename": filename}])
+
+    calls = {"analyze": 0}
+    real_analyze = app_module.analyze_song
+
+    def counted(source, **kwargs):
+        calls["analyze"] += 1
+        return real_analyze(source, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "analyze_song", counted)
+    try:
+        assert client.get(f"/api/projects/{project.id}/render-status").status_code == 200
+        assert calls["analyze"] == 1, "the landing did not trigger a measurement"
+        for _ in range(3):
+            assert client.get(f"/api/projects/{project.id}/render-status").status_code == 200
+        assert calls["analyze"] == 1, "a later tick re-measured a song that had not changed"
+    finally:
+        monkeypatch.undo()
+
+    assert ProjectStore(tmp_path).get(project.id).song.analysis.bpm == pytest.approx(120, rel=0.05)
+
+
+def test_a_song_whose_audio_is_not_on_disk_says_so(tmp_path: Path):
+    """A record pointing at audio that is not there — a generated Song still rendering, or a file
+    deleted by hand. Named as a missing file rather than as "not analysed yet", because the two
+    have different remedies and only one of them is waiting."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="No audio"))
+    project.song = models.Song(
+        title="Pending", source="imported", path="media/songs/000-never-written.wav", duration=4.0
+    )
+    store.save(project)
+
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json() == {
+        "present": False,
+        "reason": SONG_ANALYSIS_MEDIA_MISSING,
+    }
+
+    # A generated Song whose render has not landed yet has no path at all, and that is a
+    # *different* state with a different remedy: nothing is lost and nothing needs doing. Telling
+    # a Director their audio "was not found on disk" while it is still rendering would send them
+    # looking for a file that was never supposed to exist yet.
+    project.song = models.Song(title="Queued", source="generated", path="", duration=4.0)
+    store.save(project)
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json() == {
+        "present": False,
+        "reason": SONG_ENVELOPE_AUDIO_PENDING,
+    }
+    assert SONG_ENVELOPE_AUDIO_PENDING != SONG_ANALYSIS_MEDIA_MISSING
+
+
+def test_the_absence_reason_is_recomputed_from_this_machine_and_never_stored(tmp_path: Path):
+    """AD-21 and standing law 5, applied to a failure rather than to a validity verdict.
+
+    The obvious implementation is a `reason` field on `SongAnalysis`, written when an analysis
+    fails. It is the same mistake as a `valid` flag one step further from the truth: a stored
+    string describes an attempt that happened once, on a machine that may since have had ffmpeg
+    installed, over a file that may since have been replaced. It can only get more wrong, and
+    nothing would ever clear it.
+
+    So this asserts the property directly. One project, one manifest, **byte-identical throughout**
+    — and two different answers, decided only by whether ffmpeg is on PATH at the moment of the
+    read. A stored reason cannot do that.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Recomputed"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Fine", "duration": "4.0"},
+        files={"file": ("fine.wav", click_wav_bytes(bpm=120), "audio/wav")},
+    )
+    # Clear the record so the endpoint has to explain an absence rather than serve an envelope.
+    saved = ProjectStore(tmp_path).get(project.id)
+    saved.song.analysis = models.SongAnalysis()
+    ProjectStore(tmp_path).save(saved)
+    manifest = store.project_dir(project.id) / "project.json"
+    before = manifest.read_bytes()
+
+    endpoint = f"/api/projects/{project.id}/song/envelope"
+    assert client.get(endpoint).json()["reason"] == SONG_ENVELOPE_NOT_TAKEN
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module.shutil, "which", lambda _name: None)
+    try:
+        assert client.get(endpoint).json() == {
+            "present": False,
+            "reason": SONG_ANALYSIS_FFMPEG_MISSING,
+        }
+    finally:
+        monkeypatch.undo()
+
+    # Put ffmpeg back and the answer goes back with it. Nothing was written to reach either one.
+    assert client.get(endpoint).json()["reason"] == SONG_ENVELOPE_NOT_TAKEN
+    assert manifest.read_bytes() == before, "a read-only endpoint wrote the manifest"
+
+    # The record has nowhere to keep a reason even if somebody wanted to.
+    assert set(models.SongAnalysis.model_fields) == {
+        "path",
+        "analysis_rate",
+        "band_count",
+        "bpm",
+        "song_fingerprint",
+    }
+
+
+def test_every_absence_the_endpoint_reports_names_its_own_cause(tmp_path: Path):
+    """The six answers, end to end, each distinguishable from the other five.
+
+    A single `present: false` with one sentence for every cause would be the easy version and the
+    useless one: "no analysis" sends a Director looking for a button when the real answer is that
+    ffmpeg is not installed, or that the file they imported is not audio, or that the song they
+    replaced this morning is why. Distinct causes, distinct sentences.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Six answers"))
+    endpoint = f"/api/projects/{project.id}/song/envelope"
+
+    # 1. No Song at all.
+    assert client.get(endpoint).json()["reason"] == SONG_ENVELOPE_WITHOUT_SONG
+
+    # 2. A Song whose audio is not on disk.
+    project.song = models.Song(title="Gone", source="imported", path="media/songs/gone.wav")
+    store.save(project)
+    assert client.get(endpoint).json()["reason"] == SONG_ANALYSIS_MEDIA_MISSING
+
+    # 3. A file ffmpeg will not decode.
+    client.post(
+        f"/api/projects/{project.id}/songs/upload?confirm_song_replacement=true",
+        data={"title": "Broken", "duration": "3.0", "confirm_song_replacement": "true"},
+        files={"file": ("broken.wav", b"this is not a wave file", "audio/wav")},
+    )
+    assert client.get(endpoint).json()["reason"] == SONG_ENVELOPE_UNDECODABLE
+
+    # 4. ffmpeg absent from this machine.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module.shutil, "which", lambda _name: None)
+    try:
+        assert client.get(endpoint).json()["reason"] == SONG_ANALYSIS_FFMPEG_MISSING
+    finally:
+        monkeypatch.undo()
+
+    # 5. A real, measured song — the one answer that is not an absence.
+    replaced = client.post(
+        f"/api/projects/{project.id}/songs/upload?confirm_song_replacement=true",
+        data={"title": "Real", "duration": "4.0", "confirm_song_replacement": "true"},
+        files={"file": ("real.wav", click_wav_bytes(bpm=120), "audio/wav")},
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert client.get(endpoint).json()["present"] is True
+
+    # 6. The song's bytes change underneath it.
+    saved = ProjectStore(tmp_path).get(project.id)
+    audio = store.project_dir(project.id) / saved.song.path
+    audio.write_bytes(click_wav_bytes(bpm=90))
+    assert client.get(endpoint).json()["reason"] == SONG_ENVELOPE_SONG_CHANGED
+
+    # 7. The sidecar goes missing.
+    audio.write_bytes(click_wav_bytes(bpm=120))
+    assert client.get(endpoint).json()["present"] is True
+    (store.project_dir(project.id) / saved.song.analysis.path).unlink()
+    assert client.get(endpoint).json()["reason"] == SONG_ENVELOPE_FILE_UNREADABLE
+
+    # Every sentence above is distinct — a reason that duplicates another is a reason that does
+    # not tell the Director which of the two happened.
+    reasons = {
+        SONG_ENVELOPE_WITHOUT_SONG,
+        SONG_ANALYSIS_MEDIA_MISSING,
+        SONG_ENVELOPE_UNDECODABLE,
+        SONG_ANALYSIS_FFMPEG_MISSING,
+        SONG_ENVELOPE_SONG_CHANGED,
+        SONG_ENVELOPE_FILE_UNREADABLE,
+        SONG_ENVELOPE_NOT_TAKEN,
+    }
+    assert len(reasons) == 7
+
+
+def test_the_envelope_endpoint_computes_nothing_and_persists_nothing(tmp_path: Path):
+    """Read-only in the strong sense, asserted where it is easiest to break.
+
+    The endpoint now works out *why* an envelope is missing, which puts it one short step from
+    helpfully producing one. It must not: offering the fix is an interface decision with its own
+    route and its own confirmation. So a project with a perfectly analysable song and no record
+    answers "not analysed yet" as many times as it is asked, and neither the manifest nor the
+    media directory moves.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Read only"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Analysable", "duration": "4.0"},
+        files={"file": ("fine.wav", click_wav_bytes(bpm=120), "audio/wav")},
+    )
+    saved = ProjectStore(tmp_path).get(project.id)
+    sidecar = store.project_dir(project.id) / saved.song.analysis.path
+    sidecar.unlink()
+    saved.song.analysis = models.SongAnalysis()
+    ProjectStore(tmp_path).save(saved)
+
+    manifest = store.project_dir(project.id) / "project.json"
+    before = manifest.read_bytes()
+
+    calls = {"analyze": 0}
+
+    def counted(*args, **kwargs):
+        calls["analyze"] += 1
+        raise AssertionError("the read-only endpoint computed an envelope")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "analyze_song", counted)
+    try:
+        for _ in range(3):
+            assert client.get(f"/api/projects/{project.id}/song/envelope").json() == {
+                "present": False,
+                "reason": SONG_ENVELOPE_NOT_TAKEN,
+            }
+    finally:
+        monkeypatch.undo()
+
+    assert calls["analyze"] == 0
+    assert manifest.read_bytes() == before
+    assert not sidecar.exists()
+
+
+# ---------------------------------------------------------------------------
+# Story 8.1, review findings: the failure paths nobody had exercised, and the
+# two gates that keep a read cheap and a measurement honest.
+# ---------------------------------------------------------------------------
+
+
+def test_an_import_survives_a_sidecar_that_cannot_be_written(tmp_path: Path):
+    """The disk fills up during the one write this feature makes.
+
+    `SONG_ANALYSIS_WRITE_FAILED` existed, was formatted with a reason, and was reached by no test
+    at all - so "the import still succeeds" was an argument about a branch nobody had run. The
+    Song must be stored whole, the record must stay defaulted rather than pointing at a file that
+    was never written, and the route must answer 200.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Full disk"))
+
+    def no_space(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module.ProjectStore, "write_song_envelope", no_space)
+    try:
+        import_measured_song(client, project.id)
+    finally:
+        monkeypatch.undo()
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.song.title == "Measured"
+    assert saved.song.duration == 4.0
+    assert saved.song.path.endswith("beat.wav")
+    assert saved.song.analysis == models.SongAnalysis(), "a record was left pointing at nothing"
+    assert "{reason}" in SONG_ANALYSIS_WRITE_FAILED
+
+
+def test_no_analysis_failure_can_ever_take_the_import_down_with_it(tmp_path: Path):
+    """The measurement is a bonus and may never cost the Director their upload.
+
+    The catch used to name two exception classes, and what it let through was worse than what it
+    caught: a `MemoryError` on a long track, or an `OSError` reading the file out from under a
+    decode, escaped into `upload_song`, which then raised before `store.save` - answering 500 with
+    the audio on disk and no Song in the manifest at all. Enumerating every exception numpy and
+    ffmpeg can raise is not a strategy, so nothing escapes.
+    """
+    from music_video_producer import app as app_module
+
+    for failure in (MemoryError("out of memory"), OSError(5, "I/O error"), RuntimeError()):
+        client, store, _comfy = make_client(tmp_path / str(id(failure)))
+        project = store.create(Project(name="Escapes"))
+
+        def raising(*_args, _failure=failure, **_kwargs):
+            raise _failure
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(app_module, "analyze_song", raising)
+        try:
+            response = client.post(
+                f"/api/projects/{project.id}/songs/upload",
+                data={"title": "Kept", "duration": "4.0"},
+                files={"file": ("beat.wav", click_wav_bytes(bpm=120), "audio/wav")},
+            )
+        finally:
+            monkeypatch.undo()
+
+        assert response.status_code == 200, f"{type(failure).__name__} took the import down"
+        saved = ProjectStore(tmp_path / str(id(failure))).get(project.id)
+        assert saved.song is not None, "the upload was lost"
+        assert saved.song.title == "Kept"
+        assert saved.song.analysis == models.SongAnalysis()
+
+
+def test_the_read_time_probe_has_no_opinion_when_it_could_not_run(tmp_path: Path):
+    """The third answer, and the reason the helper is tri-state at all.
+
+    `False` is ffprobe having read the file and refused it - a verdict about the file. `None` is
+    ffprobe not being on this machine, or timing out, or failing to decode its own stderr: no
+    verdict, and telling a Director "your file is not audio" on the strength of a tool that never
+    ran is exactly the fabricated statement this codebase refuses. Both existing reason tests let
+    the real ffprobe run, so only True and False were ever observed.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="No opinion"))
+    client.post(
+        f"/api/projects/{project.id}/songs/upload",
+        data={"title": "Fine", "duration": "4.0"},
+        files={"file": ("fine.wav", click_wav_bytes(bpm=120), "audio/wav")},
+    )
+    saved = ProjectStore(tmp_path).get(project.id)
+    saved.song.analysis = models.SongAnalysis()
+    ProjectStore(tmp_path).save(saved)
+    endpoint = f"/api/projects/{project.id}/song/envelope"
+
+    silenced = [
+        FileNotFoundError(2, "No such file or directory", "ffprobe"),
+        subprocess.TimeoutExpired("ffprobe", 15),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        PermissionError(13, "Permission denied"),
+    ]
+    for failure in silenced:
+        def raising(*_args, _failure=failure, **_kwargs):
+            raise _failure
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(app_module.subprocess, "run", raising)
+        try:
+            answer = client.get(endpoint).json()
+        finally:
+            monkeypatch.undo()
+        assert answer["reason"] == SONG_ENVELOPE_NOT_TAKEN, type(failure).__name__
+        assert answer["reason"] != SONG_ENVELOPE_UNDECODABLE
+
+    # And the tri-state's other two answers still work, so this is not a blanket silencer.
+    assert app_module._audio_stream_present(
+        store.project_dir(project.id) / saved.song.path
+    ) is True
+
+
+def test_the_envelope_read_does_not_hash_a_song_whose_length_already_disagrees(tmp_path: Path):
+    """The cost the render-status gate was written to avoid, on the route that pays it.
+
+    A fingerprint carries the byte count it was taken over precisely so this question can be asked
+    of a file without reading it. A song that was replaced is almost never the same length as the
+    one before it, so the cheap half answers the common case and the SHA-256 runs only when the
+    lengths agree.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Cheap read"))
+    import_measured_song(client, project.id)
+    saved = ProjectStore(tmp_path).get(project.id)
+    audio = store.project_dir(project.id) / saved.song.path
+
+    calls = {"hash": 0}
+    real = app_module.song_fingerprint
+
+    def counted(path):
+        calls["hash"] += 1
+        return real(path)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "song_fingerprint", counted)
+    try:
+        # Same bytes: the sizes agree, so the digest has to settle it and is paid once.
+        assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+        assert calls["hash"] == 1
+
+        # A different length is a definitive "not the same bytes" and needs no hash at all.
+        audio.write_bytes(click_wav_bytes(bpm=120, seconds=6.0))
+        answer = client.get(f"/api/projects/{project.id}/song/envelope").json()
+    finally:
+        monkeypatch.undo()
+
+    assert answer["reason"] == SONG_ENVELOPE_SONG_CHANGED
+    assert calls["hash"] == 1, "a song of an obviously different length was hashed anyway"
+
+
+def test_a_song_rewritten_at_the_same_path_is_measured_again(tmp_path: Path):
+    """A path that did not change is not proof the audio did not.
+
+    A re-render landing on the same output filename rewrites the bytes underneath an unchanged
+    `Song.path`. The path comparison alone would never fire again, leaving a stale envelope that
+    nothing in this story can retake - so the landing gate has a second arm: a `stat` against the
+    byte count the stored fingerprint was taken over. Still not a hash, and still only reached on
+    a tick where something actually settled.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Same name"))
+    job = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Take one", "caption": "industrial synth rock", "duration": 4},
+    ).json()
+    subfolder, filename, audio = generated_song_take(store, project.id, bpm=120)
+    comfy.history = completed_history_for([{"subfolder": subfolder, "filename": filename}])
+    assert client.get(f"/api/projects/{project.id}/jobs/{job['id']}").status_code == 200
+    first = ProjectStore(tmp_path).get(project.id).song.analysis
+    assert first.bpm == pytest.approx(120, rel=0.05)
+
+    # A second take at the same filename: different music, different length, same path.
+    audio.write_bytes(click_wav_bytes(bpm=90, seconds=6.0))
+    second_job = client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Take two", "caption": "colder synth rock", "duration": 6},
+    ).json()
+    # The new Song record carries the previous take's path and its previous fingerprint, which is
+    # the state the path comparison cannot see through.
+    staged = ProjectStore(tmp_path).get(project.id)
+    staged.song.path = f"{subfolder}/{filename}"
+    staged.song.analysis = first
+    ProjectStore(tmp_path).save(staged)
+    comfy.history = completed_history_for([{"subfolder": subfolder, "filename": filename}])
+
+    assert client.get(f"/api/projects/{project.id}/jobs/{second_job['id']}").status_code == 200
+    again = ProjectStore(tmp_path).get(project.id).song.analysis
+    assert again.bpm == pytest.approx(90, rel=0.05), "the rewritten take kept the old measurement"
+    assert again.song_fingerprint != first.song_fingerprint
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+
+
+def test_an_envelope_that_disagrees_with_its_record_is_not_served(tmp_path: Path):
+    """A consumer reads `band_count` off the *record* and then indexes `bands` in the *file*.
+
+    They are written in the same breath and cannot disagree by any path this application takes -
+    but the manifest is hand-editable, and "they cannot differ" is an argument rather than a
+    guarantee. A disagreement is an out-of-range read on a screen rather than an error anybody
+    sees, so it is checked, and the answer is absent with its own sentence.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Disagreement"))
+    import_measured_song(client, project.id)
+    endpoint = f"/api/projects/{project.id}/song/envelope"
+    assert client.get(endpoint).json()["present"] is True
+
+    for field, value in (("band_count", 3), ("analysis_rate", 60.0)):
+        saved = ProjectStore(tmp_path).get(project.id)
+        setattr(saved.song.analysis, field, value)
+        ProjectStore(tmp_path).save(saved)
+        answer = client.get(endpoint).json()
+        assert answer == {"present": False, "reason": SONG_ENVELOPE_RECORD_DISAGREES}, field
+
+        saved = ProjectStore(tmp_path).get(project.id)
+        setattr(saved.song.analysis, field, {"band_count": 8, "analysis_rate": 30.0}[field])
+        ProjectStore(tmp_path).save(saved)
+    assert client.get(endpoint).json()["present"] is True
+
+    # And the case the two scalar comparisons cannot see: the record and the envelope's own
+    # `band_count` agree with each other, and the `bands` array is shorter than both of them.
+    # That is the actual out-of-range read - a panel asking for band 7 of a list with three rows -
+    # and neither number in the header would have given it away.
+    saved = ProjectStore(tmp_path).get(project.id)
+    sidecar = store.project_dir(project.id) / saved.song.analysis.path
+    envelope = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert envelope["band_count"] == saved.song.analysis.band_count == 8
+    envelope["bands"] = envelope["bands"][:3]
+    sidecar.write_text(json.dumps(envelope), encoding="utf-8")
+    assert client.get(endpoint).json() == {
+        "present": False,
+        "reason": SONG_ENVELOPE_RECORD_DISAGREES,
+    }
+
+
+def test_a_sidecar_that_is_not_an_envelope_is_never_served_as_one(tmp_path: Path):
+    """End to end through the endpoint: the store's shape and version checks are what stand
+    between a consumer and a `present: true` carrying no arrays to read."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Not an envelope"))
+    import_measured_song(client, project.id)
+    saved = ProjectStore(tmp_path).get(project.id)
+    sidecar = store.project_dir(project.id) / saved.song.analysis.path
+    endpoint = f"/api/projects/{project.id}/song/envelope"
+
+    for payload in ("{}", '{"version": 1}', '{"version": 99, "rms": []}'):
+        sidecar.write_text(payload, encoding="utf-8")
+        assert client.get(endpoint).json() == {
+            "present": False,
+            "reason": SONG_ENVELOPE_FILE_UNREADABLE,
+        }, payload
+
+    # And the project's own manifest, which is inside the project directory and is a JSON object,
+    # is refused rather than served as a measurement.
+    saved.song.analysis.path = "project.json"
+    ProjectStore(tmp_path).save(saved)
+    assert client.get(endpoint).json()["present"] is False
+
+
+def test_a_lost_save_race_leaves_no_envelope_nobody_points_at(tmp_path: Path):
+    """The poll's compare-and-swap can refuse every attempt, and the sidecar is written before it.
+
+    The manifest that would have named the file never lands, so the file is referenced by nothing:
+    this tick's write already replaced whatever was there, and the pointer was dropped with the
+    save. Sweeping it leaves the project in the state the refused save left everything else in,
+    rather than a measurement on disk that no manifest mentions and nothing will ever clean up.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Lost race"))
+    client.post(
+        f"/api/projects/{project.id}/generate/music",
+        json={"title": "Racing", "caption": "industrial synth rock", "duration": 4},
+    )
+    subfolder, filename, _audio = generated_song_take(store, project.id, bpm=120)
+    comfy.history = completed_history_for([{"subfolder": subfolder, "filename": filename}])
+
+    def always_refuse(*_args, **_kwargs):
+        raise ProjectChangedDuringSave("another writer landed first")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module_save_target(), "save", always_refuse)
+    try:
+        report = client.get(f"/api/projects/{project.id}/render-status")
+    finally:
+        monkeypatch.undo()
+
+    assert report.status_code == 200, "a lost race must not become an error"
+    assert not (
+        store.project_dir(project.id) / "media" / "analysis" / "song-envelope.json"
+    ).exists(), "an envelope was left behind with no manifest pointing at it"
+
+
+def app_module_save_target():
+    from music_video_producer import app as app_module
+
+    return app_module.ProjectStore
+
+
+# ---------------------------------------------------------------------------
+# Story 8.1, Director ruling during review triage: the re-analyze route.
+#
+# Three of this feature's absence reasons name a condition the Director can fix
+# and, until this route, could then do nothing about. These are the tests that
+# each of the three is genuinely clearable.
+# ---------------------------------------------------------------------------
+
+
+def analyze_song_route(client, project_id: str):
+    return client.post(f"/api/projects/{project_id}/song/analyze")
+
+
+def test_re_analyzing_clears_a_song_that_changed_underneath_its_envelope(tmp_path: Path):
+    """The first terminal state. The Director replaced the audio; the stored fingerprint no longer
+    describes it; every read says so and nothing could act on it. One click, and the envelope
+    describes the track that is actually there."""
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Changed"))
+    import_measured_song(client, project.id, bpm=120)
+    endpoint = f"/api/projects/{project.id}/song/envelope"
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    audio = store.project_dir(project.id) / saved.song.path
+    audio.write_bytes(click_wav_bytes(bpm=90, seconds=6.0))
+    assert client.get(endpoint).json()["reason"] == SONG_ENVELOPE_SONG_CHANGED
+
+    response = analyze_song_route(client, project.id)
+    assert response.status_code == 200, response.text
+    assert response.json()["song"]["analysis"]["bpm"] == pytest.approx(90, rel=0.05)
+
+    assert client.get(endpoint).json()["present"] is True
+    stored = ProjectStore(tmp_path).get(project.id).song.analysis
+    assert stored.bpm == pytest.approx(90, rel=0.05)
+    assert stored.song_fingerprint == song_fingerprint(audio)
+
+
+def test_re_analyzing_clears_an_analysis_whose_sidecar_could_not_be_written(tmp_path: Path):
+    """The second terminal state. The disk was full at import, so the Song was stored with no
+    record at all; freeing the disk fixed the condition and left no way to act on it."""
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Was full"))
+
+    def no_space(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module.ProjectStore, "write_song_envelope", no_space)
+    try:
+        import_measured_song(client, project.id, bpm=120)
+    finally:
+        monkeypatch.undo()
+
+    assert ProjectStore(tmp_path).get(project.id).song.analysis == models.SongAnalysis()
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is False
+
+    assert analyze_song_route(client, project.id).status_code == 200
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+    assert ProjectStore(tmp_path).get(project.id).song.analysis.bpm == pytest.approx(
+        120, rel=0.05
+    )
+
+
+def test_re_analyzing_clears_an_import_that_happened_while_ffmpeg_was_absent(tmp_path: Path):
+    """The third terminal state, and the one whose remedy is furthest from the application.
+
+    A Director imports before installing ffmpeg. The Song is stored whole and unmeasured, they
+    install ffmpeg, and nothing they can do inside the interface takes the measurement — the only
+    path to it was re-importing the track through a destructive confirmation gate.
+    """
+    from music_video_producer import app as app_module
+    from music_video_producer.audio import FfmpegMissing
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="No ffmpeg yet"))
+
+    def missing(*_args, **_kwargs):
+        raise FfmpegMissing("ffmpeg was not found on PATH")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "analyze_song", missing)
+    monkeypatch.setattr(app_module.shutil, "which", lambda _name: None)
+    try:
+        import_measured_song(client, project.id, bpm=100)
+        assert client.get(f"/api/projects/{project.id}/song/envelope").json()["reason"] == (
+            SONG_ANALYSIS_FFMPEG_MISSING
+        )
+        # And the route refuses while ffmpeg is genuinely still missing, naming the same reason
+        # rather than answering 500 or pretending to have measured something.
+        refused = analyze_song_route(client, project.id)
+        assert refused.status_code == 502
+        assert refused.json()["detail"] == SONG_ANALYSIS_FFMPEG_MISSING
+        assert ProjectStore(tmp_path).get(project.id).song.analysis == models.SongAnalysis()
+    finally:
+        monkeypatch.undo()
+
+    # ffmpeg installed. The same click now works, with no re-import.
+    assert analyze_song_route(client, project.id).status_code == 200
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+    assert ProjectStore(tmp_path).get(project.id).song.analysis.bpm == pytest.approx(
+        100, rel=0.05
+    )
+
+
+def test_re_analyzing_measures_again_even_when_the_envelope_is_already_current(tmp_path: Path):
+    """What `force` means, and the whole difference between this route and the automatic path.
+
+    The automatic path skips what is already done because it is not the Director asking. This one
+    is, so a current envelope is re-measured rather than silently left alone — otherwise the button
+    does nothing on the one project where the Director most wants to see it do something.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Already current"))
+    import_measured_song(client, project.id, bpm=120)
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    sidecar = store.project_dir(project.id) / saved.song.analysis.path
+    written = sidecar.read_bytes()
+    sidecar.write_bytes(written + b"\n")  # a marker only a real re-measure erases
+
+    calls = {"analyze": 0}
+    real = app_module.analyze_song
+
+    def counted(source, **kwargs):
+        calls["analyze"] += 1
+        return real(source, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "analyze_song", counted)
+    try:
+        assert analyze_song_route(client, project.id).status_code == 200
+    finally:
+        monkeypatch.undo()
+
+    assert calls["analyze"] == 1, "force did not force"
+    assert sidecar.read_bytes() == written, "the sidecar was not rewritten"
+    assert ProjectStore(tmp_path).get(project.id).song.analysis == saved.song.analysis
+
+
+def test_re_analyzing_is_one_request_and_one_measurement(tmp_path: Path):
+    """Not a poll and not a job lane, which is what keeps the frozen Never intact rather than
+    bending it. There is no task record, nothing to come back and ask about, and no client is
+    expected to call this on a timer: one request in, one measurement taken, one Project out."""
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="One shot"))
+    import_measured_song(client, project.id, bpm=120)
+
+    calls = {"analyze": 0}
+    real = app_module.analyze_song
+
+    def counted(source, **kwargs):
+        calls["analyze"] += 1
+        return real(source, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "analyze_song", counted)
+    try:
+        response = analyze_song_route(client, project.id)
+    finally:
+        monkeypatch.undo()
+
+    assert response.status_code == 200
+    assert calls["analyze"] == 1
+    # The answer is the Project, like every other song route, and it carries no envelope.
+    body = response.json()
+    assert body["id"] == project.id
+    assert body["song"]["analysis"]["path"] == "media/analysis/song-envelope.json"
+    assert "rms" not in json.dumps(body)
+    # And no job record was invented to describe the work.
+    assert ProjectStore(tmp_path).get(project.id).jobs == []
+
+
+def test_re_analyzing_refuses_a_project_with_nothing_to_measure(tmp_path: Path):
+    """The stated decision, covered. `align_song_lyrics` is the sibling and this follows it: a
+    precondition nobody can measure past is a 422 naming the reason, never a 500 and never a
+    cheerful 200 over a project where nothing happened."""
+    client, store, _comfy = make_client(tmp_path)
+
+    # No Song at all.
+    project = store.create(Project(name="Songless"))
+    refused = analyze_song_route(client, project.id)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == SONG_ANALYSIS_WITHOUT_SONG
+
+    # A generated Song whose render has not landed: nothing on disk to measure, same sentence.
+    project.song = models.Song(title="Queued", source="generated", path="", duration=4.0)
+    store.save(project)
+    refused = analyze_song_route(client, project.id)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == SONG_ANALYSIS_WITHOUT_SONG
+
+    # A Song whose audio has gone: the containment accessor's own 404, the same answer every
+    # other song route gives for a missing file rather than a second spelling of it.
+    project.song = models.Song(
+        title="Gone", source="imported", path="media/songs/000-gone.wav", duration=4.0
+    )
+    store.save(project)
+    assert analyze_song_route(client, project.id).status_code == 404
+
+    # And an unknown project is a 404 before any of that is considered.
+    assert analyze_song_route(client, "project_deadbeef").status_code == 404
+
+
+def test_a_refused_re_analysis_leaves_the_project_exactly_as_it_found_it(tmp_path: Path):
+    """The import path's discipline, arriving here by a different route.
+
+    `analyze_project_song` mutates the Project only on success and never saves, and the save is
+    reached only when it returned no reason — so a failure cannot leave a half-applied record, and
+    cannot move `updated_at` under a Director who is mid-edit somewhere else.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Untouched"))
+    import_measured_song(client, project.id, bpm=120)
+    manifest = store.project_dir(project.id) / "project.json"
+    before = manifest.read_bytes()
+
+    for failure in (MemoryError("out of memory"), OSError(5, "I/O error"), RuntimeError()):
+        def raising(*_args, _failure=failure, **_kwargs):
+            raise _failure
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(app_module, "analyze_song", raising)
+        try:
+            refused = analyze_song_route(client, project.id)
+        finally:
+            monkeypatch.undo()
+
+        assert refused.status_code == 502, type(failure).__name__
+        assert refused.json()["detail"], "a refusal with no reason in it"
+        assert manifest.read_bytes() == before, "a refused re-analysis wrote the manifest"
+
+    # The envelope that was already there is still served, untouched by any of it.
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is True
