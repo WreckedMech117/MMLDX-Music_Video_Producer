@@ -15,6 +15,18 @@ export const state = {
   // The candidate import's own measurement, tied to the File it came from. Kept apart
   // from audioBuffer, which loadPersistedWaveform also writes for the stored song.
   pendingImport: null,
+  // The Song Envelope this browser has read, or `null`. Session-scoped and never persisted: it
+  // is a measurement the server holds in a sidecar, fetched once per project and song file on
+  // the load path, and a copy kept in `localStorage` would be a second truth about a file that
+  // can be replaced between two page loads.
+  //
+  // `null` until a read comes back `present: true`, which is the same nothing an absent, stale,
+  // unreadable or never-taken measurement leaves behind -- naming *which* absence it was is the
+  // endpoint's job, and nothing on this side branches on it or even counts them. Deliberately NOT
+  // on `state.project`: the project object is what `PUT /api/projects/{id}` sends back whole, and
+  // over a megabyte of arrays folded into it would be written straight into the manifest by the
+  // next ordinary save. It sits beside `audioBuffer`, which is out here for the same reason.
+  songEnvelope: null,
   pixelsPerSecond: 16,
   playhead: 0,
   dirty: false,

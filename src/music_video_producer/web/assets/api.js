@@ -5158,6 +5158,155 @@ export function timelineWheelPlan({
   return still;
 }
 
+// ---- Beat markers over the timeline waveform -------------------------------------------------
+//
+// Story 8.1 measured the song into an envelope carrying beats and onsets in absolute seconds and
+// nothing showed them: the Director cuts against a waveform that draws amplitude and nothing
+// else, inferring where the beat falls from the shape of the peaks. This is the drawing half.
+//
+// Everything below is arithmetic, `zoomViewport`'s rule one section up: seconds and pixels, no
+// DOM. `app.js` positions and writes, and re-derives none of it.
+
+// The band the marks are drawn into, and the toggle that shows them. Constants rather than
+// literals, `VRAM_EJECT_CONTROL`'s reason exactly: an id spelled once here and once in the
+// markup is an id that drifts, and with it here the contract test holds both to one string.
+export const BEAT_MARKERS_BAND = "#beat-band";
+export const BEAT_MARKERS_CONTROL = "#beat-markers";
+export const BEAT_MARKERS_LABEL = "Beat markers";
+export const BEAT_MARKERS_HELP =
+  "Draws the beats and onsets the song analysis measured over the master waveform. Display " +
+  "only — showing or hiding them changes nothing about any shot and writes nothing to the " +
+  "project. A song that has not been analysed, or one replaced since it was, simply draws " +
+  "nothing.";
+
+// The two kinds, and the class each is drawn with. **The class is decided here**, not in the
+// template, because it is the other half of the placement decision: a beat is a taller, heavier
+// rule and an onset a short thin tick, which is what tells them apart by height and weight rather
+// than by hue. Both take inert tokens. Standing law 7 closes the palette at six accents with fixed
+// meanings -- `--cyan` already means *approved* and `--blue` is reserved permanently for
+// transitions and reactive bindings -- and a marker is a reference mark, not a state.
+export const BEAT_MARKER_KINDS = { beat: "beat", onset: "onset" };
+export const BEAT_MARKER_CLASSES = { beat: "beat-mark", onset: "onset-mark" };
+
+// How close two marks of the same kind may come before the further one is dropped, and how close
+// an onset may come to a *kept beat* before the onset is dropped.
+//
+// **Measured, on a real 3-minute track analysed by this application on 2026-08-24:** 440 beats and
+// 332 onsets, 772 marks in all. That is 2.44 beats and 1.84 onsets a second -- an average onset
+// every 0.54 s, nowhere near the 0.07 s floor the picker enforces, so the picker's floor is the
+// wrong number to design against. What those densities become on screen:
+//
+//   * 40 px/s -- a beat every 16.4 px, an onset every 21.7 px: comfortable, nothing is dropped.
+//   * 16 px/s (the default) -- 6.5 px and 8.7 px: dense but legible, and both kinds survive.
+//   *  6 px/s (the floor)   -- 2.5 px between beats. Against a 2 px mark that is ~80% ink, which
+//      is a solid bar and not a reference mark, however short it is drawn.
+//
+// So the same-kind gap is what stops the far end of the zoom being a wall, and it is deliberately
+// larger than the clearance: a clearance wide enough to thin the band would also wipe every onset
+// out at the default zoom, where beats already sit 6.5 px apart. The clearance's only job is that
+// two marks never land on the same pixel, and when they compete **the beat wins** -- it is the
+// stronger of the two claims, and the one a cut is placed against.
+export const BEAT_MARKER_MIN_GAP_PIXELS = 6;
+export const BEAT_MARKER_CLEARANCE_PIXELS = 2;
+
+// Where every mark goes, and whether there are any at all.
+//
+// `envelope` takes either the endpoint's whole report -- `{present, reason, envelope}` -- or a
+// bare envelope, because absence has a named reason for every way it can happen and **every one
+// of them draws the same nothing here**. Absence is silence: no error, no toast, no refusal text,
+// and a timeline identical to the one this application drew before the feature existed. The named
+// refusal with its `[Analyze song]` action belongs where a consumer genuinely *needs* an envelope;
+// beat markers do not need one, they simply do not draw. Nothing here reads `reason`, so a reason
+// this file has never heard of draws exactly the same nothing as the ones it has.
+//
+// Offsets are `seconds * pixelsPerSecond` -- the same expression the clips are laid out with,
+// deliberately, and *not* a fraction of `trackWidth`. Below `900 / pixelsPerSecond` the waveform
+// canvas stretches to its 900px floor while the clips stay on their seconds, so the waveform and
+// the clips already disagree down there. That is pre-existing and is not fixed here; what this
+// settles is which of the two a mark agrees with, and the answer is the clips, because a beat
+// marker exists to say where to put a cut.
+//
+// `trackWidth` and `duration` both trim, and both are needed. The track has that same 900px floor,
+// so on a short song at a low zoom the drawn width runs past the end of the audio -- and a mark
+// out there would sit on silence that was never measured. A mark is drawn only where the two agree
+// there is still song.
+//
+// The two lists are assumed ascending, which is what `audio.py` writes. Given anything else the
+// thinning under-drops rather than mis-places: every mark still lands on its own second.
+export function beatMarkerPlan({
+  envelope = null,
+  pixelsPerSecond = TIMELINE_ZOOM_BASE,
+  trackWidth = 0,
+  duration = 0,
+  enabled = true,
+  minimumGap = BEAT_MARKER_MIN_GAP_PIXELS,
+  clearance = BEAT_MARKER_CLEARANCE_PIXELS,
+} = {}) {
+  const empty = { markers: [], beats: 0, onsets: 0 };
+  if (!enabled) return empty;
+  const scale = Number(pixelsPerSecond);
+  const width = Number(trackWidth);
+  if (!Number.isFinite(scale) || scale <= 0) return empty;
+  if (!Number.isFinite(width) || width <= 0) return empty;
+  const report = envelope && typeof envelope === "object" ? envelope : null;
+  if (!report) return empty;
+  const measured = "present" in report
+    ? (report.present === true ? report.envelope : null)
+    : report;
+  if (!measured || typeof measured !== "object") return empty;
+  const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0);
+  const song = positive(duration);
+  const limit = song ? Math.min(width, song * scale) : width;
+  const gap = positive(minimumGap);
+  const clear = positive(clearance);
+  // `typeof === "number"` rather than a coercion, because this file's own producer writes real
+  // numbers and `allow_nan=False` on the write side guarantees they are finite: coercing would
+  // quietly turn a `null` in a malformed array into a mark at second zero.
+  const placed = (times, kind) => (Array.isArray(times) ? times : [])
+    .filter((seconds) => typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0)
+    .map((seconds) => ({
+      kind,
+      seconds,
+      left: seconds * scale,
+      className: BEAT_MARKER_CLASSES[kind],
+    }))
+    .filter((mark) => mark.left < limit);
+  // Thinned to a minimum spacing, first-wins, so the result is a deterministic function of the
+  // measurement rather than of which end it was scanned from. `against` is the marks this kind
+  // yields to -- ascending, so the cursor only ever moves forward.
+  const spaced = (marks, room, against = []) => {
+    const kept = [];
+    let cursor = 0;
+    for (const mark of marks) {
+      while (cursor < against.length && against[cursor].left <= mark.left - clear) cursor += 1;
+      if (cursor < against.length && against[cursor].left < mark.left + clear) continue;
+      const previous = kept[kept.length - 1];
+      if (previous && mark.left - previous.left < room) continue;
+      kept.push(mark);
+    }
+    return kept;
+  };
+  const beats = spaced(placed(measured.beats, BEAT_MARKER_KINDS.beat), gap);
+  const onsets = spaced(placed(measured.onsets, BEAT_MARKER_KINDS.onset), gap, beats);
+  // Onsets first in the markup, so a beat paints over an onset that survived beside it rather than
+  // under it -- the clearance keeps the two off the same pixel, not out of the same neighbourhood.
+  return { markers: [...onsets, ...beats], beats: beats.length, onsets: onsets.length };
+}
+
+// Which song a read envelope belongs to. The band is keyed on this, so it is re-read exactly when
+// the answer changes and never otherwise -- the endpoint hashes the whole master to decide
+// validity, which is why nothing may ask it on a timer.
+//
+// The **fingerprint** is in the key, not only the path. A measurement retaken over the same file --
+// the Director pressing Analyze again, a re-render landing on the same output name -- changes the
+// fingerprint and nothing else, and keyed on the path alone it would never be re-read at all.
+export function songEnvelopeIdentity(projectId, song = null) {
+  const id = projectId || "";
+  const path = song?.path || "";
+  if (!id || !path) return `${id}::`;
+  return `${id}:${path}:${song?.analysis?.song_fingerprint || ""}`;
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.
@@ -5228,6 +5377,14 @@ export const api = {
   // filled from the measurement. First run transcribes (minutes, CPU); the words are kept
   // on the Song so every later run is instant.
   alignLyrics: (id, body = {}) => request(`/api/projects/${id}/song/align-lyrics`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // The Song Envelope, on its own read-only route and never inside a Project: a three-minute
+  // measurement is over a megabyte of JSON against a whole manifest of 110–190 KB, and the
+  // manifest rides a two-second poll. Absence is a **200** carrying `{present: false, reason}`
+  // for every one of its reasons -- no song, no audio yet, a replaced song, a missing or
+  // unreadable sidecar -- so a caller branches on `present` and never on a status code. Read
+  // once on the load path when a song is on screen; it hashes the song file to decide validity,
+  // which is precisely why nothing may put it behind a timer.
+  songEnvelope: (id) => request(`/api/projects/${id}/song/envelope`),
   // One pointer moves: `output` switches among the shot's own takes (provenance is its
   // job history), `asset_id` attaches a video asset as the shot's clip.
   selectTake: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/select-take`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

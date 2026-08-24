@@ -368,7 +368,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    third signal rather than the only one. Wider than `.icon-tool` because its glyph is two
    characters — an edge meeting a marker. */
 #snap-playhead { width: auto; padding: 0 8px; letter-spacing: -1px; }
-#snap-playhead.snap-on { color: var(--acid); border-color: var(--acid); }
+/* The beat-marker toggle takes the same pressed treatment, and takes it from the same rule rather
+   than from a copy of it: two toggles in one row whose "on" is spelled twice is how one of them
+   drifts. Both carry `aria-pressed` and an accessible name saying on or off, so the colour here is
+   the third signal and never the only one. */
+#snap-playhead.snap-on, #beat-markers.snap-on { color: var(--acid); border-color: var(--acid); }
 /* Undo and Redo. Ordinary icon tools; the disabled state is the stylesheet's own, and everything
    that distinguishes "nothing to undo" from "undo the split" is in the accessible name. */
 #undo-shots, #redo-shots { font-size: 15px; }
@@ -402,6 +406,26 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 /* Where the track actually sings, striped along the bottom of the master row. */
 #vocal-band { position: absolute; left: 0; right: 0; bottom: 0; height: 5px; pointer-events: none; }
 .vocal-span { position: absolute; top: 0; height: 100%; background: #d4f75e66; border-radius: 2px; }
+/* Beats and onsets from the Song Envelope, as a tick strip along the TOP of the master row.
+   `#vocal-band` is the precedent: a 5px stripe at the bottom edge annotates the waveform without
+   covering it. This band was `inset: 0` and browser QA on 2026-08-24 showed exactly why that is
+   wrong -- full-height marks made the default zoom a picket fence and 38% a near-solid grey wall
+   with the waveform reduced to a thin olive line between two banks of ticks. The requirement is
+   that markers *read against* the waveform, and a mark that buries it fails that however correctly
+   it is placed. 13px of an 80px row, at the top, where a centred waveform draws nothing.
+   `pointer-events: none` for `#vocal-band`'s reason and it is load-bearing even at this height:
+   the seek gesture and every clip drag that starts here must pass straight through. */
+#beat-band { position: absolute; left: 0; right: 0; top: 0; height: 13px; pointer-events: none; overflow: hidden; }
+/* The two kinds, told apart by **height and weight**, not by hue -- the same floor this stylesheet
+   holds every other state to, and here it is the whole distinction. Both take inert tokens:
+   `--muted` and `--dim`. A marker is a reference mark and not a state, and standing law 7 keeps the
+   six accents for states -- `--cyan` is *approved*, `--blue` is reserved permanently for
+   transitions and reactive bindings. The beat is the full 13px at 2px wide; the onset is 6px at
+   1px, so the two read as a ruler with its bar lines and its subdivisions. Density is not this
+   file's problem: api.js's beatMarkerPlan thins both kinds to a minimum pixel gap before either
+   reaches here, and it writes the class too -- neither is ever chosen in the template. */
+.beat-mark { position: absolute; top: 0; width: 2px; height: 100%; background: var(--muted); opacity: .7; }
+.onset-mark { position: absolute; top: 0; width: 1px; height: 46%; background: var(--dim); opacity: .9; }
 #master-volume { width: 74px; accent-color: var(--acid); }
 .shots-track { min-height: 110px; }
 .refs-track { min-height: 52px; }

@@ -362,7 +362,13 @@
               says on or off in words — the row already holds two mute buttons whose state is a
               hue, and this application's rule is that state is never carried by colour alone. The
               title here is a placeholder: app.js's syncPlayheadSnapControl writes the live one at
-              boot and on every press. --><button class="quiet-button icon-tool snap-on" id="snap-playhead" aria-pressed="true" title="Snap to playhead: on." aria-label="Snap to playhead: on.">⇥│</button><span class="divider"></span><!-- The zoom slider the Director expected to find and did not: what was there was
+              boot and on every press. --><button class="quiet-button icon-tool snap-on" id="snap-playhead" aria-pressed="true" title="Snap to playhead: on." aria-label="Snap to playhead: on.">⇥│</button><!-- Beat markers on the master waveform, beside the magnet that lands a cut on one. A view
+              toggle and nothing more: it changes no Shot, writes nothing to the manifest and lives
+              in this browser's session store beside the zoom and the magnet — how a Director likes
+              to look at the song is not a property of the video. Its state is `aria-pressed` and
+              its accessible name says on or off in words, because this row's rule is that state is
+              never carried by colour alone. The title here is a placeholder: app.js's
+              syncBeatMarkersControl writes the live one at boot and on every press. --><button class="quiet-button icon-tool" id="beat-markers" aria-pressed="true" title="Beat markers: on." aria-label="Beat markers: on">♩</button><span class="divider"></span><!-- The zoom slider the Director expected to find and did not: what was there was
               `#master-volume` further along this same bar, which is a volume control. Both sliders
               now carry a visible label, because two unlabelled sliders in one row is the confusion
               that produced the report. This one drives the same `state.pixelsPerSecond` the two
@@ -377,7 +383,13 @@
               <div class="timeline-canvas" id="timeline-canvas">
                 <div class="timeline-ruler" id="timeline-ruler"></div>
                 <div class="track section-track"><div class="track-label">SECTIONS</div><div class="track-content" id="section-track"></div></div>
-                <div class="track waveform-track"><div class="track-label">MASTER</div><div class="track-content"><canvas id="timeline-waveform" height="78"></canvas><div id="vocal-band" title="Measured voice activity (Whisper) — where the track actually sings"></div></div></div>
+                <div class="track waveform-track"><div class="track-label">MASTER</div><div class="track-content"><canvas id="timeline-waveform" height="78"></canvas><!-- The beats and onsets the song analysis measured, over the same waveform. A sibling of
+                     `#vocal-band` inside `.track-content`, so it shares that box's origin and needs
+                     no label-gutter offset — `#timeline-playhead` carries the 90px only because it
+                     is a child of `#timeline-canvas`. `pointer-events: none` in the stylesheet is
+                     what keeps the seek gesture and the clip drags alive straight through it.
+                     Painted by app.js's renderTimeline from api.js's beatMarkerPlan, and empty
+                     whenever there is no valid envelope — which is silence, not an error. --><div id="beat-band"></div><div id="vocal-band" title="Measured voice activity (Whisper) — where the track actually sings"></div></div></div>
                 <div class="track shots-track"><div class="track-label">SHOTS</div><div class="track-content" id="shots-track"></div></div>
                 <div class="track refs-track"><div class="track-label">REFERENCES</div><div class="track-content" id="refs-track"></div></div>
                 <div class="timeline-playhead" id="timeline-playhead"></div>

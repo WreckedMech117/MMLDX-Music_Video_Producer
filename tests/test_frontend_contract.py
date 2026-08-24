@@ -3,6 +3,7 @@ import json
 import re
 import subprocess
 from dataclasses import asdict
+from itertools import pairwise
 from pathlib import Path
 from typing import get_args
 
@@ -258,6 +259,17 @@ globalThis.fetch = (path, options = {}) => {
     json: async () => canned.body,
   });
 };
+// The browser session store, `mvp-session`, seeded with `__SESSION__` before the workspace boots.
+// It answered `undefined` before, which every reader here catches -- so `persistSession` threw and
+// was swallowed, and `restoreSession` returned `{}`: a stored view setting could be neither written
+// nor read back by any test. Seeded, the two halves of "it survives a reload" become executable,
+// which is the only way to tell a setting that persists from one that is merely spelled correctly.
+const storage = new Map(Object.entries(__SESSION__));
+globalThis.localStorage = {
+  getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+  setItem: (key, value) => { storage.set(key, String(value)); },
+  removeItem: (key) => { storage.delete(key); },
+};
 // The workspace boots on import: it binds every handler, then fires its startup requests, which
 // reject. Timers are stubbed out so a pending toast cannot hold the process open for its 4.2 s.
 globalThis.setTimeout = () => 0;
@@ -285,14 +297,19 @@ const flush = async () => { for (let index = 0; index < 60; index += 1) await Pr
 """
 
 
-def run_workspace(body: str, responses: dict | None = None):
+def run_workspace(body: str, responses: dict | None = None, session: dict | None = None):
     """Boot `app.js` against the stub DOM and run `body` against the workspace it produced.
 
     `responses` maps an exact request path to `{"body": ...}` for a 200, or
     `{"status": N, "body": ...}` for a refusal. Anything unlisted is rejected, which is what
     every caller that passes nothing gets.
+
+    `session` seeds `localStorage` *before* the workspace boots, keyed by storage key -- so
+    `{"mvp-session": json.dumps({...})}` is what a Director's browser carries into a reload. The
+    default is an empty store, which is a first-ever visit and is what every existing caller gets.
     """
     harness = WORKSPACE_HARNESS.replace("__RESPONSES__", json.dumps(responses or {}))
+    harness = harness.replace("__SESSION__", json.dumps(session or {}))
     return run_module(harness + body)
 
 
@@ -11224,6 +11241,823 @@ def test_the_timeline_tools_carry_undo_redo_and_the_playhead_magnet():
     assert 'aria-pressed="true"' in re.search(
         r'<button[^>]*id="snap-playhead"[^>]*>', markup
     ).group(0)
+
+
+# ------------------------------------------------------------------------------------------
+# Beats on the waveform (Story 8.2). Story 8.1 measured the song into an envelope carrying
+# beats and onsets in absolute seconds, and nothing showed them: the Director cut against a
+# waveform drawing amplitude and nothing else.
+#
+# The placement arithmetic is executed under node; **so is the wiring**. Review iteration 1
+# demonstrated why: deleting the repaint guard's envelope-identity clause, and deleting the
+# loader's `present` unwrap together with its repaint, both left the whole frontend suite green,
+# because every stateful part of this feature was pinned by reading source text rather than by
+# being run. Source greps below are limited to conventions a run cannot observe.
+# ------------------------------------------------------------------------------------------
+
+
+# A measurement small enough to write out in full, so every mark drawn from it is accounted for
+# by name: four beats a second apart, with an onset between each pair.
+SMALL_ENVELOPE = {
+    "version": 1,
+    "analysis_rate": 30,
+    "band_count": 8,
+    "bpm": 60,
+    "duration": 60.0,
+    "beats": [0, 1, 2, 3],
+    "onsets": [0.5, 1.5, 2.5],
+}
+
+# A Song carrying an analysis pointer, as `GET /api/projects/{id}` really answers one. The
+# fingerprint matters to the client for exactly one reason: it is half of which measurement the
+# band is currently drawing.
+MEASURED_SONG = {
+    "title": "Spine",
+    "source": "imported",
+    "path": "media/songs/000-master.wav",
+    "duration": 60,
+    "vocal_spans": [],
+    "analysis": {
+        "path": "media/analysis/song-envelope.json",
+        "analysis_rate": 30,
+        "band_count": 8,
+        "bpm": 60,
+        "song_fingerprint": "4194304:8f14e45fceea167a",
+    },
+}
+
+
+def envelope_absence_reasons() -> list[str]:
+    """Every sentence a `present: false` envelope read can carry, read off `app.py`.
+
+    Derived rather than retyped, and this is not tidiness. An earlier draft of this story said
+    "six read-time reasons" and hand-listed six; there are twelve -- seven `SONG_ENVELOPE_*`
+    plus the five `SONG_ANALYSIS_*` failures `analysis_absence_reason` and the write half can
+    reach. A hand-list is a claim about the server that goes stale silently, and the client's
+    whole contract here is that it never branches on which reason it was, so the honest test is
+    to feed it *all* of them, including ones added after this test was written.
+    """
+    from music_video_producer import app as app_module
+
+    reasons = sorted(
+        value
+        for name, value in vars(app_module).items()
+        if isinstance(value, str)
+        and name.startswith(("SONG_ENVELOPE_", "SONG_ANALYSIS_"))
+    )
+    assert len(reasons) >= 10, (
+        "the absence reasons stopped being derivable from app.py, so this test proves nothing"
+    )
+    return reasons
+
+
+def test_beat_markers_are_placed_on_their_seconds_and_absence_draws_nothing():
+    """`beatMarkerPlan` over every row of this story's I/O matrix, executed under node.
+
+    Two properties here are invisible to a source read. **A mark sits at `seconds *
+    pixelsPerSecond`** -- the same expression the clips are laid out with, not a fraction of the
+    track's width -- so at every zoom the mark and the cut it exists to place agree with each
+    other, which is the entire point of drawing it. And **absence draws nothing**: the endpoint
+    answers a 200 with a named reason for a project with no song, a song still rendering, a
+    replaced song, an unreadable sidecar, a machine without ffmpeg and half a dozen more, and not
+    one of them may become an error, a toast or a refusal on a display-only reference mark.
+    """
+    reasons = envelope_absence_reasons()
+    planned = run_module(f"""
+      import {{ BEAT_MARKER_CLASSES, BEAT_MARKER_KINDS, beatMarkerPlan }}
+        from './src/music_video_producer/web/assets/api.js';
+      const envelope = {json.dumps(SMALL_ENVELOPE)};
+      const report = {{ present: true, reason: '', envelope }};
+      // Thinning off, so this test is about placement alone -- density has its own.
+      const plan = (over = {{}}) => beatMarkerPlan({{
+        envelope: report, pixelsPerSecond: 16, trackWidth: 900, minimumGap: 0, clearance: 0,
+        ...over,
+      }});
+      const laid = (result) =>
+        result.markers.map((mark) => [mark.kind, mark.seconds, mark.left, mark.className]);
+      const absent = {{}};
+      for (const reason of {json.dumps(reasons)}) {{
+        absent[reason] = beatMarkerPlan({{
+          envelope: {{ present: false, reason }}, pixelsPerSecond: 16, trackWidth: 900,
+        }}).markers.length;
+      }}
+      console.log(JSON.stringify({{
+        kinds: BEAT_MARKER_KINDS,
+        classes: BEAT_MARKER_CLASSES,
+        on: laid(plan()),
+        counts: {{ beats: plan().beats, onsets: plan().onsets }},
+        off: plan({{ enabled: false }}).markers.length,
+        zoomed: laid(plan({{ pixelsPerSecond: 64 }})),
+        // The width trims. At 24px only the marks before 1.5s survive, and nothing is allowed to
+        // overflow the track it is drawn in.
+        trimmed: laid(plan({{ trackWidth: 24 }})),
+        // And so does the song's own length, which is the half the width cannot do: the track has
+        // a 900px floor, so a 2-second song at 16 px/s is drawn 900px wide and every mark after
+        // second 2 would otherwise be placed on silence that was never measured.
+        beyondTheSong: laid(plan({{ duration: 2 }})),
+        absent,
+        nothing: beatMarkerPlan().markers.length,
+        nullEnvelope: beatMarkerPlan({{ envelope: null, trackWidth: 900 }}).markers.length,
+        // A valid measurement of a song with no detectable beat is not an error either.
+        silent: plan({{
+          envelope: {{ present: true, reason: '', envelope: {{ ...envelope, beats: [], onsets: [] }} }},
+        }}).markers.length,
+        // A bare envelope, not wrapped in a report, and junk in its arrays: dropped rather than
+        // positioned at `NaN` or coerced to second zero.
+        junk: laid(plan({{
+          envelope: {{ ...envelope, beats: [-1, null, 'x', 2], onsets: [] }},
+        }})),
+      }}));
+    """)
+
+    beat, onset = planned["kinds"]["beat"], planned["kinds"]["onset"]
+    assert planned["classes"] == {"beat": "beat-mark", "onset": "onset-mark"}
+    # Onsets first, so a beat paints *over* an onset that survived beside it rather than under it
+    # -- the beat is the stronger of the two claims, and the one a cut is placed against.
+    assert planned["on"] == [
+        [onset, 0.5, 8, "onset-mark"],
+        [onset, 1.5, 24, "onset-mark"],
+        [onset, 2.5, 40, "onset-mark"],
+        [beat, 0, 0, "beat-mark"],
+        [beat, 1, 16, "beat-mark"],
+        [beat, 2, 32, "beat-mark"],
+        [beat, 3, 48, "beat-mark"],
+    ]
+    assert planned["counts"] == {"beats": 4, "onsets": 3}
+
+    # Turned off, the band is empty -- and it is the *plan* that is empty, so nothing downstream
+    # has to know the setting exists.
+    assert planned["off"] == 0
+
+    # Zoomed: each mark keeps its own second and moves with the clips, not with the pixels.
+    assert [mark[1] for mark in planned["zoomed"]] == [mark[1] for mark in planned["on"]]
+    for kind, seconds, left, _class in planned["zoomed"]:
+        assert left == pytest.approx(seconds * 64), (kind, seconds, left)
+
+    # Trimmed at the drawn width: 1.5s lands exactly on 24px and is already past the edge.
+    assert planned["trimmed"] == [
+        [onset, 0.5, 8, "onset-mark"],
+        [beat, 0, 0, "beat-mark"],
+        [beat, 1, 16, "beat-mark"],
+    ]
+    # Trimmed at the end of the audio: a 2-second song keeps only what happened inside it.
+    assert planned["beyondTheSong"] == [
+        [onset, 0.5, 8, "onset-mark"],
+        [onset, 1.5, 24, "onset-mark"],
+        [beat, 0, 0, "beat-mark"],
+        [beat, 1, 16, "beat-mark"],
+    ]
+
+    # Every absence the server can report, silently. `absent` is keyed by the server's own
+    # sentence, so a failure names which reason drew something it should not have.
+    assert planned["absent"] == dict.fromkeys(reasons, 0)
+    assert planned["nothing"] == 0
+    assert planned["nullEnvelope"] == 0
+    assert planned["silent"] == 0
+
+    assert planned["junk"] == [[beat, 2, 32, "beat-mark"]]
+
+
+def test_beat_markers_thin_to_a_readable_density_at_every_zoom():
+    """Density, at the three zooms that matter, against the densities a real track produces.
+
+    **Measured in a browser on 2026-08-24**, on a real 3-minute song this application analysed:
+    440 beats and 332 onsets -- 2.44 beats and 1.84 onsets a second. Not the 0.07 s picker floor
+    an earlier reading of `audio.py` assumed; the average onset is 0.54 s from its neighbour. At
+    the 6 px/s floor that still puts beats 2.5 px apart, and 2 px-wide marks 2.5 px apart are a
+    solid bar rather than a reference mark, however short the band is drawn.
+
+    So the plan thins, and the properties asserted are the ones a threshold change must not
+    break: nothing of one kind lands within the gap of its own kind, no onset lands within the
+    clearance of a kept beat, the ink never approaches a solid bar, and the default zoom keeps
+    *both* kinds -- a clearance wide enough to thin the band would wipe every onset out at 16
+    px/s, where beats already sit 6.5 px apart.
+    """
+    seconds = 180.0
+    beats = [round(index / 2.4444, 6) for index in range(440)]
+    onsets = [round(0.27 + index / 1.8444, 6) for index in range(332)]
+    envelope = {**SMALL_ENVELOPE, "duration": seconds, "beats": beats, "onsets": onsets}
+    drawn = run_module(f"""
+      import {{ BEAT_MARKER_CLEARANCE_PIXELS, BEAT_MARKER_MIN_GAP_PIXELS, beatMarkerPlan }}
+        from './src/music_video_producer/web/assets/api.js';
+      const envelope = {json.dumps(envelope)};
+      const at = (scale) => {{
+        const plan = beatMarkerPlan({{
+          envelope, pixelsPerSecond: scale, trackWidth: Math.max(900, {seconds} * scale),
+          duration: {seconds},
+        }});
+        return {{
+          scale,
+          beats: plan.beats,
+          onsets: plan.onsets,
+          // Every kept mark's left edge and width, so the assertions can measure spacing and ink
+          // rather than trust a count.
+          marks: plan.markers.map((mark) => [mark.kind, mark.left]),
+          width: {seconds} * scale,
+        }};
+      }};
+      console.log(JSON.stringify({{
+        gap: BEAT_MARKER_MIN_GAP_PIXELS,
+        clearance: BEAT_MARKER_CLEARANCE_PIXELS,
+        offered: {{ beats: envelope.beats.length, onsets: envelope.onsets.length }},
+        comfortable: at(40),
+        default: at(16),
+        floor: at(6),
+      }}));
+    """)
+
+    assert drawn["offered"] == {"beats": 440, "onsets": 332}
+    gap, clearance = drawn["gap"], drawn["clearance"]
+    widths = {"beat": 2, "onset": 1}
+
+    for name in ("comfortable", "default", "floor"):
+        zoom = drawn[name]
+        kept = zoom["marks"]
+        by_kind: dict[str, list[float]] = {"beat": [], "onset": []}
+        for kind, left in kept:
+            by_kind[kind].append(left)
+        # Same kind: never closer than the gap.
+        for kind, lefts in by_kind.items():
+            closest = min(
+                (b - a for a, b in pairwise(lefts)), default=float("inf")
+            )
+            assert closest >= gap - 1e-9, (name, kind, closest)
+        # Beats outrank onsets: no onset survives within the clearance of a kept beat.
+        for onset in by_kind["onset"]:
+            nearest = min((abs(onset - b) for b in by_kind["beat"]), default=float("inf"))
+            assert nearest >= clearance - 1e-9, (name, onset, nearest)
+        # And the band is never close to solid, at any zoom.
+        ink = sum(widths[kind] for kind, _left in kept) / zoom["width"]
+        assert ink < 0.45, (name, ink)
+
+    # 40 px/s: a beat every 16.4 px and an onset every 21.7 px. No mark is dropped for spacing at
+    # all -- both are comfortably past the gap. The onsets that do give way are the ones that would
+    # have been drawn *inside* a beat mark: a 4 px exclusion around a beat every 16.4 px is about a
+    # quarter of the track, and losing a 1 px tick that would have been invisible under a 2 px rule
+    # is the trade this clearance exists to make.
+    assert drawn["comfortable"]["beats"] == 440
+    assert drawn["comfortable"]["onsets"] >= 230
+
+    # 16 px/s, the default: both kinds survive in quantity. This is the assertion that fails if
+    # the clearance is ever raised to do the gap's job.
+    assert drawn["default"]["beats"] == 440
+    assert drawn["default"]["onsets"] >= 100
+
+    # 6 px/s, the floor: thinned hard, and that is the point -- the untouched measurement would
+    # be 772 marks across 1080 px.
+    assert drawn["floor"]["beats"] < 440
+    assert drawn["floor"]["beats"] + drawn["floor"]["onsets"] < 400
+
+
+def test_the_plan_reads_the_field_names_a_real_measurement_actually_carries():
+    """`beatMarkerPlan` indexes `beats` and `onsets` on a dict `audio.py` wrote, and the two
+    halves are in different languages with no shared schema between them. So the envelope fed
+    through the plan here is a **real one**, extracted from a synthesised click track by the same
+    pure function the production path calls -- renaming either array in `audio.py` fails here
+    rather than silently emptying the band in a browser."""
+    from test_audio import click_track
+
+    from music_video_producer.audio import ENVELOPE_REQUIRED_KEYS, extract_envelope
+
+    envelope = extract_envelope(click_track(120, seconds=8.0))
+    assert {"beats", "onsets"} <= set(ENVELOPE_REQUIRED_KEYS)
+
+    drawn = run_module(f"""
+      import {{ beatMarkerPlan }} from './src/music_video_producer/web/assets/api.js';
+      const envelope = {json.dumps(envelope)};
+      const plan = beatMarkerPlan({{
+        envelope: {{ present: true, reason: '', envelope }},
+        pixelsPerSecond: 40, trackWidth: 900, duration: envelope.duration,
+      }});
+      console.log(JSON.stringify({{
+        beats: plan.beats,
+        onsets: plan.onsets,
+        // Read back off the markers, so a mark's second really is a second of this song.
+        latest: plan.markers.reduce((most, mark) => Math.max(most, mark.seconds), 0),
+        keys: Object.keys(envelope).sort(),
+      }}));
+    """)
+
+    assert drawn["keys"] == sorted(envelope), "the envelope did not survive the JSON round trip"
+    # A 120 BPM click track over 8 seconds: the plan finds beats in it and places them inside it.
+    assert drawn["beats"] > 0, "a real measurement drew no beat marks — check the field names"
+    assert drawn["latest"] <= envelope["duration"] + 1e-6
+
+
+def test_marks_appear_on_a_first_load_with_neither_the_zoom_nor_the_toggle_touched():
+    """The primary path, executed end to end: a project load paints an empty band, the envelope
+    arrives afterwards, and the marks appear without anybody touching a control.
+
+    This is the test whose absence let a reviewer delete the repaint guard's envelope-identity
+    clause and the loader's repaint call with the whole suite still green. In a browser either
+    deletion means the band is painted empty by `renderAll()`, the measurement lands at a
+    signature that has not moved, and **no mark is ever drawn** until the Director happens to
+    zoom or toggle. Driven through `#project-select`, so `loadProject` -> `renderAll` ->
+    `loadSongEnvelope` is the real sequence and not a hand-assembled one.
+    """
+    project = {
+        "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": [], "song": MEASURED_SONG,
+    }
+    drawn = run_workspace(
+        """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null };
+      state.pixelsPerSecond = 16;
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      // The band as `renderAll()` left it: the project is on screen, the measurement is not here
+      // yet, and nothing has been asked of the zoom or the toggle.
+      const painted = { band: at('#beat-band').innerHTML, scale: state.pixelsPerSecond,
+                        on: at('#beat-markers').classList.contains('snap-on') };
+      await flush();
+      const settled = { band: at('#beat-band').innerHTML, scale: state.pixelsPerSecond,
+                        on: at('#beat-markers').classList.contains('snap-on') };
+      console.log(JSON.stringify({
+        painted, settled,
+        // What was kept, not merely what was drawn. The slot holds the *envelope*, and a reply
+        // stored whole would still draw correctly today -- `beatMarkerPlan` unwraps either shape
+        // -- while handing every later consumer of this slot a record with no `beats` in it.
+        stored: state.songEnvelope,
+        asked: requests.filter((sent) => sent.path.includes('/song/envelope')).map((s) => s.path),
+      }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": project},
+            "/api/projects/p2/song/envelope": {
+                "body": {"present": True, "reason": "", "envelope": SMALL_ENVELOPE}
+            },
+        },
+    )
+
+    assert drawn["asked"] == ["/api/projects/p2/song/envelope"], (
+        "the envelope was read a number of times other than once on the load path"
+    )
+    # Nothing at first, and nothing touched: same scale, toggle still on.
+    assert drawn["painted"]["band"] == ""
+    assert drawn["settled"]["scale"] == drawn["painted"]["scale"] == 16
+    assert drawn["settled"]["on"] is True and drawn["painted"]["on"] is True
+    # The slot holds the measurement itself, unwrapped from the report that carried it.
+    assert "present" not in drawn["stored"], (
+        "the whole report was stored where the envelope belongs; `bands` and `beats` are a level "
+        "down, so every later consumer of state.songEnvelope reads undefined"
+    )
+    assert drawn["stored"]["beats"] == SMALL_ENVELOPE["beats"]
+    # And then the marks, drawn by the reply alone.
+    assert drawn["settled"]["band"].count("beat-mark") == 4
+    assert drawn["settled"]["band"].count("onset-mark") == 3
+    for left in (0, 16, 32, 48):
+        assert f'<span class="beat-mark" style="left:{left}px"></span>' in drawn["settled"]["band"]
+
+
+def test_a_reported_absence_empties_the_band_and_a_refused_read_leaves_it_alone():
+    """The two failure shapes are not the same thing and are not treated as one.
+
+    A **reported absence** is the server answering, with one of its dozen reasons, that there is
+    no measurement: the band empties and nothing at all is said. A **refused request** is this
+    client never reaching the server -- it knows nothing new, so it changes nothing, says nothing,
+    and leaves its key unclaimed so the next load asks again rather than the band being lost to
+    one bad moment. Executed, because "swallowed" and "never called" look identical in source.
+    """
+    reason = envelope_absence_reasons()[0]
+    drawn = run_workspace(
+        f"""
+      const song = {json.dumps(MEASURED_SONG)};
+      const project = (id) => ({{ id, name: id, shots: [], jobs: [], assets: [], sections: [],
+                                 messages: [], documents: {{}}, song: {{ ...song }} }});
+      // `toast` is the only caller of `document.createElement` in this workspace, so recording it
+      // records every sentence this feature could put in front of the Director.
+      const spoken = [];
+      const made = globalThis.document.createElement;
+      globalThis.document.createElement = (tag) => {{
+        const element = made(tag);
+        spoken.push(element);
+        return element;
+      }};
+      state.pixelsPerSecond = 16;
+
+      // A read that finds a measurement.
+      state.project = project('p1');
+      await app.loadSongEnvelope('p1');
+      const measured = at('#beat-band').innerHTML;
+
+      // A read the server answers with a named absence.
+      state.project = project('p2');
+      await app.loadSongEnvelope('p2');
+      const absent = at('#beat-band').innerHTML;
+      const storedWhenAbsent = state.songEnvelope;
+
+      // Measured again, and then a read the server refuses outright.
+      state.project = project('p1');
+      await app.loadSongEnvelope('p1');
+      const back = at('#beat-band').innerHTML;
+      state.project = project('p3');
+      await app.loadSongEnvelope('p3');
+      const refused = at('#beat-band').innerHTML;
+
+      console.log(JSON.stringify({{
+        measured, absent, back, refused,
+        // Null, not the report that said so: a stored `{{present: false}}` is a truthy object
+        // sitting where a measurement belongs.
+        storedWhenAbsent,
+        said: spoken.map((element) => element.textContent).filter(Boolean),
+      }}));
+    """,
+        responses={
+            "/api/projects/p1/song/envelope": {
+                "body": {"present": True, "reason": "", "envelope": SMALL_ENVELOPE}
+            },
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": reason}},
+            "/api/projects/p3/song/envelope": {"status": 500, "body": {"detail": "boom"}},
+        },
+    )
+
+    assert drawn["measured"].count("beat-mark") == 4
+    # Reported absent: the band empties, and the slot holds nothing rather than the refusal.
+    assert drawn["absent"] == ""
+    assert drawn["storedWhenAbsent"] is None
+    assert drawn["back"].count("beat-mark") == 4
+    # Refused: it knows nothing new, so it changes nothing.
+    assert drawn["refused"] == drawn["back"]
+    # And through all four, not one word to the Director. Absence here is silence, not a message.
+    assert drawn["said"] == [], drawn["said"]
+
+
+def test_every_song_transition_leaves_no_marks_from_the_song_before_it():
+    """The ways the current song changes without a project load, each executed.
+
+    `loadSongEnvelope` clears nothing until a reply lands, which is right for a refresh and wrong
+    for a replacement -- so every transition that swaps the master forgets first. **Import is the
+    sharp one:** the upload route measures the new song inline and answers with the project, so
+    without this the band draws the *previous* song's beats over the new master for as long as the
+    envelope request takes, which is the one state `BEAT_MARKERS_HELP` tells the Director cannot
+    happen. Removal is sharper still -- the line above it already clears `state.audioBuffer` for
+    exactly this reason, and the envelope was not added beside it.
+
+    The fourth transition is the render poll noticing a generated song's audio land. It is
+    asserted here as the rule the poll leans on rather than through a canned tick: a song that did
+    not really move reads nothing at all, and a re-measured one reads exactly once.
+    """
+    songless = {
+        "id": "p1", "name": "One", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": [], "documents": {}, "song": None,
+    }
+    imported = {**songless, "song": {**MEASURED_SONG, "path": "media/songs/001-new.wav"}}
+    drawn = run_workspace(
+        f"""
+      const song = {json.dumps(MEASURED_SONG)};
+      const marks = () => at('#beat-band').innerHTML;
+      const measure = async () => {{
+        state.project = {{ id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                          messages: [], documents: {{}}, song: {{ ...song }} }};
+        state.pixelsPerSecond = 16;
+        await app.loadSongEnvelope('p1');
+        return marks();
+      }};
+
+      // 1. The song is removed. The measurement goes with it, before the render that follows.
+      const beforeRemove = await measure();
+      answer(true);
+      await fire('#remove-song:click', {{}});
+      const afterRemove = marks();
+      await flush();
+
+      // 2. A new song is imported. The reply carries a different master, and the band must not
+      //    keep drawing the old one's beats while the new measurement is still on the wire.
+      const beforeImport = await measure();
+      at('#song-file').files = [{{ name: 'new.wav' }}];
+      answer(true);
+      await fire('#import-song:click', {{}});
+      const afterImport = marks();
+      await flush();
+
+      // 3. The project is cleared. No project, no song, no marks.
+      const beforeClear = await measure();
+      answer(true);
+      await fire('#project-select:change', {{ target: {{ value: '' }} }});
+      const afterClear = marks();
+      await flush();
+
+      // 4. What the render poll leans on: an unchanged song asks nothing, a re-measured one asks.
+      await measure();
+      const settled = requests.filter((sent) => sent.path.includes('/song/envelope')).length;
+      await app.loadSongEnvelope('p1');
+      const unchangedTick = requests.filter((sent) => sent.path.includes('/song/envelope')).length;
+      state.project.song = {{ ...song, analysis: {{ ...song.analysis, song_fingerprint: 'moved' }} }};
+      await app.loadSongEnvelope('p1');
+      const landedTick = requests.filter((sent) => sent.path.includes('/song/envelope')).length;
+
+      console.log(JSON.stringify({{
+        beforeRemove, afterRemove, beforeImport, afterImport, beforeClear, afterClear,
+        settled, unchangedTick, landedTick,
+      }}));
+    """,
+        responses={
+            "/api/projects/p1/song/envelope": {
+                "body": {"present": True, "reason": "", "envelope": SMALL_ENVELOPE}
+            },
+            "/api/projects/p1/song?confirm_song_replacement=true": {"body": songless},
+            "/api/projects/p1/song?confirm_song_replacement=false": {"body": songless},
+            "/api/projects/p1/songs/upload": {"body": imported},
+        },
+    )
+
+    for stage in ("Remove", "Import", "Clear"):
+        assert drawn[f"before{stage}"].count("beat-mark") == 4, stage
+        assert drawn[f"after{stage}"] == "", (
+            f"marks measured from the song before it survived a {stage.lower()}"
+        )
+
+    assert drawn["unchangedTick"] == drawn["settled"], (
+        "a read where the song had not moved still asked the envelope endpoint"
+    )
+    assert drawn["landedTick"] == drawn["settled"] + 1
+
+
+def test_the_timeline_paints_the_beat_band_and_the_toggle_changes_only_that():
+    """The band drawn through a real `renderTimeline`, and the Shots track read either side of it.
+
+    The acceptance this executes is the one a source read cannot reach: that showing or hiding a
+    reference mark changes *nothing else*. The clip markup is compared byte for byte across the
+    toggle, the whole project object is compared across it, and the request log is checked -- a
+    view setting that quietly saved a project would be this feature's worst possible defect.
+    """
+    drawn = run_workspace(f"""
+      const shots = [
+        {{ id: 'shot_a', start: 0, duration: 2, prompt: 'a wolf at the window', status: 'draft' }},
+        {{ id: 'shot_b', start: 2, duration: 2, prompt: 'a wolf in the snow', status: 'draft' }},
+      ];
+      state.project = {{ id: 'p1', shots, jobs: [], assets: [], sections: [], messages: [],
+                        song: {json.dumps(MEASURED_SONG)} }};
+      state.songEnvelope = {json.dumps(SMALL_ENVELOPE)};
+      state.pixelsPerSecond = 16;
+      const before = {{ project: JSON.stringify(state.project), requests: requests.length }};
+      // The toggle is both the gesture under test and the shortest path to a real
+      // `renderTimeline` from outside it: off first, then back on.
+      fire('#beat-markers:click');
+      const hidden = {{ band: at('#beat-band').innerHTML, shots: at('#shots-track').innerHTML,
+                       lit: at('#beat-markers').classList.contains('snap-on') }};
+      fire('#beat-markers:click');
+      const shown = {{ band: at('#beat-band').innerHTML, shots: at('#shots-track').innerHTML,
+                      lit: at('#beat-markers').classList.contains('snap-on') }};
+      // Zoomed: the same marks on the same seconds at the new scale. The band is only rewritten
+      // when something it depends on moved, so this is also what proves the scale is one of them.
+      fire('#zoom-in:click');
+      const zoomed = {{ band: at('#beat-band').innerHTML, scale: state.pixelsPerSecond }};
+      console.log(JSON.stringify({{
+        hidden, shown, zoomed, before,
+        after: {{ project: JSON.stringify(state.project), requests: requests.length }},
+      }}));
+    """)
+
+    # Four beats and three onsets, each on its own second at 16 px/s.
+    for left in (0, 16, 32, 48):
+        assert f'<span class="beat-mark" style="left:{left}px"></span>' in drawn["shown"]["band"]
+    for left in (8, 24, 40):
+        assert f'<span class="onset-mark" style="left:{left}px"></span>' in drawn["shown"]["band"]
+    assert drawn["shown"]["band"].count("beat-mark") == 4
+    assert drawn["shown"]["band"].count("onset-mark") == 3
+    assert drawn["shown"]["lit"] is True
+
+    # Off: an empty band, and the pressed treatment off with it.
+    assert drawn["hidden"]["band"] == ""
+    assert drawn["hidden"]["lit"] is False
+
+    # One press of the zoom is 16 -> 20 px/s, and every mark moves onto the new scale rather than
+    # staying where the last paint left it.
+    assert drawn["zoomed"]["scale"] == 20
+    for left in (0, 20, 40, 60):
+        assert f'<span class="beat-mark" style="left:{left}px"></span>' in drawn["zoomed"]["band"]
+
+    # And nothing else moved. The clips are identical markup either way, the project is the same
+    # object it was, and not one request was sent by either press.
+    assert drawn["hidden"]["shots"] == drawn["shown"]["shots"]
+    assert "a wolf at the window" in drawn["shown"]["shots"]
+    assert drawn["after"]["project"] == drawn["before"]["project"]
+    assert drawn["after"]["requests"] == drawn["before"]["requests"], (
+        "toggling a display-only marker sent a request"
+    )
+
+
+def test_the_timeline_positions_the_beat_marks_and_decides_nothing_about_them():
+    """The paint is a template over a plan. Every decision -- which marks survive the track's
+    width and the song's length, where each sits, which class it takes -- is `beatMarkerPlan`'s,
+    and re-deriving any of it here is how the band and the pure function it is tested through
+    drift apart. A convention a run cannot observe, so it is read rather than executed."""
+    block = APP_JS.read_text(encoding="utf-8").split(
+        "const beatBand = $(BEAT_MARKERS_BAND);", 1
+    )[1].split("\n  }", 1)[0]
+    code = without_comments(block)
+
+    assert "beatMarkerPlan({" in code
+    assert "mark.className" in code and "mark.left" in code
+    assert "* state.pixelsPerSecond" not in code, (
+        "the offset is re-derived in app.js, so the band can disagree with the tested plan"
+    )
+    assert "beat-mark" not in code and "onset-mark" not in code, (
+        "the marker's class is chosen in the template rather than by the plan"
+    )
+    # Display only, in the strong sense: the paint writes nothing and reads no Shot.
+    assert "shot" not in code.lower()
+    assert "save" not in code.lower()
+
+
+def test_the_beat_marker_toggle_survives_a_reload_and_defaults_on():
+    """Both halves of "it persists", executed against a seeded browser session store.
+
+    A first-ever visit carries no key at all, and reading that as "off" would ship the feature
+    switched off for every Director who already has a session -- which is every Director who has
+    used this workspace. So only an explicit `false` disables, exactly as `playheadSnap` does, and
+    the value is written into `mvp-session` beside the panel, the zoom and the volume rather than
+    into the project.
+    """
+    fresh = run_workspace("""
+      const stored = () => JSON.parse(localStorage.getItem('mvp-session') || '{}');
+      const first = { lit: at('#beat-markers').classList.contains('snap-on') };
+      fire('#beat-markers:click');
+      const turnedOff = { lit: at('#beat-markers').classList.contains('snap-on'), stored: stored() };
+      console.log(JSON.stringify({ first, turnedOff }));
+    """)
+    # First ever load: on, before anything has been stored.
+    assert fresh["first"]["lit"] is True
+    # Turned off, and written where the other view settings live -- with them, not instead of them.
+    assert fresh["turnedOff"]["lit"] is False
+    assert fresh["turnedOff"]["stored"]["beatMarkers"] is False
+    assert "playheadSnap" in fresh["turnedOff"]["stored"]
+    assert "pixelsPerSecond" in fresh["turnedOff"]["stored"]
+
+    # Reloaded with that session: still off. And a session written before this feature existed --
+    # every key but this one -- comes back on rather than silently disabled.
+    reloaded = run_workspace(
+        """
+      console.log(JSON.stringify({ lit: at('#beat-markers').classList.contains('snap-on') }));
+    """,
+        session={"mvp-session": json.dumps({"beatMarkers": False, "playheadSnap": True})},
+    )
+    assert reloaded["lit"] is False
+
+    older = run_workspace(
+        """
+      console.log(JSON.stringify({ lit: at('#beat-markers').classList.contains('snap-on') }));
+    """,
+        session={"mvp-session": json.dumps({"panel": "song", "pixelsPerSecond": 24})},
+    )
+    assert older["lit"] is True, "a session predating this feature read as 'markers off'"
+
+    # And it never became a machine preference on the server: `preferences.py` holds one key and
+    # it is a GPU policy, where this is a view setting.
+    preferences = Path("src/music_video_producer/preferences.py").read_text(encoding="utf-8")
+    assert "beat" not in preferences.lower()
+
+
+def test_the_song_envelope_is_never_read_from_a_polling_path():
+    """The endpoint hashes the song's bytes to decide whether the measurement still describes
+    them. Behind a timer that is a SHA-256 of the master every few seconds to answer a question
+    whose answer changes only when the song does.
+
+    The render poll may *notice* that a song landed -- `changed.song` is an in-memory comparison
+    the tick already makes, and the read it triggers is gated by the same key everything else is,
+    which the executed transition test drives. What may never happen is a read on a timer, and a
+    timer is the one thing a stub DOM stubs out: `setInterval` returns 0 here, so no run can
+    observe it. Read rather than executed for that reason.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert source.count("api.songEnvelope(") == 1, "the envelope is fetched from more than one place"
+    for line in source.splitlines():
+        if "setInterval" in line:
+            assert "nvelope" not in line, line
+
+    # The client's path and the server's route, read off both sides. `api.songEnvelope` writes
+    # its URL by hand, and a route that only this client names is a route nothing else checks.
+    assert "/api/projects/${id}/song/envelope" in API_JS.read_text(encoding="utf-8")
+    assert '@app.get("/api/projects/{project_id}/song/envelope")' in Path(
+        "src/music_video_producer/app.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_the_envelope_key_is_the_measurement_and_not_only_the_file():
+    """Which song a read envelope belongs to, decided by a pure function so it can be executed.
+
+    The **fingerprint** is in it and not only the path. A measurement retaken over the same file
+    -- the Director pressing Analyze again, a re-render landing on the same output name -- changes
+    the fingerprint and nothing else, and keyed on the path alone it would never be re-read at
+    all: the band would keep drawing the previous measurement for the life of the page.
+    """
+    keys = run_module(f"""
+      import {{ songEnvelopeIdentity }} from './src/music_video_producer/web/assets/api.js';
+      const song = {json.dumps(MEASURED_SONG)};
+      const of = (over) => songEnvelopeIdentity('p1', {{ ...song, ...over }});
+      console.log(JSON.stringify({{
+        same: [of({{}}), of({{ duration: 999, title: 'renamed' }})],
+        remeasured: of({{ analysis: {{ ...song.analysis, song_fingerprint: 'other' }} }}),
+        replaced: of({{ path: 'media/songs/001-master.wav' }}),
+        neverMeasured: of({{ analysis: {{ ...song.analysis, song_fingerprint: '' }} }}),
+        otherProject: songEnvelopeIdentity('p2', song),
+        noSong: [songEnvelopeIdentity('p1', null), songEnvelopeIdentity('p1', {{ path: '' }})],
+        noProject: songEnvelopeIdentity('', song),
+      }}));
+    """)
+
+    settled = keys["same"][0]
+    # Everything else about the Song may move without re-reading a measurement of the same bytes.
+    assert keys["same"][1] == settled
+    # These three each mean a different measurement, and each must be re-read.
+    for changed in ("remeasured", "replaced", "neverMeasured"):
+        assert keys[changed] != settled, changed
+    assert keys["otherProject"] != settled
+    # No song is one identity, whichever way it is absent, so a project without one asks nothing.
+    assert keys["noSong"][0] == keys["noSong"][1]
+    assert keys["noSong"][0] != settled
+    assert keys["noProject"] != settled
+
+
+def test_the_beat_band_and_its_toggle_sit_where_this_codebases_overlays_sit():
+    """A DOM band, absolutely positioned inside the `position: relative` container every other
+    overlay in this workspace uses -- `.playhead`, `.vocal-span`, the section pills, the clips.
+    Never canvas: the contract harness's stub DOM has no `getContext`, so a painted band could
+    not be asserted here at all, while this one is.
+
+    It is a **strip**, not the whole row. Browser QA on 2026-08-24 found `inset: 0` made the
+    default zoom a picket fence and 38% a near-solid wall with the waveform reduced to a line
+    between two banks of full-height ticks -- markers that bury the waveform fail the requirement
+    to read against it however correctly they are placed. `#vocal-band` is the precedent: 5px at
+    the bottom edge, annotating without covering.
+
+    The two kinds are told apart by **height and weight**, and both take inert tokens. Standing
+    law 7 closes the palette at six accents with fixed meanings; a marker is a reference mark, not
+    a state, so `--cyan` (*approved*) and `--blue` (transitions and reactive bindings) are not
+    available to it and nothing here reaches for a seventh.
+    """
+    ids = run_module("""
+      import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, BEAT_MARKERS_LABEL, BEAT_MARKER_CLASSES }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        band: BEAT_MARKERS_BAND, control: BEAT_MARKERS_CONTROL, label: BEAT_MARKERS_LABEL,
+        classes: BEAT_MARKER_CLASSES,
+      }));
+    """)
+    assert ids["band"] == "#beat-band" and ids["control"] == "#beat-markers"
+
+    # The ids are constants so that they are spelled once. Exporting them and then writing the
+    # literal at every lookup is the drift they exist to prevent, unprevented.
+    workspace = APP_JS.read_text(encoding="utf-8")
+    assert '"#beat-band"' not in workspace and '"#beat-markers"' not in workspace, (
+        "app.js spells a beat-marker id as a literal beside the constant that exports it"
+    )
+
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    # A sibling of `#vocal-band` inside the master track's `.track-content`, so it shares that
+    # box's origin and needs no label-gutter offset -- `#timeline-playhead` carries the 90px only
+    # because it is a child of `#timeline-canvas`.
+    waveform = markup.split('<div class="track waveform-track">', 1)[1].split(
+        '<div class="track shots-track">', 1
+    )[0]
+    for expected in ('id="beat-band"', 'id="vocal-band"', 'class="track-content"'):
+        assert expected in waveform, expected
+    assert waveform.index('id="beat-band"') > waveform.index('class="track-content"')
+
+    tools = re.search(r'<div class="timeline-tools">.*?</div>', markup, re.DOTALL).group(0)
+    button = re.search(r'<button[^>]*id="beat-markers"[^>]*>', tools)
+    assert button, "the beat-marker toggle is not in the bar under the Monitor"
+    # Reachable and operable by keyboard because it is a real button, with its state announced:
+    # `aria-pressed` and an accessible name that says on or off in words.
+    assert 'aria-pressed="true"' in button.group(0), button.group(0)
+    name = re.search(r'aria-label="([^"]*)"', button.group(0))
+    assert name, button.group(0)
+    # A *name*, not a paragraph. It is read out on every focus and every press, and the help text
+    # belongs on `title` -- the live control announced 288 characters before this.
+    assert name.group(1).startswith(ids["label"])
+    assert len(name.group(1)) <= 40, name.group(1)
+
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    band = next(line for line in styles.splitlines() if line.startswith("#beat-band "))
+    assert "pointer-events: none" in band, (
+        "without this the band eats the seek gesture and every clip drag that starts on it"
+    )
+    assert "position: absolute" in band
+    # A strip at one edge, never the whole row: the waveform has to stay readable underneath.
+    assert "inset: 0" not in band, "the band covers the whole master row and buries the waveform"
+    height = re.search(r"height: (\d+)px", band)
+    assert height and int(height.group(1)) <= 20, band
+
+    rules = {
+        name: next(line for line in styles.splitlines() if line.startswith(f".{name} "))
+        for name in ids["classes"].values()
+    }
+    for rule in rules.values():
+        for accent in ("--acid", "--amber", "--red", "--cyan", "--blue"):
+            assert accent not in rule, rule
+    assert "var(--muted)" in rules["beat-mark"] and "var(--dim)" in rules["onset-mark"]
+    for property_name in ("width", "height"):
+        pattern = rf"{property_name}: ([^;]+);"
+        beat = re.search(pattern, rules["beat-mark"]).group(1)
+        onset = re.search(pattern, rules["onset-mark"]).group(1)
+        assert beat != onset, f"the two marks share a {property_name}, so only hue tells them apart"
+
+    # The control's pressed treatment is the magnet's, taken from the same rule rather than a
+    # copy of it: two toggles spelling "on" twice is how one of them drifts.
+    assert "#snap-playhead.snap-on, #beat-markers.snap-on" in styles
 
 
 def test_ctrl_z_is_bound_and_is_not_swallowed_by_the_transport_keys():

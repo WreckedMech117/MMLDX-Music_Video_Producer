@@ -13,6 +13,10 @@ import { SAMPLING_PROFILE_CONTROL, SAMPLING_PROFILE_NOTE, SAMPLING_PROFILE_NOTE_
 // Fill section looks: the Director's empty shared prompt, read out of the Treatment.
 import { FILL_SECTION_LOOKS_APPLIED, FILL_SECTION_LOOKS_HELP, FILL_SECTION_LOOKS_LABEL, FILL_SECTION_LOOKS_OVERWRITE_QUESTION, FILL_SECTION_LOOKS_RUNNING, sectionLooksConfirmation, sectionLooksReportLines, sectionLooksWritten } from "./api.js";
 import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clampTimelineZoom, timelineWheelPlan, zoomFromSlider, zoomLabelText, zoomSliderValue, zoomViewport } from "./api.js";
+// Beat and onset marks over the master waveform, from the Song Envelope. Where each one goes and
+// which class it takes is `beatMarkerPlan`, and nothing here re-derives any of it: this module
+// reads the envelope once on the load path, positions what the plan returns, and writes nothing.
+import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, BEAT_MARKERS_HELP, BEAT_MARKERS_LABEL, beatMarkerPlan, songEnvelopeIdentity } from "./api.js";
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
@@ -83,6 +87,19 @@ let sectionLooksReport = null;
 // master volume do, and never in the manifest -- how one Director likes to drag is not a property
 // of the video. On by default, because the request was for the behaviour and not for a switch.
 let playheadSnapOn = true;
+// Whether the measured beats and onsets are drawn over the master waveform. A view setting and
+// nothing else -- it changes no Shot, writes nothing to the manifest and touches no project state
+// -- so it lives beside `playheadSnapOn` in this browser's session store, with the same default-on
+// asymmetry: the feature is the drawing, not the switch, and only an explicit `false` turns it off.
+// `preferences.py` is not the place for it either; that file holds one key and it is a GPU policy.
+let beatMarkersOn = true;
+// What the beat band was last painted from: the toggle, the scale and the track's width in one
+// string, and the measurement by identity. `renderTimeline` repaints on every pointermove of a
+// drag and these four are the only things the band's markup depends on, so this is what keeps a
+// few thousand reference marks off the drag path. Not a cache of the *plan* -- the plan is pure
+// and cheap to ask for; this is a record of what is already on screen.
+let beatBandKey = "";
+let beatBandEnvelope = null;
 // Replace With / Cancel, offered only after a delete was refused. Module state for `snapReport`'s
 // reason exactly -- derived, never saved, never sent back. `replaceForAssetId` is which asset the
 // refusal was about, so the affordance cannot leak onto a different card when the selection moves;
@@ -242,6 +259,9 @@ function persistSession() {
       volume: $("#master-audio")?.volume ?? 1,
       // How this Director likes to drag, never a property of the video -- see `playheadSnapOn`.
       playheadSnap: playheadSnapOn,
+      // How this Director likes to look at the song, and for the same reason: a view setting sits
+      // with the other view settings, not in the project.
+      beatMarkers: beatMarkersOn,
     }));
   } catch { /* storage may be denied; the app works without it */ }
 }
@@ -334,6 +354,9 @@ async function loadProject(id) {
   if (!id) {
     state.project = null;
     state.audioBuffer = null;
+    // Beside `audioBuffer` and for its reason: with no project on screen there is no song, and a
+    // band still drawing the last one's beats would be marks over nothing.
+    forgetSongEnvelope();
     clearUndoHistory();
     renderAll();
     return;
@@ -342,6 +365,10 @@ async function loadProject(id) {
   const previousSelection = state.selectedShotId;
   state.project = await api.project(id);
   state.audioBuffer = null;
+  // A measurement describes one project's song, so it is dropped on a real project change and
+  // kept across a refresh of the project already on screen -- which is what loadProject mostly
+  // is, after every queue action. Clearing it on every call would blank the band on each refresh.
+  if (previousProject !== id) forgetSongEnvelope();
   state.selectedAssetId = null;
   // A reload of the SAME project keeps the working shot: loadProject runs after every
   // queue action and refresh, and being thrown back to shot 1 from shot 23 each time was
@@ -360,6 +387,7 @@ async function loadProject(id) {
   clearUndoHistory();
   renderAll();
   loadPersistedWaveform(id);
+  loadSongEnvelope(id);
   loadReadiness(id);
   // Refreshed here rather than in each submission handler, because every path that queues a
   // render reloads the project immediately afterwards -- the queue-ready loop, both generate
@@ -670,6 +698,77 @@ async function loadPersistedWaveform(projectId) {
   } catch {
     // Playback uses the media element even when Web Audio cannot decode the source.
   }
+}
+
+// One envelope read per *measurement* -- project, song file and the fingerprint the measurement
+// was taken from, which is `songEnvelopeIdentity`. **Never behind a timer.** The endpoint hashes
+// the song's bytes to decide validity, so a poll would be a SHA-256 of the master every few
+// seconds to answer a question whose answer only changes when the song does. The render poll may
+// *notice* that a song landed -- that is `changed.song`, an in-memory comparison the tick already
+// makes -- and this key then decides whether anything is asked for at all, which is the same shape
+// Story 8.1 gave the same problem on the server.
+//
+// Absence is silence, in every one of its forms. A project with no song, a song replaced since it
+// was measured, a machine without ffmpeg, a sidecar someone deleted: all of them answer 200 with
+// `present: false`, and all of them leave the band empty and the timeline exactly as it draws
+// today. Nothing here reads `reason`, raises, or says anything.
+//
+// A failed *request* is different from a reported absence and is treated as one: the key is
+// claimed only after a reply has been painted, so the last known measurement stays on screen and
+// the next load tries again rather than the timeline losing its marks to one unreachable moment.
+let songEnvelopeKey = "";
+
+// Everything this browser remembers about *which* song the band is drawing, forgotten: the
+// measurement, the key it was read under, and the record of what is currently painted.
+//
+// Called by every transition that changes which song is current, because `loadSongEnvelope` alone
+// is not enough for those: it clears nothing until a reply lands, which is right for a refresh and
+// wrong for a replacement. Between an import landing and its envelope arriving, the band would
+// otherwise draw the *previous* song's beats over the new master -- the one state
+// `BEAT_MARKERS_HELP` tells the Director is impossible.
+//
+// `beatBandEnvelope` is dropped here too, and not only for correctness: it holds a direct
+// reference to a measurement that is over a megabyte of arrays, and leaving it set after a project
+// switch pins that in memory on a machine whose memory belongs to ComfyUI.
+function forgetSongEnvelope() {
+  state.songEnvelope = null;
+  songEnvelopeKey = "";
+  beatBandKey = "";
+  beatBandEnvelope = null;
+}
+
+// Exported for the executed frontend contract, `renderSnapCuts`' and `syncRenderPolling`'s reason
+// exactly: what has to be provable here is that a reply actually reaches the band -- that marks
+// appear on a first load with nothing touched, that a reported absence empties it, and that a
+// refused request changes nothing -- and none of that is visible to a source read of a function
+// nothing in the suite can call.
+export async function loadSongEnvelope(projectId) {
+  const key = songEnvelopeIdentity(projectId, state.project?.song);
+  if (key === songEnvelopeKey) return;
+  if (!state.project?.song?.path) {
+    // No audio to measure. Anything still on screen belongs to a song that is not here any more.
+    if (state.songEnvelope) { state.songEnvelope = null; renderTimeline(); }
+    songEnvelopeKey = key;
+    return;
+  }
+  let report = null;
+  try {
+    report = await api.songEnvelope(projectId);
+  } catch {
+    // Unreachable or refused: the last known measurement is kept, nothing is said, and the key is
+    // left unclaimed so the next load asks again. There is no error state for a reference mark.
+    return;
+  }
+  // The project moved on while the request was open; this answer describes a song nobody is
+  // looking at, and the load that replaced it owns the band now.
+  if (state.project?.id !== projectId) return;
+  state.songEnvelope = report?.present === true ? report.envelope || null : null;
+  // **Outside the `try`, deliberately.** A throw from the paint is not an absent envelope, and
+  // catching it in that silent `catch` would abort the whole timeline render without a word. And
+  // the key is claimed only *after* the paint, so a render that failed is asked for again on the
+  // next load rather than remembered as done.
+  renderTimeline();
+  songEnvelopeKey = key;
 }
 
 async function toggleMasterAudio() {
@@ -1537,6 +1636,41 @@ function renderTimeline() {
     vocalBand.innerHTML = (state.project?.song?.vocal_spans || []).map(([from, to]) =>
       `<span class="vocal-span" style="left:${from * state.pixelsPerSecond}px;width:${Math.max(2, (to - from) * state.pixelsPerSecond)}px"></span>`
     ).join("");
+  }
+  // The measured beats and onsets, over the same waveform. Display only: this paints a band and
+  // nothing else -- no Shot is read or written here, and the toggle above changes what is drawn
+  // and nothing in the project. Every decision is `beatMarkerPlan`'s: which marks survive the
+  // track's width, where each one sits, and which class it takes. This block positions what it is
+  // handed and re-derives none of it, which is also why no `state.pixelsPerSecond` arithmetic
+  // appears below -- the scale goes *into* the plan, and offsets come out.
+  const beatBand = $(BEAT_MARKERS_BAND);
+  if (beatBand) {
+    // Rebuilt only when one of the five things it depends on has moved. `renderTimeline` runs on
+    // every `pointermove` of a clip drag, and a real 3-minute track measures 772 marks (440 beats
+    // and 332 onsets, measured 2026-08-24): rebuilding that string sixty times a second would make
+    // dragging a boundary measurably heavier than it is today, and this story is not allowed to
+    // change boundary editing in any way. Nothing here decides *placement* -- it decides whether
+    // to write, and the plan below is still the only thing that decides where.
+    //
+    // `songSeconds` is the *song's* length, not `duration` above: that one is the drawn extent of
+    // the timeline (`max(song, last shot, 30)`), and bounding the marks by it would let a beat be
+    // drawn past the end of the audio whenever a shot runs off the end of the track.
+    const songSeconds = state.project?.song?.duration || 0;
+    const key = `${beatMarkersOn}:${state.pixelsPerSecond}:${trackWidth}:${songSeconds}`;
+    if (key !== beatBandKey || state.songEnvelope !== beatBandEnvelope) {
+      beatBandKey = key;
+      beatBandEnvelope = state.songEnvelope;
+      const plan = beatMarkerPlan({
+        envelope: state.songEnvelope,
+        pixelsPerSecond: state.pixelsPerSecond,
+        trackWidth,
+        duration: songSeconds,
+        enabled: beatMarkersOn,
+      });
+      beatBand.innerHTML = plan.markers.map((mark) =>
+        `<span class="${mark.className}" style="left:${mark.left}px"></span>`
+      ).join("");
+    }
   }
   renderSnapCuts();
   renderAssembly();
@@ -2882,7 +3016,12 @@ export async function pollRenderStatus() {
     const phasesMoved = JSON.stringify(phases) !== JSON.stringify(state.renderPhase || {});
     state.renderPhase = phases;
     if (changed.assets || progressMoved) renderAssets();
-    if (changed.song) renderSong();
+    // A generated song's audio lands here and nowhere else: `apply_job_history` fills `Song.path`
+    // when the music render settles, and 8.1's route measures it at that moment. `changed.song` is
+    // an in-memory comparison this tick already made, so the poll *notices* rather than asks -- and
+    // `loadSongEnvelope`'s key decides whether anything is fetched at all, which on a tick where
+    // the song did not really move is nothing. This is not a poll of the envelope endpoint.
+    if (changed.song) { renderSong(); loadSongEnvelope(state.project.id); }
     if (changed.shots || progressMoved || phasesMoved) renderTimeline();
     // `renderJobs` re-runs `syncRenderPolling`, which is how the loop stops itself on the tick
     // that settles the last open job. The explicit call covers a tick that changed nothing
@@ -3445,6 +3584,26 @@ function syncPlayheadSnapControl() {
   button.setAttribute("aria-label", button.title);
 }
 
+// The beat band's switch, drawn from the flag for `syncPlayheadSnapControl`'s reason exactly, so
+// the button, the paint and the stored session cannot disagree about whether the marks are on.
+// The state is in `aria-pressed` and spelled out in the accessible name as well as carried by the
+// pressed hue -- a toggle whose only signal is a colour is a toggle a screen reader cannot read,
+// and it is reachable and operable by keyboard because it is a real `<button>`.
+function syncBeatMarkersControl() {
+  const button = $(BEAT_MARKERS_CONTROL);
+  if (!button) return;
+  const onOff = beatMarkersOn ? "on" : "off";
+  button.classList.toggle("snap-on", beatMarkersOn);
+  button.setAttribute("aria-pressed", beatMarkersOn ? "true" : "false");
+  // Two different lengths on purpose. The **accessible name** is the four words a screen reader
+  // should read on every focus and every press; the paragraph explaining what the band is goes on
+  // `title`, where it is read once by someone who went looking for it. Naming the button with the
+  // whole help text made focusing it a 288-character announcement, which is how a control becomes
+  // unusable by being over-described.
+  button.title = `${BEAT_MARKERS_LABEL}: ${onOff}. ${BEAT_MARKERS_HELP}`;
+  button.setAttribute("aria-label", `${BEAT_MARKERS_LABEL}: ${onOff}`);
+}
+
 // One step back. The snapshot is sent first and adopted only from the reply: a refused undo must
 // leave the screen showing what the server actually holds, and mutating `state.project.shots`
 // before the write is how an undo that the server refused would still look as though it happened.
@@ -3868,8 +4027,15 @@ function bindEvents() {
       // it, and the import boxes are emptied: a sheet left sitting in them would be sent again by
       // the next import of a different track.
       state.songContextDirty = false;
+      // The master this band was measured from is gone. Forgotten *before* the render, not after
+      // the next read replies: the upload route measures the new song inline and answers with the
+      // project, so without this the band draws the old song's beats over the new track for as
+      // long as the envelope request takes -- the one thing `BEAT_MARKERS_HELP` promises cannot
+      // happen. The reload that follows is what puts the new measurement on screen.
+      forgetSongEnvelope();
       $("#import-lyrics").value = ""; $("#import-style").value = "";
       renderAll();
+      loadSongEnvelope(state.project.id);
       toast("Song imported");
     }
     catch (error) { await recoverFromSongRefusal(error); }
@@ -3932,6 +4098,9 @@ function bindEvents() {
       // cannot reappear and be read as current.
       waveformLoadRevision += 1;
       state.audioBuffer = null;
+      // Beside it, and for exactly the reason the line above exists: a removed song's marks must
+      // not reappear and be read as current any more than its waveform may.
+      forgetSongEnvelope();
       // The song those two editors described is gone, so what is in them describes nothing; left
       // dirty they would sit there disabled, showing context for a song this project no longer has.
       state.songContextDirty = false;
@@ -4222,6 +4391,15 @@ function bindEvents() {
     playheadSnapOn = !playheadSnapOn;
     syncPlayheadSnapControl();
     persistSession();
+  });
+  // The beat band's switch, beside it and session-only for the same reason. It repaints the
+  // timeline and does nothing else: no save, no request, and nothing about any Shot is touched by
+  // showing or hiding a reference mark.
+  $(BEAT_MARKERS_CONTROL)?.addEventListener("click", () => {
+    beatMarkersOn = !beatMarkersOn;
+    syncBeatMarkersControl();
+    persistSession();
+    renderTimeline();
   });
   // Duplicate copies the plan and nothing else. It used to clone the whole Shot and reset
   // `status`, which left the copy owning the original's take: the same `latest_output` played in
@@ -4589,7 +4767,11 @@ async function init() {
   // all, and reading that as "off" would ship the feature switched off for everyone who already
   // had a session -- which is every Director who has used this workspace.
   if (session.playheadSnap === false) playheadSnapOn = false;
+  // The same asymmetry, for the same reason: a session saved before this existed carries no key,
+  // and reading that as "off" would ship the markers hidden for every Director who already has one.
+  if (session.beatMarkers === false) beatMarkersOn = false;
   syncPlayheadSnapControl();
+  syncBeatMarkersControl();
   await Promise.all([loadHealth(), loadVramEject(), api.workflows().catch(() => [])]);
   try { await loadProjects(); } catch (error) { toast(error.message, "error"); }
   if (session.panel) document.querySelector(`[data-panel="${session.panel}"]`)?.click();
