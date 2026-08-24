@@ -2173,19 +2173,27 @@ def _adopt_expansion_maps(project: Project, stored: dict[str, Shot]) -> None:
 #: as a set so `replace_project`'s guard and the test that proves it cannot drift apart: a field
 #: added to `RenderJob`'s provenance block and not to this list is the next instance of the hole.
 #:
-#: "Measured" is the name it was born with and is now the narrower half of what it holds. Two of
-#: these are not measurements at all: `render_frames` and `sampling_bundle` are both written at
-#: *submission*, at the one moment the graph's length and the graph's bundle are true, because
-#: both describe a render that later edits and later settings make unrecoverable. What every
-#: field here shares is that this application produced it and a client must not be able to move
-#: it — in either direction, since forging one plants provenance for a render nobody ran.
+#: **It was called `JOB_MEASURED_FIELDS` until 2026-08-23, and the rename is the whole of the
+#: change** — same tuple, same order, same guard, same two loops below. "Measured" had stopped
+#: describing two of the five: `render_frames` and `sampling_bundle` are written at *submission*,
+#: at the one moment the graph's length and the graph's bundle are true, because both describe a
+#: render that later edits and later settings make unrecoverable. A name that says "measured" asks
+#: the next person deciding where a new field belongs the wrong question — "is this a
+#: measurement?", to which `render_frames` answers no and belongs here anyway — and the eleven
+#: recorded instances of this exact hole in `replace_project` are all a field that somebody
+#: decided did not belong. The question the name has to ask is the one that actually governs:
+#: **did this application produce the value, such that a client must not be able to move it?**
+#: In either direction, since forging one plants provenance for a render nobody ran.
 #:
 #: The test that holds it is `test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard`,
 #: which reads `batch.stamp_job_settled`'s own assignments rather than matching field names. An
 #: earlier version derived "measured" as `startswith("render_")`, which a `gpu_seconds` would have
 #: slipped straight through — the same hole one level up from the one this tuple closes. It also
-#: names the submission-written fields explicitly, so adding one is a deliberate act.
-JOB_MEASURED_FIELDS = (
+#: names the submission-written fields explicitly, so adding one is a deliberate act. Its sibling
+#: `test_the_guard_has_teeth_for_every_field_it_names` forges each of these five through the
+#: generic `PUT` on a job the store holds *and* on one it does not, and requires every one to come
+#: back unmoved — so this rename is proved rather than assumed to be inert.
+JOB_RECORDED_FIELDS = (
     "render_seconds",
     "render_seconds_source",
     "render_frames",
@@ -2195,7 +2203,14 @@ JOB_MEASURED_FIELDS = (
 
 
 def _adopt_job_measurements(project: Project, stored: dict[str, RenderJob]) -> None:
-    """Server-own every measured field on `RenderJob` across the generic whole-project write.
+    """Server-own every `JOB_RECORDED_FIELDS` entry on `RenderJob` across the generic
+    whole-project write.
+
+    The *function* keeps the name `_adopt_job_measurements` where the tuple lost "measured" on
+    2026-08-23. It is the older and more visible of the two names — `RenderJob.render_frames`,
+    `RenderJob.sampling_bundle` and `docs/WORKFLOW-MAP.md` all cite it by name — and it names a
+    verb rather than a category, so unlike the tuple it never asks anybody a question it answers
+    wrongly. Renaming both would have been one change more than the defect.
 
     **The eighth time this exact hole was found in `replace_project`** when this helper was
     written — the eleventh as of 2026-08-23, when `sampling_bundle` joined the list — and it fails the
@@ -2259,13 +2274,13 @@ def _adopt_job_measurements(project: Project, stored: dict[str, RenderJob]) -> N
         if offered is None:
             kept.append(was)
             continue
-        for name in JOB_MEASURED_FIELDS:
+        for name in JOB_RECORDED_FIELDS:
             setattr(offered, name, getattr(was, name))
         kept.append(offered)
     for job in project.jobs:
         if job.id in stored:
             continue
-        for name in JOB_MEASURED_FIELDS:
+        for name in JOB_RECORDED_FIELDS:
             field = RenderJob.model_fields[name]
             setattr(job, name, field.get_default(call_default_factory=True))
         # `updated_at`'s default factory is `now_utc`, which would stamp a settle moment onto a
@@ -2503,14 +2518,32 @@ class AssetFillResponse(BaseModel):
 #: consequence, and the measured per-shot range so the Director can do the arithmetic.
 GENERATE_BATCH_CONFIRM_REFUSAL = (
     "This batch would queue {count} H3 render(s). A reference shot measured 288-438 s on "
-    "the default profile (about 2 min on turbo), so this is a real GPU commitment. "
-    "Send confirm_gpu=true to proceed."
+    "the default profile; turbo-references2v measured about 2.0x faster at production "
+    "length (2026-08-23), and turbo is unmeasured at that length. Whichever bundle this "
+    "project is set to, this is a real GPU commitment. Send confirm_gpu=true to proceed."
 )
 GENERATE_BATCH_EMPTY_READY = (
     "No shots are ready to generate. Mark shots ready first — or tick Replace existing "
     "takes to re-render settled shots."
 )
 GENERATE_BATCH_EMPTY_FLAGGED = "No shots are flagged for re-render."
+#: The `empty` scope's own nothing-to-do sentence. Says both halves of why the scope came back
+#: empty, because both are reachable and they call for different next actions: every shot may
+#: already hold a take, or the takeless ones may all be protected (a locked shot with no take is
+#: an ordinary state). The browser says the same thing before the request — see
+#: `GENERATE_EMPTY_NONE` — so this is the backstop for a client that did not ask first.
+GENERATE_BATCH_EMPTY_WITHOUT_TAKES = (
+    "Every shot already has a video, or the ones without are locked or approved. Nothing to "
+    "generate."
+)
+#: One sentence per scope, looked up rather than chained, so a fourth scope cannot inherit the
+#: `ready` wording by falling off the end of an if/else. The `.get` default is still `ready`'s,
+#: because `GenerateBatchRequest.scope` cannot hold anything this table does not name.
+GENERATE_BATCH_EMPTY_BY_SCOPE = {
+    "ready": GENERATE_BATCH_EMPTY_READY,
+    "flagged": GENERATE_BATCH_EMPTY_FLAGGED,
+    "empty": GENERATE_BATCH_EMPTY_WITHOUT_TAKES,
+}
 
 #: What a batch re-render adds to the shot's seed, so the retake differs from the take
 #: the Director just rejected. A named odd stride rather than +1 so it cannot collide
@@ -5217,14 +5250,20 @@ def _replacement_row(change: ReplacementChange) -> AssetReplacementShot:
 
 
 class GenerateBatchRequest(BaseModel):
-    """One batch, one confirmation. `scope` picks FR-4's ready set or AD-5's flagged set;
+    """One batch, one confirmation. `scope` picks FR-4's ready set, AD-5's flagged set, or the
+    `empty` set — every shot with no video yet (`batch_targets`, 2026-08-23);
     `replace_existing` widens the ready scope to settled, unprotected shots; `profile`
     applies one evidenced sampling bundle to the whole batch (per-shot profiles are Ask
     First). `confirm_gpu` is the acknowledgement itself — a client sends true only after
-    showing the warning, exactly like `confirm_song_replacement`."""
+    showing the warning, exactly like `confirm_song_replacement`.
+
+    `empty` is a third value on the field that already existed rather than a second route, and
+    that is the whole of its implementation cost: the readiness gate, the per-shot refusals, the
+    bundle resolution, the batch id, the seed stride and the report are the ones this route
+    already had."""
 
     confirm_gpu: bool = False
-    scope: Literal["ready", "flagged"] = "ready"
+    scope: Literal["ready", "flagged", "empty"] = "ready"
     replace_existing: bool = False
     # `None` rather than `"default"`, and the distinction is the whole of the fix: an omitted
     # profile now means "whatever this project is set to", which is how one setting reaches the
@@ -9576,9 +9615,9 @@ def create_app(
         if not targets:
             raise HTTPException(
                 status_code=422,
-                detail=GENERATE_BATCH_EMPTY_FLAGGED
-                if request.scope == "flagged"
-                else GENERATE_BATCH_EMPTY_READY,
+                detail=GENERATE_BATCH_EMPTY_BY_SCOPE.get(
+                    request.scope, GENERATE_BATCH_EMPTY_READY
+                ),
             )
         if not request.confirm_gpu:
             raise HTTPException(
@@ -9594,13 +9633,39 @@ def create_app(
         for target in targets:
             label = shot_label(project, target)
             try:
+                # The `empty` scope's one extra step, and the only place drafts are armed by
+                # anything but a click on that shot. It rides `mark_shot_ready` in-closure for
+                # exactly `render_again`'s reason two lines below: the arming refusals — locked,
+                # approved, already-rendered, a live job (409), and the readiness prompt gate —
+                # are that route's own, in that route's own words, so this batch cannot say yes
+                # to a shot a lone Mark ready would turn away. A refusal lands in `skipped` by
+                # name through the same `except` and blocks nothing else in the batch.
+                #
+                # Scoped to `empty` deliberately. `ready` cannot reach a draft at all, and a
+                # draft in the `flagged` scope goes on meeting `generate_h3`'s "must be ready"
+                # exactly as it did before this change — that scope is unchanged, by construction
+                # rather than by intention.
+                #
+                # `mark_shot_ready` is "never automatic" and stays so: this is one deliberate,
+                # confirmed act by the Director, on a set they were shown the count of, in the
+                # same shape `Mark all drafts ready` already promotes a whole plan with. What the
+                # rule forbids is a *side effect* — a populate or an expansion arming shots
+                # nobody asked to arm — and nothing here is one.
+                if request.scope == "empty" and target.status == "draft":
+                    mark_shot_ready(project_id, target.id)
                 # A settled shot re-opens through the same route a lone click uses; its
                 # refusals (in-flight, locked, approved, the prompt gate re-asked) are
                 # the batch's refusals, in the same words.
                 if target.status in ("complete", "error"):
                     render_again(project_id, target.id)
-                    # A re-render at the same seed and prompt reproduces the identical
-                    # take — the fixed-seed trap the roadmap already recorded for Flux,
+                    # A re-render at the same seed and prompt reproduces the identical take while
+                    # ComfyUI keeps the model resident — measured 2026-08-23, all 141 frames
+                    # byte-identical across two repeats, and re-rolled only when ComfyUI evicted
+                    # and reloaded the model unprompted between them. The stride does not depend
+                    # on which of those happens: a byte-identical resubmission is also served
+                    # straight from ComfyUI's execution cache in ~1.2 s with no sampling at all,
+                    # so without the stride this loop can spend no GPU and still report a take.
+                    # The fixed-seed trap the roadmap already recorded for Flux,
                     # met again by the flag/replace loop (the run-2 audit). The stride
                     # lands here, in the batch route, because render_again's contract is
                     # pinned as "writes exactly one field"; a lone-click re-render keeps

@@ -3954,8 +3954,10 @@ def test_the_shot_inspector_draws_and_binds_the_render_again_control_it_was_give
     assert "SHOT 01 (shot_a)" in rendered["notice"]
 
     # Accepted: re-open, stride the seed, queue one take — in that order, because the render
-    # reads the seed from the store and a stride that landed after submission would render
-    # the identical take (the "nothing was replaced" the one-gesture flow exists to end).
+    # reads the seed from the store and a stride that landed after submission would submit the
+    # unchanged payload: served from ComfyUI's execution cache without sampling at all, or
+    # rendering the identical take while the model stays resident (measured 2026-08-23). Both
+    # are the "nothing was replaced" the one-gesture flow exists to end.
     # Reads (the readiness refresh the silent saver triggers, the reload) may interleave;
     # the writes and their order are the contract.
     writes = [
@@ -10889,6 +10891,233 @@ def test_expand_all_prompts_is_offered_on_the_cuts_bar_with_the_sweeps_own_words
     assert "one call per shot" in drawn["planned"]
 
 
+# ------------------------------------------------------------------------------------------
+# Generate All Empty (2026-08-23): the cuts bar's second batch door. `generateEmptyPlan` is
+# executed for every state, and the button is *run* against the stub DOM and clicked -- never
+# asserted by reading the source, which is what let three UI guarantees invert with a green
+# suite once already.
+# ------------------------------------------------------------------------------------------
+
+
+def test_the_empty_scope_plan_counts_the_takeless_and_names_the_drafts_it_will_commit():
+    """The button's whole decision, in every state it has.
+
+    `latest_output` is the test for "has a video", exactly as `shot_has_take` is server-side:
+    a shot reading `draft` with a take on disk is out of scope, and one reading `complete`
+    with no file is in it. The Director's own live plan carries three of the first kind.
+    """
+    plans = run_module("""
+      import { GENERATE_EMPTY_NONE, emptyScopeShots, generateEmptyPlan }
+        from './src/music_video_producer/web/assets/api.js';
+      const shot = (id, status, extra = {}) => ({ id, status, prompt: 'p', ...extra });
+      const mixed = { shots: [
+        shot('s_draft', 'draft'),
+        shot('s_ready', 'ready'),
+        shot('s_failed', 'error'),
+        shot('s_hollow', 'complete'),
+        shot('s_done', 'complete', { latest_output: 'takes/a.mp4' }),
+        shot('s_draft_take', 'draft', { latest_output: 'takes/b.mp4' }),
+        shot('s_queued', 'queued'),
+        shot('s_running', 'running'),
+        shot('s_locked', 'draft', { locked: true }),
+        // Approval is two independent facts server-side (`protected` reads
+        // `approved_output or status == "approved"`), so both are here separately. With only a
+        // shot carrying both, either guard covers for the other and a dropped one goes unseen --
+        // which is exactly what a mutation of `!shot.approved_output` proved on 2026-08-23.
+        shot('s_approved', 'approved'),
+        shot('s_approved_pointer', 'complete', { approved_output: 'takes/c.mp4' }),
+      ] };
+      console.log(JSON.stringify({
+        none: GENERATE_EMPTY_NONE,
+        selected: emptyScopeShots(mixed).map((entry) => entry.id),
+        mixed: generateEmptyPlan(mixed),
+        allDrafts: generateEmptyPlan({ shots: [shot('a', 'draft'), shot('b', 'draft')] }),
+        oneDraft: generateEmptyPlan({ shots: [shot('a', 'draft')] }),
+        noDrafts: generateEmptyPlan({ shots: [shot('a', 'ready'), shot('b', 'error')] }),
+        settled: generateEmptyPlan({ shots: [shot('a', 'complete', { latest_output: 'x.mp4' })] }),
+        noShots: generateEmptyPlan({ shots: [] }),
+        noProject: generateEmptyPlan(null),
+        turbo: generateEmptyPlan({ shots: [shot('a', 'draft')], sampling_profile: 'turbo-references2v' }),
+      }));
+    """)
+
+    # In flight is excluded (already rendering); locked and approved are excluded from the
+    # *count* because the server names them in its report, exactly as Replace Existing does.
+    assert plans["selected"] == ["s_draft", "s_ready", "s_failed", "s_hollow"]
+    assert plans["mixed"]["count"] == 4
+    assert plans["mixed"]["drafts"] == 1
+    # Named separately so neither approval guard can cover for the other.
+    assert "s_approved" not in plans["selected"]
+    assert "s_approved_pointer" not in plans["selected"]
+    assert "s_locked" not in plans["selected"]
+
+    # What it will do, before it does it: the count, the drafts it commits, and the bundle.
+    assert "Queue 2 shots" in plans["allDrafts"]["confirm"]
+    assert "every shot with no video yet" in plans["allDrafts"]["confirm"]
+    assert "2 shots are still a draft and will be committed" in plans["allDrafts"]["confirm"]
+    assert "1 shot is still a draft and will be committed" in plans["oneDraft"]["confirm"]
+    assert "Bundle: " in plans["allDrafts"]["confirm"]
+    assert "288-438 s" in plans["allDrafts"]["confirm"]
+    assert "One confirmation covers the batch." in plans["allDrafts"]["confirm"]
+    # A bundle other than the default names its own measured figure in the same sentence.
+    assert "2.0" in plans["turbo"]["confirm"] and "288-438 s" not in plans["turbo"]["confirm"]
+
+    # No drafts, no arming clause -- the sentence does not claim a promotion it will not make.
+    assert "draft" not in plans["noDrafts"]["confirm"]
+    assert plans["noDrafts"]["drafts"] == 0
+    assert plans["noDrafts"]["count"] == 2
+
+    # Nothing to do says so, in the same words in all three empty shapes. Pinned by *content*
+    # as well as by identity: `plan.empty === GENERATE_EMPTY_NONE` compares the constant with
+    # itself and would pass with the sentence blanked, which is a test that can only pass. A
+    # sentinel over the server's sister constant survived the suite for exactly that shape.
+    assert "Every shot already has a video" in plans["none"]
+    assert "Nothing to generate" in plans["none"]
+    assert "Generate All still takes the ready set" in plans["none"]
+    for key in ("settled", "noShots", "noProject"):
+        assert plans[key]["count"] == 0
+        assert plans[key]["empty"] == plans["none"]
+        assert "Every shot already has a video" in plans[key]["empty"]
+        assert plans[key]["confirm"] == ""
+
+
+def test_generate_all_empty_is_drawn_on_the_cuts_bar_and_stays_live_with_nothing_to_do():
+    """Beside Expand All Prompts, in its shape -- and live even when the plan is fully
+    rendered, which is the one place it deliberately differs from the button next to it.
+
+    A plan with every shot rendered is the success state, not a misconfiguration. Drawn shut
+    it would say so only to a Director who hovers it; drawn live it answers in a toast, which
+    is the fix the three silent shot controls got on 2026-08-22.
+    """
+    drawn = run_workspace("""
+      const base = {
+        id: 'p3', updated_at: 'r1', name: 'x', assets: [], jobs: [], sections: [], messages: [],
+        song: { duration: 40, path: 'songs/000-x.wav', lyric_words: [], vocal_spans: [] },
+      };
+      const shot = (id, start, status, extra = {}) => ({ id, start, duration: 4, prompt: 'p', status, ...extra });
+      state.project = { ...base, shots: [shot('s1', 0, 'draft'), shot('s2', 4, 'draft')] };
+      app.renderSnapCuts();
+      const drafts = at('#snap-bar').innerHTML;
+      state.project = { ...base, shots: [shot('s1', 0, 'complete', { latest_output: 'a.mp4' })] };
+      app.renderSnapCuts();
+      const rendered = at('#snap-bar').innerHTML;
+      console.log(JSON.stringify({
+        selector: contract.GENERATE_EMPTY_CONTROL,
+        label: contract.GENERATE_EMPTY_LABEL,
+        expandSelector: contract.EXPAND_ALL_PROMPTS_TIMELINE_CONTROL,
+        drafts, rendered,
+      }));
+    """)
+
+    control = drawn["selector"][1:]
+    assert control == "timeline-generate-empty"
+    assert drawn["selector"] != drawn["expandSelector"]
+    # The label is pinned by its words, not by `drawn["label"] in markup` alone -- that compares
+    # the constant with itself and an empty label would satisfy it.
+    assert drawn["label"] == "Generate All Empty"
+    for markup in (drawn["drafts"], drawn["rendered"]):
+        assert f'id="{control}"' in markup
+        assert drawn["label"] in markup
+    # Beside Expand All Prompts, not somewhere else on the bar.
+    assert drawn["drafts"].index('id="timeline-expand-prompts"') < drawn["drafts"].index(
+        f'id="{control}"'
+    )
+    # Says what it will do before doing it: the count and the drafts it will commit.
+    attributes = drawn["drafts"].split(f'id="{control}"')[1].split(">")[0]
+    assert "disabled" not in attributes
+    assert "Generate 2 shots with no video yet" in attributes
+    assert "committing 2 drafts first" in attributes
+    # Fully rendered: still live, and its title is the sentence it will say.
+    rendered_attributes = drawn["rendered"].split(f'id="{control}"')[1].split(">")[0]
+    assert "disabled" not in rendered_attributes
+    assert "Every shot already has a video" in rendered_attributes
+
+
+def test_generate_all_empty_asks_before_it_queues_and_says_so_when_nothing_is_empty():
+    """The click, executed. Three things a reading of the source cannot prove: the dialog is
+    shown before anything goes out, declining sends nothing, and a fully-rendered plan gets a
+    sentence rather than silence."""
+    driven = run_workspace(
+        """
+      const base = {
+        id: 'p1', updated_at: 'r1', name: 'x', assets: [], jobs: [], sections: [], messages: [],
+        song: { duration: 40, path: 'songs/000-x.wav', lyric_words: [], vocal_spans: [] },
+      };
+      const shot = (id, start, status, extra = {}) => ({ id, start, duration: 4, prompt: 'p', status, ...extra });
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      await flush();
+
+      // Nothing empty: no question, no request, and a sentence rather than silence.
+      state.project = { ...base, shots: [shot('s1', 0, 'complete', { latest_output: 'a.mp4' })] };
+      app.renderSnapCuts();
+      answer(true);
+      toasts.length = 0;
+      await fire('#timeline-generate-empty:click');
+      const rendered = { asked: [...asked], requests: [...requests], toasts: [...toasts] };
+
+      // Two takeless drafts, declined: the question is asked, nothing goes out.
+      state.project = { ...base, shots: [shot('s1', 0, 'draft'), shot('s2', 4, 'draft')] };
+      app.renderSnapCuts();
+      answer(false);
+      toasts.length = 0;
+      await fire('#timeline-generate-empty:click');
+      const declined = { asked: [...asked], requests: [...requests] };
+
+      // Confirmed: one POST, and the report's own sentence comes back as the toast.
+      answer(true);
+      toasts.length = 0;
+      await fire('#timeline-generate-empty:click');
+      await flush();
+      console.log(JSON.stringify({
+        rendered, declined,
+        confirmed: { asked: [...asked], requests: [...requests], toasts: [...toasts] },
+      }));
+    """,
+        responses={
+            "/api/projects/p1/generate/batch": {
+                "body": {
+                    "batch_id": "batch_1",
+                    "submitted": [{"shot_id": "s1", "label": "SHOT 01", "job_id": "job_1"}],
+                    "skipped": [
+                        {"shot_id": "s2", "label": "SHOT 02", "reason": "SHOT 02 is locked."}
+                    ],
+                }
+            },
+            "/api/projects/p1": {
+                "body": {
+                    "id": "p1", "updated_at": "r2", "name": "x", "assets": [], "jobs": [],
+                    "sections": [], "messages": [], "shots": [], "song": None,
+                }
+            },
+        },
+    )
+
+    # A fully rendered plan: not a question, not a request -- a sentence.
+    assert driven["rendered"]["asked"] == []
+    assert driven["rendered"]["requests"] == []
+    assert "Every shot already has a video" in driven["rendered"]["toasts"][0]
+
+    # Declined: asked once, sent nothing. The count and the arming are in the question.
+    assert len(driven["declined"]["asked"]) == 1
+    assert "Queue 2 shots" in driven["declined"]["asked"][0]
+    assert "2 shots are still a draft and will be committed" in driven["declined"]["asked"][0]
+    assert "Bundle: " in driven["declined"]["asked"][0]
+    assert driven["declined"]["requests"] == []
+
+    # Confirmed: exactly one submission, on the scope the server names, with the
+    # acknowledgement the server enforces -- and the batch report reaches the screen whole.
+    posts = [
+        entry for entry in driven["confirmed"]["requests"]
+        if entry["path"] == "/api/projects/p1/generate/batch"
+    ]
+    assert len(posts) == 1
+    assert posts[0]["method"] == "POST"
+    assert json.loads(posts[0]["body"]) == {"confirm_gpu": True, "scope": "empty"}
+    assert "1 shot queued as one batch" in driven["confirmed"]["toasts"][0]
+    assert "SHOT 02 is locked." in driven["confirmed"]["toasts"][0]
+
+
 def test_the_sweeps_per_shot_report_is_drawn_beside_the_button_that_raised_it():
     """The route answers per shot on purpose: "a locked shot the sweep silently skipped is
     indistinguishable to the Director from one it forgot". Those notices live in the Director
@@ -11480,6 +11709,298 @@ def test_the_two_locations_note_is_a_warning_and_not_a_block_anywhere():
         assert "SETTING_CONFLICT" not in segment, (
             f"the two-locations note reaches `blocking`, which is a refusal: {segment}"
         )
+
+
+# --------------------------------------------------------------------------------------------
+# A window-warning kind this client has no branch for. Until 2026-08-23 `windowNoteKind` fell back
+# to `NOTE_KIND_WINDOW_SHORT`, so the *next* kind the server grew would have reached the Director
+# under the heading "Short window", in the muted colour that says "this is fine", over a sentence
+# about something else. A wrong label is worse than an unknown one.
+# --------------------------------------------------------------------------------------------
+
+
+def test_an_unrecognised_window_kind_keeps_its_sentence_and_borrows_no_ones_name():
+    """The fallback, executed, against every heading this client can draw.
+
+    The assertion that matters is the negative one: the line an unknown kind produces must not be
+    labelled with any *other* kind's name. Asserting only that it reads "Note" would pass if the
+    fallback were rewired to `NOTE_KIND_WINDOW_LONG` and the long label were then renamed to
+    "Note" -- so both halves are checked, and the whole known-label set is checked against.
+    """
+    drawn = run_module("""
+      import { NOTE_KIND_WINDOW_UNKNOWN, READINESS_SETTING_CONFLICT_LABEL,
+               READINESS_TAKE_UNCOVERED_LABEL, READINESS_UNNAMED_NOTE_LABEL,
+               READINESS_WINDOW_LONG_LABEL, READINESS_WINDOW_SHORT_LABEL,
+               clipWindowState, readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      // A kind from a server newer than this browser, with the server's own whole sentence.
+      const future = {
+        shot_ids: ['s1'], labels: ['SHOT 01'], kind: 'lens_mismatch',
+        reason: 'SHOT 01 asks for a 24mm lens while its section look reads telephoto.',
+      };
+      const report = { window_warnings: [future] };
+      const byShot = windowWarningsByShot(report);
+      console.log(JSON.stringify({
+        unknownKind: NOTE_KIND_WINDOW_UNKNOWN,
+        label: READINESS_UNNAMED_NOTE_LABEL,
+        knownLabels: [READINESS_WINDOW_SHORT_LABEL, READINESS_WINDOW_LONG_LABEL,
+                      READINESS_TAKE_UNCOVERED_LABEL, READINESS_SETTING_CONFLICT_LABEL],
+        byShot,
+        onClip: clipWindowState(byShot.s1, 'A slow push-in.'),
+        lines: readinessLines(report),
+        // A note with no kind at all, and one with a kind that is a real *blocking* kind rather
+        // than a window one, land in the same place: neither is a window kind this client knows.
+        blankKind: windowWarningsByShot({ window_warnings: [{ shot_ids: ['s1'], reason: 'x' }] }),
+        // And the fallback must not be reachable by inheriting Object.prototype.
+        inherited: windowWarningsByShot({
+          window_warnings: [{ shot_ids: ['s1'], kind: 'toString', reason: 'x' }],
+        }),
+      }));
+    """)
+    # The kind is this client's own sentinel, and it is not one of the server's spellings.
+    assert drawn["unknownKind"] == "window_unknown"
+    assert drawn["byShot"] == {"s1": "window_unknown"}
+    assert drawn["blankKind"] == {"s1": "window_unknown"}
+    # `'toString' in {}` is true; `Object.hasOwn` semantics are what this needs, and the explicit
+    # branch chain is what provides them. A rewrite to a table lookup fails here.
+    assert drawn["inherited"] == {"s1": "window_unknown"}, (
+        "a kind inherited from Object.prototype was recognised as a real window kind"
+    )
+    # One line, carrying the server's sentence whole and unreworded.
+    assert len(drawn["lines"]) == 1, drawn["lines"]
+    line = drawn["lines"][0]
+    assert line["reason"] == (
+        "SHOT 01 asks for a 24mm lens while its section look reads telephoto."
+    )
+    assert line["shotIds"] == ["s1"]
+    # Under a heading that claims nothing, and under **nobody else's** heading. This is the whole
+    # defect: before 2026-08-23 this line read "Short window - SHOT 01: ...".
+    assert drawn["label"] == "Note"
+    assert drawn["label"] not in drawn["knownLabels"], (
+        "the unknown-kind heading is another readiness kind's name, so a note nobody has a branch "
+        "for reaches the Director's list describing a rule the server does not have"
+    )
+    assert line["text"].startswith("Note - SHOT 01: ")
+    for known in drawn["knownLabels"]:
+        assert not line["text"].startswith(f"{known} -"), (
+            f"an unrecognised kind is labelled {known!r}, which is a lie about what it is"
+        )
+    # Its own list class, so the stylesheet can colour it without borrowing `window-short`'s muted
+    # rule -- muted is the claim "this is a cost, not a problem", and nothing here may make it.
+    assert line["kind"] == "window-note"
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".plan-readiness li.window-note { color: var(--amber); }" in styles
+    assert ".plan-readiness li.window-short { color: var(--muted); }" in styles
+    # And it paints no clip: an unrecognised kind has not earned a border.
+    assert drawn["onClip"] == {"className": "", "note": "", "label": "A slow push-in."}
+
+
+def test_an_unrecognised_window_kind_never_displaces_a_border_a_known_kind_earned():
+    """Ranked rather than omitted, on the two-locations note's own argument: an absent rank makes
+    both comparisons false, so the answer would depend on the order the server happened to list two
+    notes in. And ranked *lowest*, because the one thing known about an unrecognised kind is that
+    this client cannot say what it means -- so it must lose to every kind that has a branch, in
+    either order."""
+    verdicts = run_module("""
+      import { readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const unknown = { shot_ids: ['s'], labels: ['SHOT 01'], kind: 'lens_mismatch', reason: 'u' };
+      const pair = (other) => {
+        const forwards = windowWarningsByShot({ window_warnings: [unknown, other] });
+        const backwards = windowWarningsByShot({ window_warnings: [other, unknown] });
+        return { forwards: forwards.s, backwards: backwards.s };
+      };
+      console.log(JSON.stringify({
+        vsUncovered: pair({ shot_ids: ['s'], kind: 'take_uncovered', reason: 'o' }),
+        vsLong: pair({ shot_ids: ['s'], kind: 'window_long', reason: 'o' }),
+        vsShort: pair({ shot_ids: ['s'], kind: 'window_short', reason: 'o' }),
+        vsConflict: pair({ shot_ids: ['s'], kind: 'setting_conflict', reason: 'o' }),
+        // Both lines survive whichever wins the clip: nothing is dropped from the list.
+        lines: readinessLines({
+          window_warnings: [unknown, { shot_ids: ['s'], kind: 'window_long', reason: 'o' }],
+        }).map((line) => line.kind),
+      }));
+    """)
+    for beside, expected in (
+        ("vsUncovered", "take_uncovered"),
+        ("vsLong", "window_long"),
+        ("vsShort", "window_short"),
+        ("vsConflict", "setting_conflict"),
+    ):
+        assert verdicts[beside] == {"forwards": expected, "backwards": expected}, (
+            f"an unrecognised kind changed what the clip wears beside {expected}, or the answer "
+            f"depended on the order the server listed them: {verdicts[beside]}"
+        )
+    assert verdicts["lines"] == ["window-note", "window-long"], verdicts["lines"]
+
+
+# --------------------------------------------------------------------------------------------
+# Two more places that resolved a job's shot without asking whether it still exists. `jobTarget`
+# was written for this on 2026-08-22 and the queue row was the only caller that got it.
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_settled_render_toast_never_names_a_shot_the_populate_took_away():
+    """A render outlives its shot: a populate replaces `project.shots` wholesale and mints new ids,
+    and an H3 take is minutes long, so this is reachable rather than theoretical. The toast used to
+    call `shotLabel` directly, which returns the bare id for a shot it cannot find -- so a
+    completion arrived as "Render complete: shot_9f2c4b1e0a77 is ready", naming something the
+    Director cannot find anywhere on the timeline.
+
+    `ltx` is asserted alongside `h3` because it is the same defect with the same target: an LTX
+    enhancement's `target_id` is a shot id too.
+    """
+    said = run_module("""
+      import { JOB_TARGET_DETACHED, jobTarget, renderSettledToast }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = {
+        id: 'p1',
+        shots: [{ id: 's1' }, { id: 's2' }],
+        assets: [{ id: 'a1', name: 'Lucy' }],
+        song: { title: 'Harder Faster' },
+      };
+      const settled = (job) => renderSettledToast(project, job);
+      console.log(JSON.stringify({
+        detached: JOB_TARGET_DETACHED,
+        h3Live: settled({ kind: 'h3', status: 'complete', target_id: 's2' }),
+        h3Gone: settled({ kind: 'h3', status: 'complete', target_id: 'shot_9f2c4b1e0a77' }),
+        h3GoneFailed: settled({
+          kind: 'h3', status: 'error', target_id: 'shot_9f2c4b1e0a77', error: 'OOM',
+        }),
+        ltxLive: settled({ kind: 'ltx', status: 'complete', target_id: 's1' }),
+        ltxGone: settled({ kind: 'ltx', status: 'complete', target_id: 'shot_dead' }),
+        // Unchanged, and asserted so, because this went through a shared resolver: the asset and
+        // song branches must read exactly as they did.
+        flux: settled({ kind: 'flux', status: 'complete', target_id: 'a1' }),
+        music: settled({ kind: 'music', status: 'complete', target_id: 'song' }),
+        target: jobTarget(project, { kind: 'h3', target_id: 'shot_9f2c4b1e0a77' }),
+      }));
+    """)
+    # A shot that is still there reads exactly as it always did.
+    assert said["h3Live"] == "Render complete: SHOT 02 (s2) is ready"
+    assert said["ltxLive"] == "Render complete: SHOT 01 (s1) is ready"
+    # A shot that is gone is *said to be gone*, in `jobTarget`'s one wording, rather than named as
+    # though the Director could go and look at it.
+    assert said["detached"] == "shot no longer on the plan"
+    assert said["h3Gone"] == (
+        f"Render complete: shot_9f2c4b1e0a77 — {said['detached']} is ready"
+    )
+    assert said["h3Gone"] == f"Render complete: {said['target']['label']} is ready"
+    assert said["ltxGone"] == f"Render complete: shot_dead — {said['detached']} is ready"
+    # The failure branch carries it too, and still carries ComfyUI's own reason.
+    assert said["h3GoneFailed"] == (
+        f"Render failed for shot_9f2c4b1e0a77 — {said['detached']}: OOM"
+    )
+    # Byte for byte what the other three kinds said before.
+    assert said["flux"] == "Render complete: Lucy is ready"
+    assert said["music"] == "Render complete: Harder Faster is ready"
+
+
+def test_the_queue_names_an_ltx_jobs_shot_the_way_it_names_an_h3_jobs():
+    """`jobTarget` special-cased `kind === 'h3'` alone, so an LTX enhancement drew the raw
+    `shot_…` id -- the dead text a 2026-08-20 finding removed from this panel -- and drew it
+    unlinked even while its shot was on the timeline. One kind was special-cased where two were
+    meant.
+
+    Pinned against `models.RenderJob.kind`'s own literal, so a sixth kind that starts carrying a
+    shot id cannot be added on the Python side and silently miss this list.
+    """
+    verdicts = run_module("""
+      import { JOB_KINDS_TARGETING_A_SHOT, JOB_TARGET_DETACHED, jobTarget }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { id: 'p1', shots: [{ id: 's1' }, { id: 's2' }] };
+      console.log(JSON.stringify({
+        kinds: JOB_KINDS_TARGETING_A_SHOT,
+        detached: JOB_TARGET_DETACHED,
+        h3: jobTarget(project, { kind: 'h3', target_id: 's2' }),
+        ltx: jobTarget(project, { kind: 'ltx', target_id: 's2' }),
+        ltxGone: jobTarget(project, { kind: 'ltx', target_id: 'shot_dead' }),
+        // Every other kind is untouched: no shot lookup, no detached sentence, no link.
+        flux: jobTarget(project, { kind: 'flux', target_id: 'a1' }),
+        music: jobTarget(project, { kind: 'music', target_id: 'song' }),
+        blank: jobTarget(project, { kind: 'ltx', target_id: '' }),
+      }));
+    """)
+    assert verdicts["kinds"] == ["h3", "ltx"]
+    # An LTX job's live shot is named and linked exactly as an H3 job's is.
+    assert verdicts["ltx"] == verdicts["h3"]
+    assert verdicts["ltx"] == {
+        "label": "SHOT 02 (s2)", "shotId": "s2", "linked": True, "title": ""
+    }
+    # And a detached one gets the sentence rather than the dead id.
+    assert verdicts["ltxGone"]["label"] == f"shot_dead — {verdicts['detached']}"
+    assert verdicts["ltxGone"]["linked"] is False
+    assert verdicts["ltxGone"]["shotId"] == ""
+    # The kinds that do not name a shot are unchanged: bare id, unlinked, no title.
+    assert verdicts["flux"] == {"label": "a1", "shotId": "", "linked": False, "title": ""}
+    assert verdicts["music"] == {"label": "song", "shotId": "", "linked": False, "title": ""}
+    assert verdicts["blank"] == {"label": "—", "shotId": "", "linked": False, "title": ""}
+    # The Python side's own vocabulary, so this list cannot silently fall behind it.
+    from music_video_producer.models import RenderJob
+
+    kinds = set(get_args(RenderJob.model_fields["kind"].annotation))
+    assert set(verdicts["kinds"]) <= kinds, (
+        f"the browser names a job kind the server has no literal for: {verdicts['kinds']}"
+    )
+    assert kinds - set(verdicts["kinds"]) == {"music", "flux", "multiview", "edit", "post"}, (
+        "a job kind was added or removed on the server; decide whether its target_id is a shot id "
+        "and put it in JOB_KINDS_TARGETING_A_SHOT or in this list, rather than leaving it to the "
+        "fallback that drew a raw shot id for two years"
+    )
+
+
+def test_the_clips_tab_labels_a_take_whose_shot_a_populate_replaced():
+    """This tab is built from the job list *precisely* so a take survives the re-plan that removed
+    its shot -- and until 2026-08-23 that was the case it drew worst. `shotLabel` on a dead id
+    returns the id, so the card read `shot_9f2c4b1e0a77` and offered an Open shot button that set
+    `selectedShotId` to an id no shot has and selected nothing: the same dead text, and the same
+    dead click, that the queue row had fixed the day before.
+
+    Driven through the real workspace so the *markup* is asserted rather than a row object --
+    `clipLibraryRows` is module-private and the button is drawn in a template literal, so a row
+    flag that nothing in the template reads would look identical to a fix from the outside.
+    """
+    drawn = run_workspace("""
+      const job = (id, target, file) => ({
+        id, kind: 'h3', status: 'complete', target_id: target, seed: 1, output_files: [file],
+      });
+      state.project = {
+        id: 'p1', updated_at: 'r1', name: 'x', assets: [], sections: [], messages: [],
+        song: { duration: 40, path: 'songs/000-x.wav', lyric_words: [], vocal_spans: [] },
+        shots: [{ id: 's1', start: 0, duration: 4, prompt: 'p', status: 'complete',
+                  latest_output: 'shots/live.mp4' }],
+        jobs: [
+          job('j1', 's1', 'shots/live.mp4'),
+          job('j2', 'shot_9f2c4b1e0a77', 'shots/orphan.mp4'),
+        ],
+      };
+      await flush();
+      app.renderAssets();
+      console.log(JSON.stringify({ markup: at('#clips-library').innerHTML }));
+    """)
+    markup = drawn["markup"]
+    # Both takes are on the tab: the record is kept, which is the point of building this from the
+    # job list. Newest first, so the orphan's card is drawn before the live one.
+    cards = markup.split('<div class="clip-card">')[1:]
+    assert len(cards) == 2, markup
+    orphan, live = cards
+    assert "shots/orphan.mp4" in orphan and "shots/live.mp4" in live
+    # The live take is named and openable exactly as before.
+    assert "<span title=\"\">SHOT 01 (s1)</span>" in live
+    assert 'data-shot-id="s1">Open shot</button>' in live
+    # The orphan take is named as gone rather than by the dead id alone, in `jobTarget`'s one
+    # wording, and its footer carries that constant's whole explanation as the title.
+    assert "shot_9f2c4b1e0a77 — shot no longer on the plan</span>" in orphan, orphan
+    assert "replaces every window and mints new shot ids" in orphan
+    # And it offers no Open shot button, because there is no shot to open. This is the half a row
+    # flag alone would not prove.
+    assert "clip-jump" not in orphan, (
+        "the Clips tab drew an Open shot button for a take whose shot is gone, which is a click "
+        "that selects nothing"
+    )
+    assert markup.count("clip-jump") == 1, markup
+    # The dead id never reaches `data-shot-id`, which is what the click handler reads.
+    assert 'data-shot-id="shot_9f2c4b1e0a77"' not in markup
 
 
 # --------------------------------------------------------------------------------------------
@@ -12227,8 +12748,9 @@ def test_a_queued_retake_moves_its_seed_by_exactly_one_rule():
     There are two of them now: the server's own RESUBMIT_SEED_STRIDE, which the lone-click
     render-again has applied since 2026-08-19, and the Director's randomize toggle. Applying both
     would put an invisible drift on the one value the Director has just asked to own; applying
-    neither would resubmit at the same seed and prompt, which reproduces the identical take and
-    reads as "nothing was replaced".
+    neither would resubmit at the same seed and prompt, which ComfyUI answers out of its
+    execution cache without sampling, or which reproduces the identical take while the model
+    stays resident (measured 2026-08-23) — both of which read as "nothing was replaced".
 
     Driven with an injected `random`, so the edges are exercised rather than sampled.
     """

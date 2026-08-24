@@ -1757,24 +1757,74 @@ GENERATE_BATCH_APPROVED_SKIP = (
 GENERATE_BATCH_LOCKED_SKIP = "{shot} is locked."
 
 
+def shot_has_take(shot: Shot) -> bool:
+    """Whether this shot already has a video, which is the whole of the ``empty`` scope's test.
+
+    `latest_output` and nothing else. It is the single pointer the whole application means by
+    "this shot's video" -- the take player, the Monitor, assembly and `select_shot_take` all
+    resolve through it -- so asking anything else here would invent a second definition.
+
+    Deliberately **not** `status`. The three facts that rule status out, each observed rather
+    than reasoned:
+
+    * a reconciled job writes `status = "complete"` before it looks at `output_files`, so a
+      completed render that produced no file leaves a `complete` shot with no video;
+    * a failed re-render writes `status = "error"` and leaves `latest_output` untouched, so an
+      `error` shot may very well still have a perfectly good earlier take -- and one that never
+      rendered at all has none;
+    * the Director's own live plan (2026-08-23) carries three `draft` shots that already hold a
+      finished take. A status test would re-render all three; this one leaves them alone.
+
+    And the converse is what makes a deleted take come back: clearing `latest_output` -- however
+    it is cleared -- is exactly what puts the shot back in scope, because the pointer *is* the
+    claim. A take whose file was deleted from disk behind the application's back still has its
+    pointer, and stays out of scope; that is the same reading every other take path takes (they
+    refuse with `TAKE_MISSING_FILE_REFUSAL` rather than pretending there was never a take).
+    """
+    return bool(shot.latest_output)
+
+
 def batch_targets(
     project: Project, *, scope: str = "ready", replace_existing: bool = False
 ) -> tuple[list[Shot], list[tuple[Shot, str]]]:
     """The shots one batch will submit, in timeline order, and the named skips.
 
-    Two scopes, per the spec's matrix. ``ready`` is FR-4's own set -- every shot standing
+    Three scopes, per the spec's matrix. ``ready`` is FR-4's own set -- every shot standing
     at ``ready`` -- widened by ``replace_existing`` to settled (``complete``/``error``)
     shots that nothing protects; approved and locked settled shots are skipped **by
     name**. ``flagged`` is AD-5's resubmission set: exactly the flagged shots, with the
     same two protections named.
 
+    ``empty`` is the Director's ask of 2026-08-23 -- "generate all shots that dont already
+    have a video" -- and it is the *complement* of a take rather than any status class:
+    every shot `shot_has_take` says no about. Two exclusions and both are borrowed rather
+    than invented:
+
+    * in-flight (``queued``/``running``) shots have no take *yet* and are silently absent,
+      exactly as they are from the Replace Existing set. They are already rendering, which
+      the queue panel shows, and a second submission is the one case that does real harm;
+    * approved and locked shots are named, through the same `protected` the other two
+      scopes use. An approved shot with no take is not reachable in practice, but a locked
+      one is, and a locked shot silently missing from both lists reads as a bug.
+
+    Draft shots **are** in this scope, and that is the one decision here that is not
+    mechanical. The alternative was tested against the case the button was asked for: a
+    freshly populated plan is thirty drafts with prose and no takes, so a scope that
+    excluded drafts would do nothing on precisely the plan it was built for. The gate it
+    steps around is already bulk-bypassable by design -- `Mark all drafts ready` promotes
+    every draft in one click -- and it is not stepped around silently here either: the
+    batch route arms each draft through `mark_shot_ready` itself, so the arming refusals
+    (locked, approved, in-flight, no prompt) fire per shot and land in the report by name.
+    "Emptiness blocks, sameness warns" is untouched: a draft with no prompt is refused,
+    not submitted.
+
     Deliberately only the *meaning-level* protections are decided here (approval, lock --
     the two states a submission could never be right about). Everything mechanical --
     in-flight 409s, the readiness prompt gate, adapterless modes -- is left to the
     single-shot routes the batch delegates to, so no second copy of any of those rules
-    exists to drift. Draft shots are not this route's act at all: arming is arm-a-plan's
-    lane, and a draft in the flagged scope surfaces through the single-shot path's own
-    "must be ready" refusal rather than a rule here.
+    exists to drift. A draft in the *flagged* scope is still not this function's business
+    and still surfaces through the single-shot path's own "must be ready" refusal, which is
+    what keeps that scope byte-identical across this change.
     """
     targets: list[Shot] = []
     skipped: list[tuple[Shot, str]] = []
@@ -1789,6 +1839,14 @@ def batch_targets(
     for shot in ordered_shots(project):
         if scope == "flagged":
             if not shot.flagged:
+                continue
+            reason = protected(shot)
+            if reason:
+                skipped.append((shot, reason))
+            else:
+                targets.append(shot)
+        elif scope == "empty":
+            if shot_has_take(shot) or shot.status in ("queued", "running"):
                 continue
             reason = protected(shot)
             if reason:

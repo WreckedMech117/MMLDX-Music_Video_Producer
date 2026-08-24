@@ -1598,13 +1598,6 @@ export function generateAllPlan(project, report = null, replaceExisting = false)
   // sentence is kept word for word, so a Director who has touched nothing reads exactly what they
   // read before; a chosen bundle adds its own measured figure beside it and never replaces it
   // with an interpolation.
-  const bundle = samplingProfileSpec(samplingProfileOf(project));
-  const bundleNote = ` Bundle: ${bundle.label}.`;
-  const costNote = bundle.value === "default"
-    ? " A reference shot measured 288-438 s on the default profile."
-    : bundle.minutes
-      ? ` Measured ~${bundle.minutes} min a shot, about 2.0× faster than default (2026-08-23).`
-      : " Per-shot cost on this bundle is not measured.";
   return {
     disabled: false,
     count: targets.length,
@@ -1616,8 +1609,84 @@ export function generateAllPlan(project, report = null, replaceExisting = false)
     title: `Generate ${noun(targets.length)}${skipNote}`,
     confirm:
       `Queue ${noun(targets.length)} as one batch?${skipNote ? `${skipNote}.` : ""}`
-      + `${bundleNote}${costNote} `
+      + `${bundleSpend(project)} `
       + "One confirmation covers the batch.",
+  };
+}
+
+//: What this batch will spend, in the sentence every batch confirmation ends with. One copy,
+//: because two batch buttons now show it and a bundle named correctly in one dialog and stale in
+//: the other is exactly the drift `batchEtaNote` was built to end. The default's own cost sentence
+//: is kept word for word, so a Director who has touched nothing reads exactly what they read
+//: before; a chosen bundle adds its own measured figure beside it and never replaces it with an
+//: interpolation.
+export function bundleSpend(project) {
+  const bundle = samplingProfileSpec(samplingProfileOf(project));
+  const costNote = bundle.value === "default"
+    ? " A reference shot measured 288-438 s on the default profile."
+    : bundle.minutes
+      ? ` Measured ~${bundle.minutes} min a shot, about 2.0× faster than default (2026-08-23).`
+      : " Per-shot cost on this bundle is not measured.";
+  return ` Bundle: ${bundle.label}.${costNote}`;
+}
+
+//: "Generate All Empty" -- the Director's ask of 2026-08-23, beside Expand All Prompts on the cuts
+//: bar: "which would generate all shots that dont already have a video". The gesture it replaces
+//: is `Mark all drafts ready` then `Generate All`, two clicks in a panel the plan is not in.
+export const GENERATE_EMPTY_CONTROL = "#timeline-generate-empty";
+export const GENERATE_EMPTY_LABEL = "Generate All Empty";
+export const GENERATE_EMPTY_RUNNING = "Queueing…";
+//: Said out loud rather than left to a dead button. Three shot controls were silently inert until
+//: 2026-08-22 and this is the same failure waiting to happen: a plan whose shots all have takes is
+//: the *success* state, and a button that answers it with nothing reads as broken.
+export const GENERATE_EMPTY_NONE =
+  "Every shot already has a video. Nothing to generate — a locked or approved shot without one is "
+  + "left alone too, and the queue panel's Generate All still takes the ready set.";
+
+//: The empty scope, decided client-side in the same terms the server decides it (`batch_targets`,
+//: scope `empty`): no take, not already rendering, and neither locked nor approved -- the two
+//: protections the server *names* in its report and this count therefore leaves out, exactly as
+//: `generateAllPlan`'s Replace Existing set does.
+//:
+//: `latest_output` and nothing else is the test for "has a video", matching `shot_has_take`. The
+//: Director's own live plan is the case that makes it matter: thirty shots all reading `draft`,
+//: three of them already holding a finished take. A status test would re-render those three.
+export function emptyScopeShots(project) {
+  return (project?.shots || []).filter(Boolean).filter(
+    (shot) =>
+      !shot.latest_output
+      && !["queued", "running"].includes(shot.status)
+      && !shot.locked
+      && !shot.approved_output
+      && shot.status !== "approved",
+  );
+}
+
+//: Generate All Empty's whole decision: the count it will submit, how many of those are drafts it
+//: will commit on the way, and the bundle it will spend. Executed by the contract tests for every
+//: state, never re-derived in the template or in the click handler.
+export function generateEmptyPlan(project) {
+  const targets = emptyScopeShots(project);
+  const drafts = targets.filter((shot) => shot.status === "draft");
+  if (!targets.length) {
+    return { count: 0, drafts: 0, title: GENERATE_EMPTY_NONE, confirm: "", empty: GENERATE_EMPTY_NONE };
+  }
+  const noun = (n) => `${n} shot${n === 1 ? "" : "s"}`;
+  // The arming is named before the click, not discovered after it. Committing a draft is a
+  // decision the Director otherwise makes per shot (or in one pass with `Mark all drafts ready`),
+  // so a batch that does it on their behalf has to say so in the sentence they confirm.
+  const draftNote = drafts.length
+    ? ` ${noun(drafts.length)} ${drafts.length === 1 ? "is" : "are"} still a draft and will be committed to the render queue first.`
+    : "";
+  return {
+    count: targets.length,
+    drafts: drafts.length,
+    title: `Generate ${noun(targets.length)} with no video yet${drafts.length ? `, committing ${drafts.length} draft${drafts.length === 1 ? "" : "s"} first` : ""}`,
+    confirm:
+      `Queue ${noun(targets.length)} — every shot with no video yet — as one batch?`
+      + `${draftNote}${bundleSpend(project)} `
+      + "One confirmation covers the batch.",
+    empty: "",
   };
 }
 
@@ -1663,6 +1732,12 @@ export const READINESS_TAKE_UNCOVERED_LABEL = "Past the take";
 //: of the problem. Amber, never a block; the server's sentence carries the two names and the
 //: evidence.
 export const READINESS_SETTING_CONFLICT_LABEL = "Two locations";
+//: And the heading for a kind this client has no name for -- see `NOTE_KIND_WINDOW_UNKNOWN`. It
+//: says only that the server sent a note, which is the whole of what is known. Deliberately not
+//: "Unknown warning" or anything else that editorialises: the sentence that follows is the
+//: server's and it explains itself, and a heading guessing at severity would be the same
+//: invention, one notch quieter, as the "Short window" this replaced.
+export const READINESS_UNNAMED_NOTE_LABEL = "Note";
 
 // ------------------------------------------------------------------------------------------
 // The shot-length band, as the *server* judges it. `batch.NOTE_KIND_WINDOW_SHORT` and
@@ -1702,12 +1777,31 @@ export const NOTE_KIND_TAKE_UNCOVERED = "take_uncovered";
 //: nothing here re-derives it. A client-side version would need the asset library and the sections
 //: together, and would be a second opinion about a rule that already has one.
 export const NOTE_KIND_SETTING_CONFLICT = "setting_conflict";
+//: **Not a kind the server sends.** It is what this client calls a kind it does not recognise, so
+//: that the fallback has a name of its own instead of borrowing a real one.
+//:
+//: Until 2026-08-23 the fallback returned `NOTE_KIND_WINDOW_SHORT`, and that is a lie rather than
+//: a gap: a note the server added last week would have reached the Director's readiness list under
+//: the heading **"Short window"**, over a sentence about something else entirely, in the muted
+//: colour that says "this one is fine" — the exact failure the comment on `readinessLines` warns
+//: about two screens down, committed by the branch that comment points at. Every kind the server
+//: has gets a branch; this is what the ones it has not got yet get, and a wrong label is worse
+//: than an unknown one.
+//:
+//: A note that lands here still keeps everything that carries meaning: the server's own sentence,
+//: the Shot names, and a place in the list. What it loses is a name this client cannot honestly
+//: supply. The remedy is to add a branch, and the note is visible enough to make somebody do it.
+export const NOTE_KIND_WINDOW_UNKNOWN = "window_unknown";
 
+//: Which of the kinds this client knows a note is, or `NOTE_KIND_WINDOW_UNKNOWN`. Written as one
+//: explicit branch per known kind rather than as a table lookup so that a kind can never be
+//: recognised by inheriting `Object.prototype`.
 function windowNoteKind(note) {
+  if (note?.kind === NOTE_KIND_WINDOW_SHORT) return NOTE_KIND_WINDOW_SHORT;
   if (note?.kind === NOTE_KIND_WINDOW_LONG) return NOTE_KIND_WINDOW_LONG;
   if (note?.kind === NOTE_KIND_TAKE_UNCOVERED) return NOTE_KIND_TAKE_UNCOVERED;
   if (note?.kind === NOTE_KIND_SETTING_CONFLICT) return NOTE_KIND_SETTING_CONFLICT;
-  return NOTE_KIND_WINDOW_SHORT;
+  return NOTE_KIND_WINDOW_UNKNOWN;
 }
 
 //: Which of two window states a clip wears when the report has both to say about it. A shot can
@@ -1729,7 +1823,14 @@ function windowNoteKind(note) {
 //: a clip's one border is about the clip: the band and the coverage are properties of the window
 //: the Director is dragging, and where the shot is set is a property of its references, fixed in
 //: the inspector. The readiness list prints its whole sentence either way.
+//:
+//: An unrecognised kind ranks below every known one, and is ranked rather than omitted for the
+//: same reason the setting conflict is: an absent rank makes both comparisons false and hands the
+//: answer to whichever note the server happened to list first. Lowest, because the one thing that
+//: *is* known about it is that this client cannot say what it means — so it must never displace a
+//: border that a kind with a branch earned.
 const WINDOW_KIND_RANK = {
+  [NOTE_KIND_WINDOW_UNKNOWN]: -2,
   [NOTE_KIND_SETTING_CONFLICT]: -1,
   [NOTE_KIND_WINDOW_SHORT]: 0,
   [NOTE_KIND_WINDOW_LONG]: 1,
@@ -1754,9 +1855,11 @@ export function windowWarningsByShot(report) {
 }
 
 //: The class a clip carries for its window state, and the sentence appended to its accessible
-//: name. Two of the three states draw: the long band and a take the window has left. The short
-//: end draws neither class nor words, because it is not a problem. State is never carried by
-//: colour alone here either, so a class always comes with a sentence.
+//: name. Only two kinds draw anything: the long band and a take the window has left. The short
+//: end draws neither class nor words, because it is not a problem; the setting conflict draws
+//: none because it is not about the window; and an unrecognised kind draws none because this
+//: client cannot say what it would be claiming. State is never carried by colour alone here
+//: either, so a class always comes with a sentence.
 export const CLIP_WINDOW_LONG_CLASS = "window-long";
 export const CLIP_WINDOW_LONG_NOTE =
   "Longer than the range H3 is trained for. It still submits and renders; expect motion and " +
@@ -1810,17 +1913,24 @@ export function clipWindowState(kind, label = "") {
 //: The readiness list's own class and heading for each window kind, keyed by the server's kind so
 //: the two can never be paired up wrongly. The classes are the stylesheet's, and only the ones
 //: that colour have a rule -- `window-short` deliberately has none.
+//:
+//: `window-note` is the unrecognised kind's row, and it is amber rather than muted. Muted is a
+//: claim -- it is what `window-short` wears to say "this is a cost, not a problem" -- and this
+//: client has no grounds to make that claim about a note it cannot name. Amber says only what the
+//: server already said by putting it in this list: something here wants looking at.
 const WINDOW_LINE_KINDS = {
   [NOTE_KIND_WINDOW_LONG]: "window-long",
   [NOTE_KIND_WINDOW_SHORT]: "window-short",
   [NOTE_KIND_TAKE_UNCOVERED]: "take-uncovered",
   [NOTE_KIND_SETTING_CONFLICT]: "setting-conflict",
+  [NOTE_KIND_WINDOW_UNKNOWN]: "window-note",
 };
 const WINDOW_LINE_LABELS = {
   [NOTE_KIND_WINDOW_LONG]: READINESS_WINDOW_LONG_LABEL,
   [NOTE_KIND_WINDOW_SHORT]: READINESS_WINDOW_SHORT_LABEL,
   [NOTE_KIND_TAKE_UNCOVERED]: READINESS_TAKE_UNCOVERED_LABEL,
   [NOTE_KIND_SETTING_CONFLICT]: READINESS_SETTING_CONFLICT_LABEL,
+  [NOTE_KIND_WINDOW_UNKNOWN]: READINESS_UNNAMED_NOTE_LABEL,
 };
 
 //: The heading each blocking kind reads under. Only the kinds that have a name of their own appear;
@@ -1851,8 +1961,10 @@ export function readinessLines(report) {
     // Each kind in that list under its own name and its own list-marker class, decided from the
     // note's `kind` in one place: a line that read "Long window" over a coverage sentence, or
     // "Short window" over a two-locations one, would be describing a rule the server does not
-    // have -- which is exactly what `windowNoteKind`'s fallback does to any kind nobody adds a
-    // branch for, so every kind the server sends gets one.
+    // have. Every kind the server sends gets a branch, and since 2026-08-23 a kind it does not
+    // send yet gets `NOTE_KIND_WINDOW_UNKNOWN` -- which prints the server's sentence under a
+    // heading that claims nothing, rather than under the "Short window" the fallback used to
+    // borrow. The mislabel this paragraph warns about was, until then, what the fallback did.
     ...(report?.window_warnings || []).map((note) => {
       const kind = windowNoteKind(note);
       return render(WINDOW_LINE_KINDS[kind], WINDOW_LINE_LABELS[kind])(note);
@@ -1915,7 +2027,20 @@ export const RENDER_AGAIN_HELP =
   "Re-open this shot and queue one new take (turbo, fresh seed). The previous take stays until " +
   "the new one lands; cancelling the dialog re-opens without rendering.";
 // app.py's RESUBMIT_SEED_STRIDE, asserted identical by a contract test: a re-render at the same
-// seed and prompt reproduces the identical take, which reads as "nothing was replaced".
+// seed and prompt reproduces the identical take *while ComfyUI keeps the model resident*, which
+// reads as "nothing was replaced".
+//
+// The condition is measured rather than assumed (2026-08-23, §8.8 follow-up of the H3 attention
+// experiment): four repeats of one byte-identical payload at one seed produced two pairs, each
+// pair bit-identical across all 141 frames, and the two pairs differ from each other only because
+// ComfyUI evicted and reloaded the model between them, unprompted. So the sampler is
+// deterministic and the take is not guaranteed to be: without the stride a Director gets the same
+// take, *or* a different one at a moment nobody chose, and neither reads as a decision.
+//
+// And the stride carries a second load the seed alone would not. ComfyUI serves an unchanged
+// graph from its **execution cache**: a byte-identical resubmission came back in 1.157 s with the
+// sampler reported cached — no sampling, no power draw, the previous file re-saved under a new
+// name. Moving the seed is what makes the submission a render at all.
 export const RESUBMIT_SEED_STRIDE = 101;
 // The two refusals the browser can see coming, in the server's words. Drawn as a disabled control
 // carrying the reason rather than as no control at all: "why can I not render this again" is a
@@ -2002,12 +2127,24 @@ export const JOB_TARGET_DETACHED_TITLE =
   "produced is still on disk, and this row is the only thing that says which render made that " +
   "file, with what seed and how long it took. There is no shot to open.";
 
+//: The job kinds whose `target_id` is a **Shot** id, and therefore the kinds this function has an
+//: opinion about. `models.RenderJob.kind` also holds `music` (the song), `flux` and `multiview`
+//: (an asset), `edit` and `post` — none of which name a shot, so none of them can be detached from
+//: one.
+//:
+//: `ltx` is here since 2026-08-23. `app.generate_ltx_enhance` writes `target_id=shot.id` exactly
+//: as `generate_h3` does, and `app.py:1568` reads it back as a shot id when it looks for an
+//: in-flight enhancement — so an LTX row was drawing the raw `shot_9f2c…` the 2026-08-20 finding
+//: removed from this panel, and drawing it as unlinked dead text even while its shot was right
+//: there on the timeline. One kind was special-cased where two were meant.
+export const JOB_KINDS_TARGETING_A_SHOT = ["h3", "ltx"];
+
 //: How the queue panel names one job's target and whether the row is a way back to it. Pure, so
 //: the "is this shot still here" question is answered once rather than three times inside a
 //: template literal.
 export function jobTarget(project, job) {
   const targetId = job?.target_id || "";
-  if (job?.kind !== "h3" || !targetId) {
+  if (!JOB_KINDS_TARGETING_A_SHOT.includes(job?.kind) || !targetId) {
     return { label: targetId || "—", shotId: "", linked: false, title: "" };
   }
   if (!(project?.shots || []).some((shot) => shot?.id === targetId)) {
@@ -2063,8 +2200,11 @@ export function randomSeed(random = Math.random) {
 // seed movement are chosen between, so they cannot both fire.
 //
 // Without randomize this is the server's own RESUBMIT_SEED_STRIDE, unchanged: a resubmission at the
-// same seed and prompt reproduces the identical take, which reads as "nothing was replaced", and
-// that stride is what the inspector's Render again has always applied.
+// same seed and prompt reproduces the identical take while ComfyUI keeps the model resident, which
+// reads as "nothing was replaced", and that stride is what the inspector's Render again has always
+// applied. See RESUBMIT_SEED_STRIDE for what "while resident" was measured to mean, and for the
+// second thing the stride buys -- an unchanged graph is served from ComfyUI's execution cache
+// without sampling at all.
 //
 // With randomize it is a fresh roll *instead of* the stride, never as well as it. Adding a stride
 // to a random number would be a second, invisible source of drift on a value the Director has just
@@ -4683,12 +4823,21 @@ export function applyRenderStatus(project, report) {
 // sentence per job, decided here rather than in the poll loop, so the wording is executed by the
 // contract tests -- a completion that reads as an error, or an error that reads as good news, is
 // the kind of inversion only an executed string catches.
+//
+// The shot half goes through `jobTarget`, and that is the fix rather than a tidy-up. A render can
+// outlive its shot -- a populate mid-render replaces `project.shots` wholesale and mints new ids
+// -- and this toast used to call `shotLabel` directly, which for an id no shot has returns the
+// bare `shot_9f2c…` string. So the completion of a long H3 render could arrive as "Render
+// complete: shot_9f2c4b1e0a77 is ready", naming a shot the Director cannot find anywhere on the
+// timeline, exactly as the queue row did until 2026-08-22. `jobTarget` already owns that
+// question, says "shot no longer on the plan" in the one place it is worded, and covers `ltx` as
+// well as `h3`.
 export function renderSettledToast(project, job) {
   let name = job.target_id || job.kind;
   if (job.kind === "flux" || job.kind === "multiview") {
     name = (project?.assets || []).find((asset) => asset.id === job.target_id)?.name || "an asset";
-  } else if (job.kind === "h3" || job.kind === "ltx") {
-    name = shotLabel(project, job.target_id);
+  } else if (JOB_KINDS_TARGETING_A_SHOT.includes(job.kind)) {
+    name = jobTarget(project, job).label;
   } else if (job.kind === "music") {
     name = project?.song?.title || "the song";
   }

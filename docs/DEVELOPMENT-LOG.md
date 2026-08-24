@@ -4,6 +4,400 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-23 — Nine named items cleared: a fixed-seed claim that needed a condition, a fallback that mislabelled, two more callers of a resolver written for them, and a tuple whose name asked the wrong question
+
+A list of known, named, unfixed items, worked as a batch. **The accounting is as much the
+deliverable as the fixes**, so every item below says fixed or not fixed and why, including the two
+that were skipped and the one that was declined on the merits.
+
+**No render, no ComfyUI submission, no model call.** `data/projects/project_59f14d19ff10` was not
+touched at all. A second agent was live in this tree adding the **Generate All Empty** scope
+(entry below); two items landed inside functions it was editing and were handed to it rather than
+raced.
+
+### The fixed-seed claim was true and unconditioned, in seven places
+
+A measurement on 2026-08-23 (§8.8's follow-up in
+`_bmad-output/planning-artifacts/h3-attention-backend-experiment.md`) settled what a fixed seed
+buys, and it is **narrower and sharper than what the code said**. Four renders of one
+byte-identical payload at seed 14, one session, back to back: two of them are **bit-identical to
+each other across all 141 frames**, the other two are bit-identical to each other, and the two
+pairs are different takes. Every §8 statistic agrees to the last digit printed within a pair.
+What separates the pairs is that ComfyUI **evicted and reloaded the model between them,
+unprompted** — the second such eviction observed, this one between two byte-identical
+submissions. ComfyUI's own `execution_cached` list correlates perfectly with the pixels.
+
+So: **the sampler is bit-deterministic on this card, and the nondeterminism lives in the
+load-and-encode path.** Cross-reload divergence (16.7/255, r 0.58) is the same size as a prompt
+change (19.2, r 0.54). The claim as written — *"a re-render at the same seed and prompt reproduces
+the identical take"* — is true while the model stays resident and false across a reload, and
+nothing in the application can observe which it got.
+
+The condition was added at six of the seven sites: `RESUBMIT_SEED_STRIDE` and `nextRenderSeed` in
+`api.js`, the `#render-again` handler's two comments in `app.js`,
+`tests/e2e_seed_and_asset_tabs.py`'s assertion message, and two places in
+`tests/test_frontend_contract.py`. `docs/WORKFLOW-MAP.md` gains the measured note itself, because
+that is the file the next person checks before re-deriving it.
+
+**And the second finding, which nobody had recorded.** ComfyUI serves an unchanged graph from its
+**execution cache**: the byte-identical resubmission came back in **1.157 s with the sampler
+reported cached** — no sampling, no power draw, the previous file re-saved under a new name.
+**That is not a render.** It makes `RESUBMIT_SEED_STRIDE` load-bearing for a reason independent of
+determinism: without the stride, a batch re-render can spend no GPU at all and still report a
+take. That is now written where the stride is defined, rather than being a property nobody knew
+the stride had.
+
+**The seventh site is `app.py`'s batch route**, inside the loop the other agent was editing. Its
+replacement text was handed over rather than written — see "What was skipped" below.
+
+### `windowNoteKind` mislabelled every kind it did not know
+
+`api.js` fell back to `NOTE_KIND_WINDOW_SHORT` for an unrecognised kind. The consequence is not a
+gap, it is a **lie**: the next warning kind the server grew would have reached the Director's
+readiness list under the heading **"Short window"**, in the muted colour that exists to say *this
+one is fine*, over a sentence about something else entirely. `readinessLines`' own comment warns
+about exactly this failure two screens further down — and names the branch that was committing
+it.
+
+`NOTE_KIND_WINDOW_UNKNOWN` is now what the fallback returns. It is a client-side sentinel the
+server never sends, so the fallback has a name of its own instead of borrowing a real one. The
+note keeps everything that carries meaning — the server's sentence, the Shot names, a place in the
+list — and loses only a name this client cannot honestly supply. Three decisions inside it:
+
+* **The heading is `"Note"`**, and the test asserts it is not *any* known kind's heading. Reading
+  the constant back out of the module it labels the line with proves only self-consistency;
+  rewriting it to "Short window" has to fail, and does.
+* **The list class is `window-note`, coloured amber, not `window-short`'s muted.** Muted is a
+  *claim* — it is how the short band says "a cost, not a problem" — and nothing here is entitled
+  to make it about a note it cannot name. Amber says only what the server already said by putting
+  it in the warnings list.
+* **It is ranked, at −2, below every known kind.** Ranked rather than omitted for the
+  two-locations note's own reason: an absent rank makes both comparisons false, so a shot carrying
+  two notes would keep whichever the server listed first. Lowest, because the one thing known
+  about it is that this client cannot say what it means, so it must never displace a border a kind
+  with a branch earned. Both orders are executed.
+
+The branch chain stayed a chain of explicit `===` comparisons rather than becoming a table lookup,
+and that is deliberate: `"toString" in {}` is `true`, so a lookup would "recognise" a kind
+inherited from `Object.prototype`. A mutant that rewrites it as a lookup is caught.
+
+### Two more callers resolved a job's shot without asking whether it exists
+
+`jobTarget` was written on 2026-08-22 for exactly this and the queue row was the only caller that
+got it. Both remaining ones are now on it.
+
+**`renderSettledToast`** called `shotLabel` directly, which returns the bare id for a shot it
+cannot find. A populate replaces `project.shots` wholesale and mints new ids, and an H3 take is
+minutes long, so this is reachable rather than theoretical: a completion arrived as *"Render
+complete: shot_9f2c4b1e0a77 is ready"*, naming something the Director cannot find anywhere. It now
+reads *"shot_9f2c4b1e0a77 — shot no longer on the plan"*, in the one place that sentence is
+worded, on the success branch and the failure branch alike. The `flux`, `multiview` and `music`
+branches are asserted byte-for-byte unchanged, because this went through a shared resolver.
+
+**`clipLibraryRows`** had the same defect and one more. This tab is built from the job list
+*precisely so a take survives the re-plan that removed its shot* — and that was the case it drew
+worst: the card read the dead id, and offered an **Open shot** button that set `selectedShotId` to
+an id no shot has and selected nothing. The row now carries `jobTarget`'s whole verdict, the
+footer draws its label and its title, and the button is drawn **only where there is a shot to
+open**. Asserted on the rendered markup rather than on the row object: the button lives in a
+template literal, so a row flag nothing reads would look identical from the outside.
+
+### `jobTarget` special-cased one kind where two were meant
+
+`kind === "h3"` alone, so an LTX enhancement drew its raw `shot_…` id — the dead text a 2026-08-20
+finding removed from this panel — and drew it *unlinked* even while its shot was on the timeline.
+`generate_ltx_enhance` writes `target_id=shot.id` exactly as `generate_h3` does, and `app.py`
+reads it back as a shot id when it looks for an in-flight enhancement.
+
+`JOB_KINDS_TARGETING_A_SHOT` is now the list, and it is pinned against `RenderJob.kind`'s own
+`Literal` from the Python side: the test asserts the complement is exactly
+`{music, flux, multiview, edit, post}`, so a sixth kind that starts carrying a shot id cannot be
+added on the server and silently miss the browser.
+
+### `JOB_MEASURED_FIELDS` → `JOB_RECORDED_FIELDS`
+
+Two of its five entries are not measurements. `render_frames` and `sampling_bundle` are written at
+**submission**, at the one moment the graph's length and the graph's bundle are true. The name
+matters because of what it asks the next person: *"is this a measurement?"* — to which
+`render_frames` answers no and belongs in the tuple anyway. The **eleven** recorded instances of
+this exact hole in `replace_project` are all a field somebody decided did not belong. The question
+the name has to ask is the one that governs: **did this application produce the value, such that a
+client must not be able to move it?**
+
+Same tuple, same order, same guard, same two loops. The rename touches the generic `PUT` guard, so
+it is **proved rather than assumed inert**: `test_the_guard_has_teeth_for_every_field_it_names`
+forges all five through the whole-project `PUT` on a job the store holds *and* on one it does not
+and requires every one back unmoved, and four mutants — dropping either submission-written field
+from the tuple, and emptying either adoption loop — are all caught.
+
+The *function* keeps the name `_adopt_job_measurements`. It is the older and more cited of the two
+(`RenderJob.render_frames`, `RenderJob.sampling_bundle` and `docs/WORKFLOW-MAP.md` all name it) and
+it names a **verb** rather than a category, so unlike the tuple it never asks anybody a question it
+answers wrongly. Renaming both would have been one change more than the defect.
+
+### Declined on the merits: no sampling bundle for Flux or multiview
+
+`RenderJob.sampling_bundle` is written only for H3, and `kind` currently answers *"no H3 graph"*
+rather than *"here is what this sampled"*. Extending it was raised and **declined**, and the
+reasoning is now on the field itself so it is not re-raised as an omission.
+
+A *bundle* is a named, evidenced configuration read out of one of the Director's own exports, of
+which there are three, between which the Director chooses per project. Neither other sampler has
+anything of that shape.
+
+* **Multiview chooses nothing.** `MultiviewRequest` carries `prompt` and `seed` and no sampling
+  field at all; the steps, cfg, sampler, scheduler, LoRA and strength are literals inside
+  `build_multiview_payload`. A record would copy a constant out of the builder onto every job row
+  and would read, to anyone scanning the queue, as evidence that a choice was made.
+* **Flux does vary — and `SamplingBundle` is still the wrong container.** It has no `name`: no
+  evidenced Flux bundle exists anywhere in this repo, so the column the record is keyed on would
+  be blank or invented for every Flux job, and `NO_EVIDENCED_BUNDLE` cannot be borrowed without
+  making that constant mean two things. Worse, `FluxRequest` varies `steps` **and** `guidance`,
+  and this shape has a column for the first and none for the second — a row reading `flux · 20`
+  would look complete while silently dropping half of what the Director set. **A record that looks
+  complete and is not is worse than the honest silence it replaces**, which is the whole argument
+  behind `render_seconds_source` and the `unknown` bundle cell.
+
+So the gap is **named rather than papered over**: a Flux take's `steps` and `guidance` are
+unrecoverable after the fact, exactly as an H3 take's bundle was before that field. If it becomes
+worth fixing it wants its own record echoing `FluxRequest`, not a second tenant in a vocabulary
+built for a choice Flux does not offer. `kind` answering "no H3 graph" is not a shrug; it is the
+true and complete answer to the question the field asks.
+
+### Three stale claims in `docs/WORKFLOW-MAP.md`, one of which contradicted itself on the day it was written
+
+* *"Nothing has been rendered on any non-default profile as this is written."* **False since the
+  2026-08-21/22 sweep**, which rendered all five attention profiles at 107 frames (`default` 9.08,
+  `comfy-kitchen` 9.18, `sage-auto` 9.22, `sage-fp8-cuda++` 9.37, `pytorch` 11.41 s/it) and then
+  promoted `pytorch` to 226 frames where it **did not complete** — 97 minutes, zero sampling
+  steps, which is the measurement that identified the 158→226 cliff as a memory wall. Replaced
+  with the figures and their three standing caveats; the schema-audit sentence survives, because a
+  schema audit is still not evidence of a frame.
+* The readiness table's *"the `turbo` sampling profile … has **never been rendered from this
+  application**"*. That **already contradicted** the same file's "verified live from this
+  application on 2026-08-18" when it was written, and is now doubly false. All three bundles have
+  been rendered; the row says which and when, and says what the old line was.
+* A third instance of the same class, found while checking the rest of the file: the parenthetical
+  at line 180 still said `turbo-references2v` *"has not been rendered"*, four paragraphs below a
+  section recording its six takes of 2026-08-23.
+
+**And one that was not on the list.** `docs/ROADMAP.md` carried the identical self-contradiction:
+its H3-profiles entry near the top records `turbo` "rendered live 2026-08-18", and its detail
+section 180 lines further down still said *"Nothing has been rendered on the turbo profile"*. That
+line was already false on the day it was written. Corrected, along with the entry's "two of three
+rendered" count and the open comparison item — which is **half done**, and the half that is done is
+not the half it asks for: `turbo-references2v` was rendered against `default`, and the two *turbo*
+bundles have still never been put beside each other. `AGENTS.md` names ROADMAP as the
+verified-vs-unverified authority, so a stale claim there is worse than one in the workflow map.
+
+The rest of the workflow map was swept for the same shape of claim. Four survive and are **still
+true**:
+the LTX extender is schema-audited only with no route and no UI, no non-default profile has been
+rendered on the text-only Director path (that path refuses one with a 422), video references and
+paired video audio remain never exercised live, and neither the turbo LoRA in isolation nor a
+crossed sampler/scheduler pairing has been rendered by anyone here.
+
+### What was skipped, and why
+
+Two items sit inside functions the concurrent agent was editing — `generate_batch` in `app.py`.
+The coordination rule is not to race, so neither was written; both were handed over as exact
+replacement text.
+
+1. **The seventh fixed-seed site**, the comment in `generate_batch`'s target loop.
+2. **`GENERATE_BATCH_CONFIRM_REFUSAL`**, which quotes "288-438 s on the default profile" whatever
+   the project's bundle is. It stays true as written because it names the profile, and is now
+   incomplete: `turbo-references2v` is measured at production length and `api.js`'s
+   `generateAllPlan` already says so per bundle, so the server sentence is the half that lags. Its
+   `.format(count=...)` call is inside that same function.
+
+### The e2e that had never been executed
+
+`tests/e2e_render_polling.py` was changed for the asset-URL move on 2026-08-23 and never run — an
+unexecuted e2e change is a claim nobody has checked. **It was run, and it passes.** On port 8871
+with its ComfyUI double on 8872, its own throwaway data root, and the Director's app on 8765
+untouched and still listening. `prompt: 0` on the double, so nothing reached a GPU. Every
+assertion the script exists for held: zero polling requests on an idle project, polling started
+with no click, a dead ComfyUI produced no toast spray, the completion toast and the asset card
+landed without a click, the manifest reconciled, and polling stopped after the settle.
+
+### Tests, and the mutation sweep
+
+Four new contract tests, all executed under node as this repo pins: the unrecognised-kind fallback
+against every heading it must not borrow (including the `Object.prototype` case), its ranking
+against all four known kinds in both orders, the settled-render toast for a detached shot on
+`h3` and `ltx` and the failure branch, the LTX queue label pinned to `RenderJob.kind`, and the
+Clips tab's markup for a take whose shot a populate replaced.
+
+Every new branch was mutation-checked in a `git worktree` with `PYTHONPATH` at its own `src` and
+the resolved `music_video_producer.__file__` asserted to be inside it, restores by
+`read_bytes`/`write_bytes`, anchors converted to each file's CRLF with the match count asserted at
+exactly one, `__pycache__` purged without walking `.git`, and one sentinel per mutated file that
+must fail.
+
+**21 behaviour mutants, all 21 caught.** Eight on the unknown-kind fallback (return the old
+`window_short`; make the short branch return the sentinel; rank the unknown above everything;
+un-rank it; give it `window-short`'s class; give it the Short window heading; rename the heading
+to a real kind's; rewrite the branch chain as a table lookup so `Object.prototype` leaks in);
+three on `jobTarget`'s gate (drop `ltx`, invert it, remove it); two on the settled toast (back to
+`shotLabel`, back to `h3`-only); four on the Clips tab (every row linked, back to `shotLabel`, the
+Open shot button unconditional, and the equivalent one below); four on the renamed guard (drop
+either submission-written field from the tuple, empty either adoption loop).
+
+**Two survivors, and neither is a test gap.**
+
+* **The first app.py sentinel was a bad sentinel.** It mutated `GENERATE_BATCH_EMPTY_FLAGGED`'s
+  text, and the only test that mentions that constant asserts `detail != GENERATE_BATCH_EMPTY_FLAGGED`
+  — the constant compared against itself, so the mutation moves both sides. Replaced with
+  `RESUBMIT_SEED_STRIDE` `101 → 102`, which `api.js` carries as its own literal and a contract test
+  asserts equal across the two languages, so a Python-side change cannot drag the JavaScript side
+  with it. **Caught.** The app.py half of the sweep is therefore proved rather than assumed. (The
+  incidental finding stands: nothing pins the *words* of the flagged-scope empty sentence.)
+* **`shotId: to.shotId` → `shotId: job.target_id` in `clipLibraryRows` is an equivalent mutant**,
+  and the argument is now written beside the line rather than left in a report. `shotId` has
+  exactly two readers. Open shot's `data-shot-id` is gated on `linked`, and `jobTarget` reports
+  `linked` only for a target it has just found among `project.shots`, so wherever that attribute
+  is drawn the two expressions are the same string. `clipCardFace` does
+  `shots.find(item => item.id === row.shotId)`, which fails for `""` and fails identically for an
+  id no shot has — "no shot has it" being the definition of the detached case — so both fall to
+  the same ComfyUI `/view` branch. It cannot change behaviour today; it is kept because the
+  alternative is a row carrying a shot id that is not a shot id, which is the next caller's bug
+  rather than this one's.
+
+## 2026-08-23 — Generate All Empty: one button for every shot that has no video, and the draft gate it deliberately steps through
+
+The Director's ask, verbatim: a button on the timeline beside **Expand All Prompts**, *"which
+would generate all shots that dont already have a video"*. The gesture it replaces is **Mark all
+drafts ready** then **Generate All**, two clicks in the queue panel, which is not the panel the
+plan is in.
+
+**No render, no ComfyUI submission, no model call.** `data/projects/project_59f14d19ff10` was read
+**read-only**, to check the scope selects the shots it should.
+
+### A third scope, not a second route
+
+`GenerateBatchRequest.scope` was already `Literal["ready", "flagged"]`, `batch_targets` already
+branched on it, and `generate_batch` already reported per-shot skips with reasons. `empty` is a
+third value on that field. Everything downstream came for free and is therefore not a second copy
+of anything: the readiness gate, the per-shot refusals in the single-shot routes' own words, the
+project's sampling bundle, the one freshly-minted `batch_id`, the resubmit seed stride, and the
+`confirm_gpu` acknowledgement the server enforces.
+
+### "Has a video" is `latest_output`, and status cannot stand in for it
+
+`batch.shot_has_take` reads the single pointer the whole application means by "this shot's video" —
+the take player, the Monitor, assembly and `select_shot_take` all resolve through it. Status was
+checked and rejected on four observed disagreements, in both directions:
+
+* `apply_job_history` writes `status = "complete"` **before** it looks at `output_files`, so a job
+  that finished and produced nothing leaves a `complete` shot with no video;
+* a failed re-render writes `status = "error"` and leaves `latest_output` untouched, so an `error`
+  shot may still hold a perfectly good earlier take — while one that never rendered holds none.
+  `cancel_job` produces exactly the second case;
+* **the Director's own live plan is the decisive one.** All 30 shots read `draft`; three of them
+  (`shot_8cf8e6490471`, `shot_740424ff5d2a`, `shot_f82bf42e3abc`) already hold a finished take. A
+  status test would re-render those three. The pointer test leaves them alone and selects 27.
+
+The converse is what makes a deleted take come back: clearing `latest_output` — however it is
+cleared — is the whole of returning to scope, because the pointer *is* the claim. **Found and not
+fixed:** the application has no take-delete control at all, so the only way to clear it today is
+the generic shots write; and a take whose *file* is deleted from disk behind the application's back
+keeps its pointer and stays out of scope. That is the same reading every other take path takes —
+they refuse with `TAKE_MISSING_FILE_REFUSAL` rather than pretending there was never a take.
+
+### The design question: yes, drafts are in scope, and they are armed rather than failed
+
+Excluding drafts would have made the button do nothing on a freshly populated plan — thirty shots
+with prose and no takes — which is the exact case it was asked for. Including them means submitting
+shots the Director has not marked ready, so two things make that a decision rather than a bypass:
+
+* the gate is already bulk-bypassable by design. **Mark all drafts ready** promotes every draft in
+  one click, and this is that promotion fused to the batch behind one confirmation that names both
+  halves;
+* the arming is not a shortcut around the gate, it **is** the gate. Each draft goes through
+  `mark_shot_ready` itself, in-closure, exactly as a settled target already goes through
+  `render_again`. So the arming refusals — locked, approved, already-rendered, a live job (409) and
+  the readiness prompt gate — are that route's own, in that route's own words, and land in
+  `skipped` by name. A draft with no prompt is **refused and reported, never submitted and failed**,
+  and it is still a draft afterwards. Emptiness blocks; sameness warns.
+
+The arming is scoped to `empty`. `ready` cannot reach a draft at all, and a draft in the `flagged`
+scope goes on meeting `generate_h3`'s "must be ready" exactly as before — pinned by its own test,
+which is what makes "the existing two scopes are unchanged" a check rather than a claim.
+
+**What the Director sees on a plan of 30 drafts** (27 without takes): the button reads
+*"Generate All Empty"*, its hover says *"Generate 27 shots with no video yet, committing 27 drafts
+first"*, and the click asks *"Queue 27 shots — every shot with no video yet — as one batch? 27
+shots are still a draft and will be committed to the render queue first. Bundle: … One confirmation
+covers the batch."* Confirming queues 27 H3 renders; the three shots that already have takes are
+untouched, status and take alike.
+
+### The control, and the case where it does nothing
+
+Drawn by `renderSnapCuts` beside Expand All Prompts, in its shape and its voice, with its own id
+(`#timeline-generate-empty`) because two elements may not share one. It differs from the button
+next to it in exactly one way, deliberately: it stays **live** when nothing is empty. A plan whose
+every shot is rendered is the *success* state, not a misconfiguration, and drawn shut it would say
+so only to a Director who hovers it. Clicked, it answers `GENERATE_EMPTY_NONE` in a toast — the fix
+the three silent shot controls got on 2026-08-22, applied before the defect rather than after it.
+The server has the same sentence as its backstop (`GENERATE_BATCH_EMPTY_WITHOUT_TAKES`), looked up
+per scope rather than chained, so a fourth scope cannot inherit `ready`'s "mark shots ready first"
+by falling off the end of an if/else.
+
+`bundleSpend` was extracted while adding the second confirmation, so the bundle sentence has one
+copy across both batch dialogs; `generateAllPlan`'s text is byte-identical and pinned.
+
+### Tests
+
+Thirteen cases, split between the pure selector and the routes, plus three executed under node.
+`batch_targets` is asserted directly over an eleven-shot plan holding one shot per state it has to
+decide about: the four takeless shots are selected in timeline order, locked and approved takeless
+shots are **named** with their reasons, and `queued`/`running` are silently absent as they are from
+Replace Existing. `shot_has_take` is asserted in both directions against every status; a take
+cleared returns its shot to scope with nothing else changed; and both existing scopes are asked
+over that same plan so a rule leaking out of the new branch shows up as an extra target. On the
+routes: the batch submits every takeless shot and commits its drafts, leaves the shots that have
+takes untouched, refuses blank and placeholder drafts by name and leaves them drafts, answers the
+fully-rendered plan with its own sentence, brings a shot back after its take is cleared, refuses a
+scope it does not name, and — the pin — still turns a flagged *draft* away with "must be ready".
+The browser half executes `generateEmptyPlan` for every state and *runs* the button against the
+stub DOM: the markup is read after `renderSnapCuts`, and the click is fired three times — nothing
+empty (no question, no request, a sentence), declined (asked once, sent nothing), confirmed (one
+POST carrying `{confirm_gpu: true, scope: "empty"}`, and the batch report's skips on screen whole).
+
+### A test shape that can only pass, found by a sentinel
+
+A parallel agent's mutation sentinel blanked `GENERATE_BATCH_EMPTY_FLAGGED` and **survived**. The
+only assertion naming it was `detail != GENERATE_BATCH_EMPTY_FLAGGED`, which compares a constant
+with itself; the first version of this change's own `detail == GENERATE_BATCH_EMPTY_WITHOUT_TAKES`
+had the identical shape. All three nothing-to-do sentences and the `confirm_gpu` refusal were
+unpinned by content — the sentence could have been rewritten to anything, or to nothing, with a
+green suite. They are now pinned to the *instruction each carries*, because that instruction is the
+whole reason a refusal exists: it is the only thing telling a Director which control to reach for
+next. `GENERATE_EMPTY_NONE` and the button's label got the same treatment on the browser side.
+The general shape to watch for: **`assert x == CONSTANT` where `x` came from that same constant**
+proves the plumbing, never the words.
+
+### Mutation results
+
+38 mutants over the four changed files, in two rounds, run in a `git worktree` with `PYTHONPATH`
+at its own `src` (verified by printing `music_video_producer.__file__` before anything else),
+`read_bytes`/`write_bytes` restores, anchors converted to each file's own line ending with match
+counts asserted, `__pycache__` purged between mutants without walking `.git`, every run
+time-boxed, and one sentinel per file that must fail. All four sentinels failed as required.
+
+Round one: 27 behaviour mutants, **26 killed, 1 survived**. The survivor is worth recording
+because it is a fixture defect of the same family as the one above. Dropping `!shot.approved_output`
+from `emptyScopeShots` changed nothing, because the only approved shot in the fixture carried
+*both* `approved_output` and `status === "approved"` — so either guard covered for the other.
+Approval is two independent facts server-side (`protected` reads `approved_output or status ==
+"approved"`), and both fixtures now carry a shot with each fact alone. Round two: that mutant and
+its twin, plus one per newly pinned refusal sentence — **7 more, all killed, 0 survived**.
+
+Notable kills: the take test replaced by a status test (both languages), the in-flight exclusion
+dropped, the arming leaking into the `flagged` scope, the wrong scope on the wire, a declined
+confirmation queueing anyway, the button drawn but bound to nothing, and the button falling silent
+on a fully rendered plan.
+
 ## 2026-08-23 — A shot in two places warns, measured at 5 of 30 before it was built; and the slow-render marker is declined
 
 Two Director rulings. The first is the work; the second is a decision recorded so it is not

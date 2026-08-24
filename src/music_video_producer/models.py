@@ -1648,6 +1648,31 @@ class RenderJob(BaseModel):
     #: application submits no H3 graph for a `music`, `flux`, `multiview`, `edit`, `ltx` or `post`
     #: job, so `kind` already answers the question and the surface reads it from there.
     #:
+    #: **H3-only by design, decided 2026-08-23 rather than left as an omission.** Flux and
+    #: multiview do sample, and "extend the field to them" was raised and declined. The reason is
+    #: what a *bundle* is: a named, evidenced configuration read out of one of the Director's own
+    #: exports, of which there are three, between which the Director chooses per project. Neither
+    #: other sampler has anything of that shape.
+    #:
+    #: * **Multiview chooses nothing.** `MultiviewRequest` carries `prompt` and `seed` and no
+    #:   sampling field at all; the steps, the cfg, the sampler, the scheduler, the QuadView LoRA
+    #:   and its strength are literals inside `workflows.build_multiview_payload`. A record would
+    #:   copy a constant out of the builder onto every job row and would read, to anyone scanning
+    #:   the queue, as evidence that a choice was made. Nothing was chosen.
+    #: * **Flux does vary, and `SamplingBundle` is still the wrong container for it.** It has no
+    #:   `name` — no evidenced Flux bundle exists anywhere in this repo — so the column the whole
+    #:   record is keyed on would be blank or invented for every Flux job, and `NO_EVIDENCED_BUNDLE`
+    #:   cannot be borrowed for it without making that constant mean two different things. Worse,
+    #:   `FluxRequest` varies `steps` **and** `guidance`, and this shape has a column for the first
+    #:   and none for the second: a Flux row reading `flux · 20` would look complete while silently
+    #:   dropping half of what the Director actually set.
+    #:
+    #: So the gap is named rather than papered over: **a Flux take's `steps` and `guidance` are
+    #: unrecoverable after the fact**, exactly as an H3 take's bundle was before this field. If
+    #: that becomes worth fixing it wants its own record echoing `FluxRequest`, not a second tenant
+    #: in a vocabulary built for a choice Flux does not offer. `kind` answering "no H3 graph" is
+    #: not a shrug — it is the true and complete answer to the question this field asks.
+    #:
     #: A *present* record with `name == NO_EVIDENCED_BUNDLE` is the third state and is written
     #: deliberately: an H3 submission through the first/last keyframe or text-only Director graph,
     #: neither of which has an evidenced bundle. Positively recorded so it can never be read as

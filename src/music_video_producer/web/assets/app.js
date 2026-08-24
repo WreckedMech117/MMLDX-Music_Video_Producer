@@ -1,6 +1,10 @@
 import { APPLY_DOCUMENTS_CONTROL, ASSET_NAME_HELP, ASSET_NAME_LABEL, assetNamePlan, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, characterSlotPlan, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, jobTarget, INSTRUMENTAL_NOTE, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, VOCAL_TYPES, vocalTaggingPlan, vocalTypeSpec, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
+// Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
+// decision -- the count, the drafts it commits on the way, the bundle it spends -- is
+// `generateEmptyPlan`, and nothing about it is re-derived here.
+import { GENERATE_EMPTY_CONTROL, GENERATE_EMPTY_LABEL, GENERATE_EMPTY_RUNNING, generateEmptyPlan } from "./api.js";
 import { SNAP_CUTS_APPLIED_TOAST, SNAP_CUTS_DISMISS_LABEL, SNAP_CUTS_MOVED_HEADING, SNAP_CUTS_RUNNING, SNAP_CUTS_SKIPPED_HEADING, SNAP_CUTS_TOLERANCE_HELP, SNAP_CUTS_TOLERANCE_LABEL, SNAP_TOLERANCE_DEFAULT, SNAP_TOLERANCE_MAX, SNAP_TOLERANCE_STEP, snapCutsControl, snapCutsReportLines, snapTolerance } from "./api.js";
 // The sampling bundle: one project-level choice that governs Generate All, Re-queue flagged and
 // Render Again alike, with the step count on the option and the 2026-08-23 comparison's findings
@@ -57,6 +61,11 @@ let snapInFlight = false;
 // report naming one plan's shots drawn under another plan is a claim about shots not on screen.
 let expansionSweepInFlight = false;
 let expansionSweepReport = null;
+// Generate All Empty's in-flight flag, held here rather than set on the button, for
+// `expansionSweepInFlight`'s recorded reason: `renderSnapCuts` repaints the whole bar, so a label
+// changed by hand is wiped by the next repaint while a flag the render reads cannot be. It gates
+// the click too — a second submission of the same set is exactly the double-batch this guards.
+let emptyBatchInFlight = false;
 // The section-look pass's own report, held for the section inspector to draw. Module state for
 // `snapReport`'s reason exactly -- derived, never saved, never sent back -- and it is held rather
 // than shown once and dropped because the per-section skip reasons *are* half this feature: "the
@@ -921,6 +930,16 @@ export function renderAssets() {
 // Split out from the drawing below so the tab strip can count the takes without building the
 // markup for them: a count drawn from a second, similar-looking loop is a count that can drift
 // from the list it labels.
+//
+// Each row carries `jobTarget`'s verdict rather than a bare `target_id`, and the reason is this
+// tab's own premise. It is built *from the job list* precisely so that a take survives the
+// re-plan that replaced the shot it was made for — and until 2026-08-23 that was exactly the case
+// it drew worst: the card footer called `shotLabel` on an id no shot has, which returns the id
+// itself, so the take a Director had come here to find was labelled `shot_9f2c4b1e0a77` and given
+// an Open shot button that set `selectedShotId` to a dead id and selected nothing. The same
+// defect, in the same words, that the queue row had fixed the day before. `linked` is what decides
+// whether the button is drawn at all; a row without one is not a broken row, it is a take whose
+// shot is gone, which is a state this tab exists to keep visible.
 function clipLibraryRows() {
   const rows = [];
   const seen = new Set();
@@ -931,7 +950,24 @@ function clipLibraryRows() {
       const key = file.replace("-audio.mp4", ".mp4");
       if (seen.has(key)) continue;
       seen.add(key);
-      rows.push({ file, shotId: job.target_id });
+      const to = jobTarget(state.project, job);
+      // `shotId` is the resolver's -- empty for a detached take -- rather than `job.target_id`.
+      //
+      // **That choice cannot change what this tab does today, and the reason is worth writing
+      // down rather than rediscovering.** A mutation test put `job.target_id` back here and no
+      // test failed, so the claim is checked rather than assumed. `shotId` is read in exactly two
+      // places. The `data-shot-id` on Open shot is gated on `linked`, and `jobTarget` only reports
+      // `linked` for a target it has just found among `project.shots` -- so wherever that
+      // attribute is drawn the two values are the same string. The other reader is
+      // `clipCardFace`, which does `shots.find(item => item.id === row.shotId)`: for a detached
+      // take that lookup fails for `""` and fails identically for an id no shot has, because "no
+      // shot has it" is the definition of the case. Both fall through to the same ComfyUI `/view`
+      // branch, which is the branch a detached take needs.
+      //
+      // So this is consistency with the one resolver, not a behaviour the template depends on --
+      // and it stays because the alternative is a row carrying a shot id that is **not** a shot
+      // id, which is the shape of the next caller's bug rather than of this one's.
+      rows.push({ file, shotId: to.shotId, label: to.label, linked: to.linked, title: to.title });
     }
   }
   return rows;
@@ -980,7 +1016,13 @@ function renderClipsLibrary() {
     const picture = face.playable
       ? `<video preload="metadata" muted src="${escapeHtml(face.url)}" data-via="${face.via}" title="${escapeHtml(row.file)}"></video>`
       : `<div class="clip-unplayable" title="${escapeHtml(row.file)}">${escapeHtml(face.title)}</div>`;
-    return `<div class="clip-card">${picture}<footer><span>${escapeHtml(shotLabel(state.project, row.shotId))}</span><button class="quiet-button clip-jump" data-shot-id="${escapeHtml(row.shotId)}">Open shot</button></footer></div>`;
+    // The footer names the take's shot in `jobTarget`'s words, and offers Open shot only where
+    // there is a shot to open -- a button that selects a dead id is the dead text this panel
+    // already retired once, wearing a border.
+    const jump = row.linked
+      ? `<button class="quiet-button clip-jump" data-shot-id="${escapeHtml(row.shotId)}">Open shot</button>`
+      : "";
+    return `<div class="clip-card">${picture}<footer><span title="${escapeHtml(row.title)}">${escapeHtml(row.label)}</span>${jump}</footer></div>`;
   }).join("")}</div>`;
   $$(".clip-card video", region).forEach((video) => {
     video.addEventListener("mouseenter", () => { video.play().catch(() => {}); });
@@ -1545,6 +1587,19 @@ export function renderSnapCuts() {
   const sweep = expandAllPromptsControl(state.project);
   const sweepLabel = expansionSweepInFlight ? EXPAND_ALL_PROMPTS_RUNNING : EXPAND_ALL_PROMPTS_TIMELINE_LABEL;
   const expand = `<button class="quiet-button" id="${EXPAND_ALL_PROMPTS_TIMELINE_CONTROL.slice(1)}" ${sweep.disabled || expansionSweepInFlight ? "disabled" : ""} title="${escapeHtml(sweep.title)}" aria-label="${escapeHtml(sweep.title)}">${escapeHtml(sweepLabel)}</button>`;
+  // "Generate All Empty", beside it, in its shape and its voice. The Director's ask of
+  // 2026-08-23: "a button on the timeline beside Expand All Prompts... which would generate all
+  // shots that dont already have a video".
+  //
+  // Live even when nothing is empty, deliberately, and this is the one place it differs from the
+  // sweep button next to it. A plan whose every shot has a take is the *success* state, not a
+  // misconfiguration, and a control that answers it by being shut says so only to a Director who
+  // hovers it. It stays clickable and answers with `GENERATE_EMPTY_NONE` — the fix the three
+  // silent shot controls got on 2026-08-22, applied before the defect rather than after it. Its
+  // title carries the count and the drafts either way, so the cost is readable before the click.
+  const empties = generateEmptyPlan(state.project);
+  const emptyLabel = emptyBatchInFlight ? GENERATE_EMPTY_RUNNING : GENERATE_EMPTY_LABEL;
+  const generateEmpty = `<button class="quiet-button" id="${GENERATE_EMPTY_CONTROL.slice(1)}" ${emptyBatchInFlight ? "disabled" : ""} title="${escapeHtml(empties.title)}" aria-label="${escapeHtml(empties.title)}">${escapeHtml(emptyLabel)}</button>`;
   // Every line the route reported, whole and in its own words, each labelled for its kind. This
   // is the half that must not be swallowed: a sweep that silently skipped four locked shots is
   // indistinguishable from one that forgot them, which is exactly why the route answers per shot.
@@ -1552,9 +1607,11 @@ export function renderSnapCuts() {
     ? `<div class="snap-report expansion-report">${expansionSweepReport.map((line) =>
         `<div class="snap-${line.kind === "change" ? "move" : "skip"}"><strong>${escapeHtml(NOTICE_KINDS[line.kind]?.label || line.kind)}</strong> ${escapeHtml(line.text)}</div>`).join("")}<button class="quiet-button" id="expansion-dismiss">${escapeHtml(SNAP_CUTS_DISMISS_LABEL)}</button></div>`
     : "";
-  bar.innerHTML = `<div class="snap-controls"><span class="eyebrow">Cuts</span>${tolerance}<button class="quiet-button" id="snap-cuts" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button>${dismiss}${expand}<span class="snap-reason">${escapeHtml(control.reason)}</span></div>${report}${sweepReport}`;
+  bar.innerHTML = `<div class="snap-controls"><span class="eyebrow">Cuts</span>${tolerance}<button class="quiet-button" id="snap-cuts" ${disabled ? "disabled" : ""} title="${escapeHtml(control.title)}">${escapeHtml(label)}</button>${dismiss}${expand}${generateEmpty}<span class="snap-reason">${escapeHtml(control.reason)}</span></div>${report}${sweepReport}`;
   const expandButton = $(EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, bar);
   if (expandButton) expandButton.addEventListener("click", expandPlanPrompts);
+  const emptyButton = $(GENERATE_EMPTY_CONTROL, bar);
+  if (emptyButton) emptyButton.addEventListener("click", generateEmptyShots);
   const forget = $("#expansion-dismiss", bar);
   if (forget) forget.addEventListener("click", () => { expansionSweepReport = null; renderSnapCuts(); });
   const box = $("#snap-tolerance", bar);
@@ -2579,9 +2636,12 @@ export function renderShotInspector() {
     // again... nothing came across ComfyUI and it did not end up replaced" — the button
     // re-opened the shot and stopped, leaving the render as an unadvertised second step).
     // Re-open, then move the seed, then queue: a resubmission at the same seed and prompt
-    // reproduces the identical take, which reads as "nothing was replaced" all over again.
-    // The stride is the server's own RESUBMIT_SEED_STRIDE. Cancel keeps the old contract —
-    // re-opened, seed untouched, nothing queued, no GPU spent.
+    // reproduces the identical take while ComfyUI keeps the model resident (measured 2026-08-23 —
+    // see `RESUBMIT_SEED_STRIDE` in api.js), which reads as "nothing was replaced" all over
+    // again; and a byte-identical graph is served from ComfyUI's execution cache in ~1.2 s
+    // without sampling at all, so it would not even be a render. The stride is the server's own
+    // RESUBMIT_SEED_STRIDE. Cancel keeps the old contract — re-opened, seed untouched, nothing
+    // queued, no GPU spent.
     const queue = window.confirm(
       "Queue one new take now (turbo, fresh seed)?\nCancel re-opens the shot without rendering.",
     );
@@ -2611,8 +2671,10 @@ export function renderShotInspector() {
       // whose box is unticked strides, whatever was ticked on another clip.
       if (fresh) fresh.seed = nextRenderSeed(fresh, randomizeSeedFor(shot.id));
       // Through the one blessed shot saver, then awaited settled, because the render reads
-      // the seed from the store: a stride still on the wire at submission renders the
-      // identical take.
+      // the seed from the store: a stride still on the wire at submission submits the
+      // unchanged payload, which ComfyUI answers out of its execution cache in ~1.2 s with the
+      // previous file re-saved under a new name — or, if it has reloaded the model since,
+      // renders a take nobody chose. Either way it is not the retake the gesture promised.
       saveShotsSilently();
       await shotSaveChain;
       // No profile on the wire, and that is the fix rather than an omission. This line read
@@ -3204,6 +3266,39 @@ async function expandPlanPrompts() {
     expansionSweepInFlight = false;
     if (button) { button.disabled = false; button.textContent = label; }
     syncExpansionControls();
+    renderSnapCuts();
+  }
+}
+
+// Generate All Empty. The Director's ask, verbatim (2026-08-23): a button on the timeline beside
+// Expand All Prompts "which would generate all shots that dont already have a video".
+//
+// A third value on `GenerateBatchRequest.scope` rather than a route of its own, so the readiness
+// gate, the per-shot refusals, the bundle resolution and the batch report are the ones
+// `Generate All` already had. The server re-decides the set from its own manifest, exactly as it
+// re-checks `confirm_gpu`; the plan computed here is what the Director is shown and confirms.
+//
+// Re-decided at the click from the same function that drew the button, `queue-ready`'s rule: the
+// count in the dialog is the count the request means.
+async function generateEmptyShots() {
+  if (!requireProject()) return;
+  if (emptyBatchInFlight) return;
+  const plan = generateEmptyPlan(state.project);
+  // Said, not shrugged at. A plan with every shot rendered is the success state, and the button
+  // that answers it with nothing at all is the defect the shot controls carried until 2026-08-22.
+  if (!plan.count) return toast(plan.empty);
+  if (!window.confirm(plan.confirm)) return;
+  const projectId = state.project.id;
+  emptyBatchInFlight = true;
+  renderSnapCuts();
+  try {
+    const report = await api.generateBatch(projectId, { confirm_gpu: true, scope: "empty" });
+    toast(batchReportToast(report), report.submitted.length ? "info" : "error");
+    if (state.project?.id === projectId) await loadProject(projectId);
+  } catch (error) { toast(error.message, "error"); }
+  finally {
+    emptyBatchInFlight = false;
+    renderJobs();
     renderSnapCuts();
   }
 }

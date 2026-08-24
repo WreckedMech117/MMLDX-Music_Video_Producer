@@ -647,8 +647,9 @@ def main() -> None:
             random_after = wait_for_seed_change(server.base_url, project_id, tick_two)
             assert random_after != tick_two, (
                 "with the randomizer ticked, Render again left the seed exactly where it was: "
-                f"{random_after}. That resubmits at the same seed and prompt, which reproduces "
-                "the identical take."
+                f"{random_after}. That resubmits at the same seed and prompt, which is served "
+                "from ComfyUI's execution cache without sampling, or reproduces the identical "
+                "take while the model stays resident (measured 2026-08-23)."
             )
             assert 1 <= random_after <= 99999, (
                 f"the re-rolled seed {random_after} is outside the Director's 1-99999"

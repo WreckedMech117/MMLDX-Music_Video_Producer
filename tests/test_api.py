@@ -40,9 +40,12 @@ from music_video_producer.app import (
     EXPANSION_ATTEMPTS,
     EXPANSION_LOCKED_NOTICE,
     EXPANSION_REJECTED_EMPTY_NOTICE,
+    GENERATE_BATCH_EMPTY_FLAGGED,
+    GENERATE_BATCH_EMPTY_READY,
+    GENERATE_BATCH_EMPTY_WITHOUT_TAKES,
     GENERIC_WRITE_APPROVAL_REFUSAL,
     H3_ADAPTERS,
-    JOB_MEASURED_FIELDS,
+    JOB_RECORDED_FIELDS,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
     MARK_READY_APPROVED_REFUSAL,
     MARK_READY_IN_FLIGHT_REFUSAL,
@@ -5196,6 +5199,264 @@ def test_generate_batch_flagged_scope_resubmits_and_clears_the_flag_only_on_succ
     # skip again rather than lying that nothing is flagged.
     assert none_left.status_code == 202
     assert none_left.json()["submitted"] == []
+
+
+def test_generate_batch_empty_scope_submits_every_takeless_shot_and_commits_its_drafts(
+    tmp_path: Path,
+):
+    """The Director's ask of 2026-08-23, end to end: "generate all shots that dont already
+    have a video". One batch, one confirmation, drafts armed on the way.
+
+    The freshly-populated case is the whole point — thirty shots with prose and no takes —
+    so the drafts are submitted rather than left for a separate `Mark all drafts ready`.
+    Each is armed through `mark_shot_ready` itself, which is what keeps that route's
+    refusals the batch's refusals.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_draft", start=0, duration=4, prompt="A wide open", status="draft"),
+        Shot(id="shot_ready", start=4, duration=4, prompt="A crane", status="ready"),
+        # `error` and never rendered: exactly what `cancel_job` leaves behind.
+        Shot(id="shot_failed", start=8, duration=4, prompt="A push in", status="error"),
+        # Already has a video, and `draft` on screen — the Director's own live plan carries
+        # three of these. Status would submit it; the take is why it is left alone.
+        Shot(id="shot_draft_take", start=12, duration=4, prompt="A pan", status="draft",
+             latest_output="takes/kept.mp4"),
+        Shot(id="shot_done", start=16, duration=4, prompt="A dolly", status="complete",
+             latest_output="takes/done.mp4"),
+    ])
+
+    unconfirmed = generate_batch(client, project_id, scope="empty")
+    assert unconfirmed.status_code == 422
+    # The confirmation names the count this scope means, through the route's one refusal.
+    assert "3 H3 render(s)" in unconfirmed.json()["detail"]
+    assert comfy.prompts == []
+
+    response = generate_batch(client, project_id, confirm_gpu=True, scope="empty")
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert [entry["shot_id"] for entry in body["submitted"]] == [
+        "shot_draft", "shot_ready", "shot_failed"
+    ]
+    assert body["skipped"] == []
+    assert len(comfy.prompts) == 3
+    saved = ProjectStore(tmp_path).get(project_id)
+    statuses = {shot.id: shot.status for shot in saved.shots}
+    assert statuses["shot_draft"] == "queued"
+    assert statuses["shot_failed"] == "queued"
+    # The two that already had a video are untouched — status, take and all.
+    assert statuses["shot_draft_take"] == "draft" and statuses["shot_done"] == "complete"
+    takes = {shot.id: shot.latest_output for shot in saved.shots}
+    assert takes["shot_draft_take"] == "takes/kept.mp4"
+    assert takes["shot_done"] == "takes/done.mp4"
+    # One batch, as the other two scopes form one.
+    batch_ids = {job.batch_id for job in saved.jobs}
+    assert len(batch_ids) == 1 and batch_ids.pop().startswith("batch_")
+
+
+def test_generate_batch_empty_scope_refuses_a_blocked_draft_by_name_and_leaves_it_a_draft(
+    tmp_path: Path,
+):
+    """"Emptiness blocks, sameness warns", met on the arming step rather than around it.
+
+    A draft with no prompt cannot render, so it is refused with the readiness sentence and
+    reported — not submitted and failed. And the refusal is a refusal: the shot is still a
+    draft afterwards, so nothing was armed on the Director's behalf that could not go.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_good", start=0, duration=4, prompt="A real prompt", status="draft"),
+        Shot(id="shot_blank", start=4, duration=4, prompt="   ", status="draft"),
+        Shot(id="shot_placeholder", start=8, duration=4, prompt=PLACEHOLDER_PROMPT,
+             status="draft"),
+        Shot(id="shot_locked", start=12, duration=4, prompt="A hold", status="draft",
+             locked=True),
+    ])
+
+    response = generate_batch(client, project_id, confirm_gpu=True, scope="empty")
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert [entry["shot_id"] for entry in body["submitted"]] == ["shot_good"]
+    skipped = {entry["shot_id"]: entry["reason"] for entry in body["skipped"]}
+    assert set(skipped) == {"shot_blank", "shot_placeholder", "shot_locked"}
+    assert "no prompt" in skipped["shot_blank"]
+    assert "no prompt" in skipped["shot_placeholder"]
+    assert "locked" in skipped["shot_locked"]
+    assert len(comfy.prompts) == 1
+    saved = ProjectStore(tmp_path).get(project_id)
+    statuses = {shot.id: shot.status for shot in saved.shots}
+    assert statuses["shot_blank"] == "draft"
+    assert statuses["shot_placeholder"] == "draft"
+    assert statuses["shot_locked"] == "draft"
+
+
+def test_generate_batch_empty_scope_says_so_when_every_shot_has_a_video(tmp_path: Path):
+    """A plan with nothing left to render is the *success* state, so it is answered in words.
+
+    And the sentence is the empty scope's own: telling a Director to "mark shots ready" when
+    every shot already has a take would send them to the wrong control.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_done", start=0, duration=4, prompt="p", status="complete",
+             latest_output="takes/a.mp4"),
+        Shot(id="shot_locked", start=4, duration=4, prompt="p2", status="draft", locked=True),
+    ])
+
+    response = generate_batch(client, project_id, confirm_gpu=True, scope="empty")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail == GENERATE_BATCH_EMPTY_WITHOUT_TAKES
+    # Pinned by *content*, not only by identity. `detail == THE_CONSTANT` compares the constant
+    # with itself and passes however the sentence is rewritten — including to nothing at all —
+    # which is a test that can only pass. The words are what the Director reads at the one moment
+    # they are confused, so the words are what is asserted.
+    assert "Every shot already has a video" in detail
+    assert "locked or approved" in detail
+    assert detail != GENERATE_BATCH_EMPTY_READY and detail != GENERATE_BATCH_EMPTY_FLAGGED
+
+
+def test_each_empty_batch_refusal_says_what_that_scope_would_have_needed(tmp_path: Path):
+    """All three nothing-to-do sentences, pinned by their words and reached through the route.
+
+    Found by mutation (2026-08-23): every one of these was asserted only as `detail == CONSTANT`
+    or `detail != CONSTANT`, both of which compare a constant with itself. A sentinel that blanked
+    `GENERATE_BATCH_EMPTY_FLAGGED` survived the suite. These are refusals — the sentence *is* the
+    feature, because it is the only thing that tells a Director which control to reach for next —
+    so each one is pinned to the instruction it carries and to the scope that produces it.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_done", start=0, duration=4, prompt="p", status="complete",
+             latest_output="takes/a.mp4"),
+    ])
+
+    ready = generate_batch(client, project_id, confirm_gpu=True)
+    flagged = generate_batch(client, project_id, confirm_gpu=True, scope="flagged")
+    empty = generate_batch(client, project_id, confirm_gpu=True, scope="empty")
+
+    assert (ready.status_code, flagged.status_code, empty.status_code) == (422, 422, 422)
+    said = {
+        "ready": ready.json()["detail"],
+        "flagged": flagged.json()["detail"],
+        "empty": empty.json()["detail"],
+    }
+    # One scope, one sentence — no two of the three may be the same text.
+    assert len(set(said.values())) == 3
+    # `ready` sends them to the two controls that would give it something to do.
+    assert said["ready"] == GENERATE_BATCH_EMPTY_READY
+    assert "No shots are ready to generate" in said["ready"]
+    assert "Mark shots ready" in said["ready"]
+    assert "Replace existing" in said["ready"]
+    # `flagged` names the mark it found none of.
+    assert said["flagged"] == GENERATE_BATCH_EMPTY_FLAGGED
+    assert "No shots are flagged for re-render" in said["flagged"]
+    # `empty` says both reasons it can be empty, because they call for different next actions.
+    assert said["empty"] == GENERATE_BATCH_EMPTY_WITHOUT_TAKES
+    assert "Every shot already has a video" in said["empty"]
+    assert "locked or approved" in said["empty"]
+    assert "Nothing to generate" in said["empty"]
+
+
+def test_the_batch_confirmation_names_the_count_and_does_not_price_one_bundle_for_all(
+    tmp_path: Path,
+):
+    """The server-enforced confirmation, pinned by content for the reason above — and it is
+    reached by every scope, so it may not describe only the one it was written for.
+
+    It named "288-438 s on the default profile (about 2 min on turbo)" unconditionally until
+    2026-08-23, which prices a bundle the batch may not be on. It now says which figure is
+    measured for which bundle and which is not measured at all.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_a", start=0, duration=4, prompt="p", status="draft"),
+        Shot(id="shot_b", start=4, duration=4, prompt="p2", status="ready"),
+    ])
+
+    for scope, expected in (("ready", "1 H3 render(s)"), ("empty", "2 H3 render(s)")):
+        refusal = generate_batch(client, project_id, scope=scope)
+        assert refusal.status_code == 422
+        detail = refusal.json()["detail"]
+        assert expected in detail
+        assert "288-438 s on the default profile" in detail
+        assert "turbo-references2v measured about 2.0x faster" in detail
+        assert "turbo is unmeasured at that length" in detail
+        assert "Whichever bundle this project is set to" in detail
+        assert "confirm_gpu=true" in detail
+
+
+def test_a_take_deleted_from_a_shot_puts_it_back_in_the_empty_scope(tmp_path: Path):
+    """The Director's own reading: a shot they deleted the take of should be in scope again.
+
+    The application has no take-delete control, so the deletion here is what a client actually
+    does — clear `latest_output` through the shots write. The point is that nothing else has to
+    happen: the pointer *is* the claim, so clearing it is the whole of coming back.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_done", start=0, duration=4, prompt="A dolly", status="complete",
+             latest_output="takes/done.mp4"),
+    ])
+
+    settled = generate_batch(client, project_id, confirm_gpu=True, scope="empty")
+    assert settled.status_code == 422
+    assert comfy.prompts == []
+
+    project = ProjectStore(tmp_path).get(project_id)
+    shots = [shot.model_dump(mode="json") for shot in project.shots]
+    shots[0]["latest_output"] = ""
+    cleared = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert cleared.status_code == 200, cleared.text
+
+    back = generate_batch(client, project_id, confirm_gpu=True, scope="empty")
+    assert back.status_code == 202, back.text
+    assert [entry["shot_id"] for entry in back.json()["submitted"]] == ["shot_done"]
+    assert len(comfy.prompts) == 1
+
+
+def test_the_flagged_scope_still_refuses_a_draft_rather_than_arming_it(tmp_path: Path):
+    """The pin on the scope the empty scope must not have changed.
+
+    A flagged draft *is* a flagged-scope target and always has been; what turns it away is
+    `generate_h3`'s own "must be ready", and the arming the empty scope does is scoped to the
+    empty scope precisely so this stays true. The shot is still a draft afterwards.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_flag_draft", start=0, duration=4, prompt="A real prompt",
+             status="draft", flagged=True),
+    ])
+
+    response = generate_batch(client, project_id, confirm_gpu=True, scope="flagged")
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["submitted"] == []
+    assert body["skipped"][0]["shot_id"] == "shot_flag_draft"
+    assert "must be ready" in body["skipped"][0]["reason"]
+    assert comfy.prompts == []
+    saved = ProjectStore(tmp_path).get(project_id)
+    assert saved.shots[0].status == "draft"
+    # The flag is kept by a refusal — success only, and this was not one.
+    assert saved.shots[0].flagged is True
+
+
+def test_generate_batch_rejects_a_scope_it_does_not_name(tmp_path: Path):
+    """Three scopes and no fourth. The Literal is the gate, and it is checked so that adding a
+    value cannot be done by a client rather than by this application."""
+    client, store, _comfy = make_client(tmp_path)
+    project_id = batch_plan_project(store, [
+        Shot(id="shot_ready", start=0, duration=4, prompt="p", status="ready"),
+    ])
+
+    response = generate_batch(client, project_id, confirm_gpu=True, scope="everything")
+
+    assert response.status_code == 422
+    assert "scope" in response.text
 
 
 class StageManagingDirector:
@@ -20531,7 +20792,7 @@ def _fields_the_settle_path_writes() -> set[str]:
 
 
 def test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard():
-    """The drift this pins: a field this application measures and `JOB_MEASURED_FIELDS` does not
+    """The drift this pins: a field this application measures and `JOB_RECORDED_FIELDS` does not
     name is silently writable by any client, which is how this route has been the hole seven
     times before.
 
@@ -20545,7 +20806,7 @@ def test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard():
 
     # The harness reads the real function rather than an empty set that would pass vacuously.
     assert {"render_seconds", "render_seconds_source", "updated_at"} <= written
-    assert written <= set(JOB_MEASURED_FIELDS)
+    assert written <= set(JOB_RECORDED_FIELDS)
     # Two fields no settle path writes, both recorded by the submission route at the single
     # moment each is true, and both for the same reason: what they describe is edited or
     # re-chosen afterwards, so re-deriving either later describes a render that never happened.
@@ -20553,17 +20814,17 @@ def test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard():
     # `Project.sampling_profile` is a standing choice the Director changes between renders, which
     # is exactly why a project's takes became a mixture. They are named in the guard for the same
     # reason as the rest, and the test below proves the naming has teeth rather than reciting it.
-    assert set(JOB_MEASURED_FIELDS) - written == {"render_frames", "sampling_bundle"}
+    assert set(JOB_RECORDED_FIELDS) - written == {"render_frames", "sampling_bundle"}
 
 
 def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
-    """The list, executed. Every field in `JOB_MEASURED_FIELDS` is forged in a whole-project body
+    """The list, executed. Every field in `JOB_RECORDED_FIELDS` is forged in a whole-project body
     and every one of them must come back unmoved -- so the tuple is a set of enforced refusals
     rather than a set of names a test recites back to itself."""
     client, store, comfy = make_client(tmp_path)
     project_id, _shot_id, job_id = rendered_shot(client, store, comfy, "Teeth")
 
-    for name in JOB_MEASURED_FIELDS:
+    for name in JOB_RECORDED_FIELDS:
         before = timing_of(store, project_id, job_id)
         held = getattr(before, name)
         forged = {

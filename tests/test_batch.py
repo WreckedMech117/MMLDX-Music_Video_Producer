@@ -51,6 +51,7 @@ from music_video_producer.batch import (
     _words,
     accept_submission,
     apply_job_history,
+    batch_targets,
     format_duration,
     prompt_is_missing,
     prompt_rejection,
@@ -62,6 +63,7 @@ from music_video_producer.batch import (
     render_status_report,
     render_timing_summary,
     setting_conflict_note,
+    shot_has_take,
     shot_label,
     stamp_job_settled,
     supersede_target_jobs,
@@ -2191,3 +2193,144 @@ def test_supersession_stamps_the_record_and_does_not_call_it_a_render():
     # The bystanders are untouched, timing included: a settle stamps the record it settles.
     bystander = next(job for job in project.jobs if job.id == "job_other_shot")
     assert bystander.render_seconds_source == ""
+
+
+# ------------------------------------------------------------------------------------------
+# The `empty` batch scope (2026-08-23): "generate all shots that dont already have a video".
+# Asserted over the pure selector, `test_timeline.py`'s precedent, so the rule is read rather
+# than inferred from a route's status code. The route half is in `tests/test_api.py`.
+# ------------------------------------------------------------------------------------------
+
+
+def every_state_plan() -> Project:
+    """One shot per state the empty scope has to decide about, in timeline order."""
+    return Project(
+        id="p_empty",
+        name="Empty scope",
+        shots=[
+            # Takeless, in every status that can hold no take.
+            Shot(id="shot_draft", start=0, duration=4, prompt="A wide open", status="draft"),
+            Shot(id="shot_ready", start=4, duration=4, prompt="A crane", status="ready"),
+            # `error` with nothing to show for it: a submission that failed, or a job the
+            # Director cancelled (`cancel_job` writes exactly this state).
+            Shot(id="shot_failed", start=8, duration=4, prompt="A push in", status="error"),
+            # `complete` with no file. Reachable: `apply_job_history` writes the status before
+            # it looks at `output_files`, so a job that finished and produced nothing lands here.
+            Shot(id="shot_hollow", start=12, duration=4, prompt="A tilt", status="complete"),
+            # Has a take, in every status that can hold one.
+            Shot(id="shot_done", start=16, duration=4, prompt="A dolly", status="complete",
+                 latest_output="takes/done.mp4"),
+            # The Director's own live plan, exactly: `draft` on screen, take on disk.
+            Shot(id="shot_draft_take", start=20, duration=4, prompt="A pan", status="draft",
+                 latest_output="takes/kept.mp4"),
+            # `error` over an earlier take -- a re-render that failed. It still has a video.
+            Shot(id="shot_retry_failed", start=24, duration=4, prompt="A whip", status="error",
+                 latest_output="takes/older.mp4"),
+            # Already rendering. No take yet, and deliberately absent from both lists.
+            Shot(id="shot_queued", start=28, duration=4, prompt="A rise", status="queued"),
+            Shot(id="shot_running", start=32, duration=4, prompt="A fall", status="running"),
+            # Takeless and protected: named, never silently dropped. Approval is two
+            # independent facts -- `protected` reads `approved_output or status == "approved"`
+            # -- so both appear separately. With only a shot carrying both, either half of that
+            # `or` covers for the other and a dropped one goes unseen; a mutation of the
+            # browser's mirror of this rule proved exactly that on 2026-08-23.
+            Shot(id="shot_locked", start=36, duration=4, prompt="A hold", status="draft",
+                 locked=True),
+            Shot(id="shot_approved", start=40, duration=4, prompt="A drift", status="approved"),
+            Shot(id="shot_approved_pointer", start=44, duration=4, prompt="A settle",
+                 status="complete", approved_output="takes/blessed.mp4"),
+        ],
+    )
+
+
+def test_the_empty_scope_selects_exactly_the_shots_with_no_take_and_names_the_protected():
+    """The Director's sentence, decided: every shot that does not already have a video.
+
+    Status is not the test and cannot be -- four rows here disagree with it in both
+    directions. `latest_output` is, because it is the one pointer the whole application
+    means by "this shot's video".
+    """
+    project = every_state_plan()
+
+    targets, skipped = batch_targets(project, scope="empty")
+
+    assert [shot.id for shot in targets] == [
+        "shot_draft", "shot_ready", "shot_failed", "shot_hollow",
+    ]
+    # Protected *and* takeless: named with the reason, exactly as the other two scopes name
+    # them. A locked shot missing from both lists reads as a bug.
+    named = {shot.id: reason for shot, reason in skipped}
+    assert set(named) == {"shot_locked", "shot_approved", "shot_approved_pointer"}
+    assert "locked" in named["shot_locked"]
+    assert "approved take" in named["shot_approved"]
+    assert "approved take" in named["shot_approved_pointer"]
+    # In flight is neither: it is already rendering, which the queue panel shows, and a second
+    # submission is the one case that does real harm. Silent, as Replace Existing leaves it.
+    assert "shot_queued" not in named and "shot_running" not in named
+
+
+def test_shot_has_take_reads_the_pointer_and_nothing_else():
+    """The predicate the scope is built on, in both directions and against every status."""
+    project = every_state_plan()
+    by_id = {shot.id: shot for shot in project.shots}
+
+    assert shot_has_take(by_id["shot_draft_take"]) is True
+    assert shot_has_take(by_id["shot_retry_failed"]) is True
+    assert shot_has_take(by_id["shot_hollow"]) is False
+    assert shot_has_take(by_id["shot_failed"]) is False
+
+
+def test_a_shot_whose_take_was_deleted_comes_back_into_the_empty_scope():
+    """The pointer is the claim, so clearing it is what returns the shot -- and it is the only
+    thing that has to happen. Nothing else about the shot changes: same status, same prompt."""
+    project = every_state_plan()
+    kept = next(shot for shot in project.shots if shot.id == "shot_done")
+
+    assert kept.id not in {shot.id for shot in batch_targets(project, scope="empty")[0]}
+
+    kept.latest_output = ""
+
+    targets, _ = batch_targets(project, scope="empty")
+    assert "shot_done" in {shot.id for shot in targets}
+    assert kept.status == "complete"
+
+
+def test_the_ready_and_flagged_scopes_are_untouched_by_the_empty_scope():
+    """The pin. Both existing scopes are asked over the same plan the empty scope selects four
+    shots from -- so a rule that leaked out of the new branch would show up here as an extra
+    target rather than as nothing at all."""
+    project = every_state_plan()
+    for shot in project.shots:
+        if shot.id in ("shot_draft", "shot_done", "shot_locked"):
+            shot.flagged = True
+
+    ready, ready_skipped = batch_targets(project, scope="ready")
+    assert [shot.id for shot in ready] == ["shot_ready"]
+    assert ready_skipped == []
+
+    replacing, replace_skipped = batch_targets(
+        project, scope="ready", replace_existing=True
+    )
+    # Settled means `complete`/`error`/`approved`, take or no take -- unchanged, and note
+    # `shot_hollow` and `shot_failed` are here for their *status*, not for their emptiness.
+    assert [shot.id for shot in replacing] == [
+        "shot_ready", "shot_failed", "shot_hollow", "shot_done", "shot_retry_failed",
+    ]
+    # Both halves of the approval protection are named here too — `replace_existing` reaches
+    # `approved` shots and `approved_output` shots by two different clauses of its own.
+    assert [shot.id for shot, _ in replace_skipped] == ["shot_approved", "shot_approved_pointer"]
+
+    flagged, flagged_skipped = batch_targets(project, scope="flagged")
+    # A flagged draft is still a flagged-scope target -- it is `generate_h3`'s "must be ready"
+    # that turns it away, and that is deliberately not a rule in this function.
+    assert [shot.id for shot in flagged] == ["shot_draft", "shot_done"]
+    assert [shot.id for shot, _ in flagged_skipped] == ["shot_locked"]
+
+
+def test_an_unknown_scope_still_falls_through_to_ready():
+    """`GenerateBatchRequest.scope` is a Literal, so this is unreachable from the wire -- but the
+    branch order is what makes that true, and a third scope inserted above the `else` is exactly
+    how a default stops being the default."""
+    project = every_state_plan()
+
+    assert [shot.id for shot in batch_targets(project, scope="whatever")[0]] == ["shot_ready"]
