@@ -3736,12 +3736,30 @@ def test_the_timeline_clip_renders_only_what_the_prompt_cell_decided():
     # `clipWindowState`'s, because the shot-length band folds its own sentence into the same
     # string rather than the template joining two. `band.label` *is* `cell.label` for every clip
     # inside the band, and `clipWindowState` is executed for both arms by its own test.
-    assert "const band = clipWindowState(windowKinds[shot.id], cell.label);" in body
+    # The label the band folds its sentence into now carries the render phase's sentence too --
+    # "ComfyUI is rendering this shot now" against "waiting its turn" -- because the accessible
+    # name is the only one of the clip's signals a screen reader announces, and the two in-flight
+    # states this feature exists to tell apart must be distinguishable there as well as by hue.
+    # Still one join, still above the template, still `clipWindowState`'s single label out.
+    assert (
+        "const band = clipWindowState(windowKinds[shot.id], "
+        '[cell.label, phase.note].filter(Boolean).join(" "));'
+    ) in body
     assert 'title="${escapeHtml(band.label)}"' in body
     assert 'aria-label="${escapeHtml(band.label)}"' in body
+    # The phase itself is looked up above the template and gated on the shot really being in
+    # flight, so a settled shot cannot inherit a stale phase from a job record.
+    assert (
+        "const phase = clipRenderPhase(render.inFlight ? state.renderPhase?.[shot.id] : \"\", "
+        "percent);"
+    ) in body
     # The render-state word is applied the same way: one function decides it, including whether
-    # the percentage is known at all, and the template only chooses whether the span exists.
-    assert '<span class="clip-state">${escapeHtml(renderingFlag(percent))}</span>' in body
+    # the percentage is known at all, and the template only chooses whether the span exists. The
+    # fallback arm is `renderingFlag` unchanged -- an unknown phase draws exactly what this line
+    # drew before the phase existed.
+    assert (
+        '<span class="clip-state">${escapeHtml(phase.flag || renderingFlag(percent))}</span>'
+    ) in body
     # No second copy of either decision, in any of its spellings. `RENDERING` spelled out here
     # would be a template that had stopped asking `renderingFlag` what the word is -- which is
     # also where a hand-formatted percentage would appear.
@@ -14734,3 +14752,448 @@ def test_the_bundle_control_exists_in_the_queue_panel_and_hardcodes_no_option():
 
     styles = STYLES_CSS.read_text(encoding="utf-8")
     assert re.search(r"\.sampling-profile-note \{", styles), "the findings note has no style"
+
+
+# ----------------------------------------------------------------------------------------------
+# The failed-and-empty shot, the whole-queue cancel, and the timeline's render-phase indicator --
+# the Director's three reports of 2026-08-23, after a Generate All they cancelled from ComfyUI's
+# own UI because cancelling twenty-six renders in this application meant twenty-six clicks.
+# ----------------------------------------------------------------------------------------------
+
+
+def test_a_released_shot_offers_the_commit_control_and_a_settled_one_offers_the_flag():
+    """Item 1's client half, executed: which control the inspector actually draws.
+
+    The Director's report: after twenty-six failed renders "thier option is 'Flag for re-render'
+    instead of just returning to ready after the fail". `Flag for re-render` is drawn on exactly
+    the shots `renderAgainControl` is shown for, which is the settled set -- so releasing a
+    takeless shot to `ready` is what takes the flag away, and nothing in the inspector needed a
+    new rule. The two states are rendered here rather than reasoned about, because the flag rides
+    `again.shown` and a template that had stopped reading it would still pass a source grep.
+    """
+    drawn = run_workspace("""
+      const shot = (fields) => ({
+        id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+        mode: 'text', asset_ids: [], reference_labels: {}, use_song_audio: false, seed: 0,
+        status: 'ready', prompt_id: '', latest_output: '', approved_output: '', locked: false,
+        flagged: false, ...fields,
+      });
+      const draw = (fields) => {
+        state.project = { id: 'p1', assets: [], jobs: [], song: null, shots: [shot(fields)] };
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+        const html = at('#shot-inspector').innerHTML;
+        return {
+          flag: html.includes('id="flag-shot"'),
+          again: html.includes('id="render-again"'),
+          mark: html.includes('id="mark-ready"'),
+          markLabel: (/id="mark-ready"[^>]*>([^<]*)</.exec(html) || [null, ''])[1],
+        };
+      };
+      console.log(JSON.stringify({
+        released: draw({}),
+        settled: draw({ status: 'error', latest_output: 'takes/one.mp4' }),
+      }));
+    """)
+
+    # A render that produced nothing leaves the shot armed: no take, so no flag and no re-open --
+    # the only thing left to say about it is that it may be taken back out of the queue.
+    assert drawn["released"] == {
+        "flag": False, "again": False, "mark": True, "markLabel": "Back to draft",
+    }
+    # A failed re-render over a take it still holds is a settled shot, and both controls stand.
+    assert drawn["settled"]["flag"] is True
+    assert drawn["settled"]["again"] is True
+    assert drawn["settled"]["mark"] is False
+
+
+def test_the_release_rule_is_the_servers_and_the_client_never_re_derives_it():
+    """The client draws `Back to draft` for a released shot because the *server* released it.
+
+    Asserted as the server's own function over the same two shots the browser would be handed, so
+    the two halves cannot come apart: nothing in `api.js` decides where a failed render leaves a
+    shot, and nothing should -- `shot_status_after_failed_render` is the one implementation and
+    `markReadyControl`/`renderAgainControl` only read the status it wrote.
+    """
+    from music_video_producer.batch import shot_status_after_failed_render
+
+    takeless = Shot(id="s1", start=0, duration=4, prompt="Wide", status="queued")
+    retake = Shot(id="s2", start=4, duration=4, prompt="Wide", status="running",
+                  latest_output="takes/one.mp4")
+
+    assert shot_status_after_failed_render(takeless) == "ready"
+    assert shot_status_after_failed_render(retake) == "error"
+    # And the two statuses land in the two halves of the client's control vocabulary, which is
+    # what makes the inspector draw a different control for each without knowing why.
+    controls = run_module("""
+      import { MARK_READY_STATUSES, RENDER_AGAIN_STATUSES }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ mark: MARK_READY_STATUSES, again: RENDER_AGAIN_STATUSES }));
+    """)
+    assert "ready" in controls["mark"] and "ready" not in controls["again"]
+    assert "error" in controls["again"] and "error" not in controls["mark"]
+
+
+def test_the_cancel_all_plan_counts_open_renders_and_names_the_count_before_it_fires():
+    """Item 2's decision, executed for every state, and the confirmation pinned by its content.
+
+    The count is the whole safety of the gesture: cancelling twenty-six renders is not undoable,
+    and a dialog that did not say twenty-six would be a dialog nobody could judge. It is asserted
+    as a substring of the sentence rather than against a constant the sentence was built from --
+    `assert count in confirm` where `confirm` was formatted from `count` can only pass.
+    """
+    plans = run_module("""
+      import { CANCEL_ALL_CONTROL, CANCEL_ALL_HELP, CANCEL_ALL_LABEL, cancelAllPlan }
+        from './src/music_video_producer/web/assets/api.js';
+      const job = (fields) => ({ id: 'j', kind: 'h3', status: 'queued', prompt_id: 'p', ...fields });
+      console.log(JSON.stringify({
+        control: CANCEL_ALL_CONTROL, label: CANCEL_ALL_LABEL, help: CANCEL_ALL_HELP,
+        idle: cancelAllPlan({ jobs: [] }),
+        settled: cancelAllPlan({ jobs: [job({ status: 'complete' }), job({ status: 'cancelled' })] }),
+        local: cancelAllPlan({ jobs: [job({ kind: 'post', prompt_id: '' })] }),
+        one: cancelAllPlan({ jobs: [job({ id: 'j1' })] }),
+        many: cancelAllPlan({
+          jobs: [job({ id: 'j1' }), job({ id: 'j2', status: 'running' }), job({ id: 'j3', kind: 'music' })],
+        }),
+        missing: cancelAllPlan(null),
+      }));
+    """)
+
+    # Nothing open, in four different ways, and every one of them hides the button rather than
+    # disabling it: "nothing is rendering" is not a refusal that needs explaining.
+    for quiet in ("idle", "settled", "local", "missing"):
+        assert plans[quiet]["count"] == 0, quiet
+        assert plans[quiet]["hidden"] is True, quiet
+        assert plans[quiet]["confirm"] == "", quiet
+    # A local export (empty prompt_id) is deliberately out of scope: nothing here could stop a
+    # running ffmpeg, so settling its record would be a claim the button cannot back.
+    assert plans["local"]["count"] == 0
+
+    assert plans["one"]["count"] == 1
+    assert plans["one"]["hidden"] is False
+    assert plans["one"]["label"] == "Cancel all renders (1)"
+    assert "Cancel 1 open render for this project?" in plans["one"]["confirm"]
+    # Singular, not "1 open renders".
+    assert "1 open renders" not in plans["one"]["confirm"]
+
+    # Every open ComfyUI job, whatever its kind and whatever batch it belongs to -- the scope
+    # argument in `app.CANCEL_ALL_NONE_OPEN`'s note, executed.
+    assert plans["many"]["count"] == 3
+    assert plans["many"]["label"] == "Cancel all renders (3)"
+    confirm = plans["many"]["confirm"]
+    assert "Cancel 3 open renders for this project?" in confirm
+    # Pinned by content, so a dialog that stopped saying what it costs fails here. Each clause is
+    # a separate fact the Director acts on: the scope is wider than the batch line above the
+    # button, the act cannot be undone, and the shots come back.
+    assert "not just the newest batch" in confirm
+    assert "cannot be undone" in confirm
+    assert "go back to ready" in confirm
+    assert plans["control"] == "#queue-cancel-all"
+    assert "not just the newest batch" in plans["help"]
+
+
+def test_the_cancel_all_button_is_drawn_confirmed_and_sent_against_the_real_workspace():
+    """The button, rendered, refused once and then clicked -- never grepped.
+
+    Three things no source read can establish. The queue panel really applies `cancelAllPlan`
+    (a panel that drew the button for an idle project would fail here); declining the dialog
+    really sends nothing, which is the whole point of a confirmation on an act that cannot be
+    undone; and the click reaches the collection route with the acknowledgement on it rather than
+    looping the per-job `DELETE` from the browser, which would be a second cancellation path.
+    """
+    driven = run_workspace(
+        """
+      const job = (fields) => ({
+        id: 'j1', kind: 'h3', batch_id: 'batch_1', status: 'queued', prompt_id: 'p1',
+        target_id: 'shot_a', seed: 0, output_files: [], error: '', ...fields,
+      });
+      state.project = {
+        id: 'p1', assets: [], jobs: [job({}), job({ id: 'j2', prompt_id: 'p2', status: 'running' })],
+        shots: [], sections: [], song: null,
+      };
+      app.renderJobs();
+      const button = at('#queue-cancel-all');
+      const drawn = { hidden: button.hidden, label: button.textContent };
+
+      answer(false);
+      await fire('#queue-cancel-all:click');
+      const declined = { asked: asked.slice(), sent: requests.slice() };
+
+      answer(true);
+      await fire('#queue-cancel-all:click');
+      await flush();
+      const fired = { asked: asked.slice(), sent: requests.map((entry) => entry.path + ' ' + entry.method) };
+
+      state.project = { id: 'p1', assets: [], jobs: [], shots: [], sections: [], song: null };
+      app.renderJobs();
+      console.log(JSON.stringify({
+        drawn, declined, fired, idle: at('#queue-cancel-all').hidden,
+      }));
+    """,
+        {
+            "/api/projects/p1/jobs?confirm_cancel=true": {
+                "body": {
+                    "cancelled": [{"job_id": "j1", "label": "SHOT 01 (shot_a)"}],
+                    "skipped": [],
+                }
+            },
+        },
+    )
+
+    assert driven["drawn"] == {"hidden": False, "label": "Cancel all renders (2)"}
+    # Declining asked the question and sent nothing at all.
+    assert len(driven["declined"]["asked"]) == 1
+    assert "Cancel 2 open renders for this project?" in driven["declined"]["asked"][0]
+    assert driven["declined"]["sent"] == []
+    # Accepting sent one request, to the collection route, carrying the acknowledgement.
+    assert driven["fired"]["sent"][0] == "/api/projects/p1/jobs?confirm_cancel=true DELETE"
+    # And the panel hides the button again once nothing is open.
+    assert driven["idle"] is True
+
+
+def test_the_cancellation_toast_reports_the_jobs_it_left_alone_by_name():
+    """A job that settled between the click and the loop reaching it is reported, not absorbed.
+
+    A Director who stopped nineteen of twenty-six renders has to be able to see that seven are
+    still running, and under which names -- `batchReportToast`'s rule in the other direction.
+    """
+    toasts = run_module("""
+      import { cancellationToast } from './src/music_video_producer/web/assets/api.js';
+      const settled = 'This job is already complete; there is nothing running to cancel.';
+      console.log(JSON.stringify({
+        clean: cancellationToast({ cancelled: [{ job_id: 'j1' }, { job_id: 'j2' }], skipped: [] }),
+        one: cancellationToast({ cancelled: [{ job_id: 'j1' }], skipped: [] }),
+        partial: cancellationToast({
+          cancelled: [{ job_id: 'j1' }],
+          skipped: [{ job_id: 'j2', label: 'SHOT 07 (shot_g)', reason: settled }],
+        }),
+        nothing: cancellationToast({ cancelled: [], skipped: [] }),
+        missing: cancellationToast(null),
+      }));
+    """)
+
+    assert toasts["clean"] == "2 renders cancelled"
+    assert toasts["one"] == "1 render cancelled"
+    assert toasts["nothing"] == "Nothing cancelled"
+    assert toasts["missing"] == "Nothing cancelled"
+    assert toasts["partial"].startswith("1 render cancelled")
+    assert "1 left alone." in toasts["partial"]
+    # By name and with the server's own sentence, never a count on its own.
+    assert "SHOT 07 (shot_g)" in toasts["partial"]
+    assert "already complete" in toasts["partial"]
+
+
+def test_the_clip_tells_the_running_shot_from_the_ones_queued_behind_it():
+    """Item 3, executed: the phase map off the poll's own report, and what a clip draws from it.
+
+    Nothing in this application writes `running` onto a Shot -- `generate_h3` writes `queued` and
+    the reconciler writes `running` onto the *job* -- so before this a batch of twenty-six drew
+    twenty-six identical `RENDERING` clips. The phase is read off the render-status report the
+    poll already fetches, which is why this adds no request: `renderPhaseByShot` is pure over that
+    report, exactly as `renderProgressByTarget` beside it is.
+    """
+    drawn = run_module("""
+      import { CLIP_RENDERING_NOW_CLASS, CLIP_RENDERING_NOW_NOTE, CLIP_RENDERING_QUEUED_CLASS,
+        CLIP_RENDERING_QUEUED_FLAG, CLIP_RENDERING_QUEUED_NOTE, SHOT_RENDERING_FLAG,
+        clipRenderPhase, renderPhaseByShot } from './src/music_video_producer/web/assets/api.js';
+      const job = (fields) => ({ id: 'j', kind: 'h3', status: 'queued', target_id: 't', ...fields });
+      console.log(JSON.stringify({
+        queuedFlag: CLIP_RENDERING_QUEUED_FLAG,
+        runningWord: SHOT_RENDERING_FLAG,
+        nowClass: CLIP_RENDERING_NOW_CLASS,
+        queuedClass: CLIP_RENDERING_QUEUED_CLASS,
+        nowNote: CLIP_RENDERING_NOW_NOTE,
+        queuedNote: CLIP_RENDERING_QUEUED_NOTE,
+        phases: renderPhaseByShot({ jobs: [
+          job({ id: 'j1', target_id: 'shot_run', status: 'running' }),
+          job({ id: 'j2', target_id: 'shot_wait' }),
+          job({ id: 'j3', target_id: 'shot_done', status: 'complete' }),
+          job({ id: 'j4', target_id: 'shot_err', status: 'error' }),
+          job({ id: 'j5', target_id: 'shot_cancel', status: 'cancelled' }),
+          job({ id: 'j6', kind: 'music', target_id: 'song', status: 'running' }),
+          job({ id: 'j7', kind: 'flux', target_id: 'asset_w', status: 'queued' }),
+          job({ id: 'j8', kind: 'ltx', target_id: 'shot_ltx', status: 'running' }),
+          job({ id: 'j9', kind: 'h3', target_id: '', status: 'running' }),
+        ] }),
+        contested: renderPhaseByShot({ jobs: [
+          job({ id: 'a', target_id: 'shot_x' }),
+          job({ id: 'b', target_id: 'shot_x', status: 'running' }),
+        ] }),
+        contestedReversed: renderPhaseByShot({ jobs: [
+          job({ id: 'b', target_id: 'shot_x', status: 'running' }),
+          job({ id: 'a', target_id: 'shot_x' }),
+        ] }),
+        empty: renderPhaseByShot(null),
+        running: clipRenderPhase('running', 42),
+        runningUnknownPercent: clipRenderPhase('running', null),
+        queued: clipRenderPhase('queued', 42),
+        settled: clipRenderPhase('', 42),
+        unknown: clipRenderPhase(undefined, undefined),
+        nonsense: clipRenderPhase('complete', 42),
+      }));
+    """)
+
+    # Only the two open phases, only for the kinds whose target is a shot, and never for a job
+    # naming no target at all.
+    assert drawn["phases"] == {"shot_run": "running", "shot_wait": "queued", "shot_ltx": "running"}
+    # Two open jobs on one shot: the one ComfyUI has started is the answer, in either order.
+    assert drawn["contested"] == {"shot_x": "running"}
+    assert drawn["contestedReversed"] == {"shot_x": "running"}
+    assert drawn["empty"] == {}
+
+    # The running clip: its own class, the word plus the live percentage, and a sentence that
+    # says which of the two states it is in -- the accessible name is the only signal a screen
+    # reader announces, so the distinction has to exist there and not only in the hue.
+    assert drawn["running"] == {
+        "className": "rendering-now", "flag": "RENDERING 42%",
+        "note": "ComfyUI is rendering this shot now.",
+    }
+    # An unknown percentage degrades to the bare word, never to `NaN%`.
+    assert drawn["runningUnknownPercent"]["flag"] == "RENDERING"
+
+    # The waiting clip: a different word, not a dimmer copy of the same one -- and no percentage,
+    # because a shot that has not started has none and one beside QUEUED would be invented.
+    assert drawn["queued"]["className"] == "rendering-queued"
+    assert drawn["queued"]["flag"] == "QUEUED"
+    assert drawn["queued"]["flag"] != drawn["runningWord"]
+    assert "42" not in drawn["queued"]["flag"]
+    assert "waiting its turn" in drawn["queued"]["note"]
+
+    # A shot that is neither running nor queued draws nothing at all: no class, no word, no
+    # sentence -- which is what makes the timeline fall back to exactly what it drew before.
+    for silent in ("settled", "unknown", "nonsense"):
+        assert drawn[silent] == {"className": "", "flag": "", "note": ""}, silent
+
+
+def test_the_render_phase_rides_the_existing_poll_and_adds_no_request_of_its_own():
+    """No new polling: the phase is a second read of the report the poll already fetched.
+
+    Executed against the workspace so it is the real `pollRenderStatus` that fills the map, and
+    counted rather than reasoned about: one tick, one request. The Director's constraint was
+    explicit, and a timer or a fetch added here would be invisible to any source grep.
+    """
+    shot = {
+        "start": 0, "duration": 4, "prompt": "One", "status": "queued", "asset_ids": [],
+        "reference_labels": {}, "seed": 0, "latest_output": "", "approved_output": "",
+        "locked": False,
+    }
+    job = {
+        "kind": "h3", "status": "queued", "seed": 0, "output_files": [], "error": "",
+    }
+    loaded = json.dumps(
+        {
+            "id": "p1", "assets": [], "sections": [], "song": None,
+            "jobs": [
+                {**job, "id": "j1", "prompt_id": "p1", "target_id": "shot_a"},
+                {**job, "id": "j2", "prompt_id": "p2", "target_id": "shot_b"},
+            ],
+            "shots": [
+                {**shot, "id": "shot_a"},
+                {**shot, "id": "shot_b", "start": 4, "prompt": "Two"},
+            ],
+        }
+    )
+    polled = run_workspace(
+        f"""
+      state.project = {loaded};
+      requests.length = 0;
+      await app.pollRenderStatus();
+      await flush();
+      console.log(JSON.stringify({{
+        phase: state.renderPhase,
+        requests: requests.map((entry) => entry.path),
+        markup: at('#shots-track').innerHTML,
+      }}));
+    """,
+        {
+            "/api/projects/p1/render-status": {
+                "body": {
+                    "active": True,
+                    "comfy_online": True,
+                    "progress": [],
+                    "assets": [],
+                    "song": None,
+                    "shots": [
+                        {"shot_id": "shot_a", "status": "queued", "latest_output": ""},
+                        {"shot_id": "shot_b", "status": "queued", "latest_output": ""},
+                    ],
+                    "jobs": [
+                        {**job, "id": "j1", "prompt_id": "p1", "target_id": "shot_a",
+                         "status": "running"},
+                        {**job, "id": "j2", "prompt_id": "p2", "target_id": "shot_b"},
+                    ],
+                }
+            },
+        },
+    )
+
+    # One tick, one request. The phase cost nothing.
+    assert polled["requests"] == ["/api/projects/p1/render-status"]
+    assert polled["phase"] == {"shot_a": "running", "shot_b": "queued"}
+    # And the two clips really draw apart, which is the whole of what the Director asked for.
+    clips = {
+        re.search(r'data-shot-id="(\w+)"', chunk).group(1): chunk
+        for chunk in polled["markup"].split('<div class="shot-clip')[1:]
+    }
+    assert sorted(clips) == ["shot_a", "shot_b"], sorted(clips)
+    running, waiting = clips["shot_a"], clips["shot_b"]
+    assert "rendering-now" in running and "rendering-queued" not in running
+    assert "rendering-queued" in waiting and "rendering-now" not in waiting
+    assert ">RENDERING<" in running
+    assert ">QUEUED<" in waiting
+    assert "ComfyUI is rendering this shot now." in running
+    assert "waiting its turn" in waiting
+
+
+def test_the_two_render_phases_are_styled_apart_and_never_animated():
+    """The hue is the second signal and it still has to exist; the animation must not.
+
+    The timeline re-renders on `pointerdown`, so a keyframed pulse on the running clip would
+    restart on every click of every clip -- a state that flickers under an unrelated gesture
+    reads as a bug. Asserted because it is the obvious thing to reach for and it is wrong here.
+    """
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    classes = run_module("""
+      import { CLIP_RENDERING_NOW_CLASS, CLIP_RENDERING_QUEUED_CLASS }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify([CLIP_RENDERING_NOW_CLASS, CLIP_RENDERING_QUEUED_CLASS]));
+    """)
+    now, waiting = classes
+    rules = "\n".join(
+        line
+        for line in styles.splitlines()
+        if f".shot-clip.{now}" in line or f".shot-clip.{waiting}" in line
+    )
+    assert f".shot-clip.{now} {{" in rules, now
+    assert f".shot-clip.{waiting} {{" in rules, waiting
+    for animated in ("animation", "@keyframes", "transition"):
+        assert animated not in rules, animated
+
+
+def test_the_queue_panel_ships_the_cancel_all_button_hidden_beside_the_batch_controls():
+    """The markup half: the control exists, ships hidden, and carries no sentence of its own.
+
+    Hidden in the markup for `Re-queue flagged`'s reason one element over -- a button offering to
+    cancel renders on a project with none is a control whose only outcome is a refusal. Its title
+    and its count come from `cancelAllPlan` at render time, so a second copy of either cannot sit
+    in the HTML going stale.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    exported = run_module("""
+      import { CANCEL_ALL_CONTROL, CANCEL_ALL_LABEL }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ control: CANCEL_ALL_CONTROL, label: CANCEL_ALL_LABEL }));
+    """)
+    control = exported["control"].removeprefix("#")
+
+    panel = re.search(r'<section class="panel" id="panel-queue".*?</section>', markup, re.DOTALL)
+    assert panel, "the render queue panel is gone"
+    actions = re.search(
+        r'<div class="heading-actions">.*?id="queue-ready".*?</div>', panel.group(0), re.DOTALL
+    )
+    assert actions, "the queue heading actions row is gone"
+    button = re.search(rf'<button[^>]*id="{control}"[^>]*>([^<]*)</button>', actions.group(0))
+    assert button, f"the queue panel no longer carries #{control}"
+    assert " hidden" in button.group(0), button.group(0)
+    assert "title=" not in button.group(0), button.group(0)
+    assert button.group(1) == exported["label"]

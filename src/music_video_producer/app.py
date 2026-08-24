@@ -47,6 +47,7 @@ from .batch import (
     JOB_NEVER_SUBMITTED,
     NOTE_KIND_PROMPT,
     PENDING_SUBMISSION_PROMPT_ID,
+    SHOT_AFTER_FAILED_RENDER,
     TERMINAL_JOB_STATUSES,
     ReadinessReport,
     RenderStatusReport,
@@ -61,6 +62,7 @@ from .batch import (
     reconcile_render_jobs,
     render_status_report,
     shot_label,
+    shot_status_after_failed_render,
     stamp_job_settled,
     supersede_target_jobs,
 )
@@ -5293,6 +5295,38 @@ class BatchSubmissionResponse(BaseModel):
     skipped: list[BatchSkippedShot]
 
 
+class CancelledJob(BaseModel):
+    """One render this cancellation stopped, under the name the queue panel already draws."""
+
+    job_id: str
+    label: str
+
+
+class UncancelledJob(BaseModel):
+    """One render the cancellation did **not** stop, with the route's own sentence for why.
+
+    `BatchSkippedShot`'s shape and its reason: a job that refused must be reported by name with
+    the refusal that produced it, never counted into a total the Director cannot account for.
+    The overwhelmingly common entry here is a job that settled between the click and the loop
+    reaching it — `cancel_job`'s own `CANCEL_JOB_SETTLED`, which is not a failure at all.
+    """
+
+    job_id: str
+    label: str
+    reason: str
+
+
+class CancellationReport(BaseModel):
+    """What one whole-queue cancellation did: every job it stopped, and every job it did not.
+
+    `BatchSubmissionResponse`'s shape deliberately, because it answers the same question in the
+    other direction and the Director reads the two toasts in the same session.
+    """
+
+    cancelled: list[CancelledJob]
+    skipped: list[UncancelledJob]
+
+
 class AssetEditRequest(BaseModel):
     """AI Mod's wire shape: the edit in the Director's words, and which evidenced bundle.
 
@@ -6445,9 +6479,76 @@ CONSISTENCY_PROMPT_TOO_LONG = (
 
 CANCEL_JOB_SETTLED = "This job is already {status}; there is nothing running to cancel."
 CANCEL_JOB_NOTE = (
-    "Cancelled by the Director before it finished. Nothing was produced; render again "
-    "re-opens the shot."
+    "Cancelled by the Director before it finished. Nothing was produced. "
+    f"{SHOT_AFTER_FAILED_RENDER}"
 )
+
+# --------------------------------------------------------------------------------------------
+# Cancel every open render (the Director's report, 2026-08-23). The per-job `×` works and
+# twenty-six of them is not a control, it is a chore — so a Generate All the Director changed
+# their mind about was cancelled in ComfyUI's own UI instead, which is the path that produced
+# the takeless-`error` shots `shot_status_after_failed_render` now settles.
+#
+# **Scope: every open ComfyUI render in this project, not one batch.** Four reasons, and the
+# first is the whole point of the control:
+#
+# * the gesture it replaces is ComfyUI's own "clear queue", which stops *everything*. A control
+#   that stops less than the trip to ComfyUI does will not replace the trip to ComfyUI;
+# * `reconcilable_jobs` is already **the** definition of "this project has renders in flight" —
+#   the poll's `active` flag is computed from it and `api.js`'s `hasActiveRenderJobs` mirrors it
+#   — so cancelling exactly that set is what makes the poll stand down afterwards. A batch-scoped
+#   cancel would leave `active` true and the panel still polling, which reads as "it did nothing";
+# * `batch_id` is **empty** for every render submitted outside a batch: a lone Render again, an
+#   LTX enhance, a music or Flux job. Those rows sit in the same queue panel wearing the same
+#   `queued`, and a batch-only cancel could not touch one — the chore returns for exactly the
+#   rows it was added to remove;
+# * the confirmation names the count, which is what makes the wider scope safe to offer: the
+#   Director reads the number of renders that will stop before any of them does.
+#
+# Local work is **not** in scope and needs no rule to exclude it: `reconcilable_jobs` skips a job
+# with an empty `prompt_id`, which is this application's local-work marker (an assembly export).
+# Nothing here could stop a running ffmpeg, so settling its record would be a claim this route
+# cannot back — and an export cannot be open beside a render anyway, since `assemble_project`
+# refuses while any render is.
+CANCEL_ALL_NONE_OPEN = (
+    "No renders are open for this project, so there is nothing to cancel. A settled job keeps "
+    "its record in the queue; only a queued or running one can be stopped."
+)
+#: The server-enforced half, in `GENERATE_BATCH_CONFIRM_REFUSAL`'s shape and for its reason: a
+#: client that never showed the warning must not be able to stop twenty-six renders by omission.
+#: Names the count, because that is the one fact that makes the gesture judgeable.
+CANCEL_ALL_CONFIRM_REFUSAL = (
+    "This would cancel {count} open render(s) for this project — every queued and running one, "
+    "not just the newest batch. Cancelling is not undoable: a render stopped part-way produces "
+    "nothing and the GPU time it has already spent is gone. Send confirm_cancel=true to proceed."
+)
+#: Deliberately **no** cancellation note of its own. Every job this route settles is settled by
+#: `cancel_job` itself and therefore carries `CANCEL_JOB_NOTE`, which is already true of it — the
+#: Director cancelled it before it finished — and one wording for one act is the whole reason this
+#: route delegates rather than writing its own settle. A second sentence would be a second
+#: spelling of the same rule, which is this repository's recurring defect.
+
+#: The job kinds whose `target_id` is a Shot id, mirroring `api.js`'s JOB_KINDS_TARGETING_A_SHOT.
+#: `music` names the Song, `flux`/`multiview`/`edit` name an Asset and `post` names nothing, so
+#: none of them can be labelled as a shot.
+JOB_KINDS_TARGETING_A_SHOT: frozenset[str] = frozenset({"h3", "ltx"})
+
+
+def job_label(project: Project, job: RenderJob) -> str:
+    """One job under the name the Director already reads for it, for a report that lists jobs.
+
+    `shot_label` where the job names a Shot this project still holds — which is what the queue
+    panel draws through `jobTarget`, so a cancellation report and the row it is about say the same
+    thing. Everything else falls back to the kind and the record id rather than to a bare
+    `target_id`: an asset or song id is a string that appears nowhere in the interface, and a job
+    whose shot a populate replaced has a `target_id` naming a shot that no longer exists (see
+    `api.js`'s JOB_TARGET_DETACHED for why those records are kept).
+    """
+    if job.kind in JOB_KINDS_TARGETING_A_SHOT:
+        shot = next((item for item in project.shots if item.id == job.target_id), None)
+        if shot is not None:
+            return shot_label(project, shot)
+    return f"{job.kind} job {job.id}"
 
 
 class AlignLyricsRequest(BaseModel):
@@ -7608,6 +7709,66 @@ def create_app(
         setattr(project.song, field, previous)
         return store.save(project)
 
+    @app.delete("/api/projects/{project_id}/jobs", response_model=CancellationReport)
+    async def cancel_open_jobs(
+        project_id: str, confirm_cancel: bool = False
+    ) -> CancellationReport:
+        """Stop every open render this project has on ComfyUI, in one confirmed act.
+
+        The Director's report, 2026-08-23: a Generate All at 20 steps that they changed their mind
+        about part-way through could only be stopped by clicking the per-job `×` twenty-six times,
+        so they cleared it from ComfyUI's own UI instead — the path that then left twenty-six
+        takeless shots reading `error`. The `×` was never wrong; twenty-six of it is not a control.
+
+        See `CANCEL_ALL_NONE_OPEN` above for the scope argument and for why local work is out of
+        it. **Nothing here is a second cancellation path**: each job is settled by `cancel_job`
+        itself, called in-closure exactly as `generate_batch` calls `generate_h3`, so the ComfyUI
+        dequeue, the record settle, the timing stamp, the note and the shot's release are the
+        per-job route's own and cannot come to differ from it.
+
+        Order of refusals: **empty before unconfirmed**. A click on a project with nothing running
+        should be told that, not asked to confirm stopping zero renders — and a confirmation
+        naming `0` is a dialog that teaches a Director to click through dialogs.
+
+        **A job that settles between the click and the loop reaching it is reported, not
+        double-handled.** The set is chosen once, from the read that produced the count the
+        Director confirmed, but every iteration re-reads the manifest inside `cancel_job` — so a
+        job a poll tick settled in the meantime is found terminal there and refused with
+        `CANCEL_JOB_SETTLED`. That refusal lands in `skipped` by name and stops nothing else, which
+        is `generate_batch`'s per-shot rule in the other direction. The same `except` catches a
+        ComfyUI that went down mid-loop (502) and a job whose record vanished (404); each is one
+        row in the report rather than a failure of the whole gesture, because a Director who
+        stopped nineteen of twenty-six renders needs to be told which seven are still running.
+        """
+        project = get_project(project_id)
+        open_jobs = reconcilable_jobs(project)
+        if not open_jobs:
+            raise HTTPException(status_code=422, detail=CANCEL_ALL_NONE_OPEN)
+        if not confirm_cancel:
+            # 409 rather than 422, matching `delete_project`'s confirmation flag: the request is
+            # well-formed and the state is real, and what is missing is consent to a destructive
+            # act. `generate_batch` answers 422 for its own confirmation because the thing it is
+            # about to do is *spend* rather than destroy.
+            raise HTTPException(
+                status_code=409,
+                detail=CANCEL_ALL_CONFIRM_REFUSAL.format(count=len(open_jobs)),
+            )
+        cancelled: list[CancelledJob] = []
+        skipped: list[UncancelledJob] = []
+        # The set and its labels are both fixed here, from the read that produced the count the
+        # Director confirmed — the labels especially, because `cancel_job` re-reads and re-saves
+        # the manifest under this loop and a name resolved later could describe a different plan.
+        for job_id, label in [(job.id, job_label(project, job)) for job in open_jobs]:
+            try:
+                await cancel_job(project_id, job_id)
+            except HTTPException as refusal:
+                skipped.append(
+                    UncancelledJob(job_id=job_id, label=label, reason=str(refusal.detail))
+                )
+                continue
+            cancelled.append(CancelledJob(job_id=job_id, label=label))
+        return CancellationReport(cancelled=cancelled, skipped=skipped)
+
     @app.delete("/api/projects/{project_id}/jobs/{job_id}", response_model=Project)
     async def cancel_job(project_id: str, job_id: str) -> Project:
         """Cancel one open render job: dequeue (and interrupt, when running) on ComfyUI,
@@ -7642,7 +7803,12 @@ def create_app(
         if job.kind == "h3":
             shot = next((item for item in project.shots if item.id == job.target_id), None)
             if shot and shot.status in ("queued", "running"):
-                shot.status = "error"
+                # "the shot released" is what the queue panel's × has always promised, and until
+                # 2026-08-23 this line wrote `error` instead — the same place the reconciler left
+                # a render killed outside the application. So the in-app cancel was **not** the
+                # correct half to copy: both paths wrote the same wrong status, and both now
+                # settle through the one rule in `shot_status_after_failed_render`.
+                shot.status = shot_status_after_failed_render(shot)
         return store.save(project)
 
     @app.delete("/api/projects/{project_id}")

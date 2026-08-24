@@ -1400,6 +1400,102 @@ export function shotRenderState(shot) {
   };
 }
 
+// ------------------------------------------------------------------------------------------
+// Which shot is rendering *now* -- the Director's ask (2026-08-23): "Would be nice to have a more
+// active indicator marking the currently generating clip on the timeline though."
+//
+// The gap is real and narrow. `shotRenderInFlight` reads `Shot.status`, and **nothing in this
+// application ever writes `running` onto a Shot**: `generate_h3` sets `queued`, and the reconciler
+// writes `running` onto the *job* rather than onto its target. So a batch of twenty-six draws
+// twenty-six identical `RENDERING` clips, one of which is on the GPU and twenty-five of which are
+// waiting -- and the queue panel knows the difference (it renders `job.status`) while the timeline,
+// which is what the Director actually watches, does not.
+//
+// **No new polling, and no new request.** The phase is read off the render-status report
+// `pollRenderStatus` already fetches every two seconds while, and only while, a render is open.
+// This is `renderProgressByTarget` one field over -- the same report, the same job-to-target join,
+// the same `{ targetId: … }` map held beside the project rather than patched into it, for that
+// function's recorded reason: a value folded into `project.jobs` is written into the manifest by
+// the Director's next save.
+//
+// **Cheap by construction.** One pass over the report's jobs per tick builds the map; the timeline
+// then does one keyed lookup per clip, which is what it already does for the percentage and for
+// `windowWarningsByShot`. Nothing here walks every clip, and nothing runs per frame.
+// ------------------------------------------------------------------------------------------
+
+//: The two phases a clip can wear, as the job records spell them -- adopted verbatim rather than
+//: renamed, so the timeline and the queue panel's status column cannot come to disagree about
+//: which shot is on the GPU.
+export const RENDER_PHASE_RUNNING = "running";
+export const RENDER_PHASE_QUEUED = "queued";
+
+//: The report -> `{ shotId: phase }`. Pure over the report alone, and only ever the two phases
+//: above: a settled job is not a phase, and a job whose kind names no shot has no clip to mark.
+//:
+//: `running` wins wherever two open jobs name one shot. Both describe work on the same box, and
+//: the one ComfyUI has actually started is the one the Director is looking for -- the same
+//: "stronger claim wins" rule `renderProgressByTarget` applies to two percentages.
+export function renderPhaseByShot(report) {
+  const found = {};
+  for (const job of report?.jobs || []) {
+    if (!JOB_KINDS_TARGETING_A_SHOT.includes(job?.kind) || !job?.target_id) continue;
+    if (job.status === RENDER_PHASE_RUNNING) found[job.target_id] = RENDER_PHASE_RUNNING;
+    else if (job.status === RENDER_PHASE_QUEUED && !found[job.target_id]) {
+      found[job.target_id] = RENDER_PHASE_QUEUED;
+    }
+  }
+  return found;
+}
+
+//: The class the clip carries for the shot ComfyUI is rendering right now, and the one for a shot
+//: waiting its turn behind it. Two classes rather than one plus a modifier, because the class names
+//: the state -- `window-long` and `take-uncovered` share an amber and are still two classes for
+//: exactly that reason.
+export const CLIP_RENDERING_NOW_CLASS = "rendering-now";
+export const CLIP_RENDERING_QUEUED_CLASS = "rendering-queued";
+
+//: The word a waiting clip carries in place of `RENDERING`. Upper case and terse like
+//: `SHOT_RENDERING_FLAG`, `NO PROMPT` and `PLACEHOLDER`, because it sits on the same small surface.
+//: It is a *different word* and not a dimmer copy of the same one: colour is never the only signal
+//: this stylesheet draws a state with, and "queued behind another render" and "on the GPU" are the
+//: two states this whole feature exists to tell apart.
+export const CLIP_RENDERING_QUEUED_FLAG = "QUEUED";
+
+//: And the sentences, for the accessible name -- the only one of a clip's signals a screen reader
+//: announces. Short, because the clip's title is not the queue panel; the panel carries the job row
+//: with its own status, seed and timing.
+export const CLIP_RENDERING_NOW_NOTE = "ComfyUI is rendering this shot now.";
+export const CLIP_RENDERING_QUEUED_NOTE =
+  "This shot is waiting its turn in ComfyUI's queue; nothing is being rendered for it yet.";
+
+//: What the clip draws for its render phase: `clipWindowState`'s shape, and its rule that a state
+//: with a class always comes with a sentence. `percent` is this shot's live percentage or nothing,
+//: and it rides the running phase only -- a queued shot has no progress to report and a number
+//: beside `QUEUED` would be one invented for it.
+//:
+//: **An unknown phase draws exactly what this file drew before the feature existed.** A report that
+//: has not been fetched, a job whose kind names no shot, a build whose queue answer the server
+//: could not read: all of them return an empty flag, and the timeline falls back to `RENDERING`
+//: with no new class -- which is the same degrade-to-today rule `renderProgressLabel` follows for
+//: an unknown percentage, and what makes a shot that is neither running nor queued draw nothing.
+export function clipRenderPhase(phase, percent) {
+  if (phase === RENDER_PHASE_RUNNING) {
+    return {
+      className: CLIP_RENDERING_NOW_CLASS,
+      flag: renderingFlag(percent),
+      note: CLIP_RENDERING_NOW_NOTE,
+    };
+  }
+  if (phase === RENDER_PHASE_QUEUED) {
+    return {
+      className: CLIP_RENDERING_QUEUED_CLASS,
+      flag: CLIP_RENDERING_QUEUED_FLAG,
+      note: CLIP_RENDERING_QUEUED_NOTE,
+    };
+  }
+  return { className: "", flag: "", note: "" };
+}
+
 // Everything the timeline draws for one clip's prompt cell, decided here rather than in the
 // template. The template used to hold the ternaries, and swapping their arms -- stamping NO PROMPT
 // on every *written* clip and rendering the unprompted one empty -- kept every substring the suite
@@ -1701,6 +1797,74 @@ export function batchReportToast(report) {
   if (skipped.length) {
     const reasons = skipped.map((entry) => `${entry.label}: ${entry.reason}`).join(" · ");
     message += ` — ${skipped.length} skipped. ${reasons}`;
+  }
+  return message;
+}
+
+// ------------------------------------------------------------------------------------------
+// Cancel every open render (the Director's report, 2026-08-23). The per-job `×` works, and
+// twenty-six of them is a chore rather than a control -- so a batch they changed their mind about
+// was cleared from ComfyUI's own UI instead, which is the path that left twenty-six takeless shots
+// reading `error`.
+//
+// The scope is every open render in this project rather than one batch, and the whole argument is
+// in `app.CANCEL_ALL_NONE_OPEN`'s note. The one line of it that lives here: this counts exactly
+// what `hasActiveRenderJobs` counts, so the poll standing down is the observable proof the button
+// did what it said.
+// ------------------------------------------------------------------------------------------
+
+export const CANCEL_ALL_CONTROL = "#queue-cancel-all";
+export const CANCEL_ALL_LABEL = "Cancel all renders";
+//: The button's hover text. It names the scope out loud, because the panel it sits in also draws a
+//: per-batch progress line, and a Director reading "Batch: 4 of 30 settled" beside a button that
+//: turned out to stop a lone Render again as well would rightly call that a surprise.
+export const CANCEL_ALL_HELP =
+  "Stop every queued and running render for this project on ComfyUI, in one act — not just the "
+  + "newest batch. Each is dequeued (interrupted when running), its job record settled, and its "
+  + "shot released. It asks first and names the count.";
+
+//: The whole decision the button is drawn from: how many renders are open, and the sentence the
+//: Director confirms. Pure and contract-tested, never re-derived in the template or at the click,
+//: for `generateAllPlan`'s reason -- the count shown and the count acted on must be one number.
+//:
+//: `hidden` rather than `disabled` for an idle project: a disabled control carries a reason worth
+//: reading, and "nothing is rendering" is not a refusal a Director needs explained beside an empty
+//: queue. `Re-queue flagged` hides on the same argument, one button over.
+export function cancelAllPlan(project) {
+  const open = (project?.jobs || []).filter(
+    (job) => job?.prompt_id && !TERMINAL_JOB_STATUSES.includes(job.status),
+  );
+  if (!open.length) {
+    return { count: 0, hidden: true, label: CANCEL_ALL_LABEL, title: CANCEL_ALL_HELP, confirm: "" };
+  }
+  const noun = `${open.length} open render${open.length === 1 ? "" : "s"}`;
+  return {
+    count: open.length,
+    hidden: false,
+    // The count rides the label as well as the dialog, so the size of the gesture is legible
+    // before the click rather than only inside the confirmation -- `Re-queue flagged (3)`'s form.
+    label: `${CANCEL_ALL_LABEL} (${open.length})`,
+    title: CANCEL_ALL_HELP,
+    confirm:
+      `Cancel ${noun} for this project? This is every queued and running render, not just the `
+      + "newest batch. It cannot be undone: a render stopped part-way produces nothing, and the "
+      + "GPU time already spent on it is gone. Shots left with no take go back to ready.",
+  };
+}
+
+//: What the cancellation did, in `batchReportToast`'s shape and its voice. A job that settled
+//: between the click and the loop reaching it lands in `skipped` with the server's own sentence,
+//: and is reported rather than folded into the total -- a Director who stopped nineteen of
+//: twenty-six renders has to be able to see that seven are still running.
+export function cancellationToast(report) {
+  const stopped = report?.cancelled?.length || 0;
+  const skipped = report?.skipped || [];
+  let message = stopped
+    ? `${stopped} render${stopped === 1 ? "" : "s"} cancelled`
+    : "Nothing cancelled";
+  if (skipped.length) {
+    const reasons = skipped.map((entry) => `${entry.label}: ${entry.reason}`).join(" · ");
+    message += ` — ${skipped.length} left alone. ${reasons}`;
   }
   return message;
 }
@@ -5076,6 +5240,11 @@ export const api = {
   // shape is the server's rule and not this function's manners.
   replaceAssetCitations: (projectId, assetId, replacementId, confirmApply) => request(`/api/projects/${projectId}/assets/${assetId}/replace-citations`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ replacement_id: replacementId, confirm_apply: confirmApply }) }),
   cancelJob: (projectId, jobId) => request(`/api/projects/${projectId}/jobs/${jobId}`, { method: "DELETE" }),
+  // Every open render at once. `confirm_cancel` is the acknowledgement itself, server-enforced --
+  // sent true only after the dialog `cancelAllPlan` writes, exactly as `confirm_gpu` is. The reply
+  // is the report, not the project, so the caller reloads: twenty-six settles moved twenty-six
+  // shots and a patch of the last one would leave the other twenty-five stale on screen.
+  cancelOpenJobs: (projectId) => request(`/api/projects/${projectId}/jobs?confirm_cancel=true`, { method: "DELETE" }),
   uploadAsset: (id, data) => request(`/api/projects/${id}/assets/upload`, { method: "POST", body: data }),
   generateMusic: (id, body) => request(`/api/projects/${id}/generate/music`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   generateSongPlanner: (id, body) => request(`/api/projects/${id}/generate/songplanner`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

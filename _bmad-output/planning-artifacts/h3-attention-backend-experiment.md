@@ -5,6 +5,11 @@
 is digest-proved unchanged, the pre-flight covers every profile, and the harness is
 `tests/measure_h3_attention.py`. **§6 corrects the premise §1–§5 were written on**, so read §6
 before acting on anything above it.
+**Status (2026-08-23, §9): DIAGNOSIS, nothing run.** §9 answers the "unload models between
+generations" question from ComfyUI's source and its own log: the cost variance is entirely in the
+sampler, not in model loading, and it is VRAM oversubscription by other processes on the card.
+`empty_cache()` is already called on the `/free` path and returns 25 MiB. **§9 supersedes the
+model-load reading of §1's cliff**, and §9.9 specifies the unrun experiment.
 
 This document exists because a render-cost cliff was measured on a pipeline whose attention
 acceleration has never once been switched on, and because the one node that would switch it on is
@@ -1658,3 +1663,564 @@ a void arm rather than a noisy one.
   other two, so there is nothing a picture shows that the zero does not show better.
 * **No code was changed.** The claims in the application that this bears on are listed in the
   handover; none were edited under this task's authorisation.
+
+---
+
+## 9. The unload-between-renders question: ANSWERED FROM SOURCE AND LOG, no render submitted (2026-08-23)
+
+**Status: DIAGNOSIS. No code changed, no render submitted, no restart, no `/free`. The Director's
+batch was running throughout (1 executing, 22 pending) and was not touched.**
+
+The Director asked whether ComfyUI can be made to unload models between generations — via
+`/free`, via an existing custom node, or via a new unloader node placed at the end of each
+workflow — on the hypothesis that the wild cost variance is a model-load cost paid against a full
+card.
+
+**The hypothesis is refuted by ComfyUI's own log, and the fix it implies would make things worse.**
+§6.21 already ran the weak form of it and measured 25% *slower*. This section says why, from the
+source and from primary telemetry.
+
+### 9.1 The variance is entirely in the sampler. Model loading is flat.
+
+`user/comfyui.log` prints a tqdm line per sampler run and a `Prompt executed in` line per prompt,
+and `load_models_gpu` prints `Requested to load X` / `loaded completely` around every load. That
+decomposes each render exactly. For the five renders the Director tabulated, all
+`turbo-references2v`, all 8 steps:
+
+| clock (2026-08-23) | frames | prompt total | model loads | **sampler s/it** |
+|---|---|---|---|---|
+| 20:16→20:20 | 141 | 273.09 s | ~93 s | **20.44** |
+| 20:21→20:24 | 141 | 246.50 s | ~70 s | **19.46** |
+| 20:40→21:18 | 124 | **00:38:28** | ~101 s | **272.37** |
+| 21:19→21:26 | 124 | 468.09 s | ~74 s | **47.07** |
+| 21:27→21:30 | 124 | 235.17 s | ~72 s | **~16.6** |
+
+**Model loading costs a flat 70–101 s in every one of them, including the 38-minute render.** The
+38 minutes is 36:18 of *sampling* — 272.37 s/it against a 16.6 s/it floor on the very next render
+of the same size. There is no model-load term to recover. An unloader cannot return time that is
+not being spent.
+
+Across the whole log, 8-step `s/it` is bimodal: a tight band at **15.1–21.5 s/it** (fourteen
+renders) and a heavy tail at **34.8, 47.1, 72.6, 72.7, 125.5, 272.4** (six). Same graph, same
+model, same step count. The 20-step renders show the same shape: 17.7, 19.5, 29.6, **136.1**.
+
+### 9.2 The tail is a recovery curve, and it always follows a break in the render stream
+
+Sorting the tail by clock position rather than by size, the pattern is unmistakable — every
+outlier is the *first* render after the card was disturbed, and the next two or three converge
+monotonically back to the floor:
+
+* `72.57 → 34.76 → 21.46 → 17.74` (2026-08-22 15:45–16:02, four consecutive)
+* `72.68 → 20.44 → 19.46` (2026-08-23 20:15–20:24, three consecutive)
+* `272.37 → 47.07 → ~16.6` (2026-08-23 21:17–21:30, three consecutive)
+
+The 272 s/it render is the first render after a **15-minute idle gap** (last prompt finished
+20:24:47; nothing ran until 20:40:02, when the Director's batch dumped 25 prompts in four
+seconds — `got prompt` ×25 between 20:40:02.686 and 20:40:05.984). And §6.21's `/free` arm, at
+**125.53 s/it**, is the second-worst per-step figure in the entire log. `/free` manufactured the
+break.
+
+### 9.3 What actually holds the card: measured, not inferred
+
+Read live at 21:31–21:35 while the batch was mid-render, all read-only:
+
+* `GET /system_stats`: `vram_total` 32607 MiB, `torch_vram_total` (= `reserved_bytes.all.current`)
+  **30426 MiB**, `vram_free` == `torch_vram_free` == 5294 MiB. Those two are equal only when
+  `mem_free_cuda` is **zero** — see `get_free_memory`, `model_management.py:1781-1787`
+  (`mem_free_total = mem_free_cuda + mem_free_torch`). **The driver reports no free VRAM at all;**
+  every byte of apparent headroom is torch's own cached-but-inactive blocks.
+* `nvidia-smi`: 32091–32099 / 32607 MiB used, **97 MiB free**.
+* Windows perf counter `\GPU Process Memory(pid_15072…)\Dedicated Usage` = **30487 MiB** for the
+  ComfyUI process — cross-validating torch's 30426 MiB reserve within 61 MiB.
+* Same counter, the other tenants on the same adapter: **Discord 2384 MiB, NVIDIA Overlay 1696 MiB,
+  dwm 409 MiB, opera 369 MiB, brave 127 MiB, WindowsTerminal 55 MiB, msedgewebview2 52 MiB,
+  explorer 33 MiB** — about **5.1 GiB**, and `nvidia-smi --query-compute-apps` lists roughly thirty
+  processes holding a CUDA context on this card, LM Studio among them.
+  (`discord_clips` reports 13.6 million MiB — a broken counter, twice sampled, stable and
+  slowly incrementing. Discard it as evidence; note it as a process to close anyway.)
+* 30487 + 5100 = **35.6 GiB requested on a 32.6 GiB card.**
+* `\GPU Adapter Memory(…0x14322…)\Shared Usage` = **1229 MiB**. That is the direct measurement:
+  **WDDM has spilled 1.2 GiB of GPU allocations into system RAM, reachable only over PCIe.**
+* Telemetry, sixteen samples at 2 s: **99% GPU utilisation, 1–4% memory-controller utilisation,
+  137–170 W, 55–56 °C, SM 2887–2895 MHz, PCIe gen 5 ×16.**
+
+150 W on a 576 W card at "99% utilisation", with the memory controller idle and clocks boosting
+normally, is not compute and it is not thermal. The SMs are stalled on memory that is not on the
+card. This is worse than the 230–280 W memory-starved band; it is the same failure, deeper.
+
+Host side: 4719 of 63080 MiB free, **26230 MiB in Windows Memory Compression**, ComfyUI's working
+set 19634 MiB. Both sides of the PCIe bus are out of room.
+
+### 9.4 What `POST /free` does, read from the source, and why 27 GiB survived it
+
+The path is short and every step is checkable.
+
+1. `server.py:1192-1200` — `/free` only sets two queue flags. It does no memory work and returns
+   an empty 200 immediately.
+2. `execution.py:1399-1402` — `set_flag` also calls `not_empty.notify()`, which wakes the worker's
+   blocked `q.get()`. So on an **idle** server the flags are honoured promptly.
+3. `main.py:399-421` — the worker consumes them **after** `e.execute()` returns, i.e. between
+   prompts:
+   * `unload_all_models()` → `model_management.py:2063` → `free_memory(1e30, device)` for each
+     device.
+   * `e.reset()` → `execution.py:672-675`, rebuilds the `CacheSet`.
+   * then `gc.collect()` and `soft_empty_cache()`, with `last_gc_collect = 0` forcing the 10 s
+     gate open immediately.
+4. `free_memory` (`model_management.py:863-907`) calls `soft_empty_cache()` at line 901 whenever
+   anything was unloaded.
+5. `soft_empty_cache` (`model_management.py:2045-2061`) on CUDA runs
+   **`torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.ipc_collect()`**,
+   unconditionally. `force` is irrelevant on this path.
+
+**So `torch.cuda.empty_cache()` is definitely called — twice, and promptly.** Of the four candidate
+explanations put to this investigation, three are ruled out:
+
+* *"Not called on that path"* — **false**, established above.
+* *"The next render had already begun allocating"* — **false here.** The measurement came from
+  `tests/measure_h3_attention.py`, which waits `FREE_SETTLE_SECONDS = 8.0` and runs with an empty
+  queue between arms.
+* *"Consumed only between prompts, reading mistimed"* — **false.** `set_flag` notifies the waiter;
+  the idle worker falls straight through to the flag block.
+* *"Emptied, but a reference is still held"* — **partly, and it is the wrong shape.** The raw
+  record settles it. `test-artifacts/2026-08-22-h3-freed-226/records/turbo-references2v+default-f226-r1.json`,
+  key `free_before_arm.freed`:
+  `{"comfy_vram_free_gib": 14.25, "host_ram_free_gib": -9.66, "vram_used_mib": 25.0}`, and the
+  f158 sibling `{"comfy_vram_free_gib": 15.65, "host_ram_free_gib": -8.35, "vram_used_mib": -4.0}`.
+
+`vram_used_mib` is the **delta** in `nvidia-smi`'s `memory.used`. **`/free` moved 14–15 GiB in
+torch's accounting and returned 25 MiB — and on the second call, −4 MiB — to the device.** Not
+"most of it stayed"; essentially none of it moved. Held references would have shown up as still
+*active*; instead the memory went from active to free-**within**-the-reserve. Cross-check the
+arithmetic against `get_free_memory`: `mem_free_torch = mem_reserved - mem_active`. Unloading
+dropped `mem_active` by 14.25 GiB, so ComfyUI's `vram_free` rose by 14.25 GiB — while
+`mem_reserved` did not move, so `nvidia-smi` did not move. That is the whole result.
+
+**The reserve is what never comes back.** `LoadedModel.model_unload` (`:805-816`) calls
+`model.detach()` / `partially_unload(self.model.offload_device, …)` — the weights are **moved to
+CPU, not discarded**, which is precisely the measured −8 to −12 GiB of host RAM. The VRAM blocks
+they vacate return to torch's cache, and `empty_cache()` then fails to hand the cache back to the
+driver. The launcher is `run_nvidia_gpu.bat`, confirmed live: PID 15072's command line is
+`.\python_embeded\python.exe -s run_comfyui_natten.py --windows-standalone-build
+--use-sage-attention --fast`, and that .bat sets **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`**
+(added 2026-08-19 to fight this same VRAM creep). Under expandable segments, allocations of a
+size class live in one large virtual reservation whose physical pages can only be released from
+the top down; a single live tensor high in the segment pins everything beneath it. Combine that
+with a card whose driver-level free memory is already zero and there is nothing for `empty_cache`
+to give back.
+
+**Consequence, and it is the answer to the crux question the Director asked to have settled first:
+`empty_cache()` is already being called and it already returns ~25 MiB. A node that calls it will
+return ~25 MiB too.** Nothing about wrapping the same call in a graph node changes what the call
+does.
+
+### 9.5 The installed-node survey — what each one really calls
+
+Surveyed `custom_nodes/` for anything that frees memory, reading call bodies rather than names.
+Four packs register such a node.
+
+| node class | pack / file | reaches a real `empty_cache`? | scope | output node | passthrough |
+|---|---|---|---|---|---|
+| `VRAM_Debug` | KJNodes `nodes/nodes.py:613-658` | **yes** — `mm.soft_empty_cache()`, toggle `empty_cache` default True | core `current_loaded_models` | **no** | `any_input`/`image_pass`/`model_pass` |
+| `easy cleanGpuUsed` | Easy-Use `py/nodes/logic.py:1415-1430` → `py/libs/utils.py:283-300` | **yes** — `mm.unload_all_models()` then `mm.soft_empty_cache()`, no toggles | core + Easy-Use private cache | **yes** | `anything` → `output` |
+| `Trellis2UnloadAllModels` | Trellis2 `nodes.py:5400-5455` | **yes, hardest** — `soft_empty_cache()` + `torch.cuda.empty_cache()` + `ipc_collect()` + 2×`gc.collect()`, plus a forced `model_unload(1e32)` loop, RAM unpin, and clearing `current_loaded_models` and `controlnet_loaded_models` | core, forcibly | **yes** | `input_1` (`*`) → `output_1` |
+| `ReActorUnload` | reactor-node `nodes.py:1614-1629` | **no** — `del`s ReActor's own globals only | private | no | IMAGE |
+
+Non-node routes to the same thing: rgthree's `purge_vram()` callable inside `Power Puter`
+(`py/power_puter.py:63-74` — `gc.collect()` + `torch.cuda.empty_cache()` + `ipc_collect()` +
+`unload_all_models()` + `soft_empty_cache()`); Easy-Use's HTTP `POST /easyuse/cleangpu`
+(`py/routes.py:24-30`); and ComfyUI-Manager's "Unload Models" button, which is just core `/free`
+(`js/comfyui-manager.js:1581-1612`) — category (b), no better than what §6.21 already measured.
+
+**Which of them beat `/free`? None of them, materially.** Three reach `torch.cuda.empty_cache()`,
+but §9.4 establishes that `/free` reaches it too and gets 25 MiB back. Trellis2's node is the only
+one that does anything `/free` does not — it clears the registry outright and unpins host RAM —
+and there is no evidence that changes the device-level result. The one real defect it would fix is
+a subtlety worth recording: `unload_all_models()` alone does **not** guarantee an allocator flush
+(`free_memory` calls `soft_empty_cache()` only when something was evicted, or when torch's free
+reserve exceeds 25% of total), which is why the well-written nodes append their own
+`soft_empty_cache()`. On the `/free` path the worker's own `gc` block appends it anyway.
+
+KJNodes' `VRAM_Debug` additionally has an ordering quirk: it empties the cache **before**
+unloading, so with both toggles on the memory the unload frees is not flushed by that node.
+
+Also worth knowing, because they fire as side effects mid-graph: WanVideoWrapper's loader and
+sampler call `unload_all_models()` + `soft_empty_cache()` (`nodes_model_loading.py:1120-1122`,
+`nodes_sampler.py:877-879`), as does HunyuanVideoWrapper (`nodes.py:311-312`, `:1440-1442`); both
+also remove their own patcher from `current_loaded_models`, hiding it from core accounting.
+None of the `MiniMaxH3`/`Spectrum` packs contain any memory-freeing node.
+
+### 9.6 Can an end-of-workflow unloader work? Yes mechanically, no usefully.
+
+Honest answers to each half of the Director's proposal:
+
+* **Can a node be made to run last?** Yes. `easy cleanGpuUsed` and `Trellis2UnloadAllModels` are
+  both `OUTPUT_NODE = True` with an `any → any` passthrough, so wiring
+  `VHS_VideoCombine.filenames → cleanGpuUsed.anything` forces it after the video is written.
+  Output-node ordering is otherwise not guaranteed; the wire is what guarantees it.
+* **Can a node free the model the prompt is still using?** For the H3 graph, yes — by the time
+  `VHS_VideoCombine` runs, sampling and both VAE decodes are done and nothing further needs the
+  weights. `unload_all_models()` at that point is a proven pattern; WanVideoWrapper does exactly
+  this at sampler start.
+* **Does it free anything `/free` does not?** No, and this is the load-bearing point. It calls the
+  same `unload_all_models()` and the same `soft_empty_cache()` → `torch.cuda.empty_cache()`, which
+  this project measured returning 25 MiB.
+* **Does the freed memory survive to the next prompt?** In torch's bookkeeping, yes. On the device,
+  there is nothing to survive. And **only for the models this graph loaded** — it cannot touch the
+  ~5 GiB held by Discord, the NVIDIA Overlay, dwm, the browsers, or LM Studio, and those are the
+  processes that make the card oversubscribed.
+* **Would it help?** **No — the evidence says it would hurt.** §6.21 ran the equivalent: a 226-frame
+  render immediately after a `/free` cost 1004 s against 804 s occupied, 24.9% slower, at
+  125.53 s/it. §9.2 says why: unloading manufactures exactly the break in residency that precedes
+  every slow render in the log. A batch that unloaded after every shot would hand the card back to
+  the other tenants between shots and turn every render into a first-render-after-idle.
+
+The proposal is a well-aimed answer to the wrong diagnosis. The card is not slow because ComfyUI
+holds too much; it is slow because ComfyUI cannot hold enough.
+
+### 9.7 The reproducibility trade — already spent
+
+§8.9's follow-up established that a fixed seed reproduces **bit-exactly** while the model stays
+resident and re-rolls across a reload. So unloading between renders would, in principle, cost
+seed reproducibility for every take.
+
+**In this configuration that price has already been paid in full, by the model sizes.**
+`load_models_gpu` logs `Requested to load X` **only** when X is absent from
+`current_loaded_models` (`model_management.py:945-948` — the already-resident branch logs nothing).
+The batch log shows `Requested to load MiniMaxH3TEModel_` and `Requested to load MiniMaxH3` at the
+head of **every single prompt**. They cannot coexist: the text encoder is 25883.83 MB and the
+transformer is 19996.14 MB, 45.9 GB against a 30.4 GB reserve, so each one evicts the other every
+render, and the VAEs (577.08 + 4966.19 MB) sometimes evict the transformer in turn. That mutual
+eviction is the flat 70–101 s of §9.1 — roughly 46 GB of PCIe traffic per render.
+
+So: **an unloader would cost no additional reproducibility, because H3 takes in this batch are
+already not reproducible by seed.** That is not an argument for building it. It is the correct
+statement of the trade, and it is also a standing caveat that belongs on any future H3 A/B: the
+§6.19 rule "discard an arm that re-executed `mvp:model`" would void **every** H3 arm at these
+model sizes. Only the restart path or a smaller bundle can restore bit-exact H3 reproduction.
+
+### 9.8 What to do — and what only a restart can do
+
+Ranked by measured value, and none of it is code:
+
+1. **Take the other tenants off the card.** ~5.1 GiB measured across Discord, `discord_clips`,
+   the NVIDIA Overlay, dwm, Opera, Brave, Edge/WebView2 and Windows Terminal, plus LM Studio's
+   context. The card is oversubscribed by about 3 GiB; this is more than enough to clear it, it
+   is free, and it needs no restart. The existing `MVP_LLM_EJECT_BEFORE_RENDER` eject
+   (`src/music_video_producer/vram.py`) already handles LM Studio and nothing else.
+2. **Restart ComfyUI between batches, not between shots.** This is the one thing that has ever
+   produced a clean card (2233 MiB, §6.19) — because only process exit destroys the CUDA context
+   and returns torch's reserve to the driver. It costs one cold reload per batch, ~80–100 s, which
+   the batch is already paying on every render anyway. **The Director can automate this; agents
+   must not (AGENTS.md:10).** If the honest conclusion has to be one line, it is this one: nothing
+   inside a running ComfyUI process gives the card back, so the only lever that works is process
+   lifetime, and it belongs at batch boundaries.
+3. **Do not build the unloader node.** If it is built anyway, build it as an experiment arm and
+   not as a default, and expect §6.21's result.
+4. Leave `expandable_segments:True` alone unless it is measured. It was added for this exact
+   symptom on 2026-08-19 and has never been A/B'd; changing it is a separate experiment.
+
+### 9.9 SPECIFIED, NOT RUN: does clearing the card's other tenants remove the tail?
+
+**Not run. 22 renders were pending when this was written and nothing was submitted.** Run it only
+on the Director's explicit authorisation, after the batch drains.
+
+> **Arm A was subsequently run on 2026-08-23 22:15 — see §9.10. Arm B was NOT run and the
+> experiment is not decided.** §9.10 also invalidates one half of this section's decision rule
+> before Arm B is attempted: mid-render Shared Usage was ~3.2 GiB on *every* Arm A render while
+> every one of them sampled at the floor, so nonzero spill is **not** sufficient for the tail and
+> "arm B's Shared Usage stays at 0 MiB" cannot be carried as a condition. Read §9.10 before
+> running Arm B.
+
+**Question.** Is the heavy tail in `seconds_per_step` caused by VRAM oversubscription from
+non-ComfyUI tenants? Not the median — the median is already at the 15–21 s/it floor in every
+arm. The tail is the entire cost.
+
+**Arms.** Fixed shot, fixed seed, `turbo-references2v`, 8 steps, **141 frames** (the modal size and
+the middle of the flat per-frame region).
+
+* **Arm 0 — discarded.** One warm render immediately after the batch drains, not scored. §6.19's
+  rule; the first arm is always cold.
+* **Arm A — as-is.** Desktop exactly as it is today: Discord and `discord_clips` running, NVIDIA
+  Overlay running, Opera/Brave/Edge open, LM Studio resident.
+* **Arm B — cleared.** Discord (all three processes), `discord_clips`, NVIDIA Overlay, all
+  browsers closed; LM Studio ejected via the existing `lms unload --all` path. dwm cannot be
+  closed and stays in both arms.
+
+**Design.** `A×5, B×5, A×5` — 15 scored renders plus the discard, ~1.5 h at the floor and longer
+if the tail appears. A block design is unavoidable because the treatment is opening and closing
+desktop applications; the trailing A block is the price of that, and it is what detects drift and
+re-tests the tail. Do **not** average across blocks that disagree — §6.19: an anomaly is re-run,
+never explained.
+
+**Measured per render** — `tests/measure_h3_attention.py` already records all but the last two:
+
+* `seconds_per_step` — **the primary**
+* `sampling_seconds`, `execution_seconds`, `non_sampling_seconds` — the reload term, which should
+  stay flat at 70–101 s in both arms and confirms the §9.1 decomposition
+* `power_w_median`, `power_w_max` — the diagnostic: ~470–520 W compute-bound, 150–280 W at high
+  utilisation memory-starved
+* `state_before` / `state_after`: `vram_used_mib`, `comfy_vram_free_gib`, `host_ram_free_gib`,
+  temperature, SM clock, active throttle reasons
+* `execution_cached` on every arm (§6.19 rule 2), noting that at these model sizes every H3 arm
+  will show a reload — record it, do not void on it
+* **new:** `\GPU Adapter Memory(luid…0x14322…)\Shared Usage` sampled mid-render alongside power.
+  Nonzero shared usage is the direct signature of WDDM spill and is the mechanism this experiment
+  is actually testing.
+* **new:** `\GPU Process Memory(*)\Dedicated Usage` for the 5090's LUID, once per arm, to record
+  what the other tenants were actually holding.
+
+**Decision rule, fixed before the run.**
+
+* **Justifies the change:** arm B's median `s/it` is at or below arm A's, **and** arm B produces no
+  render above **25 s/it** while arm A produces at least one, **and** arm B's mid-render Shared
+  Usage stays at 0 MiB while arm A's is above 0. Then the recommendation is operational — keep the
+  card single-tenant during batches — and no code changes.
+* **Kills the diagnosis:** arm B still throws renders above 25 s/it with Shared Usage at 0. Then
+  the tail is not tenancy, §9.2's recovery curve needs another explanation, and this section
+  reopens.
+* **Ambiguous:** the tail appears in neither arm. Then the batch drained into a quiet machine and
+  the experiment did not reproduce the condition; say so and re-run when the tail is observable,
+  rather than reporting a clean result from a run that could not have shown a dirty one.
+
+**Optional Arm C, only if the Director wants the unloader closed empirically:** five renders with
+`easy cleanGpuUsed` wired from `VHS_VideoCombine.filenames`. §6.21 predicts no better and probably
+worse. It costs five renders to end the question permanently, and that may be worth it.
+
+**Constraints carried from this section's own run.** No ComfyUI restart from an agent. No `/free`
+anywhere in the harness (`--free-between-arms` stays off — it changes what is being measured).
+`data/projects/project_59f14d19ff10` digested before and verified byte-identical after.
+
+##### Method notes for §9
+
+* **Nothing was submitted, restarted, or interrupted.** The batch ran throughout — `/queue` showed
+  1 running and 22 pending. Only `/system_stats`, `/queue`, `nvidia-smi`, Windows perf counters,
+  and file reads were used.
+* **No code was changed** and nothing was committed.
+* **Primary sources**, all read directly:
+  `J:/…/ComfyUI/main.py:329-421`, `server.py:685-716`, `server.py:1192-1200`,
+  `execution.py:672-675`, `:1251-1279`, `:1399-1411`,
+  `comfy/model_management.py:741-830`, `:863-907`, `:909-1011`, `:1748-1790`, `:2045-2066`,
+  `ComfyUI_windows_portable/run_nvidia_gpu.bat`, `run_comfyui_natten.py`,
+  and `J:/…/ComfyUI/user/comfyui.log` (session opened 2026-08-22 14:09:57, still running).
+* **The `discord_clips` counter is not evidence.** 13.6 million MiB on a 32 GiB card, stable across
+  two samples. Every other per-process figure cross-validates against torch's own reserve to
+  within 61 MiB.
+
+---
+
+### 9.10 MEASURED 2026-08-23: Arm A only. The tail did not reproduce, and the spill signature was present the whole time anyway.
+
+**Status: ARM A RUN AND SCORED. ARM B NOT RUN — its treatment is closing the Director's own
+applications, which is theirs to do. No code changed, no commit, no `/free`, no restart, nothing
+written to `data/projects/project_59f14d19ff10`.**
+
+**The headline, stated the way §9.9 asked for it in advance: no Arm A render exceeded 25 s/it.
+The five landed at 18.72–20.14 s/it, a 7.6% spread, every one inside §9.1's 15.1–21.5 s/it floor
+band. The pathology this experiment exists to treat was not happening while Arm A ran, so Arm A
+could not have demonstrated that anything cures it.** That is §9.9's "ambiguous" outcome, named
+before the run, and it is a result rather than a failed run.
+
+It is not, however, an empty one. Arm A was instrumented for the two counters §9.9 added, and
+what they show contradicts the mechanism §9.9 assumed.
+
+#### The tenancy baseline
+
+Read the moment the Director's queue drained (2026-08-23 21:45, card idle), and again after Arm A
+finished (22:16, card idle). Per-process `\GPU Process Memory(*)\Dedicated Usage` for the 5090's
+LUID `0x00014322`, and `\GPU Adapter Memory(…0x14322…)\Shared Usage`.
+
+| | 21:45 idle, pre-run | 22:16 idle, post-run |
+|---|---|---|
+| **Adapter Shared Usage** | **778.4 MiB** | **365.9 MiB** |
+| ComfyUI (`python`, pid 15072) | 648.6 MiB | 26197.9 MiB |
+| Discord (pid 51400 / 27476) | 2775.0 + 47.3 | 2861.3 + 72.1 |
+| NVIDIA Overlay (16196 / 18376) | 1696.2 + 16.3 | 1696.2 + 16.3 |
+| opera | 476.5 | 663.5 |
+| dwm | 432.2 | 434.3 |
+| brave | 192.2 | 337.6 |
+| WindowsTerminal | 57.7 | 57.7 |
+| msedgewebview2 / msedge | 50.9 / 16.1 | 50.9 / 23.1 |
+| explorer | 33.0 | 66.5 |
+| **LM Studio** | **14.1** | **14.1** |
+| System / csrss | 4.3 / 3.9 | 4.3 / 19.1 |
+| **non-ComfyUI total** | **5815.7 MiB (5.68 GiB)** | **6317.0 MiB (6.17 GiB)** |
+| host RAM free | 14432 / 63080 MiB | 14988 / 63080 MiB |
+| `nvidia-smi` compute contexts | — | 32 processes |
+
+* **`discord_clips` (pid 38436) read 13,731,280 MiB pre-run and 15,303,477 MiB post-run.** Broken,
+  as §9 already flags, and now confirmed to be *incrementing* rather than stable. Discarded from
+  every total above.
+* **The other tenants are heavier than §9.3 measured, not lighter: 5.68–6.17 GiB against ~5.1 GiB.**
+  Nothing was closed for Arm A and nothing needed to be — this is the desktop exactly as the
+  Director has it.
+* **LM Studio held 14.1 MiB and had no model loaded.** `lms ps` answered "No models are currently
+  loaded" during the run. **This matters for Arm B:** ejecting LM Studio is one of Arm B's named
+  treatments and on today's machine it would free approximately nothing. Arm B's real treatment is
+  Discord (2.9 GiB) and the NVIDIA Overlay (1.7 GiB); those two are three quarters of the tenancy.
+
+#### The five renders
+
+One session, consecutive, warm, no `/free`, no restart, nothing interrupted. `turbo-references2v`,
+8 steps, `default` attention (inherited `--use-sage-attention`), 141 frames, shot
+`shot_f82bf42e3abc` of `project_59f14d19ff10`, window 66.33–72.205 s, lead 0.25 s.
+
+**Discarded cold warmup**, 107 frames, submitted 21:48:28 into an idle card: 191.76 s execution,
+~96 s of model load, **10.69 s/it**. Not scored.
+
+| # | seed | s/it | sampling | comfy exec | non-sampling | W median | W max | VRAM before | comfy vram free | host RAM free | temp before → mid max | SM mid max | throttle | cached nodes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 20260822 | **18.82** | 150 s | 164.17 s | 14.17 s | 457.3 W | 563.4 W | 28764 MiB | 3.04 GiB | 8.51 GiB | 49 → 81 °C | 2850 MHz | 0x0 / 0x4 | 14 |
+| 2 | 20260823 | **19.04** | 152 s | 243.45 s | 91.45 s | 455.1 W | 567.7 W | 8158 MiB | 25.25 GiB | 26.38 GiB | 63 → 81 °C | 2895 MHz | 0x0 / 0x4 | 1 |
+| 3 | 20260824 | **20.14** | 161 s | 240.48 s | 79.48 s | 432.1 W | 568.8 W | 8681 MiB | 24.68 GiB | 26.54 GiB | 62 → 79 °C | 2895 MHz | 0x0 / 0x4 | 4 |
+| 4 | 20260825 | **19.29** | 154 s | 225.86 s | 71.86 s | 454.8 W | 567.3 W | 8700 MiB | 24.68 GiB | 24.31 GiB | 63 → 83 °C | 2887 MHz | 0x0 / 0x4 | 4 |
+| 5 | 20260826 | **18.72** | 149 s | 162.76 s | 13.76 s | 464.4 W | 573.3 W | 28762 MiB | 3.20 GiB | 15.00 GiB | 63 → 82 °C | 2842 MHz | 0x0 / 0x4 | 14 |
+
+**Median 19.04 s/it. Maximum 20.14 s/it. Nothing above 25.** `0x4` is SW Power Cap and appeared
+mid-render on every arm: the card was *power-limited*, which is the compute-bound regime, not the
+memory-starved one.
+
+A sixth render exists and agrees. Before this table was produced, the same shot rendered at seed
+20260821 through `tests/measure_h3_attention.py` at **19.18 s/it**, 247.64 s execution, 94.64 s
+non-sampling, 456.0 W median / 570.0 W max. It is reported separately only because the run it came
+from turned out to be measuring the wrong thing after its first render — see the caching finding
+below — not because anything about that render is in doubt.
+
+#### The two new counters, and what they refute
+
+`\GPU Adapter Memory(…0x14322…)\Shared Usage` and per-process `Dedicated Usage` were sampled every
+~7 s across the whole session, 190 samples, and joined to each render by ComfyUI's own execution
+span.
+
+| # | Shared Usage min / **median** / max, mid-render | ComfyUI dedicated max | other tenants median | memory-controller util median / max |
+|---|---|---|---|---|
+| 1 | 340.3 / **3282.0** / 3404.4 MiB | 29305.6 MiB | 6080.3 MiB | 28% / 46% |
+| 2 | 337.5 / **3214.9** / 5057.1 MiB | 29389.5 MiB | 6094.0 MiB | 30% / 58% |
+| 3 | 344.5 / **3217.6** / 4992.1 MiB | 29389.5 MiB | 6084.0 MiB | 26% / 48% |
+| 4 | 340.0 / **3285.2** / 4922.7 MiB | 29325.6 MiB | 6247.3 MiB | 29% / 57% |
+| 5 | 334.7 / **3282.4** / 3303.6 MiB | 29305.6 MiB | 6264.9 MiB | 31.5% / 59% |
+
+**Every scored render ran with ~3.2 GiB of GPU memory spilled into system RAM, and every one of
+them sampled at the floor.** The one-second trace through render 3 makes the shape unmistakable:
+Shared Usage sits at ~350 MiB while the models load, jumps to ~3.2 GiB at the *first sampling
+step*, and then holds within ±30 MiB for the entire 161 s of sampling while the card draws
+427–466 W at 99% utilisation with the memory controller between 15% and 48%.
+
+```
+22:05:58  shared  352 MiB  comfy  29182  others 6247  vram 31804  100 W  gpu  20%  mem  5%   (loading)
+22:06:05  shared 3359 MiB  comfy  29262  others 6221  vram 31852  420 W  gpu  99%  mem 42%   (sampling)
+22:06:19  shared 3209 MiB  comfy  29389  others 6062  vram 31821  438 W  gpu  99%  mem 26%
+…24 samples, shared 3190–3225 MiB throughout…
+22:08:33  shared 3220 MiB  comfy  29389  others 6080  vram 31839  454 W  gpu  99%  mem 27%
+22:08:40  shared 3225 MiB  comfy  26480  others 6082  vram 23065  118 W  gpu   9%  mem  1%   (decode)
+```
+
+29389 + 6080 = **35.5 GiB requested on a 32.6 GiB card** — §9.3's arithmetic, reproduced almost
+exactly, and the ~2.9 GiB overdraft matches the ~3.2 GiB that WDDM put in system RAM to within
+the counter's own noise. **The oversubscription is real, it is measured, it is slightly worse than
+§9.3 found it, and it cost 7.6% of run-to-run spread and nothing else.**
+
+**So the direct signature §9.9 nominated is not sufficient for the tail.** §9.9's "justifies the
+change" branch required arm B's Shared Usage to reach 0 MiB while arm A's stayed above it. Arm A's
+never went below 334 MiB and spent every sampling second at 3.2 GiB, at the floor. That condition
+cannot discriminate anything and must be struck from the decision rule before Arm B runs. What
+distinguished §9.3's pathological render was never the spill on its own — it was **137–170 W with
+the memory controller at 1–4%**. Arm A today was 432–464 W with the memory controller at 26–31%.
+Two different regimes, one identical spill.
+
+#### Two method findings, both of which change how the next run must be built
+
+**1. `--repeats N` on an unchanged payload does not produce N renders. It produces one render and
+N−1 cache hits.** The first attempt at Arm A ran `measure_h3_attention.py … --repeats 5`. Repeat 1
+sampled normally at 19.18 s/it. Repeats 2, 3, 4 and 5 returned in **1.23, 1.22, 1.24 and 1.34
+seconds** at **74.5–84.6 W**, with no tqdm summary in their log windows at all — ComfyUI's
+execution cache served the sampler's latents and only the video mux re-ran. The harness recorded
+them dutifully as `0.009 s/frame (whole-render)`, and its own audio comparison returned the
+identical `correlation 0.963, lag_ms 0.1` for all five because all five files came from one
+sampling pass.
+
+Nothing in the harness is wrong; the assumption that repeats are renders is. **Any future repeat
+design at a fixed frame count must vary the seed**, which busts the cache without changing a
+single cost term. This run used a fixed, written-down seed list — **20260822, 20260823, 20260824,
+20260825, 20260826** — and **Arm B must render those same five seeds in that same order**, or the
+two arms are not comparable.
+
+This also puts a caveat on §6.19's rule 2 in the other direction. `execution_cached` was recorded
+on every arm here, as §9.9 asked: 14, 1, 4, 4, 14 nodes. A *large* cached-node count is not proof
+an arm was cheap-and-fine — at 14 nodes cached the sampler still ran and only the text-encode was
+reused — but a count that leaves the sampler cached produces a 1.2 s "render". Read the tqdm line,
+not the node count.
+
+**2. §9.1's "flat 70–101 s" model-load term is a property of that batch, not a law.** Here it was
+**13.76, 91.45, 79.48, 71.86 and 13.76 s** — a 6.6× spread, because renders 1 and 5 reused a
+resident text encoder and renders 2–4 paid the `MiniMaxH3TEModel_` ↔ `MiniMaxH3` mutual eviction
+§9.7 describes. **`seconds_per_step` moved by 7.6% across that 6.6× swing**, which is the cleanest
+confirmation this document has of §9.1's central claim: the sampler's cost and the loader's cost
+are independent, and only the first of them is the tail.
+
+#### What this settles, and what it does not
+
+* **Settled: the tail is not a constant.** The card was oversubscribed by ~2.9 GiB, spilled ~3.2
+  GiB over PCIe, ran 32 CUDA contexts and 6.2 GiB of foreign tenants, and produced five renders
+  inside a 1.4 s/it band. Oversubscription alone does not produce the tail.
+* **Settled: nonzero Shared Usage is not the tail's signature.** It is the *overdraft's* signature,
+  and the overdraft was continuously present and continuously harmless here.
+* **Not settled, and untouched: whether clearing the tenants removes the tail.** The tail was not
+  available to be removed. Arm B run now would compare a floor against a floor.
+* **Weakened, not refuted, is §9.2's recovery curve.** Every §9.2 outlier followed a break in the
+  render stream. Arm A had exactly one break — the 15-minute idle after the Director's 21:44
+  cancellation — and the render that followed it was the *warmup*, at 107 frames and 10.69 s/it,
+  the fastest per-step figure in this session. One cold render is not a test of that hypothesis,
+  but it is the first datum that runs against it.
+
+#### What Arm B should be, when the Director is ready
+
+**Do not run Arm B against today's machine as a speed test.** It would return "no difference"
+from two floors and that result would be worthless — worse than worthless, because it reads as a
+refutation.
+
+Two things are worth doing instead, in this order:
+
+1. **Run Arm B as a *spill* test, not a speed test.** The question it can still answer cheaply is
+   mechanical: does closing Discord and the NVIDIA Overlay (4.6 GiB of the 6.2) actually take
+   Shared Usage to zero, or does WDDM spill anyway? That is one arm of five renders and it
+   calibrates the instrument for whenever the tail next appears. Its decision rule is
+   Shared-Usage-only; s/it is recorded and is not the verdict.
+2. **Catch the tail in the wild.** The tail is a property of the Director's real batch conditions —
+   25 prompts dumped in four seconds after an idle gap — not of a five-render probe. The cheapest
+   route to an answer is to leave the Shared-Usage sampler running across the Director's *next*
+   batch and read what the counters say during a render that actually goes long. That costs no GPU
+   minutes at all.
+
+##### Method notes for §9.10
+
+* **The Director's queue was drained before anything was submitted.** `/queue` was polled to 0
+  running / 0 pending. Their last render was **cancelled by them** at 21:44:47 (`Cancelling running
+  prompt c22e2196…`, `Prompt executed in 00:14:25`, interrupted), along with seven pending prompts
+  at 21:41. Nothing here interrupted, cancelled, cleared, restarted or `/free`d anything.
+* **The project is untouched, verified by digest either side.** `project.json`
+  `915c7f60f833329d6ed4f8de348a35e1ebe6846be25daee9569694a816d6e9ba`, three-file aggregate
+  `0638531beba551e2c311cd8875f5ac3355ce00099ce456085465229a650f67d4` — identical before and after.
+  (An earlier digest at 21:45:10 differed; it was a torn read taken *during* the application's own
+  write of the cancelled render's job record, and the file settled to the value above and stayed
+  there. The application writes this manifest; this run did not.)
+* **No code was changed.** `tests/measure_h3_attention.py` aborts on this project because its
+  `build_references` resolves every cited asset under the project directory, while
+  `app.resolve_asset_path` (`src/music_video_producer/app.py:7098`) resolves by `Asset.source` —
+  and `shot_f82bf42e3abc` cites one `krea-multiview` asset that lives under ComfyUI's `output/`.
+  Rather than edit the harness, a scratchpad script imported it as a module and rebound that one
+  module-global to a resolver applying the route's own rule. Payload construction, submission,
+  timing, log-window attribution and every recorded field are the audited harness's own functions.
+  **This is a real gap in the harness and it is not fixed** — see the handover below.
+* **All artefacts are in the session scratchpad, not in the repo**, because the manifest and the
+  rendered takes carry the song's copyrighted lyrics: `armA/` (the first, cache-poisoned attempt),
+  `armA-seeds/` (the five scored renders and their per-render ComfyUI log windows),
+  `telemetry.jsonl` (190 counter samples), `armA-joined.json`, `baseline-tenancy.json`,
+  `final-tenancy.json`.
+* **One confound I cannot rule out, stated rather than assumed away.** Another agent ran the full
+  pytest suite — about two minutes of heavy CPU — around 21:48, which overlaps the discarded warmup
+  and possibly the seed-20260821 render. The five scored renders ran 21:58:01–22:15:30, after all
+  other CPU-heavy work in this session was held. **I did not sample host CPU utilisation, so I
+  cannot confirm the scored window was clean from my own instrumentation** — only that nothing was
+  scheduled into it.
+* **`nvidia-smi` reported 32 processes holding a CUDA context on this card**, matching §9.3's
+  "roughly thirty".

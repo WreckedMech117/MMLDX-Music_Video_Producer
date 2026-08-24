@@ -4,6 +4,126 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-23 — A failed render leaves the shot available, one click cancels the whole queue, and the timeline says which clip is actually on the GPU
+
+Three reports from one incident. The Director started **Generate All Empty** at 20 steps, changed
+their mind part-way through and wanted turbo instead, and cancelled the renders **in ComfyUI's own
+UI** — because cancelling them here would have meant clicking the per-job `×` twenty-six times.
+The application caught the failures cleanly. What it did with them afterwards was wrong in one
+place and missing in two others.
+
+**No render, no ComfyUI call, no model call.** `data/projects/project_59f14d19ff10` was read and
+never written; the Director's batch was live in this tree throughout.
+
+### 1. A render that produced nothing left the shot looking like it had a take
+
+The Director's words: *"it turned all of the effected shots to think they had a clip or something
+so thier option is 'Flag for re-render' instead of just returning to ready after the fail."*
+
+`Flag for re-render` is drawn on exactly the shots `renderAgainControl` is shown for — the settled
+set, `complete`/`error`/`approved` — and it means *this shot has a take I do not like*. Twenty-six
+shots had no take. Nothing had rendered for them.
+
+**The in-app cancel was not the correct half to copy from.** The `×`'s tooltip has always promised
+"the job settled, the shot released", and a test was even named
+`test_cancelling_a_job_settles_it_and_releases_the_shot` — but `cancel_job` wrote
+`shot.status = "error"`, which is the same thing the reconciler's missing-ticks death wrote and the
+same thing `apply_job_history` wrote for a failed history. **All three paths agreed, and all three
+were wrong.** So this is not "make the externally-killed path agree with the in-app one"; it is one
+new rule applied to all three.
+
+`batch.shot_status_after_failed_render(shot)` is that rule and its whole implementation:
+
+* **no take → `ready`.** A shot that was armed, submitted and got nothing back is not in a failed
+  state, it is in an un-started one. `ready` is exactly where it stood before the submission:
+  `Generate All` picks it up again, `generate_h3` accepts it directly (it gates on
+  `status == "ready"`), and the inspector draws `Back to draft` instead of a flag over a take that
+  does not exist. Nothing needs re-opening first, because nothing ever closed.
+* **a take → `error`, unchanged.** A failed *re*-render is a real settled state with a real file
+  behind it. `Render again` and `Flag for re-render` are the right controls for it, and releasing
+  it would drop a shot with a good take straight back into the batch's ready set to be rendered
+  over.
+
+The test is `shot_has_take` — `latest_output` and nothing else — and that function's own recorded
+reasons are why: a shot can read `complete` and hold no video, and a shot can read `error` and hold
+a perfectly good earlier take. Both of those still work; only the failed-and-empty case moved.
+
+Three sentences ended `"Render again re-opens the shot."` and stopped being true, so they now share
+one clause, `batch.SHOT_AFTER_FAILED_RENDER`, which states both halves of the rule.
+
+### 2. There was no way to cancel a batch
+
+**Scope: every open ComfyUI render in the project, not one batch**, and the argument is recorded on
+`app.CANCEL_ALL_NONE_OPEN`. The short form: the gesture being replaced is ComfyUI's own *clear
+queue*, which stops everything, and a control that stops less will not replace the trip to ComfyUI;
+`reconcilable_jobs` is already **the** definition of "this project has renders in flight", so
+cancelling exactly that set is what makes the poll stand down afterwards as observable proof;
+`batch_id` is empty for every render submitted outside a batch, so a batch-scoped cancel could not
+touch a lone `Render again`, an LTX enhance or a music job sitting `queued` in the same panel.
+Local work is excluded for free — `reconcilable_jobs` skips an empty `prompt_id` — and it should be:
+nothing here can stop a running ffmpeg, so settling its record would be a claim the route cannot
+back.
+
+`DELETE /api/projects/{id}/jobs` is **not a second cancellation path**. Each job is settled by
+`cancel_job` itself, called in-closure exactly as `generate_batch` calls `generate_h3`, so the
+ComfyUI dequeue, the record settle, the timing stamp, the note and the shot's release are the
+per-job route's own. A source-level test asserts the route writes no `status`, no `error`, no stamp
+and calls no `store.save` of its own.
+
+A job that **settles between the click and the loop reaching it** is reported, not double-handled:
+the set is chosen once from the read that produced the confirmed count, and every iteration re-reads
+the manifest inside `cancel_job`, so the settled one is refused there with `CANCEL_JOB_SETTLED` and
+lands in `skipped` by name. The same `except` catches a ComfyUI that went down mid-loop and a record
+that vanished; each is one row rather than a failure of the whole gesture, because a Director who
+stopped nineteen of twenty-six renders needs to know which seven are still running.
+
+The confirmation is server-enforced (`confirm_cancel`) and **names the count**, on
+`GENERATE_BATCH_CONFIRM_REFUSAL`'s argument in the other direction. Empty is checked **before**
+unconfirmed, deliberately: a click on a project with nothing running is told so rather than asked to
+confirm stopping zero renders. 409 for the missing confirmation, matching `delete_project` — the
+request is well formed and what is missing is consent to something destructive.
+
+### 3. The timeline could not tell the rendering clip from the ones waiting
+
+The gap was narrow and complete: **nothing in this application writes `running` onto a Shot.**
+`generate_h3` writes `queued`; the reconciler writes `running` onto the *job*. So a batch of
+twenty-six drew twenty-six identical `RENDERING` clips in the same blue, while the queue panel one
+tab over knew exactly which was on the GPU.
+
+`renderPhaseByShot(report)` is `renderProgressByTarget` one field over: pure over the render-status
+report the poll **already fetches**, joining jobs to targets, held beside the project rather than
+patched into it (a value folded into `project.jobs` is written into the manifest by the next save).
+**No new polling and no new request** — a contract test drives one real `pollRenderStatus` tick and
+counts the requests. One pass per tick builds the map; the timeline does one keyed lookup per clip,
+which is what it already does for the percentage and for `windowWarningsByShot`.
+
+The clip draws `RENDERING 42%` in amber over a warmer body for the running shot and `QUEUED` in
+muted grey for one waiting behind it, with a different sentence in the accessible name for each —
+a different **word**, not a dimmer copy of the same one, because state is never carried by colour
+alone here. A shot that is neither running nor queued draws nothing at all, and an unknown phase
+degrades to exactly what the clip drew before this existed. **No animation**: the timeline
+re-renders on `pointerdown`, so a keyframed pulse would restart on every click of every clip.
+
+### Found and not fixed
+
+`cancel_job` reads the whole manifest, awaits ComfyUI, then saves the whole manifest back. A write
+that lands inside that span — a poll tick settling another job — is lost. It is a pre-existing
+lost-update window in the per-job route, it is not introduced or widened by the loop above (which
+re-reads per iteration), and closing it means the fresh-read-and-patch shape `generate_batch` uses
+for its bookkeeping. Recorded here rather than fixed in a change about cancellation.
+
+### Verified
+
+`uv run pytest` — **1916 passed** (1899 before). `uv run ruff check .` clean. `node --check` clean
+on both JS modules. Every new branch was mutation-swept in a dedicated `git worktree` with
+`PYTHONPATH` pinned at that tree's own `src` and the import location printed before the sweep;
+restores are byte-for-byte, anchors are converted to each file's own line ending with their match
+count asserted, and one sentinel per touched file had to fail for the run to count.
+
+**A restart is required** for any of this to be reachable in a browser: the application serves
+`app.js`, `api.js`, `styles.css` and `index.html` from disk, and the new `DELETE /jobs` route is a
+server change.
+
 ## 2026-08-23 — Nine named items cleared: a fixed-seed claim that needed a condition, a fallback that mislabelled, two more callers of a resolver written for them, and a tuple whose name asked the wrong question
 
 A list of known, named, unfixed items, worked as a batch. **The accounting is as much the

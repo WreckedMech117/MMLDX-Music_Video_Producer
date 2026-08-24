@@ -1390,10 +1390,14 @@ async def test_a_vanished_prompt_keeps_its_status_until_absence_persists():
     One absent tick is what the seconds of a ComfyUI restart look like, so the early ticks
     only *count* (persisted, so the counter survives the browser's two-second poll). At
     `MISSING_TICKS_LIMIT` the absence is the answer: the prompt died with the queue, the job
-    settles as that error in `JOB_LOST_WITH_QUEUE`'s words, and the h3 job's shot moves to
-    `error` so it stops pinning render-status "active" and can be re-opened. Met three times
-    live on 2026-08-19/20: pulled queue entries and a CUDA-crash restart each left jobs
-    "queued" forever.
+    settles as that error in `JOB_LOST_WITH_QUEUE`'s words, and the h3 job's shot is released
+    so it stops pinning render-status "active". Met three times live on 2026-08-19/20: pulled
+    queue entries and a CUDA-crash restart each left jobs "queued" forever.
+
+    **This is the externally-killed path**, and since 2026-08-23 the shot it releases with no
+    take lands on `ready` rather than on `error` — the same place `cancel_job` puts one, through
+    the same `shot_status_after_failed_render`. A render cleared out of ComfyUI's own UI and one
+    cancelled with the `×` must not leave the Director's plan in two different states.
     """
     project = render_plan()
     comfy = ScriptedComfy()
@@ -1411,8 +1415,10 @@ async def test_a_vanished_prompt_keeps_its_status_until_absence_persists():
     settled = {job.id: job for job in project.jobs if job.status != "complete"}
     assert {job.status for job in settled.values()} == {"error"}
     assert all(job.error == JOB_LOST_WITH_QUEUE for job in settled.values())
-    # The h3 job's shot is released from its stuck in-flight status...
-    assert project.shots[0].status == "error"
+    # The h3 job's shot is released from its stuck in-flight status — and it never produced a
+    # take, so "released" means back to `ready`, ready for the next batch, not `error`.
+    assert project.shots[0].latest_output == ""
+    assert project.shots[0].status == "ready"
     # ...and a lost job that reappears in the queue is forgiven its strikes.
     reborn = ScriptedComfy(pending=["prompt-h3"])
     fresh = render_plan()
@@ -1551,7 +1557,15 @@ async def test_h3_completion_moves_the_shot_and_displaces_the_stale_review():
     assert shot.latest_review is None
 
 
-async def test_an_h3_execution_error_marks_the_shot_and_carries_the_reason():
+async def test_an_h3_execution_error_releases_a_takeless_shot_and_carries_the_reason():
+    """A render that failed and produced nothing leaves the shot **available**, not settled.
+
+    The Director's report of 2026-08-23: twenty-six failed renders all left `error` shots, so the
+    inspector offered `Flag for re-render` — a control about a take they did not like — for shots
+    that had never had a take at all. `error` is a settled state and settling requires something
+    to have settled; nothing did here. The job keeps ComfyUI's own reason, which is where the
+    failure is read.
+    """
     project = render_plan()
     comfy = ScriptedComfy(
         histories={
@@ -1564,10 +1578,57 @@ async def test_an_h3_execution_error_marks_the_shot_and_carries_the_reason():
     outcome = await reconcile_render_jobs(project, comfy)
 
     assert outcome.changed is True
-    assert project.shots[0].status == "error"
+    assert project.shots[0].latest_output == ""
+    assert project.shots[0].status == "ready"
     job = next(job for job in project.jobs if job.id == "job_h3")
     assert job.status == "error"
     assert job.error == "KSampler: out of memory"
+
+
+async def test_an_h3_execution_error_over_an_existing_take_still_settles_the_shot():
+    """The half that must not move. A failed *re*-render is a settled shot with a real take
+    behind it: `Render again` and `Flag for re-render` are the right controls for it, and
+    releasing it to `ready` would put a shot with a good take back in Generate All's ready set.
+
+    `latest_output` is the whole test — `batch.shot_has_take`'s rule, and the reason `status`
+    cannot stand in for it: this shot reads `error` and holds a perfectly good take.
+    """
+    project = render_plan()
+    project.shots[0].latest_output = "old/take_00001.mp4"
+    comfy = ScriptedComfy(
+        histories={
+            "prompt-h3": HistoryResult(
+                prompt_id="prompt-h3", status="error", error="KSampler: out of memory"
+            )
+        }
+    )
+
+    await reconcile_render_jobs(project, comfy)
+
+    assert project.shots[0].status == "error"
+    # Nothing on the failure path clears a pointer: the previous take is still what plays.
+    assert project.shots[0].latest_output == "old/take_00001.mp4"
+
+
+def test_a_complete_shot_holding_no_output_is_left_exactly_as_it_was():
+    """The third case, and the one that changes nothing: `complete` with no `latest_output`.
+
+    `apply_job_history` writes `status = "complete"` before it looks at `output_files`, so this
+    state is reachable and real. It is not a failed render, so `shot_status_after_failed_render`
+    is never asked about it — and `shot_has_take` still says no about it, which is what keeps it
+    inside Generate All Empty's scope. Both halves are asserted here because the release rule
+    reads the same field the scope does, and a change to one that quietly moved the other would
+    otherwise pass.
+    """
+    shot = Shot(id="shot_hollow", start=0, duration=4, prompt="Wide", status="complete")
+
+    assert shot_has_take(shot) is False
+    assert shot.status == "complete"
+    # And it is still what the empty scope names, unchanged by any of this.
+    project = Project(name="Hollow", shots=[shot])
+    targets, skipped = batch_targets(project, scope="empty")
+    assert [target.id for target in targets] == ["shot_hollow"]
+    assert skipped == []
 
 
 async def test_music_adoption_is_keyed_by_prompt_id_not_by_whatever_song_is_loaded():

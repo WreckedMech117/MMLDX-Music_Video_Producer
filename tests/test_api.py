@@ -2,6 +2,7 @@ import ast
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import re
 import subprocess
@@ -25,6 +26,9 @@ from music_video_producer.app import (
     ASSET_NAME_EMPTY,
     ASSET_NAME_LIMIT,
     ASSET_NAME_TOO_LONG,
+    CANCEL_ALL_NONE_OPEN,
+    CANCEL_JOB_NOTE,
+    CANCEL_JOB_SETTLED,
     CHAT_EMPTY_MESSAGE,
     CONSISTENCY_PROMPT_LIMIT,
     CONSISTENCY_PROMPT_TOO_LONG,
@@ -12440,7 +12444,13 @@ def test_an_asset_deletes_unless_a_shot_cites_it(tmp_path: Path):
 def test_cancelling_a_job_settles_it_and_releases_the_shot(tmp_path: Path):
     """Both halves in one act — dequeue on ComfyUI AND settle the record — because this
     same night proved what a queue-only cancel leaves behind: a job stuck 'queued' until
-    the reconciler's strike counter cleans it up."""
+    the reconciler's strike counter cleans it up.
+
+    And "releases" now means what the `×`'s tooltip has always claimed. Until 2026-08-23 this
+    route wrote `error` onto a shot that had never produced anything, which is what put
+    **Flag for re-render** — a control about a take the Director does not like — in front of a
+    Director whose render had produced no take at all. It goes back to `ready`.
+    """
     client, store, comfy = make_client(tmp_path)
     project = store.create(Project(name="Cancellable"))
     project.shots = [Shot(id="shot_r", start=0, duration=4, prompt="Wide", status="queued")]
@@ -12452,9 +12462,33 @@ def test_cancelling_a_job_settles_it_and_releases_the_shot(tmp_path: Path):
     assert comfy.cancelled == ["prompt-r"]
     body = cancelled.json()
     assert body["jobs"][0]["status"] == "cancelled"
-    assert body["shots"][0]["status"] == "error"
+    assert body["shots"][0]["status"] == "ready"
     settled = client.delete(f"/api/projects/{project.id}/jobs/job_r")
     assert settled.status_code == 422
+
+
+def test_cancelling_a_render_over_an_existing_take_leaves_the_shot_settled(tmp_path: Path):
+    """The other half of the release rule, and the one that must NOT move: a shot re-rendering
+    over a take it already holds is settled as `error`, keeps the take, and goes on offering
+    Render again and Flag for re-render — which are the right controls for a take that exists.
+
+    Releasing this one to `ready` would put a shot with a perfectly good take straight back into
+    Generate All's ready set to be rendered over, which is the harm the two cases exist to keep
+    apart. `latest_output` is the test, never `status` — see `batch.shot_has_take`.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Retake"))
+    project.shots = [Shot(id="shot_k", start=0, duration=4, prompt="Wide", status="queued",
+                          latest_output="takes/kept_00001.mp4")]
+    project.jobs = [RenderJob(id="job_k", kind="h3", target_id="shot_k",
+                              status="running", prompt_id="prompt-k")]
+    store.save(project)
+    cancelled = client.delete(f"/api/projects/{project.id}/jobs/job_k")
+    assert cancelled.status_code == 200
+    shot = cancelled.json()["shots"][0]
+    assert shot["status"] == "error"
+    # The take is untouched by the cancellation: nothing here clears a pointer.
+    assert shot["latest_output"] == "takes/kept_00001.mp4"
 
 
 def test_select_take_switches_takes_and_attaches_video_assets(tmp_path: Path):
@@ -18081,7 +18115,9 @@ def test_a_contended_poll_still_settles_a_genuinely_orphaned_record(tmp_path: Pa
     settled = store.get(project.id)
     assert settled.jobs[0].status == "error"
     assert settled.jobs[0].error == JOB_NEVER_SUBMITTED
-    assert settled.shots[0].status == "error"
+    # Released rather than settled: no graph was ever accepted, so nothing rendered and there is
+    # no take to flag. `ready` is where the shot stood before the submission it never got.
+    assert settled.shots[0].status == "ready"
     assert settled.creative_brief == f"edit {MISSING_TICKS_LIMIT - 1}"
     assert report.json()["active"] is False
 
@@ -18416,7 +18452,9 @@ def test_an_orphaned_pre_submit_record_reconciles_through_the_poll(tmp_path: Pat
     settled = store.get(project.id)
     assert settled.jobs[0].status == "error"
     assert settled.jobs[0].error == JOB_NEVER_SUBMITTED
-    assert settled.shots[0].status == "error"
+    # Released rather than settled: the graph was never accepted, so this shot never had a take
+    # and the next batch should simply pick it up again.
+    assert settled.shots[0].status == "ready"
     # The poll releases, which is what "settled" has to mean to the browser.
     assert report.json()["active"] is False
 
@@ -20847,3 +20885,251 @@ def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
         assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200, name
 
         assert getattr(timing_of(store, project_id, job_id), name) == held, name
+
+
+# ----------------------------------------------------------------------------------------------
+# Cancel every open render (the Director's report, 2026-08-23). The per-job `×` works; twenty-six
+# of it is a chore, and the chore is what sent them to ComfyUI's own UI to clear the queue.
+# ----------------------------------------------------------------------------------------------
+
+
+def cancellable_project(store, *, jobs, shots=()):
+    """A project with an open queue, for the whole-queue cancel."""
+    project = store.create(Project(name="Cancel all"))
+    project.shots = list(shots)
+    project.jobs = list(jobs)
+    return store.save(project)
+
+
+def test_cancelling_the_whole_queue_refuses_until_the_count_has_been_shown(tmp_path: Path):
+    """The confirmation is server-enforced and it names the count, because that count is the
+    whole of what makes the gesture judgeable: twenty-six renders stopped is not undoable, and a
+    client that never showed the number must not be able to spend the decision by omission.
+
+    409 rather than 422, matching `delete_project`: the request is well formed and the state is
+    real, and what is missing is consent to something destructive.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = cancellable_project(store, jobs=[
+        RenderJob(id="job_1", kind="h3", target_id="shot_a", status="queued", prompt_id="p1"),
+        RenderJob(id="job_2", kind="h3", target_id="shot_b", status="running", prompt_id="p2"),
+        RenderJob(id="job_3", kind="h3", target_id="shot_c", status="complete", prompt_id="p3"),
+    ])
+
+    refused = client.delete(f"/api/projects/{project.id}/jobs")
+
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    # The two open ones, not the settled one, and the number is in the sentence the Director reads.
+    assert "2 open render(s)" in detail
+    assert "not just the newest batch" in detail
+    assert "confirm_cancel=true" in detail
+    # And nothing was touched: no ComfyUI call, no record moved.
+    assert comfy.cancelled == []
+    assert [job.status for job in store.get(project.id).jobs] == ["queued", "running", "complete"]
+
+
+def test_cancelling_the_whole_queue_settles_every_open_job_and_releases_their_shots(
+    tmp_path: Path,
+):
+    """One click for the whole queue, and every job settled by `cancel_job` itself.
+
+    The scope is every open ComfyUI render in the project rather than one batch, which is what
+    makes it a replacement for the trip to ComfyUI: `job_lone` belongs to no batch at all and
+    would be unreachable from a batch-scoped cancel, and `job_ltx` is a different kind entirely.
+    A settled job is left exactly as it was, and so is the local export -- `reconcilable_jobs`
+    skips an empty `prompt_id`, and nothing here could stop a running ffmpeg anyway.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = cancellable_project(
+        store,
+        shots=[
+            Shot(id="shot_a", start=0, duration=4, prompt="Wide", status="queued"),
+            Shot(id="shot_b", start=4, duration=4, prompt="Crane", status="running",
+                 latest_output="takes/kept.mp4"),
+            Shot(id="shot_c", start=8, duration=4, prompt="Push", status="complete",
+                 latest_output="takes/done.mp4"),
+        ],
+        jobs=[
+            RenderJob(id="job_batch", kind="h3", batch_id="batch_1", target_id="shot_a",
+                      status="queued", prompt_id="p1"),
+            RenderJob(id="job_retake", kind="h3", batch_id="batch_1", target_id="shot_b",
+                      status="running", prompt_id="p2"),
+            RenderJob(id="job_done", kind="h3", batch_id="batch_1", target_id="shot_c",
+                      status="complete", prompt_id="p3"),
+            RenderJob(id="job_lone", kind="music", target_id="song", status="queued",
+                      prompt_id="p4"),
+            RenderJob(id="job_export", kind="post", target_id="", status="running",
+                      prompt_id=""),
+        ],
+    )
+
+    report = client.delete(f"/api/projects/{project.id}/jobs?confirm_cancel=true")
+
+    assert report.status_code == 200, report.text
+    body = report.json()
+    assert [entry["job_id"] for entry in body["cancelled"]] == ["job_batch", "job_retake", "job_lone"]
+    assert body["skipped"] == []
+    # Under the names the queue panel already draws: a shot job by its shot label, everything
+    # else by its kind and record id, because an asset or song id appears nowhere in the UI.
+    assert [entry["label"] for entry in body["cancelled"]] == [
+        "SHOT 01 (shot_a)", "SHOT 02 (shot_b)", "music job job_lone",
+    ]
+    # Each one dequeued on ComfyUI, in queue order, through the per-job route's own call.
+    assert comfy.cancelled == ["p1", "p2", "p4"]
+
+    saved = {job.id: job for job in store.get(project.id).jobs}
+    assert saved["job_batch"].status == "cancelled"
+    assert saved["job_retake"].status == "cancelled"
+    assert saved["job_lone"].status == "cancelled"
+    # One wording for one act, and it is `cancel_job`'s: this route writes no note of its own.
+    # Pinned twice on purpose -- identity to the named constant proves the route did not invent a
+    # second sentence, and the content pin is what makes the identity mean anything, since a
+    # comparison against the constant the value came from can only ever pass.
+    assert saved["job_batch"].error == CANCEL_JOB_NOTE
+    assert "Cancelled by the Director before it finished." in saved["job_batch"].error
+    assert "goes back to ready" in saved["job_batch"].error
+    # Settled therefore stamped, by the per-job route's own `stamp_job_settled`.
+    assert saved["job_batch"].render_seconds_source
+    # The settled job and the local export are untouched.
+    assert saved["job_done"].status == "complete"
+    assert saved["job_export"].status == "running"
+
+    shots = {shot.id: shot for shot in store.get(project.id).shots}
+    # No take, so released back to ready: the next batch picks it up and the inspector offers
+    # `Back to draft` rather than a flag over a take that does not exist.
+    assert shots["shot_a"].status == "ready"
+    # A take it already held, so settled as `error` and the take is still there.
+    assert shots["shot_b"].status == "error"
+    assert shots["shot_b"].latest_output == "takes/kept.mp4"
+    # Never in flight, never touched.
+    assert shots["shot_c"].status == "complete"
+
+
+def test_cancelling_the_whole_queue_reports_a_job_that_settled_mid_loop_by_name(
+    tmp_path: Path, monkeypatch
+):
+    """The race this route has to answer for: a poll tick settles a job between the click and
+    the loop reaching it.
+
+    The set is chosen once, from the read that produced the count the Director confirmed, but
+    every iteration re-reads the manifest inside `cancel_job` -- so the settled one is found
+    terminal there and refused with that route's own sentence. It lands in `skipped` by name and
+    stops nothing else, which is `generate_batch`'s per-shot rule in the other direction.
+
+    Injected **between iterations** -- immediately after the first cancellation's save and before
+    the next one's read -- because that is where the window actually is. It is deliberately not
+    injected inside a single `cancel_job`, which reads the whole manifest, awaits ComfyUI and then
+    saves the whole manifest back: a write landing inside *that* span is lost to the save, which
+    is a pre-existing hazard of the per-job route and not something this loop introduces or can
+    fix from the outside.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = cancellable_project(
+        store,
+        shots=[
+            Shot(id="shot_a", start=0, duration=4, prompt="Wide", status="queued"),
+            Shot(id="shot_b", start=4, duration=4, prompt="Crane", status="queued"),
+            Shot(id="shot_c", start=8, duration=4, prompt="Push", status="queued"),
+        ],
+        jobs=[
+            RenderJob(id="job_1", kind="h3", target_id="shot_a", status="queued", prompt_id="p1"),
+            RenderJob(id="job_2", kind="h3", target_id="shot_b", status="queued", prompt_id="p2"),
+            RenderJob(id="job_3", kind="h3", target_id="shot_c", status="queued", prompt_id="p3"),
+        ],
+    )
+
+    settled_by_the_poll = []
+    write = store.save
+
+    def save_then_let_the_poll_land(saving):
+        stored = write(saving)
+        if settled_by_the_poll:
+            return stored
+        settled_by_the_poll.append("job_2")
+        mid_flight = store.get(project.id)
+        for job in mid_flight.jobs:
+            if job.id == "job_2":
+                job.status = "complete"
+                job.output_files = ["takes/landed.mp4"]
+        for shot in mid_flight.shots:
+            if shot.id == "shot_b":
+                shot.status = "complete"
+                shot.latest_output = "takes/landed.mp4"
+        write(mid_flight)
+        return stored
+
+    monkeypatch.setattr(store, "save", save_then_let_the_poll_land)
+
+    report = client.delete(f"/api/projects/{project.id}/jobs?confirm_cancel=true")
+
+    assert report.status_code == 200, report.text
+    body = report.json()
+    # The two that were still open were stopped; the one that finished in the meantime was not.
+    assert [entry["job_id"] for entry in body["cancelled"]] == ["job_1", "job_3"]
+    assert [entry["job_id"] for entry in body["skipped"]] == ["job_2"]
+    assert body["skipped"][0]["label"] == "SHOT 02 (shot_b)"
+    assert body["skipped"][0]["reason"] == CANCEL_JOB_SETTLED.format(status="complete")
+    # And by content, so the identity above is not a constant compared with itself.
+    assert "already complete" in body["skipped"][0]["reason"]
+    assert "nothing running to cancel" in body["skipped"][0]["reason"]
+    # Never re-cancelled on ComfyUI, and its take is untouched.
+    assert comfy.cancelled == ["p1", "p3"]
+    saved = store.get(project.id)
+    landed = {job.id: job for job in saved.jobs}["job_2"]
+    assert landed.status == "complete"
+    assert landed.output_files == ["takes/landed.mp4"]
+    shots = {shot.id: shot for shot in saved.shots}
+    assert shots["shot_b"].status == "complete"
+    assert shots["shot_b"].latest_output == "takes/landed.mp4"
+    # And the two that were cancelled had produced nothing, so both are available again.
+    assert shots["shot_a"].status == "ready"
+    assert shots["shot_c"].status == "ready"
+
+
+def test_cancelling_the_whole_queue_with_nothing_open_says_so_rather_than_asking(
+    tmp_path: Path,
+):
+    """Empty is checked before the confirmation, deliberately: a click on a project with nothing
+    running should be told that, not asked to confirm stopping zero renders. A dialog naming `0`
+    is a dialog that teaches a Director to click through dialogs.
+
+    A settled job and a local export are both "nothing open" here, for the two different reasons
+    `reconcilable_jobs` already distinguishes.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = cancellable_project(store, jobs=[
+        RenderJob(id="job_done", kind="h3", target_id="shot_a", status="complete", prompt_id="p1"),
+        RenderJob(id="job_export", kind="post", target_id="", status="running", prompt_id=""),
+    ])
+
+    for query in ("", "?confirm_cancel=true"):
+        empty = client.delete(f"/api/projects/{project.id}/jobs{query}")
+        assert empty.status_code == 422, query
+        assert empty.json()["detail"] == CANCEL_ALL_NONE_OPEN, query
+        # By content as well as by identity: the line above compares the route's answer with the
+        # constant it was built from, which on its own can only pass.
+        assert "nothing to cancel" in empty.json()["detail"], query
+        assert "only a queued or running one can be stopped" in empty.json()["detail"], query
+    assert comfy.cancelled == []
+
+
+def test_the_whole_queue_cancel_is_the_per_job_route_and_not_a_second_settle_path():
+    """Structural: this route writes no `status`, no `error` and no stamp of its own.
+
+    Two spellings of one cancellation rule is the recurring defect this delegation exists to
+    avoid, and it is invisible in behaviour until the two drift -- so it is asserted about the
+    source. The only writes the route makes are its two report lists.
+    """
+    source = inspect.getsource(create_app)
+    body = source.split("async def cancel_open_jobs", 1)[1].split("\n    @app.", 1)[0]
+    assert "await cancel_job(project_id, job_id)" in body
+    for spelling in (
+        'job.status = "cancelled"',
+        "job.error =",
+        "stamp_job_settled",
+        "shot.status =",
+        "comfy.cancel",
+        "store.save",
+    ):
+        assert spelling not in body, spelling

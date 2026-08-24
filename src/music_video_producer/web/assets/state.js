@@ -52,6 +52,18 @@ export const state = {
   // codebase's repeat offender for exactly that. Kept beside `vramEject`, which is out here for
   // the same reason: it is machine state, not project data.
   renderProgress: {},
+  // Which shot ComfyUI is rendering *now* and which are waiting behind it, `{ shotId: phase }`,
+  // rebuilt from every render-status answer by `renderPhaseByShot`. Out here for
+  // `renderProgress`' reasons exactly -- it is derived from an answer rather than stored on the
+  // manifest, and a phase folded into `project.jobs[].status` would be written back by the next
+  // ordinary project save.
+  //
+  // It exists because nothing in this application ever writes `running` onto a Shot: the
+  // submission route writes `queued` and the reconciler writes `running` onto the *job*, so
+  // `Shot.status` alone cannot tell a clip on the GPU from twenty-five queued behind it. An
+  // empty object is the honest starting state, and an absent key makes the clip draw exactly
+  // what it drew before this existed.
+  renderPhase: {},
 };
 
 export function selectedAsset() {

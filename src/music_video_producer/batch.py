@@ -70,6 +70,7 @@ __all__ = [
     "NOTE_KIND_WINDOW_SHORT",
     "PLACEHOLDER_PROMPT",
     "READINESS_REFUSAL",
+    "SHOT_AFTER_FAILED_RENDER",
     "SHOT_SETTING_FIGHTS_SECTION",
     "SHOT_WITH_STALE_REFERENCE_MAP",
     "TERMINAL_JOB_STATUSES",
@@ -94,6 +95,7 @@ __all__ = [
     "sampling_bundle_summary",
     "setting_conflict_note",
     "shot_label",
+    "shot_status_after_failed_render",
     "stamp_job_settled",
     "supersede_target_jobs",
     "take_coverage_note",
@@ -1275,9 +1277,19 @@ _ADOPTED_HISTORY_STATUSES = frozenset({"queued", "running", "complete", "error"}
 #: with the queue.
 MISSING_TICKS_LIMIT = 3
 
+#: What a settle that produced nothing leaves behind, said once and shared by every sentence that
+#: has to say it. Before 2026-08-23 all three of them ended "Render again re-opens the shot",
+#: which stopped being true the moment `shot_status_after_failed_render` started releasing a shot
+#: that never got a take: such a shot is already open, and `Render again` is not drawn for it.
+#: Both halves are named because both are reachable from one settle — see that function.
+SHOT_AFTER_FAILED_RENDER = (
+    "A shot left with no take by this goes back to ready, so the next batch picks it up; one "
+    "that still holds an earlier take stays settled and offers Render again."
+)
+
 JOB_LOST_WITH_QUEUE = (
     "ComfyUI no longer knows this prompt — its queue was cleared, restarted, or crashed "
-    "before the render ran. Nothing was produced. Render again re-opens the shot."
+    f"before the render ran. Nothing was produced. {SHOT_AFTER_FAILED_RENDER}"
 )
 
 #: What `prompt_id` holds between a job record being saved and its graph being accepted by
@@ -1312,7 +1324,7 @@ PENDING_SUBMISSION_PROMPT_ID = "pending-submission"
 #: identical, so the last two sentences are.
 JOB_NEVER_SUBMITTED = (
     "The record for this render was saved and its graph was then never accepted by ComfyUI, "
-    "so no prompt was ever queued. Nothing was produced. Render again re-opens the shot."
+    f"so no prompt was ever queued. Nothing was produced. {SHOT_AFTER_FAILED_RENDER}"
 )
 
 
@@ -1373,6 +1385,41 @@ def queue_locations(payload: dict[str, Any]) -> dict[str, str]:
                 if isinstance(part, str):
                     located[part] = state
     return located
+
+
+def shot_status_after_failed_render(shot: Shot) -> ShotStatus:
+    """Where a Shot lands when its render stops without completing. The one rule, three callers.
+
+    The Director's report (2026-08-23): a Generate All at 20 steps was cancelled from ComfyUI's own
+    UI part-way through, twenty-six renders died with it, and every one of those shots came back
+    reading `error` — so the inspector offered **Flag for re-render**, a control that means "this
+    shot has a take I do not like". None of them had a take. Nothing had rendered. In their words:
+    "thier option is 'Flag for re-render' instead of just returning to ready after the fail."
+
+    **`error` and no take is not a failure state, it is an un-started one.** Such a shot was armed,
+    it was submitted, and it never got anything back. The honest place for it is exactly where it
+    stood before the submission — `ready` — from which `Generate All` picks it up again, the
+    per-shot submit route accepts it (`generate_h3` gates on `status == "ready"`), and the
+    inspector draws `Back to draft` rather than a re-render flag over a take that does not exist.
+    Nothing has to be un-done first: `render_again` exists to *re-open* a settled shot, and a shot
+    that never closed does not need re-opening.
+
+    **A shot that still holds an earlier take keeps `error`, unchanged.** That is a real settled
+    state with a real file behind it: the take on screen is the previous one, `Render again` and
+    `Flag for re-render` are the right controls for it, and releasing it to `ready` would put a
+    shot with a perfectly good take back in the batch's ready set to be rendered over.
+
+    **The test is `shot_has_take`, not `status`** — that function's own three reasons, and this is
+    a fourth caller of them rather than a fourth reading. Most sharply here: a shot can read
+    `error` and hold a good earlier take, and a shot can read `complete` and hold nothing at all.
+    Only `latest_output` separates the two cases this function has to separate.
+
+    Pure, and returns rather than writes, because the three settle paths each guard differently on
+    the way in — `cancel_job` and the missing-ticks death only touch a shot that is still in flight,
+    while `apply_job_history` adopts ComfyUI's own verdict unconditionally — and folding those
+    guards in here would make one of them silently apply to the other two.
+    """
+    return "error" if shot_has_take(shot) else "ready"
 
 
 def apply_job_history(project: Project, job: RenderJob, history: HistoryResult) -> None:
@@ -1454,7 +1501,12 @@ def apply_job_history(project: Project, job: RenderJob, history: HistoryResult) 
     elif job.kind == "h3" and job.status == "error":
         shot = next((item for item in project.shots if item.id == job.target_id), None)
         if shot:
-            shot.status = "error"
+            # `error` only where there is a take to be settled *over*; a shot this render left
+            # with nothing is released back to `ready`. See `shot_status_after_failed_render`.
+            # Nothing on this branch moves `latest_output` — only the `complete` branch above does
+            # — so what is read here is the earlier take the shot was already holding, which is
+            # exactly the thing the two cases have to be told apart by.
+            shot.status = shot_status_after_failed_render(shot)
 
 
 @dataclass(slots=True)
@@ -1545,8 +1597,14 @@ async def reconcile_render_jobs(project: Project, comfy: Any) -> RenderReconcili
                 shot = next(
                     (item for item in project.shots if item.id == job.target_id), None
                 )
+                # The externally-killed path: ComfyUI's queue was cleared, restarted or crashed
+                # under a live batch, which is precisely what the Director did on 2026-08-23 and
+                # what left twenty-six takeless shots reading `error`. It settles the shot through
+                # the same one rule the completion path and the cancel route use, so a render
+                # killed outside this application and one cancelled inside it leave the shot in
+                # the same place. See `shot_status_after_failed_render`.
                 if job.kind == "h3" and shot and shot.status in ("queued", "running"):
-                    shot.status = "error"
+                    shot.status = shot_status_after_failed_render(shot)
             continue
         before = (job.status, list(job.output_files), job.error)
         apply_job_history(project, job, history)

@@ -23,6 +23,10 @@ import { CLIP_RECHECK_LABEL, attachToShotControl, clipCardFace, clipPreviewState
 // The shot-length band, as the server judges it: the report carries the verdict and the clip
 // reads it. Nothing on this side re-derives the band -- see `clipWindowState` for why.
 import { clipWindowState, windowWarningsByShot } from "./api.js";
+// The whole-queue cancel (the Director's ask, 2026-08-23) and the render-phase indicator that
+// tells the clip ComfyUI is on from the ones waiting behind it. Both are decided in api.js and
+// only applied here, `clipWindowState`'s rule one line up.
+import { CANCEL_ALL_CONTROL, cancelAllPlan, cancellationToast, clipRenderPhase, renderPhaseByShot } from "./api.js";
 import { REPLACE_WITH_CANCEL, REPLACE_WITH_HEADING, REPLACE_WITH_HELP, REPLACE_WITH_MERGED_HEADING, REPLACE_WITH_PLACEHOLDER, REPLACE_WITH_RUNNING, REPLACE_WITH_SKIPPED_HEADING, REPLACE_WITH_SWAPPED_HEADING, assetIsCited, assetReplacementControl, assetReplacementOptions, assetReplacementReportLines, replaceInShotsControl } from "./api.js";
 import { selectedAsset, selectedShot, state } from "./state.js";
 
@@ -313,6 +317,10 @@ async function loadProject(id) {
   // render nobody is looking at. Cleared on every load, refresh included -- the next poll answer
   // rebuilds it whole, and until then the surfaces show what they show with nothing known.
   state.renderProgress = {};
+  // The render phases belong to the project being left for the identical reason, and are cleared
+  // in the same breath: they are keyed by shot id, and a QUEUED clip drawn under another project's
+  // name is a claim about a render nobody is looking at. The next poll answer rebuilds it whole.
+  state.renderPhase = {};
   // Ahead of the no-project branch too, and for the same reason: the Song context editors are
   // seeded from the project on screen, so a sheet left dirty from the project being left would
   // otherwise stay in the boxes under the next project's name -- or under no project at all.
@@ -1475,16 +1483,24 @@ function renderTimeline() {
     // Director's yellow; the sentence goes into the title and the accessible name beside it,
     // because a state carried by colour alone does not exist for a screen reader and this
     // application says so about every other state it draws.
-    const band = clipWindowState(windowKinds[shot.id], cell.label);
+    // Which of the two in-flight states this clip is in -- on the GPU, or waiting behind another
+    // render -- read off the phase map the poll already builds, and applied here rather than
+    // re-decided. `render.inFlight` is still the gate: a shot with no render open carries no state
+    // span and no phase class, exactly as before. An *unknown* phase (no report yet, or a job kind
+    // that names no shot) draws exactly what this line drew before the feature existed --
+    // `RENDERING` from `renderingFlag`, no class, no extra sentence.
+    const phase = clipRenderPhase(render.inFlight ? state.renderPhase?.[shot.id] : "", percent);
+    const band = clipWindowState(windowKinds[shot.id], [cell.label, phase.note].filter(Boolean).join(" "));
     const marks = [
       `status-${shot.status || "draft"}`,
       shot.approved_output || shot.status === "approved" ? "approved" : "",
       shot.flagged ? "flagged" : "",
       shot.locked ? "locked" : "",
       render.inFlight ? "rendering" : "",
+      phase.className,
       band.className,
     ].filter(Boolean).join(" ");
-    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
+    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(phase.flag || renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
   }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
@@ -2857,9 +2873,17 @@ export async function pollRenderStatus() {
     const progress = renderProgressByTarget(report);
     const progressMoved = JSON.stringify(progress) !== JSON.stringify(state.renderProgress || {});
     state.renderProgress = progress;
+    // Which shot ComfyUI is on *now*, and which are waiting behind it. Off the same answer, held
+    // beside the project for the same reason and rebuilt whole on the same terms: a shot whose
+    // render settles takes its phase away with it rather than leaving a stale QUEUED on the clip.
+    // This adds no request -- it is a second read of the report this tick already fetched -- and
+    // the repaint is gated on the map actually moving, exactly as the percentages are.
+    const phases = renderPhaseByShot(report);
+    const phasesMoved = JSON.stringify(phases) !== JSON.stringify(state.renderPhase || {});
+    state.renderPhase = phases;
     if (changed.assets || progressMoved) renderAssets();
     if (changed.song) renderSong();
-    if (changed.shots || progressMoved) renderTimeline();
+    if (changed.shots || progressMoved || phasesMoved) renderTimeline();
     // `renderJobs` re-runs `syncRenderPolling`, which is how the loop stops itself on the tick
     // that settles the last open job. The explicit call covers a tick that changed nothing
     // visible but should still stand the timer down -- a job settled by the manual refresh.
@@ -3045,6 +3069,17 @@ export function renderJobs() {
   if (flaggedButton) {
     flaggedButton.hidden = !flagged.length;
     flaggedButton.textContent = `Re-queue flagged (${flagged.length})`;
+  }
+  // Cancel all renders, drawn from one contract-tested decision and applied here -- `#queue-ready`
+  // above and the clip's own cell follow the same rule. Hidden rather than disabled with nothing
+  // open, because "nothing is rendering" is not a refusal that needs explaining beside an empty
+  // queue, and `Re-queue flagged` hides on exactly that argument one line up.
+  const cancelAll = cancelAllPlan(state.project);
+  const cancelButton = $(CANCEL_ALL_CONTROL);
+  if (cancelButton) {
+    cancelButton.hidden = cancelAll.hidden;
+    cancelButton.textContent = cancelAll.label;
+    cancelButton.title = cancelAll.title;
   }
   if (!jobs.length) { list.innerHTML = `<div class="queue-empty">No render jobs for this project.</div>`; return; }
   // Targets named the way the timeline names them, and a shot row is a link back to its
@@ -4430,6 +4465,27 @@ function bindEvents() {
       if (state.project?.id === projectId) await loadProject(projectId);
     } catch (error) { toast(error.message, "error"); }
     finally { renderJobs(); }
+  });
+  // Cancel all renders. The plan is re-decided at the click from the same function that drew the
+  // button, so the count in the dialog is the count the request means -- `#queue-ready`'s rule,
+  // and the reason the server re-checks the confirmation itself (`confirm_cancel`).
+  //
+  // The whole project is reloaded afterwards rather than patched: a cancellation of twenty-six
+  // renders settles twenty-six job records and releases up to twenty-six shots, and the reply is
+  // the report rather than the project.
+  $(CANCEL_ALL_CONTROL)?.addEventListener("click", async () => {
+    if (!requireProject()) return;
+    const plan = cancelAllPlan(state.project);
+    if (!plan.count || !window.confirm(plan.confirm)) return;
+    const projectId = state.project.id;
+    const button = $(CANCEL_ALL_CONTROL);
+    button.disabled = true;
+    try {
+      const report = await api.cancelOpenJobs(projectId);
+      toast(cancellationToast(report), report.cancelled.length ? "info" : "error");
+      if (state.project?.id === projectId) await loadProject(projectId);
+    } catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; renderJobs(); renderTimeline(); }
   });
   $("#queue-flagged").addEventListener("click", async () => {
     if (!requireProject()) return;

@@ -482,6 +482,20 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    ranks higher, and the readiness list prints both sentences either way. */
 .shot-clip.take-uncovered { border-top: 2px solid var(--amber); }
 .shot-clip.take-uncovered .clip-id { color: var(--amber); }
+/* Which shot ComfyUI is on, and which are waiting behind it (the Director's ask, 2026-08-23:
+   "a more active indicator marking the currently generating clip"). Both were `status-queued`
+   blue and the word RENDERING before this, because nothing writes `running` onto a Shot -- only
+   onto its job -- so a batch of twenty-six drew twenty-six identical clips.
+
+   Colour is the second signal here as everywhere else on this clip: app.js writes a different
+   WORD into `.clip-state` for each (RENDERING against QUEUED) and a different sentence into the
+   accessible name, which is the only one a screen reader announces. Deliberately no animation:
+   the timeline re-renders on `pointerdown`, so a keyframed pulse would restart on every click of
+   every clip -- and a state that flickers under an unrelated gesture reads as a bug. */
+.shot-clip.rendering-now { border-left-color: var(--amber); background: #2b2617; }
+.shot-clip.rendering-now .clip-state { color: var(--amber); font-weight: 700; }
+.shot-clip.rendering-queued { border-left-color: #3d6070; }
+.shot-clip.rendering-queued .clip-state { color: var(--muted); }
 .shot-clip .clip-id { display: block; padding: 7px 9px 3px; color: var(--acid); font: 9px Consolas, monospace; }
 /* The word for a render in flight, on the clip itself. The left-bar hue above says the same
    thing and is the second, redundant signal -- this is the one that survives the colour being
