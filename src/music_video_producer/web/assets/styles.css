@@ -363,16 +363,29 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    never in the glyph alone — the same rule this stylesheet applies to colour. `.danger-button`
    keeps its red on top of this, so the destructive one is still not one of the others. */
 .icon-tool { width: 30px; padding: 0; font-size: 14px; line-height: 1; }
-/* The playhead magnet's toggle, pressed. State is never carried by colour alone here either: the
-   button's `aria-pressed` and its accessible name both say on or off in words, and this is the
-   third signal rather than the only one. Wider than `.icon-tool` because its glyph is two
-   characters — an edge meeting a marker. */
-#snap-playhead { width: auto; padding: 0 8px; letter-spacing: -1px; }
-/* The beat-marker toggle takes the same pressed treatment, and takes it from the same rule rather
-   than from a copy of it: two toggles in one row whose "on" is spelled twice is how one of them
-   drifts. Both carry `aria-pressed` and an accessible name saying on or off, so the colour here is
-   the third signal and never the only one. */
-#snap-playhead.snap-on, #beat-markers.snap-on { color: var(--acid); border-color: var(--acid); }
+/* The "Snap to" selector. A native `<details>`, so it opens and closes by keyboard with no script
+   and announces its own expanded state; `position: relative` is what lets the list hang under it
+   without pushing the rest of the bar sideways when it opens. */
+.snap-select { position: relative; display: inline-block; }
+/* Its summary is styled as one of this bar's buttons and behaves as one, so the row still reads as
+   a toolbar. `list-style: none` plus the WebKit pseudo-element removes the disclosure triangle: the
+   glyph and the words already say what it is, and a marker in front of them made the button two
+   different widths depending on whether it was open. */
+#snap-targets-summary { display: inline-flex; align-items: center; white-space: nowrap; cursor: pointer; list-style: none; letter-spacing: -.2px; }
+#snap-targets-summary::-webkit-details-marker { display: none; }
+/* Pressed treatment for the two toggles in this bar that have one — the snap selector when any
+   kind at all is active, and the beat markers. One rule rather than a copy each: two controls in
+   one row spelling "on" twice is how one of them drifts. Both say their state in words as well —
+   the selector names the active set, the markers say on or off — so the colour here is never the
+   only signal. */
+#snap-targets-summary.snap-on, #beat-markers.snap-on { color: var(--acid); border-color: var(--acid); }
+/* The open list. Above the tracks and clear of them, with its own ground, because it hangs over a
+   timeline that is drawn right up to this bar. Rows are `.lock-toggle`, this stylesheet's existing
+   checkbox-with-a-label treatment, so the ticks look like every other tick in the application. */
+.snap-kind-list { display: block; position: absolute; z-index: 6; top: calc(100% + 4px); left: 0; min-width: 230px; padding: 8px 10px; background: var(--surface-3); border: 1px solid var(--line-strong); border-radius: 4px; box-shadow: 0 6px 18px rgba(0, 0, 0, .45); text-align: left; }
+.snap-kind-list .lock-toggle { align-items: flex-start; margin: 0 0 8px; }
+.snap-kind-list .lock-toggle:last-child { margin-bottom: 0; }
+.snap-kind-list .snap-kind-note { display: block; margin-top: 2px; color: var(--dim); font-size: 10px; text-transform: none; letter-spacing: 0; }
 /* Undo and Redo. Ordinary icon tools; the disabled state is the stylesheet's own, and everything
    that distinguishes "nothing to undo" from "undo the split" is in the accessible name. */
 #undo-shots, #redo-shots { font-size: 15px; }

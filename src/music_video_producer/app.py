@@ -170,6 +170,7 @@ from .timeline import (
     anchored_label,
     assistant_input,
     build_director_timeline,
+    drag_snap_targets,
     expansion_input,
     layout_spans,
     lyric_blocks,
@@ -12428,6 +12429,58 @@ def create_app(
         response.project = store.save(project)
         response.applied = True
         return response
+
+    @app.get("/api/projects/{project_id}/timeline/snap-targets")
+    def read_timeline_snap_targets(project_id: str) -> dict[str, Any]:
+        """Every second a dragged Shot edge may land on. Read-only, and one opinion only.
+
+        **Why this exists at all.** A drag had exactly one target — the playhead. The batch
+        "Snap cuts" button had a different and much better one, voiceless gaps, and no drag could
+        reach it. Porting the gap rule into the browser was considered and rejected: `timeline.py`
+        names a second snapper for a second caller as this codebase's own recurring defect, and a
+        drag offering *lyric word edges* while the button clamps into gaps by
+        `SNAP_CLEARANCE_SECONDS` would be exactly that — two opinions about where a cut belongs,
+        differing by which gesture the Director reached for. So the targets are computed by the
+        same module the button uses, served here, and the browser does nothing with them but pick
+        the nearest one within its tolerance.
+
+        **Absence of either half is a 200 with the half that exists.** A song nobody transcribed
+        has no gap targets and keeps its beats; a song nobody analysed has no beat targets and
+        keeps its gaps; a project with no song at all answers two empty lists. None of those is an
+        error, and none of them may become one: this is an assist on a gesture that has to keep
+        working exactly as it does today whenever a measurement is missing. `song/envelope`'s rule
+        verbatim — the only 404 here is the project itself not existing.
+
+        `measured` and `analysed` are reported rather than inferred from the lists being empty,
+        because `vocal_gaps` distinguishes *unmeasured* from *measured and voiced throughout* and
+        this application's standing convention is that the two are never flattened together.
+        Nothing in the browser branches on either; they are here so a reader of the wire can tell
+        which of the two it is looking at.
+
+        A sync `def`, so FastAPI runs it in the threadpool: reaching the beats goes through
+        `song_envelope_report`, which hashes the whole master to decide whether the measurement is
+        still current, and a multi-megabyte read has no business on the event loop.
+        """
+        project = get_project(project_id)
+        report = song_envelope_report(project_id, project)
+        served = report.get("envelope") if report.get("present") else None
+        # One expression decides both `analysed` and where the beats come from, so the flag cannot
+        # disagree with the list it describes. Earlier it was `envelope is not None` while the
+        # beats were read behind a separate `isinstance` check, which could answer `analysed: true`
+        # with no beats for a report whose envelope was not a mapping, and `analysed: false` for a
+        # present report whose envelope key was missing. The flag exists precisely so a reader of
+        # the wire can tell those cases apart, so it may not be the thing that blurs them.
+        envelope = served if isinstance(served, dict) else None
+        beats = envelope.get("beats") or [] if envelope is not None else []
+        targets = drag_snap_targets(project.song, beats=beats)
+        return {
+            "gaps": targets.gaps,
+            "beats": targets.beats,
+            "measured": targets.measured,
+            "analysed": envelope is not None,
+            "start": targets.start,
+            "end": targets.end,
+        }
 
     @app.post(
         "/api/projects/{project_id}/timeline/clean-prompts",

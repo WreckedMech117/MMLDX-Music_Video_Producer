@@ -20,7 +20,13 @@ import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, BEAT_MARKERS_HELP, BEAT_MARKER
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
-import { GAP_FILL_TOAST, MIN_WINDOW_SECONDS, PLAYHEAD_SNAP_HELP, PLAYHEAD_SNAP_LABEL, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, anchoredNudge, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, noShotSelectedRefusal, playheadSnap, splitShotPlan, undoControl, undoGestureLabel } from "./api.js";
+import { GAP_FILL_TOAST, MIN_WINDOW_SECONDS, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, anchoredNudge, boundaryMovePlan, doubleEdgePress, edgePressSurvivesDrag, exactSeconds, gapFillPlan, noShotSelectedRefusal, splitShotPlan, undoControl, undoGestureLabel } from "./api.js";
+// The rest of that magnet, Story 8.3: the song's own targets beside the playhead. `dragSnapPlan`
+// resolves them once per drag and `edgeSnap` chooses among them per pointer move -- both pure,
+// both in api.js, and neither of them deciding *where a cut belongs*. That decision is
+// `timeline.py`'s, served whole by `GET /timeline/snap-targets`, so a drag and the batch "Snap
+// cuts" button cannot hold two opinions about the same second.
+import { SNAP_SELECT_CONTROL, SNAP_SELECT_HELP, SNAP_SELECT_LIST, SNAP_SELECT_SUMMARY, SNAP_TARGET_ORDER, SNAP_TARGET_TOASTS, dragSnapPlan, edgeSnap, snapKindsFromSession, snapSelectorPlan, snapTargetsIdentity } from "./api.js";
 // The Clips tab's honest state when ComfyUI is not running, and the Assets panel's named attach
 // target -- two of the four interaction defects cleared on 2026-08-21.
 import { CLIP_RECHECK_LABEL, attachToShotControl, clipCardFace, clipPreviewState } from "./api.js";
@@ -81,15 +87,26 @@ let emptyBatchInFlight = false;
 // treatment, and a confirm dialog they have already dismissed cannot be re-read. Cleared by a
 // project load, because it names one structure's sections.
 let sectionLooksReport = null;
-// Whether a dragged shot edge is pulled onto the playhead when it comes within a few pixels of
-// it (the Director's ask, 2026-08-21). A working preference, not project data: it lives in this
-// browser's session storage beside the zoom and the panel, exactly as the two line mutes and the
-// master volume do, and never in the manifest -- how one Director likes to drag is not a property
-// of the video. On by default, because the request was for the behaviour and not for a switch.
-let playheadSnapOn = true;
+// **Which set of points a dragged shot edge lands on**, as a set of kind names -- the playhead the
+// Director parked, the voiceless phrase gaps `timeline.py` chooses, the beats the analysis
+// measured. The Director's ruling of 2026-08-24 replaced the playhead magnet's own on/off switch
+// with one selector over all of them, so there is a single answer to "what does dragging snap to"
+// rather than one switch per kind acquired as kinds were added.
+//
+// A working preference, not project data: it lives in this browser's session storage beside the
+// zoom and the panel, exactly as the two line mutes and the master volume do, and never in the
+// manifest -- how one Director likes to drag is not a property of the video.
+//
+// **Every kind by default, and an empty set is not the same thing.** A session that has never
+// stored a selection gets all of them, which is the default-on asymmetry the other view toggles
+// use; a session storing `[]` is a Director who switched them all off on purpose and gets exactly
+// that. `storedSnapKinds` is where the two are told apart, and it answers `null` for "nothing was
+// stored" rather than inventing a list, so this initialiser stays the one statement of the
+// default.
+let snapTargetKinds = new Set(SNAP_TARGET_ORDER);
 // Whether the measured beats and onsets are drawn over the master waveform. A view setting and
 // nothing else -- it changes no Shot, writes nothing to the manifest and touches no project state
-// -- so it lives beside `playheadSnapOn` in this browser's session store, with the same default-on
+// -- so it lives beside `snapTargetKinds` in this browser's session store, with the same default-on
 // asymmetry: the feature is the drawing, not the switch, and only an explicit `false` turns it off.
 // `preferences.py` is not the place for it either; that file holds one key and it is a GPU policy.
 let beatMarkersOn = true;
@@ -257,8 +274,11 @@ function persistSession() {
       pixelsPerSecond: state.pixelsPerSecond,
       selectedShotId: state.selectedShotId,
       volume: $("#master-audio")?.volume ?? 1,
-      // How this Director likes to drag, never a property of the video -- see `playheadSnapOn`.
-      playheadSnap: playheadSnapOn,
+      // How this Director likes to drag, never a property of the video -- see `snapTargetKinds`.
+      // Written as an array, always, so an empty selection is stored as an empty selection: the
+      // one thing this key must be able to say and could not if it were three booleans or a
+      // truthiness test. `storedSnapKinds` reads it back, and tells absent from empty there.
+      snapTargets: [...snapTargetKinds],
       // How this Director likes to look at the song, and for the same reason: a view setting sits
       // with the other view settings, not in the project.
       beatMarkers: beatMarkersOn,
@@ -388,6 +408,9 @@ async function loadProject(id) {
   renderAll();
   loadPersistedWaveform(id);
   loadSongEnvelope(id);
+  // Beside it and on the same load path, never on the poll: the seconds a dragged shot edge may
+  // land on. A second request rather than a field on the envelope -- see `loadSnapTargets`.
+  loadSnapTargets(id);
   loadReadiness(id);
   // Refreshed here rather than in each submission handler, because every path that queues a
   // render reloads the project immediately afterwards -- the queue-ready loop, both generate
@@ -718,8 +741,9 @@ async function loadPersistedWaveform(projectId) {
 // the next load tries again rather than the timeline losing its marks to one unreachable moment.
 let songEnvelopeKey = "";
 
-// Everything this browser remembers about *which* song the band is drawing, forgotten: the
-// measurement, the key it was read under, and the record of what is currently painted.
+// Everything this browser remembers about *which* song is current, forgotten: the measurement,
+// the key it was read under, the record of what is currently painted, and the seconds a dragged
+// edge may land on.
 //
 // Called by every transition that changes which song is current, because `loadSongEnvelope` alone
 // is not enough for those: it clears nothing until a reply lands, which is right for a refresh and
@@ -735,6 +759,60 @@ function forgetSongEnvelope() {
   songEnvelopeKey = "";
   beatBandKey = "";
   beatBandEnvelope = null;
+  // The drag's targets belong to the same song and are dropped in the same breath. Half of them
+  // -- the voiceless gaps -- are not derived from the envelope at all, so they would survive a
+  // song replacement on their own and pull a cut onto a rest measured in a track that is gone.
+  state.snapTargets = null;
+  snapTargetsKey = "";
+}
+
+// One targets read per *measurement*: the song file, the analysis fingerprint and the word and
+// span counts, which is `snapTargetsIdentity`. **Never behind a timer**, for `loadSongEnvelope`'s
+// reason exactly -- the route reaches the beats through `song_envelope_report`, which hashes the
+// master to decide whether the analysis is current.
+//
+// It is a second request rather than a field on the envelope read because the two answer different
+// questions from different halves of the project: the envelope is a measurement of the audio, and
+// half of these targets come from a *transcription* that has no envelope in it. Folding them
+// together would make a song nobody analysed lose the gap snapping the batch button already gives
+// it, which is the one thing the frozen matrix says must keep working.
+//
+// Absence in every form is silence: no song, no analysis, no transcription, a route that is not
+// there. Each leaves the drag exactly as it was before this story -- the playhead and nothing
+// else -- and none of them says anything. A failed *request* is different from a reported absence
+// and is treated as one: the last known targets stay, and the key is left unclaimed so the next
+// load asks again rather than the magnet being lost to one unreachable moment.
+let snapTargetsKey = "";
+
+// Exported for the executed frontend contract, `loadSongEnvelope`'s reason exactly: what has to be
+// provable is that a reply reaches the drag -- that a load fills the slot, that an absent half
+// leaves the other working, and that a refused read changes nothing -- and none of that is visible
+// to a source read of a function nothing in the suite can call.
+export async function loadSnapTargets(projectId) {
+  const key = snapTargetsIdentity(projectId, state.project?.song);
+  if (key === snapTargetsKey) return;
+  if (!state.project?.song?.path) {
+    // No audio, so nothing measured either way. Anything still held belongs to a song that is not
+    // here any more, and a magnet pulling towards it is the one thing this must not do.
+    state.snapTargets = null;
+    snapTargetsKey = key;
+    return;
+  }
+  let report = null;
+  try {
+    report = await api.snapTargets(projectId);
+  } catch {
+    // Unreachable or refused: dragging behaves exactly as it does today, the last known targets
+    // are kept, nothing is said, and the key is left unclaimed so the next load asks again.
+    return;
+  }
+  // The project moved on while the request was open; this answer describes a song nobody is
+  // looking at, and the load that replaced it owns the magnet now.
+  if (state.project?.id !== projectId) return;
+  state.snapTargets = report || null;
+  snapTargetsKey = key;
+  // Nothing is repainted. Targets are not drawn: they change where the *next* drag lands and
+  // nothing that is on screen right now, which is why this read has no repaint to get wrong.
 }
 
 // Exported for the executed frontend contract, `renderSnapCuts`' and `syncRenderPolling`'s reason
@@ -2009,13 +2087,19 @@ function masterPlaying() {
   return Boolean(audio && audio.paused === false);
 }
 
-// The Director's gesture C: park the playhead on a beat, drag a cut to it, and have it land
-// exactly there. Applied on release rather than during the drag, and through `boundaryMovePlan`
-// rather than by writing one window, because a cut belongs to *two* shots -- the neighbour's edge
-// moves with it and the plan stays contiguous. Freehand dragging is untouched: it still changes
-// one window, which is the gesture that put four sub-frame gaps in the Director's plan and the
-// reason this one exists.
-function applyPlayheadSnap(shot, mode, seconds, original) {
+// The Director's gesture C, widened by Story 8.3: drag a cut onto a target and have it land
+// exactly there. The target is the playhead they parked, a voiceless moment `timeline.py` chose,
+// or a measured beat -- `edgeSnap` decided which, and this applies whichever it was. Applied on
+// release rather than during the drag, and through `boundaryMovePlan` rather than by writing one
+// window, because a cut belongs to *two* shots -- the neighbour's edge moves with it and the plan
+// stays contiguous. Freehand dragging is untouched: it still changes one window, which is the
+// gesture that put four sub-frame gaps in the Director's plan and the reason this one exists.
+//
+// `kind` is only ever read to *report* what happened. Every kind is applied identically, which is
+// the point: a snapped cut is a snapped cut, and the target it found does not change what a write
+// of it means. An unrecognised kind falls back to the playhead's sentence rather than saying
+// nothing, because a silent write is worse than an imprecise report of one.
+function applySnappedCut(shot, mode, seconds, original, kind = "playhead") {
   // Measured against the plan as it was before the drag: the neighbour shares the *original*
   // cut, and the shot has been mutated live by the pointermove handler.
   restoreWindow(shot, original);
@@ -2044,7 +2128,7 @@ function applyPlayheadSnap(shot, mode, seconds, original) {
   state.dirty = true;
   saveShotsSilently("snap");
   renderTimeline();
-  toast(PLAYHEAD_SNAP_TOAST.replace("{seconds}", seconds.toFixed(3)));
+  toast((SNAP_TARGET_TOASTS[kind] || PLAYHEAD_SNAP_TOAST).replace("{seconds}", seconds.toFixed(3)));
   return true;
 }
 
@@ -2110,22 +2194,48 @@ function bindClip(clip) {
     // by `edgePressSurvivesDrag`, which is what stops a drag from leaving its press standing as
     // the first half of a double-click -- see there.
     let travelled = 0;
-    // Where the playhead caught this edge, or null. Read at release, which is what makes the
-    // snap a decision about where the drag *ended* rather than about every frame it crossed.
+    // Which target caught this edge, as `{snapped, seconds, kind}`, or null. Read at release,
+    // which is what makes the snap a decision about where the drag *ended* rather than about
+    // every frame it crossed. The kind travels with it because a cut moved to a beat may not be
+    // reported as a cut moved to the playhead.
     let magnetised = null;
     // Frame-stepped, not quarter-second: the buffer being dragged out is 6 frames deep on
     // one side, and a 0.25 s step could only ever reveal one notch of it.
     const grid = (value) => Math.round(value * 24) / 24;
-    // The playhead's pull on the edge being dragged, in seconds. `playheadSnap` decides; it
-    // measures in screen pixels, so the gesture feels the same at every zoom, and it declines
-    // while the song is playing.
-    const magnet = (edgeSeconds) => playheadSnap({
-      seconds: edgeSeconds,
+    // **The drag's targets, resolved once, here.** `renderTimeline` runs on every `pointermove`
+    // -- which is why the beat band's rebuild is guarded -- and a three-minute song carries
+    // several hundred targets. Sorting them and measuring every one's local spacing sixty times a
+    // second would reintroduce exactly the cost that guard exists to prevent, so the expensive
+    // half happens at `pointerdown` and only the choosing happens per move.
+    //
+    // The empty set for a move drag, which has never had a magnet: the whole clip slides and there
+    // is no one edge being placed. One condition rather than one per kind, which is the shape the
+    // selector asked for -- this closure does not know how many kinds there are.
+    //
+    // The playhead goes *into* the plan rather than being passed per move, so it takes the same
+    // local-spacing cap every other target takes and crowds the beats around it as they crowd it.
+    const snapKinds = mode === "move" ? new Set() : snapTargetKinds;
+    const resolveSnapPlan = () => dragSnapPlan({
+      targets: state.snapTargets,
       playhead: state.playhead,
       pixelsPerSecond: state.pixelsPerSecond,
-      enabled: playheadSnapOn && mode !== "move",
-      playing: masterPlaying(),
+      enabledKinds: snapKinds,
     });
+    let snapPlan = resolveSnapPlan();
+    // Every target's pull on the edge being dragged, in seconds. `edgeSnap` decides, over the plan
+    // and nothing else: tolerance in screen pixels, so the gesture feels the same at every zoom,
+    // capped to a fraction of the local target spacing so a dead zone always remains between
+    // targets, and declining entirely while the song is playing.
+    //
+    // **Re-resolved when the scale it was measured in moves, and only then.** Ctrl+wheel zooms
+    // mid-drag, and a plan's tolerances are pixels converted to seconds: one resolved at 16 px/s
+    // is worth 10.7 px at 64 px/s, past a ceiling whose own comment calls raising it an Ask First.
+    // The check is one number per move and the rebuild happens only when the answer would
+    // otherwise be wrong, so the per-move cost this closure exists to avoid is not reintroduced.
+    const magnet = (edgeSeconds) => {
+      if (snapPlan.pixelsPerSecond !== state.pixelsPerSecond) snapPlan = resolveSnapPlan();
+      return edgeSnap({ seconds: edgeSeconds, plan: snapPlan, playing: masterPlaying() });
+    };
     const move = (moveEvent) => {
       const delta = (moveEvent.clientX - startX) / state.pixelsPerSecond;
       const snapped = grid(delta);
@@ -2178,17 +2288,17 @@ function bindClip(clip) {
           moveWindowStart(shot, clamp(want, 0, end - MIN_WINDOW_SECONDS), original);
         }
         shot.duration = exactSeconds(end - shot.start);
-        // Only when the clamp did not fight the magnet: an edge held off the playhead by the
+        // Only when the clamp did not fight the magnet: an edge held off its target by the
         // floor has not landed on it, and saying it had would move the neighbour to a cut the
         // edge never reached.
-        if (pull.snapped && shot.start === pull.seconds) magnetised = pull.seconds;
+        if (pull.snapped && shot.start === pull.seconds) magnetised = pull;
       }
       if (mode === "right") {
         const pull = magnet(original.start + original.duration + delta);
         shot.duration = pull.snapped
           ? Math.max(MIN_WINDOW_SECONDS, exactSeconds(pull.seconds - shot.start))
           : Math.max(MIN_WINDOW_SECONDS, grid(original.duration + snapped));
-        if (pull.snapped && exactSeconds(shot.start + shot.duration) === pull.seconds) magnetised = pull.seconds;
+        if (pull.snapped && exactSeconds(shot.start + shot.duration) === pull.seconds) magnetised = pull;
       }
       state.dirty = true;
       renderTimeline();
@@ -2210,13 +2320,14 @@ function bindClip(clip) {
       // starting the second drag, stretching the shot to its neighbour.
       if (!edgePressSurvivesDrag(travelled)) lastEdgePress = null;
       // Re-read after every step rather than computed once, because a refused snap puts `shot`
-      // back the way it was: `applyPlayheadSnap` restores it from `original` and answers false.
+      // back the way it was: `applySnappedCut` restores it from `original` and answers false.
       // A `moved` measured before that call was still true afterwards, so a refusal the Director
       // had just been shown sent a no-op `PUT /shots` -- which bumped `updated_at`, pushed an
       // undo entry for a gesture that never happened, and threw the redo stack away.
       const moved = () => shot.start !== original.start || shot.duration !== original.duration
         || (shot.trim_nudge || 0) !== original.nudge;
-      if (moved() && magnetised !== null && applyPlayheadSnap(shot, mode, magnetised, original)) return;
+      if (moved() && magnetised !== null
+        && applySnappedCut(shot, mode, magnetised.seconds, original, magnetised.kind)) return;
       if (moved()) return saveShotsSilently(mode === "move" ? "move" : "resize");
       // Nothing to save *from this gesture*, so this gesture's dirt is cleared. `move` sets the
       // dirty flag on the first pixel, and every drag used to end in a write, so leaving it set
@@ -3021,7 +3132,11 @@ export async function pollRenderStatus() {
     // an in-memory comparison this tick already made, so the poll *notices* rather than asks -- and
     // `loadSongEnvelope`'s key decides whether anything is fetched at all, which on a tick where
     // the song did not really move is nothing. This is not a poll of the envelope endpoint.
-    if (changed.song) { renderSong(); loadSongEnvelope(state.project.id); }
+    if (changed.song) {
+      renderSong();
+      loadSongEnvelope(state.project.id);
+      loadSnapTargets(state.project.id);
+    }
     if (changed.shots || progressMoved || phasesMoved) renderTimeline();
     // `renderJobs` re-runs `syncRenderPolling`, which is how the loop stops itself on the tick
     // that settles the last open job. The explicit call covers a tick that changed nothing
@@ -3571,20 +3686,72 @@ export function syncUndoControls() {
   }
 }
 
-// The magnet's switch, drawn from the flag rather than from the DOM's own class, so the button,
-// the drag handler and the stored session can never disagree about whether it is on. Pressed
-// state in words as well as in `aria-pressed`, because a toggle whose only signal is a hue is a
-// toggle nobody can read.
-function syncPlayheadSnapControl() {
-  const button = $("#snap-playhead");
-  if (!button) return;
-  button.classList.toggle("snap-on", playheadSnapOn);
-  button.setAttribute("aria-pressed", playheadSnapOn ? "true" : "false");
-  button.title = `${PLAYHEAD_SNAP_LABEL}: ${playheadSnapOn ? "on" : "off"}. ${PLAYHEAD_SNAP_HELP}`;
-  button.setAttribute("aria-label", button.title);
+// The "Snap to" selector, drawn from the set rather than from the DOM's own ticks, so the
+// control, the drag and the stored session can never disagree about what a drag lands on.
+//
+// **Everything it says comes from `snapSelectorPlan`.** Which rows exist, which are ticked and the
+// one line the summary reads are decided there, over `SNAP_TARGET_ORDER`; this writes markup and
+// nothing else. That is what makes a fourth kind in Epic 10 or 11 a line in api.js rather than an
+// edit here, and it is why nothing below names a kind.
+//
+// The active set is in **words** on the summary, not a count and not a colour: "2 selected" does
+// not tell a Director what a drag is about to do. The `.snap-on` hue is a third signal on top of
+// the sentence and the checkboxes' own announced state, never the only one.
+function syncSnapTargetsControl() {
+  const summary = $(SNAP_SELECT_SUMMARY);
+  const list = $(SNAP_SELECT_LIST);
+  if (!summary || !list) return;
+  const plan = snapSelectorPlan(snapTargetKinds);
+  summary.classList.toggle("snap-on", plan.any);
+  summary.textContent = plan.summary;
+  summary.title = `${plan.summary}. ${SNAP_SELECT_HELP}`;
+  summary.setAttribute("aria-label", plan.summary);
+  // Real checkboxes with real labels, so each kind announces its own state and none of it is
+  // carried by colour. `data-kind` is what the one delegated handler below reads -- a listener per
+  // row would be re-bound every time this ran, which is the leak that shape always has.
+  //
+  // **Written when the kinds change, not when the selection does.** Rebuilding the rows on every
+  // press replaces the very checkbox the Director has just operated: in a browser that drops
+  // keyboard focus mid-gesture and sends the next Tab back to the top of the document, and it
+  // makes every element reference held by anything else stale. So the markup is a function of
+  // *which kinds exist* -- settled at boot and again only if a kind is ever added -- and a press
+  // moves a tick.
+  const listed = plan.kinds.map((row) => row.kind).join(",");
+  if (list.dataset.kinds !== listed) {
+    list.dataset.kinds = listed;
+    list.innerHTML = plan.kinds.map((row) => `
+    <label class="lock-toggle" title="${escapeHtml(row.help)}">
+      <input type="checkbox" class="snap-kind" id="snap-kind-${escapeHtml(row.kind)}"
+             data-kind="${escapeHtml(row.kind)}"${row.checked ? " checked" : ""}>
+      <span>${escapeHtml(row.label)}<span class="snap-kind-note">${escapeHtml(row.note)}</span></span>
+    </label>`).join("");
+  }
+  // The ticks, from the set rather than from what the box happens to hold. A press is applied to
+  // the set first and read back here, so a change event this file never saw -- a form reset, an
+  // assistive technology setting `checked` directly -- cannot leave the control claiming
+  // something the drag will not do.
+  //
+  // The id goes through `cssEscape` because it was `escapeHtml`d on the way into the markup and a
+  // selector is a different grammar from an attribute value: a kind name carrying anything CSS
+  // reads as syntax would build a selector that matches nothing, and the row would silently stop
+  // taking its tick. No kind is like that today, which is exactly why it would go unnoticed.
+  for (const row of plan.kinds) {
+    const box = $(`#snap-kind-${cssEscape(row.kind)}`, list);
+    if (box) box.checked = row.checked;
+  }
 }
 
-// The beat band's switch, drawn from the flag for `syncPlayheadSnapControl`'s reason exactly, so
+// One identifier, escaped for a selector rather than for markup. `CSS.escape` where the browser
+// has it, and a conservative fallback where it does not -- the contract harness runs this file
+// under node, which has no `CSS` at all, and a helper that threw there would take every executed
+// frontend test with it.
+function cssEscape(value) {
+  const text = String(value);
+  if (globalThis.CSS?.escape) return globalThis.CSS.escape(text);
+  return text.replace(/[^a-zA-Z0-9_-]/g, (character) => `\${character}`);
+}
+
+// The beat band's switch, drawn from the flag for `syncSnapTargetsControl`'s reason exactly, so
 // the button, the paint and the stored session cannot disagree about whether the marks are on.
 // The state is in `aria-pressed` and spelled out in the accessible name as well as carried by the
 // pressed hue -- a toggle whose only signal is a colour is a toggle a screen reader cannot read,
@@ -4036,6 +4203,7 @@ function bindEvents() {
       $("#import-lyrics").value = ""; $("#import-style").value = "";
       renderAll();
       loadSongEnvelope(state.project.id);
+      loadSnapTargets(state.project.id);
       toast("Song imported");
     }
     catch (error) { await recoverFromSongRefusal(error); }
@@ -4080,6 +4248,12 @@ function bindEvents() {
       if (state.project?.id !== projectId) return;
       state.project = project;
       renderAll();
+      // A first transcription is what *creates* the voiceless-gap targets: this route writes
+      // `lyric_words` and `vocal_spans`, and `snapTargetsIdentity` counts both, so the read below
+      // is a no-op on a re-run and the whole set on the first one. Without it the gap half of the
+      // magnet would not appear until the next project load -- the feature silently late by one
+      // reload on the one gesture that just earned it.
+      loadSnapTargets(projectId);
       toast(`Sections filled from the track: ${project.sections.map((s) => s.label).join(" · ")}`);
     } catch (error) { toast(error.message, "error"); }
     finally {
@@ -4386,11 +4560,47 @@ function bindEvents() {
   // rather than being silently ignored.
   $("#undo-shots")?.addEventListener("click", runUndo);
   $("#redo-shots")?.addEventListener("click", runRedo);
-  // The playhead magnet's switch. Session-only, like the two line mutes beside it.
-  $("#snap-playhead")?.addEventListener("click", () => {
-    playheadSnapOn = !playheadSnapOn;
-    syncPlayheadSnapControl();
+  // The "Snap to" selector. **One delegated listener on the list**, not one per row: the rows are
+  // redrawn from the plan every time the set changes, so a listener bound to a row would be bound
+  // to markup that is about to be replaced.
+  //
+  // Session-only, like the two line mutes beside it. It writes nothing, asks for nothing and
+  // repaints nothing -- targets are not drawn, so a change here alters where the *next* drag lands
+  // and nothing that is on screen.
+  $(SNAP_SELECT_LIST)?.addEventListener("change", (event) => {
+    const kind = event?.target?.dataset?.kind;
+    if (!kind || !SNAP_TARGET_ORDER.includes(kind)) return;
+    // Read from the checkbox that was actually ticked rather than toggled from the set, so the
+    // control and the set cannot drift apart if one change event is ever missed.
+    if (event.target.checked) snapTargetKinds.add(kind);
+    else snapTargetKinds.delete(kind);
+    syncSnapTargetsControl();
     persistSession();
+  });
+  // **Both ways out of an open panel that every other disclosure in a browser offers**, and
+  // neither of which `<details>` gives for free: clicking away from it, and Escape. Without them
+  // the only way to shut it is to find the summary again, and it hangs over the timeline until
+  // you do. Bound on `document` in the capture-free bubble phase, so a click on a control inside
+  // the panel still reaches that control first.
+  document.addEventListener?.("pointerdown", (event) => {
+    const panel = $(SNAP_SELECT_CONTROL);
+    if (!panel?.open) return;
+    if (event.target?.closest?.(SNAP_SELECT_CONTROL) === panel) return;
+    panel.open = false;
+  });
+  // Escape is bound on the panel rather than on the document, deliberately. A keyboard Director
+  // opening this has focus on the summary or on one of the rows, both inside it, so the key
+  // bubbles here -- and Escape stays the property of whatever is focused rather than becoming a
+  // global this control has claimed. It also keeps `document`'s one keydown handler the undo
+  // shortcut's, which is the only thing on this page that wants every keystroke.
+  $(SNAP_SELECT_CONTROL)?.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const panel = $(SNAP_SELECT_CONTROL);
+    if (!panel?.open) return;
+    panel.open = false;
+    // Focus goes back to the control the Director was operating rather than to the document, which
+    // is where a keyboard user would otherwise be dropped.
+    $(SNAP_SELECT_SUMMARY)?.focus?.();
   });
   // The beat band's switch, beside it and session-only for the same reason. It repaints the
   // timeline and does nothing else: no save, no request, and nothing about any Shot is touched by
@@ -4763,14 +4973,21 @@ async function init() {
   bindEvents();
   const session = restoreSession();
   if (Number.isFinite(session.pixelsPerSecond)) state.pixelsPerSecond = clampTimelineZoom(session.pixelsPerSecond);
-  // Only an explicit `false` turns it off. A session saved before this existed carries no key at
-  // all, and reading that as "off" would ship the feature switched off for everyone who already
-  // had a session -- which is every Director who has used this workspace.
-  if (session.playheadSnap === false) playheadSnapOn = false;
+  // **Three states, and the middle one is the whole reason this is not an `||`.**
+  // `snapKindsFromSession` answers `null` when nothing was stored -- a first-ever run, or a session
+  // written before this existed -- and the initialiser's every-kind default stands, which is the
+  // same default-on asymmetry the beat markers use below. An empty array is a Director who switched
+  // every kind off on purpose and comes back exactly that way. Anything else is their subset, with
+  // names this build does not know dropped rather than thrown on.
+  //
+  // It also carries the migration off the playhead magnet's old `playheadSnap` key, so a Director
+  // who had that switched off does not find it switched back on. See there.
+  const restoredKinds = snapKindsFromSession(session);
+  if (restoredKinds !== null) snapTargetKinds = new Set(restoredKinds);
   // The same asymmetry, for the same reason: a session saved before this existed carries no key,
   // and reading that as "off" would ship the markers hidden for every Director who already has one.
   if (session.beatMarkers === false) beatMarkersOn = false;
-  syncPlayheadSnapControl();
+  syncSnapTargetsControl();
   syncBeatMarkersControl();
   await Promise.all([loadHealth(), loadVramEject(), api.workflows().catch(() => [])]);
   try { await loadProjects(); } catch (error) { toast(error.message, "error"); }

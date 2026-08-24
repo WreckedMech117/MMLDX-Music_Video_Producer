@@ -61,6 +61,7 @@ from music_video_producer.timeline import (
     asset_anchor,
     assistant_input,
     build_director_timeline,
+    drag_snap_targets,
     expansion_input,
     lyric_line_tags,
     margin_frames,
@@ -2583,6 +2584,139 @@ def test_the_snap_target_clamps_into_the_gap_rather_than_jumping_to_its_middle()
     narrow = (10.0, 10.2)
     assert _gap_snap_target(narrow, 5.0) == pytest.approx(10.1)
     assert _gap_snap_target(narrow, 40.0) == pytest.approx(10.1)
+
+
+def test_a_dragged_edge_is_offered_the_same_seconds_the_batch_button_would_choose():
+    """Story 8.3's hard promise: **one snapper, two consumers.**
+
+    The batch "Snap cuts" button asks `_gap_snap_target` where one boundary would land. A drag
+    cannot ask that — it has to know the answers before it knows which boundary is being dragged
+    — so `drag_snap_targets` asks the rule for its own reachable answers instead of restating
+    them. This asserts the two agree the only way that matters: every second the button actually
+    proposes over a whole song's plan is a second the drag is offered.
+
+    A full 154.6 s plan against a realistic voice map, so the claim is made over thirty-odd cuts
+    and a dozen gaps rather than over one contrived pair.
+    """
+    duration = 154.644898
+    song = snap_song(dense_vocal_spans(duration), duration=duration)
+    project = Project(name="Both doors", song=song, shots=long_song_plan(duration))
+
+    plan = snap_cut_plan(project, tolerance=SNAP_TOLERANCE_DEFAULT)
+    targets = drag_snap_targets(song)
+
+    assert plan.status == "ready"
+    assert plan.moves, "the fixture proposed no moves, so this test proves nothing"
+    assert targets.measured is True
+    offered = set(targets.gaps)
+    # **Compared exactly, with no rounding on either side of the assertion.** An earlier version
+    # rounded `move.proposed` to a millisecond before looking it up, which is the resolution both
+    # sides already work in -- so the comparison could not have failed if one of them had changed
+    # its mind about precision, which is the divergence it exists to rule out. They agree because
+    # `snap_window_plan` rounds its own proposal to three places and `drag_snap_targets` rounds to
+    # the same three; if either stops, this fails, which is the point.
+    for move in plan.moves:
+        assert move.proposed in offered, (
+            "the button moved a cut to a second the drag is not offered: "
+            f"{move.proposed!r} from {move.boundary!r}"
+        )
+    # And the other direction: every second the drag offers is a second the rule itself produces,
+    # reached by handing it a boundary outside the gap it belongs to. Nothing here is a number
+    # this test worked out on its own.
+    gaps = vocal_gaps(song, start=0.0, end=duration)
+    assert gaps is not None
+    reachable = {round(_gap_snap_target(gap, edge), 3) for gap in gaps for edge in gap}
+    assert offered == reachable
+    # And every second on offer is a real number of milliseconds, which is what makes the exact
+    # comparison above meaningful rather than lucky.
+    assert all(target == round(target, 3) for target in targets.gaps)
+
+
+def test_the_drag_targets_are_a_gaps_two_reachable_ends_and_nothing_between_them():
+    """Why the endpoints are the whole of it.
+
+    Inside `[low + clearance, high - clearance]` the clamp is the identity: the boundary is
+    already where the rule would put it, and the batch snapper reports no move at all. Offering
+    the interior as well would have a drag "snap" a cut to the second it was already on — a
+    write, a neighbour carried and a toast, for a gesture that moved nothing.
+
+    A gap too narrow to hold the clearance twice has exactly one answer, its midpoint, and it is
+    offered once rather than twice.
+    """
+    wide = Song(
+        title="Wide", path="w.flac", source="imported", duration=20.0,
+        lyric_words=[("a", 0.0, 5.0), ("b", 15.0, 16.0)],
+    )
+    narrow = Song(
+        title="Narrow", path="n.flac", source="imported", duration=20.0,
+        lyric_words=[("a", 0.0, 5.0), ("b", 5.3, 10.0)],
+    )
+
+    assert drag_snap_targets(wide).gaps == [
+        5.0 + SNAP_CLEARANCE_SECONDS, 15.0 - SNAP_CLEARANCE_SECONDS,
+        16.0 + SNAP_CLEARANCE_SECONDS, 20.0 - SNAP_CLEARANCE_SECONDS,
+    ]
+    # 0.3 s is exactly `SNAP_MINIMUM_GAP_SECONDS`, so the gap is reported — and exactly twice the
+    # clearance, so it cannot hold it at both ends and its midpoint is the one thing it can offer.
+    assert drag_snap_targets(narrow).gaps == [
+        5.15, 10.0 + SNAP_CLEARANCE_SECONDS, 20.0 - SNAP_CLEARANCE_SECONDS,
+    ]
+
+
+def test_an_unmeasured_song_offers_no_gap_targets_and_says_so():
+    """`vocal_gaps`' absent-analysis convention, carried through to the drag.
+
+    A song with neither `lyric_words` nor `vocal_spans` is **unmeasured, not silent**. It offers
+    no gap targets, and `measured` says which of the two empty lists this is — because "no rest
+    was found" and "nobody listened" are the same empty list and the codebase's standing rule is
+    that they are never flattened together. Nothing raises, and the beats are untouched: a song
+    that was analysed but never transcribed keeps every beat target it has.
+    """
+    unmeasured = Song(title="Raw", path="r.flac", source="imported", duration=20.0)
+
+    targets = drag_snap_targets(unmeasured, beats=[1.0, 2.0, 3.0])
+
+    assert targets.gaps == []
+    assert targets.measured is False
+    assert targets.beats == [1.0, 2.0, 3.0]
+    # No song at all is the same nothing, and is not an error either.
+    assert drag_snap_targets(None).gaps == []
+    assert drag_snap_targets(None).measured is False
+
+
+def test_the_measured_beats_keep_their_order_and_stay_inside_the_window():
+    """This module has almost no opinion about beats. It is handed them and it hands them on.
+
+    No thinning, no re-sorting, no snapping of one to another: every one of those would be this
+    file inventing a second opinion about a measurement `audio.py` owns. A beat measured at
+    0.512 s stays at 0.512 s, and a list that arrives out of order leaves in the order it arrived.
+
+    **Two things are dropped, and both are about this function's own promise.** A value that is
+    not a real number goes, because a `null` in an array becomes a target at second zero that
+    nothing measured. And a beat outside `[start, end]` goes, because those two are *reported* as
+    the window every second in the result is inside -- an earlier version stated the window and
+    enforced nothing, and a test locked in a beat at 400.0 s on a 20 s song as correct. A magnet
+    out there pulls a cut onto silence nobody measured.
+    """
+    song = Song(
+        title="Measured", path="m.flac", source="imported", duration=20.0,
+        lyric_words=[("a", 0.0, 5.0)],
+    )
+    beats = [0.512, 1.0, 0.9, 19.999]
+
+    # Order and value untouched, including the pair that arrive descending.
+    assert drag_snap_targets(song, beats=beats).beats == beats
+    assert drag_snap_targets(song, beats=[]).beats == []
+    assert drag_snap_targets(song, beats=[1.0, None, "2", float("nan"), 3.0]).beats == [1.0, 3.0]
+    # Past the end of the song, and before the start of an explicit window: both gone, and the
+    # window that was reported is the window the answer is actually inside.
+    beyond = drag_snap_targets(song, beats=[-0.5, 0.0, 19.999, 20.0, 20.001, 400.0])
+    assert beyond.beats == [0.0, 19.999, 20.0]
+    assert beyond.start == 0.0 and beyond.end == 20.0
+    windowed = drag_snap_targets(song, beats=[1.0, 6.0, 12.0], start=5.0, end=10.0)
+    assert windowed.beats == [6.0]
+    assert (windowed.start, windowed.end) == (5.0, 10.0)
+    assert all(windowed.start <= beat <= windowed.end for beat in windowed.beats)
 
 
 def test_a_hole_has_no_seam_in_it_and_an_overlap_is_not_a_hole():

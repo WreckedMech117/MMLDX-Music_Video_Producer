@@ -27,6 +27,19 @@ export const state = {
   // over a megabyte of arrays folded into it would be written straight into the manifest by the
   // next ordinary save. It sits beside `audioBuffer`, which is out here for the same reason.
   songEnvelope: null,
+  // Every second a dragged shot edge may land on, as the server computed them: the voiceless-gap
+  // targets `timeline.py` itself chooses and the beats the analysis measured. Session-scoped and
+  // read-only here -- this application has one snapper, on the server, and this slot holds its
+  // answer rather than a second opinion derived from it.
+  //
+  // `null` until a read comes back, which is also what an unreachable route and a project with no
+  // song leave behind: all three mean "no targets", and a drag with no targets is the drag this
+  // application made before Story 8.3. Never persisted -- the route hashes the master to decide
+  // whether the analysis is still current, so a copy in `localStorage` would be a second truth
+  // about a file that can be replaced between two page loads. Deliberately NOT on `state.project`,
+  // beside `songEnvelope` and for its reason: the project object is what `PUT /api/projects/{id}`
+  // sends back whole, and anything folded into it is written into the manifest by the next save.
+  snapTargets: null,
   pixelsPerSecond: 16,
   playhead: 0,
   dirty: false,

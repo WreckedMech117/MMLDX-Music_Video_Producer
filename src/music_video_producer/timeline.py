@@ -16,6 +16,7 @@ from .models import (
     Asset,
     Project,
     Shot,
+    Song,
     numbered_references,
     resolve_shot_mode,
     shot_label,
@@ -2560,6 +2561,98 @@ def _gap_snap_target(gap: tuple[float, float], boundary: float) -> float:
     if high - low <= 2 * SNAP_CLEARANCE_SECONDS:
         return (low + high) / 2
     return min(max(boundary, low + SNAP_CLEARANCE_SECONDS), high - SNAP_CLEARANCE_SECONDS)
+
+
+@dataclass(frozen=True)
+class DragSnapTargets:
+    """Every second a dragged Shot edge may land on, and where each of them came from.
+
+    `gaps` are this module's own opinion about where a cut belongs — the seconds
+    `_gap_snap_target` can move a boundary *to*. `beats` are the song analysis's, in the order
+    they were measured. `measured` is `vocal_gaps`' three-valued answer flattened to the one bit a
+    consumer needs: false means nothing was measured, which is **not** the same as a measured song
+    with no usable rest in it, and is why an empty `gaps` list is never read as "nowhere to cut".
+
+    `start` and `end` are the window every second here is inside, reported so a reader of the wire
+    can see what was searched rather than inferring it from the values that came back.
+    """
+
+    gaps: list[float]
+    beats: list[float]
+    measured: bool
+    start: float
+    end: float
+
+
+def drag_snap_targets(
+    song: Song | None,
+    *,
+    beats: Sequence[float] = (),
+    start: float = 0.0,
+    end: float | None = None,
+) -> DragSnapTargets:
+    """The seconds a dragged Shot edge may be pulled onto. Pure, I/O-free, writes nothing.
+
+    **The second door onto the gap rule, and deliberately not a second rule.** `snap_window_plan`
+    asks `_gap_snap_target` where one boundary would land; a drag needs the same question answered
+    before it knows which boundary it is asking about, so this asks the rule for *its own reachable
+    answers* rather than restating them: `_gap_snap_target(gap, gap[0])` and
+    `_gap_snap_target(gap, gap[1])`. Handed a gap's own ends, the clamp returns exactly
+    `low + SNAP_CLEARANCE_SECONDS` and `high - SNAP_CLEARANCE_SECONDS` — and for a gap too narrow
+    to hold the clearance twice it returns that gap's midpoint from both, which collapses to one
+    target, which is the only answer that gap has. So this list is the image of the rule and not a
+    paraphrase of it: change the clearance, or the narrow-gap case, and these move with it.
+
+    **Why the endpoints are the whole of it.** Inside `[low + c, high - c]` the clamp is the
+    identity — the boundary is already where the rule would put it, and the plan-level snapper
+    reports no move at all. The only seconds the rule ever *moves* a boundary to are those
+    two, so those two are the only things a drag can usefully land on. Offering the interior as well would have a
+    drag "snap" a cut to the second it was already on, which is a write, a neighbour carried and a
+    toast for a gesture that moved nothing.
+
+    **The window is the song, not the plan's span, and that costs no agreement with the button.**
+    `snap_cut_plan` windows over `[first shot start, last shot end]` because that is the stretch
+    its cuts live in. `vocal_gaps` only *clamps* to its window, so every gap bounded by words at
+    both ends — which is every gap an interior cut can be in — is identical under either window.
+    The two that differ are the outermost, and they differ only at the window edge itself: seconds
+    at or beyond the plan's own outer edges, which `snap_window_plan` never moves ("the plan's
+    outer edges never move"). There is therefore no cut the button can move for which these two
+    answer differently — and windowing over the song instead means the answer depends on the song
+    alone, so a browser can key one read on the song rather than re-asking after every edit.
+
+    `beats` are whatever the caller measured, in absolute seconds, and keep the order they were
+    given: nothing here thins them, snaps them to anything or re-sorts them — every one of those
+    would be this module inventing a second opinion about a measurement `audio.py` owns.
+
+    Two things *are* dropped, and both are about this function's own promise rather than about the
+    measurement. A value that is not a real number goes, because a `null` in an array coerces to a
+    beat at second zero. And a beat outside `[start, end]` goes, because `start`/`end` are stated
+    as the window every second in the result is inside — a window nothing enforced was a window
+    that was not true, and a beat past the end of the song is a magnet on silence nobody measured.
+    """
+    low = max(0.0, float(start))
+    high = float(end) if end is not None else float(getattr(song, "duration", 0.0) or 0.0)
+    gaps = vocal_gaps(song, start=low, end=high) if high > low else None
+    targets: set[float] = set()
+    for gap in gaps or ():
+        # Asked of the rule, at each end of the gap, rather than restated here. See the docstring:
+        # this is what makes the list the rule's own image instead of a copy of its arithmetic.
+        targets.add(round(_gap_snap_target(gap, gap[0]), 3))
+        targets.add(round(_gap_snap_target(gap, gap[1]), 3))
+    return DragSnapTargets(
+        gaps=sorted(targets),
+        beats=[
+            float(beat)
+            for beat in beats
+            if isinstance(beat, (int, float))
+            and not isinstance(beat, bool)
+            and math.isfinite(float(beat))
+            and low - 1e-9 <= float(beat) <= high + 1e-9
+        ],
+        measured=gaps is not None,
+        start=low,
+        end=high,
+    )
 
 
 # ------------------------------------------------------------------------------------------

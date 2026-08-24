@@ -189,7 +189,7 @@ BAR_CONTROLS = {
     # media query.
     "undo-shots": "the Undo button",
     "redo-shots": "the Redo button",
-    "snap-playhead": "the playhead magnet",
+    "snap-targets-summary": "the Snap to selector",
     "add-shot": "the add-shot button",
     "split-shot": "the split button",
     "duplicate-shot": "the duplicate button",

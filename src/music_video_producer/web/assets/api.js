@@ -4390,12 +4390,15 @@ export function gapFillPlan(project, shotId, edge) {
 //: not seconds, so the gesture feels identical at every zoom: 0.4 s of pull at 6 px/s would
 //: swallow a whole short shot, and at 64 px/s would be unreachably fine.
 export const PLAYHEAD_SNAP_PIXELS = 8;
-export const PLAYHEAD_SNAP_LABEL = "Snap to playhead";
+//: The playhead's own name and sentence, now read by the "Snap to" selector's playhead row rather
+//: than by a button of its own -- the Director's ruling of 2026-08-24 replaced that button with one
+//: control over every kind. **The magnet itself is unchanged**: same 8 px, same decline while the
+//: song plays, same `playheadSnap` below. Only where it is switched has moved.
 export const PLAYHEAD_SNAP_HELP =
-  "While it is on, dragging a shot edge within a few pixels of the playhead lands it exactly " +
-  "on the playhead, and the neighbouring shot's edge follows so the plan stays contiguous. " +
-  "Park the playhead on a beat, then drag the cut to it. Off while the song is playing — a " +
-  "moving playhead is not a target.";
+  "Dragging a shot edge within a few pixels of the playhead lands it exactly on the playhead, " +
+  "and the neighbouring shot's edge follows so the plan stays contiguous. Park the playhead " +
+  "where you want the cut, then drag the cut to it. Off while the song is playing — a moving " +
+  "playhead is not a target.";
 export const PLAYHEAD_SNAP_TOAST = "Cut moved to the playhead at {seconds}s.";
 export const BOUNDARY_COLLAPSE_REFUSAL =
   "Moving that cut to the playhead would leave {shot} with no length at all.";
@@ -4418,6 +4421,434 @@ export function playheadSnap({
   return { snapped: true, seconds: exactSeconds(playhead) };
 }
 
+
+// ---- C2. snap an edge to the song itself: voiceless gaps and measured beats ------------------
+//
+// Story 8.3. Before this, a dragged edge snapped to exactly one thing — the playhead — and both
+// of the song's own opinions about where a cut belongs were out of reach of the gesture: the
+// beats Story 8.2 drew could not be landed on, and the voiceless gaps the batch "Snap cuts"
+// button aims for were reachable only by rewriting the whole plan at once.
+//
+// **Nothing here decides where a cut belongs.** `timeline.py` does, on the server, for the drag
+// and the button alike, and `GET /timeline/snap-targets` serves the answer. Everything below is
+// arithmetic over the seconds it was handed: which of them is nearest, and whether it is near
+// enough. A gap rule re-derived here would be the second snapper `timeline.py` names as this
+// codebase's own recurring defect — and it would differ, because the button does not snap to
+// lyric-word edges, it clamps into gaps by a clearance this file has never heard of.
+
+// The three kinds, and the order they settle a tie in. Distance decides first and almost always
+// alone; rank is only consulted when two targets are the *same* distance from the edge, which on
+// real numbers means they are the same instant reached two ways.
+//
+// **Playhead over gap over beat**, and the argument runs the same way each time: the playhead is
+// where the Director's own hand put it, so it outranks anything measured; a gap is where the plan
+// snapper says a cut belongs — the strongest editorial claim the song makes — and a beat is a
+// reference mark. Identical to the precedence `beatMarkerPlan` already uses when a beat and an
+// onset compete for one pixel: the stronger claim wins, and it is stated rather than emergent.
+//
+// **Every kind must appear in `SNAP_TARGET_RANK`**, and a test asserts it rather than trusting it:
+// a kind missing from this table compares `undefined > 2`, which is false, so it would silently
+// lose every tie it entered instead of failing anywhere a reader could see.
+export const SNAP_TARGET_KINDS = { playhead: "playhead", gap: "gap", beat: "beat" };
+export const SNAP_TARGET_RANK = { beat: 1, gap: 2, playhead: 3 };
+
+// What the Director is told a cut moved to. One sentence per kind, because "Cut moved to the
+// playhead" said of a beat is a false report of what the application just did.
+export const SNAP_TARGET_TOASTS = {
+  playhead: PLAYHEAD_SNAP_TOAST,
+  gap: "Cut moved to a voiceless moment at {seconds}s — the same second Snap cuts would choose.",
+  beat: "Cut moved to the beat at {seconds}s.",
+};
+
+// Which kinds a drag may land on, as a **set of kind names**. One argument for the whole
+// question, deliberately, rather than a boolean per kind.
+//
+// The Director's ruling: what is being chosen is *which set of snap points this drag snaps to*,
+// and a control that isolates a set is not the same shape as three switches that happen to sit
+// beside each other. A `beats: true, gaps: true` signature would encode the number of kinds into
+// every caller and every test, so adding a fourth would edit all of them -- and it would put the
+// choice's structure in the pure function rather than in the control that owns it.
+//
+// So nothing below knows how many kinds exist or how the Director picked them. `null` and
+// `undefined` mean **every kind**, which is both the honest default for a pure function and the
+// behaviour while no selection has been stored; an empty set means none, and a drag with none is
+// the freehand drag this application made before any of this existed.
+//
+// **Always a copy, never the caller's own Set.** `app.js` holds one live set that the selector
+// mutates, and handing that object through would make a plan resolved at `pointerdown` change its
+// mind halfway through a drag if a kind were toggled -- a gesture whose rules moved under it.
+export function snapKindSet(kinds = null) {
+  if (kinds === null || kinds === undefined) return new Set(Object.values(SNAP_TARGET_KINDS));
+  if (kinds instanceof Set) return new Set(kinds);
+  return new Set(Array.isArray(kinds) ? kinds : [kinds]);
+}
+
+// The widest a target may reach, in *screen pixels*. The playhead magnet's own number, and it is
+// a ceiling rather than a starting point -- raising it above `PLAYHEAD_SNAP_PIXELS` is an
+// Ask First change, because two magnets on one gesture with two different reaches would feel
+// like one magnet that is sometimes broken.
+export const DRAG_SNAP_PIXELS = PLAYHEAD_SNAP_PIXELS;
+
+// ...and how much of the room between two neighbouring targets one of them may claim.
+//
+// **This is the story's central clause held as arithmetic.** One target on its own can safely
+// claim the whole 8 px: there is nowhere else to land. Beats are 440 targets on a 3-minute song --
+// measured 2.44 a second on a real track (2026-08-24), which is 16.4 px apart at 40 px/s,
+// **6.5 px apart at the 16 px/s default** and 2.5 px at the 6 px/s floor. A flat 8 px radius at
+// the default would capture every pixel between every pair of beats, and placing a cut off the
+// beat would become impossible -- breaking the one thing this story promises it will not do.
+//
+// A third of the local spacing on each side leaves a third of it as dead zone at every zoom, and
+// it makes snapping *fade out* as the targets crowd rather than becoming absolute: at 6 px/s the
+// radius is 0.83 px, which is a magnet that has effectively stopped, which is the honest answer
+// when the Director cannot see the difference between two beats anyway.
+//
+// **The playhead is capped by this too, and review iteration 1 is why.** It was left on a flat
+// 8 px on the reading that "one target is safe", which is true of a playhead alone and false of a
+// playhead parked among beats: measured between two beats 0.41 s apart at 16 px/s, 33% of the span
+// was free with beats alone and **0%** once a playhead sat in the middle of it. All three kinds are
+// active by default and a Director parks the playhead where they are working, so that was the
+// default configuration. Lowering a tolerance to keep the dead zone is what the clause above
+// always required; only *raising* one past 8 px is an Ask First.
+export const DRAG_SNAP_SPACING_FRACTION = 1 / 3;
+
+// The drag's targets, resolved once. **Once per drag, not once per pointer move.**
+//
+// `renderTimeline` runs on every `pointermove` of an edge drag -- which is why Story 8.2 had to
+// guard the marker band's rebuild -- and a three-minute song carries several hundred targets.
+// Sorting them, de-duplicating them and measuring every one's local spacing sixty times a second
+// would reintroduce exactly the cost that guard exists to prevent. So this is the expensive half,
+// done at `pointerdown`, and `edgeSnap` below is the cheap half that runs per move.
+//
+// `targets` is the route's whole report -- `{gaps, beats, ...}` -- or null, which is a project
+// whose targets have not been read, or a read that failed. Null, absent, empty and disabled all
+// produce the same empty plan, and an empty plan is a drag that behaves exactly as it did before
+// this story existed.
+//
+// **The playhead is folded in here, as a point like any other.** It is the one target that is a
+// live number rather than a measured list, and keeping it outside was the defect review iteration
+// 1 found: outside, it neither took the spacing cap nor crowded the beats around it. Inside, one
+// pass answers both -- it is capped by its neighbours and it caps them -- and `edgeSnap` has a
+// single list to scan instead of a list plus an exception.
+//
+// Each point carries **its own** tolerance, in seconds, because the spacing that caps it is local:
+// beats crowd in a chorus and spread over an outro, and one number for the whole song would be
+// the wrong number for most of it. The scale they were measured in is carried out with them, so a
+// caller can tell that a zoom has invalidated them rather than having to remember.
+export function dragSnapPlan({
+  targets = null,
+  playhead = null,
+  pixelsPerSecond = TIMELINE_ZOOM_BASE,
+  enabledKinds = null,
+  tolerancePixels = DRAG_SNAP_PIXELS,
+  spacingFraction = DRAG_SNAP_SPACING_FRACTION,
+} = {}) {
+  const scale = Number(pixelsPerSecond);
+  const empty = { points: [], reach: 0, pixelsPerSecond: scale, playhead: null, counts: {} };
+  if (!Number.isFinite(scale) || scale <= 0) return { ...empty, pixelsPerSecond: 0 };
+  const room = Math.min(Number(tolerancePixels) || 0, DRAG_SNAP_PIXELS);
+  if (!(room > 0)) return empty;
+  const fraction = Number(spacingFraction);
+  if (!Number.isFinite(fraction) || fraction <= 0) return empty;
+  // **A kind left out of the set is left out of the plan, not filtered out of the result.** The
+  // spacing that caps every tolerance is measured over the points that are actually in play, so
+  // a set with beats out of it gives the surviving gap targets the full reach they deserve
+  // rather than a reach still crowded by beats nobody can land on.
+  const enabled = snapKindSet(enabledKinds);
+  // One second, one kind. A beat measured at the same instant a gap target sits on is one place
+  // to land, not two, and the stronger claim names it -- `SNAP_TARGET_RANK`'s reason.
+  const claimed = new Map();
+  const claim = (value, kind) => {
+    // `typeof === "number"`, not a coercion: a `null` in a malformed array coerces to a target
+    // at second zero, which is a magnet at the head of the song that nothing measured.
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return;
+    const at = exactSeconds(value);
+    const held = claimed.get(at);
+    if (held === undefined || SNAP_TARGET_RANK[kind] > SNAP_TARGET_RANK[held]) claimed.set(at, kind);
+  };
+  const take = (list, kind) => {
+    if (!enabled.has(kind)) return;
+    for (const value of Array.isArray(list) ? list : []) claim(value, kind);
+  };
+  take(targets?.gaps, SNAP_TARGET_KINDS.gap);
+  take(targets?.beats, SNAP_TARGET_KINDS.beat);
+  if (enabled.has(SNAP_TARGET_KINDS.playhead)) claim(playhead, SNAP_TARGET_KINDS.playhead);
+  const ordered = [...claimed.entries()]
+    .map(([seconds, kind]) => ({ seconds, kind }))
+    .sort((first, second) => first.seconds - second.seconds);
+  const points = ordered.map((point, index) => {
+    // The nearer of its two neighbours: a target with a beat 2 px to its left and open song to
+    // its right may not claim 8 px leftward on the strength of the open side.
+    const before = index > 0 ? point.seconds - ordered[index - 1].seconds : Infinity;
+    const after = index + 1 < ordered.length ? ordered[index + 1].seconds - point.seconds : Infinity;
+    const spacing = Math.min(before, after);
+    const capped = Number.isFinite(spacing) ? Math.min(room, spacing * scale * fraction) : room;
+    return { ...point, tolerancePixels: capped, tolerance: capped / scale };
+  });
+  const counts = {};
+  for (const point of points) counts[point.kind] = (counts[point.kind] || 0) + 1;
+  return {
+    points,
+    // The widest any point's tolerance can be, in seconds. `edgeSnap` scans outward from the edge
+    // and stops here, which is what keeps a per-move search bounded on a song with hundreds of
+    // targets rather than walking all of them.
+    reach: room / scale,
+    // What this plan was measured in and against, so a caller can notice that a zoom or a seek has
+    // made it stale. Carried rather than re-derived: a plan resolved at 16 px/s whose tolerances
+    // are read at 64 px/s claims 10.7 px of pull, above a ceiling this file calls an Ask First.
+    pixelsPerSecond: scale,
+    playhead: enabled.has(SNAP_TARGET_KINDS.playhead) && Number.isFinite(Number(playhead))
+      ? exactSeconds(playhead)
+      : null,
+    // Per kind rather than a field each, so nothing here counts the kinds either.
+    counts,
+  };
+}
+
+// Where a dragged edge actually lands. `playheadSnap`'s contract, extended: the same
+// `{snapped, seconds}` a caller already reads, plus `kind` so the report of what happened can
+// name the right thing.
+//
+// **The nearer target wins, whichever kind it is**, and every kind is asked the same question by
+// the same function: `playheadSnap` decides whether an edge is within N screen pixels of an
+// instant, which is the whole of the playhead magnet's rule and now the whole of every target's.
+// It was generalised rather than copied -- there is still exactly one implementation of "near
+// enough", and the playhead's own behaviour is what it always was when it is the only target
+// in play.
+//
+// **The plan is the only source of what may be landed on.** No kind filter here, no playhead
+// argument, no scale: all three are decided when the plan is resolved, so a caller cannot pass a
+// plan built one way and a filter built another and get an answer belonging to neither. That
+// mismatch was real -- a plan built with every kind, snapped with `['playhead']`, used to answer
+// `kind: "beat"`.
+//
+// **Off every target is a real answer.** Nothing here refuses, clamps, colours or reports; an
+// edge released between targets comes back `snapped: false` at the second it was released, and
+// the caller writes it as the freehand drag always has.
+//
+// Snapping declines entirely while the master is playing, matching the playhead magnet: an edge
+// cannot be lined up against anything while the thing it is being lined up against is moving,
+// and a cut that lands somewhere different depending on how long the drag took is not a target.
+export function edgeSnap({ seconds, plan = null, playing = false } = {}) {
+  const value = Number(seconds);
+  const free = { snapped: false, seconds: exactSeconds(seconds), kind: "" };
+  if (!Number.isFinite(value)) return free;
+  const scale = Number(plan?.pixelsPerSecond);
+  const points = plan?.points || [];
+  if (playing || !Number.isFinite(scale) || scale <= 0 || !points.length) return free;
+  let best = null;
+  const consider = (point) => {
+    // The one implementation of "near enough", asked of this target exactly as it has always been
+    // asked of the playhead, at this target's own capped tolerance.
+    const pull = playheadSnap({
+      seconds: value,
+      playhead: point.seconds,
+      pixelsPerSecond: scale,
+      tolerancePixels: point.tolerancePixels,
+    });
+    if (!pull.snapped) return;
+    const distance = Math.abs(value - point.seconds);
+    if (best === null
+      || distance < best.distance - GAP_EPSILON_SECONDS
+      || (distance <= best.distance + GAP_EPSILON_SECONDS
+        && SNAP_TARGET_RANK[point.kind] > SNAP_TARGET_RANK[best.kind])) {
+      best = { seconds: pull.seconds, kind: point.kind, distance };
+    }
+  };
+  const reach = Number(plan?.reach) || 0;
+  // Binary search for where this edge falls among the sorted points, then out from there until
+  // the widest a point's tolerance could possibly be is behind us. Bounded by `reach` rather
+  // than by the list, so a per-move call costs a handful of comparisons on any song.
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (points[middle].seconds < value) low = middle + 1;
+    else high = middle;
+  }
+  for (let index = low - 1; index >= 0 && value - points[index].seconds <= reach; index -= 1) {
+    consider(points[index]);
+  }
+  for (let index = low; index < points.length && points[index].seconds - value <= reach; index += 1) {
+    consider(points[index]);
+  }
+  return best === null ? free : { snapped: true, seconds: best.seconds, kind: best.kind };
+}
+
+// Which measurement a read set of drag targets belongs to. The fetch is keyed on this, so it is
+// re-read exactly when the answer changes and never otherwise -- the route hashes the whole master
+// to decide whether the analysis is current, which is why nothing may ask it on a timer.
+//
+// It is `songEnvelopeIdentity` plus the three things the *gap* half depends on and the envelope's
+// key does not: the word and span counts, and the song's own duration. A first transcription, or a
+// re-transcription, changes neither the song file nor the analysis fingerprint and changes every
+// gap target there is. The duration is in it because the outermost gap target is
+// `duration - SNAP_CLEARANCE_SECONDS`, so a Song whose length was corrected without the file being
+// replaced would otherwise keep a target measured against the old end of the track.
+//
+// Deliberately **not** keyed on the shot plan. The targets are computed over the song rather than
+// over the plan's span (see `drag_snap_targets`), so editing a window cannot move one -- which is
+// what lets this be one read on a load path instead of a re-read after every drag.
+export function snapTargetsIdentity(projectId, song = null) {
+  const id = projectId || "";
+  if (!id || !song?.path) return `${id}::`;
+  const words = Array.isArray(song?.lyric_words) ? song.lyric_words.length : 0;
+  const spans = Array.isArray(song?.vocal_spans) ? song.vocal_spans.length : 0;
+  return `${songEnvelopeIdentity(id, song)}:${words}:${spans}:${song?.duration || 0}`;
+}
+
+
+// ---- C3. the "Snap to" selector: which set of points a drag lands on -------------------------
+//
+// The Director's ruling of 2026-08-24, mid-implementation: *"there should definitely be a dropdown
+// selector or something to help isolate what set of snap points dragging snaps to."*
+//
+// **One control answers "what does dragging snap to".** It replaces the playhead magnet's own
+// button rather than sitting beside it, because two controls answering one question is how a
+// Director ends up opening both to find out. The playhead's *behaviour* is untouched -- still
+// `playheadSnap`, still 8 px, still declining while the master plays; only where it is switched
+// has moved.
+//
+// **It deliberately does not absorb `#beat-markers`.** Markers are drawing and snap targets are
+// dragging: a Director may want to see the beats without landing on them, or land on beats they
+// have hidden. Folding the two together is an Ask First in this story's spec.
+//
+// Everything below is text and structure over a set of kind names, and nothing in it counts them:
+// the control draws whatever `SNAP_TARGET_ORDER` lists, and `app.js` writes markup from the plan.
+//
+// **What adding a fourth kind actually costs, stated honestly**, because an earlier draft of these
+// comments said "one line in `SNAP_TARGET_ORDER`" and that was not true. It is one entry in each of
+// the tables a kind needs -- `SNAP_TARGET_KINDS`, `SNAP_TARGET_RANK`, `SNAP_TARGET_ORDER`,
+// `SNAP_TARGET_LABELS`, `SNAP_TARGET_SHORT`, `SNAP_TARGET_NOTES`, `SNAP_TARGET_HELP` and
+// `SNAP_TARGET_TOASTS` -- plus wherever its seconds come from: a `take(...)` line in
+// `dragSnapPlan` for a served list, or a `claim(...)` line for a live number like the playhead,
+// and the matching key on the server's report. What it does **not** cost is a signature change, a
+// per-kind boolean anywhere, or an edit to `edgeSnap`, `app.js` or any caller -- which is the part
+// the set-shaped argument bought. Completeness tests hold `RANK` and `LABELS` to the order list,
+// because a kind missing from `RANK` silently loses every tie rather than failing.
+export const SNAP_SELECT_CONTROL = "#snap-targets";
+export const SNAP_SELECT_SUMMARY = "#snap-targets-summary";
+export const SNAP_SELECT_LIST = "#snap-target-kinds";
+export const SNAP_SELECT_LABEL = "Snap to";
+//: What the control says when the Director has switched every kind off. A sentence rather than an
+//: empty space: "Snap to:" with nothing after it reads as a control that failed to draw, and this
+//: is a real and deliberate state -- dragging is entirely freehand and that is a choice.
+export const SNAP_SELECT_NONE = "nothing";
+export const SNAP_SELECT_HELP =
+  "Which points a dragged shot edge lands on. Any combination, including none. Snapping is an " +
+  "assist and never a rule: an edge put down between targets stays exactly where it was " +
+  "released, and nothing warns or refuses. The pull shrinks as targets crowd together, so there " +
+  "is always room to place a cut deliberately off them, and nothing snaps while the song plays. " +
+  "Showing the beat marks is a separate switch — you can snap to beats you have hidden.";
+
+//: The kinds, in the order the control lists them, and the one place their number is written
+//: down. Strongest editorial claim first, which is also `SNAP_TARGET_RANK`'s order.
+export const SNAP_TARGET_ORDER = [
+  SNAP_TARGET_KINDS.playhead, SNAP_TARGET_KINDS.gap, SNAP_TARGET_KINDS.beat,
+];
+export const SNAP_TARGET_LABELS = {
+  playhead: "Playhead",
+  gap: "Phrase gaps",
+  beat: "Beats",
+};
+//: The same three for the summary line, where the control has one row of a toolbar to say what
+//: dragging will do. Lower case and shorter, because it is read as a phrase and not as a list of
+//: headings: `Snap to: playhead · gaps · beats`.
+export const SNAP_TARGET_SHORT = { playhead: "playhead", gap: "gaps", beat: "beats" };
+//: One short line each, drawn under the row's own name. What the kind *is* and where it comes
+//: from -- the thing a Director cannot get from the word "gaps" alone is that these are the same
+//: seconds the batch Snap cuts button chooses, which is the whole argument for the feature.
+export const SNAP_TARGET_NOTES = {
+  playhead: "Where you parked the play marker.",
+  gap: "The voiceless moments Snap cuts chooses — needs a transcribed song.",
+  beat: "The beats the song analysis measured — needs an analysed song.",
+};
+//: ...and the paragraph behind it, on the row's `title`, for a Director who went looking. The
+//: playhead's is the sentence its own button used to carry, so the magnet's explanation moved with
+//: its switch rather than being rewritten shorter and losing half of what it said.
+export const SNAP_TARGET_HELP = {
+  playhead: PLAYHEAD_SNAP_HELP,
+  gap: "The seconds `timeline.py` picks inside each voiceless stretch — far enough inside that " +
+    "neither shot's edge sits on a syllable. Exactly what the batch Snap cuts button lands a cut " +
+    "on, computed once on the server so a drag and that button can never disagree. A song that " +
+    "has not been transcribed has none, and nothing here says so: the other kinds keep working.",
+  beat: "Every beat the song analysis measured, not the thinned set drawn on the waveform — you " +
+    "can land on a beat whose mark is hidden. A song that has not been analysed has none, and " +
+    "nothing here says so: the other kinds keep working.",
+};
+
+// The control's whole state, decided here so `app.js` writes markup and nothing else: which rows
+// to draw, which are ticked, and the one line the summary says.
+//
+// `active` is normalised on the way through -- a kind this build does not have is dropped rather
+// than drawn, which is what makes a stored selection from an older or newer browser session
+// harmless. See `storedSnapKinds`, which is the other half of that.
+export function snapSelectorPlan(activeKinds = null) {
+  const enabled = snapKindSet(activeKinds);
+  const kinds = SNAP_TARGET_ORDER.map((kind) => ({
+    kind,
+    label: SNAP_TARGET_LABELS[kind] || kind,
+    note: SNAP_TARGET_NOTES[kind] || "",
+    help: SNAP_TARGET_HELP[kind] || "",
+    checked: enabled.has(kind),
+  }));
+  const active = kinds.filter((row) => row.checked).map((row) => row.kind);
+  const named = active.map((kind) => SNAP_TARGET_SHORT[kind] || kind).join(" · ");
+  return {
+    kinds,
+    active,
+    any: active.length > 0,
+    // The state, in words, on the control itself. Never a count and never a colour: "2 selected"
+    // does not tell a Director what a drag is about to do, and a lit button says even less.
+    summary: `${SNAP_SELECT_LABEL}: ${active.length ? named : SNAP_SELECT_NONE}`,
+  };
+}
+
+// One stored session value, read back as a selection. **Three states, and the third is the one a
+// careless read loses.**
+//
+// * **absent** -- `undefined`, `null`, or anything that is not an array -- means *every kind*.
+//   That is the default-on asymmetry the other view toggles use, and it is what a first-ever run
+//   and a session saved before this feature both carry. Answered as `null` here, so the caller
+//   keeps its own default rather than being handed a list this function invented.
+// * **an empty array** means the Director switched everything off on purpose. Freehand dragging
+//   is a real choice and it has to survive a reload.
+// * **a populated array** is exactly that subset.
+//
+// `session.snapTargets || ALL` would flatten the first two together in the *other* direction and
+// happen to work -- `[]` is truthy -- which is precisely why this is a named function with a test
+// rather than an expression somebody has to reason about at a glance.
+//
+// Unknown names are dropped rather than thrown on: a session written by an older build may name a
+// kind that has gone, and one written by a newer build may name a kind this one does not have.
+// Either way the selection is what this build can honour of what was asked for.
+export function storedSnapKinds(value) {
+  if (!Array.isArray(value)) return null;
+  return value.filter((kind) => SNAP_TARGET_ORDER.includes(kind));
+}
+
+// The whole selection a stored session implies, migration included. `null` still means "nothing
+// was stored, keep the every-kind default"; anything else is the selection to adopt.
+//
+// **`playheadSnap: false` is honoured, and review iteration 1 is why.** That key was the playhead
+// magnet's own switch before this selector replaced it, and deleting its restore line with nothing
+// in its place silently switched the magnet back on for every Director who had turned it off --
+// a preference reversed without being asked, on the next load, with nothing on screen to say so.
+// A session carrying it and no `snapTargets` is therefore read as "every kind except the
+// playhead", which is what that Director had.
+//
+// The migration is deliberately one-way and one-shot: the moment a selection is stored, that key
+// stops being consulted, so a Director who ticks the playhead back on is not overruled by it on
+// the next load. Nothing rewrites or deletes the old key -- a session store is not a migration
+// journal, and leaving it costs one dead field.
+export function snapKindsFromSession(session = null) {
+  const stored = storedSnapKinds(session?.snapTargets);
+  if (stored !== null) return stored;
+  if (session?.playheadSnap === false) {
+    return SNAP_TARGET_ORDER.filter((kind) => kind !== SNAP_TARGET_KINDS.playhead);
+  }
+  return null;
+}
 // Move the cut at one shot's edge to `seconds`, carrying the shot that shares it.
 //
 // This is the half that keeps the plan contiguous, and it is why snapping is not simply the
@@ -5385,6 +5816,13 @@ export const api = {
   // once on the load path when a song is on screen; it hashes the song file to decide validity,
   // which is precisely why nothing may put it behind a timer.
   songEnvelope: (id) => request(`/api/projects/${id}/song/envelope`),
+  // Every second a dragged shot edge may land on: the voiceless-gap targets `timeline.py` itself
+  // chooses -- the same seconds the batch "Snap cuts" button lands a cut on -- and the beats the
+  // song analysis measured. Computed server-side so the drag and the button can never hold two
+  // opinions about where a cut belongs. Absence of either half is a 200 carrying the half that
+  // exists, so a caller reads the lists and never a status code. Read once on the load path for
+  // `songEnvelope`'s reason exactly: reaching the beats hashes the master.
+  snapTargets: (id) => request(`/api/projects/${id}/timeline/snap-targets`),
   // One pointer moves: `output` switches among the shot's own takes (provenance is its
   // job history), `asset_id` attaches a video asset as the shot's clip.
   selectTake: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/select-take`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),

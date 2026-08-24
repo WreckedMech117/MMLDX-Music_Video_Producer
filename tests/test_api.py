@@ -213,6 +213,7 @@ from music_video_producer.timeline import (
     SNAP_TOLERANCE_OFF,
     SNAP_UNMEASURED,
     SNAP_WITHOUT_CUTS,
+    drag_snap_targets,
     expansion_input,
     lyric_line_tags,
     over_render_frames,
@@ -21234,6 +21235,145 @@ def test_importing_a_song_measures_it_into_a_sidecar_and_records_only_a_pointer(
     assert len(envelope["bands"]) == envelope["band_count"] == 8
     assert len(envelope["band_average"]) == 8
     assert envelope["analysis_rate"] == 30.0
+
+
+def test_the_drag_snap_targets_route_serves_both_halves_and_neither_is_required(tmp_path: Path):
+    """Story 8.3's route: every second a dragged Shot edge may land on, computed by `timeline.py`
+    so the drag and the batch "Snap cuts" button cannot hold two opinions about where a cut goes.
+
+    **Absence of either half is a 200 carrying the half that exists.** Beats come from the
+    analysis and gap targets from the transcription, and the two are independent: a song nobody
+    transcribed keeps its beats, a song nobody analysed keeps its gap targets, and a project with
+    no song at all answers two empty lists rather than an error. None of them may become a status
+    code, because this is an assist on a gesture that has to keep working exactly as it does today
+    whenever a measurement is missing.
+
+    `measured` and `analysed` are reported rather than left to be inferred from an empty list:
+    `vocal_gaps` distinguishes *unmeasured* from *measured and voiced throughout*, and this
+    codebase never flattens the two together.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Targets"))
+
+    # No song at all: two empty lists, a 200, and nothing that reads as a failure.
+    bare = client.get(f"/api/projects/{project.id}/timeline/snap-targets")
+    assert bare.status_code == 200, bare.text
+    assert bare.json() == {
+        "gaps": [], "beats": [], "measured": False, "analysed": False, "start": 0.0, "end": 0.0
+    }
+
+    # Analysed but never transcribed: the beats are served, the gap half is honestly empty.
+    import_measured_song(client, project.id, bpm=120)
+    analysed = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert analysed["analysed"] is True
+    assert analysed["beats"], "an analysed song served no beat targets"
+    assert analysed["measured"] is False and analysed["gaps"] == []
+
+    # The beats are the envelope's own, passed through rather than re-derived or thinned.
+    saved = ProjectStore(tmp_path).get(project.id)
+    envelope = json.loads(
+        (store.project_dir(project.id) / saved.song.analysis.path).read_text(encoding="utf-8")
+    )
+    assert analysed["beats"] == envelope["beats"]
+
+    # Now transcribed as well: the gap targets appear beside the beats, and are exactly the
+    # seconds `timeline.py`'s own rule can move a boundary to.
+    saved.song.lyric_words = [("la", 0.5, 1.0), ("la", 2.5, 3.0)]
+    saved.song.vocal_spans = [(0.5, 1.0), (2.5, 3.0)]
+    store.save(saved)
+    both = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert both["measured"] is True
+    assert both["beats"] == analysed["beats"]
+    assert both["gaps"] == drag_snap_targets(saved.song).gaps
+    assert both["gaps"], "a transcribed song served no gap targets"
+
+    # And the only 404 is the project itself not existing -- absence is never one.
+    assert client.get("/api/projects/project_missing/timeline/snap-targets").status_code == 404
+
+
+def test_a_replaced_song_stops_serving_the_beats_it_was_measured_from(tmp_path: Path):
+    """The read-time validity rule, carried into the drag.
+
+    Nothing stores "this envelope is stale"; every read compares the song's current bytes against
+    the fingerprint the measurement was taken from, and a mismatch means *absent*. A magnet still
+    pulling a cut onto the beats of a track that has been replaced is the one state this feature
+    must not be able to reach, and it is closed by the same rule `song/envelope` uses rather than
+    by a second one written here.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Replaced"))
+    import_measured_song(client, project.id, bpm=120)
+    assert client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()["beats"]
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    audio = store.project_dir(project.id) / saved.song.path
+    audio.write_bytes(click_wav_bytes(bpm=90))
+
+    after = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert after["analysed"] is False and after["beats"] == []
+    # ...and the route still answers 200, so the drag simply has fewer targets rather than the
+    # client having an error to draw.
+    assert client.get(f"/api/projects/{project.id}/timeline/snap-targets").status_code == 200
+
+
+def test_the_analysed_flag_never_disagrees_with_the_beats_it_describes(tmp_path: Path):
+    """`analysed` exists so a reader of the wire can tell "no measurement" from "measured, and
+    this song has no detectable beat". A flag true beside an empty list for the *wrong* reason
+    answers neither question, so it is computed from the same expression the beats are rather than
+    from a second check that can drift away from it.
+
+    Three states, and every one of them driven through the real route:
+
+    * a measurement with beats in it -- analysed, and the beats are the envelope's own;
+    * a measurement of a song with no detectable beat -- **analysed**, with an empty list, which
+      is the case the flag exists for. `audio.py` answers `0.0, []` for flat silence, so this is
+      not hypothetical;
+    * a sidecar that is not an envelope -- absent, and therefore not analysed and no beats.
+
+    The fourth shape the flag used to be able to reach -- `analysed: true` with beats missing
+    because the envelope was not a mapping -- is unreachable from here on purpose:
+    `store.read_song_envelope` refuses anything that is not shaped like an envelope, so the route
+    is never handed a half-read one. That is checked below rather than assumed.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Flagged"))
+    import_measured_song(client, project.id, bpm=120)
+
+    honest = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert honest["analysed"] is True and honest["beats"]
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    sidecar = store.project_dir(project.id) / saved.song.analysis.path
+    kept = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    # A song with no detectable beat is measured, not unmeasured. This is the row the flag exists
+    # to distinguish and the one an empty list alone cannot say.
+    sidecar.write_text(json.dumps({**kept, "beats": []}), encoding="utf-8")
+    flat = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert flat["analysed"] is True, "a real measurement of a beatless song read as never taken"
+    assert flat["beats"] == []
+
+    # An envelope missing a key `audio.extract_envelope` promises is not an envelope, and the
+    # sidecar reader refuses it before this route sees it -- so `analysed` cannot be true with the
+    # beats key simply gone.
+    without = {key: value for key, value in kept.items() if key != "beats"}
+    sidecar.write_text(json.dumps(without), encoding="utf-8")
+    partial = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert partial["analysed"] is False and partial["beats"] == []
+
+    # And JSON that is not an object at all is absent, never "analysed with nothing in it".
+    sidecar.write_text("[1, 2, 3]", encoding="utf-8")
+    broken = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert broken["analysed"] is False and broken["beats"] == []
+    # The gap half is independent of all of this: no transcription, so no gap targets either way.
+    assert broken["measured"] is False
+    # The flag and the list are read from one expression, so neither can be true of a state the
+    # other is not. Read rather than driven, because the shape it forbids is now unreachable.
+    route = Path("src/music_video_producer/app.py").read_text(encoding="utf-8").split(
+        'def read_timeline_snap_targets(', 1
+    )[1].split("\n    @app.", 1)[0]
+    assert "envelope = served if isinstance(served, dict) else None" in route
+    assert '"analysed": envelope is not None' in route
 
 
 def test_the_envelope_is_served_by_its_own_endpoint_and_never_by_a_project_response(

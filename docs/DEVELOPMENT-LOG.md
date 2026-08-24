@@ -4,6 +4,144 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-24 — A dragged cut lands on the song: voiceless gaps, measured beats, and one control that says which
+
+Story 8.3, the last of Epic 8. Before it, a dragged shot edge snapped to exactly one thing — the
+playhead — and both of the song's own opinions about where a cut belongs were out of the gesture's
+reach: the beats Story 8.2 drew could not be landed on, and the voiceless gaps the batch
+**Snap cuts** button aims for were reachable only by rewriting the whole plan at once.
+
+**No render, no ComfyUI call, no model call.** Suite at 2020 passing when this landed, from 1996.
+
+### One snapper, two consumers
+
+`timeline.py`'s own module comment names *a second snapper for a second caller* as this codebase's
+recurring defect, and the temptation here was exactly that: port the gap rule into JavaScript so a
+drag could see it. It would also have been **wrong** — the batch button does not snap to lyric-word
+edges, it clamps a boundary `SNAP_CLEARANCE_SECONDS` inside a voiceless stretch, and a drag offering
+word edges would have been a second opinion wearing the same name.
+
+So `timeline.drag_snap_targets` asks the existing rule for its own reachable answers rather than
+restating them: `_gap_snap_target(gap, gap[0])` and `_gap_snap_target(gap, gap[1])`, which are
+`low + clearance` and `high - clearance` for a wide gap and that gap's midpoint for one too narrow
+to hold the clearance twice. Inside `[low + c, high - c]` the clamp is the identity — the boundary
+is already where the rule would put it and the button reports no move — so those two endpoints are
+the only seconds the rule can ever *move* a boundary to, and therefore the only ones a drag can
+usefully land on. `tests/test_timeline.py` asserts the two doors agree **exactly**, with no rounding
+on either side of the comparison: `snap_window_plan` rounds its proposal to the millisecond and this
+rounds to the same millisecond, and if either stops the test fails.
+
+The window is the **song**, not the plan's span, which is what lets one read be keyed on the song
+alone. `vocal_gaps` only clamps to its window, so every gap bounded by words at both ends — every
+gap an interior cut can be in — is identical either way; the two that differ do so only at the
+window edge, and `snap_window_plan` never moves a plan's outer edges. There is no cut the button can
+move for which the two windows answer differently.
+
+`GET /api/projects/{id}/timeline/snap-targets` serves the result. Absence of either half is a 200
+carrying the half that exists: a song nobody transcribed keeps its beats, a song nobody analysed
+keeps its gap targets, a project with no song answers two empty lists. `measured` and `analysed` are
+reported rather than inferred from an empty list, because `vocal_gaps` distinguishes *unmeasured*
+from *measured and voiced throughout* and this codebase does not flatten the two — and both are
+computed from the same expression the beats are, so the flag cannot describe a state the list is not
+in.
+
+### The pull has to fade, or the feature eats its own promise
+
+The frozen intent says an edge placed off every target is accepted silently. A flat 8 px radius
+makes that false the moment targets are dense: beats sit **2.44 a second** on a real 3-minute track
+(measured for Story 8.2), which is 6.5 px apart at the 16 px/s default — so a flat 8 px would capture
+every position between every pair and placing a cut off the beat would be impossible.
+
+Each target's tolerance is therefore capped at a **third of its local spacing**, leaving a third of
+the room between any two as dead zone at every zoom, and making the magnet fade out as targets crowd
+rather than becoming absolute — 0.83 px at the 6 px/s floor, which is a magnet a Director cannot
+feel, and the honest answer when they cannot see the difference between two beats either.
+
+**The first cut of this missed the playhead**, which kept a flat 8 px on the reading that "one
+target is safe". True of a playhead alone; false of a playhead parked among beats. Measured on the
+shipped build: between two beats 0.41 s apart at the default zoom, 33% of the span was free with
+beats alone and **0%** once a playhead sat in the middle of it — and every kind is active by
+default, and a Director parks the playhead where they are working. So the story's central clause
+failed in the *default* configuration. The playhead is now a point in the same plan, capped by its
+neighbours and crowding them in turn, and a test sweeps that span and asserts a third of it still
+snaps to nothing.
+
+### The magnet is `playheadSnap`, generalised rather than copied
+
+`playheadSnap` already answered "is this edge within N screen pixels of that instant", which is the
+whole of the playhead magnet's rule. `edgeSnap` now asks it once per candidate target, at that
+target's own capped tolerance — so there is still exactly one implementation of *near enough*, and
+with a playhead as the only target the answer is byte for byte what this application shipped before.
+A test sweeps 804 positions across both and compares.
+
+`edgeSnap` takes a plan and nothing else: no kind filter, no playhead, no scale. All three are
+decided when the plan is resolved. An earlier shape took `enabledKinds` on both calls and honoured
+it on only one, so a plan built with every kind and snapped with `['playhead']` answered
+`kind: "beat"` — a filter the caller thought it had passed. Structurally impossible now: one place
+a selection can be expressed is one place for it to be wrong.
+
+The plan is resolved **once per drag**, at `pointerdown`. `renderTimeline` runs on every
+`pointermove` — which is why Story 8.2 had to guard the marker band's rebuild — and a three-minute
+song carries several hundred targets. The move handler re-resolves only when `pixelsPerSecond` has
+actually changed, because a plan's tolerances are pixels stored as seconds: one resolved at 16 px/s
+is worth 10.7 px at 64, past a ceiling this file calls an Ask First to raise.
+
+### One control that answers "what does dragging snap to"
+
+The Director's ruling, mid-implementation: *"there should definitely be a dropdown selector or
+something to help isolate what set of snap points dragging snaps to."*
+
+`#snap-playhead` is **gone**, replaced by a **Snap to** multi-select — a native `<details>`, so it
+opens and closes by keyboard with no script and reports its own expanded state, with real checkboxes
+carrying real labels inside a `role="group"` named by the summary. The summary says the active set
+in words (`Snap to: playhead · gaps · beats`, or `Snap to: nothing`), never a count and never a
+colour alone: a Director should not have to open it to learn what a drag will do. It closes on an
+outside click and on Escape, the latter bound on the panel rather than on the document so Escape
+stays the property of whatever is focused and `document`'s one keydown listener stays the undo
+shortcut's.
+
+The magnet takes the active kinds as a **set**, so nothing pure counts them; the enabled filter is
+applied *inside* the spacing pass, so a kind the Director switched off does not go on crowding the
+reach of one they kept. Adding a target in Epic 10 or 11 costs one entry in each of the kind tables
+and one line for where its seconds come from — and no signature change, no per-kind boolean, and no
+edit to any caller. That is stated in the source honestly, because an earlier draft claimed "one
+line" and it was not true.
+
+`#beat-markers` is deliberately **not** folded in. Markers are drawing and snap targets are
+dragging; a Director may want to see beats without landing on them, or land on beats they have
+hidden. Folding them is now an Ask First.
+
+**The stored selection needs three states, not two.** Absent means every kind — the default-on
+asymmetry the other view settings use. An empty array means the Director switched everything off on
+purpose, and that survives a reload like any other choice. A populated array is their subset.
+`session.snapTargets || ALL` happens to work because `[]` is truthy, which is exactly why the read is
+a named function with a test. And a session carrying the old `playheadSnap: false` and no selection
+yet is migrated to *every kind except the playhead*: deleting that restore line with nothing in its
+place silently switched the magnet back on for every Director who had turned it off.
+
+### What a browser found that nothing else could
+
+`--panel` was used exactly once — as the dropdown's own background — and defined nowhere. `var()` on
+an undefined custom property is valid CSS that resolves to nothing, so the panel rendered
+**transparent** over the timeline, with its help text sitting on the ruler and beat marks showing
+through the words. It is now `--surface-3`, and a four-line test asserts every `var(--x)` in
+`styles.css` resolves to a token that file defines, which kills the class.
+
+`tests/e2e_timeline_edit.py` gained a fourteenth section on port 8771 with a project of its own,
+because every other section runs against silence and `audio.py` measures silence as **no beats at
+all** — a click track anywhere else would have put a second magnet on drags those sections are not
+about. It drives a non-default selection across a page reload, an edge released short of an off-grid
+beat landing on it to the millisecond with the neighbour following, an edge released *between* two
+beats staying where it was let go, and the same beat snap again with a take on both shots at the cut
+so the 2026-08-21 take-anchoring ruling is shown to hold for this gesture too.
+
+Two latent defects in that harness surfaced on the way. `scrub_to` nudged **2 px** per attempt,
+which at 16 px/s is exactly three frames — it preserved the parity of wherever the first click
+landed, so a first click on the frame grid meant all ten attempts were on it and the loop could not
+do the one thing it exists for. One run parked at exactly 34.500 s ten times. It steps 1 px now.
+And `synthesize_song` wrote silence, which is right for every section that measures nothing and
+useless for one that must.
+
 ## 2026-08-23 — A failed render leaves the shot available, one click cancels the whole queue, and the timeline says which clip is actually on the GPU
 
 Three reports from one incident. The Director started **Generate All Empty** at 20 steps, changed

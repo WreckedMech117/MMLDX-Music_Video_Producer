@@ -27,7 +27,7 @@ What is asserted, in order:
 
 1. **The controls exist where the Director was told to look**, are hit-tested rather than merely
    found, carry accessible names, and start in the honest state (both history buttons shut, the
-   magnet pressed).
+   "Snap to" selector naming every kind it will snap to).
 2. **Undo restores the exact prior plan after every covered gesture** -- split, delete, duplicate,
    add, move, resize -- each one driven as a real click or a real drag, each one read back off
    disk, and the plan compared field for field.
@@ -38,7 +38,8 @@ What is asserted, in order:
 5. **Gap fill on both edges**, on a 0.002 s gap and on a 2.5 s one, on the song's own tail, and
    refused on a locked neighbour.
 6. **Snap to playhead moves the shared boundary**: the neighbour's edge follows, the plan stays
-   contiguous, and the same drag with the magnet switched off does not land on the playhead.
+   contiguous, and the same drag with every kind deselected in the "Snap to" selector does not
+   land on the playhead.
 7. **One Undo steps back one gesture**, even when two gestures were made inside a single round
    trip -- and the state between them is reachable (review Finding 4, 2026-08-21).
 8. **A drag does not leave a double-click behind**: re-grabbing an edge just after dragging it
@@ -63,6 +64,15 @@ What is asserted, in order:
     unlocked one moves it, both read back as `start - lead - nudge` off the manifest; a window
     dragged off the picture its take holds turns amber without shutting anything; and a take that
     recorded no window of its own is never warned about.
+14. **Snapping a cut to a measured beat, and deliberately off one** (Story 8.3). Its own project
+    with a click track for a song, because every other section runs against silence and silence
+    measures no beats. A non-default selection is made and read back across a page reload; with
+    the "Snap to" selector set to beats alone, a real edge drag released a couple of pixels short
+    of an off-grid beat lands exactly on it and carries the neighbour; a real edge drag released
+    *between* two beats stays where it was let go, silently; and the same beat snap is driven
+    again with a take on **both** shots at the cut, so the ruling of 2026-08-21 is shown to hold
+    for this gesture and not only for the playhead's. The middle one is the half no offline test
+    can prove about a real pointer at a real zoom.
 
 **No GPU time and no model time is spent.** Nothing here reaches `/prompt`; the one control that
 could spend model time is deliberately driven only as far as its own confirmation and then
@@ -319,22 +329,53 @@ if (!window.__mvpEdgeWatch) {
 return true;
 """
 
-#: The magnet's own state, as the button announces it rather than as the module holds it.
+#: The "Snap to" selector's own state, as the control announces it rather than as the module holds
+#: it: the sentence on the summary, and which kinds are actually ticked. The Director's ruling of
+#: 2026-08-24 replaced the playhead magnet's own button with this, so what used to be one
+#: `aria-pressed` is now a set -- and the summary has to say what that set is without being opened.
 SNAP_STATE = """
-const button = document.querySelector('#snap-playhead');
-return button ? {pressed: button.getAttribute('aria-pressed'), name: button.getAttribute('aria-label')} : null;
+const summary = document.querySelector('#snap-targets-summary');
+if (!summary) return null;
+const boxes = [...document.querySelectorAll('#snap-target-kinds input')];
+return {
+  name: summary.getAttribute('aria-label'),
+  text: summary.textContent,
+  kinds: boxes.map((box) => box.dataset.kind),
+  active: boxes.filter((box) => box.checked).map((box) => box.dataset.kind),
+};
 """
 
 
-def synthesize_song(target: Path, seconds: float = SONG_SECONDS) -> None:
-    """Silence, at a real sample rate. The timeline needs a Song with a duration and a path; the
-    audio element needs something it can seek in, because the playhead this script snaps to is
-    `#master-audio`'s own `currentTime`."""
+def synthesize_song(
+    target: Path, seconds: float = SONG_SECONDS, *, clicks_per_minute: float = 0.0
+) -> None:
+    """Silence at a real sample rate, or a click track when one is asked for.
+
+    The timeline needs a Song with a duration and a path; the audio element needs something it can
+    seek in, because the playhead most of this script snaps to is `#master-audio`'s own
+    `currentTime`. Silence is enough for all of that, and it is what every section but the last
+    uses -- deliberately, because a song the analysis finds beats in would put a second magnet on
+    every drag those sections make and they are not about that.
+
+    **The click track exists for exactly one section.** `audio.py` estimates a tempo from the
+    spectral flux and lays a beat grid on it, and flat silence has no flux at all: `_estimate_tempo`
+    answers `0.0, []` for it, so a silent song measures no beats and there is nothing to snap to.
+    Each click is a handful of samples at full scale -- a transient with energy across the whole
+    band, which is what an onset detector is looking for.
+    """
+    frames = bytearray()
+    period = 0 if clicks_per_minute <= 0 else int(8000 * 60.0 / clicks_per_minute)
+    for index in range(int(seconds * 8000)):
+        inside = period and index % period < 24
+        # Alternating full-scale samples: a square burst, so the click has energy everywhere
+        # rather than in one band the analysis might weight away to nothing.
+        sample = (0x7000 if index % 2 == 0 else -0x7000) if inside else 0
+        frames += int(sample).to_bytes(2, "little", signed=True)
     with wave.open(str(target), "wb") as out:
         out.setnchannels(1)
         out.setsampwidth(2)
         out.setframerate(8000)
-        out.writeframes(b"\x00\x00" * int(seconds * 8000))
+        out.writeframes(bytes(frames))
 
 
 def seed(base_url: str) -> str:
@@ -347,10 +388,13 @@ def seed(base_url: str) -> str:
     return project
 
 
-def post_multipart_project(base_url: str) -> str:
-    project = post_json(base_url + "/api/projects", {"name": "Timeline edit browser QA"})
-    song = artifact_dir() / "timeline-edit-song.wav"
-    synthesize_song(song)
+def post_multipart_project(
+    base_url: str, *, name: str = "Timeline edit browser QA", clicks_per_minute: float = 0.0
+) -> str:
+    project = post_json(base_url + "/api/projects", {"name": name})
+    stem = "timeline-edit-song" if clicks_per_minute <= 0 else "timeline-edit-clicks"
+    song = artifact_dir() / f"{stem}.wav"
+    synthesize_song(song, clicks_per_minute=clicks_per_minute)
     post_multipart(
         f"{base_url}/api/projects/{project['id']}/songs/upload",
         {"title": "Timeline edit QA song", "duration": str(SONG_SECONDS)},
@@ -599,7 +643,12 @@ def scrub_to(driver, seconds: float) -> float:
             " pps: (arguments[0].offsetWidth - 90) / arguments[1]};",
             canvas, SONG_SECONDS,
         )
-        want_x = box["left"] + LABEL_WIDTH + seconds * box["pps"] + correction + 2 * attempt
+        # **One pixel a round, not two.** At the 16 px/s default a pixel is 1.5 frames, so an odd
+        # step lands between grid lines and an even one lands on them: a 2 px nudge preserved the
+        # parity of wherever the first click landed, and a first click on the grid meant all ten
+        # rounds were on the grid and this loop could not do the one thing it exists for. Found on
+        # 2026-08-24, when a run parked at exactly 34.500 s ten times running.
+        want_x = box["left"] + LABEL_WIDTH + seconds * box["pps"] + correction + attempt
         ActionChains(driver).move_to_element_with_offset(
             canvas,
             round(want_x - (box["left"] + box["width"] / 2)),
@@ -672,6 +721,37 @@ def take_anchor_second(server: ManagedServer, project_id: str, shot_id: str) -> 
     return take_state(server, project_id, shot_id)
 
 
+def snap_kinds(driver, active: set[str]) -> dict:
+    """Set the "Snap to" selector to exactly `active`, through the control the Director uses.
+
+    A real open, a real click on a real checkbox, a real close -- not a script that pokes the
+    module's state. The whole point of the selector is that it is the one place a drag's targets
+    are chosen, so a browser run that set them any other way would prove nothing about it.
+
+    The `<details>` is closed again afterwards, because it is absolutely positioned over the top
+    of the timeline and Selenium will refuse to click a resize handle underneath an open panel.
+    """
+    if not driver.find_element(By.ID, "snap-targets").get_attribute("open"):
+        driver.find_element(By.ID, "snap-targets-summary").click()
+    listed = driver.execute_script(
+        "return [...document.querySelectorAll('#snap-target-kinds input')]"
+        ".map((box) => box.dataset.kind);"
+    )
+    for kind in listed:
+        # Re-found by name each round rather than held from a list taken before the first click.
+        # The control redraws its summary on every change, and a reference taken before one is a
+        # reference this script has no business assuming survived it.
+        box = driver.find_element(
+            By.CSS_SELECTOR, f'#snap-target-kinds input[data-kind="{kind}"]'
+        )
+        if box.is_selected() != (kind in active):
+            box.click()
+    driver.find_element(By.ID, "snap-targets-summary").click()
+    state = driver.execute_script(SNAP_STATE)
+    assert set(state["active"]) == active, (state, active)
+    return state
+
+
 def shot_label_in(text: str, shot_id: str) -> bool:
     """Whether the readiness list names this shot at all. The labels carry the raw id in
     brackets (`shot_label`), so the id is the honest thing to look for."""
@@ -707,7 +787,7 @@ def main() -> None:
             for control, what in (
                 ("undo-shots", "the Undo button"),
                 ("redo-shots", "the Redo button"),
-                ("snap-playhead", "the playhead magnet"),
+                ("snap-targets-summary", "the Snap to selector"),
             ):
                 element = driver.find_element(By.ID, control)
                 controls[control] = visible_and_clickable(driver, element, what)
@@ -725,9 +805,15 @@ def main() -> None:
             assert opening["redo"]["disabled"] is True, opening
             assert "Nothing to undo" in opening["undo"]["name"], opening
             result["history_at_open"] = opening
+            # The selector opens with every kind active -- the default-on asymmetry -- and says so
+            # in words on the control itself, without being opened. Read from the real checkboxes
+            # rather than from the sentence, so the two are checked against each other.
             magnet = driver.execute_script(SNAP_STATE)
-            assert magnet["pressed"] == "true", magnet
-            assert "on" in magnet["name"].lower(), magnet
+            assert magnet["active"] == magnet["kinds"], magnet
+            assert "playhead" in magnet["kinds"], magnet
+            assert magnet["name"].startswith("Snap to:"), magnet
+            assert "playhead" in magnet["name"], magnet
+            assert magnet["text"] == magnet["name"], magnet
             result["magnet_at_open"] = magnet
             assert contiguity(seeded) == [
                 "+2.5000s gap between shot_05 and shot_06",
@@ -1122,11 +1208,12 @@ def main() -> None:
             # freehand behaviour, unchanged.
             press_history(driver, server, project_id, "undo-shots")
             assert windows(server, project_id) == before
-            driver.find_element(By.ID, "snap-playhead").click()
+            # Every kind off, through the selector: the magnet's switch lives in there since the
+            # Director's ruling of 2026-08-24, and with nothing selected the drag is freehand.
+            off = snap_kinds(driver, set())
             settle(driver, "#shots-track", quiet_ms=300)
-            off = driver.execute_script(SNAP_STATE)
-            assert off["pressed"] == "false", off
-            assert "off" in off["name"].lower(), off
+            assert off["active"] == [], off
+            assert "nothing" in off["name"].lower(), off
             handle = clip_for(driver, cutting).find_element(
                 By.CSS_SELECTOR, ".resize-handle.right"
             )
@@ -1149,7 +1236,7 @@ def main() -> None:
             result["magnet_off"] = {
                 "state": off, "cut_after": free_end, "neighbour": freehand[index + 1],
             }
-            driver.find_element(By.ID, "snap-playhead").click()
+            snap_kinds(driver, set(off["kinds"]))
             settle(driver, "#shots-track", quiet_ms=300)
             press_history(driver, server, project_id, "undo-shots")
 
@@ -1762,7 +1849,10 @@ def main() -> None:
 
             load_ruling_plan()
             magnet = driver.execute_script(SNAP_STATE)
-            assert magnet["pressed"] == "true", ("the magnet is off before section 13", magnet)
+            assert "playhead" in magnet["active"], (
+                "the playhead is deselected before section 13, so its snap gesture cannot fire",
+                magnet,
+            )
 
             # --- 13a. Snapping a cut carries the neighbour's window, not its take -------------
             #
@@ -2113,6 +2203,308 @@ def main() -> None:
                             "mode": "text", "status": "draft"} for shot in SHOTS]},
             )
 
+            # --- 14. Snapping a cut to a measured beat, and deliberately off one ---------------
+            #
+            # Story 8.3. Everything above drags against the playhead; this drags against the
+            # **song**. Two gestures, and the second matters as much as the first:
+            #
+            # * a real edge drag released a couple of pixels short of a measured beat lands
+            #   exactly on the beat, with the neighbour's edge following and the plan still
+            #   contiguous;
+            # * a real edge drag released **between** two beats stays exactly where it was let go.
+            #   Snapping is an assist, and a magnet with no dead zone would take away the
+            #   Director's ability to place a cut deliberately off the music -- which is this
+            #   story's own central clause and the one thing no unit test can prove about a real
+            #   pointer at a real zoom.
+            #
+            # Its own project, with its own song, for a reason: every section above runs against
+            # silence, which `audio.py` measures as no beats at all, so none of them has a second
+            # magnet on it. Giving *this* project a click track leaves those untouched.
+            #
+            # The song is a click track and nothing else, so it has no transcription -- which
+            # means no phrase-gap targets, and the selector is set to beats alone. Whatever
+            # catches this edge is a beat, provably, rather than the playhead the sections above
+            # have been using.
+            beats_result: dict[str, object] = {}
+            beat_project = post_multipart_project(
+                server.base_url, name="Beat snapping browser QA", clicks_per_minute=100.0
+            )
+            put_json(
+                f"{server.base_url}/api/projects/{beat_project}/shots",
+                {"shots": [{**shot, "prompt": f"{shot['id']}: the corridor, pushing in.",
+                            "mode": "text", "status": "draft"} for shot in SHOTS]},
+            )
+            served = get_json(
+                f"{server.base_url}/api/projects/{beat_project}/timeline/snap-targets"
+            )
+            assert served["analysed"] is True and served["beats"], (
+                "the click track measured no beats, so this section would prove nothing", served
+            )
+            assert served["measured"] is False and served["gaps"] == [], (
+                ("the click track has a transcription, so a gap target could be what catches "
+                 "the edge below"), served,
+            )
+            beats = sorted(served["beats"])
+            beats_result["served"] = {
+                "beats": len(beats), "first": beats[:4], "gaps": served["gaps"],
+            }
+
+            # **A non-default selection, made before the reload and read back after it.** The
+            # earlier assertion here compared the restored set against every kind, which is what
+            # the default is -- so a persistence layer that had stopped working entirely would
+            # have satisfied it. Gaps only is a set nothing produces by accident.
+            chosen = snap_kinds(driver, {"gap"})
+            assert chosen["active"] == ["gap"], chosen
+
+            # Reloaded before the switch, because this project was made through the API after the
+            # page loaded and the workspace lists projects once at boot -- there is no live channel
+            # for "a project appeared", and there is not supposed to be. The reload also settles
+            # the page: nothing is dirty, so switching asks no unsaved-work question a headless
+            # driver would silently answer no to.
+            driver.refresh()
+            select_project(driver, wait, beat_project)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            wait.until(
+                lambda browser: len(
+                    browser.find_elements(By.CSS_SELECTOR, "#shots-track .shot-clip")
+                ) == SHOT_COUNT
+            )
+            settle(driver, "#shots-track")
+            # Beats only. This is also the selector's own proof in a real browser: with the
+            # playhead deselected, nothing below can be the playhead magnet firing. The selection
+            # survived the reload, which is the round-trip assertion made on a real browser store.
+            restored = driver.execute_script(SNAP_STATE)
+            assert restored["active"] == ["gap"], (
+                "the deliberately non-default selection did not survive the reload", restored,
+            )
+            assert "gaps" in restored["name"] and "beats" not in restored["name"], restored
+            beats_result["restored_after_reload"] = restored
+            beats_result["selection"] = snap_kinds(driver, {"beat"})
+
+            # Zoomed in until a beat's pull is worth several screen pixels. **The pull is capped
+            # at a fraction of the local spacing**, so at the 16 px/s default these 0.6 s beats
+            # are 9.6 px apart and each claims about 3 px -- a real magnet, but finer than the
+            # integer pixel a driver can aim. Zooming does not change what is being proven; it
+            # makes the aim reproducible.
+            def beat_scale() -> float:
+                return geometry(driver, "shot_01")["pixelsPerSecond"]
+
+            spacing = min(later - earlier for earlier, later in itertools.pairwise(beats))
+            for _ in range(6):
+                if min(8.0, spacing * beat_scale() / 3) >= 4:
+                    break
+                driver.find_element(By.ID, "zoom-in").click()
+                settle(driver, "#shots-track", quiet_ms=250)
+            pixels_per_second = beat_scale()
+            reach = min(8.0, spacing * pixels_per_second / 3)
+            assert reach >= 4, (
+                f"a beat's pull is {reach:.2f}px at {pixels_per_second:.1f}px/s, which is finer "
+                "than this driver can aim -- the section cannot tell a miss from a bug"
+            )
+
+            beat_before = windows(server, beat_project)
+            # A cut with a beat a real drag's distance to its right, where the **beat is off the
+            # 1/24 s frame grid**. On the grid, "landed on the beat" and "quantised by the drag"
+            # would be the same number and this section would pass whether the magnet fired or
+            # not -- `scrub_to`'s reasoning, applied to a target the song chose instead of one
+            # this script parked.
+            picked = None
+            for index in range(len(beat_before) - 1):
+                left, right = beat_before[index], beat_before[index + 1]
+                if left["locked"] or right["locked"]:
+                    continue
+                cut = round(left["start"] + left["duration"], 6)
+                if abs(right["start"] - cut) > BOUNDARY_TOLERANCE_SECONDS:
+                    continue  # a real gap, not a shared cut: that is the double-click's gesture
+                for beat in beats:
+                    if not 0.25 <= beat - cut <= 1.2:
+                        continue
+                    if abs(beat * 24 - round(beat * 24)) < 0.2:
+                        continue
+                    picked = (index, cut, beat)
+                    break
+                if picked:
+                    break
+            assert picked, "no off-grid beat sits within a drag of a shared cut"
+            index, cut_at, beat_at = picked
+
+            # Released a little short of the beat: inside its pull, and nowhere near it if the
+            # magnet is not working -- a freehand drop would quantise to the frame grid instead.
+            short_by = max(1, int(reach / 2))
+            travel = round((beat_at - cut_at) * pixels_per_second) - short_by
+            handle = clip_for(driver, beat_before[index]["id"]).find_element(
+                By.CSS_SELECTOR, ".resize-handle.right"
+            )
+            was = shots_writes(driver)
+            ActionChains(driver).click_and_hold(handle).move_by_offset(travel, 0).release().perform()
+            await_shots_write(driver, was, "the beat-snapped edge drag")
+            settle(driver, "#shots-track")
+            snapped_plan = windows(server, beat_project)
+            landed = round(snapped_plan[index]["start"] + snapped_plan[index]["duration"], 6)
+            assert abs(landed - beat_at) < 0.003, (
+                f"the cut landed at {landed:.4f}s, {abs(landed - beat_at) * 1000:.0f}ms from the "
+                f"beat at {beat_at:.4f}s -- the magnet did not fire, or fired onto the frame grid"
+            )
+            assert snapped_plan[index + 1]["start"] == round(landed, 6), (
+                "the neighbour's edge did not follow the cut onto the beat, so the plan now has a "
+                f"hole where the boundary used to be: {snapped_plan[index]} "
+                f"{snapped_plan[index + 1]}"
+            )
+            assert contiguity(snapped_plan) == contiguity(beat_before), (
+                "snapping a cut to a beat changed the plan's contiguity",
+                contiguity(snapped_plan),
+            )
+            # And it says what it landed on. "Cut moved to the playhead" said of a beat is a
+            # false report of what the application just did, which is why the kind travels from
+            # the magnet to the write rather than being assumed there.
+            said = toasts_on_screen(driver)
+            assert any("beat" in line.lower() for line in said), said
+            beats_result["toast"] = said
+            beats_result["snapped_to_beat"] = {
+                "cut_before": cut_at, "beat": beat_at, "cut_after": landed,
+                "shot": beat_before[index]["id"], "travel_px": travel,
+                "pixels_per_second": pixels_per_second, "pull_px": reach,
+            }
+
+            # And the half that says this is an assist rather than a rule: released **between**
+            # two beats it stays between them. There is a dead zone at every zoom by construction
+            # -- each beat claims a third of the room on either side -- and the midpoint is the
+            # deadest part of it.
+            press_history(driver, server, beat_project, "undo-shots")
+            assert windows(server, beat_project) == beat_before
+            # Cleared, so the silence asserted after the next drag is this drag's silence and not
+            # a toast from the one above having simply not expired yet.
+            clear_toasts(driver)
+            after_beat = next(beat for beat in beats if beat > beat_at)
+            between = (beat_at + after_beat) / 2
+            free_travel = round((between - cut_at) * pixels_per_second)
+            handle = clip_for(driver, beat_before[index]["id"]).find_element(
+                By.CSS_SELECTOR, ".resize-handle.right"
+            )
+            was = shots_writes(driver)
+            ActionChains(driver).click_and_hold(handle).move_by_offset(
+                free_travel, 0
+            ).release().perform()
+            await_shots_write(driver, was, "the off-beat edge drag")
+            settle(driver, "#shots-track")
+            free_plan = windows(server, beat_project)
+            free_end = round(free_plan[index]["start"] + free_plan[index]["duration"], 6)
+            nearest = min(abs(free_end - beat) for beat in beats)
+            # Outside every beat's pull, which is what "it was not snapped" means in seconds --
+            # `reach` is a screen-pixel radius, so it is divided by the scale to compare with one.
+            # A cut that *had* been caught would sit within a millisecond or two of a beat, and a
+            # dead zone is a third of the spacing on each side, so the midpoint clears this by a
+            # margin at every zoom rather than by luck at this one.
+            assert nearest > reach / pixels_per_second, (
+                f"the cut released between beats was pulled to within {nearest * 1000:.0f}ms of "
+                f"one at {free_end:.4f}s -- there is no dead zone, so a cut cannot be placed off "
+                "the beat at all"
+            )
+            # Where it was let go, to within the frame the freehand drag quantises to.
+            assert abs(free_end - between) < 1.5 / 24, (
+                f"the cut landed at {free_end:.4f}s rather than the {between:.4f}s it was "
+                "released at"
+            )
+            # ...and nothing complained about it. An off-target placement is accepted silently:
+            # no refusal, no warning, no toast.
+            assert not [
+                said for said in toasts_on_screen(driver) if "moved to" in said.lower()
+            ], toasts_on_screen(driver)
+            beats_result["placed_off_every_beat"] = {
+                "released_at": between, "landed": free_end,
+                "nearest_beat_ms": round(nearest * 1000, 1), "travel_px": free_travel,
+            }
+            # --- 14c. A beat snap on a shot locked to the music ------------------------------
+            #
+            # The Director's ruling of 2026-08-21 applies to *every* snap, not only the playhead's:
+            # a cut moved onto a beat still moves two windows, and each shot's take has to stay on
+            # the second of the song it was rendered against. Section 13 proves that for a playhead
+            # snap and 14a skipped it entirely -- it picked a pair with no takes, so the one
+            # gesture this story adds had never been shown to honour the ruling at all.
+            #
+            # Both shots at the chosen cut are given a take with a **non-zero and different** nudge,
+            # because a compensation that wrote the delta instead of adding it to what was there
+            # would land on the right anchor from zero and be invisible. Neither shot's music lock
+            # is touched, so both are anchored, which is the default a Director gets.
+            press_history(driver, server, beat_project, "undo-shots")
+            anchored = {
+                beat_before[index]["id"]: {"latest_take_start": 8.0, "trim_nudge": 0.125},
+                beat_before[index + 1]["id"]: {"latest_take_start": 13.0, "trim_nudge": 0.375},
+            }
+            put_json(
+                f"{server.base_url}/api/projects/{beat_project}/shots",
+                {"shots": [
+                    {**shot, "prompt": f"{shot['id']}: the corridor, pushing in.",
+                     "mode": "text", "status": "draft",
+                     **({"latest_output": f"music-video-producer/qa/shots/{shot['id']}-h3.mp4",
+                         "latest_take_lead": 0.25, "latest_take_duration": 9.0,
+                         "status": "complete", **anchored[shot["id"]]}
+                        if shot["id"] in anchored else {})}
+                    for shot in SHOTS
+                ]},
+            )
+            driver.refresh()
+            select_project(driver, wait, beat_project)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            wait.until(
+                lambda browser: len(
+                    browser.find_elements(By.CSS_SELECTOR, "#shots-track .shot-clip")
+                ) == SHOT_COUNT
+            )
+            settle(driver, "#shots-track")
+            snap_kinds(driver, {"beat"})
+            for _ in range(6):
+                if min(8.0, spacing * beat_scale() / 3) >= 4:
+                    break
+                driver.find_element(By.ID, "zoom-in").click()
+                settle(driver, "#shots-track", quiet_ms=250)
+            locked_scale = beat_scale()
+            anchors_before = {
+                shot_id: take_anchor_second(server, beat_project, shot_id) for shot_id in anchored
+            }
+            handle = clip_for(driver, beat_before[index]["id"]).find_element(
+                By.CSS_SELECTOR, ".resize-handle.right"
+            )
+            was = shots_writes(driver)
+            ActionChains(driver).click_and_hold(handle).move_by_offset(
+                round((beat_at - cut_at) * locked_scale) - short_by, 0
+            ).release().perform()
+            await_shots_write(driver, was, "the beat-snapped edge drag on anchored takes")
+            settle(driver, "#shots-track")
+            anchors_after = {
+                shot_id: take_anchor_second(server, beat_project, shot_id) for shot_id in anchored
+            }
+            locked_plan = windows(server, beat_project)
+            locked_landed = round(
+                locked_plan[index]["start"] + locked_plan[index]["duration"], 6
+            )
+            assert abs(locked_landed - beat_at) < 0.003, (
+                "the cut did not land on the beat once its shots carried takes", locked_landed,
+            )
+            # The neighbour is the shot whose `start` this gesture moves, and it is the one whose
+            # take the old shape slid. Both are read, because "the ruling holds" is a claim about
+            # the pair rather than about the clip under the hand.
+            for shot_id, before_state in anchors_before.items():
+                after_state = anchors_after[shot_id]
+                assert abs(after_state["anchor"] - before_state["anchor"]) < 1e-6, (
+                    f"{shot_id}'s take moved off the music when the cut snapped to a beat",
+                    before_state, after_state,
+                )
+            assert anchors_after[beat_before[index + 1]["id"]]["start"] != (
+                anchors_before[beat_before[index + 1]["id"]]["start"]
+            ), "the neighbour's start did not move, so nothing was compensated and this proves nothing"
+            beats_result["anchored_takes"] = {
+                "before": anchors_before, "after": anchors_after, "cut_after": locked_landed,
+            }
+
+            result["beat_snapping"] = beats_result
+            assert not get_json(f"{server.base_url}/api/projects/{beat_project}")["jobs"], (
+                "the beat-snapping section queued something"
+            )
+            select_project(driver, wait, project_id)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            settle(driver, "#shots-track")
+
             # Nothing anywhere in this run queued anything.
             assert not get_json(f"{server.base_url}/api/projects/{project_id}")["jobs"], (
                 "this script queued something, and it is supposed to spend no GPU time at all"
@@ -2128,15 +2520,17 @@ def main() -> None:
             # The 409 this run drove the undo into on purpose is logged by the browser as a
             # failed resource. Separated out rather than filtered away: anything unlisted fails.
             #
-            # And the take previews section 12 asks for: it writes a take onto two shots without
-            # rendering one -- which is the whole reason this run spends no GPU time -- so the
-            # `<video>` the inspector draws asks for a file that was never made and is answered
-            # 404. Listed by shot rather than by status code, so an unexpected 404 anywhere else
-            # still fails the run.
+            # And the take previews sections 12, 13 and 14c ask for: each writes a take onto shots
+            # without rendering one -- which is the whole reason this run spends no GPU time -- so
+            # the `<video>` the inspector draws asks for a file that was never made and is answered
+            # 404. Listed **by shot** rather than by status code, so an unexpected 404 anywhere else
+            # still fails the run; 14c's pair is added from the same dict that wrote its takes, so
+            # the list cannot fall behind the section.
             console_gate(
                 driver, NAME, result,
                 expected=["409", f"shots/{TAKE_SHOT}/take", f"shots/{LEGACY_SHOT}/take"]
-                + [f"shots/{shot_id}/take" for shot_id in RULING_TAKES],
+                + [f"shots/{shot_id}/take" for shot_id in RULING_TAKES]
+                + [f"shots/{shot_id}/take" for shot_id in anchored],
             )
             report(NAME, result)
         finally:

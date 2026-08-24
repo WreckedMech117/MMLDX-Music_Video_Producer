@@ -11222,14 +11222,20 @@ def escape_html(value: str) -> str:
     return value
 
 
-def test_the_timeline_tools_carry_undo_redo_and_the_playhead_magnet():
+def test_the_timeline_tools_carry_undo_redo_and_the_snap_selector():
     """In the bar the Director was told to look in, with an accessible name each. A tooltip is
     not an accessible name and a glyph is not a label -- the rule that produced "i see what i
-    think is a zoom slider that isnt functional"."""
+    think is a zoom slider that isnt functional".
+
+    The playhead magnet's own button is **gone**, replaced by the "Snap to" selector on the
+    Director's ruling of 2026-08-24: one control answers what a drag lands on, rather than one
+    switch per kind acquired as kinds were added. The magnet itself is untouched -- `playheadSnap`
+    still decides, still at 8 px, still declining while the song plays.
+    """
     markup = INDEX_HTML.read_text(encoding="utf-8")
     tools = re.search(r'<div class="timeline-tools">.*?</div>', markup, re.DOTALL)
     assert tools, "the bar under the Monitor no longer has a tools group"
-    for control in ("undo-shots", "redo-shots", "snap-playhead"):
+    for control in ("undo-shots", "redo-shots"):
         button = re.search(rf'<button[^>]*id="{control}"[^>]*>', tools.group(0))
         assert button, f"#{control} is not in the bar under the Monitor"
         assert "aria-label=" in button.group(0), button.group(0)
@@ -11237,10 +11243,28 @@ def test_the_timeline_tools_carry_undo_redo_and_the_playhead_magnet():
     # button before the first edit is a promise this feature deliberately does not make.
     for control in ("undo-shots", "redo-shots"):
         assert "disabled" in re.search(rf'<button[^>]*id="{control}"[^>]*>', markup).group(0)
-    # The magnet is a toggle, so its state is `aria-pressed` and not a class alone.
-    assert 'aria-pressed="true"' in re.search(
-        r'<button[^>]*id="snap-playhead"[^>]*>', markup
-    ).group(0)
+    # And the magnet's button is not still sitting there beside its replacement.
+    assert 'id="snap-playhead"' not in markup, (
+        "the playhead magnet still has a button of its own, so two controls now answer what a "
+        "drag snaps to"
+    )
+    # A native `<details>`, so it opens and closes by keyboard with no script and reports its own
+    # expanded state -- the accessibility floor met by using the element instead of rebuilding it.
+    assert '<details class="snap-select" id="snap-targets">' in tools.group(0)
+    summary = re.search(r'<summary[^>]*id="snap-targets-summary"[^>]*>', tools.group(0))
+    assert summary, "the snap selector has no summary, so nothing says what it does"
+    name = re.search(r'aria-label="([^"]*)"', summary.group(0))
+    assert name and name.group(1).startswith("Snap to:"), summary.group(0)
+    # The rows are written by app.js from api.js's plan, so the markup ships the container empty
+    # rather than spelling three kinds a fourth would have to be added beside.
+    rows = re.search(r'<span[^>]*id="snap-target-kinds"[^>]*></span>', tools.group(0))
+    assert rows, (
+        "the kind rows are hard-coded in the markup instead of being drawn from SNAP_TARGET_ORDER"
+    )
+    # The rows are checkboxes with their own labels, so each announces its own state -- and the
+    # group carries the summary's name, so something announces what the set is *for*.
+    assert 'role="group"' in rows.group(0), rows.group(0)
+    assert 'aria-labelledby="snap-targets-summary"' in rows.group(0), rows.group(0)
 
 
 # ------------------------------------------------------------------------------------------
@@ -11867,7 +11891,7 @@ def test_the_beat_marker_toggle_survives_a_reload_and_defaults_on():
 
     A first-ever visit carries no key at all, and reading that as "off" would ship the feature
     switched off for every Director who already has a session -- which is every Director who has
-    used this workspace. So only an explicit `false` disables, exactly as `playheadSnap` does, and
+    used this workspace. So only an explicit `false` disables, as the other view settings do, and
     the value is written into `mvp-session` beside the panel, the zoom and the volume rather than
     into the project.
     """
@@ -11883,7 +11907,7 @@ def test_the_beat_marker_toggle_survives_a_reload_and_defaults_on():
     # Turned off, and written where the other view settings live -- with them, not instead of them.
     assert fresh["turnedOff"]["lit"] is False
     assert fresh["turnedOff"]["stored"]["beatMarkers"] is False
-    assert "playheadSnap" in fresh["turnedOff"]["stored"]
+    assert "snapTargets" in fresh["turnedOff"]["stored"]
     assert "pixelsPerSecond" in fresh["turnedOff"]["stored"]
 
     # Reloaded with that session: still off. And a session written before this feature existed --
@@ -11892,7 +11916,7 @@ def test_the_beat_marker_toggle_survives_a_reload_and_defaults_on():
         """
       console.log(JSON.stringify({ lit: at('#beat-markers').classList.contains('snap-on') }));
     """,
-        session={"mvp-session": json.dumps({"beatMarkers": False, "playheadSnap": True})},
+        session={"mvp-session": json.dumps({"beatMarkers": False, "snapTargets": ["beat"]})},
     )
     assert reloaded["lit"] is False
 
@@ -12057,7 +12081,1124 @@ def test_the_beat_band_and_its_toggle_sit_where_this_codebases_overlays_sit():
 
     # The control's pressed treatment is the magnet's, taken from the same rule rather than a
     # copy of it: two toggles spelling "on" twice is how one of them drifts.
-    assert "#snap-playhead.snap-on, #beat-markers.snap-on" in styles
+    assert "#snap-targets-summary.snap-on, #beat-markers.snap-on" in styles
+
+
+# ------------------------------------------------------------------------------------------
+# Snapping a shot boundary to the song (Story 8.3). Before this a dragged edge snapped to one
+# thing, the playhead: the beats Story 8.2 drew could not be landed on, and the voiceless gaps
+# the batch "Snap cuts" button aims for were reachable only by rewriting the whole plan.
+#
+# Where a cut belongs is `timeline.py`'s decision for the drag and the button alike, served by
+# `GET /timeline/snap-targets`. What is tested here is the client's half and only the client's
+# half: which of the offered seconds is nearest, whether it is near enough, and whether the
+# Director asked for that kind at all.
+#
+# **Parameterised over `SNAP_TARGET_ORDER` rather than over three names**, deliberately. Adding a
+# reactive-binding target in Epic 10 must not mean rewriting these; a test that hard-codes the
+# number of kinds is a test that has to be edited every time the answer changes.
+# ------------------------------------------------------------------------------------------
+
+
+def snap_target_kinds() -> list[str]:
+    """Every kind the selector offers, read off api.js rather than retyped here."""
+    kinds = run_module("""
+      import { SNAP_TARGET_ORDER } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(SNAP_TARGET_ORDER));
+    """)
+    assert len(kinds) >= 2, "the snap selector stopped offering a choice, so these prove nothing"
+    return kinds
+
+
+def test_every_kind_is_complete_in_every_table_that_decides_its_behaviour():
+    """A kind is only as real as the tables that describe it, and two of them fail *silently*.
+
+    A kind missing from `SNAP_TARGET_RANK` compares `undefined > 2`, which is false, so it loses
+    every tie it enters and nothing anywhere raises. A kind missing from `SNAP_TARGET_LABELS`
+    falls back to its own name through `|| kind`, so the control draws `beat` where it should draw
+    `Beats` and every assertion about the rows still passes. Both are the shape of defect this
+    file exists to catch: correct-looking output from an incomplete table.
+
+    Held against `SNAP_TARGET_ORDER` in both directions, so a table that gains an entry for a kind
+    the order list does not have fails here too.
+    """
+    tables = run_module("""
+      import { SNAP_TARGET_ORDER, SNAP_TARGET_KINDS, SNAP_TARGET_RANK, SNAP_TARGET_LABELS,
+               SNAP_TARGET_SHORT, SNAP_TARGET_NOTES, SNAP_TARGET_HELP, SNAP_TARGET_TOASTS }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        order: SNAP_TARGET_ORDER,
+        kinds: Object.values(SNAP_TARGET_KINDS),
+        rank: SNAP_TARGET_RANK, labels: SNAP_TARGET_LABELS, short: SNAP_TARGET_SHORT,
+        notes: SNAP_TARGET_NOTES, help: SNAP_TARGET_HELP, toasts: SNAP_TARGET_TOASTS,
+      }));
+    """)
+    order = tables["order"]
+
+    assert sorted(tables["kinds"]) == sorted(order)
+    for table in ("rank", "labels", "short", "notes", "help", "toasts"):
+        assert sorted(tables[table]) == sorted(order), (
+            f"SNAP_TARGET_{table.upper()} does not describe exactly the kinds that exist"
+        )
+    # Ranks are a strict order, not a set of equal claims: two kinds sharing a rank would make a
+    # tie between them depend on scan order, which is what stating a precedence is meant to stop.
+    ranks = [tables["rank"][kind] for kind in order]
+    assert len(set(ranks)) == len(ranks), tables["rank"]
+    # And the order the control lists them in is the order of their claims, strongest first.
+    assert ranks == sorted(ranks, reverse=True), (
+        "the control lists the kinds in a different order from the one their ties resolve in"
+    )
+
+
+def test_a_dragged_edge_lands_on_the_nearest_target_within_its_own_tolerance():
+    """The magnet's whole contract, executed: beats, gap targets and the playhead compete on
+    distance, the nearest wins, and an edge released between them is left exactly where it was.
+
+    **Off every target is a real answer, not a failure.** `snapped: false` at the second the drag
+    ended is what the freehand write then uses, and nothing in this path refuses, clamps, colours
+    or warns -- the Director placing a cut deliberately off the music is the case this feature is
+    not allowed to take away.
+
+    Ties resolve by a stated precedence rather than by which list was scanned first: the playhead
+    is where the Director's own hand put it, a gap is where the plan snapper says a cut belongs,
+    and a beat is a reference mark.
+    """
+    verdicts = run_module("""
+      import { edgeSnap, dragSnapPlan, SNAP_TARGET_KINDS }
+        from './src/music_video_producer/web/assets/api.js';
+      // One of each kind, far enough apart that every tolerance is the full 8px.
+      const targets = { gaps: [20], beats: [10, 30.02] };
+      const plan = dragSnapPlan({ targets, playhead: 30, pixelsPerSecond: 16 });
+      const at = (seconds) => edgeSnap({ seconds, plan });
+      // A beat and a gap target on the very same second: one place to land, not two.
+      const shared = dragSnapPlan({ targets: { gaps: [12], beats: [12] }, pixelsPerSecond: 16 });
+      console.log(JSON.stringify({
+        kinds: SNAP_TARGET_KINDS,
+        counts: plan.counts,
+        // 0.3s from the beat at 10 is 4.8px, inside 8px.
+        nearBeat: at(10.3),
+        // 0.3s from the gap target at 20.
+        nearGap: at(19.7),
+        // 0.6s from anything is 9.6px, outside every tolerance: it stays where it was released.
+        offEverything: at(15.6),
+        // A playhead at 30 and a beat at 30.02 crowd each other down to a hair's breadth
+        // apiece, and the nearer of the two still wins: at 30.015 that is the beat...
+        beatNearer: at(30.015),
+        // ...and at 30.005 it is the playhead.
+        playheadNearer: at(30.005),
+        // Dead level between them is dead in both senses: the midpoint of any two adjacent
+        // targets is s/2 away while neither may claim more than s/3, so it always snaps to
+        // neither. A distance tie between two *distinct* points is unreachable by construction,
+        // which is the dead zone stated from the other end.
+        deadLevel: at(30.01),
+        // The same second reached two ways is one point, and the stronger claim names it.
+        sameSecond: { points: shared.points, snap: edgeSnap({ seconds: 12.1, plan: shared }) },
+        // Nothing at all to land on: no targets read, or a project with no measurement.
+        noTargets: edgeSnap({
+          seconds: 10.3, plan: dragSnapPlan({ targets: null, pixelsPerSecond: 16 }),
+        }),
+        // And no snapping of any kind while the master is playing.
+        playing: edgeSnap({ seconds: 10.3, plan, playing: true }),
+      }));
+    """)
+
+    assert verdicts["nearBeat"] == {"snapped": True, "seconds": 10, "kind": "beat"}
+    assert verdicts["nearGap"] == {"snapped": True, "seconds": 20, "kind": "gap"}
+    assert verdicts["offEverything"] == {"snapped": False, "seconds": 15.6, "kind": ""}
+    # The playhead is a point in the plan like any other, counted with the rest.
+    assert verdicts["counts"] == {"beat": 2, "gap": 1, "playhead": 1}
+    assert verdicts["beatNearer"]["kind"] == "beat", (
+        "the playhead won from further away, so distance is not what decides"
+    )
+    assert verdicts["playheadNearer"]["kind"] == "playhead"
+    # And the midpoint between them snaps to neither, which is the dead zone holding between two
+    # kinds exactly as it holds between two beats.
+    assert verdicts["deadLevel"] == {"snapped": False, "seconds": 30.01, "kind": ""}
+    assert len(verdicts["sameSecond"]["points"]) == 1, verdicts["sameSecond"]["points"]
+    assert verdicts["sameSecond"]["snap"]["kind"] == "gap"
+    assert verdicts["noTargets"]["snapped"] is False
+    assert verdicts["playing"]["snapped"] is False, (
+        "an edge snapped while the song was running, which is a moving target"
+    )
+
+
+def test_the_plan_is_the_only_thing_that_decides_what_may_be_landed_on():
+    """The invariant `edgeSnap`'s own comment claims, enforced rather than trusted.
+
+    An earlier shape took `enabledKinds` on **both** calls and applied it only to the plan's
+    construction, so a plan built with every kind and snapped with `['playhead']` answered
+    `kind: "beat"` -- a filter the caller thought it had passed and the function ignored. It
+    worked in the workspace only because one variable happened to be handed to both.
+
+    The fix is structural: `edgeSnap` takes no kind filter, no playhead and no scale. There is one
+    place a selection can be expressed, so there is no second place for it to disagree with.
+    """
+    kinds = snap_target_kinds()
+    verdicts = run_module(f"""
+      import {{ dragSnapPlan, edgeSnap }} from './src/music_video_producer/web/assets/api.js';
+      const targets = {{ gaps: [20], beats: [10] }};
+      const everything = dragSnapPlan({{ targets, playhead: 30, pixelsPerSecond: 16 }});
+      const headOnly = dragSnapPlan({{
+        targets, playhead: 30, pixelsPerSecond: 16, enabledKinds: ['playhead'],
+      }});
+      console.log(JSON.stringify({{
+        // The signature carries no way to ask the wrong question.
+        parameters: edgeSnap.length,
+        everything: edgeSnap({{ seconds: 10.3, plan: everything }}),
+        headOnly: edgeSnap({{ seconds: 10.3, plan: headOnly }}),
+        headOnlyCounts: headOnly.counts,
+        order: {json.dumps(kinds)},
+      }}));
+    """)
+
+    assert verdicts["everything"]["kind"] == "beat"
+    # The same edge, the same second, a plan the Director restricted: nothing pulls it.
+    assert verdicts["headOnly"] == {"snapped": False, "seconds": 10.3, "kind": ""}
+    assert verdicts["headOnlyCounts"] == {"playhead": 1}
+    # One options object and nothing else: no second channel for a selection to arrive through.
+    assert verdicts["parameters"] == 0
+
+    # And the workspace passes one set to the one call that takes one.
+    contract = API_JS.read_text(encoding="utf-8")
+    signature = contract.split("export function edgeSnap({", 1)[1].split("}", 1)[0]
+    for banned in ("enabledKinds", "playhead", "pixelsPerSecond"):
+        assert banned not in signature, (
+            f"`{banned}` is back on edgeSnap, which is a second place for a selection to live"
+        )
+
+
+def test_a_kind_set_handed_in_is_copied_so_a_drag_keeps_the_rules_it_started_with():
+    """`snapKindSet` used to answer the caller's own Set by identity, and `app.js` holds one live
+    set that the selector mutates. So a kind toggled *during* a drag changed the rules under a
+    gesture already in progress -- the plan's points stayed as resolved while the filter moved.
+
+    Copied, the plan a drag started with is the plan it finishes with, which is the same promise
+    per-drag resolution makes about the targets themselves.
+    """
+    verdicts = run_module("""
+      import { snapKindSet, dragSnapPlan, edgeSnap }
+        from './src/music_video_producer/web/assets/api.js';
+      const live = new Set(['playhead', 'beat']);
+      const taken = snapKindSet(live);
+      const plan = dragSnapPlan({
+        targets: { beats: [10], gaps: [20] }, pixelsPerSecond: 16, enabledKinds: live,
+      });
+      // The Director changes their mind mid-drag.
+      live.delete('beat');
+      live.add('gap');
+      console.log(JSON.stringify({
+        identical: taken === live,
+        takenAfter: [...taken],
+        // The plan resolved before the change still answers what it was resolved to answer.
+        beatStillPulls: edgeSnap({ seconds: 10.3, plan }).kind,
+        gapStillSilent: edgeSnap({ seconds: 19.7, plan }).snapped,
+      }));
+    """)
+
+    assert verdicts["identical"] is False, "snapKindSet handed back the caller's own set"
+    assert sorted(verdicts["takenAfter"]) == ["beat", "playhead"]
+    assert verdicts["beatStillPulls"] == "beat"
+    assert verdicts["gapStillSilent"] is False
+
+
+def test_with_no_targets_the_magnet_is_byte_for_byte_the_playhead_magnet():
+    """The failure path's real promise: "dragging behaves exactly as it does today".
+
+    A refused targets request, a project with no song, a song nobody measured and nobody analysed
+    all leave the same nothing, and the magnet over that nothing -- a playhead and nothing else --
+    has to be the function this application shipped before Story 8.3, not merely similar to it.
+    Asserted by running both over the same sweep of edge positions and comparing the answers,
+    because "swallowed" and "quietly different" look identical in source.
+
+    A lone playhead has no neighbour to be crowded by, so the local-spacing cap leaves it on the
+    full 8 px: capping every kind did not change what the magnet does when it is the only one.
+    """
+    compared = run_module("""
+      import { dragSnapPlan, edgeSnap, playheadSnap }
+        from './src/music_video_producer/web/assets/api.js';
+      const rows = [];
+      for (let step = 0; step <= 200; step += 1) {
+        const seconds = 11 + step / 100;
+        for (const playing of [false, true]) {
+          for (const enabled of [null, []]) {
+            const plan = dragSnapPlan({
+              targets: null, playhead: 12, pixelsPerSecond: 16, enabledKinds: enabled,
+            });
+            const was = playheadSnap({
+              seconds, playhead: 12, pixelsPerSecond: 16,
+              enabled: enabled === null, playing,
+            });
+            const now = edgeSnap({ seconds, plan, playing });
+            rows.push([was.snapped === now.snapped, was.seconds === now.seconds]);
+          }
+        }
+      }
+      console.log(JSON.stringify({
+        rows: rows.length,
+        agree: rows.every(([snapped, seconds]) => snapped && seconds),
+        // A lone playhead keeps the whole 8px -- nothing crowds it.
+        alone: dragSnapPlan({ targets: null, playhead: 12, pixelsPerSecond: 16 }).points[0],
+        // And with every kind switched off, targets or no targets, nothing pulls at all.
+        nothingSelected: edgeSnap({
+          seconds: 12.01,
+          plan: dragSnapPlan({
+            targets: { beats: [12], gaps: [12.02] }, playhead: 12, pixelsPerSecond: 16,
+            enabledKinds: [],
+          }),
+        }),
+      }));
+    """)
+
+    assert compared["rows"] == 804
+    assert compared["agree"] is True, (
+        "the magnet with no targets no longer answers what the playhead magnet alone answered"
+    )
+    assert compared["alone"]["tolerancePixels"] == 8
+    assert compared["nothingSelected"] == {"snapped": False, "seconds": 12.01, "kind": ""}
+
+
+def test_each_kind_pulls_only_when_the_director_selected_it():
+    """Every subset, generated from `SNAP_TARGET_ORDER` rather than from three hand-written cases.
+
+    One kind in isolation, every pair, all of them and none of them: a kind in the set pulls and a
+    kind out of it does not, whatever the others are doing. This is the matrix's "beats deselected",
+    "one kind only" and "nothing selected" rows in one property, and it is written so that a fourth
+    target in Epic 10 or 11 is covered by it the day it is added rather than the day somebody
+    remembers to extend a list here.
+    """
+    kinds = snap_target_kinds()
+    verdicts = run_module("""
+      import { dragSnapPlan, edgeSnap, SNAP_TARGET_ORDER }
+        from './src/music_video_producer/web/assets/api.js';
+      // One target per kind, a whole second apart so each is comfortably inside 8px at 16px/s and
+      // nowhere near its neighbour. The playhead is a live number rather than a served list, so it
+      // is placed by the same arithmetic and passed on its own argument.
+      const seconds = {};
+      SNAP_TARGET_ORDER.forEach((kind, index) => { seconds[kind] = 10 + index * 2; });
+      const targets = {
+        gaps: SNAP_TARGET_ORDER.includes('gap') ? [seconds.gap] : [],
+        beats: SNAP_TARGET_ORDER.includes('beat') ? [seconds.beat] : [],
+      };
+      const subsets = [[]];
+      for (const kind of SNAP_TARGET_ORDER) {
+        for (const subset of [...subsets]) subsets.push([...subset, kind]);
+      }
+      const answers = subsets.map((subset) => {
+        const plan = dragSnapPlan({
+          targets, playhead: seconds.playhead, pixelsPerSecond: 16, enabledKinds: subset,
+        });
+        const pulled = SNAP_TARGET_ORDER.filter((kind) => edgeSnap({
+          seconds: seconds[kind] + 0.2, plan,
+        }).kind === kind);
+        return { subset, pulled };
+      });
+      console.log(JSON.stringify({ order: SNAP_TARGET_ORDER, answers }));
+    """)
+
+    assert verdicts["order"] == kinds
+    assert len(verdicts["answers"]) == 2 ** len(kinds), "not every subset was tried"
+    for answer in verdicts["answers"]:
+        assert answer["pulled"] == answer["subset"], (
+            f"selection {answer['subset']} pulled {answer['pulled']}"
+        )
+    # The empty set is in there and it pulls nothing: dragging is entirely freehand, which is a
+    # choice a Director may make and not a state to be corrected.
+    assert {"subset": [], "pulled": []} in verdicts["answers"]
+
+
+def test_a_deselected_kind_does_not_crowd_the_reach_of_a_selected_one():
+    """The enabled filter is applied *inside* the spacing pass, and this is what that buys.
+
+    A gap target with beats 0.05 s either side of it: with beats selected, all three crowd each
+    other and the gap's pull shrinks to a fraction of a pixel. With beats **deselected** they are
+    not in the plan at all, so they cannot cap a reach nobody can land on -- the gap keeps the
+    full 8 px it would have if the beats had never been measured.
+
+    Filtering the *result* instead would leave the gap crowded by targets the Director had
+    switched off, which is a magnet weakened by something invisible.
+    """
+    verdicts = run_module("""
+      import { dragSnapPlan, edgeSnap, DRAG_SNAP_PIXELS }
+        from './src/music_video_producer/web/assets/api.js';
+      const targets = { gaps: [10.05], beats: [10.00, 10.10] };
+      const together = dragSnapPlan({ targets, pixelsPerSecond: 16 });
+      const gapOnly = dragSnapPlan({ targets, pixelsPerSecond: 16, enabledKinds: ['gap'] });
+      const reach = (plan) => plan.points.find((point) => point.kind === 'gap').tolerancePixels;
+      console.log(JSON.stringify({
+        ceiling: DRAG_SNAP_PIXELS,
+        crowded: reach(together),
+        alone: reach(gapOnly),
+        // 0.3s away is 4.8px: inside 8px, far outside the crowded cap.
+        pullsWhenAlone: edgeSnap({ seconds: 10.35, plan: gapOnly }),
+        silentWhenCrowded: edgeSnap({ seconds: 10.35, plan: together }).snapped,
+      }));
+    """)
+
+    # 0.05s at 16px/s is 0.8px of spacing, a third of which is 0.27px.
+    assert verdicts["crowded"] == pytest.approx(0.8 / 3, abs=0.01)
+    assert verdicts["alone"] == verdicts["ceiling"], (
+        "a deselected beat still capped the reach of the gap target beside it"
+    )
+    assert verdicts["pullsWhenAlone"]["kind"] == "gap"
+    assert verdicts["silentWhenCrowded"] is False
+
+
+def test_the_pull_shrinks_with_the_local_spacing_so_a_dead_zone_survives_every_zoom():
+    """The story's central clause, held as arithmetic and measured at all three real densities.
+
+    Beats sit **2.44 a second** on a real 3-minute track (measured 2026-08-24), which is 16.4px
+    apart at 40px/s, 6.5px at the 16px/s default and 2.5px at the 6px/s floor. A flat 8px radius
+    would capture every pixel between every pair at the default and make placing a cut off the
+    beat impossible -- which is the one thing this story promises it will not do.
+
+    So each target's tolerance is capped at a fraction of its **local** spacing. The property
+    asserted is the one that matters: at every zoom, a third of the room between two targets snaps
+    to neither, and the pull *fades out* as they crowd rather than becoming absolute.
+    """
+    measured = run_module("""
+      import { dragSnapPlan, edgeSnap, DRAG_SNAP_PIXELS, DRAG_SNAP_SPACING_FRACTION }
+        from './src/music_video_producer/web/assets/api.js';
+      const beats = Array.from({ length: 60 }, (_, index) => Math.round(index / 2.44 * 1000) / 1000);
+      const density = (pixelsPerSecond) => {
+        const plan = dragSnapPlan({ targets: { beats, gaps: [] }, pixelsPerSecond });
+        const from = plan.points[20].seconds;
+        const to = plan.points[21].seconds;
+        let captured = 0;
+        let total = 0;
+        for (let at = from; at < to; at += (to - from) / 400) {
+          total += 1;
+          if (edgeSnap({ seconds: at, plan }).snapped) captured += 1;
+        }
+        return {
+          spacingPixels: (to - from) * pixelsPerSecond,
+          tolerancePixels: plan.points[20].tolerancePixels,
+          capturedFraction: captured / total,
+        };
+      };
+      console.log(JSON.stringify({
+        ceiling: DRAG_SNAP_PIXELS,
+        fraction: DRAG_SNAP_SPACING_FRACTION,
+        zoomedIn: density(40),
+        normal: density(16),
+        zoomedOut: density(6),
+        // One target on its own has no local spacing to be capped by, so it keeps the full reach.
+        alone: dragSnapPlan({ targets: { beats: [10], gaps: [] }, pixelsPerSecond: 16 }).points[0],
+      }));
+    """)
+
+    # Never wider than the playhead magnet's own reach: raising that is an Ask First change.
+    assert measured["ceiling"] == 8
+    for zoom, expected_spacing in (("zoomedIn", 16.4), ("normal", 6.5), ("zoomedOut", 2.5)):
+        row = measured[zoom]
+        assert row["spacingPixels"] == pytest.approx(expected_spacing, abs=0.3), (zoom, row)
+        # Two-thirds captured, one-third dead, at every zoom -- so an off-target placement is
+        # always possible and the Director never has to fight the magnet to make one.
+        assert row["capturedFraction"] == pytest.approx(2 * measured["fraction"], abs=0.02), (
+            zoom, row
+        )
+        assert row["tolerancePixels"] <= measured["ceiling"]
+    # Zoomed out it has effectively stopped rather than swallowing every pixel: under one screen
+    # pixel of pull is a magnet a Director cannot feel, which is the honest answer when they
+    # cannot see the difference between two beats either.
+    assert measured["zoomedOut"]["tolerancePixels"] < 1
+    # Zoomed in the spacing is wide enough that the cap bites before the ceiling does...
+    assert measured["zoomedIn"]["tolerancePixels"] < measured["ceiling"]
+    # ...and a target with no neighbour keeps the whole 8px.
+    assert measured["alone"]["tolerancePixels"] == measured["ceiling"]
+
+
+def test_a_playhead_parked_among_beats_does_not_close_the_dead_zone():
+    """**Review iteration 1's central finding, as a regression test.**
+
+    The cap was applied to the measured targets and not to the playhead, which kept a flat 8px
+    through `playheadSnap`. Measured on the shipped build: between two beats 0.41 s apart at the
+    16px/s default, 33% of the span was free with beats alone and **0%** once a playhead was
+    parked in the middle of it. Every kind is active by default and a Director parks the playhead
+    where they are working, so the frozen clause "an edge placed off every target is accepted"
+    was false in the *default* configuration.
+
+    The fix is that the playhead is a point in the same plan, capped by its neighbours and
+    crowding them in turn. Asserted by sweeping the whole span rather than by reading a tolerance,
+    because what the clause promises is that some position in there does not snap.
+    """
+    swept = run_module("""
+      import { dragSnapPlan, edgeSnap } from './src/music_video_producer/web/assets/api.js';
+      const beats = Array.from({ length: 40 },
+        (_, index) => Math.round((5 + index * 0.41) * 1000) / 1000);
+      const from = beats[10];
+      const to = beats[11];
+      const free = (plan) => {
+        let loose = 0;
+        let total = 0;
+        for (let at = from; at < to; at += (to - from) / 500) {
+          total += 1;
+          if (!edgeSnap({ seconds: at, plan }).snapped) loose += 1;
+        }
+        return loose / total;
+      };
+      const parked = (from + to) / 2;
+      const withHead = dragSnapPlan({ targets: { beats, gaps: [] }, playhead: parked,
+                                      pixelsPerSecond: 16 });
+      console.log(JSON.stringify({
+        beatsAlone: free(dragSnapPlan({ targets: { beats, gaps: [] }, pixelsPerSecond: 16 })),
+        playheadParked: free(withHead),
+        // The playhead took a cap of its own rather than the flat 8px it used to keep...
+        headTolerance: withHead.points.find((point) => point.kind === 'playhead').tolerancePixels,
+        // ...and it crowds the beats beside it exactly as another beat would.
+        neighbour: withHead.points.find((point) => point.kind === 'beat'
+          && Math.abs(point.seconds - parked) < 0.25).tolerancePixels,
+        // Parked *on* a beat it is one point, not two, and the stronger claim names it.
+        onABeat: dragSnapPlan({ targets: { beats, gaps: [] }, playhead: beats[10],
+                                pixelsPerSecond: 16 }).counts,
+      }));
+    """)
+
+    # A third of the span free with beats alone, and still a third of it free with a playhead in
+    # the middle -- the whole point of the fix.
+    assert swept["beatsAlone"] == pytest.approx(1 / 3, abs=0.02)
+    assert swept["playheadParked"] > 0.25, (
+        f"only {swept['playheadParked'] * 100:.0f}% of the span between two beats is free with a "
+        "playhead parked in it, so a cut cannot be placed off every target in the default "
+        "configuration"
+    )
+    # 0.205s of spacing at 16px/s is 3.28px; a third of that is ~1.09px, far under the flat 8.
+    assert swept["headTolerance"] < 2
+    assert swept["neighbour"] < 2, "the playhead did not crowd the beats it was parked between"
+    assert swept["onABeat"]["playhead"] == 1
+    assert "beat" not in str(swept["onABeat"].get("playhead", ""))
+
+
+def test_the_snap_selector_says_what_dragging_will_do_without_being_opened():
+    """The control's own promise. A Director should not have to open it to learn what a drag
+    lands on, so the active set is named **in words** on the summary -- not a count, which says
+    nothing about behaviour, and not a colour, which this application never lets carry state
+    alone. Every row is drawn from `SNAP_TARGET_ORDER`, so a fourth kind appears without an edit
+    here or in `app.js`."""
+    kinds = snap_target_kinds()
+    plans = run_module("""
+      import { snapSelectorPlan, SNAP_SELECT_LABEL, SNAP_SELECT_NONE, SNAP_TARGET_ORDER,
+               SNAP_TARGET_SHORT } from './src/music_video_producer/web/assets/api.js';
+      const subsets = [[]];
+      for (const kind of SNAP_TARGET_ORDER) {
+        for (const subset of [...subsets]) subsets.push([...subset, kind]);
+      }
+      console.log(JSON.stringify({
+        label: SNAP_SELECT_LABEL,
+        none: SNAP_SELECT_NONE,
+        short: SNAP_TARGET_SHORT,
+        all: snapSelectorPlan(),
+        described: subsets.map((subset) => ({ subset, ...snapSelectorPlan(subset) })),
+      }));
+    """)
+
+    # An absent selection is every kind, which is what a first-ever run gets.
+    assert plans["all"]["active"] == kinds
+    for row in plans["described"]:
+        # Every kind is listed whether or not it is active -- a control that hides what is off
+        # cannot be used to turn it back on.
+        assert [kind["kind"] for kind in row["kinds"]] == kinds
+        assert [kind["kind"] for kind in row["kinds"] if kind["checked"]] == row["subset"]
+        assert row["any"] is bool(row["subset"])
+        if row["subset"]:
+            # The set, in words, in the order the control lists it.
+            for kind in row["subset"]:
+                assert plans["short"][kind] in row["summary"], row
+            for kind in set(kinds) - set(row["subset"]):
+                assert plans["short"][kind] not in row["summary"], row
+        else:
+            # Never an empty phrase: "Snap to:" with nothing after it reads as a control that
+            # failed to draw, where this is a real and deliberate state.
+            assert row["summary"] == f"{plans['label']}: {plans['none']}"
+        # Each row carries its own sentence, so the choice is not three unexplained words.
+        for kind in row["kinds"]:
+            assert kind["label"] and kind["note"] and kind["help"], kind
+            # A real name, not the kind's own identifier falling through `|| kind`.
+            assert kind["label"] != kind["kind"], kind
+
+
+def test_a_stored_selection_tells_absent_from_empty_and_ignores_a_kind_it_does_not_know():
+    """**Three states, and flattening two of them is the specific bug this exists to prevent.**
+
+    An *absent* setting means every kind is active -- the default-on asymmetry the other view
+    settings use, and what a first-ever run and a session written before this feature both carry.
+    An *empty array* means the Director switched every kind off on purpose, and that has to
+    survive a reload like any other choice. A *populated array* is their subset.
+
+    `session.snapTargets || ALL_KINDS` happens to work because `[]` is truthy, which is exactly
+    why the distinction is a named function with a test rather than an expression the next reader
+    has to squint at.
+
+    A name this build does not know is dropped rather than thrown on: an older session may name a
+    kind that has gone, and a newer one may name a kind that has not arrived here yet.
+    """
+    kinds = snap_target_kinds()
+    read = run_module(f"""
+      import {{ storedSnapKinds }} from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({{
+        absent: storedSnapKinds(undefined),
+        nulled: storedSnapKinds(null),
+        notAList: [storedSnapKinds(true), storedSnapKinds('beat'), storedSnapKinds(0)],
+        empty: storedSnapKinds([]),
+        subset: storedSnapKinds({json.dumps(kinds[:1])}),
+        unknownOnly: storedSnapKinds(['reactive-binding', 'transition']),
+        mixed: storedSnapKinds({json.dumps([kinds[0], "reactive-binding"])}),
+      }}));
+    """)
+
+    # `null` is "nothing was stored", so the caller keeps its own every-kind default rather than
+    # being handed a list this function invented.
+    assert read["absent"] is None and read["nulled"] is None
+    assert read["notAList"] == [None, None, None]
+    # And an empty selection comes back as an empty selection, not as "nothing was stored".
+    assert read["empty"] == []
+    assert read["subset"] == kinds[:1]
+    assert read["unknownOnly"] == []
+    assert read["mixed"] == [kinds[0]]
+
+
+def test_a_director_who_had_the_playhead_magnet_off_does_not_find_it_switched_back_on():
+    """**Review iteration 1: a preference reversed without being asked.**
+
+    `playheadSnap: false` was the magnet's own switch before this selector replaced it. Its
+    restore line was deleted with nothing in its place, so on the next load a Director who had
+    turned the magnet off got all three kinds active -- their setting undone silently, by an
+    upgrade, with nothing on screen to say so.
+
+    The migration is one-way and one-shot: it applies only while no `snapTargets` selection has
+    been stored, so ticking the playhead back on is not overruled by the old key on the next load.
+    """
+    kinds = snap_target_kinds()
+    read = run_module(f"""
+      import {{ snapKindsFromSession }} from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({{
+        firstEver: snapKindsFromSession({{}}),
+        noSession: [snapKindsFromSession(), snapKindsFromSession(null)],
+        magnetWasOff: snapKindsFromSession({{ playheadSnap: false }}),
+        magnetWasOn: snapKindsFromSession({{ playheadSnap: true }}),
+        // Once a selection exists it is the whole answer, old key or not.
+        chosenBack: snapKindsFromSession({{
+          playheadSnap: false, snapTargets: {json.dumps(kinds)},
+        }}),
+        chosenNothing: snapKindsFromSession({{ playheadSnap: false, snapTargets: [] }}),
+      }}));
+    """)
+
+    assert read["firstEver"] is None, "a first-ever run stopped meaning 'every kind'"
+    assert read["noSession"] == [None, None]
+    # Every kind except the playhead: exactly the state that Director had.
+    assert read["magnetWasOff"] == [kind for kind in kinds if kind != "playhead"]
+    assert "playhead" not in read["magnetWasOff"]
+    assert read["magnetWasOn"] is None, "an explicitly-on magnet is not a selection, it is a default"
+    # A stored selection wins over the migration, in both directions.
+    assert read["chosenBack"] == kinds
+    assert read["chosenNothing"] == []
+
+    # And it is wired: the workspace reads the session through this one function.
+    workspace = APP_JS.read_text(encoding="utf-8")
+    assert "snapKindsFromSession(session)" in workspace
+    assert "session.snapTargets" not in workspace, (
+        "app.js reads the stored key directly, so the migration can be bypassed"
+    )
+
+
+def test_the_snap_selection_round_trips_through_a_reload_including_the_empty_one():
+    """Both halves of "it persists", executed against a seeded browser session store: a subset
+    chosen in the workspace is written where the other view settings live, and a session carrying
+    one comes back with exactly it. The **empty** selection is the case a truthiness test loses,
+    so it is driven rather than reasoned about."""
+    kinds = snap_target_kinds()
+    chosen = run_workspace(f"""
+      const stored = () => JSON.parse(localStorage.getItem('mvp-session') || '{{}}');
+      const summary = () => at('#snap-targets-summary').title;
+      const first = {{ summary: summary(), rows: at('#snap-target-kinds').innerHTML }};
+      // Every kind off, one at a time, through the control's own change handler.
+      for (const kind of {json.dumps(kinds)}) {{
+        fire('#snap-target-kinds:change', {{ target: {{ dataset: {{ kind }}, checked: false }} }});
+      }}
+      const off = {{ summary: summary(), stored: stored() }};
+      // ...and one back on.
+      fire('#snap-target-kinds:change', {{
+        target: {{ dataset: {{ kind: {json.dumps(kinds[0])} }}, checked: true }},
+      }});
+      const back = {{ summary: summary(), stored: stored() }};
+      // A name this build does not know changes nothing at all.
+      fire('#snap-target-kinds:change', {{
+        target: {{ dataset: {{ kind: 'reactive-binding' }}, checked: true }},
+      }});
+      console.log(JSON.stringify({{
+        first, off, back, afterUnknown: stored().snapTargets,
+      }}));
+    """)
+
+    # A first-ever run has every kind, and every kind is drawn whether ticked or not.
+    for kind in kinds:
+        assert f'data-kind="{kind}"' in chosen["first"]["rows"], kind
+    assert chosen["first"]["rows"].count("checked") == len(kinds)
+    # Switched all off: the control says so in words and the store carries an empty list, which is
+    # a different thing from carrying no list at all.
+    assert chosen["off"]["stored"]["snapTargets"] == []
+    assert "nothing" in chosen["off"]["summary"]
+    assert chosen["back"]["stored"]["snapTargets"] == kinds[:1]
+    assert chosen["afterUnknown"] == kinds[:1], "an unknown kind was written into the selection"
+    # Beside the other view settings, not instead of them.
+    assert "beatMarkers" in chosen["off"]["stored"] and "pixelsPerSecond" in chosen["off"]["stored"]
+
+    # Reloaded with an empty selection: still empty. This is the assertion a `|| ALL_KINDS`
+    # restore fails, and it is why the read is a named function.
+    empty = run_workspace(
+        """
+      console.log(JSON.stringify({ summary: at('#snap-targets-summary').title,
+                                   ticked: at('#snap-kind-beat').checked }));
+    """,
+        session={"mvp-session": json.dumps({"snapTargets": []})},
+    )
+    assert "nothing" in empty["summary"]
+    assert empty["ticked"] is False
+
+    # Reloaded with a subset: exactly that subset, read from the boxes rather than from the markup,
+    # because the rows are written once and only their ticks move afterwards.
+    subset = run_workspace(
+        f"""
+      console.log(JSON.stringify({{
+        ticked: {json.dumps(kinds)}.filter((kind) => at('#snap-kind-' + kind).checked),
+        summary: at('#snap-targets-summary').title,
+      }}));
+    """,
+        session={"mvp-session": json.dumps({"snapTargets": kinds[:1]})},
+    )
+    assert subset["ticked"] == kinds[:1]
+
+    # And a session written before this feature existed carries no key at all, which is every
+    # kind -- not, as a truthiness test would have it, none of them.
+    older = run_workspace(
+        f"""
+      console.log(JSON.stringify({{
+        ticked: {json.dumps(kinds)}.filter((kind) => at('#snap-kind-' + kind).checked),
+      }}));
+    """,
+        session={"mvp-session": json.dumps({"panel": "song", "pixelsPerSecond": 24})},
+    )
+    assert older["ticked"] == kinds, (
+        "a session predating the selector read as something other than 'snap to everything'"
+    )
+
+    # ...unless it carries the magnet's own old switch, turned off. Driven through the workspace,
+    # not only through the pure function, because the migration is only real if `init` runs it.
+    migrated = run_workspace(
+        f"""
+      console.log(JSON.stringify({{
+        ticked: {json.dumps(kinds)}.filter((kind) => at('#snap-kind-' + kind).checked),
+        summary: at('#snap-targets-summary').title,
+      }}));
+    """,
+        session={"mvp-session": json.dumps({"playheadSnap": False})},
+    )
+    assert migrated["ticked"] == [kind for kind in kinds if kind != "playhead"]
+    assert "playhead" not in migrated["summary"]
+
+
+def test_the_drag_targets_reach_the_workspace_on_a_load_and_a_refused_read_changes_nothing():
+    """The stateful half, driven end to end rather than grepped.
+
+    A project load fetches the targets once and puts the **report** in its own slot, outside
+    `state.project` -- folded into the project object they would be written straight into the
+    manifest by the next ordinary save. A refused read is not a reported absence: the client knows
+    nothing new, so it changes nothing, says nothing, and leaves its key unclaimed so the next
+    load asks again rather than the magnet being lost to one unreachable moment.
+    """
+    project = {
+        "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": [], "song": MEASURED_SONG,
+    }
+    served = {"gaps": [12.15, 19.85], "beats": [10, 20], "measured": True, "analysed": True,
+              "start": 0.0, "end": 60.0}
+    landed = run_workspace(
+        """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      console.log(JSON.stringify({
+        held: state.snapTargets,
+        onProject: 'snapTargets' in (state.project || {}),
+        asked: requests.filter((sent) => sent.path.includes('snap-targets')).map((s) => s.path),
+      }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": project},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {"body": served},
+        },
+    )
+
+    assert landed["asked"] == ["/api/projects/p2/timeline/snap-targets"], (
+        "the targets were read a number of times other than once on the load path"
+    )
+    assert landed["held"] == served
+    assert landed["onProject"] is False, (
+        "the targets were folded into state.project, so the next save writes them to the manifest"
+    )
+
+
+def test_a_refused_targets_read_keeps_the_last_known_ones_rather_than_dropping_them():
+    """The matrix's "targets request fails" row, and it has to start from something.
+
+    The earlier version of this asserted `state.snapTargets === null` after a refused read from a
+    **cold** start, where `null` was already the value -- so it would have passed just as happily
+    if the failure path had cleared the slot, which is the behaviour it exists to forbid. Here a
+    measurement is held first and the read that follows is refused.
+
+    A *reported absence* and a *refused request* are different things and only one of them is
+    news: the server saying "there is no measurement" empties the slot, and this client never
+    reaching the server tells it nothing, so it changes nothing and leaves its key unclaimed for
+    the next load to try again. A project *change* is different again -- that drops the targets
+    with everything else about the previous song, which is `forgetSongEnvelope`'s job.
+    """
+    project = {
+        "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": [], "song": MEASURED_SONG,
+    }
+    served = {"gaps": [12.15], "beats": [10, 20], "measured": True, "analysed": True,
+              "start": 0.0, "end": 60.0}
+    kept = run_workspace(
+        f"""
+      answer(true);
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      // The route is refused, so nothing arrived and nothing was invented.
+      const cold = state.snapTargets;
+      // Now the Director has a measurement on screen from a read that did land, and the song is
+      // re-measured underneath it -- which moves the key, so the route is asked again.
+      state.snapTargets = {json.dumps(served)};
+      state.project.song.duration = 61;
+      await app.loadSnapTargets('p2');
+      await flush();
+      console.log(JSON.stringify({{
+        cold,
+        after: state.snapTargets,
+        asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
+      }}));
+    """,
+        responses={
+            "/api/projects/p2": {"body": project},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {"status": 500, "body": {"detail": "no"}},
+        },
+    )
+
+    assert kept["cold"] is None, "a refused read invented targets out of nothing"
+    assert kept["asked"] == 2, (
+        "the second read was never attempted, so the key was claimed by a read that failed and "
+        "this project would never ask again"
+    )
+    assert kept["after"] == served, (
+        "a refused read discarded the last known targets, so one unreachable moment costs the "
+        "Director their magnet until the next load"
+    )
+
+
+def test_a_removed_or_replaced_song_takes_its_snap_targets_with_it():
+    """The one state this feature must not be able to reach: a magnet pulling a cut onto the
+    beats of a track that is not there any more.
+
+    Half these targets -- the voiceless gaps -- are not derived from the envelope at all, so they
+    would survive a song replacement on their own if the forget did not name them. Driven through
+    `#remove-song`, which is the gesture a Director actually makes, rather than by calling the
+    forget directly: deleting `state.snapTargets = null` from it left the whole suite green.
+    """
+    song = {**MEASURED_SONG}
+    served = {"gaps": [12.15], "beats": [10, 20], "measured": True, "analysed": True,
+              "start": 0.0, "end": 60.0}
+    removed = run_workspace(
+        """
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const before = state.snapTargets;
+      await fire('#remove-song:click', {});
+      await flush();
+      console.log(JSON.stringify({ before, after: state.snapTargets }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": {
+                "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+                "messages": [], "song": song,
+            }},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {"body": served},
+            "/api/projects/p2/song?confirm_song_replacement=false": {"body": {
+                "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+                "messages": [], "song": None,
+            }},
+        },
+    )
+
+    assert removed["before"] == served, "the targets never arrived, so this proves nothing"
+    assert removed["after"] is None, (
+        "the removed song's snap targets are still on screen, so a drag would land a cut on a "
+        "beat measured in a track this project no longer has"
+    )
+
+
+def test_the_targets_are_re_read_exactly_when_the_measurement_behind_them_changes():
+    """The re-read rule, executed. `snapTargetsIdentity` decides when the route is asked again,
+    and it was never run by any test at all -- deleting `:${words}:${spans}` from it kept every
+    test passing while phrase-gap snapping silently never arrived until a page reload.
+
+    That is the one gesture that *creates* gap targets: `align-lyrics` writes `lyric_words` and
+    `vocal_spans` onto a Song whose file and analysis fingerprint do not move, so a key that reads
+    only those two cannot see the change that matters most.
+    """
+    keys = run_module(f"""
+      import {{ snapTargetsIdentity }} from './src/music_video_producer/web/assets/api.js';
+      const song = {json.dumps(MEASURED_SONG)};
+      const of = (over) => snapTargetsIdentity('p1', {{ ...song, ...over }});
+      console.log(JSON.stringify({{
+        same: [of({{}}), of({{ title: 'renamed', caption: 'new' }})],
+        transcribed: of({{ lyric_words: [['la', 1, 2]], vocal_spans: [[1, 2]] }}),
+        retranscribed: of({{ lyric_words: [['la', 1, 2], ['la', 3, 4]], vocal_spans: [[1, 4]] }}),
+        spansOnly: of({{ vocal_spans: [[1, 2]] }}),
+        relengthed: of({{ duration: 61 }}),
+        remeasured: of({{ analysis: {{ ...song.analysis, song_fingerprint: 'other' }} }}),
+        replaced: of({{ path: 'media/songs/001-master.wav' }}),
+        otherProject: snapTargetsIdentity('p2', song),
+        noSong: [snapTargetsIdentity('p1', null), snapTargetsIdentity('p1', {{ path: '' }})],
+      }}));
+    """)
+
+    settled = keys["same"][0]
+    # Everything else about the Song may move without re-asking for targets computed from it.
+    assert keys["same"][1] == settled
+    # Each of these changes a target, and each must therefore change the key.
+    for changed in ("transcribed", "retranscribed", "spansOnly", "relengthed", "remeasured",
+                    "replaced", "otherProject"):
+        assert keys[changed] != settled, changed
+    # A first transcription and a re-transcription are different measurements of the same file.
+    assert keys["transcribed"] != keys["retranscribed"]
+    # No song is one identity, whichever way it is absent, and it is not the measured one.
+    assert keys["noSong"][0] == keys["noSong"][1] != settled
+
+    # And the workspace re-reads on the transcription path, which does not go through loadProject.
+    workspace = APP_JS.read_text(encoding="utf-8")
+    aligned = workspace.split("api.alignLyrics(", 1)[1].split("catch (error)", 1)[0]
+    assert "loadSnapTargets(" in aligned, (
+        "a first transcription does not re-read the targets it just created, so gap snapping "
+        "arrives one page reload late"
+    )
+
+
+def test_the_drag_resolves_its_targets_once_and_never_ports_the_gap_rule_into_javascript():
+    """Three conventions no run can observe, so they are read off the source.
+
+    **Once per drag.** `renderTimeline` runs on every `pointermove`, which is why Story 8.2 had to
+    guard the beat band's rebuild; a plan re-resolved per move would reintroduce exactly that cost
+    on a song with several hundred targets. So the plan is built where the drag is set up, and the
+    move handler rebuilds it only when the *scale it was measured in* has actually changed.
+
+    **A move drag has no magnet.** The whole clip slides and there is no one edge being placed, so
+    it is handed an empty set -- which the rename of this closure's variables quietly stopped
+    anything from asserting.
+
+    **One snapper.** `timeline.py`'s own comment names a second snapper for a second caller as
+    this codebase's recurring defect, and the batch button does not snap to lyric-word edges -- it
+    clamps into voiceless gaps by a clearance this file has never heard of.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    contract = API_JS.read_text(encoding="utf-8")
+
+    # The plan is built in `bindClip`'s setup, before the move handler exists...
+    clip = source.split("function bindClip(clip) {", 1)[1]
+    setup, move = clip.split("const move = (moveEvent) => {", 1)
+    assert "dragSnapPlan({" in setup
+    handler = move.split("\n    };", 1)[0]
+    for banned in ("dragSnapPlan", "edgeSnap"):
+        assert banned not in handler, (
+            f"{banned} is called from inside the pointermove handler, which is the cost Story "
+            "8.2's repaint guard exists to prevent"
+        )
+    # ...and asked for exactly once, from the one closure that owns a drag.
+    assert source.count("dragSnapPlan({") == 1
+    # The move drag is handed no kinds at all, and that is the only exclusion in the closure.
+    assert 'const snapKinds = mode === "move" ? new Set() : snapTargetKinds;' in setup
+    # A zoom mid-drag invalidates the plan's tolerances, which are pixels stored as seconds.
+    assert "snapPlan.pixelsPerSecond !== state.pixelsPerSecond" in clip, (
+        "a plan resolved at one scale is still used at another, so its pull is measured in the "
+        "wrong pixels after a mid-drag zoom"
+    )
+
+    # Neither the gap rule nor its clearance exists on this side. Scoped to the magnet's own
+    # section rather than to the whole file, because *citing* the server function in a comment is
+    # the good outcome -- what may not appear is its arithmetic, its constants, or the transcript
+    # fields it is computed from.
+    from music_video_producer.timeline import SNAP_CLEARANCE_SECONDS, SNAP_MINIMUM_GAP_SECONDS
+
+    magnet = contract.split("export function dragSnapPlan(", 1)[1].split(
+        "// Which measurement a read set of drag targets belongs to", 1
+    )[0]
+    assert "export function edgeSnap(" in magnet, "the section markers moved"
+    for banned in ("vocal_gaps", "vocalGaps", "_gap_snap_target", "gapSnapTarget",
+                   "lyric_words", "vocal_spans"):
+        assert banned not in magnet, (
+            f"{banned} reached the client's magnet, which is the second snapper timeline.py names "
+            "as this codebase's own recurring defect"
+        )
+    for number in (SNAP_CLEARANCE_SECONDS, SNAP_MINIMUM_GAP_SECONDS):
+        assert str(number) not in magnet, (
+            f"{number} is the gap rule's own constant and it is now written in JavaScript too"
+        )
+    # The targets are read once, on a load path, never on a timer: the route hashes the master to
+    # decide whether the analysis is current.
+    assert source.count("api.snapTargets(") == 1
+    for line in source.splitlines():
+        if "setInterval" in line:
+            assert "napTargets" not in line, line
+    # The client's path and the server's route, read off both sides.
+    assert "/api/projects/${id}/timeline/snap-targets" in contract
+    assert '@app.get("/api/projects/{project_id}/timeline/snap-targets")' in Path(
+        "src/music_video_producer/app.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_a_zoom_mid_drag_re_measures_the_pull_instead_of_inflating_it():
+    """A plan's tolerances are screen pixels stored as seconds, so the scale they were taken at is
+    part of what they mean. Resolved at 16 px/s and read at 64, a 2.7 px pull becomes 10.7 px --
+    above a ceiling whose own comment calls raising it an Ask First, on a gesture the Director is
+    in the middle of.
+
+    Executed over the plan rather than read out of `app.js`, because what matters is that a plan
+    knows the scale it was measured in and that re-resolving at the new one gives the right pull.
+    """
+    zoomed = run_module("""
+      import { dragSnapPlan, edgeSnap } from './src/music_video_producer/web/assets/api.js';
+      const targets = { beats: [10, 10.25], gaps: [] };
+      const near = dragSnapPlan({ targets, pixelsPerSecond: 16 });
+      const far = dragSnapPlan({ targets, pixelsPerSecond: 64 });
+      console.log(JSON.stringify({
+        // The scale is carried, so a caller can see that a zoom has invalidated the plan.
+        nearScale: near.pixelsPerSecond,
+        farScale: far.pixelsPerSecond,
+        nearPixels: near.points[0].tolerancePixels,
+        farPixels: far.points[0].tolerancePixels,
+        // What the stale plan's tolerance would be worth if it were read at the new scale.
+        staleAtNewScale: near.points[0].tolerance * 64,
+        // An edge 0.10s off the beat is 6.4px at 64px/s, outside the 5.33px this plan allows.
+        atNew: edgeSnap({ seconds: 10.10, plan: far }).snapped,
+      }));
+    """)
+
+    assert zoomed["nearScale"] == 16 and zoomed["farScale"] == 64
+    # 0.25s of spacing is 4px at 16px/s and 16px at 64: a third of each, capped at 8.
+    assert zoomed["nearPixels"] == pytest.approx(4 / 3, abs=0.01)
+    assert zoomed["farPixels"] == pytest.approx(16 / 3, abs=0.01)
+    # The number the drag would have used had nothing re-resolved, and why it is not allowed.
+    assert zoomed["staleAtNewScale"] == pytest.approx(16 / 3, abs=0.01)
+    assert zoomed["atNew"] is False
+
+
+def test_a_snapped_drag_reports_the_target_it_actually_found():
+    """One sentence per kind. "Cut moved to the playhead" said of a beat is a false report of what
+    the application just did -- and this codebase's honest-status convention is the reason the
+    kind is carried from the magnet to the write rather than being assumed there."""
+    toasts = run_module("""
+      import { SNAP_TARGET_TOASTS, SNAP_TARGET_ORDER }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ toasts: SNAP_TARGET_TOASTS, order: SNAP_TARGET_ORDER }));
+    """)
+
+    for kind in toasts["order"]:
+        sentence = toasts["toasts"][kind]
+        assert sentence, kind
+        assert "{seconds}" in sentence, (kind, sentence)
+    # No two kinds say the same thing, which is the whole point of there being three.
+    assert len({toasts["toasts"][kind] for kind in toasts["order"]}) == len(toasts["order"])
+
+    # And the write path names the kind it was handed rather than one of them by default.
+    applied = without_comments(app_js_block("function applySnappedCut(", "\n}"))
+    assert "SNAP_TARGET_TOASTS[kind]" in applied
+
+
+def test_the_snap_selector_can_be_dismissed_the_two_ways_every_panel_can():
+    """An open disclosure hanging over the timeline with only one way out is a panel a Director
+    has to go back and find. Both were missing and both were verified missing in a browser: a
+    click anywhere else, and Escape.
+
+    Escape is bound on the panel rather than on the document on purpose -- a keyboard Director
+    operating this has focus inside it, so the key bubbles here, and Escape stays the property of
+    whatever is focused instead of becoming a global this control has claimed. That also leaves
+    `document`'s single keydown listener to the undo shortcut, which is the only thing on the page
+    that genuinely wants every keystroke.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+
+    outside = source.split('document.addEventListener?.("pointerdown"', 1)[1].split("\n  });", 1)[0]
+    assert "SNAP_SELECT_CONTROL" in outside
+    assert "panel.open = false" in outside
+    # A click *inside* the panel is not a dismissal, or every checkbox would shut it.
+    assert "closest" in outside and "return" in outside
+
+    escape = source.split("$(SNAP_SELECT_CONTROL)?.addEventListener(\"keydown\"", 1)[1].split(
+        "\n  });", 1
+    )[0]
+    assert 'event.key !== "Escape"' in escape
+    assert "panel.open = false" in escape
+    # Focus goes back to the control, not to the document body.
+    assert "SNAP_SELECT_SUMMARY" in escape and "focus" in escape
+
+    # One global keydown listener on this page, and it is the undo shortcut's.
+    assert source.count('document.addEventListener?.("keydown"') == 1
+    undo = source.split('document.addEventListener?.("keydown"', 1)[1].split("\n  });", 1)[0]
+    assert "runUndo()" in undo
+
+
+def test_the_selector_reaches_its_rows_with_a_selector_it_escaped_for_a_selector():
+    """A kind name is `escapeHtml`d into an attribute and then read back through a `#id` selector,
+    and those are two different grammars. A name carrying anything CSS reads as syntax builds a
+    selector matching nothing, and the row silently stops taking its tick -- correct-looking
+    markup that no longer reflects the set. No kind is like that today, which is exactly why it
+    would go unnoticed until one is."""
+    escaped = run_workspace("""
+      const list = at('#snap-target-kinds');
+      console.log(JSON.stringify({
+        // Every row this build has is reachable and reflects the set.
+        rows: list.innerHTML.match(/data-kind="[^"]*"/g),
+        beat: at('#snap-kind-beat').checked,
+      }));
+    """)
+    assert escaped["beat"] is True
+    assert escaped["rows"], "no rows were drawn at all"
+
+    sync = without_comments(app_js_block("function syncSnapTargetsControl(", "\n}"))
+    assert "cssEscape(row.kind)" in sync, (
+        "the row's id is interpolated into a selector without being escaped for one"
+    )
+    # And the helper is a real fallback rather than an unguarded `CSS.escape`, because the
+    # contract harness runs this file under node, where there is no `CSS` at all.
+    helper = without_comments(app_js_block("function cssEscape(value) {", "\n}"))
+    assert "globalThis.CSS?.escape" in helper and "replace(" in helper
+
+
+def test_every_custom_property_the_stylesheet_uses_is_one_it_defines():
+    """`--panel` was used exactly once, in the snap selector's own panel, and defined nowhere --
+    so the dropdown rendered transparent over the timeline, with its help text sitting on top of
+    the ruler and beat marks showing through the words. A browser found it; nothing else could.
+
+    This is the whole class, killed in four lines, and it belongs with the other conventions this
+    file already proves by reading source. A stylesheet is the one place a name can be wrong and
+    still parse: `var(--nonsense)` is valid CSS that silently resolves to nothing.
+    """
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    defined = set(re.findall(r"^\s*(--[a-z0-9-]+)\s*:", styles, re.MULTILINE))
+    used = set(re.findall(r"var\(\s*(--[a-z0-9-]+)", styles))
+
+    assert defined, "no custom properties were found at all, so this test proves nothing"
+    assert not (used - defined), (
+        f"the stylesheet uses custom properties it never defines: {sorted(used - defined)}"
+    )
+    # The panel's own ground, named rather than merely present: a popover over the timeline needs
+    # a surface, and the palette already has the top one.
+    panel = next(line for line in styles.splitlines() if line.startswith(".snap-kind-list "))
+    assert "var(--surface-3)" in panel, panel
 
 
 def test_ctrl_z_is_bound_and_is_not_swallowed_by_the_transport_keys():
@@ -13063,7 +14204,7 @@ def test_the_neighbours_own_lock_governs_the_neighbours_take():
     one take that gesture can displace was the one take it never compensated. Both windows now go
     through the door, which reads each target's own id -- so it is B's lock that decides what
     happens to B's take, not the lock of whatever clip the pointer was on."""
-    snap = without_comments(app_js_block("function applyPlayheadSnap(", "\n}"))
+    snap = without_comments(app_js_block("function applySnappedCut(", "\n}"))
     # Every window the plan carries, the shared neighbour included, and no special case for the
     # dragged shot: on a right-edge snap its start does not move and the door writes nothing.
     assert "moveWindowStart(target, window.start);" in snap
