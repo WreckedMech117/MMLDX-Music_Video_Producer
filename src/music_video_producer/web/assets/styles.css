@@ -123,7 +123,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .source-badge { padding: 4px 6px; border: 1px solid var(--line-strong); color: var(--muted); font: 9px Consolas, monospace; letter-spacing: .1em; }
 .waveform-actions { display: flex; gap: 7px; }
 .master-audio { width: calc(100% - 36px); height: 38px; margin: 12px 18px 0; accent-color: var(--acid); }
-.waveform-shell { position: relative; flex: 1; min-height: 300px; overflow: hidden; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(10% - 1px), #252828 calc(10% - 1px), #252828 10%); }
+/* Bounded rather than `flex: 1`, which let the waveform absorb every spare pixel of the stage —
+   on a tall window it grew past 700px and pushed Song context, the lyric sheet and the per-line
+   singer tagging below the fold, which is exactly the work a duet project comes to this page to
+   do. A waveform is a scrub target and an envelope at a glance; it needs enough height to read
+   and no more. The stage's spare height now goes to `.song-context` below, which is the part
+   that grows with the song. */
+.waveform-shell { position: relative; flex: 0 0 clamp(150px, 20vh, 240px); overflow: hidden; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(10% - 1px), #252828 calc(10% - 1px), #252828 10%); }
 #waveform { display: block; width: 100%; height: 100%; }
 .waveform-empty { position: absolute; inset: 0; display: grid; place-content: center; gap: 7px; text-align: center; color: var(--muted); }
 .waveform-empty span { font-size: 12px; }
@@ -134,7 +140,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .analysis-strip > div:last-child { border-right: 0; }
 .analysis-strip span { display: block; margin-bottom: 5px; color: var(--dim); font-size: 10px; text-transform: uppercase; }
 .analysis-strip strong { font-size: 13px; font-weight: 550; }
-.song-context { padding: 15px 18px; border-bottom: 1px solid var(--line); }
+/* Takes the height the waveform gave up, and scrolls inside itself rather than pushing the stage
+   taller: the per-line singer tagging is one row per lyric line, so a long sheet is unbounded and
+   would otherwise run the page off the bottom however tall the window is. */
+.song-context { flex: 1; min-height: 0; overflow-y: auto; padding: 15px 18px; border-bottom: 1px solid var(--line); }
 .song-context .block-heading { margin-bottom: 11px; }
 /* The two per-field restore buttons, above the save so the row that undoes is never mistaken for
    the row that writes. Each stretches to half the width: two equal targets for two equal fields. */
