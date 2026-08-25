@@ -1,8 +1,9 @@
 # Director's rulings — Effects and Transitions, 2026-08-24
 
-Recorded by Amelia (Dev) during the build of Epic 8 and its retrospective. These are decisions,
-not proposals. They continue the sequence begun in `effects-director-rulings-2026-08-21.md`
-(R-1…R-7); a change here is a change to the PRD and the architecture spine.
+Recorded by Amelia (Dev) during the build of Epic 8 and its retrospective, and continued through
+Epic 9's first slice. These are decisions, not proposals. They continue the sequence begun in
+`effects-director-rulings-2026-08-21.md` (R-1…R-7); a change here is a change to the PRD and the
+architecture spine.
 
 **Why this file exists.** Every ruling below was made during implementation and, until now, lived
 only in three places: the story specs under `_bmad-output/implementation-artifacts/`, which
@@ -184,6 +185,44 @@ transients that are not on the beat grid.
 **Consequence:** a tick a Director cannot land on is fine; a tick they cannot land on and were
 never told about is the contradiction. A test asserts the relationship — every kind the band draws
 is either offered by the selector or named in the help as not being somewhere a cut lands.
+
+## R-20 — The empty-stack identity guarantee is an argv guarantee, not an mp4 guarantee
+
+Story 9.1's acceptance criterion — *"a Project with an empty stack everywhere exports
+byte-identically to the file it produces today"* (`epics-effects.md:286`, stated as FX-5 at `:36`
+and repeated for story 9.4 at `:388`) — is untestable read literally. An mp4 out of this pipeline
+is not byte-reproducible at all, so two runs of the **same** export differ with no effects
+involved anywhere.
+
+**Measured 2026-08-25, during slice B:** eight renders of one identical grained chain through this
+project's own `libx264 -preset veryfast` produced **two distinct pictures**; the same chain's
+output *before* the encoder was bit-identical across ten runs, and pinning the encoder to a single
+thread collapsed the encoded results to one as well. Multi-threaded libx264 is not bit-exact on
+high-entropy input, and grain is what makes a render entropic enough to expose it — an effect-free
+export is stable only because its input is not.
+
+The criterion is satisfiable, and satisfied, one level down: with no effects, `trim_args` builds
+the byte-identical command it always built.
+`test_the_default_preset_is_draft_and_draft_is_what_this_application_already_built`
+(`tests/test_assembly.py:515`) pins that argv against the written-out `TODAYS_TRIM_ARGV` constant;
+it predates the epic (`611594b`, 2026-08-20) and `d8b8afb` did not touch it — that commit changed
+five files and `tests/test_assembly.py` is none of them. Slice B added its own
+`test_a_shot_with_no_effects_builds_exactly_what_this_application_builds_today`
+(`tests/test_effects.py:215`), which passes empty stage groups and asserts the same argv written
+out rather than derived.
+
+**The ruling:** slice C asserts argv identity for the empty stack and never compares exported mp4
+bytes. A determinism claim about rendered output is asserted on raw frames off the filter graph —
+which *is* reproducible — never on the encoded container.
+
+*Rejected:* pinning `-threads 1` on the export so the file becomes byte-reproducible, which buys a
+test property with every Director's export time and lies outside slice B's two splice points; and
+narrowing the criterion to "an effect-free export looks the same", which no test can assert at
+all.
+
+**Consequence:** FX-5, story 9.1's closing AC and story 9.4's all still say *byte-identically*
+about a file when they mean the argv, and want amending to say so. The measurement is also carried
+in `docs/BUILD-HANDOFF.md` under the ffmpeg-and-encoding caveats, where slice C will meet it.
 
 ---
 

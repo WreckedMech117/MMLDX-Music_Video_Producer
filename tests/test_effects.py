@@ -178,6 +178,42 @@ def test_a_disabled_effect_is_validated_and_not_composed():
     assert "grain's strength is 900" in str(refusal.value)
 
 
+def test_a_switched_off_grade_does_not_brick_an_export_over_a_deleted_file(tmp_path: Path):
+    """The line between the two halves of that rule: a *spec* is checked whether the card is on
+    or off, and the **folder** is not.
+
+    `build_effect_stages` always skipped the file-existence check for a disabled effect, and the
+    id-existence check one function earlier did not — so deleting one `.cube` refused every
+    export of every project holding a switched-off card that named it, a grade the Director can
+    see is off. The two are now the same tolerance.
+    """
+    write_default_luts(lut_directory(tmp_path), size=5)
+    luts = discover_luts(tmp_path)
+
+    # An id that no longer exists, on a card that is off: composed as nothing, not refused.
+    assert stages([effect("lut_look", enabled=False, lut="deleted-look")], luts=luts) == (
+        EffectStages()
+    )
+    # The same card switched on is still refused by name.
+    with pytest.raises(EffectRefusal) as switched_on:
+        stages([effect("lut_look", lut="deleted-look")], luts=luts)
+    assert str(switched_on.value) == EFFECT_LUT_UNKNOWN_REFUSAL.format(lut="deleted-look")
+    # And a file that has gone since discovery, on a card that is off, is the same tolerance.
+    warm = next(entry for entry in luts if entry.lut_id == "warm-shift")
+    warm.path.unlink()
+    assert stages([effect("lut_look", enabled=False, lut="warm-shift")], luts=luts) == (
+        EffectStages()
+    )
+    # What is *not* tolerated is a spec that is wrong on its own terms. Those are the stack's
+    # business rather than the folder's, and a disabled card is still refused for them.
+    with pytest.raises(EffectRefusal) as unnamed:
+        stages([effect("lut_look", enabled=False)], luts=luts)
+    assert "lut_look needs a look chosen" in str(unnamed.value)
+    with pytest.raises(EffectRefusal) as bad_choice:
+        stages([effect("lut_look", enabled=False, lut="warm-shift", interp="cubic")], luts=luts)
+    assert "lut_look's interp must be one of" in str(bad_choice.value)
+
+
 # ------------------------------------------------------------------------------------------
 # The splice into `trim_args`.
 # ------------------------------------------------------------------------------------------
@@ -333,12 +369,11 @@ def test_a_dutch_tilt_crops_back_inside_the_frame_it_rotated():
         f"rotate=a={f'{radians:.6f}'.rstrip('0').rstrip('.')}:ow=iw:oh=ih",
         f"crop=w=iw/{inscribed}:h=ih/{inscribed}:x=(iw-ow)/2:y=(ih-oh)/2",
     )
-    # At zero the pair is a no-op the chain can carry harmlessly: no rotation, factor 1.
-    unit = r"max((iw*1+ih*0)/iw\,(iw*0+ih*1)/ih)"
-    assert stages([effect("dutch_tilt")]).geometry == (
-        "rotate=a=0:ow=iw:oh=ih",
-        f"crop=w=iw/{unit}:h=ih/{unit}:x=(iw-ow)/2:y=(ih-oh)/2",
-    )
+    # At zero there is no pair at all. It used to emit `rotate=a=0` and a crop by a factor of 1,
+    # which reproduce their own input exactly — measured `inf` PSNR — for the price of two real
+    # filters on every frame of the shot.
+    assert stages([effect("dutch_tilt")]).geometry == ()
+    assert stages([effect("dutch_tilt", angle=0)]).geometry == ()
 
 
 # ------------------------------------------------------------------------------------------
@@ -347,17 +382,93 @@ def test_a_dutch_tilt_crops_back_inside_the_frame_it_rotated():
 
 
 def test_an_omitted_parameter_takes_the_catalogues_default():
-    """And the default is written out here rather than read from the catalogue, so a default
-    that drifted would fail this test rather than redefine it."""
-    assert stages([effect("grain")]).treatment == ("noise=alls=0:allf=t+u:all_seed=0",)
-    assert stages([effect("contrast")]).treatment == ("eq=contrast=1",)
-    assert stages([effect("punch_in")]).geometry == (
-        "crop=w=iw/1:h=ih/1:x=(iw-ow)/2:y=(ih-oh)/2",
+    """Read off the *composed stage*, so it is the value that reached the filter that is asserted
+    and not the value the validator wrote down.
+
+    Every expectation is written out here rather than derived from the catalogue, so a default
+    that drifted would fail this test rather than redefine it. The effects below are set off
+    their identity by one parameter and left alone on the others, because an effect sitting at
+    every identity value at once composes to nothing at all — which is the next test.
+    """
+    # `seed` omitted: the grain still carries one, and it is 0.
+    assert stages([effect("grain", strength=8)]).treatment == (
+        "noise=alls=8:allf=t+u:all_seed=0",
     )
+    # `gamma` and `gain` omitted: both are filled in, and the pair is still two stages.
+    assert stages([effect("lift_gamma_gain", lift=0.1)]).treatment == (
+        "colorbalance=rs=0.1:gs=0.1:bs=0.1:rh=0:gh=0:bh=0",
+        "eq=gamma=1",
+    )
+    # `interp` omitted, and its default is a word rather than a number.
     assert stages([effect("mirror")]).geometry == ("hflip",)
-    assert stages([effect("posterize")]).treatment == ("lutyuv=y=trunc(val/1)*1",)
+    assert stages([effect("handheld_shake", amplitude=0.02)]).geometry == (
+        (
+            "crop=w=iw*0.96:h=ih*0.96"
+            ":x=(iw-ow)/2+iw*0.02*sin(2*PI*2*t)"
+            ":y=(ih-oh)/2+ih*0.02*cos(2*PI*2.74*t)"
+        ),
+    )
     # A spec carrying no `parameters` key at all is the same thing as one carrying an empty map.
     assert stages([{"effect": "grain"}]) == stages([effect("grain")])
+
+
+def test_an_effect_at_its_identity_values_composes_no_stage_at_all():
+    """The Spec Change Log's claim, made true rather than softened: *"every other parameter in
+    the catalogue defaults to a value that changes no pixel."*
+
+    A filter that does no arithmetic is not the same as no filter. `colorbalance=rm=0:bm=0`
+    computes nothing and still drags the frame through `yuv420p -> gbrp -> yuv420p`, which
+    measured 47.10 dB average PSNR against the same chain without it; `lutyuv` at a step of 1
+    leaves luma at `inf` and takes chroma through 4:4:4 at u:59.81 v:63.96. So a card at its
+    identity emits nothing, and the claim holds at the pixel rather than in the arithmetic.
+
+    `mirror` and `monochrome` are the two the Change Log names as having no identity *default* —
+    adding either one is the request — and they are the two that still compose at their defaults.
+    """
+    for effect_id in (
+        "punch_in",
+        "handheld_shake",
+        "dutch_tilt",
+        "grain",
+        "vignette",
+        "soft_focus",
+        "sharpen",
+        "banding_suppression",
+        "exposure",
+        "contrast",
+        "saturation",
+        "temperature",
+        "tint",
+        "lift_gamma_gain",
+        "chroma_split",
+        "posterize",
+        "pixelate",
+    ):
+        assert stages([{"effect": effect_id}]) == EffectStages(), effect_id
+
+    assert stages([effect("mirror")]).geometry == ("hflip",)
+    assert stages([effect("monochrome")]).treatment == ("hue=s=0",)
+
+    # An identity reached explicitly is the same as an identity left alone, and an identity value
+    # that is not the default counts too: monochrome at 0 is `hue=s=1`, which reproduces its own
+    # input and charges a filter pass for it.
+    assert stages([effect("temperature", amount=0)]) == EffectStages()
+    assert stages([effect("monochrome", amount=0)]) == EffectStages()
+    assert stages([effect("posterize", levels=256)]) == EffectStages()
+    assert stages([effect("pixelate", size=1)]) == EffectStages()
+
+    # A shift too small to move a whole pixel at this width is a shift of none. The identity is
+    # decided on what the filter would be handed, not on the stored fraction.
+    assert stages([effect("chroma_split", shift=0.0004)]) == EffectStages()
+    assert stages([effect("chroma_split", shift=0.0005)]).treatment == (
+        "chromashift=cbh=1:crh=-1",
+    )
+
+    # And one parameter off its identity is still the whole effect, both stages of it.
+    assert stages([effect("lift_gamma_gain", gamma=1.2)]).treatment == (
+        "colorbalance=rs=0:gs=0:bs=0:rh=0:gh=0:bh=0",
+        "eq=gamma=1.2",
+    )
 
 
 def test_every_declared_parameter_reaches_the_composer_whether_it_was_sent_or_not():
@@ -401,9 +512,11 @@ def test_a_value_past_a_bound_is_refused_naming_the_bound_it_broke():
     assert str(high.value) == (
         "grain's strength is 61, above its maximum of 60. Nothing was composed."
     )
-    # The bounds themselves are inside.
+    # The bounds themselves are inside. `punch_in` at its minimum is agreed and composes to
+    # nothing, because a zoom of 1 is the identity — so the agreement is asserted on the
+    # resolved values rather than on a stage that no longer exists.
     assert stages([effect("grain", strength=60)]).treatment[0].startswith("noise=alls=60")
-    assert stages([effect("punch_in", zoom=1)]).geometry
+    assert dict(validate_stack([effect("punch_in", zoom=1)])[0].values) == {"zoom": 1.0}
 
 
 def test_a_value_of_the_wrong_type_is_refused_naming_the_offender():
@@ -446,6 +559,85 @@ def test_a_stack_entry_that_is_not_a_spec_is_refused_by_position():
     with pytest.raises(EffectRefusal) as bad_flag:
         stages([{"effect": "grain", "enabled": "yes"}])
     assert "grain is either enabled or it is not" in str(bad_flag.value)
+
+
+def test_a_misspelled_top_level_key_is_refused_rather_than_ignored():
+    """The level a client actually gets wrong, and the one the module docstring names: *"an
+    ignored key is how a typo becomes an effect that quietly does nothing"*.
+
+    `paramters` used to be dropped on the floor and the effect composed at its defaults — a
+    grain card the Director set to 40 rendering as no grain at all, with nothing said. An
+    undeclared parameter was already refused; this is the same refusal one level up, in the same
+    sentence.
+    """
+    with pytest.raises(EffectRefusal) as typo:
+        stages([{"effect": "grain", "paramters": {"strength": 40}}])
+    assert str(typo.value) == (
+        "grain has no key called 'paramters'. It takes effect, enabled, parameters. "
+        "Nothing was composed."
+    )
+    with pytest.raises(EffectRefusal) as flag:
+        stages([{"effect": "grain", "enabledd": False}])
+    assert "grain has no key called 'enabledd'" in str(flag.value)
+    # The three that are declared are, of course, all accepted together.
+    assert stages([{"effect": "grain", "enabled": True, "parameters": {"strength": 4}}])
+
+
+def test_a_refusal_prints_the_number_it_was_given_and_not_a_filter_rounding():
+    """The sentence and the comparison that produced it must agree.
+
+    The bound refusal used to format both the value and the bound through the *filter* formatter,
+    whose six decimals exist so two float states compare equal in a chain. In a sentence that is
+    a lie: any violation under half a millionth read `zoom is 1, below its minimum of 1`, and a
+    value of 1e308 printed as a 309-digit integer because `.6f` never goes scientific.
+    """
+    with pytest.raises(EffectRefusal) as tiny:
+        stages([effect("punch_in", zoom=1e-9)])
+    assert str(tiny.value) == (
+        "punch_in's zoom is 1e-09, below its minimum of 1. Nothing was composed."
+    )
+    with pytest.raises(EffectRefusal) as huge:
+        stages([effect("punch_in", zoom=1e308)])
+    assert str(huge.value) == (
+        "punch_in's zoom is 1e+308, above its maximum of 2. Nothing was composed."
+    )
+    with pytest.raises(EffectRefusal) as near:
+        stages([effect("punch_in", zoom=0.9999999)])
+    assert str(near.value) == (
+        "punch_in's zoom is 0.9999999, below its minimum of 1. Nothing was composed."
+    )
+    # And the *filter* formatter is untouched, six decimals and all: the two frequencies below
+    # are rounded in the chain, which is the lossiness the sentence above must not inherit.
+    assert stages(
+        [effect("handheld_shake", amplitude=0.01, frequency=0.1234567)]
+    ).geometry == (
+        (
+            "crop=w=iw*0.98:h=ih*0.98"
+            ":x=(iw-ow)/2+iw*0.01*sin(2*PI*0.123457*t)"
+            ":y=(ih-oh)/2+ih*0.01*cos(2*PI*0.169136*t)"
+        ),
+    )
+
+
+def test_a_stack_that_is_not_a_list_at_all_is_refused_rather_than_raised_through():
+    """`EffectRefusal` is the boundary, and the two shapes below used to leave as `TypeError`.
+
+    A non-iterable stack, and a `parameters` map whose keys are not all of one type — `sorted`
+    over `{1, 'opacity'}` raises rather than refusing. Both are low-reachability and both escape
+    the only exception a caller has been told to catch.
+    """
+    for value in (None, 5, 2.5):
+        with pytest.raises(EffectRefusal) as refusal:
+            validate_stack(value)  # type: ignore[arg-type]
+        assert str(refusal.value) == (
+            f"An effect stack is a list of effects, and {value!r} is not. Nothing was composed."
+        )
+    with pytest.raises(EffectRefusal) as mixed:
+        validate_stack([{"effect": "grain", "parameters": {1: 2, "opacity": 3}}])
+    assert "grain has no parameter called 'opacity'" in str(mixed.value)
+    with pytest.raises(EffectRefusal) as mixed_keys:
+        validate_stack([{"effect": "grain", 1: 2, "colour": 3}])
+    assert "grain has no key called" in str(mixed_keys.value)
 
 
 def test_nothing_is_composed_when_anything_in_the_stack_is_refused():
@@ -498,6 +690,57 @@ def test_the_defaults_are_written_once_and_never_argued_with(tmp_path: Path):
     assert discover_luts(tmp_path) == ()
 
 
+def test_an_interrupted_first_run_leaves_no_half_written_look(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """"Never overwriting" and "written in place" are a trap together.
+
+    Each of these is about a megabyte at the shipped lattice. Interrupted part-way through one —
+    a closed lid, a killed process, a full disk — the old code left a truncated file that still
+    carried its header, so it was still offered, and still existed, so the never-overwrite rule
+    meant it was never regenerated. One interruption, and a look that fails at export forever.
+
+    So the write goes to a temporary name and is moved onto the destination. Below, the third
+    look's write is interrupted **half way through the bytes** — which is the only interruption
+    that matters, and the reason this test patches the write rather than the generator: a run
+    that dies before writing anything was never the problem. Nothing of that look survives, the
+    two before it are whole, and the next run completes the set.
+    """
+    directory = lut_directory(tmp_path)
+    real_write_text = Path.write_text
+
+    def half_a_write(self: Path, data: str, *args: object, **kwargs: object) -> int:
+        if "bleach-bypass" in self.name:
+            real_write_text(self, data[: len(data) // 2], *args, **kwargs)  # type: ignore[arg-type]
+            raise KeyboardInterrupt("the lid closed")
+        return real_write_text(self, data, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", half_a_write)
+    with pytest.raises(KeyboardInterrupt):
+        write_default_luts(directory, size=8)
+    monkeypatch.undo()
+
+    # Written out by hand: the third of the five is the one that was interrupted, and nothing of
+    # it is on disk — not a truncated `.cube`, and not a leftover temporary either.
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "filmic-contrast.cube",
+        "teal-and-orange.cube",
+    ]
+
+    assert [path.name for path in write_default_luts(directory, size=8)] == [
+        "bleach-bypass.cube",
+        "warm-shift.cube",
+        "panchromatic-mono.cube",
+    ]
+    assert [entry.lut_id for entry in discover_luts(tmp_path)] == [
+        "bleach-bypass",
+        "filmic-contrast",
+        "panchromatic-mono",
+        "teal-and-orange",
+        "warm-shift",
+    ]
+
+
 def test_a_directors_own_luts_are_indistinguishable_from_the_generated_ones(tmp_path: Path):
     """The whole point of discovering rather than bundling. A file dropped in is offered under
     an id derived from its name, exactly like the five this application generated."""
@@ -525,18 +768,88 @@ def test_anything_that_is_not_a_lut_is_ignored_rather_than_offered(tmp_path: Pat
     assert [entry.lut_id for entry in discover_luts(tmp_path)] == ["real"]
 
 
+def test_a_half_copied_download_is_not_offered_as_a_look(tmp_path: Path):
+    """The case the sniff was written for, and the case it used to pass.
+
+    A half-copied download has `LUT_3D_SIZE N` on line 1 — the *end* is what is missing — so a
+    header test accepts it, and ffmpeg then fails the export with `Error initializing filters`,
+    which is neither the file's name nor a sentence anybody can act on. So the table is counted
+    against the size the header declares.
+
+    The count is deliberately a few lines slack — the header lines are counted with the data, so
+    it asks for `N**3` lines of any kind — which is why the truncations below are gross rather
+    than off-by-one. The last two files are the reason for that slack: a complete table is still
+    offered when it carries a title, a comment and a blank line, because a sniff that drops a
+    Director's real look is a worse failure than the one it prevents — a look that is not offered
+    is invisible, where a refusal at export names itself.
+    """
+    directory = lut_directory(tmp_path)
+    directory.mkdir(parents=True)
+    whole = cube_text(8, identity_transform, title="Half A Download")
+    (directory / "halfcopy.cube").write_text(whole[: len(whole) // 2], encoding="utf-8")
+    (directory / "header-only.cube").write_text("LUT_3D_SIZE 8\n", encoding="utf-8")
+    (directory / "short-by-ten.cube").write_text(
+        "\n".join(whole.splitlines()[:-10]) + "\n", encoding="utf-8"
+    )
+    (directory / "whole.cube").write_text(whole, encoding="utf-8")
+    (directory / "chatty.cube").write_text(
+        'TITLE "Chatty"\n# graded on the 21st\n\n' + cube_text(4, identity_transform),
+        encoding="utf-8",
+    )
+    assert [entry.lut_id for entry in discover_luts(tmp_path)] == ["chatty", "whole"]
+
+
 def test_two_files_whose_names_collide_get_stable_distinct_ids(tmp_path: Path):
-    """The id is lossy by design, so a collision is possible. It is resolved in the folder's
-    sorted order, which makes the ids the same on every run and on every machine."""
+    """The id is lossy by design, so a collision is possible. Every member of a collision set is
+    suffixed with a digest of its **own** filename — nobody keeps the bare base, and nothing an
+    id points at depends on what else is in the folder.
+
+    The ids below are written out by hand. They are the contract a manifest stores, so a change
+    to how they are derived has to be a change to this list, not a value this test recomputes
+    from the same function it is checking.
+    """
     directory = lut_directory(tmp_path)
     directory.mkdir(parents=True)
     for name in ("Warm Shift.cube", "warm_shift.cube", "warm-shift.cube"):
         (directory / name).write_text(cube_text(2, identity_transform), encoding="utf-8")
     ids = [entry.lut_id for entry in discover_luts(tmp_path)]
-    assert ids == ["warm-shift", "warm-shift-2", "warm-shift-3"]
+    assert ids == ["warm-shift-a88a519f", "warm-shift-8fc81c18", "warm-shift-aa624071"]
     assert ids == [entry.lut_id for entry in discover_luts(tmp_path)]
+    assert "warm-shift" not in ids
+    # A file that is the only holder of its base keeps the bare id — the ordinary case, and the
+    # whole of the Director's own 48-file pack.
+    (directory / "Kodak 2383.cube").write_text(
+        cube_text(2, identity_transform), encoding="utf-8"
+    )
+    assert "kodak-2383" in [entry.lut_id for entry in discover_luts(tmp_path)]
     assert lut_id_for_name("Kodak 2383 (D65)!") == "kodak-2383-d65"
     assert lut_id_for_name("...") == "lut"
+
+
+def test_deleting_one_look_never_silently_retargets_another(tmp_path: Path):
+    """A LUT id is stored in a manifest, so it has to be a handle on a *file*.
+
+    It used to be a handle on a position: the collision suffix counted up the sorted listing, so
+    `my-look` was whichever colliding file happened to sort first. Delete that one, and the id
+    a manifest was holding went on grading — through a different file, with no refusal and
+    nothing visible anywhere. This is that sequence, and the assertion is that the stale id is
+    now *refused* rather than quietly answered by the survivor.
+    """
+    directory = lut_directory(tmp_path)
+    directory.mkdir(parents=True)
+    for name in ("My Look.cube", "my-look.cube"):
+        (directory / name).write_text(cube_text(2, identity_transform), encoding="utf-8")
+    before = {entry.lut_id: entry.path.name for entry in discover_luts(tmp_path)}
+    assert before == {"my-look-c9021654": "My Look.cube", "my-look-21c1a34c": "my-look.cube"}
+
+    (directory / "My Look.cube").unlink()
+    after = discover_luts(tmp_path)
+    assert {entry.lut_id: entry.path.name for entry in after} == {"my-look": "my-look.cube"}
+    with pytest.raises(EffectRefusal) as refusal:
+        stages([effect("lut_look", lut="my-look-c9021654")], luts=after)
+    assert str(refusal.value) == (
+        "There is no look called 'my-look-c9021654' in the looks folder. Nothing was composed."
+    )
 
 
 def test_a_grade_names_a_lut_by_id_and_the_path_comes_from_the_server(tmp_path: Path):
@@ -782,6 +1095,64 @@ def test_a_texture_before_pad_leaves_the_letterbox_bars_pure_black(tmp_path: Pat
     )
     assert subprocess.run(misordered, capture_output=True, check=False).returncode == 0
     assert int(bars(dirty).max()) > 0
+
+
+def test_pixelate_does_not_change_the_frames_size_and_pad_adds_no_border(tmp_path: Path):
+    """A treatment may not resize the frame, and this one did.
+
+    `scale=iw/N` truncates, so `scale=iw*N` cannot restore a size N does not divide. At the
+    export this application actually uses, 1056x608, a block size of 64 handed `pad` a 1024x576
+    frame and `pad` centred it inside a 16-pixel black border on all four sides — on a shot with
+    no letterbox at all. The source below is **entirely white**, so any black pixel in the output
+    is a border and nothing else, and the corner sampled `00 00 00` before this was fixed.
+
+    Two block sizes, neither of which divides the frame, and one that does: the acceptance sweep
+    exercises size 4 on 320x240, where both divisions come out exact, which is why the bug
+    survived it.
+    """
+    for width, height, size in ((1056, 608, 64), (1920, 1080, 7), (320, 240, 4)):
+        source = tmp_path / f"white-{width}x{height}.mp4"
+        assert (
+            ffmpeg(
+                "-f", "lavfi", "-i", f"color=c=white:s={width}x{height}:d=1:r=24",
+                "-frames:v", "8", "-pix_fmt", "yuv420p", str(source),
+            ).returncode
+            == 0
+        )
+        built = build_effect_stages(
+            [effect("pixelate", size=size)], width=width, height=height
+        )
+        assert built.treatment == (f"pixelize=w={size}:h={size}:mode=avg",)
+
+        rendered = tmp_path / f"pixelated-{width}-{size}.mp4"
+        assert (
+            subprocess.run(
+                trim_args(
+                    source,
+                    rendered,
+                    frames=4,
+                    width=width,
+                    height=height,
+                    treatment_stages=built.treatment,
+                ),
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+        raw = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-i", str(rendered), "-frames:v", "4",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ],
+            capture_output=True,
+            check=False,
+        ).stdout
+        frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, height, width, 3)
+        assert frames.shape[0] == 4
+        # A white source, pixelated: every pixel of every frame is still white, and in
+        # particular no edge of it is the black `pad` used to put there.
+        assert int(frames.min()) == 255, (width, size)
 
 
 def test_every_stage_the_catalogue_can_emit_is_accepted_by_this_projects_ffmpeg(tmp_path: Path):

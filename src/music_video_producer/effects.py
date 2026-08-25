@@ -52,6 +52,20 @@ Within a family the Director's order is kept. The builder **sorts by family as i
 (AD-31), so a stack stored out of order — copied, hand-edited, written by an older client — is
 harmless rather than undefined. Storage order is never load-bearing.
 
+**An effect at its identity values composes to no stage at all.** Every parameter in the
+catalogue but one — `mirror`'s axis, where there is no such thing — has a value that means
+"leave it alone", and all of them but two *default* to it: `mirror` again, and `monochrome`,
+whose default is full monochrome because adding that card is the request. The promise attached
+to an identity value is that it changes no pixel, and a filter that does nothing is not free
+enough to keep it: `colorbalance=rm=0:bm=0` performs no
+arithmetic and still drags the frame through `yuv420p -> gbrp -> yuv420p`, which cost 47.10 dB
+average PSNR measured 2026-08-25 on a 1056x608 `testsrc2`; `lutyuv` at a step of 1 leaves luma
+untouched and takes chroma through 4:4:4 at u:59.81 v:63.96. So the promise is kept by *emitting
+nothing*, in the composer, and the builder simply has fewer stages to splice. Not every identity
+was costing a picture — `deband` at its floor and `rotate=a=0` measured `inf` — but the rule is
+uniform, because "which of these no-ops is really a no-op" is not a thing a Director should have
+to know.
+
 Two ordering constraints carry measurements rather than opinions. **Geometry precedes `scale`**
 so a punch-in samples the take's own pixels instead of resampling an already-scaled frame — the
 one constraint that is invisible in a still and obvious in motion. **Every treatment precedes
@@ -98,6 +112,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -105,9 +120,11 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "DEBAND_FLOOR",
     "DEFAULT_LUTS",
     "DEFAULT_LUT_SIZE",
     "EFFECT_CATALOGUE",
+    "EFFECT_SPEC_KEYS",
     "FAMILY_GEOMETRY",
     "FAMILY_GRADE",
     "FAMILY_ORDER",
@@ -116,6 +133,7 @@ __all__ = [
     "FINGERPRINT_CHUNK_BYTES",
     "LUT_DIRECTORY_NAME",
     "LUT_HEADER_SCAN_BYTES",
+    "LUT_SCAN_CHUNK_BYTES",
     "LUT_SUFFIX",
     "PRE_PAD_FAMILIES",
     "PRE_SCALE_FAMILIES",
@@ -274,6 +292,12 @@ EFFECT_ENABLED_NOT_A_FLAG_REFUSAL = (
 EFFECT_UNKNOWN_PARAMETER_REFUSAL = (
     "{effect} has no parameter called {parameter!r}. It takes {declared}. Nothing was composed."
 )
+EFFECT_UNKNOWN_KEY_REFUSAL = (
+    "{effect} has no key called {key!r}. It takes {declared}. Nothing was composed."
+)
+EFFECT_STACK_NOT_A_LIST_REFUSAL = (
+    "An effect stack is a list of effects, and {value!r} is not. Nothing was composed."
+)
 EFFECT_PARAMETER_TYPE_REFUSAL = (
     "{effect}'s {parameter} must be {expected}, and {value!r} is not. Nothing was composed."
 )
@@ -328,6 +352,23 @@ LUT_SUFFIX = ".cube"
 #: "what looks are available?". Eight kibibytes is generous for a header and cheap for a listing.
 LUT_HEADER_SCAN_BYTES = 8192
 
+#: How much of a file is read at a time while its table is counted against the size its header
+#: declared. The count has to reach the end of a complete table — there is no other way to tell a
+#: half-copied download from a whole one — so what is bounded here is the *memory*, never the
+#: file: 64 KiB at a time, and the loop stops the moment enough lines have been seen.
+LUT_SCAN_CHUNK_BYTES = 1 << 16
+
+#: `LUT_3D_SIZE N`, at the start of a line. ffmpeg skips leading whitespace and ignores every
+#: line before this one, and so does this: the pattern is anchored to a line rather than to the
+#: file, so the keyword inside somebody's comment is not mistaken for the header.
+_LUT_SIZE_HEADER = re.compile(rb"^[ \t]*LUT_3D_SIZE[ \t]+(\d+)", re.MULTILINE)
+
+#: `deband`'s own threshold floor, and the Banding Suppression card's default. Named here rather
+#: than written twice because the composer compares against it to decide there is nothing to
+#: compose, and a catalogue whose default drifted off the composer's identity would put the
+#: filter back into every chain without anybody asking for it.
+DEBAND_FLOOR = 0.0001
+
 #: The lattice size the generated defaults are written at. See the module docstring: 33 costs
 #: 330 ms per 120 1080p frames against 319 ms for 17, and 17 visibly quantises gradients.
 DEFAULT_LUT_SIZE = 33
@@ -354,16 +395,41 @@ def lut_directory(data_root: Path | str) -> Path:
 
 
 def lut_id_for_name(name: str) -> str:
-    """A stable id for one discovered file: lowercase, hyphenated, alphanumerics only.
+    """The base id for one filename: lowercase, hyphenated, alphanumerics only.
 
     Derived from the filename rather than stored, so a folder is the whole of the state: drop a
     file in, it is offered; take it out, it is gone. The transformation is deliberately lossy —
-    two files whose names differ only in punctuation collapse to the same id — and
-    `discover_luts` resolves that collision by suffixing, in the folder's sorted order, so the
-    ids a folder produces are the same ids on every run and on every machine.
+    two files whose names differ only in punctuation collapse to the same base — and it is
+    therefore **not** by itself the id: `discover_luts` hands the bare base to a file only when
+    that file is the sole holder of it, and gives every member of a collision set
+    `_collision_suffix` instead.
+
+    So the id one *file* gets depends on whether anything else in the folder collides with it,
+    and cannot depend on anything more than that. The distinction matters because a manifest
+    stores the id: a folder that reshuffles must turn a stale id into a refusal, never into a
+    different file. See `_collision_suffix`.
     """
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug or "lut"
+
+
+def _collision_suffix(filename: str) -> str:
+    """What distinguishes one member of a collision set: eight hex characters of its own name.
+
+    The suffix this replaced was the member's **position** in the folder's sorted listing, and a
+    position is a property of the folder rather than of the file. Two files whose names differ
+    only in punctuation took `my-look` and `my-look-2`; deleting the first left the survivor
+    holding `my-look` — a manifest storing that id went on grading, through a different file,
+    with no refusal and nothing visible anywhere.
+
+    A digest of the filename cannot be reshuffled by a neighbour, and no member of a collision
+    set holds the bare base, so the id a stack stored either resolves to the file it always meant
+    or is refused by name. The one thing it does not do is survive the *arrival* of a colliding
+    neighbour: an incumbent alone in its base loses the bare id when a second file collides with
+    it, and its manifests are refused rather than silently retargeted. That direction is loud, so
+    it is the right way round to be wrong.
+    """
+    return hashlib.sha256(filename.encode("utf-8")).hexdigest()[:8]
 
 
 def _clamp_unit(value: float) -> float:
@@ -494,6 +560,16 @@ def write_default_luts(directory: Path, *, size: int = DEFAULT_LUT_SIZE) -> tupl
     Never overwriting is the point. A Director who edits or replaces `warm-shift.cube` has made
     a decision, and a generator that reasserted itself on the next start would undo it without
     saying so. The absence of a *file* is what triggers a write, and only for that file.
+
+    **Which is exactly why each file appears whole or not at all.** These are a megabyte each at
+    the shipped lattice, and a first run interrupted part-way through one — a closed lid, a
+    killed process, a full disk — used to leave a truncated file that still carried its header,
+    so it was still offered, and still `exists()`, so the rule above meant it was never
+    regenerated: one interruption, and a look that fails at export forever. So the text goes to a
+    temporary name beside the destination and is moved onto it, and a rename is the one file
+    operation that cannot be observed half-done. The temporary carries this process's id, because
+    two of them may be doing this at once, and it does not end in `.cube`, so an interrupted run
+    leaves something discovery ignores rather than something it offers.
     """
     directory.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -501,25 +577,64 @@ def write_default_luts(directory: Path, *, size: int = DEFAULT_LUT_SIZE) -> tupl
         destination = directory / f"{lut_id}{LUT_SUFFIX}"
         if destination.exists():
             continue
-        destination.write_text(cube_text(size, transform, title=title), encoding="utf-8")
+        partial = directory / f".{lut_id}{LUT_SUFFIX}.{os.getpid()}.partial"
+        try:
+            partial.write_text(cube_text(size, transform, title=title), encoding="utf-8")
+            partial.replace(destination)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
         written.append(destination)
     return tuple(written)
 
 
 def _looks_like_a_cube(path: Path) -> bool:
-    """Whether a `.cube` file actually carries the one line ffmpeg requires.
+    """Whether a `.cube` file carries the mandatory header **and** the table that header promises.
 
     A folder is a place people put things. The extension check alone would offer a half-copied
-    download or a text file someone renamed, and the Director would find out at export. Reading
-    a bounded head and looking for the mandatory header answers it now, for the price of one
-    small read per file.
+    download or a text file someone renamed, and the Director would find out at export.
+
+    The header alone is not enough, and this is the specific failure the check exists to catch: a
+    half-copied download has `LUT_3D_SIZE N` on line 1 — it is the *end* of the file that is
+    missing — so a header test passes it, ffmpeg fails at export with `Error initializing
+    filters`, and the "reported by name, never a crash" property this folder claims is not true.
+    So the size the header declares is read, and the file is required to hold the `N**3` lines it
+    just promised.
+
+    **Counting newlines is a deliberate under-count.** The header lines are counted with the data
+    lines, so this asks for `N**3` lines *of any kind* after the file's start, which a complete
+    table always has (the header itself makes up the difference when a last line has no trailing
+    newline) and which a table missing more than a line or two never does. A stricter count would
+    have to decide what a data line is, and a sniff that drops a Director's real look because of
+    a comment or a blank line is a worse failure than the one it is preventing: a look that is
+    simply not offered is invisible, where a refusal at export names itself.
+
+    Cost is bounded twice over: the read is chunked, so a large file is never held in memory, and
+    it stops the moment enough lines have been seen, so the price of a valid file is the file
+    itself and the price of a truncated one is whatever is left of it. Measured 2026-08-25 over
+    the Director's own pack — 48 files, 44.2 MB, every one of them complete, which is the worst
+    case because nothing can stop early: **221 ms cold, 23 ms warm** for the whole listing. The
+    five generated defaults are 5.0 MB and 24 ms cold.
     """
     try:
         with path.open("rb") as handle:
             head = handle.read(LUT_HEADER_SCAN_BYTES)
+            match = _LUT_SIZE_HEADER.search(head)
+            if match is None:
+                return False
+            declared = int(match.group(1))
+            if declared < 2:
+                return False
+            needed = declared**3
+            counted = head.count(b"\n")
+            while counted < needed:
+                chunk = handle.read(LUT_SCAN_CHUNK_BYTES)
+                if not chunk:
+                    return False
+                counted += chunk.count(b"\n")
     except OSError:
         return False
-    return b"LUT_3D_SIZE" in head
+    return True
 
 
 def discover_luts(
@@ -533,8 +648,11 @@ def discover_luts(
     and are indistinguishable to the chain — that is the whole design, and it is what dissolves
     the licensing question rather than managing it.
 
-    Ordering is by lowercased filename so the id collision suffixes below are the same on every
-    machine, and so a listing does not reshuffle between calls.
+    Ordering is by lowercased filename, so a listing does not reshuffle between calls or between
+    machines. It is **not** what decides an id: an id is the file's own base, or — when more than
+    one file in the folder claims that base — the base plus a digest of that file's own name. A
+    listing's order therefore has no effect on what any id points at, which is what makes an id
+    safe to store in a manifest.
     """
     directory = lut_directory(data_root)
     if generate_defaults and not directory.exists():
@@ -551,16 +669,24 @@ def discover_luts(
         )
     except OSError:
         return ()
+    files = [path for path in candidates if path.is_file() and _looks_like_a_cube(path)]
+    # Two passes, because whether a file may hold the bare base id is a question about the whole
+    # folder and cannot be answered while walking it.
+    holders: dict[str, int] = {}
+    for path in files:
+        base = lut_id_for_name(path.stem)
+        holders[base] = holders.get(base, 0) + 1
     entries: list[LutEntry] = []
     taken: set[str] = set()
-    for path in candidates:
-        if not path.is_file() or not _looks_like_a_cube(path):
-            continue
+    for path in files:
         base = lut_id_for_name(path.stem)
-        lut_id = base
+        lut_id = base if holders[base] == 1 else f"{base}-{_collision_suffix(path.name)}"
         suffix = 2
         while lut_id in taken:
-            lut_id = f"{base}-{suffix}"
+            # Unreachable for two `.cube` files in one folder, which cannot share a name: this
+            # is here so that a digest collision produces two ids rather than one entry that
+            # silently disappears from the listing.
+            lut_id = f"{base}-{_collision_suffix(path.name)}-{suffix}"
             suffix += 1
         taken.add(lut_id)
         entries.append(LutEntry(lut_id=lut_id, name=path.stem, path=path))
@@ -648,10 +774,20 @@ class StageContext:
     """What a composer is allowed to know: the geometry the **export** chose, and the file
     argument for every look the stack named.
 
-    The dimensions are the export's, never the take's, because every stage a composer emits into
-    the treatment group runs *after* `scale` — the frame is already the export's size by then.
+    The dimensions are the export's, never the take's, and they describe the **delivery grid** a
+    treatment stage is being composed for rather than the frame it will be handed. The difference
+    matters and is easy to read past: `scale=W:H:force_original_aspect_ratio=decrease` fits the
+    take *inside* that grid, so a 4:3 take into a 16:9 export arrives at a treatment stage 810
+    wide, not 1056 — `pad` is what makes it the export's size, and `pad` comes after every
+    treatment.
+
+    So these numbers are the right thing to compose a *look* against — `chroma_split` stores a
+    fraction and turns it into pixels here, so the same stored look ships the same split at any
+    delivery size — and they are the wrong thing to write into a frame's geometry. No composer
+    may use them to set a size. `pixelate` is the cautionary tale: see `_compose_pixelate`.
+
     Geometry composers run before `scale` and therefore address the take's pixels through ffmpeg's
-    own `iw`/`ih`, which is why none of them read these numbers.
+    own `iw`/`ih`, which is why none of them read these numbers at all.
     """
 
     width: int
@@ -682,6 +818,23 @@ def _number(value: float) -> str:
     return "0" if text in ("", "-0") else text
 
 
+def _message_number(value: float) -> str:
+    """A number as a *sentence* renders it. Never filter text, and never the other way round.
+
+    `_number` above is the filter formatter, and its six decimals are load-bearing there: they
+    are what makes two float states that mean the same thing compare equal as a string. Reused in
+    a refusal they import that lossiness into a claim about a number, and the sentence then
+    contradicts the check that produced it — a zoom of `5e-7` read `zoom is 1, below its minimum
+    of 1`, and `1e308` printed as a 309-digit integer because `.6f` never goes scientific.
+
+    `repr` is the shortest text that round-trips to the same float, so the sentence can never
+    disagree with the comparison. The trailing `.0` of a whole number is dropped: a bound of `1`
+    reads as a bound and `1.0` reads as a measurement, and nothing is lost, because a `repr`
+    ending in `.0` is exactly a value with nothing after the point.
+    """
+    return repr(float(value)).removesuffix(".0")
+
+
 # --- Geometry: before `scale`, addressing the take's own pixels through `iw`/`ih`. ---
 
 
@@ -691,7 +844,11 @@ def _compose_punch_in(values: Mapping[str, Any], context: StageContext) -> tuple
     The zoom is bounded at 1 from below, so the crop is always *inside* the source frame and can
     never expose an undefined edge — FX-11's bound, expressed as the parameter's minimum rather
     than as a clamp buried in this function.
+
+    A zoom of exactly 1 is a crop to the frame's own size, which is the identity: no stage.
     """
+    if float(values["zoom"]) == 1.0:
+        return ()
     zoom = _number(values["zoom"])
     return (f"crop=w=iw/{zoom}:h=ih/{zoom}:x=(iw-ow)/2:y=(ih-oh)/2",)
 
@@ -706,7 +863,12 @@ def _compose_dutch_tilt(values: Mapping[str, Any], context: StageContext) -> tup
     not the frame it is cropping.
 
     The comma inside `max()` is escaped, because the chain these stages join is comma-separated.
+
+    At zero degrees the pair reproduces its own input — measured `inf` PSNR through the real
+    chain — for the price of a real `rotate` and a real `crop`. Nothing is what that is worth.
     """
+    if float(values["angle"]) == 0.0:
+        return ()
     radians = math.radians(float(values["angle"]))
     cosine = _number(abs(math.cos(radians)))
     sine = _number(abs(math.sin(radians)))
@@ -739,8 +901,13 @@ def _compose_handheld_shake(values: Mapping[str, Any], context: StageContext) ->
 
     The vertical frequency is offset from the horizontal by an irrational-ish ratio so the two
     axes do not return to the same place together and the motion does not read as a circle.
+
+    Amplitude zero is a window the size of the frame that never moves, whatever the frequency
+    says: the identity, and no stage.
     """
     amplitude = float(values["amplitude"])
+    if amplitude == 0.0:
+        return ()
     frequency = _number(values["frequency"])
     vertical_frequency = _number(float(values["frequency"]) * 1.37)
     window = _number(1.0 - 2.0 * amplitude)
@@ -763,7 +930,11 @@ def _compose_grain(values: Mapping[str, Any], context: StageContext) -> tuple[st
     should be allowed to differ — but it is *always written*, because `noise` without one is
     seeded from the clock and the same manifest would render a different file every time. That
     would break the standing rule that a render input is a pure function of the manifest.
+
+    Strength zero is grain nobody would see, and the default: no stage.
     """
+    if float(values["strength"]) == 0.0:
+        return ()
     strength = _number(values["strength"])
     seed = _number(values["seed"])
     return (f"noise=alls={strength}:allf=t+u:all_seed={seed}",)
@@ -771,17 +942,24 @@ def _compose_grain(values: Mapping[str, Any], context: StageContext) -> tuple[st
 
 def _compose_vignette(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Corner falloff computed against the picture, because this runs before `pad`. An angle of
-    zero is the no-op the parameter defaults to."""
+    zero is the identity the parameter defaults to, and composes to nothing."""
+    if float(values["angle"]) == 0.0:
+        return ()
     return (f"vignette=angle={_number(values['angle'])}",)
 
 
 def _compose_soft_focus(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
-    """A Gaussian defocus. Sigma zero is the identity."""
+    """A Gaussian defocus. Sigma zero is the identity, and composes to nothing."""
+    if float(values["sigma"]) == 0.0:
+        return ()
     return (f"gblur=sigma={_number(values['sigma'])}",)
 
 
 def _compose_sharpen(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
-    """Unsharp mask on luma. Negative amounts soften, which is why the range crosses zero."""
+    """Unsharp mask on luma. Negative amounts soften, which is why the range crosses zero, and
+    zero itself is the identity: no stage."""
+    if float(values["amount"]) == 0.0:
+        return ()
     return (f"unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount={_number(values['amount'])}",)
 
 
@@ -792,8 +970,11 @@ def _compose_banding_suppression(
 
     The parameter is the filter's own threshold rather than a friendly 0..1 dial, so what the
     catalogue declares and what ffmpeg receives are the same number. Its minimum is `deband`'s
-    own floor, which is visually nothing — the no-op this family's defaults promise.
+    own floor, which is measurably nothing — `inf` PSNR through the real chain — so at the floor
+    there is no stage at all, and the default costs not even a filter pass.
     """
+    if float(values["threshold"]) <= DEBAND_FLOOR:
+        return ()
     threshold = _number(values["threshold"])
     return (f"deband=1thr={threshold}:2thr={threshold}:3thr={threshold}:4thr={threshold}",)
 
@@ -810,32 +991,64 @@ def _compose_lut_look(values: Mapping[str, Any], context: StageContext) -> tuple
 
 
 def _compose_exposure(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    """Brightness zero is the identity, and an `eq` pass is not free: no stage."""
+    if float(values["amount"]) == 0.0:
+        return ()
     return (f"eq=brightness={_number(values['amount'])}",)
 
 
 def _compose_contrast(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    """Contrast 1 is the identity, and an `eq` pass is not free: no stage."""
+    if float(values["amount"]) == 1.0:
+        return ()
     return (f"eq=contrast={_number(values['amount'])}",)
 
 
 def _compose_saturation(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    """Saturation 1 is the identity, and an `eq` pass is not free: no stage."""
+    if float(values["amount"]) == 1.0:
+        return ()
     return (f"eq=saturation={_number(values['amount'])}",)
 
 
 def _compose_temperature(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Warm and cool as one axis: red up and blue down together, in the midtones only, so the
-    black point does not take a cast."""
+    black point does not take a cast.
+
+    Zero composes to nothing, and this is the effect the measurement was taken on: the filter's
+    zero-valued arithmetic is a no-op, but the `yuv420p -> gbrp -> yuv420p` round-trip it forces
+    is not — 47.10 dB average against the same chain without it, measured 2026-08-25 over a
+    1056x608 `testsrc2`. A Temperature card added and left at 0 cost the picture exactly that.
+    """
     amount = float(values["amount"])
+    if amount == 0.0:
+        return ()
     return (f"colorbalance=rm={_number(amount)}:bm={_number(-amount)}",)
 
 
 def _compose_tint(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
-    """The axis perpendicular to temperature: green against magenta."""
+    """The axis perpendicular to temperature: green against magenta — and the same 47.10 dB at
+    zero, for the same reason. No stage."""
+    if float(values["amount"]) == 0.0:
+        return ()
     return (f"colorbalance=gm={_number(values['amount'])}",)
 
 
 def _compose_lift_gamma_gain(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Two stages, because the three controls do not live in one ffmpeg filter: shadows and
-    highlights are `colorbalance`, and the midtone curve between them is `eq`'s gamma."""
+    highlights are `colorbalance`, and the midtone curve between them is `eq`'s gamma.
+
+    All three at their identity values composes to neither stage: this one stacked a
+    `colorbalance` *and* an `eq` to reproduce its own input, at the same measured 47.10 dB as
+    Temperature. Any one of the three off its identity is still both stages, because the pair is
+    one control and its halves are not separable.
+    """
+    if (
+        float(values["lift"]) == 0.0
+        and float(values["gain"]) == 0.0
+        and float(values["gamma"]) == 1.0
+    ):
+        return ()
     lift = _number(values["lift"])
     gain = _number(values["gain"])
     return (
@@ -846,8 +1059,14 @@ def _compose_lift_gamma_gain(values: Mapping[str, Any], context: StageContext) -
 
 def _compose_monochrome(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Saturation removed by `amount`. The default is 1 — full monochrome — which is the second
-    and last place in this catalogue where a default is not a visual no-op, for the same reason
-    as `mirror`: adding this effect is the request."""
+    and last place in this catalogue where a *default* is not a visual no-op, for the same reason
+    as `mirror`: adding this effect is the request.
+
+    An amount of 0 is an identity *value* even though it is not the default, so it composes to
+    nothing like every other identity here: `hue=s=1` reproduces its input and charges for it.
+    """
+    if float(values["amount"]) == 0.0:
+        return ()
     return (f"hue=s={_number(1.0 - float(values['amount']))}",)
 
 
@@ -861,24 +1080,57 @@ def _compose_chroma_split(values: Mapping[str, Any], context: StageContext) -> t
     the export's width — the one composer that reads the geometry, and the reason it does is
     that a split of "six pixels" is a different look at 640 wide than at 1920. Storing the
     fraction makes the look survive a change of export size.
+
+    The identity is tested on the *pixels* rather than on the fraction, because the pixels are
+    what the filter would be given: a shift too small to move a whole one at this width is a
+    shift of none, and composes to nothing rather than to `chromashift=cbh=0:crh=0`.
     """
     pixels = round(float(values["shift"]) * context.width)
+    if pixels == 0:
+        return ()
     return (f"chromashift=cbh={pixels}:crh={-pixels}",)
 
 
 def _compose_posterize(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
-    """Luma quantised to `levels` steps. 256 levels is the identity, and the default."""
-    step = _number(256.0 / float(values["levels"]))
+    """Luma quantised to `levels` steps. 256 levels is the identity, and the default: no stage.
+
+    Not merely a wasted pass. `lutyuv` at a step of 1 leaves luma alone — `inf` PSNR on the Y
+    plane — and takes the chroma planes through a 4:4:4 round-trip on the way there, measured
+    2026-08-25 at u:59.81 v:63.96 against the same chain without it. A Posterize card sitting at
+    its own default was quietly costing chroma.
+    """
+    levels = float(values["levels"])
+    if levels >= 256.0:
+        return ()
+    step = _number(256.0 / levels)
     return (f"lutyuv=y=trunc(val/{step})*{step}",)
 
 
 def _compose_pixelate(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
-    """Down and back up with nearest-neighbour sampling. A block size of 1 is the identity."""
-    size = _number(values["size"])
-    return (
-        f"scale=iw/{size}:ih/{size}:flags=neighbor",
-        f"scale=iw*{size}:ih*{size}:flags=neighbor",
-    )
+    """Blocks, quantised in place — the frame that leaves is the size of the frame that arrived.
+
+    It used to be a `scale` down and a `scale` back up, and that pair does not round-trip: the
+    division truncates, so the multiplication cannot restore a size the block count does not
+    divide. Measured on a full-frame white source: a 1056x608 export at size 64 handed `pad` a
+    1024x576 frame, and `pad` centred it inside a **16-pixel black border on all four sides**,
+    corner pixel `00 00 00`, around a shot with no letterbox at all. 1920x1080 at size 7 gave the
+    same border 1 pixel wide. It survived review because the acceptance test exercised size 4 on
+    320x240 — the one arm of the range where both divisions come out exact — and asserted only
+    that ffmpeg was happy.
+
+    Writing the original dimensions back explicitly is not open to this composer. It runs *after*
+    `scale`, and `scale=W:H:force_original_aspect_ratio=decrease` produces a frame whose size
+    depends on the take's own shape — `pad` is what turns it into the export's geometry
+    afterwards — so the number to restore is not one anything here knows. `pixelize` needs no
+    such number: it quantises in place at every block size and every frame shape.
+
+    The mode is written out rather than left to the filter's default, so the stage text is this
+    application's decision and stays put if a later ffmpeg changes its mind about the default.
+    """
+    size = int(values["size"])
+    if size == 1:
+        return ()
+    return (f"pixelize=w={size}:h={size}:mode=avg",)
 
 
 #: The catalogue itself. Insertion order is the order a picker would list them in; it has no
@@ -977,7 +1229,7 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         label="Banding Suppression",
         parameters=(
             NumberParameter(
-                "threshold", "Threshold", default=0.0001, minimum=0.0001, maximum=0.05
+                "threshold", "Threshold", default=DEBAND_FLOOR, minimum=DEBAND_FLOOR, maximum=0.05
             ),
         ),
         compose=_compose_banding_suppression,
@@ -1119,6 +1371,12 @@ del _definition
 # ------------------------------------------------------------------------------------------
 
 
+#: Every key an effect spec may carry, and the whole of the shape slice C accepts as JSON. It is
+#: a tuple rather than a check written into the validator because the refusal prints it: a client
+#: that misspelled one is told what the three are, in this order.
+EFFECT_SPEC_KEYS: tuple[str, ...] = ("effect", "enabled", "parameters")
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedEffect:
     """One agreed effect: its id, its family, every declared parameter filled in, and whether
@@ -1166,8 +1424,8 @@ def _validate_number(effect_id: str, parameter: NumberParameter, value: Any) -> 
             EFFECT_PARAMETER_BELOW_REFUSAL.format(
                 effect=effect_id,
                 parameter=parameter.name,
-                value=_number(number),
-                bound=_number(parameter.minimum),
+                value=_message_number(number),
+                bound=_message_number(parameter.minimum),
             )
         )
     if number > parameter.maximum:
@@ -1175,8 +1433,8 @@ def _validate_number(effect_id: str, parameter: NumberParameter, value: Any) -> 
             EFFECT_PARAMETER_ABOVE_REFUSAL.format(
                 effect=effect_id,
                 parameter=parameter.name,
-                value=_number(number),
-                bound=_number(parameter.maximum),
+                value=_message_number(number),
+                bound=_message_number(parameter.maximum),
             )
         )
     return int(number) if parameter.integer else number
@@ -1195,10 +1453,29 @@ def _validate_choice(effect_id: str, parameter: ChoiceParameter, value: Any) -> 
     return value
 
 
-def _validate_lut(effect_id: str, parameter: LutParameter, value: Any, known: set[str]) -> str:
+def _validate_lut(
+    effect_id: str,
+    parameter: LutParameter,
+    value: Any,
+    known: set[str],
+    *,
+    enabled: bool = True,
+) -> str:
+    """The look a grade names, checked against the folder — unless the card is switched off.
+
+    The two halves of that sentence divide on where the fault lives. *Is a look chosen* is a
+    question about the spec, and a spec is wrong whether or not the Director has the card on, so
+    it is asked either way. *Does that look still exist* is a question about the folder, and a
+    disabled card is not applying a grade — refusing an export over a file a switched-off card
+    names would mean one deleted `.cube` bricks every project that ever held that card.
+
+    `build_effect_stages` has always skipped the **file**-existence check for a disabled effect.
+    This is the same tolerance one function earlier, where the **id** is checked, and the two are
+    now consistent rather than half of one and half of the other.
+    """
     if not isinstance(value, str) or not value:
         raise EffectRefusal(EFFECT_LUT_UNNAMED_REFUSAL.format(effect=effect_id))
-    if value not in known:
+    if enabled and value not in known:
         raise EffectRefusal(EFFECT_LUT_UNKNOWN_REFUSAL.format(lut=value))
     return value
 
@@ -1215,13 +1492,26 @@ def validate_stack(
     a refusal rather than an ignored key, because an ignored key is how a typo becomes an effect
     that quietly does nothing.
 
-    Disabled effects are validated exactly as enabled ones are. A stack is stored whole and a
-    disabled card can be switched back on at any moment; validating only what is currently
-    switched on would let a bad value sit in the manifest waiting for the moment it renders.
+    An undeclared **key** is refused for the same reason an undeclared parameter is, and it is
+    the level a client actually gets wrong: `paramters` for `parameters` would otherwise compose
+    the effect at its defaults and report nothing at all.
+
+    Disabled effects are validated exactly as enabled ones are, with one exception that is
+    stated in `_validate_lut` and is about the folder rather than about the stack. A stack is
+    stored whole and a disabled card can be switched back on at any moment; validating only what
+    is currently switched on would let a bad value sit in the manifest waiting for the moment it
+    renders.
     """
+    try:
+        specs = list(stack)
+    except TypeError:
+        # Not iterable at all. Slice C's 422 is built on this boundary raising `EffectRefusal`
+        # and nothing else, so the one shape that used to leave as a `TypeError` leaves as a
+        # sentence instead.
+        raise EffectRefusal(EFFECT_STACK_NOT_A_LIST_REFUSAL.format(value=stack)) from None
     known_luts = {entry.lut_id for entry in luts}
     resolved: list[ResolvedEffect] = []
-    for index, spec in enumerate(stack):
+    for index, spec in enumerate(specs):
         if not isinstance(spec, Mapping):
             raise EffectRefusal(EFFECT_NOT_A_SPEC_REFUSAL.format(index=index, value=spec))
         effect_id = spec.get("effect")
@@ -1230,6 +1520,19 @@ def validate_stack(
         definition = EFFECT_CATALOGUE.get(effect_id)
         if definition is None:
             raise EffectRefusal(EFFECT_UNKNOWN_REFUSAL.format(effect=effect_id))
+
+        # `key=repr` throughout: a JSON object has string keys, but this validator is also the
+        # boundary for a hand-edited manifest and a Python caller, and `sorted` over keys of two
+        # types raises `TypeError` — which is the one thing this function must never do.
+        unknown_keys = sorted(set(spec) - set(EFFECT_SPEC_KEYS), key=repr)
+        if unknown_keys:
+            raise EffectRefusal(
+                EFFECT_UNKNOWN_KEY_REFUSAL.format(
+                    effect=effect_id,
+                    key=unknown_keys[0],
+                    declared=", ".join(EFFECT_SPEC_KEYS),
+                )
+            )
 
         given = spec.get("parameters", {})
         if given is None:
@@ -1246,7 +1549,7 @@ def validate_stack(
             )
 
         declared = {parameter.name for parameter in definition.parameters}
-        undeclared = sorted(set(given) - declared)
+        undeclared = sorted(set(given) - declared, key=repr)
         if undeclared:
             raise EffectRefusal(
                 EFFECT_UNKNOWN_PARAMETER_REFUSAL.format(
@@ -1260,7 +1563,7 @@ def validate_stack(
         for parameter in definition.parameters:
             if isinstance(parameter, LutParameter):
                 values[parameter.name] = _validate_lut(
-                    effect_id, parameter, given.get(parameter.name), known_luts
+                    effect_id, parameter, given.get(parameter.name), known_luts, enabled=enabled
                 )
             elif isinstance(parameter, ChoiceParameter):
                 values[parameter.name] = _validate_choice(
