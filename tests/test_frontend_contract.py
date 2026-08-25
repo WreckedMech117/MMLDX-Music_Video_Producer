@@ -245,11 +245,36 @@ globalThis.window = {
 // something rather than only to be watched sending. `__RESPONSES__` is `{}` for every existing
 // caller, so an unlisted path rejects exactly as it always did and nothing already written here
 // changes behaviour. Each entry is `{body}` for a 200, or `{status, body}` to be refused.
+//
+// **Or a list of those, answered in order, the last one repeating.** One path answering one body
+// for the life of a test cannot express a measurement being taken: `timeline/snap-targets` is read
+// on the load path saying `analysed: false` and read again after the analysis saying `analysed:
+// true`, and with a single body "it asked again" and "the answer changed" collapse into one
+// another -- a test would pass just as happily against a client that re-read nothing. A plain
+// object is still a plain object, so nothing already written here is affected.
+//
+// **`unconsumed()` is what stops that guarantee going vacuous.** A list whose later entries are
+// never asked for leaves the test asserting about the first answer only, and passing -- which is
+// exactly the client that re-read nothing. A test that means "and it asked again" asserts the
+// leftovers are empty. An *exhausted* list is a named refusal rather than a `TypeError` about
+// reading a property of `undefined`, because a harness failure that reads like a code failure
+// costs the next reader the same twenty minutes every time.
 const responses = new Map(Object.entries(__RESPONSES__));
+const unconsumed = () => Object.fromEntries(
+  [...responses.entries()]
+    .filter(([, listed]) => Array.isArray(listed) && listed.length > 1)
+    .map(([path, listed]) => [path, listed.length - 1])
+);
 globalThis.fetch = (path, options = {}) => {
   requests.push({ path, method: options.method || "GET", body: options.body || null });
   if (!responses.has(path)) return Promise.reject(new Error("the contract harness makes no requests"));
-  const canned = responses.get(path);
+  const listed = responses.get(path);
+  if (Array.isArray(listed) && listed.length === 0) {
+    return Promise.reject(new Error("the canned replies for " + path + " are exhausted"));
+  }
+  const canned = Array.isArray(listed)
+    ? (listed.length > 1 ? listed.shift() : listed[0])
+    : listed;
   const status = canned.status || 200;
   return Promise.resolve({
     ok: status < 400,
@@ -302,7 +327,10 @@ def run_workspace(body: str, responses: dict | None = None, session: dict | None
 
     `responses` maps an exact request path to `{"body": ...}` for a 200, or
     `{"status": N, "body": ...}` for a refusal. Anything unlisted is rejected, which is what
-    every caller that passes nothing gets.
+    every caller that passes nothing gets. A *list* of those is answered in order, with the last
+    entry repeating -- which is how one path answers differently before and after a measurement.
+    The workspace body can call `unconsumed()` for the entries no request ever reached, so a test
+    that means "and it asked again" can assert that rather than assume it.
 
     `session` seeds `localStorage` *before* the workspace boots, keyed by storage key -- so
     `{"mvp-session": json.dumps({...})}` is what a Director's browser carries into a reload. The
@@ -12614,6 +12642,1154 @@ def test_the_snap_selector_says_what_dragging_will_do_without_being_opened():
             assert kind["label"] and kind["note"] and kind["help"], kind
             # A real name, not the kind's own identifier falling through `|| kind`.
             assert kind["label"] != kind["kind"], kind
+
+
+# ------------------------------------------------------------------------------------------
+# A row that cannot pull says so, and offers the fix this application actually holds.
+#
+# Epic 8's headline finding: the server computes twelve absence reasons and serves
+# `measured`/`analysed` on every targets read, and none of it reached the Director anywhere --
+# while `POST /song/analyze` had no caller in the interface at all and all five real projects had
+# a song and no analysis. These execute the whole matrix rather than reading the source, because
+# the two defects Epic 8 shipped both passed every source-reading gate.
+#
+# Review round 1 added four states these must tell apart and originally did not: no project at
+# all, a generated song whose render has not landed, a served body that does not carry the flag,
+# and a read that has simply not happened yet. Three of them were being answered with a sentence
+# about a different state, which is the same class of defect this whole change exists to fix.
+# ------------------------------------------------------------------------------------------
+
+UNSUNG_PROJECT = {
+    "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+    "messages": [], "song": None,
+}
+
+
+def measured_project(song: dict | None = None) -> dict:
+    """A project carrying the measured Song, for the workspace to load."""
+    return {**UNSUNG_PROJECT, "song": {**MEASURED_SONG} if song is None else song}
+
+
+def served_targets(measured: bool, analysed: bool, beats: list | None = None) -> dict:
+    """One `timeline/snap-targets` body, exactly as `read_timeline_snap_targets` shapes it."""
+    return {
+        "gaps": [12.15] if measured else [],
+        "beats": beats if beats is not None else ([10.0, 20.0] if analysed else []),
+        "measured": measured, "analysed": analysed, "start": 0.0, "end": 60.0,
+    }
+
+
+def snap_rows(workspace: dict) -> dict:
+    """The plan's rows keyed by kind, from a `run_module`/`run_workspace` payload."""
+    return {row["kind"]: row for row in workspace["kinds"]}
+
+
+#: The panel as the Director would see it, read back through **both** halves of the render.
+#:
+#: The rows are written as markup only when their *shape* changes, and everything that moves
+#: without changing the shape -- a reason's wording, the action's running label -- is applied to
+#: the element afterwards. A browser shows both; this stub DOM shows the first in `innerHTML` and
+#: the second on the element, and nowhere are the two the same object. So a test that read only
+#: `innerHTML` would report the wording the rows were *built* with however many times it has since
+#: been re-said, and one that read only the elements could not tell a row that exists from one that
+#: does not. This reads structure from the markup and text from the elements, which is what the
+#: Director's browser composes into one panel.
+SNAP_PANEL = """
+const snapPanel = () => {
+  const list = at('#snap-target-kinds');
+  const markup = String(list.innerHTML || '');
+  const drawn = (id) => markup.includes('id="' + id + '"');
+  const rows = {};
+  for (const match of markup.matchAll(/data-kind="([^"]*)"/g)) {
+    const kind = match[1];
+    rows[kind] = {
+      kind,
+      checked: at('#snap-kind-' + kind).checked,
+      reason: drawn('snap-reason-' + kind) ? at('#snap-reason-' + kind).textContent : '',
+      action: drawn('snap-action-' + kind)
+        ? { label: at('#snap-action-' + kind).textContent,
+            disabled: at('#snap-action-' + kind).disabled }
+        : null,
+    };
+  }
+  return { key: list.dataset.kinds, markup, rows, summary: at('#snap-targets-summary').textContent };
+};
+"""
+
+
+def snap_panel(payload: dict, key: str = "panel") -> dict:
+    """One `snapPanel()` snapshot out of a run_workspace payload, keyed by kind."""
+    return payload[key]["rows"]
+
+
+#: A press on a row's action, shaped like the event a browser delivers: `closest` walks up from
+#: whatever was actually clicked, which is what the handler reads. `child` presses a nested element
+#: inside the button, which is the case a handler reading `event.target.dataset` gets wrong.
+def snap_press(action: str = "analyze-song", *, child: bool = False) -> str:
+    inner = "{ dataset: {}, closest(selector) { return button; } }"
+    target = inner if child else "button"
+    named = json.dumps(action)
+    return (
+        "(() => { const button = { dataset: { snapAction: " + named + " }, "
+        "closest() { return button; } }; const target = " + target + "; return { target }; })()"
+    )
+
+
+def snap_words() -> dict:
+    """Every sentence and name the selector's rows are built from, read off api.js."""
+    return run_module("""
+      import { SNAP_TARGET_ABSENT, SNAP_TARGET_NEEDS, SNAP_TARGET_UNSONGED,
+               SNAP_TARGET_NO_PROJECT, SNAP_TARGET_UNRENDERED, SNAP_TARGET_EVIDENCE,
+               SNAP_TARGET_REMEDY, SNAP_TARGET_LABELS, SNAP_ANALYZE_ACTION, SNAP_ANALYZE_LABEL,
+               SNAP_ANALYZE_RUNNING, SNAP_ANALYZE_DONE, SNAP_ANALYZE_DONE_UNCOUNTED,
+               SNAP_SELECT_EMPTY_KIND, snapActionControl, snapBeatCount }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        absent: SNAP_TARGET_ABSENT, needs: SNAP_TARGET_NEEDS, unsonged: SNAP_TARGET_UNSONGED,
+        noProject: SNAP_TARGET_NO_PROJECT, unrendered: SNAP_TARGET_UNRENDERED,
+        evidence: SNAP_TARGET_EVIDENCE, remedy: SNAP_TARGET_REMEDY, labels: SNAP_TARGET_LABELS,
+        action: SNAP_ANALYZE_ACTION, label: SNAP_ANALYZE_LABEL, running: SNAP_ANALYZE_RUNNING,
+        done: SNAP_ANALYZE_DONE, uncounted: SNAP_ANALYZE_DONE_UNCOUNTED,
+        emptyKind: SNAP_SELECT_EMPTY_KIND,
+        controls: Object.fromEntries(
+          Object.keys(SNAP_TARGET_LABELS).map((kind) => [kind, snapActionControl(kind)])),
+        counts: [0, 1, 2, 100].map((count) => snapBeatCount(count)),
+      }));
+    """)
+
+
+def test_each_snap_row_says_what_its_own_kind_is_missing_and_offers_only_the_fix_it_has():
+    """**The frozen matrix, every combination of it, decided by one pure function.**
+
+    Which words a row says, whether it can pull and whether it can act are `snapSelectorPlan`'s
+    to decide -- `app.js` positions, writes and dispatches only -- so this is where each row of
+    the matrix is proved. What it must get right, and each of these was a real way to get it
+    wrong:
+
+    * The Beats row offers the action *only* when the beats are **known** to be missing and there
+      is audio to measure. On a measured song the row reads as it did before this existed.
+    * The Phrase gaps row never offers it. Gaps come from transcription, which is a different act
+      on a different page; a button here would not produce one.
+    * The Playhead row is unaffected by every combination, because it needs no measurement.
+    * **Four different absences, four different sentences.** No project, no song, a generated song
+      whose render has not landed, and a measurement nobody has taken are distinct states with
+      distinct next moves, and the server itself tells the middle two apart.
+    * **`undefined` is not evidence.** A served body that does not carry the flag -- an older or
+      partial response -- leaves the row saying only that nothing has been read, never asserting
+      an absence the server never reported.
+    * **The unread state still states its prerequisite.** Taking the standing "needs an analysed
+      song" clause out of the notes was right where the answer is known and wrong where it is not:
+      silence there would trade an unconditional truth for a conditional void.
+    * The flags are read, never the lists' lengths. `drag_snap_targets` distinguishes *unmeasured*
+      from *measured and voiced throughout*, and a song sung end to end has no gap targets and has
+      still been transcribed.
+    """
+    kinds = snap_target_kinds()
+    words = snap_words()
+    plans = run_module("""
+      import { snapSelectorPlan } from './src/music_video_producer/web/assets/api.js';
+      const project = { id: 'p1' };
+      const song = { path: 'media/songs/000-master.wav' };
+      const of = (served) => snapSelectorPlan(null, served);
+      console.log(JSON.stringify({
+        noProject: of({ targets: null, song: null }),
+        noSong: of({ project, song: null }),
+        unrendered: of({ project, song: { path: '' } }),
+        // A song whose targets have not been read yet, or whose read was refused.
+        unread: of({ project, song }),
+        // A served body from a build that does not carry the beat flag at all.
+        partial: of({ project, song, targets: { measured: true } }),
+        nulled: of({ project, song, targets: { measured: true, analysed: null } }),
+        neither: of({ project, song, targets: { measured: false, analysed: false } }),
+        transcribedOnly: of({ project, song, targets: { measured: true, analysed: false } }),
+        analysedOnly: of({ project, song, targets: { measured: false, analysed: true } }),
+        both: of({ project, song, targets: { measured: true, analysed: true } }),
+        // Measured end to end and voiced throughout: gaps is empty and the song *was* transcribed.
+        sungThroughout: of({ project, song, targets: { gaps: [], measured: true, analysed: true } }),
+        inFlight: of({ project, song, targets: { measured: true, analysed: false }, analysing: true }),
+        bare: snapSelectorPlan(),
+      }));
+    """)
+
+    measured_kinds = list(words["evidence"])
+    remedied = list(words["remedy"])
+    assert measured_kinds and remedied, words["evidence"]
+    assert set(measured_kinds) <= set(kinds) and set(remedied) <= set(measured_kinds)
+    free = [kind for kind in kinds if kind not in measured_kinds]
+    assert free, "every kind now needs a measurement, so 'unaffected' proves nothing"
+
+    # The half-truths this change exists to remove: a condition stated unconditionally.
+    notes = run_module("""
+      import { SNAP_TARGET_NOTES } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(SNAP_TARGET_NOTES));
+    """)
+    for note in notes.values():
+        assert "needs a" not in note.lower(), note
+
+    # Four absences, four sentences, none of them borrowed from another state.
+    settled = {
+        "noProject": words["noProject"],
+        "noSong": words["unsonged"],
+        "unrendered": words["unrendered"],
+    }
+    assert len(set(settled.values())) == 3, settled
+    for case, sentence in settled.items():
+        for kind, row in snap_rows(plans[case]).items():
+            if kind in measured_kinds:
+                assert row["available"] is False and row["known"] is True, (case, row)
+                assert row["reason"] == sentence, (case, row)
+            else:
+                assert row["available"] is True and row["reason"] == "", (case, row)
+            assert row["action"]["shown"] is False, (case, row)
+
+    # Nothing read, or a flag the server never sent: the prerequisite, and no claim of absence.
+    for case in ("unread", "partial", "nulled"):
+        for kind, row in snap_rows(plans[case]).items():
+            if kind not in measured_kinds:
+                continue
+            known_here = case != "unread" and kind == "gap"
+            if known_here:
+                assert row["known"] is True and row["reason"] == "", (case, row)
+                continue
+            assert row["available"] is True, (case, row)
+            assert row["known"] is False, (case, row)
+            assert row["reason"] == words["needs"][kind], (case, row)
+            assert row["action"]["shown"] is False, (
+                "an action was offered for a measurement nobody has reported on", case, row,
+            )
+
+    # Everything present reads exactly as it did before this existed.
+    for case in ("both", "sungThroughout"):
+        for row in plans[case]["kinds"]:
+            assert row["available"] is True and row["reason"] == "", (case, row)
+            assert row["action"]["shown"] is False, (case, row)
+
+    # A plan handed nothing still answers rather than throwing, and answers the state it has
+    # evidence for: no project has been shown to it, so it says so.
+    assert plans["bare"]["kinds"] == plans["noProject"]["kinds"]
+
+    # Each absence names its own kind's reason, and only its own.
+    cases = {"neither": (False, False), "transcribedOnly": (True, False),
+             "analysedOnly": (False, True)}
+    for case, (measured, analysed) in cases.items():
+        rows = snap_rows(plans[case])
+        served = {"measured": measured, "analysed": analysed}
+        for kind in kinds:
+            row = rows[kind]
+            flag = words["evidence"].get(kind)
+            if flag is None or served[flag]:
+                assert row["available"] is True and row["reason"] == "", (case, row)
+                assert row["action"]["shown"] is False, (case, row)
+                continue
+            assert row["available"] is False and row["known"] is True, (case, row)
+            assert row["reason"] == words["absent"][kind], (case, row)
+            assert row["action"]["shown"] is (kind in remedied), (case, row)
+            if kind in remedied:
+                assert row["action"]["action"] == words["action"], (case, row)
+                assert row["action"]["disabled"] is False, (case, row)
+                assert row["action"]["label"] == words["label"], (case, row)
+                assert row["action"]["title"], (case, row)
+
+    # Every reason is a plain sentence naming the thing and the reason, and none of them shouts.
+    for table in ("absent", "needs"):
+        for kind, reason in words[table].items():
+            assert reason.endswith("."), (table, kind, reason)
+            assert "!" not in reason and reason.upper() != reason, (table, kind, reason)
+    for kind, reason in words["absent"].items():
+        assert reason.startswith("This song has not been "), (kind, reason)
+    # The gap row's sentence names where transcription happens, since it cannot offer it.
+    assert "Song page" in words["absent"]["gap"], words["absent"]["gap"]
+    assert "Song page" not in words["absent"]["beat"], words["absent"]["beat"]
+
+    # While one runs, the control says so and cannot be fired again.
+    inflight = snap_rows(plans["inFlight"])
+    offered = [row for row in inflight.values() if row["action"]["shown"]]
+    assert offered, "nothing was offered, so the running state proves nothing"
+    for row in offered:
+        assert row["action"]["disabled"] is True, row
+        assert row["action"]["label"] == words["running"], row
+        assert row["action"]["title"] != "", row
+
+    # And availability never touches the tick: a kind switched on before its measurement exists
+    # stays switched on, because that is what the Director wants a drag to land on.
+    for case in ("noProject", "noSong", "unrendered", "neither", "inFlight"):
+        assert all(row["checked"] for row in plans[case]["kinds"]), case
+
+
+def test_the_collapsed_selector_does_not_promise_a_kind_that_has_nothing_to_land_on():
+    """**The unconditional claim, in the one place a Director reads without opening anything.**
+
+    The rows were made honest and the summary was left saying `Snap to: playhead - gaps - beats`
+    over a song nobody had measured -- the same "a condition stated unconditionally is decoration"
+    argument this change is built on, applied to its own toolbar line.
+
+    A ticked kind is *marked*, never dropped: it is the Director's own selection and this line is
+    the one place the control reports it, so removing a kind would silently reverse a choice they
+    can still see ticked in the panel. The mark says what the drag will actually do.
+    """
+    words = snap_words()
+    summaries = run_module("""
+      import { snapSelectorPlan, SNAP_SELECT_LABEL, SNAP_SELECT_NONE, SNAP_TARGET_SHORT }
+        from './src/music_video_producer/web/assets/api.js';
+      const project = { id: 'p1' };
+      const song = { path: 'media/songs/000-master.wav' };
+      const of = (active, served) => snapSelectorPlan(active, served).summary;
+      console.log(JSON.stringify({
+        label: SNAP_SELECT_LABEL, none: SNAP_SELECT_NONE, short: SNAP_TARGET_SHORT,
+        measured: of(null, { project, song, targets: { measured: true, analysed: true } }),
+        unmeasured: of(null, { project, song, targets: { measured: false, analysed: false } }),
+        halfway: of(null, { project, song, targets: { measured: true, analysed: false } }),
+        unread: of(null, { project, song }),
+        nothing: of([], { project, song, targets: { measured: false, analysed: false } }),
+      }));
+    """)
+    mark = words["emptyKind"]
+
+    # Everything measured: the line reads exactly as it always did.
+    assert summaries["measured"] == (
+        f"{summaries['label']}: "
+        + " · ".join(summaries["short"][kind] for kind in snap_target_kinds())
+    ), summaries
+    assert mark not in summaries["measured"]
+
+    # Nothing measured: every kind that needs a measurement is marked, and the playhead is not.
+    assert mark in summaries["unmeasured"], summaries
+    assert f"{summaries['short']['gap']} {mark}" in summaries["unmeasured"], summaries
+    assert f"{summaries['short']['beat']} {mark}" in summaries["unmeasured"], summaries
+    assert f"{summaries['short']['playhead']} {mark}" not in summaries["unmeasured"], summaries
+
+    # Half measured: only the half that cannot pull is marked.
+    assert f"{summaries['short']['beat']} {mark}" in summaries["halfway"], summaries
+    assert f"{summaries['short']['gap']} {mark}" not in summaries["halfway"], summaries
+
+    # Nothing read: nothing is claimed either way, so nothing is marked.
+    assert mark not in summaries["unread"], summaries
+
+    # And the deliberate every-kind-off state is untouched by any of it.
+    assert summaries["nothing"] == f"{summaries['label']}: {summaries['none']}"
+
+    # Every kind is still named, so the line still reports the Director's own selection.
+    for kind, short in summaries["short"].items():
+        assert short in summaries["unmeasured"], (kind, summaries["unmeasured"])
+
+
+def test_the_analyze_song_client_calls_a_route_the_application_serves():
+    """The path is built in one place in `api.js` and served in one place in `app.py`; a typo or a
+    rename in either is a button whose only outcome is a 404 -- and every frontend test in this
+    file would stay green through it, because the harness answers the client's own spelling.
+
+    `test_the_snap_cuts_client_calls_a_route_the_application_serves` is the precedent, and this
+    feature's other new route already has one.
+    """
+    call = run_module("""
+      import { api } from './src/music_video_producer/web/assets/api.js';
+      let seen = { path: '', method: '', body: '' };
+      globalThis.fetch = (path, options = {}) => {
+        seen = { path, method: options.method || 'GET', body: options.body || '' };
+        return Promise.reject(new Error('the contract harness makes no requests'));
+      };
+      await api.analyzeSong('PID').catch(() => {});
+      console.log(JSON.stringify(seen));
+    """)
+
+    assert call["path"] == "/api/projects/PID/song/analyze"
+    assert call["method"] == "POST"
+    # No body at all: this route takes none, and one sent here would be a field the generic PUT
+    # never sees and the route never reads.
+    assert call["body"] == ""
+    assert "/api/projects/{project_id}/song/analyze" in {
+        route.path for route in create_app().routes
+    }
+
+
+def test_the_selector_says_what_is_missing_the_moment_the_targets_land():
+    """**The trap that would have made this feature invisible**, executed.
+
+    The row markup was written once, keyed on the comma-joined *kind names* -- a string settled at
+    boot that never moves again. Rows whose words come from `measured`/`analysed` would therefore
+    have been drawn before any report existed and never repainted for the life of the page: every
+    sentence in the test above would be correct, provable and on screen nowhere.
+
+    So this drives it through a real project load: an un-analysed, un-transcribed song arrives, the
+    targets read lands, and the panel is read back out of the DOM.
+    """
+    words = snap_words()
+    shown = run_workspace(
+        """
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const list = at('#snap-target-kinds');
+      console.log(JSON.stringify({ markup: list.innerHTML, held: state.snapTargets }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
+        },
+    )
+
+    assert shown["held"]["analysed"] is False, "the report never landed, so this proves nothing"
+    markup = shown["markup"]
+    # Both rows say their own reason, in the panel, without the Director touching anything.
+    for kind, reason in words["absent"].items():
+        assert reason in markup, (kind, markup)
+    # ...and neither of them is still stating the prerequisite, which is a different state.
+    for kind, reason in words["needs"].items():
+        assert reason not in markup, (kind, markup)
+    # Exactly one row carries the button, and it is named for the row it belongs to.
+    assert markup.count(f'data-snap-action="{words["action"]}"') == 1, markup
+    assert f'id="{words["controls"]["beat"].lstrip("#")}"' in markup, markup
+    assert words["label"] in markup
+    # A real button, so it is reachable and operable by keyboard, and it does not submit.
+    assert 'type="button"' in markup
+    # Read as unavailable by `aria-disabled`, never by `disabled`, which would blur it on press.
+    assert 'aria-disabled="false"' in markup, markup
+    assert " disabled" not in markup, (
+        "the action carries a DOM `disabled`, which blurs the button the Director just pressed",
+        markup,
+    )
+    # The reason is a sibling of the label, never inside it: a button inside a `<label>` would
+    # move the tick as well as firing, which is one press doing two unrelated things.
+    assert "</label>" in markup
+    assert markup.index("</label>") < markup.index("control-reason"), markup
+    # The panel is a `<span role="group">`, which permits phrasing content only.
+    assert "<div" not in markup and "<p " not in markup, (
+        "flow content was written into a phrasing-only container", markup,
+    )
+    # Absence is a plain fact: no error state, no alarm, no seventh accent.
+    for shout in ("error", "danger", "warning", "--red", "--amber"):
+        assert shout not in markup, (shout, markup)
+
+
+def test_a_project_with_no_song_reports_nothing_to_measure_and_offers_no_analysis():
+    """The matrix's "no song at all" row, plus the two states that used to borrow its sentence.
+
+    A project with no song, and a *generated* song whose render has not landed, are different
+    facts with different next moves -- the server tells them apart in `SONG_ANALYSIS_WITHOUT_SONG`'s
+    own comment -- and neither offers a button, because a measurement needs audio to measure. The
+    row that needs no measurement is untouched by both: a playhead is where you parked it whether
+    or not this project has a track.
+    """
+    words = snap_words()
+    responses = {"/api/projects/p2": {"body": UNSUNG_PROJECT}}
+    plain = run_workspace(
+        SNAP_PANEL + """
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const before = snapPanel();
+      // ...and the same project once a generated song has been asked for but has not landed.
+      state.project.song = { title: 'Pending', source: 'generated', path: '', duration: 0 };
+      await app.loadSnapTargets('p2');
+      await flush();
+      console.log(JSON.stringify({
+        before,
+        unrendered: snapPanel(),
+        held: state.snapTargets,
+        asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
+      }));
+    """,
+        responses=responses,
+    )
+
+    assert plain["held"] is None
+    assert plain["asked"] == 0, "a project with no audio still asked the server for its targets"
+    said = {case: {kind: row["reason"] for kind, row in plain[case]["rows"].items()}
+            for case in ("before", "unrendered")}
+    # The two states say different things, and neither borrows the other's sentence.
+    for kind in words["evidence"]:
+        assert said["before"][kind] == words["unsonged"], (kind, said["before"])
+        assert said["unrendered"][kind] == words["unrendered"], (kind, said["unrendered"])
+    for case in ("before", "unrendered"):
+        panel = plain[case]
+        assert all(row["action"] is None for row in panel["rows"].values()), (
+            "a project with no audio offers to measure it", case, panel,
+        )
+        # Every row is still listed, including the one that needs no measurement.
+        assert set(panel["rows"]) == set(words["labels"]), panel
+        # ...and the one that needs no measurement says nothing.
+        for kind, row in panel["rows"].items():
+            if kind not in words["evidence"]:
+                assert row["reason"] == "", (case, row)
+
+
+def test_removing_the_song_stops_the_panel_describing_it():
+    """**Review finding 1, and the demonstration is the test.**
+
+    The sync was attached to `loadSnapTargets` -- to the *loader* -- and `#remove-song` calls
+    `forgetSongEnvelope()` and `renderAll()`, neither of which was one. So the panel went on saying
+    "This song has not been analysed..." about a song that had been removed, with a live Analyze
+    button whose only possible outcome was the server's 422. The markup was byte-identical before
+    and after the removal while `state.project.song` was null.
+
+    `test_a_removed_or_replaced_song_takes_its_snap_targets_with_it` passed throughout, because it
+    reads `state.snapTargets` and never the control -- which is why this reads the control.
+    """
+    words = snap_words()
+    removed = run_workspace(
+        """
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const before = at('#snap-target-kinds').innerHTML;
+      await fire('#remove-song:click', {});
+      await flush();
+      console.log(JSON.stringify({
+        before,
+        after: at('#snap-target-kinds').innerHTML,
+        song: state.project.song,
+        targets: state.snapTargets,
+      }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
+            "/api/projects/p2/song?confirm_song_replacement=false": {"body": UNSUNG_PROJECT},
+        },
+    )
+
+    assert words["absent"]["beat"] in removed["before"], "the starting state never arrived"
+    assert removed["song"] is None, "the song was not removed, so this proves nothing"
+    assert words["absent"]["beat"] not in removed["after"], (
+        "the panel still describes the song that was removed"
+    )
+    assert words["unsonged"] in removed["after"], removed["after"]
+    assert f'data-snap-action="{words["action"]}"' not in removed["after"], (
+        "a removed song still offers an analysis whose only outcome is the server's refusal"
+    )
+
+
+def test_a_refused_targets_read_does_not_leave_the_previous_projects_sentences_on_screen():
+    """**Review finding 2.** The loader's `catch` returned before the sync, so a switch into a
+    project whose targets read is refused left the panel making a claim about the project that had
+    been on screen when the last read landed -- "This project has no song" over a project whose
+    song is right there.
+
+    The targets themselves are still kept and the key still left unclaimed, which is the existing
+    rule and a different question: one unreachable moment must not cost the Director their magnet.
+    What it must cost is the *sentence*, because this browser no longer knows.
+    """
+    words = snap_words()
+    switched = run_workspace(
+        SNAP_PANEL + """
+      await fire('#project-select:change', { target: { value: 'p1' } });
+      await flush();
+      const unsonged = snapPanel();
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      console.log(JSON.stringify({
+        unsonged,
+        after: snapPanel(),
+        song: state.project.song ? state.project.song.path : null,
+        targets: state.snapTargets,
+      }));
+    """,
+        responses={
+            "/api/projects/p1": {"body": {**UNSUNG_PROJECT, "id": "p1"}},
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"status": 500, "body": {"detail": "no"}},
+            "/api/projects/p2/timeline/snap-targets": {"status": 500, "body": {"detail": "no"}},
+        },
+    )
+
+    before = snap_panel(switched, "unsonged")
+    after = snap_panel(switched, "after")
+    assert switched["song"], "the second project has no song, so this proves nothing"
+    for kind in words["evidence"]:
+        assert before[kind]["reason"] == words["unsonged"], (kind, before)
+        assert after[kind]["reason"] != words["unsonged"], (
+            "the panel still says the previous project's sentence over a project that has a song",
+            kind, after,
+        )
+        # What it says instead is the prerequisite, conditionally: nothing has been read.
+        assert after[kind]["reason"] == words["needs"][kind], (kind, after)
+        assert after[kind]["action"] is None, (
+            "an action was offered on the strength of a read that never landed", kind, after,
+        )
+
+
+def test_the_row_action_measures_the_song_and_puts_the_result_on_screen_without_a_reload():
+    """**The whole point of A1, and the re-measurement trap, in one run.**
+
+    `song_fingerprint` is derived from the song's *bytes*, so re-measuring the same file answers
+    the same fingerprint -- and both `songEnvelopeIdentity` and `snapTargetsIdentity` are built on
+    it, and both loaders return early when their key has not moved. A Director whose sidecar had
+    been deleted would press this, the server would genuinely re-measure, and the browser would
+    show them the cached absence: `force=True`'s entire purpose defeated by a cache.
+
+    So the analysis here answers a Project whose song is **byte-identical** -- same path, same
+    fingerprint, everything -- and the two reads must still happen and must still change what is
+    on screen. `forgetSongEnvelope` is what makes that true, and the adoption has to come *before*
+    the reads or their keys are computed from the song as it was and match anyway.
+
+    The press is delivered on a **child** of the button, which is how a browser delivers one the
+    moment the button contains anything at all, and the handler has to walk up to find it.
+
+    Nothing reloads: the assertions are all about the selector, the band and the targets after one
+    click, in one page.
+    """
+    words = snap_words()
+    envelope = {"analysis_rate": 30, "band_count": 8, "bpm": 120,
+                "beats": [10.0, 20.0, 30.0], "onsets": [10.0]}
+    measured = run_workspace(
+        f"""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      const before = {{
+        markup: at('#snap-target-kinds').innerHTML,
+        targets: state.snapTargets,
+        envelope: state.songEnvelope,
+        band: at('#beat-band').innerHTML,
+        fingerprint: state.project.song.analysis.song_fingerprint,
+      }};
+      requests.length = 0;
+      await fire('#snap-target-kinds:click', {snap_press(child=True)});
+      await flush();
+      console.log(JSON.stringify({{
+        before,
+        markup: at('#snap-target-kinds').innerHTML,
+        targets: state.snapTargets,
+        envelope: state.songEnvelope,
+        band: at('#beat-band').innerHTML,
+        fingerprint: state.project.song.analysis.song_fingerprint,
+        sent: requests.map((sent) => sent.method + ' ' + sent.path),
+        leftover: unconsumed(),
+        toasts,
+      }}));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            # Absent first, present after the measurement -- the same path, two answers.
+            "/api/projects/p2/song/envelope": [
+                {"body": {"present": False, "reason": "the sidecar is gone"}},
+                {"body": {"present": True, "envelope": envelope}},
+            ],
+            "/api/projects/p2/timeline/snap-targets": [
+                {"body": served_targets(measured=False, analysed=False)},
+                {"body": served_targets(measured=False, analysed=True, beats=envelope["beats"])},
+            ],
+            # The same Song, byte for byte: this is the trap, not an oversight.
+            "/api/projects/p2/song/analyze": {"body": measured_project()},
+        },
+    )
+
+    # The starting state is real: the row said so and offered the button.
+    assert words["absent"]["beat"] in measured["before"]["markup"]
+    assert measured["before"]["envelope"] is None
+    assert measured["before"]["band"] == "", "marks were drawn from an absent measurement"
+
+    # One click, one measurement, and both reads re-fired behind it -- and every canned answer was
+    # consumed, so "it asked again" cannot pass on a client that asked once.
+    assert measured["sent"][0] == "POST /api/projects/p2/song/analyze", measured["sent"]
+    assert "GET /api/projects/p2/song/envelope" in measured["sent"], measured["sent"]
+    assert "GET /api/projects/p2/timeline/snap-targets" in measured["sent"], measured["sent"]
+    assert measured["leftover"] == {}, ("a canned reply was never asked for", measured["leftover"])
+
+    # The trap: the song did not move, and the reads happened anyway.
+    assert measured["fingerprint"] == measured["before"]["fingerprint"], (
+        "the test no longer exercises a re-measurement of an unchanged file"
+    )
+
+    # The selector, the beat band and the snap targets all reflect the new measurement.
+    assert words["absent"]["beat"] not in measured["markup"], (
+        "the Beats row still says the song has never been analysed after measuring it"
+    )
+    assert f'data-snap-action="{words["action"]}"' not in measured["markup"], (
+        "the action is still offered on a row that can now pull"
+    )
+    assert measured["targets"]["analysed"] is True
+    assert measured["targets"]["beats"] == envelope["beats"]
+    assert measured["envelope"] == envelope
+    assert measured["band"] != "", "the beat band did not repaint from the new measurement"
+    assert measured["band"].count("<span") == len(envelope["beats"]) + len(envelope["onsets"]) - 1, (
+        measured["band"]
+    )
+
+    # And the Director is told, with the count they can check against the marks -- pluralised,
+    # because the count is the whole content of the sentence.
+    assert measured["toasts"] == [
+        words["done"].replace("{beats}", f"{len(envelope['beats'])} beats")
+    ], measured["toasts"]
+    assert words["counts"] == ["0 beats", "1 beat", "2 beats", "100 beats"], words["counts"]
+
+    # The gap row is untouched by an analysis that does not produce gaps.
+    assert words["absent"]["gap"] in measured["markup"]
+
+
+def test_a_successful_analysis_whose_read_back_fails_does_not_report_a_count_it_does_not_have():
+    """The measurement landed; the read that would say how many beats it found did not.
+
+    "Song analysed: 0 beats to snap to." is this application inventing a number, and it is the
+    exact shape the honest-status convention exists to forbid -- a Director would read it as a
+    measurement that found nothing rather than as a read that never happened. The row must not
+    claim everything is fine either: with no report, it states its prerequisite.
+    """
+    words = snap_words()
+    silent = run_workspace(
+        f"""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      await fire('#snap-target-kinds:click', {snap_press()});
+      await flush();
+      console.log(JSON.stringify({{
+        toasts, targets: state.snapTargets,
+        markup: at('#snap-target-kinds').innerHTML,
+      }}));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": [
+                {"body": {"present": False, "reason": "the sidecar is gone"}},
+                {"status": 500, "body": {"detail": "no"}},
+            ],
+            "/api/projects/p2/timeline/snap-targets": [
+                {"body": served_targets(measured=False, analysed=False)},
+                {"status": 500, "body": {"detail": "no"}},
+            ],
+            "/api/projects/p2/song/analyze": {"body": measured_project()},
+        },
+    )
+
+    assert silent["toasts"] == [words["uncounted"]], silent["toasts"]
+    assert "0 beat" not in words["uncounted"], words["uncounted"]
+    # The rows say the same thing: nothing has been read back, so nothing is claimed.
+    assert silent["targets"] is None
+    for kind, reason in words["needs"].items():
+        assert reason in silent["markup"], (kind, silent["markup"])
+    assert words["absent"]["beat"] not in silent["markup"], silent["markup"]
+
+
+def test_a_refused_analysis_says_what_the_server_said_and_changes_nothing():
+    """The matrix's refusal row, driven into all three of this route's refusals.
+
+    `POST /song/analyze` answers **422** with no song or no audio yet, **404** for an unknown
+    project or a song file that is gone, and **502** carrying a named analysis reason -- and the
+    last is the one that made this route worth wiring, because "this machine has no ffmpeg" was
+    previously indistinguishable on screen from "nobody has measured this yet".
+
+    `analyze_project_song` mutates the Project only on success and never saves, so a refusal leaves
+    the manifest exactly as it found it. The browser's half of that promise is here: nothing is
+    adopted, no cached read is dropped, no reload is fired, and the rows come back to what they
+    said before the press.
+    """
+    words = snap_words()
+    refusals = {
+        502: "This machine has no ffmpeg on PATH, so the song cannot be measured.",
+        422: "This project has no song to analyse.",
+        404: "Song media was not found",
+    }
+    for status, sentence in refusals.items():
+        refused = run_workspace(
+            f"""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push({{ text: item.textContent, kind: item.className }});
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      const before = {{
+        markup: at('#snap-target-kinds').innerHTML,
+        targets: JSON.parse(JSON.stringify(state.snapTargets)),
+        project: JSON.parse(JSON.stringify(state.project)),
+      }};
+      requests.length = 0;
+      await fire('#snap-target-kinds:click', {snap_press()});
+      await flush();
+      console.log(JSON.stringify({{
+        before,
+        markup: at('#snap-target-kinds').innerHTML,
+        targets: state.snapTargets,
+        project: state.project,
+        sent: requests.map((sent) => sent.method + ' ' + sent.path),
+        toasts,
+      }}));
+    """,
+            responses={
+                "/api/projects/p2": {"body": measured_project()},
+                "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+                "/api/projects/p2/timeline/snap-targets": {
+                    "body": served_targets(measured=False, analysed=False)},
+                "/api/projects/p2/song/analyze": {"status": status, "body": {"detail": sentence}},
+            },
+        )
+
+        # The server's own sentence, not a status code and not this client's paraphrase.
+        assert [item["text"] for item in refused["toasts"]] == [sentence], (status, refused)
+        assert all("error" in item["kind"] for item in refused["toasts"]), refused["toasts"]
+        # One request, and nothing reloaded behind it.
+        assert refused["sent"] == ["POST /api/projects/p2/song/analyze"], (status, refused["sent"])
+        # Nothing in the project changed, and the rows are back exactly where they were.
+        assert refused["project"] == refused["before"]["project"], status
+        assert refused["targets"] == refused["before"]["targets"], status
+        assert refused["markup"] == refused["before"]["markup"], (
+            "a refused analysis left the selector saying something else", status,
+        )
+        # And the action is still there, so a Director who fixes the cause can try again.
+        assert f'data-snap-action="{words["action"]}"' in refused["markup"], status
+
+
+def test_a_measurement_running_on_one_project_says_nothing_about_another():
+    """**Review finding 3 and 4.** The in-flight state was a bare boolean, so switching projects
+    mid-measurement drew the *new* project's Beats row dead and reading "Analyzing song..." about a
+    song nobody was measuring -- and the failure path toasted with no identity check, so a refusal
+    for the project the Director had left surfaced over the project they were looking at.
+
+    Held as a set of project ids: both claims are then about a named song, and two measurements
+    running at once do not release each other's.
+
+    **The analysis is held open on purpose.** Every canned reply in this harness resolves on the
+    next microtask, so a switch made "while it runs" would in truth be made after it finished, and
+    both assertions below would pass against the bare boolean they exist to forbid. The route is
+    stalled until this test releases it, which is the only way the two states genuinely overlap.
+    """
+    words = snap_words()
+    crossed = run_workspace(
+        SNAP_PANEL + f"""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      const landed = globalThis.fetch;
+      let release = null;
+      globalThis.fetch = (path, options) => path.includes('/song/analyze')
+        ? new Promise((resolve, reject) => {{
+            release = () => landed(path, options).then(resolve, reject);
+          }})
+        : landed(path, options);
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      // Started and deliberately left open.
+      const running = fire('#snap-target-kinds:click', {snap_press()});
+      const own = snapPanel();
+      // ...and the Director moves to another project while it is still open.
+      await fire('#project-select:change', {{ target: {{ value: 'p3' }} }});
+      await flush();
+      const other = snapPanel();
+      release();
+      await running;
+      await flush();
+      console.log(JSON.stringify({{
+        own, other, toasts,
+        settled: snapPanel(),
+        project: state.project.id,
+      }}));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
+            "/api/projects/p2/song/analyze": {"status": 502, "body": {"detail": "ffmpeg is gone"}},
+            "/api/projects/p3": {"body": {**measured_project(), "id": "p3"}},
+            "/api/projects/p3/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p3/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
+        },
+    )
+
+    assert crossed["project"] == "p3"
+    # The project being measured says so...
+    assert snap_panel(crossed, "own")["beat"]["action"]["label"] == words["running"], crossed["own"]
+    # ...and the one that is not, does not -- while it runs and after it settles.
+    for case in ("other", "settled"):
+        action = snap_panel(crossed, case)["beat"]["action"]
+        assert action is not None, (
+            "the project now on screen stopped offering its own analysis", case, crossed[case],
+        )
+        assert action["label"] == words["label"], (
+            "another project's Beats row claims this song is being measured", case, action,
+        )
+    # The refusal belongs to the project that asked for it, and that project is not on screen.
+    assert crossed["toasts"] == [], (
+        "a refusal for a project the Director has left surfaced over the one they are looking at",
+        crossed["toasts"],
+    )
+
+
+def test_a_second_press_cannot_start_a_second_measurement():
+    """The matrix's "action while it is running" row. The button reads as unavailable the moment
+    one starts -- and the click site checks the same claim, because a press that arrives between
+    the claim being made and the repaint landing, or one an assistive technology sends to the
+    button directly, would otherwise get through the drawing alone.
+
+    It reads as unavailable through `aria-disabled` rather than `disabled`, so **the click site is
+    the only thing that refuses it**: a browser blurs a focused element the moment it is disabled,
+    and taking the keyboard Director's place away as a consequence of their own press is not a
+    trade this control makes.
+
+    The in-flight state is module state rather than a property on the button for the reason
+    `snapInFlight` is: this button lives inside markup the sync rewrites, so a property set by hand
+    is undone by the next repaint, while a flag the renderer reads cannot be.
+    """
+    words = snap_words()
+    control = words["controls"]["beat"].lstrip("#")
+    doubled = run_workspace(
+        f"""
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      const list = at('#snap-target-kinds');
+      requests.length = 0;
+      const settled = {{ markup: list.innerHTML, key: list.dataset.kinds }};
+      const press = {snap_press()};
+      // Fired without awaiting, so the second press lands while the first is still open.
+      const first = fire('#snap-target-kinds:click', press);
+      const running = {{
+        markup: list.innerHTML,
+        key: list.dataset.kinds,
+        label: at('#{control}').textContent,
+        disabled: at('#{control}').disabled,
+      }};
+      await fire('#snap-target-kinds:click', press);
+      await first;
+      await flush();
+      console.log(JSON.stringify({{
+        settled, running,
+        sent: requests.filter((sent) => sent.path.includes('analyze')).length,
+      }}));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
+            "/api/projects/p2/song/analyze": {"body": measured_project()},
+        },
+    )
+
+    assert doubled["sent"] == 1, "a second press started a second measurement of the same song"
+    # The control says it is running, in words.
+    assert doubled["running"]["label"] == words["running"], doubled["running"]
+    # Never by the DOM's own `disabled`, which would blur the button that was just pressed.
+    assert doubled["running"]["disabled"] is False, doubled["running"]
+    # And it said so **without the rows being rewritten**: the running label is applied to the
+    # button itself, so the element the Director's focus is on survives its own press.
+    #
+    # Asserted on the rebuild key and the whole markup rather than on the button's own label
+    # appearing in the list's `innerHTML`: in this harness every element is a flat object with its
+    # own unrelated strings, so a child's label can never appear in a parent's markup and that
+    # assertion could not have failed here whatever the code did.
+    assert doubled["running"]["key"] == doubled["settled"]["key"], doubled["running"]
+    assert doubled["running"]["markup"] == doubled["settled"]["markup"], (
+        "the rows were rebuilt to say the measurement is running, which replaces the button "
+        "mid-press"
+    )
+
+
+def test_a_tick_still_moves_without_the_rows_losing_their_place():
+    """**The reason the rebuild guard exists, and it had to survive being widened.**
+
+    Rebuilding the rows on every press replaces the very checkbox the Director has just operated:
+    in a browser that drops keyboard focus mid-gesture and sends the next Tab back to the top of
+    the document, and it makes every element reference held by anything else stale. The old key
+    prevented that by never moving at all, which is precisely why state-dependent rows would never
+    have repainted.
+
+    What the key holds now is the markup's own *shape* -- which rows carry a reason paragraph and
+    which carry the button. A tick does not change that, so the markup is not rewritten, and the
+    values that do move without changing the shape are applied imperatively. This drives a real
+    change event while a reason is displayed and asserts the markup is the same string it was.
+    """
+    ticked = run_workspace(
+        """
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const list = at('#snap-target-kinds');
+      const before = { markup: list.innerHTML, key: list.dataset.kinds };
+      // The Director unticks Beats while its row is displaying the reason it cannot pull.
+      at('#snap-kind-beat').checked = false;
+      await fire('#snap-target-kinds:change', { target: { dataset: { kind: 'beat' }, checked: false } });
+      console.log(JSON.stringify({
+        before,
+        markup: list.innerHTML,
+        key: list.dataset.kinds,
+        checked: at('#snap-kind-beat').checked,
+        summary: at('#snap-targets-summary').textContent,
+      }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
+        },
+    )
+
+    assert "control-reason" in ticked["before"]["markup"], (
+        "no reason was displayed, so this proves nothing about ticking while one is"
+    )
+    assert ticked["markup"] == ticked["before"]["markup"], (
+        "moving a tick rewrote the rows, so the checkbox the Director was operating was replaced"
+    )
+    assert ticked["key"] == ticked["before"]["key"]
+    # The tick moved, and the summary followed it.
+    assert ticked["checked"] is False
+    assert "beats" not in ticked["summary"], ticked["summary"]
+
+
+def test_a_reason_that_changes_its_words_without_changing_the_shape_is_still_re_said():
+    """The imperative reason write, and the transition that makes it load-bearing.
+
+    Two states of the Phrase gaps row carry a reason and no action -- "nothing has been read yet"
+    and "this song has not been transcribed" -- so the shape key is identical across them and the
+    rows are deliberately *not* rebuilt. If the sentence were only ever written by the rebuild, the
+    row would keep the first wording for the life of the page.
+
+    Driven through a real project load: a switch into a project whose read is refused states the
+    prerequisite, and the read that lands afterwards replaces it with the fact.
+    """
+    words = snap_words()
+    said = run_workspace(
+        SNAP_PANEL + """
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const unread = snapPanel();
+      // The same song, the same project: only the read that was refused now lands.
+      state.project.song.duration = 61;
+      await app.loadSnapTargets('p2');
+      await flush();
+      console.log(JSON.stringify({ unread, panel: snapPanel() }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": [
+                {"status": 500, "body": {"detail": "no"}},
+                {"body": served_targets(measured=False, analysed=True)},
+            ],
+        },
+    )
+
+    assert snap_panel(said, "unread")["gap"]["reason"] == words["needs"]["gap"], said["unread"]
+    # The gap row's shape did not move -- a reason and no action, both before and after -- so its
+    # markup was not rewritten and nothing but the imperative write can have changed its words.
+    shape = dict(entry.split(":", 1) for entry in said["panel"]["key"].split(","))
+    was = dict(entry.split(":", 1) for entry in said["unread"]["key"].split(","))
+    assert shape["gap"] == was["gap"] == "1:0", (shape, was)
+    assert snap_panel(said, "panel")["gap"]["reason"] == words["absent"]["gap"], said["panel"]
+
+
+def test_a_slow_targets_read_cannot_repaint_over_the_measurement_that_overtook_it():
+    """**Two reads open at once, and the slower one landing last.**
+
+    A project load and the poll noticing a generated song land in the same second, so two
+    `timeline/snap-targets` requests are open together; whichever answers *last* wins, and that is
+    not necessarily the one asked last. Without a revision guard the stale body is written over the
+    fresh measurement and stays there -- under the rows *and* under the drag -- until something
+    else moves the identity.
+
+    The project id check that was already there does not cover this: both reads name the same
+    project. `waveformLoadRevision` and `readinessLoadRevision` are the same guard on the same
+    hazard, and this feature had none.
+
+    The first read is stalled until the second has landed, which is the only way to make the two
+    genuinely overlap against a harness whose replies all resolve on the next microtask.
+    """
+    stale = served_targets(measured=False, analysed=False)
+    fresh = served_targets(measured=True, analysed=True)
+    raced = run_workspace(
+        """
+      const landed = globalThis.fetch;
+      let release = null;
+      // The canned reply is taken **when the request is made**, so the two reads consume the list
+      // in the order they were sent; only the *delivery* of the first one is held back. Deferring
+      // the call itself would hand the later request the earlier answer and quietly test nothing.
+      globalThis.fetch = (path, options) => {
+        const answer = landed(path, options);
+        if (!path.includes('snap-targets') || release !== null) return answer;
+        return new Promise((resolve, reject) => { release = () => answer.then(resolve, reject); });
+      };
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      // The first read is still open. Move the measurement so a second one is asked for, and let
+      // that one answer.
+      state.project.song.duration = 61;
+      await app.loadSnapTargets('p2');
+      await flush();
+      const overtaken = JSON.parse(JSON.stringify(state.snapTargets));
+      // ...and only now does the first one answer.
+      release();
+      await flush();
+      console.log(JSON.stringify({ overtaken, after: state.snapTargets }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
+            "/api/projects/p2/timeline/snap-targets": [{"body": stale}, {"body": fresh}],
+        },
+    )
+
+    assert raced["overtaken"] == fresh, ("the second read never landed", raced)
+    assert raced["after"] == fresh, (
+        "a read that was overtaken repainted its stale report over the measurement that beat it, "
+        "so the drag lands on targets the server has already superseded"
+    )
+
+
+def test_the_rows_are_rewritten_when_the_measurement_arrives_and_not_before():
+    """Both halves of the widened guard, driven through the action itself.
+
+    **Not before:** a load whose identity has not moved makes no request and rewrites nothing --
+    which is the whole reason the old key existed. **When it arrives:** the shape key moves and the
+    rows are rebuilt, which is the half the old key made impossible.
+
+    Driven by the row's own action rather than by editing a field of the Song, so the test does not
+    encode which fields `snapTargetsIdentity` happens to read.
+    """
+    envelope = {"analysis_rate": 30, "band_count": 8, "bpm": 120, "beats": [10.0], "onsets": []}
+    repainted = run_workspace(
+        f"""
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      const list = at('#snap-target-kinds');
+      const absent = {{ markup: list.innerHTML, key: list.dataset.kinds }};
+      // A re-load of a measurement that has not moved: no request, no rewrite.
+      requests.length = 0;
+      await app.loadSnapTargets('p2');
+      await flush();
+      const idle = {{
+        markup: list.innerHTML, key: list.dataset.kinds,
+        asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
+      }};
+      await fire('#snap-target-kinds:click', {snap_press()});
+      await flush();
+      console.log(JSON.stringify({{
+        absent, idle, markup: list.innerHTML, key: list.dataset.kinds, held: state.snapTargets,
+      }}));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/song/envelope": [
+                {"body": {"present": False, "reason": "none"}},
+                {"body": {"present": True, "envelope": envelope}},
+            ],
+            "/api/projects/p2/timeline/snap-targets": [
+                {"body": served_targets(measured=False, analysed=False)},
+                {"body": served_targets(measured=True, analysed=True)},
+            ],
+            "/api/projects/p2/song/analyze": {"body": measured_project()},
+        },
+    )
+
+    assert "control-reason" in repainted["absent"]["markup"]
+    # Not before: nothing was asked and nothing was rewritten.
+    assert repainted["idle"]["asked"] == 0, "a settled measurement was re-read for nothing"
+    assert repainted["idle"]["markup"] == repainted["absent"]["markup"], (
+        "the rows were rewritten by a load that changed nothing, which is the gesture-destroying "
+        "rebuild the guard exists to prevent"
+    )
+    assert repainted["idle"]["key"] == repainted["absent"]["key"]
+    # When it arrives: the key moved and the reasons are gone.
+    assert repainted["held"]["analysed"] is True, "the second report never landed"
+    assert repainted["key"] != repainted["absent"]["key"], (
+        "the row-rebuild key did not move when the measurement did, so the rows are frozen at "
+        "whatever they said before any report existed"
+    )
+    assert "control-reason" not in repainted["markup"], (
+        "the rows still carry a reason for a measurement that has arrived"
+    )
+
 
 
 def test_a_stored_selection_tells_absent_from_empty_and_ignores_a_kind_it_does_not_know():

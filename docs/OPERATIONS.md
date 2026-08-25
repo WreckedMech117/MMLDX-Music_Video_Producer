@@ -256,15 +256,25 @@ Both the repo adapter (`patch_ltx25_dimension_boundary`) and the Director's save
 ### Self-hosting browser QA (no server to start)
 
 ```bash
-uv run --with selenium python tests/e2e_shot_controls.py    # default port 8767
-uv run --with selenium python tests/e2e_song_context.py     # default port 8768
-uv run --with selenium python tests/e2e_timeline_scroll.py  # default port 8769
-uv run --with selenium python tests/e2e_take_swap.py        # default port 8770
+uv run --with selenium python tests/e2e_shot_controls.py         # default port 8767
+uv run --with selenium python tests/e2e_song_context.py          # default port 8768  ← collides
+uv run --with selenium python tests/e2e_monitor.py               # default port 8768  ← collides
+uv run --with selenium python tests/e2e_timeline_scroll.py       # default port 8769  ← collides
+uv run --with selenium python tests/e2e_render_polling.py        # default port 8769  ← collides
+uv run --with selenium python tests/e2e_take_swap.py             # default port 8770
+uv run --with selenium python tests/e2e_timeline_edit.py         # default port 8771
+uv run --with selenium python tests/e2e_song_analysis.py         # default port 8772
+uv run --with selenium python tests/e2e_section_looks.py         # default port 8773
+uv run --with selenium python tests/e2e_seed_and_asset_tabs.py   # default port 8774
+uv run --with selenium python tests/e2e_clips_and_attach.py      # default port 8776
+uv run --with selenium python tests/e2e_clip_overlap_and_split.py # default port 8777
 ```
 
-These four **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
+These twelve **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
 
-Prerequisites: nothing listening on the port, Microsoft Edge plus its WebDriver, and `music_video_producer` importable from this checkout's `src/`. **ComfyUI does not need to be running** and no language-model host is needed. Neither script spends GPU time or reaches `/prompt`.
+**Two pairs share a default port** — 8768 and 8769, marked above. `ManagedServer` refuses a bound port by name rather than reusing it, so the collision costs a failed start and never a run against the wrong server; it does mean those two pairs cannot run at the same time without `--port`. This list was five entries long and said "these five" while there were twelve, which is why the ports were never noticed to overlap.
+
+Prerequisites: nothing listening on the port, Microsoft Edge plus its WebDriver, and `music_video_producer` importable from this checkout's `src/`. **ComfyUI does not need to be running** and no language-model host is needed. None of them spends GPU time or reaches `/prompt`.
 
 Why they start their own server rather than accepting a URL: on 2026-08-17 a health check passed against an hour-old process still bound to the port, and a live check was one step from reporting a working feature broken on the strength of stale code. `tests/e2e_support.py`'s `ManagedServer` refuses a bound port **by name and start time**, verifies the listener is its own descendant (the `uv` trampoline means the real `python run.py` is a grandchild, so teardown is `taskkill /F /T` and then proves the port came free), and proves the responder writes into a data root this run created seconds ago. **A health check that only proves something is listening proves nothing about what.** Exit code 2 means refused before any assertion ran.
 
@@ -273,6 +283,8 @@ Why they start their own server rather than accepting a URL: on 2026-08-17 a hea
 `e2e_take_swap.py` gates switching a shot between its own takes from the shot inspector, on a shot with **two real takes** synthesized locally by ffmpeg into an isolated `MVP_COMFY_ROOT` it owns. It clicks the take **row** — not the chip, which already worked — and reads `latest_output` back from the server, then checks that the Monitor followed, that Enter on the focused row swaps too, that the current row takes neither focus nor a click, and that the swap **still works after the inspector has been torn down and rebuilt** (the recorded stale-element failure mode in that panel). It declares two console errors by name: the Clips library points each take's `<video>` straight at ComfyUI's `/view`, which 404s whenever ComfyUI is down.
 
 `e2e_shot_controls.py` seeds five shots and four assets through shipped routes and drives mark-ready/mark-draft, render-again and the multiview promote control — asserting each is rendered, hit-testable at its centre, correctly labelled, and that a disabled button the browser honours changes nothing server-side. It never clicks promote, and asserts `jobs` is empty at the end. `e2e_song_context.py` drives the lyrics/style editor, its counters, save, the per-field restores, the clearing confirmation through the browser's real dialog, and the VRAM eject toggle — writing `machine-preferences.json` inside its own root, so your stored choice is untouched. It causes exactly one deliberate 422 (the oversized sheet), declared to the console gate by name.
+
+`e2e_song_analysis.py` gates analysing an existing song from the "Snap to" selector — the affordance Epic 8 shipped without, which left `POST /song/analyze` with no caller and every existing project with a song and no measurement. It imports a click track (which measures it), then **empties the analysis record in the manifest and deletes the sidecar**, so the un-analysed state is the real one every pre-Epic-8 project is in rather than a simulated one. It then asserts the Beats row names what is missing and offers the action, the Phrase gaps row names where transcription happens and offers no button that would not help, the reason resolves to an inert token rather than `--red` or `--amber`, a real keyboard press moves a tick without the row losing focus, and pressing the action puts marks on the band and clears the row **with no page reload** — proved by a `window` sentinel, which a navigation would take with it. It drives the re-measurement trap deliberately: the sidecar is deleted with the manifest record left intact, so the song fingerprint does not move and both client-side loaders would short-circuit on it. It finishes on the refusal, moving the media file out from under the manifest to take the route's real 404, and asserts the server's own sentence reaches the Director and nothing changed. Two deliberate 404s are declared to the console gate by name. It queues nothing and never reaches `/prompt`.
 
 **Found by these scripts and since fixed, each on its own merits:**
 

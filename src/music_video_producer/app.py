@@ -12454,8 +12454,16 @@ def create_app(
         `measured` and `analysed` are reported rather than inferred from the lists being empty,
         because `vocal_gaps` distinguishes *unmeasured* from *measured and voiced throughout* and
         this application's standing convention is that the two are never flattened together.
-        Nothing in the browser branches on either; they are here so a reader of the wire can tell
-        which of the two it is looking at.
+
+        **Both are read by the browser and neither is decorative.** They were not, when this route
+        shipped, and this docstring said so — which is exactly how the next change comes to assume
+        it can stop sending one. `snapSelectorPlan` in `api.js` decides each "Snap to" row's words
+        from the flag its kind names in `SNAP_TARGET_EVIDENCE`, and it branches on three values
+        rather than two: `true` reads as it always did, `false` says what is missing and (for the
+        beats) offers `POST /song/analyze`, and a **missing** key says only that nothing has been
+        read yet. So renaming or dropping either field does not degrade the selector, it makes it
+        stop describing the song — and the empty lists are not a substitute, for the reason the
+        paragraph above gives.
 
         A sync `def`, so FastAPI runs it in the threadpool: reaching the beats goes through
         `song_envelope_report`, which hashes the whole master to decide whether the measurement is

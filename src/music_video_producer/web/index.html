@@ -372,7 +372,7 @@
 
               Both the summary line and the rows are placeholders: app.js's syncSnapTargetsControl
               writes the live ones at boot and on every change, from api.js's snapSelectorPlan.
-              --><details class="snap-select" id="snap-targets"><summary class="quiet-button snap-on" id="snap-targets-summary" title="Snap to: playhead · gaps · beats." aria-label="Snap to: playhead · gaps · beats">Snap to: playhead · gaps · beats</summary><span class="snap-kind-list" id="snap-target-kinds" role="group" aria-labelledby="snap-targets-summary"></span></details><!-- Beat markers on the master waveform, beside the magnet that lands a cut on one. A view
+              --><details class="snap-select" id="snap-targets"><summary class="quiet-button snap-on" id="snap-targets-summary" title="Snap to: playhead · gaps · beats." aria-label="Snap to: playhead · gaps · beats">Snap to: playhead · gaps · beats</summary><span class="snap-kind-list" id="snap-target-kinds" role="group" aria-labelledby="snap-targets-summary" aria-live="polite"></span></details><!-- Beat markers on the master waveform, beside the magnet that lands a cut on one. A view
               toggle and nothing more: it changes no Shot, writes nothing to the manifest and lives
               in this browser's session store beside the zoom and the magnet — how a Director likes
               to look at the song is not a property of the video. Its state is `aria-pressed` and

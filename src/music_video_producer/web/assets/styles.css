@@ -383,9 +383,34 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    timeline that is drawn right up to this bar. Rows are `.lock-toggle`, this stylesheet's existing
    checkbox-with-a-label treatment, so the ticks look like every other tick in the application. */
 .snap-kind-list { display: block; position: absolute; z-index: 6; top: calc(100% + 4px); left: 0; min-width: 230px; padding: 8px 10px; background: var(--surface-3); border: 1px solid var(--line-strong); border-radius: 4px; box-shadow: 0 6px 18px rgba(0, 0, 0, .45); text-align: left; }
-.snap-kind-list .lock-toggle { align-items: flex-start; margin: 0 0 8px; }
-.snap-kind-list .lock-toggle:last-child { margin-bottom: 0; }
+.snap-kind-list .lock-toggle { align-items: flex-start; margin: 0; }
 .snap-kind-list .snap-kind-note { display: block; margin-top: 2px; color: var(--dim); font-size: 10px; text-transform: none; letter-spacing: 0; }
+/* One row: the tick and its name, and — when the kind has nothing to offer — the sentence saying
+   why and, where this application holds the route that fixes it, the button that runs it. The
+   wrapper exists because neither of those may live inside the `<label>`: a label is a click target
+   for its own checkbox, so a button in it would fire and move the tick on one press. It carries the
+   spacing the label used to, so a row with no reason is laid out exactly as it was before — which
+   is why the rule above no longer spaces the label itself, and why it no longer needs a
+   `:last-child` arm that a wrapped label can never match.
+
+   **Inert tokens, on purpose.** A song nobody has analysed is the normal state of every project
+   that predates the measurement, not a fault: `--red` is errors and `--amber` is caution, and this
+   is neither. `--muted` puts the reason above the note (`--dim`) and below the row's own name,
+   which is the order they are read in.
+
+   The reason and the button hang off one shared indent rather than two hand-typed copies of it:
+   it is the checkbox's width plus its gap, so a change to `.lock-toggle input` has one place to
+   land instead of silently unpicking the alignment of one of them. */
+.snap-kind-list .snap-kind-row { display: block; margin: 0 0 8px; }
+.snap-kind-list .snap-kind-row:last-child { margin-bottom: 0; }
+.snap-kind-list .snap-kind-row .control-reason, .snap-kind-list .snap-kind-row .quiet-button { margin-left: 19px; }
+.snap-kind-list .snap-kind-row .control-reason { display: block; margin-top: 3px; margin-bottom: 0; font-size: 10px; line-height: 1.45; text-transform: none; letter-spacing: 0; }
+.snap-kind-list .snap-kind-row .quiet-button { margin-top: 6px; min-height: 24px; padding: 0 9px; font-size: 11px; }
+/* Read as unavailable while a measurement runs, without being `disabled` — a browser blurs a
+   focused element the moment it is disabled, so the very press that starts the measurement would
+   cost a keyboard Director their place. The state is announced by `aria-disabled`; this is what it
+   looks like, and the click site is what refuses the second press. */
+.snap-kind-list .snap-kind-row .quiet-button[aria-disabled="true"] { color: var(--dim); border-color: var(--line); cursor: default; }
 /* Undo and Redo. Ordinary icon tools; the disabled state is the stylesheet's own, and everything
    that distinguishes "nothing to undo" from "undo the split" is in the accessible name. */
 #undo-shots, #redo-shots { font-size: 15px; }

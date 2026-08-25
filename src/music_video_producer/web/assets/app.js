@@ -26,7 +26,7 @@ import { GAP_FILL_TOAST, MIN_WINDOW_SECONDS, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, an
 // both in api.js, and neither of them deciding *where a cut belongs*. That decision is
 // `timeline.py`'s, served whole by `GET /timeline/snap-targets`, so a drag and the batch "Snap
 // cuts" button cannot hold two opinions about the same second.
-import { SNAP_SELECT_CONTROL, SNAP_SELECT_HELP, SNAP_SELECT_LIST, SNAP_SELECT_SUMMARY, SNAP_TARGET_ORDER, SNAP_TARGET_TOASTS, dragSnapPlan, edgeSnap, snapKindsFromSession, snapSelectorPlan, snapTargetsIdentity } from "./api.js";
+import { SNAP_ANALYZE_ACTION, SNAP_ANALYZE_DONE, SNAP_ANALYZE_DONE_UNCOUNTED, SNAP_SELECT_CONTROL, SNAP_SELECT_HELP, SNAP_SELECT_LIST, SNAP_SELECT_SUMMARY, SNAP_TARGET_ORDER, SNAP_TARGET_TOASTS, dragSnapPlan, edgeSnap, snapActionControl, snapBeatCount, snapKindsFromSession, snapSelectorPlan, snapTargetsIdentity } from "./api.js";
 // The Clips tab's honest state when ComfyUI is not running, and the Assets panel's named attach
 // target -- two of the four interaction defects cleared on 2026-08-21.
 import { CLIP_RECHECK_LABEL, attachToShotControl, clipCardFace, clipPreviewState } from "./api.js";
@@ -104,6 +104,19 @@ let sectionLooksReport = null;
 // stored" rather than inventing a list, so this initialiser stays the one statement of the
 // default.
 let snapTargetKinds = new Set(SNAP_TARGET_ORDER);
+// **Which projects have a song measurement running**, not whether one does. Module state for
+// `snapInFlight`'s recorded reason exactly, and it is the reason rather than a convenience: the
+// button lives inside markup `syncSnapTargetsControl` rewrites, so a property set by hand is undone
+// by the next rebuild, while a flag the renderer reads cannot be. It is also what the click site
+// checks, so a keyboard press that outruns the repaint cannot start a second measurement.
+//
+// **A set of ids rather than a boolean**, because a boolean says "a measurement is running" and the
+// row says "*this song* is being measured" -- two different claims that a project switch pulls
+// apart. A Director who starts a measurement and moves to another project would otherwise find that
+// project's Beats row drawn dead and reading `Analyzing song…` about a song nobody is measuring.
+// A set rather than one id because both measurements are then true at once, and a single slot would
+// have the first one's `finally` release the second one's claim.
+const snapAnalysisProjects = new Set();
 // Whether the measured beats and onsets are drawn over the master waveform. A view setting and
 // nothing else -- it changes no Shot, writes nothing to the manifest and touches no project state
 // -- so it lives beside `snapTargetKinds` in this browser's session store, with the same default-on
@@ -446,7 +459,21 @@ async function loadReadiness(projectId) {
   }
 }
 
+// **Every repaint of the whole workspace re-says the "Snap to" rows.**
+//
+// Review finding 1 and 2: the sync was attached to `loadSnapTargets` -- to the *loader* -- and the
+// panel's sentences depend on the project and the song as much as on the report. So removing a song
+// left the rows describing the song that had gone, with a live Analyze button that could only be
+// refused; and a project switch whose targets read was refused left the previous project's
+// sentences on screen. Both were demonstrated against the executed harness, and both passed every
+// existing test, because those tests read module state and never the control.
+//
+// Here rather than at each gesture: `renderAll` is what every path that changes which project or
+// which song is current already calls -- the project load and its no-project branch, the song
+// import, the song removal, the analysis below -- and it is deliberately **not** `renderTimeline`,
+// which runs on every `pointermove` of a clip drag and must not rebuild a checkbox list.
 function renderAll() {
+  syncSnapTargetsControl();
   renderSong();
   renderTreatment();
   renderAssets();
@@ -740,6 +767,9 @@ async function loadPersistedWaveform(projectId) {
 // claimed only after a reply has been painted, so the last known measurement stays on screen and
 // the next load tries again rather than the timeline losing its marks to one unreachable moment.
 let songEnvelopeKey = "";
+// `snapTargetsLoadRevision`'s twin, on the same hazard: two envelope reads open at once, and the
+// slower answer painting its band over the faster one's.
+let songEnvelopeLoadRevision = 0;
 
 // Everything this browser remembers about *which* song is current, forgotten: the measurement,
 // the key it was read under, the record of what is currently painted, and the seconds a dragged
@@ -783,6 +813,11 @@ function forgetSongEnvelope() {
 // and is treated as one: the last known targets stay, and the key is left unclaimed so the next
 // load asks again rather than the magnet being lost to one unreachable moment.
 let snapTargetsKey = "";
+// Which targets read is the current one. Two reads can be open at once -- a project load and the
+// poll noticing a generated song land in the same second -- and without this the slower answer
+// repaints over the faster one, putting a stale report under the rows and the drag. `readinessLoadRevision`
+// and `waveformLoadRevision` are the same guard on the same hazard; this feature had none.
+let snapTargetsLoadRevision = 0;
 
 // Exported for the executed frontend contract, `loadSongEnvelope`'s reason exactly: what has to be
 // provable is that a reply reaches the drag -- that a load fills the slot, that an absent half
@@ -790,12 +825,19 @@ let snapTargetsKey = "";
 // to a source read of a function nothing in the suite can call.
 export async function loadSnapTargets(projectId) {
   const key = snapTargetsIdentity(projectId, state.project?.song);
+  // **Synced before the early return, not after it.** The rows say what the *project and its song*
+  // are worth as well as what the report says, and this return is taken whenever neither the song
+  // nor its measurement has moved -- which includes a project switch back to one already read.
+  syncSnapTargetsControl();
   if (key === snapTargetsKey) return;
+  const revision = (snapTargetsLoadRevision += 1);
   if (!state.project?.song?.path) {
     // No audio, so nothing measured either way. Anything still held belongs to a song that is not
     // here any more, and a magnet pulling towards it is the one thing this must not do.
     state.snapTargets = null;
     snapTargetsKey = key;
+    // The rows describe this report, so they are re-said whenever it moves -- absent included.
+    syncSnapTargetsControl();
     return;
   }
   let report = null;
@@ -804,15 +846,35 @@ export async function loadSnapTargets(projectId) {
   } catch {
     // Unreachable or refused: dragging behaves exactly as it does today, the last known targets
     // are kept, nothing is said, and the key is left unclaimed so the next load asks again.
+    //
+    // **Nothing is re-said here, and review finding 2 is why that is now correct.** Keeping the
+    // last known *targets* is right -- one unreachable moment must not cost the Director their
+    // magnet. Keeping the last known *sentences* was not: they described whichever project was on
+    // screen when the last read landed, so a switch into a project whose read is refused left the
+    // panel claiming things about a song that was not open. The fix is above and in `renderAll`,
+    // not here: the rows are re-said at the *top* of this function, before the request is even
+    // made, and nothing this browser knows has changed between there and here. A second call in
+    // this branch reads like the guarantee and is one no test can fail -- which is the same
+    // decoration this whole change exists to take out of the panel.
     return;
   }
-  // The project moved on while the request was open; this answer describes a song nobody is
-  // looking at, and the load that replaced it owns the magnet now.
-  if (state.project?.id !== projectId) return;
+  // The project moved on while the request was open, or a later read overtook this one; either
+  // way this answer describes a measurement nobody is looking at and the read that replaced it
+  // owns the magnet now.
+  if (state.project?.id !== projectId || revision !== snapTargetsLoadRevision) return;
   state.snapTargets = report || null;
   snapTargetsKey = key;
-  // Nothing is repainted. Targets are not drawn: they change where the *next* drag lands and
-  // nothing that is on screen right now, which is why this read has no repaint to get wrong.
+  // **The selector is repainted, and nothing else is.** Targets are still not *drawn* -- they
+  // change where the next drag lands and nothing on the timeline -- but the "Snap to" rows now say
+  // what each kind is currently worth, and that answer is this report. Without this line the rows
+  // would carry whatever they said when the control was last synced, which on a first load is
+  // "nothing has been read" and stays that way until the Director happens to tick something.
+  //
+  // Here rather than at each of the five call sites: every path that re-reads the targets -- a
+  // project load, a song import, a first transcription, the poll noticing a generated song landing,
+  // and the row's own action -- has the same obligation, and one of them forgetting it is exactly
+  // how a feature arrives a reload late.
+  syncSnapTargetsControl();
 }
 
 // Exported for the executed frontend contract, `renderSnapCuts`' and `syncRenderPolling`'s reason
@@ -823,6 +885,7 @@ export async function loadSnapTargets(projectId) {
 export async function loadSongEnvelope(projectId) {
   const key = songEnvelopeIdentity(projectId, state.project?.song);
   if (key === songEnvelopeKey) return;
+  const revision = (songEnvelopeLoadRevision += 1);
   if (!state.project?.song?.path) {
     // No audio to measure. Anything still on screen belongs to a song that is not here any more.
     if (state.songEnvelope) { state.songEnvelope = null; renderTimeline(); }
@@ -837,9 +900,10 @@ export async function loadSongEnvelope(projectId) {
     // left unclaimed so the next load asks again. There is no error state for a reference mark.
     return;
   }
-  // The project moved on while the request was open; this answer describes a song nobody is
-  // looking at, and the load that replaced it owns the band now.
-  if (state.project?.id !== projectId) return;
+  // The project moved on while the request was open, or a later read overtook this one; either
+  // way this answer describes a song nobody is looking at and the read that replaced it owns the
+  // band now.
+  if (state.project?.id !== projectId || revision !== songEnvelopeLoadRevision) return;
   state.songEnvelope = report?.present === true ? report.envelope || null : null;
   // **Outside the `try`, deliberately.** A throw from the paint is not an absent envelope, and
   // catching it in that silent `catch` would abort the whole timeline render without a word. And
@@ -3701,7 +3765,16 @@ function syncSnapTargetsControl() {
   const summary = $(SNAP_SELECT_SUMMARY);
   const list = $(SNAP_SELECT_LIST);
   if (!summary || !list) return;
-  const plan = snapSelectorPlan(snapTargetKinds);
+  // The project, its song, the served report and whether *this* project is being measured: the
+  // four things a row needs to know what it is currently worth, every one of them read here and
+  // decided there. The project is passed as well as the song because "no project is open" and
+  // "this project has no song" are different sentences and a Director sees the first at boot.
+  const plan = snapSelectorPlan(snapTargetKinds, {
+    project: state.project || null,
+    song: state.project?.song || null,
+    targets: state.snapTargets,
+    analysing: Boolean(state.project?.id) && snapAnalysisProjects.has(state.project.id),
+  });
   summary.classList.toggle("snap-on", plan.any);
   summary.textContent = plan.summary;
   summary.title = `${plan.summary}. ${SNAP_SELECT_HELP}`;
@@ -3716,15 +3789,43 @@ function syncSnapTargetsControl() {
   // makes every element reference held by anything else stale. So the markup is a function of
   // *which kinds exist* -- settled at boot and again only if a kind is ever added -- and a press
   // moves a tick.
-  const listed = plan.kinds.map((row) => row.kind).join(",");
-  if (list.dataset.kinds !== listed) {
-    list.dataset.kinds = listed;
+  //
+  // **The key is the markup's own shape, not the list of kinds**, and widening it is the trap this
+  // change had to walk through rather than around. It was the comma-joined kind names, settled at
+  // boot and never moving again -- so a row whose words depend on `measured`/`analysed` would have
+  // been written once, before any report existed, and never repainted for the life of the page.
+  // What is in it now is what the *markup* depends on: which rows carry a reason paragraph and
+  // which carry the action button, because those are elements that have to exist before anything
+  // can be written into them. What is deliberately **not** in it is every value: the reason's
+  // sentence, the button's label and its disabled state all change without a rebuild, applied
+  // imperatively below exactly as the ticks already were.
+  const shape = plan.kinds
+    .map((row) => `${row.kind}:${row.reason ? 1 : 0}:${row.action.shown ? 1 : 0}`).join(",");
+  if (list.dataset.kinds !== shape) {
+    list.dataset.kinds = shape;
+    // The reason is outside the `<label>`, not inside it. A label is a click target for its own
+    // checkbox, so a sentence in it would toggle the tick and a *button* in it would toggle the
+    // tick as well as firing -- one press doing two unrelated things. The row is the wrapper; the
+    // label is still the tick and its name.
+    //
+    // **Spans laid out as blocks, not `<div>`/`<p>`**, because the panel they go into is a `<span
+    // role="group">` and a `<span>` permits phrasing content only -- a `<div>` inside one is
+    // invalid markup that every browser silently repairs differently. `<label>` and `<button>` are
+    // already phrasing; these two are made so, and the stylesheet gives them `display: block`.
     list.innerHTML = plan.kinds.map((row) => `
-    <label class="lock-toggle" title="${escapeHtml(row.help)}">
-      <input type="checkbox" class="snap-kind" id="snap-kind-${escapeHtml(row.kind)}"
-             data-kind="${escapeHtml(row.kind)}"${row.checked ? " checked" : ""}>
-      <span>${escapeHtml(row.label)}<span class="snap-kind-note">${escapeHtml(row.note)}</span></span>
-    </label>`).join("");
+    <span class="snap-kind-row">
+      <label class="lock-toggle" title="${escapeHtml(row.help)}">
+        <input type="checkbox" class="snap-kind" id="snap-kind-${escapeHtml(row.kind)}"
+               data-kind="${escapeHtml(row.kind)}"${row.checked ? " checked" : ""}${
+      row.reason ? ` aria-describedby="snap-reason-${escapeHtml(row.kind)}"` : ""}>
+        <span>${escapeHtml(row.label)}<span class="snap-kind-note">${escapeHtml(row.note)}</span></span>
+      </label>${row.reason ? `
+      <span class="control-reason" id="snap-reason-${escapeHtml(row.kind)}">${escapeHtml(row.reason)}</span>` : ""}${row.action.shown ? `
+      <button type="button" class="quiet-button" id="snap-action-${escapeHtml(row.kind)}"
+              data-snap-action="${escapeHtml(row.action.action)}"
+              aria-disabled="${row.action.disabled ? "true" : "false"}"
+              title="${escapeHtml(row.action.title)}">${escapeHtml(row.action.label)}</button>` : ""}
+    </span>`).join("");
   }
   // The ticks, from the set rather than from what the box happens to hold. A press is applied to
   // the set first and read back here, so a change event this file never saw -- a form reset, an
@@ -3738,7 +3839,137 @@ function syncSnapTargetsControl() {
   for (const row of plan.kinds) {
     const box = $(`#snap-kind-${cssEscape(row.kind)}`, list);
     if (box) box.checked = row.checked;
+    // The row's own sentence, written into the paragraph the rebuild above put there rather than
+    // by rebuilding for it. A reason that changes its words -- "no song" becoming "not analysed"
+    // when a track is imported -- must not cost the Director the checkbox their finger is on.
+    const reason = $(`#snap-reason-${cssEscape(row.kind)}`, list);
+    if (reason) reason.textContent = row.reason;
   }
+  // Each row's action, kept current the same way and **looped rather than fetched once**: a second
+  // entry in `SNAP_TARGET_REMEDY` draws a second button, and a single `$(...)` would keep updating
+  // the first one while the second went dead. Its id comes from `snapActionControl`, so the row it
+  // belongs to is in the id and no two rows can claim one.
+  //
+  // Its label and its state move the moment a measurement starts and again when it answers, and
+  // neither is in the shape key, so neither costs a rebuild -- the button the Director just pressed
+  // is still the same element while it says `Analyzing song…`.
+  //
+  // **`aria-disabled`, never `disabled`.** A browser blurs a focused element the moment it is
+  // disabled and sends the next Tab to the top of the document, so `button.disabled = true` on the
+  // button that was just activated takes the keyboard Director's place away as a *consequence of
+  // their own press*. `aria-disabled` announces the same state, keeps focus, and leaves the refusal
+  // to the click site -- which has held that guard from the start and is the half that decides.
+  for (const row of plan.kinds) {
+    const button = $(snapActionControl(row.kind), list);
+    if (!button || !row.action.shown) continue;
+    button.setAttribute("aria-disabled", row.action.disabled ? "true" : "false");
+    button.textContent = row.action.label;
+    button.title = row.action.title;
+  }
+}
+
+// Measure this project's song, because a row said it had nothing to offer and the Director
+// pressed the button under that sentence.
+//
+// **Shaped on `#analyze-song`**, the closest thing this application already had: capture the id,
+// mark it running, await, check the project has not moved, adopt, repaint, reload, toast, release
+// in a `finally`. What that one does not have to deal with is the two traps below.
+//
+// **Trap one: a content-derived fingerprint makes a forced re-measurement invisible.**
+// `song_fingerprint` is computed from the song's bytes (`effects.py`), so re-measuring the *same
+// file* answers the *same* fingerprint. Both `songEnvelopeIdentity` and `snapTargetsIdentity` are
+// built on it, and both loaders return early when the key they compute matches the one they last
+// claimed -- so the whole point of this route, which is `force=True`, would be a silent no-op
+// through the browser: a Director whose sidecar had been deleted would press this, the server
+// would genuinely re-measure, and the row would go on saying the song had never been analysed.
+// `forgetSongEnvelope` is the existing remedy and it is why it is called here on a path that has
+// not changed songs at all.
+//
+// **Trap two: the order of the two lines above it.** Both loaders compute their key from
+// `state.project?.song`, so the returned Project is adopted *before* they are called. Adopt after,
+// and the key is computed from the song as it was, matches what was stored, and both no-op --
+// which is the same defect as trap one arriving by a different road.
+//
+// **The running window is the whole window, not just the request.** `forgetSongEnvelope` nulls the
+// measurement and the targets, so between the reply landing and the two reads answering there is
+// genuinely nothing to say; holding the flag across both keeps the row reading `Analyzing song…`
+// for that gap instead of flickering back to "this song has not been analysed" a moment after the
+// analysis succeeded.
+//
+// **A refusal changes nothing.** Nothing is adopted, nothing is forgotten and nothing is reloaded
+// unless the request resolved, so the rows come back to exactly what they said -- and what the
+// Director is told is the server's own sentence, which `errorMessage` has already rendered out of
+// the `detail` for all four of this route's refusals.
+async function runSongAnalysis() {
+  if (!requireProject()) return;
+  const projectId = state.project.id;
+  // The half of "it cannot be re-fired" that the drawn state cannot make good on its own: a press
+  // arriving between the claim being made and the repaint landing, one from an assistive technology
+  // activating the button directly, and -- since the button carries `aria-disabled` rather than
+  // `disabled`, so that pressing it does not blur it -- every press while one is running.
+  //
+  // Keyed on *this* project, so a Director who switched projects mid-measurement can start one on
+  // the project they are now looking at rather than being refused by a run they cannot see.
+  if (snapAnalysisProjects.has(projectId)) return;
+  // Whether the Director is standing on the button, taken before the await: on success the row
+  // loses its reason and its button, the shape key moves and the rows are rebuilt, so the element
+  // they were on stops existing. Restoring focus to the row's own checkbox is what the shot
+  // inspector already does after it tears itself down, and it is the difference between a
+  // completed action and being thrown back to the top of the document.
+  const held = document.activeElement?.id || "";
+  const heldRow = SNAP_TARGET_ORDER.find(
+    (kind) => held === snapActionControl(kind).slice(1)
+  ) || "";
+  snapAnalysisProjects.add(projectId);
+  syncSnapTargetsControl();
+  try {
+    const project = await api.analyzeSong(projectId);
+    // The Director moved to another project while this was open; this answer describes a song
+    // nobody is looking at, and adopting it would put one project's measurement on another.
+    if (state.project?.id !== projectId) return;
+    state.project = project;
+    forgetSongEnvelope();
+    renderAll();
+    await Promise.all([loadSongEnvelope(projectId), loadSnapTargets(projectId)]);
+    if (state.project?.id !== projectId) return;
+    // **The count only when there is one.** The read that supplies it can itself be refused, and a
+    // measurement that succeeded followed by "0 beats to snap to" is this application reporting a
+    // number it does not have -- the honest-status convention, applied to the one sentence a
+    // Director would take at face value. The rows say the same thing: with no report read back,
+    // the Beats row states its prerequisite rather than claiming the measurement is on screen.
+    const beats = state.snapTargets?.analysed === true && Array.isArray(state.snapTargets?.beats)
+      ? state.snapTargets.beats.length
+      : null;
+    toast(beats === null
+      ? SNAP_ANALYZE_DONE_UNCOUNTED
+      : SNAP_ANALYZE_DONE.replace("{beats}", snapBeatCount(beats)));
+  } catch (error) {
+    // Guarded like every other branch here: a refusal for the project the Director has left is a
+    // sentence about a song they are no longer looking at, and this route's refusals name one.
+    if (state.project?.id === projectId) toast(error.message, "error");
+  }
+  finally {
+    snapAnalysisProjects.delete(projectId);
+    syncSnapTargetsControl();
+    // After the last repaint, so the element being focused is the one that survived it.
+    if (heldRow && state.project?.id === projectId) restoreSnapRowFocus(heldRow);
+  }
+}
+
+// What each row action name in `SNAP_TARGET_REMEDY` actually runs. One entry per action, read by
+// the delegated click below: the row decides what a press *means* in `api.js`, beside the sentence
+// that explains it, and this decides what it *does*.
+const SNAP_ROW_ACTIONS = { [SNAP_ANALYZE_ACTION]: runSongAnalysis };
+
+// Put the keyboard back on the row whose action has just been carried out and taken away with it.
+// **That row's own checkbox**, not the first one and not the panel: it is the nearest thing that
+// still exists, it is inside the still-open panel, and it announces the row the Director was
+// working on. Landing on the top of the list instead would be a quieter version of the defect this
+// exists to fix -- the Director's place moved by a press they made, without being asked.
+function restoreSnapRowFocus(kind) {
+  const list = $(SNAP_SELECT_LIST);
+  const box = list && $(`#snap-kind-${cssEscape(kind)}`, list);
+  if (box?.focus) box.focus();
 }
 
 // One identifier, escaped for a selector rather than for markup. `CSS.escape` where the browser
@@ -4576,6 +4807,26 @@ function bindEvents() {
     else snapTargetKinds.delete(kind);
     syncSnapTargetsControl();
     persistSession();
+  });
+  // The one action a row can offer, delegated on the same list for the same reason: the rows are
+  // rewritten whenever a kind's state changes, so a listener bound to the button would be bound to
+  // markup that is about to be replaced.
+  //
+  // **Filtered by the data attribute the plan put there, not by the button's id.** What a press
+  // means is the row's decision, made in `api.js` beside the sentence that explains it; a handler
+  // matching an id would be a second place that has to be edited when a second kind ever earns an
+  // action of its own. A press anywhere else in the panel -- a label, the panel's own padding --
+  // falls through this and does nothing, which is what a `change`-only list did before.
+  $(SNAP_SELECT_LIST)?.addEventListener("click", (event) => {
+    // `closest`, not the target itself: the moment a button carries any child element -- a glyph, a
+    // `<span>` a browser or a stylesheet inserts -- the press lands on the child and a handler
+    // reading `event.target.dataset` stops firing, silently and only in a real browser.
+    const named = event?.target?.closest?.("[data-snap-action]")?.dataset?.snapAction;
+    // A map rather than a comparison, so a second row action is one entry here and one in
+    // `SNAP_TARGET_REMEDY` -- which is what this handler's own comment claims and a hard-coded
+    // call to one function did not deliver.
+    const run = named ? SNAP_ROW_ACTIONS[named] : null;
+    if (run) run();
   });
   // **Both ways out of an open panel that every other disclosure in a browser offers**, and
   // neither of which `<details>` gives for free: clicking away from it, and Escape. Without them

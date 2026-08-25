@@ -4734,6 +4734,9 @@ export const SNAP_SELECT_LABEL = "Snap to";
 //: empty space: "Snap to:" with nothing after it reads as a control that failed to draw, and this
 //: is a real and deliberate state -- dragging is entirely freehand and that is a choice.
 export const SNAP_SELECT_NONE = "nothing";
+//: ...and what it puts after a kind that is ticked and has nothing to land on. Short, because
+//: it sits in a toolbar; parenthesised, because it qualifies the kind rather than replacing it.
+export const SNAP_SELECT_EMPTY_KIND = "(none)";
 export const SNAP_SELECT_HELP =
   "Which points a dragged shot edge lands on. Any combination, including none. Snapping is an " +
   "assist and never a rule: an edge put down between targets stays exactly where it was " +
@@ -4758,10 +4761,17 @@ export const SNAP_TARGET_SHORT = { playhead: "playhead", gap: "gaps", beat: "bea
 //: One short line each, drawn under the row's own name. What the kind *is* and where it comes
 //: from -- the thing a Director cannot get from the word "gaps" alone is that these are the same
 //: seconds the batch Snap cuts button chooses, which is the whole argument for the feature.
+//
+//: **The "needs a transcribed song" / "needs an analysed song" clauses were taken out of these
+//: two**, and that is the whole of this change said in one place. They were true of some songs
+//: and said of every song: a Director looking at a fully measured track was told its beats needed
+//: an analysed song, and a Director looking at a track nobody had measured was told exactly the
+//: same thing. A condition stated unconditionally is not a state, it is decoration. What the row
+//: is *actually* missing now comes from `SNAP_TARGET_ABSENT` below, said only when it is missing.
 export const SNAP_TARGET_NOTES = {
   playhead: "Where you parked the play marker.",
-  gap: "The voiceless moments Snap cuts chooses — needs a transcribed song.",
-  beat: "The beats the song analysis measured — needs an analysed song.",
+  gap: "The voiceless moments Snap cuts chooses.",
+  beat: "The beats the song analysis measured.",
 };
 //: ...and the paragraph behind it, on the row's `title`, for a Director who went looking. The
 //: playhead's is the sentence its own button used to carry, so the magnet's explanation moved with
@@ -4771,11 +4781,120 @@ export const SNAP_TARGET_HELP = {
   gap: "The seconds `timeline.py` picks inside each voiceless stretch — far enough inside that " +
     "neither shot's edge sits on a syllable. Exactly what the batch Snap cuts button lands a cut " +
     "on, computed once on the server so a drag and that button can never disagree. A song that " +
-    "has not been transcribed has none, and nothing here says so: the other kinds keep working.",
+    "has not been transcribed has none, and this row says so: the other kinds keep working.",
   beat: "Every beat the song analysis measured, not the thinned set drawn on the waveform — you " +
     "can land on a beat whose mark is hidden. A song that has not been analysed has none, and " +
-    "nothing here says so: the other kinds keep working.",
+    "this row says so and offers the measurement: the other kinds keep working meanwhile.",
 };
+
+// ---- C3a. a row that cannot pull, and the one it can do something about ---------------------
+//
+// **Epic 8's headline finding, in one sentence:** the server computes twelve absence reasons and
+// serves `measured`/`analysed` on every targets read, and none of it reached the Director
+// anywhere. An un-analysed song and a machine with no ffmpeg looked identical on screen, and all
+// five real projects had a song and no analysis, because the route that measures one had no
+// caller in the interface at all.
+//
+// **Why here and not on the beat marker band.** Story 8.2 ruled that absence is *silence* for the
+// markers, and that ruling stands. The distinction it drew is the one this relies on: a named
+// refusal belongs where a consumer genuinely *needs* the envelope, not where one merely draws it.
+// A Director opening this selector is asking what a drag will do, and a row that cannot pull is
+// answering that question rather than raising an alarm.
+//
+// **Absence is not an error.** A song nobody has analysed is the normal state of every project
+// that predates the measurement. `--red` is errors and `--amber` is caution; a missing
+// measurement is neither, so the words are plain and the tokens are inert. Nothing here disables
+// a tick either: a Director may switch beats on *before* measuring, and the row still says what
+// it is currently worth.
+
+//: Which served flag each kind's targets come from. A kind that is absent from this table needs
+//: no measurement at all and can never be unavailable -- the playhead is one, which is why the
+//: matrix says it is unaffected by every combination below.
+//:
+//: The flags are read rather than the lists' lengths, because `drag_snap_targets` deliberately
+//: distinguishes *unmeasured* from *measured and voiced throughout*: a song with no silent moment
+//: anywhere has no gap targets and has still been transcribed, and telling the Director to
+//: transcribe it would be a lie about a song they already transcribed.
+export const SNAP_TARGET_EVIDENCE = { gap: "measured", beat: "analysed" };
+
+//: What one row's evidence amounts to. **Three values, because two would flatten the middle one:**
+//: a kind that can pull, a kind that is *known* to have nothing, and a kind this browser has not
+//: been told about. Only the middle one is a claim about the song, and only the middle one earns
+//: an action.
+export const SNAP_ROW_READY = "ready";
+export const SNAP_ROW_ABSENT = "absent";
+export const SNAP_ROW_UNKNOWN = "unknown";
+
+//: What a row says when its kind has nothing to offer. Named thing, named reason, and -- where
+//: the fix lives somewhere else in this application -- where it lives, because a Director told
+//: "there are no phrase gaps" and nothing else has been given a dead end rather than an answer.
+export const SNAP_TARGET_ABSENT = {
+  gap: "This song has not been transcribed, so there are no phrase gaps to land on. " +
+    "Analyze structure, on the Song page, is what measures them.",
+  beat: "This song has not been analysed, so there are no beats to land on.",
+};
+//: ...and what a row says when **nothing has been read yet**, which is not the same thing and must
+//: not be spelled like it. A targets read that has not landed, or one that was refused, is not
+//: evidence of absence -- but silence in its place is how this change would trade one falsehood
+//: for another, because the row would then state no prerequisite at all. So the prerequisite the
+//: old `SNAP_TARGET_NOTES` stated unconditionally is stated here **conditionally**: only while
+//: this browser genuinely does not know.
+export const SNAP_TARGET_NEEDS = {
+  gap: "Needs a transcribed song; this one has not been read yet.",
+  beat: "Needs an analysed song; this one has not been read yet.",
+};
+//: The three ways a project can have nothing to measure, told apart rather than flattened. The
+//: server tells the last two apart in `SONG_ANALYSIS_WITHOUT_SONG`'s own comment -- "no song at
+//: all" and "a generated Song whose render has not landed" -- and a browser that called an
+//: unrendered song "no song" would be telling the Director to import a track they have already
+//: asked for.
+export const SNAP_TARGET_NO_PROJECT =
+  "No project is open, so there is nothing to measure.";
+export const SNAP_TARGET_UNSONGED =
+  "This project has no song, so there is nothing to measure yet.";
+export const SNAP_TARGET_UNRENDERED =
+  "This song has not been rendered yet, so there is no audio to measure.";
+
+//: Which kinds this application can produce itself, and the action name the click site matches.
+//: **Beats only, deliberately.** Phrase gaps come from transcription, which is its own act on its
+//: own page with its own cost; offering a button here that would not help is worse than naming
+//: where the fix actually is. A kind absent from this table simply carries no action.
+export const SNAP_ANALYZE_ACTION = "analyze-song";
+export const SNAP_TARGET_REMEDY = { beat: SNAP_ANALYZE_ACTION };
+//: A row's action button, by kind. **Per row rather than one fixed id**, because a second entry in
+//: `SNAP_TARGET_REMEDY` would otherwise draw two buttons carrying the same id and leave the second
+//: unreachable to every `querySelector` in `app.js` -- a defect that arrives with a one-line table
+//: edit and shows up nowhere near it.
+export const snapActionControl = (kind) => `#snap-action-${kind}`;
+//: **The naming, settled rather than left to collide.** The Song page's `#analyze-song` reads
+//: *Analyze structure* and runs a **transcription**; this one reads *Analyze song* and runs a
+//: **measurement**. They are different acts on different pages with different costs, and the two
+//: ids were one character apart. `#snap-action-<kind>` is named for the row it belongs to instead,
+//: so neither id can be mistaken for the other -- and the words stay in one vocabulary throughout:
+//: the row says *analysed*, the button says *Analyze song*, the toast says *Song analysed*.
+export const SNAP_ANALYZE_LABEL = "Analyze song";
+//: The house's own running copy, from the UX spine: `Analyzing song…`. Elapsed nothing, percentage
+//: nothing -- a measurement whose progress this application cannot see does not get a bar.
+export const SNAP_ANALYZE_RUNNING = "Analyzing song…";
+export const SNAP_ANALYZE_HELP =
+  "Measure this song now: levels, onsets, beats and an estimated tempo. It reads the audio and " +
+  "writes the measurement beside the project; no shot, cut or take is touched, and nothing is " +
+  "rendered. It takes a moment on a full-length track.";
+export const SNAP_ANALYZE_RUNNING_HELP =
+  "The measurement is running. One at a time — this cannot be started again until it answers.";
+//: What lands when it does. A count rather than a reassurance, because the count is the thing the
+//: Director can check against the marks that just appeared on the waveform -- and **only when
+//: there is one**: the read that would supply it can itself be refused, and "0 beats to snap to"
+//: after a measurement that succeeded is this application inventing a number it does not have.
+export const SNAP_ANALYZE_DONE = "Song analysed: {beats} to snap to.";
+export const SNAP_ANALYZE_DONE_UNCOUNTED =
+  "Song analysed. The measurement has not been read back yet, so the beats are not on screen.";
+//: `1 beat`, not `1 beats`. The count is the whole content of the sentence, so getting its grammar
+//: wrong is the one part of it a Director is guaranteed to notice.
+export function snapBeatCount(beats) {
+  const count = Number.isFinite(beats) ? Math.max(0, Math.trunc(beats)) : 0;
+  return `${count} ${count === 1 ? "beat" : "beats"}`;
+}
 
 // The control's whole state, decided here so `app.js` writes markup and nothing else: which rows
 // to draw, which are ticked, and the one line the summary says.
@@ -4783,17 +4902,131 @@ export const SNAP_TARGET_HELP = {
 // `active` is normalised on the way through -- a kind this build does not have is dropped rather
 // than drawn, which is what makes a stored selection from an older or newer browser session
 // harmless. See `storedSnapKinds`, which is the other half of that.
-export function snapSelectorPlan(activeKinds = null) {
+//
+// **`served` is the second argument and it decides three things per row**: whether the kind has
+// anything to offer, the sentence it says when it does not, and whether this application holds
+// the route that fixes it. It is the whole served targets body -- `measured` and `analysed` come
+// straight off the wire, from `read_timeline_snap_targets` -- plus the Song, plus whether a
+// measurement is running right now.
+//
+// **Four states per measured kind, and the third is the one a careless read loses.**
+//
+// * **no song** -- there is nothing to measure and no button that could change that.
+// * **a song, and no targets read yet** -- *say nothing*. A read that has not landed, or one that
+//   was refused, is not evidence of absence, and a row that claimed "not analysed" for the
+//   duration of a request would be a false sentence that flickers. Silence is what the loaders do
+//   with a refused read everywhere else in this feature.
+// * **read, and the flag is false** -- the row cannot pull, and it says why.
+// * **read, and the flag is true** -- the row reads exactly as it did before this existed.
+//
+// The action is offered only on the third of those, and only for a kind in `SNAP_TARGET_REMEDY`:
+// a button on a row that is already working is a re-measurement nobody asked for.
+export function snapSelectorPlan(activeKinds = null, served = null) {
   const enabled = snapKindSet(activeKinds);
-  const kinds = SNAP_TARGET_ORDER.map((kind) => ({
-    kind,
-    label: SNAP_TARGET_LABELS[kind] || kind,
-    note: SNAP_TARGET_NOTES[kind] || "",
-    help: SNAP_TARGET_HELP[kind] || "",
-    checked: enabled.has(kind),
-  }));
+  const targets = served?.targets || null;
+  const project = Boolean(served?.project);
+  const song = served?.song || null;
+  const running = Boolean(served?.analysing);
+  // Whether one kind has anything to offer, the sentence when it has not, and whether this is
+  // something the *browser* knows or merely has not been told. Nothing here names a kind: a
+  // fourth kind that needs a measurement is one entry in `SNAP_TARGET_EVIDENCE` and one in each
+  // of the two sentence tables, which is the bargain the rest of this control already makes.
+  //
+  // **Three states, not two, and `unknown` is the one a careless read loses.** `absent` is a
+  // claim -- "there is nothing here" -- and this browser is only entitled to make it from
+  // evidence. A read that has not landed, one that was refused, and a served body from an older
+  // build that does not carry the flag at all are none of them evidence: `undefined` is not
+  // `false`, and a row answering "has not been analysed" for a flag the server never sent would be
+  // asserting something nobody said. Unknown rows stay available, state their prerequisite, and
+  // offer no action.
+  //
+  // **One value rather than a pair of booleans**, because `known && !available` and `!available`
+  // were the same predicate -- there is no state where a row is unavailable and unknown -- so the
+  // offer below was written with a term nothing could ever make false, and a mutation of it went
+  // unnoticed by every test. `available` and `known` are still on the row for its readers; the
+  // decision is made once, here, on the state itself.
+  const evidence = (kind) => {
+    const flag = SNAP_TARGET_EVIDENCE[kind];
+    const absent = (reason) => ({ state: SNAP_ROW_ABSENT, reason });
+    if (!flag) return { state: SNAP_ROW_READY, reason: "" };
+    if (!project) return absent(SNAP_TARGET_NO_PROJECT);
+    if (!song) return absent(SNAP_TARGET_UNSONGED);
+    // A generated Song whose render has not landed: asked for, named, and with no audio on disk
+    // yet. Not the same state as no song, and the Director's next move differs for each.
+    if (!song.path) return absent(SNAP_TARGET_UNRENDERED);
+    const flagged = targets ? targets[flag] : undefined;
+    if (flagged === undefined || flagged === null) {
+      return { state: SNAP_ROW_UNKNOWN, reason: SNAP_TARGET_NEEDS[kind] || "" };
+    }
+    if (flagged) return { state: SNAP_ROW_READY, reason: "" };
+    return absent(SNAP_TARGET_ABSENT[kind] || "");
+  };
+  // The house control record, one key short: `reason` is missing on purpose. In every existing
+  // case -- `markReadyControl`, `approvalControl` -- a control's reason explains why the *button*
+  // is dead. This button is alive; it is the *row* that cannot pull, so the reason is the row's,
+  // and a copy on the button would be two owners of one sentence.
+  //
+  // Offered only on a row that is **known** to have nothing to offer -- `SNAP_ROW_ABSENT` and
+  // neither of the other two: a button on a row that works is a re-measurement nobody asked for,
+  // and a button on a row this browser has not been told about is a guess. The song's own path
+  // gates it too -- a measurement needs audio, and the three absences that are not about the
+  // measurement are exactly the ones with none.
+  const remedy = (kind, verdict) => {
+    const action = SNAP_TARGET_REMEDY[kind];
+    const offer = action && verdict.state === SNAP_ROW_ABSENT && Boolean(song?.path);
+    if (!offer) {
+      return { shown: false, disabled: true, action: "", label: SNAP_ANALYZE_LABEL, title: "" };
+    }
+    return {
+      shown: true,
+      // **Read as unavailable while one runs, never `disabled` in the DOM.** A browser blurs a
+      // focused element the moment it is disabled and sends the next Tab to the top of the
+      // document -- so the very press that starts the measurement would cost a keyboard Director
+      // their place. `app.js` applies this as `aria-disabled`, which announces the same state and
+      // keeps focus, and the click site carries the guard that actually refuses the second press.
+      disabled: running,
+      action,
+      label: running ? SNAP_ANALYZE_RUNNING : SNAP_ANALYZE_LABEL,
+      title: running ? SNAP_ANALYZE_RUNNING_HELP : SNAP_ANALYZE_HELP,
+    };
+  };
+  const kinds = SNAP_TARGET_ORDER.map((kind) => {
+    const verdict = evidence(kind);
+    return {
+      kind,
+      label: SNAP_TARGET_LABELS[kind] || kind,
+      note: SNAP_TARGET_NOTES[kind] || "",
+      help: SNAP_TARGET_HELP[kind] || "",
+      checked: enabled.has(kind),
+      // Availability never touches `checked`. A kind switched on while its measurement is missing
+      // stays switched on: the tick is what the Director wants a drag to land on, and the row
+      // below it is what that is currently worth.
+      // Both derived from the one verdict, so a reader can ask either question and neither can
+      // disagree with what the row was actually drawn from.
+      available: verdict.state !== SNAP_ROW_ABSENT,
+      known: verdict.state !== SNAP_ROW_UNKNOWN,
+      state: verdict.state,
+      reason: verdict.reason,
+      action: remedy(kind, verdict),
+    };
+  });
   const active = kinds.filter((row) => row.checked).map((row) => row.kind);
-  const named = active.map((kind) => SNAP_TARGET_SHORT[kind] || kind).join(" · ");
+  // **The summary marks what cannot pull, and this change is not finished without it.** The whole
+  // argument against the old `SNAP_TARGET_NOTES` was that a condition stated unconditionally is
+  // decoration -- and a collapsed selector reading `Snap to: playhead · gaps · beats` over
+  // a song nobody has measured makes exactly that claim, to the Director who never opens the panel.
+  //
+  // The ticked kind is still named rather than dropped. It is the Director's own selection and the
+  // control has one line to report it; taking a kind out of that line would silently reverse a
+  // choice they made and can still see ticked in the panel. `(none)` after it says what the drag
+  // will actually do, which is what the summary is for.
+  const named = kinds
+    .filter((row) => row.checked)
+    .map((row) => {
+      const short = SNAP_TARGET_SHORT[row.kind] || row.kind;
+      return row.available ? short : `${short} ${SNAP_SELECT_EMPTY_KIND}`;
+    })
+    .join(" · ");
   return {
     kinds,
     active,
@@ -5816,6 +6049,19 @@ export const api = {
   // once on the load path when a song is on screen; it hashes the song file to decide validity,
   // which is precisely why nothing may put it behind a timer.
   songEnvelope: (id) => request(`/api/projects/${id}/song/envelope`),
+  // Measure the song again, now, because the Director asked. `force=True` on the server, so it
+  // re-measures rather than skipping an analysis it considers current -- the whole difference
+  // between this and the measurement that rides a song import. It answers the **Project**, not
+  // the envelope: the envelope is read back through its own endpoint above, which is what keeps
+  // a multi-megabyte measurement off every route that returns a Project.
+  //
+  // Four refusals a caller must be ready for, all of them the server's own sentence: **422** with
+  // no song or no audio yet, **404** for an unknown project or a song file that is gone, and
+  // **502** carrying a named analysis reason -- no ffmpeg on this machine is the one that made
+  // this route worth wiring, because it was previously indistinguishable on screen from a song
+  // nobody had got round to measuring. `errorMessage` renders every one of them into the thrown
+  // Error, so the click site shows what the server said rather than a status code.
+  analyzeSong: (id) => request(`/api/projects/${id}/song/analyze`, { method: "POST" }),
   // Every second a dragged shot edge may land on: the voiceless-gap targets `timeline.py` itself
   // chooses -- the same seconds the batch "Snap cuts" button lands a cut on -- and the beats the
   // song analysis measured. Computed server-side so the drag and the button can never hold two
