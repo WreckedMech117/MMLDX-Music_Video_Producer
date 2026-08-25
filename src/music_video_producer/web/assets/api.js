@@ -5912,9 +5912,11 @@ export const BEAT_MARKERS_LABEL = "Beat markers";
 export const BEAT_MARKERS_HELP =
   "Draws the beats and onsets the song analysis measured over the master waveform. Beats are " +
   "snap targets; onsets are reference marks, showing where the transients are without being " +
-  "somewhere a cut can land. Display only — showing or hiding them changes nothing about any " +
-  "shot and writes nothing to the project. A song that has not been analysed, or one replaced " +
-  "since it was, simply draws nothing.";
+  "somewhere a cut can land. Below about 15 px/s the marks thin out so the band stays a " +
+  "texture rather than a wall — what is drawn is a legible sample, and a drag can still land " +
+  "on a beat whose mark is hidden. Display only — showing or hiding them changes nothing " +
+  "about any shot and writes nothing to the project. A song that has not been analysed, or " +
+  "one replaced since it was, simply draws nothing.";
 
 // The two kinds, and the class each is drawn with. **The class is decided here**, not in the
 // template, because it is the other half of the placement decision: a beat is a taller, heavier
@@ -5928,13 +5930,19 @@ export const BEAT_MARKER_CLASSES = { beat: "beat-mark", onset: "onset-mark" };
 // How close two marks of the same kind may come before the further one is dropped, and how close
 // an onset may come to a *kept beat* before the onset is dropped.
 //
-// **Measured, on a real 3-minute track analysed by this application on 2026-08-24:** 440 beats and
-// 332 onsets, 772 marks in all. That is 2.44 beats and 1.84 onsets a second -- an average onset
-// every 0.54 s, nowhere near the 0.07 s floor the picker enforces, so the picker's floor is the
-// wrong number to design against. What those densities become on screen:
+// **Measured on this project's own masters, 2026-08-24.** An earlier revision of this comment used
+// a synthesised track and reported 2.44 beats and 1.84 onsets a second. Both real songs invert that
+// ratio: beats run 2.02-2.14 a second and onsets 2.88-4.05, so **onsets outnumber beats** and are
+// thinned harder for it -- on a 202 s master, 279 of 819 onsets survive at the default zoom against
+// all 433 beats. That is the design working, not failing: the numbers below are what the same-kind
+// gap is for. (The 0.07 s onset-picker floor is a floor, not a typical spacing, and remains the
+// wrong number to design against -- the average onset is 0.25-0.35 s from its neighbour.)
 //
-//   * 40 px/s -- a beat every 16.4 px, an onset every 21.7 px: comfortable, nothing is dropped.
-//   * 16 px/s (the default) -- 6.5 px and 8.7 px: dense but legible, and both kinds survive.
+// What those densities become on screen:
+//
+//   * 40 px/s -- beats ~19 px apart, onsets ~11 px: comfortable, little is dropped.
+//   * 16 px/s (the default) -- beats ~7.5 px, onsets ~4 px: every beat survives and onsets thin to
+//     roughly a third, which is what keeps the band a texture rather than a smear.
 //   *  6 px/s (the floor)   -- 2.5 px between beats. Against a 2 px mark that is ~80% ink, which
 //      is a solid bar and not a reference mark, however short it is drawn.
 //
