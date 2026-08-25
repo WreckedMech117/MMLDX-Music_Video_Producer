@@ -4,7 +4,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
@@ -590,6 +590,35 @@ class AssetCitation(BaseModel):
     order: int = 0
 
 
+class EffectSpec(BaseModel):
+    """One entry of a Shot's Effect Stack: which effect, whether it is on, and its parameters.
+
+    **The same shape `effects.validate_stack` already accepts**, deliberately, so a stack entry
+    has one definition rather than two. `model_dump()` on this produces exactly the mapping that
+    validator reads, which is what lets the manifest, the wire and the chain builder all speak the
+    same three keys — `effects.EFFECT_SPEC_KEYS` names them, and its refusal prints them to a
+    client that misspelled one.
+
+    **Nothing here validates the effect or its parameters, and that is the design.** `effect` is a
+    free string and `parameters` an open mapping *on the model*, because the catalogue — which
+    effects exist, which parameters each declares, and every bound — lives in `effects.py` and is
+    the only thing entitled to decide (AD-27). The route runs `validate_stack` over the request's
+    own JSON **before** anything is bound or stored, so an unknown id, an out-of-range number or a
+    misspelled key is refused by a sentence written for a Director rather than by pydantic's. A
+    `Literal` of effect ids here would answer the same questions in a second place, in worse
+    words, and would make every manifest holding an effect this build no longer ships unloadable.
+
+    Which means a stack read back off disk is *not* proven valid by having loaded — a hand-edited
+    manifest can hold anything this model's three types accept. That is the point of AD-21: there
+    is no stored validity flag, and `build_effect_stages` re-derives the verdict at the moment it
+    composes, refusing by name with nothing half-built behind it.
+    """
+
+    effect: str
+    enabled: bool = True
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
 class Shot(BaseModel):
     """One window of the song, and what it is meant to be built from.
 
@@ -715,6 +744,22 @@ class Shot(BaseModel):
     # draining, and nothing infers it.
     flagged: bool = False
     locked: bool = False
+    # The Effect Stack (FX-5): the look this Shot carries into the export, as an ordered list of
+    # named effects. Empty — the default, and what every manifest written before this field
+    # existed loads as — means no effect at all, and `assembly.trim_args` then builds the argv it
+    # has always built, stage for stage.
+    #
+    # **Storage order is not load-bearing** (AD-31). `effects.build_effect_stages` sorts by family
+    # as it reads — geometry, texture, grade, stylize — keeping the Director's order *within* a
+    # family, so a stack copied between shots, hand-edited in the manifest or written by an older
+    # client composes to the chain the panel showed rather than to something undefined.
+    #
+    # A disabled entry is kept rather than dropped: switching a card off is not deleting it, and
+    # the parameters a Director dialled in have to survive being turned off and on again. It is
+    # validated exactly as an enabled one is (see `effects.validate_stack`) so a bad value cannot
+    # sit in the manifest waiting for the moment somebody re-enables it, and it contributes no
+    # stage to the chain.
+    effects: list[EffectSpec] = Field(default_factory=list)
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -789,6 +834,14 @@ SHOT_PLAN_CONTENT_FIELDS = frozenset(
         "singing",
         "use_song_audio",
         "seed",
+        # `Shot.effects`: the look, and plan content on the same grounds `prompt` and `seed` are.
+        # It describes what a *future* render of this window should be, names no file and claims
+        # nothing about a take — so a Duplicate that dropped it would silently hand back an
+        # ungraded shot, and the Director would have to re-dial a stack they had already built to
+        # continue the sequence they duplicated it to continue. Split is the sharper case: the two
+        # halves of one shot are one shot's look, and a half that lost it would grade differently
+        # from its own other half.
+        "effects",
     }
 )
 

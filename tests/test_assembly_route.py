@@ -35,7 +35,7 @@ from music_video_producer.assembly import (
 from music_video_producer.batch import render_timing_summary
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.models import Project, RenderJob
+from music_video_producer.models import EffectSpec, Project, RenderJob
 from music_video_producer.store import ProjectStore
 
 
@@ -1241,3 +1241,268 @@ def test_healing_an_orphaned_export_at_boot_stamps_the_record_it_settles(tmp_pat
     assert healed.created_at == orphan.created_at, "a settle must not move the enqueue time"
     assert healed.render_seconds_source == "record"
     assert "not render time" in render_timing_summary(healed)
+
+
+# ------------------------------------------------------------------------------------------
+# Slice C1 — the Effect Stack reaching the export.
+#
+# **Asserted as argv, never as pixels** (R-20). Eight renders of one identical grained chain
+# through this project's own `libx264 -preset veryfast` produced two distinct pictures on
+# 2026-08-25, while the filter graph's own frames were bit-identical across ten runs either way:
+# multi-threaded libx264 is not bit-exact on high-entropy input, and grain is what makes an
+# export entropic enough to show it. So "an empty stack exports byte-identically to today" is a
+# claim about the command, and it is checked as one.
+# ------------------------------------------------------------------------------------------
+
+
+def recorded_trims(client, monkeypatch, project_id: str) -> tuple[list[list[str]], object]:
+    """Run the export with `trim_args` recorded, and hand back one argv per clip.
+
+    The real builder still runs and its real output is still what ffmpeg gets — this wraps it
+    rather than replacing it, so the argv asserted below is the argv the export was actually
+    driven with and not a reconstruction of it.
+    """
+    import music_video_producer.app as app_module
+
+    commands: list[list[str]] = []
+    real_trim = app_module.trim_args
+
+    def record_trim(*args, **kwargs):
+        built = real_trim(*args, **kwargs)
+        commands.append(built)
+        return built
+
+    monkeypatch.setattr(app_module, "trim_args", record_trim)
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    return commands, response
+
+
+def write_stack(client, project_id: str, shot_id: str, stack: list[dict]):
+    response = client.put(
+        f"/api/projects/{project_id}/shots/{shot_id}/effects", json={"effects": stack}
+    )
+    assert response.status_code == 200, response.text
+    return response
+
+
+def test_a_shot_with_no_effects_exports_the_argv_this_route_has_always_built(
+    tmp_path: Path, monkeypatch
+):
+    """The Ask-First boundary of this whole slice, asserted at the route's own call site.
+
+    `tests/test_assembly.py` pins the *builder*'s answer against a written-out constant; this
+    pins what the export hands it. The two together are the claim: an unstyled project's
+    command is argument-for-argument the one it produced before an Effect Stack existed, and
+    the empty groups the route now passes are the empty groups `trim_args` already defaulted to.
+
+    Written out by hand rather than derived, because a filter chain compared against one the
+    code composed would agree with a chain that had grown a stage nobody asked for.
+    """
+    from music_video_producer.assembly import trim_args
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    assert all(shot.effects == [] for shot in store.get(project_id).shots)
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    assert len(commands) == 2
+
+    # The normalization target is the larger of the two takes; the windows are 4 s at 24 fps.
+    expected_chain = (
+        "scale=192:108:force_original_aspect_ratio=decrease,"
+        "pad=192:108:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    )
+    for command in commands:
+        assert command[command.index("-vf") + 1] == expected_chain
+        assert command[command.index("-frames:v") + 1] == "96"
+        # And the whole argv is what the builder produces when nothing is passed for either
+        # group at all — the identity this slice was told not to move.
+        source = Path(command[command.index("-i") + 1])
+        dest = Path(command[-1])
+        assert command == trim_args(source, dest, frames=96, width=192, height=108)
+
+    assert comfy.prompts == []
+
+
+def test_a_shots_effect_stack_reaches_the_export_at_the_two_insertion_points(
+    tmp_path: Path, monkeypatch
+):
+    """AD-17's two splice points, seen from the route: geometry before `scale`, treatment
+    before `pad`.
+
+    The stack is written **out of order** on purpose — the texture card first, the geometry
+    card second — because storage order is not load-bearing (AD-31) and the chain has to come
+    out in the fixed family order regardless. And the second shot carries nothing, so the same
+    export proves the two cases side by side: one clip graded, its neighbour byte-identical to
+    what it was before this slice.
+
+    Ordering matters here for a reason that is invisible in a still: geometry ahead of `scale`
+    is what makes a punch-in sample the take's own pixels instead of resampling an
+    already-scaled frame, and every treatment ahead of `pad` is what keeps the letterbox bars
+    at pure black (measured 2026-08-21: after `pad` the bar samples RGB (1,1,5)).
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    write_stack(
+        client,
+        project_id,
+        "shot_a",
+        [
+            {"effect": "grain", "parameters": {"strength": 8, "seed": 7}},
+            {"effect": "punch_in", "parameters": {"zoom": 1.2}},
+        ],
+    )
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    assert len(commands) == 2
+
+    assert commands[0][commands[0].index("-vf") + 1] == (
+        "crop=w=iw/1.2:h=ih/1.2:x=(iw-ow)/2:y=(ih-oh)/2,"
+        "scale=192:108:force_original_aspect_ratio=decrease,"
+        "noise=alls=8:allf=t+u:all_seed=7,"
+        "pad=192:108:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    )
+    assert commands[1][commands[1].index("-vf") + 1] == (
+        "scale=192:108:force_original_aspect_ratio=decrease,"
+        "pad=192:108:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    )
+    # Nothing else about the command moved. The chain and the two file paths are the only
+    # things that legitimately differ between two clips of one export; with those three taken
+    # out, the graded clip's command is the unstyled clip's, argument for argument.
+
+    def shape(command: list[str]) -> list[str]:
+        chain = command.index("-vf")
+        stripped = command[:chain] + command[chain + 2 :]
+        stripped[stripped.index("-i") + 1] = "<source>"
+        stripped[-1] = "<dest>"
+        return stripped
+
+    assert shape(commands[0]) == shape(commands[1])
+
+    # The export really ran and really carries both clips.
+    assert Path(response.json()["export"]).name.startswith("assembly_")
+    assert comfy.prompts == []
+
+
+def test_a_disabled_effect_is_kept_in_the_manifest_and_composes_no_stage(
+    tmp_path: Path, monkeypatch
+):
+    """The matrix's own row, and the reason a stack stores a flag rather than a deletion.
+
+    A Director switching a card off is not throwing it away — the numbers they dialled in have
+    to be there when they switch it back on — so the entry stays in the manifest and simply
+    contributes nothing to the chain. Both halves are asserted, because either alone reads as
+    an accident: the argv is the unstyled one, and the stack is still on the Shot afterwards.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    write_stack(
+        client,
+        project_id,
+        "shot_a",
+        [
+            {"effect": "grain", "enabled": False, "parameters": {"strength": 8, "seed": 7}},
+            {"effect": "punch_in", "enabled": False, "parameters": {"zoom": 1.2}},
+        ],
+    )
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    unstyled = (
+        "scale=192:108:force_original_aspect_ratio=decrease,"
+        "pad=192:108:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    )
+    assert [command[command.index("-vf") + 1] for command in commands] == [unstyled, unstyled]
+
+    kept = ProjectStore(tmp_path).get(project_id).shots[0]
+    assert [(spec.effect, spec.enabled, spec.parameters) for spec in kept.effects] == [
+        ("grain", False, {"strength": 8, "seed": 7}),
+        ("punch_in", False, {"zoom": 1.2}),
+    ]
+    assert comfy.prompts == []
+
+
+def test_an_export_refuses_a_stack_it_cannot_compose_and_names_the_shot(
+    tmp_path: Path, monkeypatch
+):
+    """Validity is re-derived at the moment of composing, never remembered from the write.
+
+    Two ways a stack that was agreed at write time stops being composable, and each takes a
+    different path through the route:
+
+    * a value that is out of the catalogue's bounds — which a hand-edited manifest can hold,
+      since nothing re-validates on load — joins `assembly_refusals`' comprehensive report, so
+      a Director is told about it in the same answer as everything else wrong with the plan;
+    * a look whose `.cube` has left the folder since it was chosen, which only the composer can
+      see. Refused before the job record is written, rather than left to fail inside ffmpeg
+      with a message naming `clut` and mentioning neither the path nor the problem.
+
+    Both name the Shot, because `EffectRefusal` is a pure function of a stack and has no idea
+    which clip carries it — and both carry the chain's own sentence whole beside that name.
+
+    **AD-21 in one test:** nothing stored says "this stack is valid". The write said so at the
+    time and the export asks again.
+    """
+    from music_video_producer.effects import EFFECT_LUT_FILE_MISSING_REFUSAL, lut_directory
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    # 1. Two manifests edited past the bounds the route enforces — and a third thing wrong
+    #    with the plan that has nothing to do with effects.
+    #
+    #    All three come back in **one** answer, which is what makes the check belong beside
+    #    `assembly_refusals` rather than only inside the composer. The unapproved shot is what
+    #    proves it: the plan is never laid out at all when a refusal stands, so a stack judged
+    #    only at composition would stay silent here and the Director would fix the approval,
+    #    run again, and *then* be told about the first of the two stacks. Being sent back three
+    #    times for three faults is the failure `assembly_refusals` exists against.
+    project = store.get(project_id)
+    project.shots[0].effects = [EffectSpec(effect="punch_in", parameters={"zoom": 9.0})]
+    project.shots[1].effects = [EffectSpec(effect="nope")]
+    store.save(project)
+    assert client.post(
+        f"/api/projects/{project_id}/shots/shot_a/unapprove"
+    ).status_code == 200
+
+    refused = client.post(f"/api/projects/{project_id}/assemble")
+    assert refused.status_code == 422, refused.text
+    detail = refused.json()["detail"]
+    assert (
+        "SHOT 01 (shot_a): punch_in's zoom is 9, above its maximum of 2. Nothing was composed."
+    ) in detail
+    assert (
+        "SHOT 02 (shot_b): There is no effect called 'nope' in the catalogue. "
+        "Nothing was composed."
+    ) in detail
+    assert ASSEMBLY_UNAPPROVED_REFUSAL.format(shot="SHOT 01 (shot_a)") in detail
+    assert store.get(project_id).jobs == [], "a refused export wrote a job record"
+
+    # 2. A look that has left the folder since it was chosen — which only the composer can see,
+    #    because the id is still one the server discovered and the file is what has gone.
+    project = store.get(project_id)
+    project.shots[0].effects = []
+    project.shots[1].effects = []
+    store.save(project)
+    assert client.post(f"/api/projects/{project_id}/shots/shot_a/approve").status_code == 200
+    looks = client.get("/api/effects/catalogue").json()["looks"]
+    chosen = looks[0]["lut_id"]
+    write_stack(client, project_id, "shot_a", [{"effect": "lut_look", "parameters": {"lut": chosen}}])
+    gone = next(
+        path
+        for path in lut_directory(tmp_path).iterdir()
+        if path.stem == looks[0]["name"]
+    )
+    gone.unlink()
+
+    vanished = client.post(f"/api/projects/{project_id}/assemble")
+    assert vanished.status_code == 422, vanished.text
+    detail = vanished.json()["detail"]
+    assert detail.startswith("SHOT 01 (shot_a): ")
+    assert detail.endswith(
+        EFFECT_LUT_FILE_MISSING_REFUSAL.format(lut=chosen, path=gone.as_posix())
+    )
+    assert store.get(project_id).jobs == []
+    assert comfy.prompts == []

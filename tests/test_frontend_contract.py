@@ -8433,6 +8433,9 @@ RENDERED_SHOT = {
     "singing": "singing",
     "use_song_audio": True,
     "seed": 4242,
+    # Plan content: the Effect Stack travels with the plan, so a Duplicate keeps the look
+    # and a Split does not leave its two halves grading differently from each other.
+    "effects": [{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.15}}],
     "status": "complete",
     "prompt_id": "comfy_prompt_1",
     "latest_output": "shots/shot_source/take_1.mp4",

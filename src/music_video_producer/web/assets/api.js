@@ -1296,6 +1296,10 @@ export const SHOT_PLAN_CONTENT_FIELDS = [
   "singing",
   "use_song_audio",
   "seed",
+  // `Shot.effects`: the Effect Stack, plan content because it describes what a future render of
+  // this window should look like and names no take -- see the model's own note. A Split whose
+  // halves graded differently from each other would be the visible failure.
+  "effects",
 ];
 
 // What a Shot nobody has rendered reads as. `Shot.status`'s own default, said out loud because

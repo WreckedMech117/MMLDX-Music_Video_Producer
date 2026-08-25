@@ -387,11 +387,23 @@ def populate(client: TestClient, project_id: str, **body) -> dict:
 #: the song to within the millisecond each span's last window is floored to. Everything else is
 #: unchanged: 27 shots, band 4.000–6.800, worst seam 1 ms, `batch.window_band_note` **0**
 #: warnings, `assembly.tiling_refusals` **0** refusals.
+#:
+#: **Re-pinned on 2026-08-25** when `Shot.effects` was declared, and this move is the digest's
+#: own rather than the plan's. `plan_digest` hashes *every* field of every shot deliberately —
+#: that is what makes it a statement about citations, prompts and windows together — so a new
+#: field on `Shot` moves it whatever its value. Proved rather than assumed: with `effects`
+#: stripped from each shot the four digests below reproduce the four values they replace,
+#: exactly, and every shot a populate writes carries `effects: []`. Nothing in populate writes
+#: a stack, and nothing here is a change to a window, a prompt, a seed or a citation. The
+#: values they replace:
+#:
+#:   marked   e84a8587382283b70dbaa0399a744f8def29a36fcacfb9a4ca288492e895006e
+#:   unmarked 1607b49e3f452dc39aa15138137ebfad2b23021bf1744d5dac8051b3c41114d0
 CHAINED_DIGEST_SECTIONS_MARKED = (
-    "e84a8587382283b70dbaa0399a744f8def29a36fcacfb9a4ca288492e895006e"
+    "285cf7a5c8a11ceb4f79eceb873953758385b61e36909fd674414fa4983a2386"
 )
 CHAINED_DIGEST_NO_SECTIONS = (
-    "1607b49e3f452dc39aa15138137ebfad2b23021bf1744d5dac8051b3c41114d0"
+    "744c2f277f7568815e59b1bf56f5c686e6733a24f324dc682f354e43732b3498"
 )
 
 
@@ -2835,11 +2847,23 @@ def test_a_line_up_report_carries_the_content_half_and_not_the_manifest(tmp_path
 #: Every figure in the table above still reads the same except coverage, which goes 0 → 154.640
 #: to **0 → 154.644**: 27 shots, band 4.000–6.800, worst seam 1 ms, 0 window warnings, 0 tiling
 #: refusals.
+#:
+#: **Re-pinned on 2026-08-25** when `Shot.effects` was declared, and this move is the digest's
+#: own rather than the plan's. `plan_digest` hashes *every* field of every shot deliberately —
+#: that is what makes it a statement about citations, prompts and windows together — so a new
+#: field on `Shot` moves it whatever its value. Proved rather than assumed: with `effects`
+#: stripped from each shot the four digests below reproduce the four values they replace,
+#: exactly, and every shot a populate writes carries `effects: []`. Nothing in populate writes
+#: a stack, and nothing here is a change to a window, a prompt, a seed or a citation. The
+#: values they replace:
+#:
+#:   marked   aae1a1e69d406723ccbb4d2ae8bb0882eebc4a79ed06b539dfe92f36d9e8cea4
+#:   unmarked f3eb2656353ea017029b75b6e7664e4641f19118d4ac14511d26c7551391e3d1
 VARIED_DIGEST_SECTIONS_MARKED = (
-    "aae1a1e69d406723ccbb4d2ae8bb0882eebc4a79ed06b539dfe92f36d9e8cea4"
+    "ea2e9e81d7149ac762cea77f634b564693d62cba15032a416448cb6e57965184"
 )
 VARIED_DIGEST_NO_SECTIONS = (
-    "f3eb2656353ea017029b75b6e7664e4641f19118d4ac14511d26c7551391e3d1"
+    "05eef24988b505e956e087c3eab7d9c7e447dd5de1eec6df73785bc9d33c4440"
 )
 
 
