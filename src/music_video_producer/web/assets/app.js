@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_NAME_HELP, ASSET_NAME_LABEL, assetNamePlan, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, characterSlotPlan, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, jobTarget, INSTRUMENTAL_NOTE, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, VOCAL_TYPES, vocalTaggingPlan, vocalTypeSpec, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { APPLY_DOCUMENTS_CONTROL, ASSET_NAME_HELP, ASSET_NAME_LABEL, assetNamePlan, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, characterSlotPlan, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, alignLyricsKeptTranscription, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, jobTarget, INSTRUMENTAL_NOTE, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, VOCAL_TYPES, vocalTaggingPlan, vocalTypeSpec, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -27,7 +27,7 @@ import { GAP_FILL_TOAST, MIN_WINDOW_SECONDS, PLAYHEAD_SNAP_TOAST, UNDO_DEPTH, an
 // both in api.js, and neither of them deciding *where a cut belongs*. That decision is
 // `timeline.py`'s, served whole by `GET /timeline/snap-targets`, so a drag and the batch "Snap
 // cuts" button cannot hold two opinions about the same second.
-import { SNAP_ANALYZE_ACTION, SNAP_ANALYZE_DONE, SNAP_ANALYZE_DONE_UNCOUNTED, SNAP_SELECT_CONTROL, SNAP_SELECT_HELP, SNAP_SELECT_LIST, SNAP_SELECT_SUMMARY, SNAP_TARGET_ORDER, SNAP_TARGET_TOASTS, dragSnapPlan, edgeSnap, snapActionControl, snapBeatCount, snapKindsFromSession, snapSelectorPlan, snapTargetsIdentity } from "./api.js";
+import { SNAP_ANALYZE_ACTION, SNAP_ANALYZE_DONE, SNAP_ANALYZE_DONE_UNCOUNTED, SNAP_SELECT_CONTROL, SNAP_SELECT_HELP, SNAP_SELECT_LIST, SNAP_SELECT_SUMMARY, SNAP_TARGET_ORDER, SNAP_TARGET_TOASTS, dragSnapPlan, edgeSnap, snapActionControl, snapBeatCount, snapKindsFromSession, snapSelectorPlan, snapTargetsIdentity, undoSnapGesture } from "./api.js";
 // The Clips tab's honest state when ComfyUI is not running, and the Assets panel's named attach
 // target -- two of the four interaction defects cleared on 2026-08-21.
 import { CLIP_RECHECK_LABEL, attachToShotControl, clipCardFace, clipPreviewState } from "./api.js";
@@ -2167,7 +2167,10 @@ function applySnappedCut(shot, mode, seconds, original, kind = "playhead") {
     target.duration = window.duration;
   }
   state.dirty = true;
-  saveShotsSilently("snap");
+  // The kind travels into the undo stack for the same reason it travels into the toast below:
+  // "Undo snapping the cut to the playhead", offered for a cut that landed on a beat, names a
+  // gesture the Director never made -- in the button's tooltip and in its accessible name alike.
+  saveShotsSilently(undoSnapGesture(kind));
   renderTimeline();
   toast((SNAP_TARGET_TOASTS[kind] || PLAYHEAD_SNAP_TOAST).replace("{seconds}", seconds.toFixed(3)));
   return true;
@@ -2256,26 +2259,55 @@ function bindClip(clip) {
     // The playhead goes *into* the plan rather than being passed per move, so it takes the same
     // local-spacing cap every other target takes and crowds the beats around it as they crowd it.
     const snapKinds = mode === "move" ? new Set() : snapTargetKinds;
-    const resolveSnapPlan = () => dragSnapPlan({
-      targets: state.songMeasurement,
-      playhead: state.playhead,
-      pixelsPerSecond: state.pixelsPerSecond,
-      enabledKinds: snapKinds,
-    });
+    // The playhead the standing plan was resolved against, kept beside the plan for exactly the
+    // reason the plan carries the scale it was measured in: so the move handler can notice it has
+    // moved with one comparison instead of rebuilding to find out.
+    //
+    // Recorded here rather than read back off `snapPlan.playhead`, which is `null` whenever the
+    // playhead is not one of the enabled kinds -- against `state.playhead` that never matches, so
+    // a Director who has switched the playhead off would rebuild on every move.
+    let snapPlanPlayhead = state.playhead;
+    const resolveSnapPlan = () => {
+      snapPlanPlayhead = state.playhead;
+      return dragSnapPlan({
+        targets: state.songMeasurement,
+        playhead: state.playhead,
+        pixelsPerSecond: state.pixelsPerSecond,
+        enabledKinds: snapKinds,
+      });
+    };
     let snapPlan = resolveSnapPlan();
     // Every target's pull on the edge being dragged, in seconds. `edgeSnap` decides, over the plan
     // and nothing else: tolerance in screen pixels, so the gesture feels the same at every zoom,
     // capped to a fraction of the local target spacing so a dead zone always remains between
     // targets, and declining entirely while the song is playing.
     //
-    // **Re-resolved when the scale it was measured in moves, and only then.** Ctrl+wheel zooms
-    // mid-drag, and a plan's tolerances are pixels converted to seconds: one resolved at 16 px/s
-    // is worth 10.7 px at 64 px/s, past a ceiling whose own comment calls raising it an Ask First.
-    // The check is one number per move and the rebuild happens only when the answer would
+    // **Re-resolved when the scale it was measured in moves, or when the playhead has moved under
+    // it -- and only then.** Ctrl+wheel zooms mid-drag, and a plan's tolerances are pixels
+    // converted to seconds: one resolved at 16 px/s is worth 10.7 px at 64 px/s, past a ceiling
+    // whose own comment calls raising it an Ask First.
+    //
+    // The playhead is the second of those, and the reachable sequence is the Director's own:
+    // snapping declines while the master plays, so they play, grab an edge, pause mid-drag and
+    // carry on -- and the plan resolved at `pointerdown` still holds the second the playhead sat
+    // at before the pause. The edge then lands there and the toast names a second the playhead is
+    // no longer at. The playhead stays *in* the plan (it takes the same local-spacing cap every
+    // other target takes, and crowds the beats around it as they crowd it); what is added here is
+    // noticing that it moved.
+    //
+    // **Gated on the song being stopped, which costs nothing and saves the rebuild that matters.**
+    // While the master plays, `timeupdate` moves the playhead several times a second and
+    // `edgeSnap` refuses to snap to anything at all, so a rebuild there would be per-move work
+    // buying an answer nothing reads. Paused, the playhead only moves when the Director moves it,
+    // so this rebuilds once per seek rather than once per pointermove.
+    //
+    // Both checks are one number apiece and the rebuild happens only when the answer would
     // otherwise be wrong, so the per-move cost this closure exists to avoid is not reintroduced.
     const magnet = (edgeSeconds) => {
-      if (snapPlan.pixelsPerSecond !== state.pixelsPerSecond) snapPlan = resolveSnapPlan();
-      return edgeSnap({ seconds: edgeSeconds, plan: snapPlan, playing: masterPlaying() });
+      const playing = masterPlaying();
+      if (snapPlan.pixelsPerSecond !== state.pixelsPerSecond
+        || (!playing && snapPlanPlayhead !== state.playhead)) snapPlan = resolveSnapPlan();
+      return edgeSnap({ seconds: edgeSeconds, plan: snapPlan, playing });
     };
     const move = (moveEvent) => {
       const delta = (moveEvent.clientX - startX) / state.pixelsPerSecond;
@@ -4467,7 +4499,40 @@ function bindEvents() {
       // gap half arriving alone through a second path: there is one read, so it cannot.
       loadSongMeasurement(projectId);
       toast(`Sections filled from the track: ${project.sections.map((s) => s.label).join(" · ")}`);
-    } catch (error) { toast(error.message, "error"); }
+    } catch (error) {
+      // **The refusal that saved something first, taken up as well as reported.** When no `[Tag]`
+      // block can be timed against what Whisper heard, the route writes `lyric_words` and
+      // `vocal_spans` onto the Song and *then* answers 422: the words are on disk while the reply
+      // is a refusal. Left unadopted, `snapTargetsIdentity`'s word and span counts never move, so
+      // the phrase-gap targets this run just created stay unreachable until a page reload -- the
+      // same "silently late by one reload" the success path above exists to close, on the branch
+      // that was never given it.
+      //
+      // **Only this refusal re-reads**, on `alignLyricsKeptTranscription`'s marker. No song, no
+      // `[Tag]` blocks, sections already placed and a transcription that failed outright all
+      // saved nothing, so a read on those would be a round trip to adopt a project that has not
+      // moved.
+      //
+      // The refusal is still reported, unchanged and in the server's own words: "no section was
+      // placed" is a true statement about sections, and adopting what was saved does not make it
+      // false. Reported *after* the adoption so the sentence is the last thing on screen, and a
+      // failed re-read cannot swallow it -- there is nothing this client could do about a project
+      // read that fails here, and the refusal is still the thing the Director needs to read.
+      if (alignLyricsKeptTranscription(error.message)) {
+        try {
+          const saved = await api.project(projectId);
+          if (state.project?.id === projectId) {
+            state.project = saved;
+            renderAll();
+            loadSongMeasurement(projectId);
+          }
+        } catch (ignored) {
+          // Swallowed on purpose: the toast below is the report, and a second sentence about a
+          // failed re-read would bury the one that says why nothing was placed.
+        }
+      }
+      toast(error.message, "error");
+    }
     finally {
       button.textContent = "Analyze structure";
       renderSong();

@@ -12261,19 +12261,21 @@ def test_every_kind_is_complete_in_every_table_that_decides_its_behaviour():
     """
     tables = run_module("""
       import { SNAP_TARGET_ORDER, SNAP_TARGET_KINDS, SNAP_TARGET_RANK, SNAP_TARGET_LABELS,
-               SNAP_TARGET_SHORT, SNAP_TARGET_NOTES, SNAP_TARGET_HELP, SNAP_TARGET_TOASTS }
+               SNAP_TARGET_SHORT, SNAP_TARGET_NOTES, SNAP_TARGET_HELP, SNAP_TARGET_TOASTS,
+               SNAP_TARGET_UNDO }
         from './src/music_video_producer/web/assets/api.js';
       console.log(JSON.stringify({
         order: SNAP_TARGET_ORDER,
         kinds: Object.values(SNAP_TARGET_KINDS),
         rank: SNAP_TARGET_RANK, labels: SNAP_TARGET_LABELS, short: SNAP_TARGET_SHORT,
         notes: SNAP_TARGET_NOTES, help: SNAP_TARGET_HELP, toasts: SNAP_TARGET_TOASTS,
+        undo: SNAP_TARGET_UNDO,
       }));
     """)
     order = tables["order"]
 
     assert sorted(tables["kinds"]) == sorted(order)
-    for table in ("rank", "labels", "short", "notes", "help", "toasts"):
+    for table in ("rank", "labels", "short", "notes", "help", "toasts", "undo"):
         assert sorted(tables[table]) == sorted(order), (
             f"SNAP_TARGET_{table.upper()} does not describe exactly the kinds that exist"
         )
@@ -14441,6 +14443,154 @@ def test_the_targets_are_re_read_exactly_when_the_measurement_behind_them_change
     )
 
 
+def test_a_transcription_the_server_saved_before_refusing_is_taken_up_anyway():
+    """`align_song_lyrics` writes `lyric_words` and `vocal_spans` and *then* refuses when no
+    `[Tag]` block could be timed against what it heard: the transcription is on disk while the
+    reply is a 422. The client used to report that refusal and adopt nothing, so
+    `snapTargetsIdentity`'s word and span counts never moved and the phrase-gap targets that very
+    run had just created were unreachable until a page reload -- the "silently late by one reload"
+    the success path's own comment claims to close, missing from the branch beside it.
+
+    Driven through the button a Director actually presses, both ways round: the refusal that saved
+    something re-reads, and the refusal that saved nothing does not. A guard that re-read on every
+    refusal would pass the first half of this and fail the second.
+    """
+    from music_video_producer.app import ALIGN_LYRICS_NOTHING_PLACED, ALIGN_LYRICS_TRANSCRIBE_FAILED
+
+    untranscribed = measured_project()
+    transcribed = measured_project({
+        **MEASURED_SONG, "lyric_words": [["la", 1.0, 1.4]], "vocal_spans": [[1.0, 1.4]],
+    })
+    watch = """
+      const spoken = [];
+      const made = globalThis.document.createElement;
+      globalThis.document.createElement = (tag) => {
+        const element = made(tag);
+        spoken.push(element);
+        return element;
+      };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const before = {
+        words: (state.project.song.lyric_words || []).length,
+        gaps: state.songMeasurement.gaps,
+      };
+      answer(true);
+      await fire('#analyze-song:click', {});
+      await flush();
+      console.log(JSON.stringify({
+        before,
+        words: (state.project.song.lyric_words || []).length,
+        spans: (state.project.song.vocal_spans || []).length,
+        gaps: state.songMeasurement.gaps,
+        reread: requests.filter((sent) => sent.path === '/api/projects/p2').length,
+        targets: requests.filter((sent) => sent.path.includes('snap-targets')).length,
+        said: spoken.map((element) => element.textContent).filter(Boolean),
+        left: unconsumed(),
+      }));
+    """
+
+    adopted = run_workspace(
+        watch,
+        responses={
+            "/api/projects/p2": [{"body": untranscribed}, {"body": transcribed}],
+            "/api/projects/p2/timeline/snap-targets": [
+                {"body": served_targets(measured=False, analysed=True)},
+                {"body": served_targets(measured=True, analysed=True)},
+            ],
+            "/api/projects/p2/song/align-lyrics": {
+                "status": 422, "body": {"detail": ALIGN_LYRICS_NOTHING_PLACED},
+            },
+        },
+    )
+
+    # The state this starts from, asserted rather than assumed: no words, and no gap to land on.
+    assert adopted["before"] == {"words": 0, "gaps": []}, adopted
+    # The words the server kept are on this client's Song...
+    assert adopted["words"] == 1 and adopted["spans"] == 1, (
+        ("the transcription the server saved before refusing was never adopted, so the word and "
+         "span counts the targets key reads are still the pre-transcription ones"),
+        adopted,
+    )
+    assert adopted["reread"] == 1, (
+        "the saved project was read a number of times other than once", adopted,
+    )
+    # ...and the phrase-gap targets it created are reachable now rather than after a reload.
+    assert adopted["gaps"] == [12.15], (
+        ("the phrase-gap targets this transcription just created are still unreachable, so a "
+         "drag cannot land on one until the project is loaded again"),
+        adopted,
+    )
+    assert adopted["targets"] == 1, adopted
+    # And the refusal is still reported, in the server's own words. Adoption is in addition to
+    # the message, never instead of it: no section *was* placed, and that stays true.
+    assert ALIGN_LYRICS_NOTHING_PLACED in adopted["said"], adopted["said"]
+    assert adopted["left"] == {}, (
+        "a canned reply was never asked for, so this proves less than it claims", adopted["left"],
+    )
+
+    # The other half: a refusal that saved nothing costs no round trip and adopts nothing.
+    failed = ALIGN_LYRICS_TRANSCRIBE_FAILED.format(error="faster-whisper is not installed")
+    quiet = run_workspace(
+        watch,
+        responses={
+            "/api/projects/p2": [{"body": untranscribed}, {"body": transcribed}],
+            "/api/projects/p2/timeline/snap-targets": [
+                {"body": served_targets(measured=False, analysed=True)},
+                {"body": served_targets(measured=True, analysed=True)},
+            ],
+            "/api/projects/p2/song/align-lyrics": {"status": 502, "body": {"detail": failed}},
+        },
+    )
+
+    assert quiet["reread"] == 0, (
+        ("a refusal that saved nothing still re-read the project, which is a round trip to adopt "
+         "a project that has not moved"),
+        quiet,
+    )
+    assert quiet["words"] == 0 and quiet["gaps"] == [], quiet
+    assert failed in quiet["said"], quiet["said"]
+
+
+def test_the_kept_transcription_marker_is_the_servers_own_words():
+    """The two sides of `ALIGN_LYRICS_KEPT_MARKER`, held together. The client re-reads the project
+    on exactly one of `align-lyrics`' refusals and tells them apart by a phrase out of the server's
+    sentence -- so the phrase must appear in that sentence and in none of the others, or the branch
+    either never fires or fires on refusals that saved nothing.
+
+    Held against every `ALIGN_LYRICS_*` sentence the module has rather than a hand-list, so a
+    refusal added later is checked by this test without being added to it.
+    """
+    from music_video_producer import app as app_module
+
+    marker = run_module("""
+      import { ALIGN_LYRICS_KEPT_MARKER, alignLyricsKeptTranscription }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        marker: ALIGN_LYRICS_KEPT_MARKER,
+        blank: alignLyricsKeptTranscription(''),
+        missing: alignLyricsKeptTranscription(null),
+      }));
+    """)
+
+    sentences = {
+        name: value for name, value in vars(app_module).items()
+        if name.startswith("ALIGN_LYRICS_") and isinstance(value, str)
+    }
+    assert "ALIGN_LYRICS_NOTHING_PLACED" in sentences, "the refusal that saves was renamed"
+    for name, sentence in sentences.items():
+        held = marker["marker"] in sentence
+        assert held is (name == "ALIGN_LYRICS_NOTHING_PLACED"), (
+            (f"{name} {'carries' if held else 'does not carry'} the phrase the client keys the "
+             "kept-transcription branch on"),
+            marker["marker"],
+            sentence,
+        )
+    # Neither an empty message nor a missing one is a kept transcription.
+    assert marker["blank"] is False and marker["missing"] is False
+
+
 def test_the_drag_resolves_its_targets_once_and_never_ports_the_gap_rule_into_javascript():
     """Three conventions no run can observe, so they are read off the source.
 
@@ -14569,6 +14719,197 @@ def test_a_snapped_drag_reports_the_target_it_actually_found():
     # And the write path names the kind it was handed rather than one of them by default.
     applied = without_comments(app_js_block("function applySnappedCut(", "\n}"))
     assert "SNAP_TARGET_TOASTS[kind]" in applied
+
+
+def drag_magnet_source() -> str:
+    """`bindClip`'s plan setup and its `magnet` closure, lifted out of `app.js` as text.
+
+    There is no browser here and no way to fire a real edge drag, so the closure is *executed*
+    rather than read: this returns the shipped source from `const snapKinds` to the end of
+    `magnet`, which `new Function` turns back into a callable given `state`, `mode`, the enabled
+    kinds and the two pure functions it calls. Everything asserted about it is therefore the code
+    that ships rather than a restatement of it -- and a mutation to the rebuild condition changes
+    the answers rather than only the prose.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    clip = source.split("function bindClip(clip) {", 1)[1]
+    setup = clip.split("const move = (moveEvent) => {", 1)[0]
+    assert "const snapKinds = " in setup, "the drag's plan setup moved out of bindClip"
+    return "const snapKinds = " + setup.split("const snapKinds = ", 1)[1]
+
+
+def test_the_drag_notices_a_playhead_that_moved_under_it():
+    """Snapping declines while the master plays, so the Director's own reachable sequence is:
+    play, grab an edge, pause mid-drag, carry on. Story 8.3 resolved the plan once at
+    `pointerdown` and re-resolved it only when the *scale* moved, so the edge went on snapping to
+    where the playhead had been before the pause -- and the toast named a second the playhead was
+    no longer at.
+
+    The playhead stays **in** the plan, which is R-16: it takes the same local-spacing cap every
+    other target takes and crowds the beats around it as they crowd it. What is added is noticing
+    that it moved, by the same one-number test the scale already gets.
+
+    **And the cost profile is an assertion here, not a footnote.** `renderTimeline` runs on every
+    `pointermove`; a plan rebuilt per move is exactly the cost Story 8.2's repaint guard exists to
+    prevent. So the rebuild count is checked at every step: a still playhead rebuilds nothing, and
+    a playhead running under a *playing* master -- which `timeupdate` moves several times a
+    second, and which `edgeSnap` refuses to snap to at all -- rebuilds nothing either.
+    """
+    script = """
+      import { dragSnapPlan, edgeSnap } from './src/music_video_producer/web/assets/api.js';
+      const state = {
+        songMeasurement: { gaps: [], beats: [10, 20, 30] },
+        pixelsPerSecond: 16,
+        playhead: 12,
+      };
+      let playing = false;
+      const masterPlaying = () => playing;
+      let resolved = 0;
+      const counted = (options) => { resolved += 1; return dragSnapPlan(options); };
+      // The shipped closure, compiled back into a function over the names it closes over.
+      const build = new Function(
+        'state', 'mode', 'snapTargetKinds', 'dragSnapPlan', 'edgeSnap', 'masterPlaying',
+        __MAGNET__ + '\\nreturn magnet;',
+      );
+      const magnet = build(
+        state, 'right', new Set(['playhead', 'gap', 'beat']), counted, edgeSnap, masterPlaying,
+      );
+      const built = resolved;
+      // An edge 0.02s from where the playhead will be, while the playhead is still at 12: the
+      // nearest beat is 5s away, so nothing pulls it.
+      const still = magnet(25.02);
+      magnet(25.02);
+      const afterStill = resolved;
+      // The pause. `timeupdate` has left the playhead at 25.
+      state.playhead = 25;
+      const moved = magnet(25.02);
+      const afterMoved = resolved;
+      magnet(25.02);
+      const settled = resolved;
+      // Playing again, and the playhead running: no snap, and nothing rebuilt for one.
+      playing = true;
+      state.playhead = 27;
+      const whilePlaying = magnet(27.01);
+      const afterPlaying = resolved;
+      playing = false;
+      const afterPause = magnet(27.01);
+      const afterPauseCount = resolved;
+      // The scale check that was already there, still there.
+      state.pixelsPerSecond = 64;
+      magnet(27.01);
+      const zoomed = resolved;
+      console.log(JSON.stringify({
+        built, still, afterStill, moved, afterMoved, settled,
+        whilePlaying, afterPlaying, afterPause, afterPauseCount, zoomed,
+      }));
+    """
+    drag = run_module(script.replace("__MAGNET__", json.dumps(drag_magnet_source())))
+
+    # One plan at `pointerdown`, and a still playhead rebuilds nothing however long the drag runs.
+    assert drag["built"] == 1, drag
+    assert drag["afterStill"] == 1, (
+        ("an ordinary drag over a still playhead rebuilds its plan per pointer move, which is "
+         "the cost the plan is resolved once to avoid"),
+        drag,
+    )
+    assert drag["still"]["snapped"] is False, drag["still"]
+
+    # The playhead moved, so the edge lands where it is *now* and the report names that second.
+    assert drag["afterMoved"] == 2, (
+        ("the drag never noticed the playhead move, so the edge still snaps to where the "
+         "playhead was when the drag began"),
+        drag,
+    )
+    assert drag["moved"]["snapped"] is True, drag["moved"]
+    assert drag["moved"]["kind"] == "playhead", drag["moved"]
+    assert drag["moved"]["seconds"] == 25, drag["moved"]
+    # And once it has been noticed, it is not noticed again.
+    assert drag["settled"] == 2, (
+        "the plan is rebuilt on every move once the playhead has moved once", drag,
+    )
+
+    # While the master plays there is no snapping at all, so a rebuild there buys nothing and is
+    # not made -- and `timeupdate` moves the playhead several times a second.
+    assert drag["whilePlaying"]["snapped"] is False, drag["whilePlaying"]
+    assert drag["afterPlaying"] == 2, (
+        ("the plan is rebuilt on every pointer move of a drag made while the song plays, which "
+         "is per-move work buying an answer edgeSnap refuses to give"),
+        drag,
+    )
+    # Paused again, the move made while playing is taken up on the next pointer move.
+    assert drag["afterPauseCount"] == 3, drag
+    assert drag["afterPause"]["snapped"] is True and drag["afterPause"]["seconds"] == 27, (
+        drag["afterPause"]
+    )
+    # The scale check Story 8.3 shipped is untouched.
+    assert drag["zoomed"] == 4, ("a mid-drag zoom no longer re-resolves the plan", drag)
+
+
+def test_an_undone_snap_names_the_target_it_actually_landed_on():
+    """The Undo control's tooltip **and** its accessible name say what will come back, so
+    "snapping the cut to the playhead" offered for a cut that landed on a beat is a false name for
+    the gesture in both -- an accessibility defect as much as a copy one.
+
+    One table, not a branch per kind: `UNDO_GESTURES` is built from `SNAP_TARGET_UNDO`, the same
+    shape `SNAP_TARGET_TOASTS` already had, so a fourth kind in Epic 10 or 11 is one line there
+    and nothing else. A kind this build has never heard of -- and a stack entry written before the
+    kinds existed -- still names a snap rather than falling through to the generic edit, which is
+    the toast path's own fallback rule.
+    """
+    labels = run_module("""
+      import { SNAP_TARGET_ORDER, SNAP_TARGET_UNDO, UNDO_GESTURES, undoControl, undoGestureLabel,
+               undoSnapGesture } from './src/music_video_producer/web/assets/api.js';
+      const named = {};
+      for (const kind of SNAP_TARGET_ORDER) {
+        const gesture = undoSnapGesture(kind);
+        named[kind] = {
+          gesture,
+          label: undoGestureLabel(gesture),
+          title: undoControl([{ kind: gesture }], { revision: 'r1', projectRevision: 'r1' }).title,
+        };
+      }
+      console.log(JSON.stringify({
+        named,
+        undo: SNAP_TARGET_UNDO,
+        order: SNAP_TARGET_ORDER,
+        // A kind from a build that does not exist yet, and the bare gesture a stack entry
+        // written before this change carries.
+        future: undoGestureLabel(undoSnapGesture('marker')),
+        legacy: undoGestureLabel('snap'),
+        generic: UNDO_GESTURES.edit,
+      }));
+    """)
+
+    order = labels["order"]
+    assert sorted(labels["undo"]) == sorted(order), (
+        "SNAP_TARGET_UNDO does not describe exactly the kinds that exist"
+    )
+    # Every kind names itself, in the tooltip and therefore in the accessible name built from it.
+    for kind in order:
+        named = labels["named"][kind]
+        assert named["label"] == labels["undo"][kind], named
+        assert named["label"] in named["title"], named
+        assert "Ctrl+Z" in named["title"], named
+    # No two kinds say the same thing, which is the whole point of there being three.
+    assert len({labels["named"][kind]["label"] for kind in order}) == len(order), labels["named"]
+    # And the two measured kinds do not claim the playhead, which is the sentence that was wrong.
+    for kind in order:
+        if kind == "playhead":
+            continue
+        assert "playhead" not in labels["named"][kind]["title"], labels["named"][kind]
+    # An unrecognised kind is still named as a snap, never as "the last shot edit".
+    assert labels["future"] == labels["undo"]["playhead"], labels["future"]
+    assert labels["legacy"] == labels["undo"]["playhead"], labels["legacy"]
+    assert labels["future"] != labels["generic"]
+
+    # And the write path records the kind it was handed rather than one name for every snap.
+    applied = without_comments(app_js_block("function applySnappedCut(", "\n}"))
+    assert "saveShotsSilently(undoSnapGesture(kind))" in applied, (
+        ("the snap records one gesture name for every kind, so the Undo names the playhead after "
+         "a beat snap"),
+        applied,
+    )
+    assert 'saveShotsSilently("snap")' not in applied
 
 
 def test_the_snap_selector_can_be_dismissed_the_two_ways_every_panel_can():

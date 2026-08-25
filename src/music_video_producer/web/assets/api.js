@@ -677,6 +677,27 @@ export function songRefusalMessage(message) {
   return typeof message === "string" && message.includes(SONG_REFUSAL_MARKER);
 }
 
+// True when a rejection is the one `align-lyrics` refusal that **saved something first**.
+//
+// `align_song_lyrics` writes `lyric_words` and `vocal_spans` onto the Song and only then refuses,
+// when no `[Tag]` block could be timed against what it heard: the transcription is on disk and the
+// reply is a 422. Every other refusal that route sends -- no song, no `[Tag]` blocks in the sheet,
+// section boxes already placed, the transcription itself failing -- wrote nothing, so this is the
+// one that a client must take up rather than only report.
+//
+// **Why the client has to care.** `snapTargetsIdentity` counts `lyric_words` and `vocal_spans`,
+// so a transcription left unadopted leaves the key unmoved and the phrase-gap targets that
+// transcription just created unreachable until a page reload -- the "silently late by one reload"
+// the success path's own comment says it exists to close.
+//
+// Keyed on a phrase from `app.ALIGN_LYRICS_NOTHING_PLACED` that appears in no other sentence that
+// route sends, exactly as the two markers above are, and a contract test holds the two together.
+export const ALIGN_LYRICS_KEPT_MARKER = "The transcribed words were kept";
+
+export function alignLyricsKeptTranscription(message) {
+  return typeof message === "string" && message.includes(ALIGN_LYRICS_KEPT_MARKER);
+}
+
 // The single wording for what changing or removing a project's Song costs, shown before
 // the import, generate and remove paths send anything. One exported constant because
 // three call sites would otherwise drift, and a consequence stated differently in three
@@ -4460,6 +4481,35 @@ export const SNAP_TARGET_TOASTS = {
   beat: "Cut moved to the beat at {seconds}s.",
 };
 
+// What an undone snap is called, per kind, and the second half of the same argument
+// `SNAP_TARGET_TOASTS` makes: "snapping the cut to the playhead" offered as the Undo for a cut
+// that landed on a beat names a gesture the Director never made. It reaches the Undo control's
+// tooltip **and** its accessible name, so a screen reader hears the wrong target too.
+//
+// No `{seconds}`: the Undo names a gesture, not a landing. "Undo snapping the cut to the beat at
+// 41.203s" describes the state being left rather than the one being returned to.
+//
+// A fourth kind in Epic 10 or 11 is a line here and nothing else -- `UNDO_GESTURES` is built from
+// this table rather than restating it.
+export const SNAP_TARGET_UNDO = {
+  playhead: "snapping the cut to the playhead",
+  gap: "snapping the cut to a voiceless moment",
+  beat: "snapping the cut to the beat",
+};
+
+// How a snap's kind is spelled when it is recorded as an undoable gesture. Prefixed rather than
+// bare so a kind name can never collide with one of the other gestures' keys, and so a reader of
+// a stack entry can still tell that the gesture was a snap.
+export const UNDO_SNAP_PREFIX = "snap:";
+
+// The gesture name `applySnappedCut` records, from the kind `edgeSnap` actually found. An
+// unrecognised kind records the bare `snap`, whose sentence is the playhead's -- the same
+// fallback the toast on that path takes, and for the same reason: an imprecise report of a write
+// beats a silent one.
+export function undoSnapGesture(kind) {
+  return SNAP_TARGET_UNDO[kind] ? `${UNDO_SNAP_PREFIX}${kind}` : "snap";
+}
+
 // Which kinds a drag may land on, as a **set of kind names**. One argument for the whole
 // question, deliberately, rather than a boolean per kind.
 //
@@ -5199,7 +5249,15 @@ export const UNDO_GESTURES = {
   move: "moving a shot",
   resize: "resizing a shot",
   gapfill: "closing the gap",
-  snap: "snapping the cut to the playhead",
+  // The bare `snap` is what an unrecognised kind falls back to, and it reads as the playhead's
+  // sentence because the playhead is the target this gesture had before the song had any others.
+  snap: SNAP_TARGET_UNDO.playhead,
+  // One entry per snap kind, spread from `SNAP_TARGET_UNDO` rather than spelled out again: a
+  // branch per kind here is the thing that went stale when Story 8.3 added two of them and left
+  // one sentence behind.
+  ...Object.fromEntries(
+    Object.entries(SNAP_TARGET_UNDO).map(([kind, what]) => [`${UNDO_SNAP_PREFIX}${kind}`, what]),
+  ),
   edit: "the last shot edit",
 };
 export const UNDO_GESTURE_FALLBACK = "edit";
