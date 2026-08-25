@@ -5,19 +5,31 @@ So almost everything here is a string equality against a stage written out by ha
 from the catalogue, because a test that computed its expectation from the same table the code
 reads would pass just as happily for a table that had drifted.
 
-Three tests run the real binary, and each is here because a string cannot prove what it claims:
+Six tests run the real binary, and each is here because a string cannot prove what it claims:
 
 * the generated `.cube` round-trips through `lut3d` at ~84 dB PSNR, and the same table written
   with the loops nested the wrong way round scores ~4 dB — the mistake that reports *nothing*;
+  the same file is then loaded again from a directory whose name carries a space, a comma, a
+  semicolon, brackets, a percent sign, an ampersand and an equals sign, which is the only
+  evidence in this suite that the quoting rule survives anything but a drive-letter colon;
 * a padded export carrying a texture leaves its letterbox bars at pure black, which is the one
   ordering constraint in this slice that is invisible in a still and wrong in a delivery;
+* a pixelated white frame carries no black border, because a treatment may not resize a frame;
 * every stage the catalogue can emit is accepted by this project's own ffmpeg, so a typo in a
-  filter option is a failed test rather than a failed export.
+  filter option is a failed test rather than a failed export — and each of those renders is
+  counted back out with `ffprobe`, because `returncode == 0` is a syntax gate and the frame
+  count is what the song is cut against;
+* the whole catalogue stacked at once renders, which is the only real render of a combination;
+* the same stack yields the same frames twice, and a different grain seed yields different ones.
+
+**Nothing here derives an expectation from the catalogue.** Where a number had to be worked out
+— a radian, a cosine, an inset, a film luma weight — it was worked out once by hand and written
+down as a literal, because a test that recomputes the code's own arithmetic cannot catch a
+misconception the two of them share.
 """
 
 from __future__ import annotations
 
-import math
 import subprocess
 from pathlib import Path
 
@@ -81,9 +93,11 @@ def test_the_stage_order_is_the_one_ad_17_fixed():
     assert FAMILY_ORDER == (FAMILY_GEOMETRY, FAMILY_TEXTURE, FAMILY_GRADE, FAMILY_STYLIZE)
     assert PRE_SCALE_FAMILIES == (FAMILY_GEOMETRY,)
     assert PRE_PAD_FAMILIES == (FAMILY_TEXTURE, FAMILY_GRADE, FAMILY_STYLIZE)
-    # Every catalogued family is placed, and none is placed twice.
+    # No family is placed twice. The companion claim — that every family in `FAMILY_ORDER` is
+    # placed *somewhere* — is a module-level `assert` in `effects.py` that runs at import, so
+    # repeating it here could never fail: a false one would stop this module importing at all.
+    # It is left where it is, and this test pins the three tuples themselves instead.
     assert set(PRE_SCALE_FAMILIES).isdisjoint(PRE_PAD_FAMILIES)
-    assert set(PRE_SCALE_FAMILIES) | set(PRE_PAD_FAMILIES) == set(FAMILY_ORDER)
     assert {definition.family for definition in EFFECT_CATALOGUE.values()} == set(FAMILY_ORDER)
 
 
@@ -359,21 +373,168 @@ def test_geometry_addresses_the_takes_pixels_through_ffmpegs_own_expressions():
 def test_a_dutch_tilt_crops_back_inside_the_frame_it_rotated():
     """A rotation fills the corners with black. The crop that follows is what keeps the tilt from
     exposing an undefined edge, and its factor is an expression over `iw`/`ih` because this stage
-    runs before `scale` and has no idea what shape the take is."""
-    built = stages([effect("dutch_tilt", angle=10)])
-    radians = math.radians(10)
-    cosine = f"{abs(math.cos(radians)):.6f}".rstrip("0").rstrip(".")
-    sine = f"{abs(math.sin(radians)):.6f}".rstrip("0").rstrip(".")
-    inscribed = f"max((iw*{cosine}+ih*{sine})/iw\\,(iw*{sine}+ih*{cosine})/ih)"
-    assert built.geometry == (
-        f"rotate=a={f'{radians:.6f}'.rstrip('0').rstrip('.')}:ow=iw:oh=ih",
-        f"crop=w=iw/{inscribed}:h=ih/{inscribed}:x=(iw-ow)/2:y=(ih-oh)/2",
+    runs before `scale` and has no idea what shape the take is.
+
+    Written out as literals rather than rebuilt from `math.radians` and a reimplementation of
+    the composer's own float formatter. A mirror implementation cannot catch a misconception the
+    test and the code share — degrees where radians belong, a sine where a cosine belongs — so
+    the numbers below were computed once, by hand, and are now the contract: 10 degrees is
+    0.174533 radians, its cosine 0.984808 and its sine 0.173648, each to six decimals.
+    """
+    assert stages([effect("dutch_tilt", angle=10)]).geometry == (
+        "rotate=a=0.174533:ow=iw:oh=ih",
+        (
+            "crop=w=iw/max((iw*0.984808+ih*0.173648)/iw\\,(iw*0.173648+ih*0.984808)/ih)"
+            ":h=ih/max((iw*0.984808+ih*0.173648)/iw\\,(iw*0.173648+ih*0.984808)/ih)"
+            ":x=(iw-ow)/2:y=(ih-oh)/2"
+        ),
+    )
+    # Tilted the other way, the rotation is negative and the *crop* is identical: the inscribed
+    # rectangle is the same shape either way, which is why the composer takes the magnitude of
+    # both trig terms. A signed sine here would write a negative width into the `max()`.
+    assert stages([effect("dutch_tilt", angle=-10)]).geometry == (
+        "rotate=a=-0.174533:ow=iw:oh=ih",
+        (
+            "crop=w=iw/max((iw*0.984808+ih*0.173648)/iw\\,(iw*0.173648+ih*0.984808)/ih)"
+            ":h=ih/max((iw*0.984808+ih*0.173648)/iw\\,(iw*0.173648+ih*0.984808)/ih)"
+            ":x=(iw-ow)/2:y=(ih-oh)/2"
+        ),
     )
     # At zero there is no pair at all. It used to emit `rotate=a=0` and a crop by a factor of 1,
     # which reproduce their own input exactly — measured `inf` PSNR — for the price of two real
     # filters on every frame of the shot.
     assert stages([effect("dutch_tilt")]).geometry == ()
     assert stages([effect("dutch_tilt", angle=0)]).geometry == ()
+
+
+# ------------------------------------------------------------------------------------------
+# Every composer's filter text, written out by hand.
+#
+# The acceptance sweep at the bottom of this file runs all twenty through the real binary and
+# asserts `returncode == 0`. That is a *syntax* gate: a filter that is well-formed and wrong
+# passes it, and a wrong-but-well-formed filter is exactly what a slipped option produces. So
+# each composer below is pinned as a string, at a value off its identity, with every number
+# computed by hand rather than taken from the catalogue or recomputed with the composer's own
+# formatter.
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_handheld_shake_insets_its_window_by_the_amplitude_on_all_four_sides():
+    """The bound FX-11 states — *"geometry that would sample outside the source frame is
+    bounded so it cannot expose an undefined edge"* — and the one that fails silently.
+
+    The window is `1 - 2*amplitude` of the frame, so an offset of `amplitude` in either
+    direction on either axis still lands inside the source. Take the inset away and the window
+    is the whole frame: ffmpeg then clamps the moving crop back to the frame's own edge on
+    every frame, the offset has nowhere to go, and **the shake stops shaking** — no error, no
+    warning, an effect that renders as its own input. Nothing else in this file would notice.
+
+    The vertical frequency is the horizontal one times 1.37, so the two axes do not return to
+    the same place together and the motion does not read as a circle. Both numbers below were
+    worked out by hand: 1 - 2*0.03 = 0.94, and 3.5 * 1.37 = 4.795.
+    """
+    assert stages([effect("handheld_shake", amplitude=0.03, frequency=3.5)]).geometry == (
+        (
+            "crop=w=iw*0.94:h=ih*0.94"
+            ":x=(iw-ow)/2+iw*0.03*sin(2*PI*3.5*t)"
+            ":y=(ih-oh)/2+ih*0.03*cos(2*PI*4.795*t)"
+        ),
+    )
+    # At the amplitude's own maximum the inset is at its largest: 1 - 2*0.05 = 0.9, a window
+    # nine tenths of the frame, and 10 * 1.37 = 13.7 on the vertical.
+    assert stages([effect("handheld_shake", amplitude=0.05, frequency=10)]).geometry == (
+        (
+            "crop=w=iw*0.9:h=ih*0.9"
+            ":x=(iw-ow)/2+iw*0.05*sin(2*PI*10*t)"
+            ":y=(ih-oh)/2+ih*0.05*cos(2*PI*13.7*t)"
+        ),
+    )
+
+
+def test_a_mirror_writes_the_flip_its_axis_names_on_every_axis():
+    """Three axes, three answers, and only the default was pinned. `vertical` emitting `hflip`
+    is a mirror that mirrors the wrong way — perfectly legal ffmpeg, and wrong in the picture."""
+    assert stages([effect("mirror", axis="horizontal")]).geometry == ("hflip",)
+    assert stages([effect("mirror", axis="vertical")]).geometry == ("vflip",)
+    assert stages([effect("mirror", axis="both")]).geometry == ("hflip", "vflip")
+
+
+def test_the_texture_composers_write_the_options_they_mean():
+    """Sharpen's radius, and deband's four planes.
+
+    `unsharp`'s matrix size is a radius: 5 and 7 are both valid and produce visibly different
+    pictures, so a slipped digit is a silently different effect. `deband` carries a threshold
+    per plane and the catalogue offers one dial, so all four must carry it — three of the four
+    left at the filter's own default would deband the luma and leave the chroma banded, which
+    is the artefact the card exists to remove.
+    """
+    assert stages([effect("sharpen", amount=1.25)]).treatment == (
+        "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=1.25",
+    )
+    # The range crosses zero: a negative amount softens, and the sign reaches the filter.
+    assert stages([effect("sharpen", amount=-0.5)]).treatment == (
+        "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=-0.5",
+    )
+    assert stages([effect("banding_suppression", threshold=0.02)]).treatment == (
+        "deband=1thr=0.02:2thr=0.02:3thr=0.02:4thr=0.02",
+    )
+
+
+def test_the_grade_composers_write_the_axis_they_mean():
+    """Exposure is brightness, temperature is red against blue, tint is green against magenta.
+
+    Each of these is one `eq` or `colorbalance` option away from being a different control
+    entirely, and every one of those neighbours is a valid option name. Exposure emitting
+    `eq=contrast=` is an Exposure slider that changes contrast; temperature with `rm` and `bm`
+    exchanged makes warm cool; tint on `gs` instead of `gm` casts the blacks green instead of
+    the midtones. All three ship green through a syntax gate.
+    """
+    assert stages([effect("exposure", amount=0.2)]).treatment == ("eq=brightness=0.2",)
+    assert stages([effect("exposure", amount=-0.35)]).treatment == ("eq=brightness=-0.35",)
+
+    # One dial, two options, opposite signs — and the sign is which way "warm" points.
+    assert stages([effect("temperature", amount=0.4)]).treatment == (
+        "colorbalance=rm=0.4:bm=-0.4",
+    )
+    assert stages([effect("temperature", amount=-0.4)]).treatment == (
+        "colorbalance=rm=-0.4:bm=0.4",
+    )
+
+    # `gm` is the midtones. `gs` is the shadows, and the module docstring's whole reason for
+    # choosing the midtone options is that a grade must not put a cast in the black point.
+    assert stages([effect("tint", amount=0.3)]).treatment == ("colorbalance=gm=0.3",)
+    assert stages([effect("tint", amount=-0.25)]).treatment == ("colorbalance=gm=-0.25",)
+
+
+def test_pixelate_quantises_in_place_and_says_which_mode():
+    """`pixelize` with the averaging mode written out.
+
+    The mode is stated rather than left to the filter's default so the stage text is this
+    application's decision — and because the neighbouring modes are not pixelation: `min` and
+    `max` are morphological, and either would read as a smear rather than as blocks.
+    """
+    assert stages([effect("pixelate", size=8)]).treatment == ("pixelize=w=8:h=8:mode=avg",)
+    assert stages([effect("pixelate", size=64)]).treatment == ("pixelize=w=64:h=64:mode=avg",)
+
+
+def test_a_chroma_split_rounds_to_the_nearest_pixel_rather_than_truncating():
+    """Half a pixel is the only place `round` and `int` disagree, so it is the only place the
+    difference can be pinned.
+
+    0.005 of 1900 is 9.5 exactly. Rounded that is 10; truncated it is 9 — a whole pixel of
+    chroma offset, on a control whose entire range is 40 pixels wide at that width. The two
+    fixtures elsewhere in this file (19.2 at 1920, 6.4 at 640) truncate to the same number they
+    round to, which is why neither of them says anything about this.
+    """
+    stack = [effect("chroma_split", shift=0.005)]
+    assert build_effect_stages(stack, width=1900, height=1068).treatment == (
+        "chromashift=cbh=10:crh=-10",
+    )
+    # And on the negative half of the range, where truncation moves the other way.
+    away = [effect("chroma_split", shift=-0.005)]
+    assert build_effect_stages(away, width=1900, height=1068).treatment == (
+        "chromashift=cbh=-10:crh=10",
+    )
 
 
 # ------------------------------------------------------------------------------------------
@@ -481,6 +642,65 @@ def test_every_declared_parameter_reaches_the_composer_whether_it_was_sent_or_no
             continue
         (only,) = validate_stack([{"effect": definition.effect_id}])
         assert set(only.values) == {parameter.name for parameter in definition.parameters}
+
+
+def test_every_declared_default_is_pinned_as_a_literal():
+    """The whole catalogue's defaults, written out, because the test above cannot do this.
+
+    That one asserts `set(only.values) == {p.name for p in definition.parameters}` — an
+    expectation read out of the same table the code reads. It proves **completeness**: no
+    declared parameter goes missing on the way to a composer. It cannot prove **correctness**:
+    a default that drifted from 1 to 0 satisfies it exactly as well, and a Contrast card that
+    silently defaulted to 0 would ship a black frame with every test in this file green.
+
+    So the twenty rows below are the contract. They are asserted on the *resolved values*
+    rather than on stage text because an effect sitting at its identity now composes no stage
+    at all — the point is that a default cannot drift unnoticed, not that it produces a filter.
+    `lut_look` is the one entry with a parameter that declares no default at all, so its look
+    is named here and its card switched off, which is what lets the folder go unconsulted.
+    """
+    expected: dict[str, dict[str, object]] = {
+        "punch_in": {"zoom": 1.0},
+        "handheld_shake": {"amplitude": 0.0, "frequency": 2.0},
+        "dutch_tilt": {"angle": 0.0},
+        "mirror": {"axis": "horizontal"},
+        "grain": {"strength": 0.0, "seed": 0},
+        "vignette": {"angle": 0.0},
+        "soft_focus": {"sigma": 0.0},
+        "sharpen": {"amount": 0.0},
+        "banding_suppression": {"threshold": 0.0001},
+        "lut_look": {"lut": "a-look-the-folder-need-not-hold", "interp": "tetrahedral"},
+        "exposure": {"amount": 0.0},
+        "contrast": {"amount": 1.0},
+        "saturation": {"amount": 1.0},
+        "temperature": {"amount": 0.0},
+        "tint": {"amount": 0.0},
+        "lift_gamma_gain": {"lift": 0.0, "gamma": 1.0, "gain": 0.0},
+        "monochrome": {"amount": 1.0},
+        "chroma_split": {"shift": 0.0},
+        "posterize": {"levels": 256},
+        "pixelate": {"size": 1},
+    }
+    assert set(expected) == set(EFFECT_CATALOGUE), "every catalogue entry must be pinned"
+
+    for effect_id, values in expected.items():
+        spec: dict[str, object] = {"effect": effect_id}
+        if effect_id == "lut_look":
+            spec["parameters"] = {"lut": values["lut"]}
+            spec["enabled"] = False
+        (resolved,) = validate_stack([spec])
+        assert dict(resolved.values) == values, effect_id
+
+    # Three of those are counts rather than fractions, and the difference is not visible in a
+    # comparison — `0 == 0.0` — but it is visible in a filter string, where `seed=0.0` is not a
+    # seed ffmpeg accepts. So the whole-number parameters are asserted to come back whole.
+    for effect_id, parameter_name in (
+        ("grain", "seed"),
+        ("posterize", "levels"),
+        ("pixelate", "size"),
+    ):
+        (resolved,) = validate_stack([{"effect": effect_id}])
+        assert isinstance(resolved.values[parameter_name], int), effect_id
 
 
 def test_an_unknown_effect_is_refused_by_name_and_nothing_is_composed():
@@ -946,14 +1166,62 @@ def test_red_varies_fastest_then_green_then_blue():
     assert lines[4] == "0.000000 0.000000 1.000000"  # and blue last
 
 
-def test_the_generated_looks_stay_inside_the_domain_and_are_reproducible():
+def test_the_generated_looks_stay_inside_the_domain_and_are_pinned_to_their_own_arithmetic():
     """Clamped, so a look cannot write a value ffmpeg would clip into a highlight nobody asked
-    for; and byte-identical between runs, because a generated render input is a pure function."""
+    for — and pinned, so "reproducible" means something.
+
+    The reproducibility half used to be `text == cube_text(5, transform, title=title)`: the
+    same pure function called twice with the same arguments, which is true of any function at
+    all and would go on being true if every look in the set were replaced by a different one.
+    What a generated render input actually owes is that **the same bytes come out today as came
+    out when the look shipped**, and the only way to say that is to write the bytes down.
+
+    Two of the five are written out whole at a lattice of 2, which is the smallest size that
+    still visits both ends of every axis and is therefore where the arithmetic is legible:
+
+    * `panchromatic-mono` is `0.30r + 0.59g + 0.11b` — the *film* weights, not the Rec.709 ones
+      the rest of this module uses, which is the whole reason the look exists. Every corner of
+      the cube lands on a distinct grey, so a slipped weight moves a number here.
+    * `warm-shift` is a gain of 1.08, 1.01 and 0.90 — and at a lattice of 2 the red and green
+      corners both exceed 1 and come back clamped, which is the clamp asserted as a value
+      rather than as a range check that a missing clamp could still pass on some other look.
+    """
+    looks = {lut_id: transform for lut_id, _title, transform in DEFAULT_LUTS}
+
+    assert cube_text(2, looks["panchromatic-mono"], title="Panchromatic Mono") == (
+        'TITLE "Panchromatic Mono"\n'
+        "LUT_3D_SIZE 2\n"
+        "DOMAIN_MIN 0 0 0\n"
+        "DOMAIN_MAX 1 1 1\n"
+        "0.000000 0.000000 0.000000\n"
+        "0.300000 0.300000 0.300000\n"
+        "0.590000 0.590000 0.590000\n"
+        "0.890000 0.890000 0.890000\n"
+        "0.110000 0.110000 0.110000\n"
+        "0.410000 0.410000 0.410000\n"
+        "0.700000 0.700000 0.700000\n"
+        "1.000000 1.000000 1.000000\n"
+    )
+    assert cube_text(2, looks["warm-shift"], title="Warm Shift") == (
+        'TITLE "Warm Shift"\n'
+        "LUT_3D_SIZE 2\n"
+        "DOMAIN_MIN 0 0 0\n"
+        "DOMAIN_MAX 1 1 1\n"
+        "0.000000 0.000000 0.000000\n"
+        "1.000000 0.000000 0.000000\n"
+        "0.000000 1.000000 0.000000\n"
+        "1.000000 1.000000 0.000000\n"
+        "0.000000 0.000000 0.900000\n"
+        "1.000000 0.000000 0.900000\n"
+        "0.000000 1.000000 0.900000\n"
+        "1.000000 1.000000 0.900000\n"
+    )
+
+    # And every look in the set stays inside the domain at a lattice fine enough to reach the
+    # midtones, where the two S-curves actually bend.
     for lut_id, title, transform in DEFAULT_LUTS:
-        text = cube_text(5, transform, title=title)
-        assert text == cube_text(5, transform, title=title), lut_id
-        for line in text.splitlines()[4:]:
-            assert all(0.0 <= float(value) <= 1.0 for value in line.split())
+        for line in cube_text(5, transform, title=title).splitlines()[4:]:
+            assert all(0.0 <= float(value) <= 1.0 for value in line.split()), lut_id
 
 
 def test_the_default_lattice_is_33(tmp_path: Path):
@@ -976,6 +1244,33 @@ def ffmpeg(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["ffmpeg", "-y", "-v", "error", *args], capture_output=True, text=True, check=False
     )
+
+
+def frame_grid(rendered: Path) -> tuple[int, int, int]:
+    """`(width, height, frames)` of a rendered file, counted rather than read off a header.
+
+    `-count_frames` decodes the stream instead of trusting `nb_frames`, which a container may
+    not carry at all and which a filter that dropped frames would not correct. The design note
+    behind this slice stakes everything on *"the assembled video matches the song within one
+    frame, for every combination of effects"*, and until this existed the three real renders in
+    this file asserted only that ffmpeg exited zero.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,nb_read_frames",
+            "-of", "default=noprint_wrappers=1",
+            rendered.as_posix(),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.strip()
+    # Read by key rather than by position: ffprobe prints these in its own fixed order, not in
+    # the order `-show_entries` asked for.
+    fields = dict(line.split("=", 1) for line in result.stdout.split() if "=" in line)
+    return (int(fields["width"]), int(fields["height"]), int(fields["nb_read_frames"]))
 
 
 def test_a_generated_identity_round_trips_through_lut3d_and_a_wrong_nesting_does_not(
@@ -1028,6 +1323,20 @@ def test_a_generated_identity_round_trips_through_lut3d_and_a_wrong_nesting_does
 
     assert psnr(right) > 60.0
     assert psnr(wrong) < 10.0
+
+    # And the same identity, loaded from a directory whose name holds every character class the
+    # quoting rule claims to survive. Until this line, the *only* paths that reached real ffmpeg
+    # in this suite were under `tmp_path`, which contains no space, comma, semicolon, bracket,
+    # percent, ampersand or equals sign — so `test_the_drive_letter_colon_never_reaches_ffmpegs
+    # _option_parser` asserted four strings and the binary evidence covered exactly one
+    # character class, the drive-letter colon. The comma and the semicolon are the two that
+    # break every other escaping form in the module docstring's table, and the percent sign is
+    # the one nothing in this file would notice if the escaper started rewriting it.
+    awkward = tmp_path / "a b,c;d[e]%f&g=h"
+    awkward.mkdir()
+    hostile = awkward / "identity.cube"
+    hostile.write_text(cube_text(33, identity_transform), encoding="utf-8")
+    assert psnr(hostile) > 60.0
 
 
 def test_a_texture_before_pad_leaves_the_letterbox_bars_pure_black(tmp_path: Path):
@@ -1220,6 +1529,84 @@ def test_every_stage_the_catalogue_can_emit_is_accepted_by_this_projects_ffmpeg(
         )
         assert result.returncode == 0, f"{effect_id}: {result.stderr.strip()}"
         assert dest.is_file(), effect_id
+        # `returncode == 0` is a syntax gate. The frame grid is the semantic one: six frames
+        # were asked for and six must come back, at the export's own geometry, because an
+        # effect that dropped or duplicated a frame would put every later shot out of sync
+        # with the song and would exit zero doing it.
+        assert frame_grid(dest) == (320, 240, 6), effect_id
+
+
+def test_all_twenty_effects_stacked_at_once_render_through_the_real_chain(tmp_path: Path):
+    """One render of a *combination*, because every other real render in this file is one
+    effect — or grain and a vignette — and combinations are string-only otherwise.
+
+    The whole catalogue at once is the extreme of the matrix: four families, both insertion
+    points, two effects that compose to more than one stage, a geometry group that crops three
+    separate times before `scale` and a treatment group of seventeen filters between `scale`
+    and `pad`. It is also the only place the escaped comma inside Dutch Tilt's `max()` shares a
+    chain with twenty-two other comma-separated stages.
+
+    The frame grid is the assertion that matters: twenty filters deep, six frames in at the
+    export's geometry must still be six frames out at the export's geometry.
+    """
+    write_default_luts(lut_directory(tmp_path), size=5)
+    luts = discover_luts(tmp_path)
+    everything = [
+        effect("punch_in", zoom=1.2),
+        effect("handheld_shake", amplitude=0.02, frequency=3),
+        effect("dutch_tilt", angle=-6),
+        effect("mirror", axis="both"),
+        effect("grain", strength=14, seed=99),
+        effect("vignette", angle=0.7),
+        effect("soft_focus", sigma=1.5),
+        effect("sharpen", amount=0.8),
+        effect("banding_suppression", threshold=0.01),
+        effect("lut_look", lut=luts[0].lut_id, interp="trilinear"),
+        effect("exposure", amount=0.1),
+        effect("contrast", amount=1.3),
+        effect("saturation", amount=0.7),
+        effect("temperature", amount=0.25),
+        effect("tint", amount=-0.2),
+        effect("lift_gamma_gain", lift=0.03, gamma=1.1, gain=-0.04),
+        effect("monochrome", amount=0.4),
+        effect("chroma_split", shift=0.006),
+        effect("posterize", levels=12),
+        effect("pixelate", size=3),
+    ]
+    assert {spec["effect"] for spec in everything} == set(EFFECT_CATALOGUE)
+
+    built = build_effect_stages(everything, width=320, height=240, luts=luts)
+    # Six geometry stages before `scale` from four effects — Dutch Tilt is two of them and
+    # Mirror on both axes is two more — and seventeen treatments from sixteen effects, the
+    # extra being Lift/Gamma/Gain's inseparable pair.
+    assert len(built.geometry) == 6
+    assert len(built.treatment) == 17
+
+    source = tmp_path / "source.mp4"
+    assert (
+        ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=s=320x240:d=1:r=24", "-frames:v", "24",
+            "-pix_fmt", "yuv420p", str(source),
+        ).returncode
+        == 0
+    )
+    dest = tmp_path / "everything.mp4"
+    result = subprocess.run(
+        trim_args(
+            source,
+            dest,
+            frames=6,
+            width=320,
+            height=240,
+            geometry_stages=built.geometry,
+            treatment_stages=built.treatment,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.strip()
+    assert frame_grid(dest) == (320, 240, 6)
 
 
 def test_the_catalogue_covers_all_four_families_with_bounded_declared_parameters():
@@ -1242,16 +1629,43 @@ def test_the_catalogue_covers_all_four_families_with_bounded_declared_parameters
 
 
 def test_a_lut_entry_never_takes_its_path_from_the_stack(tmp_path: Path):
-    """Belt and braces on the one place a client string could have become a path. The stack
-    below names an id that exists; the entry it resolves to is the one the *server* built, and
-    the composed stage carries that path and no part of the client's string."""
+    """Belt and braces on the one place a client string could have become a path.
+
+    The filename and the id are **deliberately different words**. `Grade 07 (Final).cube` is
+    discovered under the id `grade-07-final`, because the id is lowercased, hyphenated and
+    stripped of punctuation — so a stage built by interpolating the client's string would read
+    `grade-07-final` where the real one reads `Grade 07 (Final).cube`, and the two are
+    distinguishable at a glance. The previous version of this test used a fixture whose stem
+    and id were the same word, checked a substring rather than the stage, and recomputed the
+    colon escape with the same expression the code uses: it would have passed against a stub
+    that simply interpolated whatever the stack sent.
+
+    So: the whole stage is compared, the escape is built by splitting at the first colon rather
+    than by rewriting every colon the way `lut_file_argument` does, and the client's own string
+    is asserted **absent** from the result.
+    """
     directory = lut_directory(tmp_path)
     directory.mkdir(parents=True)
-    (directory / "house.cube").write_text(cube_text(2, identity_transform), encoding="utf-8")
+    server_file = directory / "Grade 07 (Final).cube"
+    server_file.write_text(cube_text(2, identity_transform), encoding="utf-8")
     luts = discover_luts(tmp_path)
-    assert luts == (LutEntry(lut_id="house", name="house", path=directory / "house.cube"),)
-    built = stages([effect("lut_look", lut="house")], luts=luts)
-    assert (directory / "house.cube").as_posix().replace(":", r"\:") in built.treatment[0]
+    assert luts == (
+        LutEntry(lut_id="grade-07-final", name="Grade 07 (Final)", path=server_file),
+    )
+
+    built = stages([effect("lut_look", lut="grade-07-final")], luts=luts)
+
+    # `tmp_path` is the one part of the expectation that cannot be a literal, so it is taken
+    # from the folder this test made — never from the entry the code returned. The drive
+    # letter's colon is escaped by hand: split once at the first colon, put `\:` back.
+    posix = directory.as_posix()
+    head, colon, tail = posix.partition(":")
+    escaped = f"{head}\\:{tail}" if colon else posix
+    assert built.treatment == (
+        f"lut3d=file='{escaped}/Grade 07 (Final).cube':interp=tetrahedral",
+    )
+    # And nothing the client sent survives into the filter string.
+    assert "grade-07-final" not in built.treatment[0]
 
 
 def test_the_same_stack_renders_the_same_frames_twice_and_the_grain_seed_is_load_bearing(
