@@ -19,6 +19,7 @@ Two design facts worth stating once:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -421,6 +422,8 @@ def trim_args(
     height: int,
     offset: float = 0.0,
     preset: ExportPreset = DRAFT_PRESET,
+    geometry_stages: Sequence[str] = (),
+    treatment_stages: Sequence[str] = (),
 ) -> list[str]:
     """One take → one normalized intermediate: exact frame count, target geometry, no audio.
 
@@ -437,17 +440,34 @@ def trim_args(
     is where the export's only video encode happens (the join copies), so it is where a
     delivery build is decided. Omitted, it is `draft`, whose two values are the two this
     function has always written.
+
+    **The two effect insertion points, and there are only two** (AD-17). `geometry_stages`
+    goes after the trim pair and *before* `scale`, so a punch-in samples the take's own
+    pixels rather than resampling an already-scaled frame. `treatment_stages` — texture,
+    grade and stylize, already in their fixed order — goes after `scale` and *before* `pad`,
+    so grain and a vignette treat the picture and leave the letterbox bars at pure black
+    (measured 2026-08-21: after `pad` the bar samples RGB `(1,1,5)`, before it `(0,0,0)`).
+    Everything from `pad` onward is untouched, and both default to empty, so a project with
+    no effects builds the byte-identical argv this function has always built.
+
+    Neither group is composed here. `effects.py` owns the catalogue, the validation and the
+    family ordering, and hands this function two lists of finished strings — which is why
+    this module imports nothing from it and the grid arithmetic below cannot be reached by
+    an effect at all.
     """
     skip = round(offset * ASSEMBLY_FPS)
     stages = (
-        [f"trim=start_frame={skip}", "setpts=PTS-STARTPTS"] if skip > 0 else []
-    ) + [
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
-        f"fps={ASSEMBLY_FPS}",
-        "setsar=1",
-        "format=yuv420p",
-    ]
+        ([f"trim=start_frame={skip}", "setpts=PTS-STARTPTS"] if skip > 0 else [])
+        + list(geometry_stages)
+        + [f"scale={width}:{height}:force_original_aspect_ratio=decrease"]
+        + list(treatment_stages)
+        + [
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+            f"fps={ASSEMBLY_FPS}",
+            "setsar=1",
+            "format=yuv420p",
+        ]
+    )
     filters = ",".join(stages)
     return [
         "ffmpeg",

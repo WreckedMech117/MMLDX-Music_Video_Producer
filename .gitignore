@@ -5,6 +5,11 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 data/projects/
+# Generated on first use by `effects.write_default_luts`, and a place the Director drops
+# their own colour work. Neither belongs in the repository: the five defaults are ~5 MB of
+# arithmetic that regenerates in a fifth of a second, and nobody else's LUTs may be
+# committed at all.
+data/luts/
 !data/.gitkeep
 .DS_Store
 Thumbs.db
