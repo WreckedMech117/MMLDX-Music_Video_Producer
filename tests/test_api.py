@@ -22475,6 +22475,267 @@ def test_an_envelope_that_disagrees_with_its_record_is_not_served(tmp_path: Path
     }
 
 
+def measured_project_for_currency(root: Path):
+    """A project with real audio and a current measurement, and the two files that describe it.
+
+    Its own data root, so each state below starts from the same clean "current" and one state
+    cannot leave a mutated sidecar behind for the next.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    client, store, _comfy = make_client(root)
+    project = store.create(Project(name="Currency"))
+    import_measured_song(client, project.id)
+    saved = ProjectStore(root).get(project.id)
+    audio = store.project_dir(project.id) / saved.song.path
+    sidecar = store.project_dir(project.id) / saved.song.analysis.path
+    return client, store, project.id, audio, sidecar
+
+
+def edit_analysis_record(root: Path, project_id: str, **fields) -> None:
+    """Hand-edit the manifest's analysis record - the state the agreement check exists to catch."""
+    saved = ProjectStore(root).get(project_id)
+    for name, value in fields.items():
+        setattr(saved.song.analysis, name, value)
+    ProjectStore(root).save(saved)
+
+
+def truncate_envelope_bands(sidecar: Path, keep: int) -> None:
+    envelope = json.loads(sidecar.read_text(encoding="utf-8"))
+    envelope["bands"] = envelope["bands"][:keep]
+    sidecar.write_text(json.dumps(envelope), encoding="utf-8")
+
+
+def test_the_read_and_the_analysis_agree_on_every_state_of_a_measurement(tmp_path: Path):
+    """A10: one question, one answer, and both callers asking it.
+
+    Two places on the server used to answer "is this envelope current?" and they answered it
+    differently. Only the read path required the manifest record and the sidecar to agree about
+    how the song was measured - so a measurement the read reported absent with
+    `SONG_ENVELOPE_RECORD_DISAGREES` was current-and-skippable to the analysis, and, the
+    non-forced caller being the render-landing path, stayed that way until something forced a
+    measurement.
+
+    **Driven, not asserted about the source.** Every row of the story's matrix is put into the
+    files, then *both* paths are asked: the read over HTTP, and `analyze_project_song` with its
+    `analyze_song` counted. "The analysis considered it current" is defined behaviourally - it
+    returned success without measuring - because that is the only definition a caller can
+    observe, and it is the one that was wrong.
+
+    The digest count is checked in the same pass: the shared verdict has to settle a song of a
+    different length on a `stat`, and it may not take one before the sizes are known to agree.
+    """
+    from music_video_producer import app as app_module
+
+    #      name, how to reach the state, present?, the read's sentence, digests the read pays
+    states = (
+        ("current", lambda ctx: None, True, "", 1),
+        (
+            "record disagrees about the band count",
+            lambda ctx: edit_analysis_record(ctx["root"], ctx["project_id"], band_count=3),
+            False,
+            SONG_ENVELOPE_RECORD_DISAGREES,
+            1,
+        ),
+        (
+            "record disagrees about the analysis rate",
+            lambda ctx: edit_analysis_record(ctx["root"], ctx["project_id"], analysis_rate=60.0),
+            False,
+            SONG_ENVELOPE_RECORD_DISAGREES,
+            1,
+        ),
+        (
+            "the bands array is shorter than both headers",
+            lambda ctx: truncate_envelope_bands(ctx["sidecar"], 3),
+            False,
+            SONG_ENVELOPE_RECORD_DISAGREES,
+            1,
+        ),
+        (
+            "bytes changed, and the length with them",
+            lambda ctx: ctx["audio"].write_bytes(click_wav_bytes(bpm=120, seconds=6.0)),
+            False,
+            SONG_ENVELOPE_SONG_CHANGED,
+            0,
+        ),
+        (
+            "bytes changed underneath an identical length",
+            lambda ctx: ctx["audio"].write_bytes(click_wav_bytes(bpm=90, seconds=4.0)),
+            False,
+            SONG_ENVELOPE_SONG_CHANGED,
+            1,
+        ),
+        (
+            "the sidecar is gone",
+            lambda ctx: ctx["sidecar"].unlink(),
+            False,
+            SONG_ENVELOPE_FILE_UNREADABLE,
+            1,
+        ),
+        (
+            "the sidecar is not an envelope",
+            lambda ctx: ctx["sidecar"].write_text("{}", encoding="utf-8"),
+            False,
+            SONG_ENVELOPE_FILE_UNREADABLE,
+            1,
+        ),
+        (
+            "no record at all",
+            lambda ctx: edit_analysis_record(
+                ctx["root"], ctx["project_id"], path="", song_fingerprint=""
+            ),
+            False,
+            SONG_ENVELOPE_NOT_TAKEN,
+            0,
+        ),
+        (
+            "the song file is gone",
+            lambda ctx: ctx["audio"].unlink(),
+            False,
+            SONG_ANALYSIS_MEDIA_MISSING,
+            0,
+        ),
+    )
+
+    for index, (name, mutate, present, reason, digests) in enumerate(states):
+        root = tmp_path / f"state-{index}"
+        client, store, project_id, audio, sidecar = measured_project_for_currency(root)
+        mutate({"root": root, "project_id": project_id, "audio": audio, "sidecar": sidecar})
+
+        calls = {"hash": 0, "measure": 0}
+        real_fingerprint = app_module.song_fingerprint
+        real_analyze = app_module.analyze_song
+
+        # Both spies bind this iteration's counter and real function as defaults: a closure over
+        # the loop variables would count into whichever dict the last iteration left behind.
+        def counted_fingerprint(path, _real=real_fingerprint, _calls=calls):
+            _calls["hash"] += 1
+            return _real(path)
+
+        def counted_analyze(source, _real=real_analyze, _calls=calls, **kwargs):
+            _calls["measure"] += 1
+            return _real(source, **kwargs)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(app_module, "song_fingerprint", counted_fingerprint)
+        monkeypatch.setattr(app_module, "analyze_song", counted_analyze)
+        try:
+            # The read first, because the analysis below repairs most of these states.
+            answer = client.get(f"/api/projects/{project_id}/song/envelope").json()
+            assert answer["present"] is present, name
+            assert answer["reason"] == reason, name
+            paid = calls["hash"]
+            assert paid == digests, f"{name}: the read took {paid} digest(s), expected {digests}"
+
+            # Then the automatic analysis path, over the same files, unforced.
+            project = ProjectStore(root).get(project_id)
+            outcome = analyze_project_song(store, project_id, project, audio)
+        finally:
+            monkeypatch.undo()
+
+        skipped = calls["measure"] == 0 and outcome == ""
+        verb = "skipped" if skipped else "re-measured"
+        assert skipped is present, (
+            f"{name}: the read says present={present} and the analysis {verb}"
+        )
+
+    assert len(states) == 10
+
+
+def test_a_record_that_disagrees_with_its_file_is_re_measured_and_not_skipped(tmp_path: Path):
+    """The divergence itself, end to end: the state that was stuck, and is no longer.
+
+    A hand-edited record whose bytes still match the song passed the analysis path's old
+    fingerprint-and-sidecar test, so the automatic route skipped it as current while the read
+    refused to serve it. Nothing but a forced `POST /song/analyze` could clear it - and the
+    non-forced caller is the render-landing path, so in practice nothing did.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Stuck"))
+    import_measured_song(client, project.id)
+    endpoint = f"/api/projects/{project.id}/song/envelope"
+    assert client.get(endpoint).json()["present"] is True
+
+    saved = ProjectStore(tmp_path).get(project.id)
+    audio = store.project_dir(project.id) / saved.song.path
+    saved.song.analysis.band_count = 3
+    ProjectStore(tmp_path).save(saved)
+    assert client.get(endpoint).json() == {
+        "present": False,
+        "reason": SONG_ENVELOPE_RECORD_DISAGREES,
+    }
+
+    # The automatic path, unforced. It re-measures, and the record it writes agrees with the file.
+    stuck = ProjectStore(tmp_path).get(project.id)
+    assert analyze_project_song(store, project.id, stuck, audio) == ""
+    assert stuck.song.analysis.band_count == 8
+    ProjectStore(tmp_path).save(stuck)
+    served = client.get(endpoint).json()
+    assert served["present"] is True
+    assert len(served["envelope"]["bands"]) == 8
+
+
+def test_the_landing_gate_reads_no_sidecar_and_takes_no_digest(tmp_path: Path):
+    """The cheap question stays cheap, and folding it into the shared verdict would have ended it.
+
+    `_song_bytes_moved` asks *could the bytes have moved?*, which a `stat` answers. The verdict
+    the other two paths share asks *is this measurement usable?*, which costs a digest and a
+    sidecar read. R-10 puts the landing trigger on an in-memory comparison precisely so the
+    two-second poll pays neither, so both are counted here rather than argued about.
+    """
+    from music_video_producer import app as app_module
+
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Cheap gate"))
+    import_measured_song(client, project.id)
+    client.post(
+        f"/api/projects/{project.id}/generate/flux",
+        json={
+            "name": "Lead singer",
+            "kind": "character",
+            "prompt": "portrait",
+            "width": 1024,
+            "height": 1024,
+            "steps": 4,
+            "guidance": 4,
+            "seed": 1,
+        },
+    )
+
+    calls = {"hash": 0, "sidecar": 0}
+    real_fingerprint = app_module.song_fingerprint
+    real_read = store.read_song_envelope
+
+    def counted_fingerprint(path):
+        calls["hash"] += 1
+        return real_fingerprint(path)
+
+    def counted_read(project_id, relative_path):
+        calls["sidecar"] += 1
+        return real_read(project_id, relative_path)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "song_fingerprint", counted_fingerprint)
+    monkeypatch.setattr(store, "read_song_envelope", counted_read)
+    try:
+        comfy.history = completed_history_for(
+            [
+                {
+                    "subfolder": f"music-video-producer/{project.id}/assets",
+                    "filename": "Lead singer_00001_.png",
+                }
+            ]
+        )
+        report = client.get(f"/api/projects/{project.id}/render-status")
+        assert report.status_code == 200, report.text
+        # The tick really did settle something, or this proves nothing at all.
+        assert report.json()["assets"][0]["path"].endswith("Lead singer_00001_.png")
+    finally:
+        monkeypatch.undo()
+
+    assert calls["hash"] == 0, "the landing gate hashed the song"
+    assert calls["sidecar"] == 0, "the landing gate read the envelope sidecar"
+
+
 def test_a_sidecar_that_is_not_an_envelope_is_never_served_as_one(tmp_path: Path):
     """End to end through the endpoint: the store's shape and version checks are what stand
     between a consumer and a `present: true` carrying no arrays to read."""

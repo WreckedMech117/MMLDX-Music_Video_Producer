@@ -6990,6 +6990,88 @@ def _adopt_song_analysis(incoming: Song | None, stored: Song | None) -> None:
     )
 
 
+@dataclass(frozen=True)
+class SongMeasurement:
+    """One verdict on one question: does this stored measurement still describe this song?
+
+    `current` is the answer. `reason` is the sentence a caller reporting absence has to report,
+    so no caller re-derives it from the same inputs — a second answer to a smaller question is
+    the shape this type exists to remove. `envelope` is the sidecar's contents when, and only
+    when, the verdict is `current`, so the read path is not made to open the file twice.
+
+    `recorded` is false when there was no measurement to judge at all. It is separate from
+    `current` because "never measured" and "measured, and stale" have different remedies, and
+    because the read path answers the first one with the more specific sentence
+    `analysis_absence_reason` works out from the state of this machine.
+    """
+
+    current: bool
+    reason: str
+    envelope: dict[str, Any] | None = None
+    recorded: bool = True
+
+
+def song_measurement_verdict(
+    store: ProjectStore, project_id: str, analysis: SongAnalysis, source: Path
+) -> SongMeasurement:
+    """Whether `analysis` still describes the audio at `source`, and why not when it does not.
+
+    **One implementation, because there was nearly a second.** The read path and the analysis
+    skip both asked this question and answered it differently: only the read path checked that
+    the record and the sidecar agree about how the song was measured, so an envelope the read
+    reported absent with `SONG_ENVELOPE_RECORD_DISAGREES` was current-and-skippable to the
+    analysis — and, the non-forced caller being the render-landing path, stayed that way until
+    something forced a measurement. Two answers to one question is the defect; this is the fix.
+
+    **Cheapest first, and the order is the contract.** A `stat` against the byte count the stored
+    fingerprint was taken over settles the common case for free — a replaced song is almost never
+    the same length as the one before it — and the SHA-256 behind it runs only when the sizes
+    agree. The sidecar is opened only once the bytes are known to match, because a measurement of
+    a song that is no longer here is not worth reading.
+
+    Not to be confused with `_song_bytes_moved`, which asks the cheaper and genuinely different
+    question *could the bytes have moved?* on the two-second render poll. That one may never grow
+    a hash or a sidecar read; this one is both, and is reached only when somebody asks.
+    """
+    if not analysis.path or not analysis.song_fingerprint:
+        # Nothing to judge. The reason is the plain one; a caller with a file in front of it and
+        # a reason to be specific refines it with `analysis_absence_reason`.
+        return SongMeasurement(False, SONG_ENVELOPE_NOT_TAKEN, recorded=False)
+    try:
+        measured = source.stat().st_size
+    except OSError:
+        # The media, not the measurement, is what is missing — and the sentence has to say so.
+        # "The song changed" would send a Director looking for a replacement they never made.
+        return SongMeasurement(False, SONG_ANALYSIS_MEDIA_MISSING)
+    if fingerprint_size(analysis.song_fingerprint) != measured:
+        return SongMeasurement(False, SONG_ENVELOPE_SONG_CHANGED)
+    # Same size is only a *maybe* — an edit in place, a re-render of the same length — so the
+    # digest still settles it. This is the expensive read, and it is now reached only by a song
+    # whose length is unchanged.
+    current = song_fingerprint(source)
+    if not current:
+        return SongMeasurement(False, SONG_ANALYSIS_MEDIA_MISSING)
+    if not song_fingerprints_match(analysis.song_fingerprint, current):
+        return SongMeasurement(False, SONG_ENVELOPE_SONG_CHANGED)
+    envelope = store.read_song_envelope(project_id, analysis.path)
+    if envelope is None:
+        return SongMeasurement(False, SONG_ENVELOPE_FILE_UNREADABLE)
+    # The record and the file have to agree about how the song was measured. They are written in
+    # the same breath and cannot disagree by any path this application takes — but a consumer
+    # reads `band_count` off the *record* and then indexes `bands` in the *file*, so a
+    # disagreement is an out-of-range read on a screen rather than an error anybody sees. Checked
+    # because it is the manifest that is hand-editable, and because "they cannot differ" is an
+    # argument, not a guarantee. It lives here rather than at the read path so that the analysis
+    # re-measures the state the read refuses to serve, instead of skipping it forever.
+    if (
+        envelope.get("band_count") != analysis.band_count
+        or envelope.get("analysis_rate") != analysis.analysis_rate
+        or len(envelope.get("bands") or ()) != analysis.band_count
+    ):
+        return SongMeasurement(False, SONG_ENVELOPE_RECORD_DISAGREES)
+    return SongMeasurement(True, "", envelope)
+
+
 def analyze_project_song(
     store: ProjectStore,
     project_id: str,
@@ -7012,12 +7094,14 @@ def analyze_project_song(
     callable from somewhere that is not the import route, and testable without one. The store and
     the already-resolved path are arguments for exactly that reason.
 
-    **Skippable by fingerprint.** With an envelope already on disk whose stored fingerprint
-    matches the song's current bytes, this returns immediately and re-measures nothing — and
-    returns `""`, because "already done" is a success and must never read as a failure to run.
-    The sidecar is checked as well as the fingerprint, so a record pointing at a deleted file
-    re-measures rather than reporting itself current forever. `force` is for a caller that wants
-    the measurement retaken at a changed rate or band count.
+    **Skippable when the measurement is still current**, and *current* is decided by
+    `song_measurement_verdict` — the one function that answers that question for this
+    application, and the same one `song_envelope_report` asks. So this path skips precisely what
+    the read path is willing to serve: a sidecar that has gone, or one whose header disagrees
+    with the record that names it, is re-measured here rather than treated as done while the
+    read reports it absent. A skip returns `""`, because "already done" is a success and must
+    never read as a failure to run. `force` is for a caller that wants the measurement retaken
+    at a changed rate or band count, and skips the verdict entirely.
 
     **Synchronous by design.** A three-minute song measures in **168 ms** end to end on this
     build — 53 ms of ffmpeg decode and 115 ms of transform and features, against a 245 ms budget
@@ -7032,15 +7116,15 @@ def analyze_project_song(
     song = project.song
     if song is None:
         return SONG_ANALYSIS_WITHOUT_SONG
+    # The currency question, asked of the one function that answers it, so this path skips
+    # exactly what the read path serves and re-measures exactly what the read path refuses.
+    # Asked before the fingerprint is taken, because the verdict settles the common "the song
+    # was replaced" case on a `stat` and a digest here would have made that saving impossible.
+    if not force and song_measurement_verdict(store, project_id, song.analysis, source).current:
+        return ""
     fingerprint = song_fingerprint(source)
     if not fingerprint:
         return SONG_ANALYSIS_MEDIA_MISSING
-    if (
-        not force
-        and song_fingerprints_match(song.analysis.song_fingerprint, fingerprint)
-        and store.read_song_envelope(project_id, song.analysis.path) is not None
-    ):
-        return ""
     try:
         envelope = analyze_song(source)
     except FfmpegMissing:
@@ -7551,11 +7635,19 @@ def create_app(
         * no Song on the project at all;
         * a Song whose audio is not on disk (no path yet, or the file is gone);
         * a Song whose bytes no longer match the fingerprint the envelope was taken from;
-        * a record pointing at a sidecar that is missing or is not readable JSON;
+        * a record pointing at a sidecar that is missing, is not readable JSON, or disagrees
+          with the record about how the song was measured;
         * a Song that has never been measured, with the specific reason worked out by
           `analysis_absence_reason` — ffmpeg absent from this machine, or a file ffmpeg will not
           decode, or simply not yet;
         * and the envelope itself.
+
+        **The middle answers are not decided here.** Whether a stored measurement still describes
+        the song in front of it is `song_measurement_verdict`'s question, and the analysis path
+        asks it too — so an envelope this route reports absent is one the analysis re-measures,
+        rather than one it skips as current. This route's own contribution is the two ends the
+        verdict has no opinion about: which sentence a *never measured* song gets, and the states
+        that exist before there is a file to judge at all.
 
         Nothing above is stored. The fingerprint is recomputed from the song's current bytes, and
         the failure reason is recomputed from the state of this machine and this file — so no
@@ -7590,44 +7682,20 @@ def create_app(
             source = None
         if source is None:
             return {"present": False, "reason": SONG_ANALYSIS_MEDIA_MISSING}
-        analysis = song.analysis
-        if not analysis.path or not analysis.song_fingerprint:
+        # Everything from here — is the record still describing this file, and if not, why not —
+        # belongs to `song_measurement_verdict`, which the analysis path asks in the same words.
+        # It works cheapest-first: a `stat` before any digest, and the sidecar opened only once
+        # the bytes are known to agree. What is left to decide here is which *sentence* an
+        # absence gets, which is the one thing this route knows and the analysis path does not.
+        verdict = song_measurement_verdict(store, project_id, song.analysis, source)
+        if verdict.current:
+            return {"present": True, "reason": "", "envelope": verdict.envelope}
+        if not verdict.recorded:
+            # Never measured, so the interesting question is why nobody could — ffmpeg absent
+            # from this machine, or a file ffmpeg will not decode, or simply not yet. Worked out
+            # now, from this machine and this file, and never remembered.
             return {"present": False, "reason": analysis_absence_reason(source)}
-        # The cheap half of the comparison first. A fingerprint carries the byte count it was
-        # taken over precisely so this question can be asked of a file without reading it: a
-        # `stat` is a metadata lookup, where the SHA-256 behind it reads every byte of a master.
-        # A song that was replaced is almost never the same length as the one before it, so this
-        # answers the common case for free and the digest below runs only when the sizes agree.
-        try:
-            measured = source.stat().st_size
-        except OSError:
-            return {"present": False, "reason": SONG_ANALYSIS_MEDIA_MISSING}
-        if fingerprint_size(analysis.song_fingerprint) != measured:
-            return {"present": False, "reason": SONG_ENVELOPE_SONG_CHANGED}
-        # Same size is only a *maybe* — an edit in place, a re-render of the same length — so the
-        # digest still settles it. This is the expensive read, and it is now reached only by a
-        # song whose length is unchanged.
-        current = song_fingerprint(source)
-        if not current:
-            return {"present": False, "reason": SONG_ANALYSIS_MEDIA_MISSING}
-        if not song_fingerprints_match(analysis.song_fingerprint, current):
-            return {"present": False, "reason": SONG_ENVELOPE_SONG_CHANGED}
-        envelope = store.read_song_envelope(project_id, analysis.path)
-        if envelope is None:
-            return {"present": False, "reason": SONG_ENVELOPE_FILE_UNREADABLE}
-        # The record and the file have to agree about how the song was measured. They are written
-        # in the same breath and cannot disagree by any path this application takes — but a
-        # consumer reads `band_count` off the *record* and then indexes `bands` in the *file*, so
-        # a disagreement is an out-of-range read on a screen rather than an error anybody sees.
-        # Checked because it is the manifest that is hand-editable, and because "they cannot
-        # differ" is an argument, not a guarantee.
-        if (
-            envelope.get("band_count") != analysis.band_count
-            or envelope.get("analysis_rate") != analysis.analysis_rate
-            or len(envelope.get("bands") or ()) != analysis.band_count
-        ):
-            return {"present": False, "reason": SONG_ENVELOPE_RECORD_DISAGREES}
-        return {"present": True, "reason": "", "envelope": envelope}
+        return {"present": False, "reason": verdict.reason}
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
