@@ -6687,10 +6687,88 @@ def served_measurement(envelope: dict[str, Any] | None) -> dict[str, Any] | None
     Missing keys are carried as missing rather than defaulted, which cannot happen for an envelope
     `store.read_song_envelope` has validated and is written this way so that a hand-edited sidecar
     surfaces as a drawing that is short rather than as arrays of zeros that look measured.
+
+    **Non-numbers are dropped for the same reason, and it is not hypothetical.** The reader checks
+    a key is *present*, never what is under it, and the currency verdict checks only `band_count`,
+    `analysis_rate` and the length of `bands` — so `"onsets": null`, a string, or a list of lists
+    all reach this function intact from a manifest a Director can edit. Serving them raised a
+    `ResponseValidationError` against the declared shape, which is a 500 on a route whose own
+    contract two paragraphs above the decorator says absence is a 200 and that none of these may
+    become an error. Worse in the browser, where the read fails silently and takes the *gap* half
+    down with it — targets that never came from the envelope at all.
     """
     if envelope is None:
         return None
-    return {key: envelope[key] for key in SERVED_ENVELOPE_KEYS if key in envelope}
+    def numbers(value: Any) -> list[float] | None:
+        if not isinstance(value, list):
+            return None
+        kept = [
+            float(item)
+            for item in value
+            if isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(item)
+        ]
+        return kept if len(kept) == len(value) else None
+    served = {}
+    for key in SERVED_ENVELOPE_KEYS:
+        if key not in envelope:
+            continue
+        usable = numbers(envelope[key])
+        if usable is not None:
+            served[key] = usable
+    return served
+
+
+class SnapTargetsEnvelope(BaseModel):
+    """`SERVED_ENVELOPE_KEYS`, declared — the drawing half of the timeline's one measurement read.
+
+    **The keys are `SERVED_ENVELOPE_KEYS` and the two must not drift**, which
+    `test_the_snap_targets_shape_is_declared_and_drops_nothing` holds by comparing them. A key
+    added to that tuple without a field here would be filtered off the wire by this model, which
+    is precisely the failure a `response_model` introduces if it is allowed to fall behind.
+
+    Every field defaults to empty **and the route is served with `response_model_exclude_unset`**,
+    so a key `served_measurement` did not carry is still absent here rather than becoming `[]`.
+    That is not a detail: `served_measurement`'s own docstring says a missing key is carried as
+    missing so that a hand-edited sidecar surfaces as a drawing that is *short* rather than as
+    arrays of zeros that look measured, and a model that defaulted it would quietly reverse that.
+    """
+
+    beats: list[float] = Field(default_factory=list)
+    onsets: list[float] = Field(default_factory=list)
+    band_average: list[float] = Field(default_factory=list)
+    band_edges: list[float] = Field(default_factory=list)
+
+
+class SnapTargetsResponse(BaseModel):
+    """What `GET /timeline/snap-targets` answers: what a drag may land on, and what the band draws.
+
+    Declared rather than left a bare dict — the retrospective's pattern-divergence finding (A13):
+    this was the only `/timeline/` route without a `response_model`, beside seven siblings that
+    all have one, so its seven fields appeared in no `/openapi.json` and no client could discover
+    them. (`GET /song/envelope` is deliberately **not** given one; its docstring argues the
+    omission and the argument holds — it serves `audio.py`'s own recorded arrays, thousands of
+    floats whose shape that module already owns.)
+
+    **A declared shape on a route that already had consumers is a filter, and that is the risk it
+    carries.** FastAPI serialises the handler's answer *through* this model, so a field the model
+    omits disappears from the wire silently — no error, no log, and two e2e scripts plus the
+    browser read this route. So the fields below are the route's return dict exactly, and
+    `test_the_snap_targets_shape_is_declared_and_drops_nothing` derives that dict's keys from the
+    handler's own source and fails if the two ever differ.
+
+    `measured` and `analysed` are here rather than inferred from the two lists being empty,
+    because `vocal_gaps` distinguishes *unmeasured* from *measured and voiced throughout* and this
+    application never flattens the two together. `envelope` is `null` when there is no
+    measurement, which is `analysed: false` said in the shape the band consumes.
+    """
+
+    gaps: list[float] = Field(default_factory=list)
+    beats: list[float] = Field(default_factory=list)
+    measured: bool = False
+    analysed: bool = False
+    start: float = 0.0
+    end: float = 0.0
+    envelope: SnapTargetsEnvelope | None = None
 
 
 class ShotListRequest(BaseModel):
@@ -7624,23 +7702,38 @@ def create_app(
     def song_envelope_report(project_id: str, project: Project) -> dict[str, Any]:
         """What this project's song analysis is, decided entirely at read time.
 
-        One shape, six answers, and **every one of them derived here and now**. `present` is the
-        only thing a consumer branches on; `reason` says why when it is false and is never empty
-        when it is false. There is no seventh answer where an envelope is served *and* something
-        is wrong with it — an envelope that fails any check here is absent, not degraded, because
-        a partly-trusted measurement is how an envelope of zeros gets downstream.
+        One shape, **nine sentences and the envelope**, and every one of them derived here and
+        now. `present` is the only thing a consumer branches on; `reason` says why when it is
+        false and is never empty when it is false. There is no further answer where an envelope
+        is served *and* something is wrong with it — an envelope that fails any check here is
+        absent, not degraded, because a partly-trusted measurement is how an envelope of zeros
+        gets downstream.
 
-        The six, in the order they are decided:
+        The nine are named rather than counted, because a count retyped in prose is a claim about
+        this function that goes stale the moment a reason is added — which is exactly what
+        happened: this docstring said *six* and omitted `SONG_ENVELOPE_RECORD_DISAGREES`, which
+        the branch at the bottom returns. `test_the_absence_reasons_split_into_read_and_write`
+        derives the split from this module and fails if any of it drifts again.
 
-        * no Song on the project at all;
-        * a Song whose audio is not on disk (no path yet, or the file is gone);
-        * a Song whose bytes no longer match the fingerprint the envelope was taken from;
-        * a record pointing at a sidecar that is missing, is not readable JSON, or disagrees
-          with the record about how the song was measured;
+        The branches, in the order they are decided:
+
+        * no Song on the project at all — `SONG_ENVELOPE_WITHOUT_SONG`;
+        * a Song whose render has not landed, so it has no audio path yet —
+          `SONG_ENVELOPE_AUDIO_PENDING`;
+        * a Song whose audio file is not on disk — `SONG_ANALYSIS_MEDIA_MISSING`;
+        * a measurement `song_measurement_verdict` accepts — **the envelope itself**;
         * a Song that has never been measured, with the specific reason worked out by
-          `analysis_absence_reason` — ffmpeg absent from this machine, or a file ffmpeg will not
-          decode, or simply not yet;
-        * and the envelope itself.
+          `analysis_absence_reason` — ffmpeg absent from this machine
+          (`SONG_ANALYSIS_FFMPEG_MISSING`), a file ffmpeg will not decode
+          (`SONG_ENVELOPE_UNDECODABLE`), or simply not yet (`SONG_ENVELOPE_NOT_TAKEN`);
+        * a stored measurement the verdict refuses — bytes that no longer match the fingerprint
+          it was taken from (`SONG_ENVELOPE_SONG_CHANGED`), a sidecar that is missing or is not
+          readable JSON (`SONG_ENVELOPE_FILE_UNREADABLE`), or a sidecar that disagrees with the
+          record about how the song was measured (`SONG_ENVELOPE_RECORD_DISAGREES`).
+
+        The three remaining `SONG_ANALYSIS_*` constants — `SONG_ANALYSIS_WITHOUT_SONG`,
+        `SONG_ANALYSIS_DECODE_FAILED` and `SONG_ANALYSIS_WRITE_FAILED` — are the write half's,
+        logged by the analysis path and never served here.
 
         **The middle answers are not decided here.** Whether a stored measurement still describes
         the song in front of it is `song_measurement_verdict`'s question, and the analysis path
@@ -12548,7 +12641,17 @@ def create_app(
         response.applied = True
         return response
 
-    @app.get("/api/projects/{project_id}/timeline/snap-targets")
+    @app.get(
+        "/api/projects/{project_id}/timeline/snap-targets",
+        response_model=SnapTargetsResponse,
+        # **Every field this handler sets is on the wire; nothing it did not set is invented.**
+        # The seven below are set unconditionally, so this changes nothing about them — what it
+        # protects is the nested envelope, where `served_measurement` carries a missing key as
+        # missing on purpose. Without this, the model's `default_factory=list` would turn that
+        # into `[]`, which is a measurement of zero beats rather than a measurement that was not
+        # taken, and `SnapTargetsEnvelope`'s docstring says why the two must stay apart.
+        response_model_exclude_unset=True,
+    )
     def read_timeline_snap_targets(project_id: str) -> dict[str, Any]:
         """The song's measurement as the timeline uses it: what to draw and what to land on.
 

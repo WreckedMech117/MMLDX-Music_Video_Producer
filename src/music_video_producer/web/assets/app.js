@@ -1,4 +1,4 @@
-import { APPLY_DOCUMENTS_CONTROL, ASSET_NAME_HELP, ASSET_NAME_LABEL, assetNamePlan, ASSET_ROLE_LABELS, ASSET_TABS, assetTab, assetsForTab, assetTabEmpty, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_EDIT_BLOCKED, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, characterSlotPlan, CITATION_MISSING_LABEL, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, consistencyAnchorPlan, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, DOCUMENT_CONTROLS, PLACEHOLDER_PROMPT, RENDER_POLL_INTERVAL_MS, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE, alignLyricsKeptTranscription, api, applyRenderStatus, approvalControl, approvalNotice, assistantControl, assistantFillAllControl, assistantToast, clearDocumentConsent, comfyOutputUrl, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, expansionReport, hasActiveRenderJobs, jobTarget, INSTRUMENTAL_NOTE, markReadyControl, markReadyNotice, aiModPlan, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, randomSeed, generateAllPlan, batchReportToast, snapSeconds, shotBoundaries, prefillControl, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, resolveShotMode, shotCitations, shotExpansionToast, shotLabel, shotInspectorReadiness, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, VOCAL_TYPES, vocalTaggingPlan, vocalTypeSpec, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast } from "./api.js";
+import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -17,7 +17,7 @@ import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clamp
 // which class it takes is `beatMarkerPlan`, and nothing here re-derives any of it: this module
 // reads the measurement once on the load path -- in the same reply that carries the drag's own
 // targets -- positions what the plan returns, and writes nothing.
-import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, BEAT_MARKERS_HELP, BEAT_MARKERS_LABEL, beatMarkerPlan } from "./api.js";
+import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, beatMarkerPlan } from "./api.js";
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
@@ -1771,7 +1771,12 @@ function renderTimeline() {
     // the timeline (`max(song, last shot, 30)`), and bounding the marks by it would let a beat be
     // drawn past the end of the audio whenever a shot runs off the end of the track.
     const songSeconds = state.project?.song?.duration || 0;
-    const key = `${beatMarkersOn}:${state.pixelsPerSecond}:${trackWidth}:${songSeconds}`;
+    const key = beatBandIdentity({
+      enabled: beatMarkersOn,
+      pixelsPerSecond: state.pixelsPerSecond,
+      trackWidth,
+      duration: songSeconds,
+    });
     if (key !== beatBandKey || state.songMeasurement !== beatBandMeasurement) {
       beatBandKey = key;
       beatBandMeasurement = state.songMeasurement;
@@ -3999,16 +4004,19 @@ function cssEscape(value) {
 function syncBeatMarkersControl() {
   const button = $(BEAT_MARKERS_CONTROL);
   if (!button) return;
-  const onOff = beatMarkersOn ? "on" : "off";
-  button.classList.toggle("snap-on", beatMarkersOn);
-  button.setAttribute("aria-pressed", beatMarkersOn ? "true" : "false");
+  // The sentences and the pressed state are `beatMarkersControlPlan`'s, not this function's --
+  // `syncSnapTargetsControl` reads a plan for exactly this reason and the two toggles shipped in
+  // one epic should not disagree about where a control's words live.
+  const plan = beatMarkersControlPlan(beatMarkersOn);
+  button.classList.toggle("snap-on", plan.on);
+  button.setAttribute("aria-pressed", plan.pressed);
   // Two different lengths on purpose. The **accessible name** is the four words a screen reader
   // should read on every focus and every press; the paragraph explaining what the band is goes on
   // `title`, where it is read once by someone who went looking for it. Naming the button with the
   // whole help text made focusing it a 288-character announcement, which is how a control becomes
   // unusable by being over-described.
-  button.title = `${BEAT_MARKERS_LABEL}: ${onOff}. ${BEAT_MARKERS_HELP}`;
-  button.setAttribute("aria-label", `${BEAT_MARKERS_LABEL}: ${onOff}`);
+  button.title = plan.title;
+  button.setAttribute("aria-label", plan.label);
 }
 
 // One step back. The snapshot is sent first and adopted only from the reply: a refused undo must

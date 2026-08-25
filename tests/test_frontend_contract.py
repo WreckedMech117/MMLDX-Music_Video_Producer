@@ -186,7 +186,15 @@ const make = (selector) => ({
   },
   addEventListener(type, handler) { listeners.set(selector + ":" + type, handler); },
   append() {}, remove() {}, pause() {}, load() {}, click() {},
-  setAttribute() {}, removeAttribute() {}, getAttribute() { return null; },
+  // Attributes are recorded rather than discarded. They were no-ops, and that was a hole with a
+  // shape: an accessible name is *only* ever set through `setAttribute`, so no test in this file
+  // could read one back, and `aria-label` and `aria-pressed` were assertable only as authored
+  // markup in `index.html` -- which is exactly the half the renderer overwrites. A control whose
+  // name is composed at runtime could be bound to the wrong string and every test would pass.
+  attributes: {},
+  setAttribute(name, value) { this.attributes[name] = String(value); },
+  removeAttribute(name) { delete this.attributes[name]; },
+  getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
   querySelectorAll: () => [],
   getBoundingClientRect: () => ({ left: 0, top: 0, width: 1000, height: 300 }),
   closest() { return this; },
@@ -11345,14 +11353,21 @@ MEASURED_SONG = {
 
 
 def envelope_absence_reasons() -> list[str]:
-    """Every sentence a `present: false` envelope read can carry, read off `app.py`.
+    """Every absence sentence `app.py` declares, read off the module rather than retyped.
 
     Derived rather than retyped, and this is not tidiness. An earlier draft of this story said
-    "six read-time reasons" and hand-listed six; there are twelve -- seven `SONG_ENVELOPE_*`
-    plus the five `SONG_ANALYSIS_*` failures `analysis_absence_reason` and the write half can
-    reach. A hand-list is a claim about the server that goes stale silently, and the client's
-    whole contract here is that it never branches on which reason it was, so the honest test is
-    to feed it *all* of them, including ones added after this test was written.
+    "six read-time reasons" and hand-listed six; `app.py` declares **twelve** -- seven
+    `SONG_ENVELOPE_*` and five `SONG_ANALYSIS_*` -- of which **nine are reachable from a read**
+    and three belong to the write half alone (`SONG_ANALYSIS_WITHOUT_SONG`,
+    `SONG_ANALYSIS_DECODE_FAILED`, `SONG_ANALYSIS_WRITE_FAILED`). That split is derived and
+    asserted by `test_the_absence_reasons_split_into_read_and_write` in `tests/test_api.py`;
+    what is derived here is the whole twelve.
+
+    **The superset is deliberate.** The client's contract is that it never branches on which
+    reason it was, so the honest test feeds it every sentence the server has -- the three a read
+    cannot currently produce included, because "cannot currently" is a fact about today's
+    branches and not about the client. A hand-list is a claim about the server that goes stale
+    silently; this one takes in reasons added after it was written.
     """
     from music_video_producer import app as app_module
 
@@ -11514,6 +11529,70 @@ def test_every_kind_the_band_draws_is_either_snappable_or_named_as_a_reference_m
     assert "reference mark" in lowered, help_text
     # The one that *is* snappable must not be described as merely a reference mark.
     assert lowered.index("snap target") < lowered.index("reference mark"), help_text
+
+
+def test_the_beat_band_and_its_toggle_decide_nothing_in_the_drawing_module():
+    """Both of the marker band's decisions live in `api.js`, beside their own siblings.
+
+    Epic 8 shipped two identity keys as pure functions here -- `songEnvelopeIdentity` and
+    `snapTargetsIdentity` -- and composed the beat band's third one inline in `app.js`. It shipped
+    `syncSnapTargetsControl` reading a plan for its sentences, and `syncBeatMarkersControl`
+    composing its own beside it. Two toggles from one epic disagreeing about where a control's
+    words live is the divergence this asserts against, and `app.js` re-deriving a decision is the
+    rejection this repo's convention exists for.
+
+    The measurement is compared by object identity at the call site rather than folded into the
+    key: it is half a megabyte of arrays, and stringifying it every render to notice it changed
+    would cost more than the repaint being avoided.
+    """
+    plan = run_module(
+        """
+        import { beatBandIdentity, beatMarkersControlPlan, BEAT_MARKERS_LABEL, BEAT_MARKERS_HELP }
+          from './src/music_video_producer/web/assets/api.js';
+        const key = (over) => beatBandIdentity(Object.assign(
+          { enabled: true, pixelsPerSecond: 16, trackWidth: 900, duration: 60 }, over));
+        console.log(JSON.stringify({
+          same:      key({}) === key({}),
+          offMoves:  key({}) !== key({ enabled: false }),
+          zoomMoves: key({}) !== key({ pixelsPerSecond: 32 }),
+          widthMoves:key({}) !== key({ trackWidth: 901 }),
+          songMoves: key({}) !== key({ duration: 61 }),
+          empty:     beatBandIdentity(),
+          on:        beatMarkersControlPlan(true),
+          off:       beatMarkersControlPlan(false),
+          label:     BEAT_MARKERS_LABEL,
+          help:      BEAT_MARKERS_HELP,
+        }));
+        """
+    )
+
+    # Every input the drawing depends on moves the key, and nothing else does.
+    assert plan["same"], "the same inputs gave two different keys"
+    for moved in ("offMoves", "zoomMoves", "widthMoves", "songMoves"):
+        assert plan[moved], f"{moved}: an input the band is drawn from does not move the key"
+    assert isinstance(plan["empty"], str) and plan["empty"], "no arguments must still give a key"
+
+    # The toggle's two lengths, and the reason they differ: the accessible name is read on every
+    # focus, the paragraph is read once by someone who went looking.
+    assert plan["on"]["label"] == f"{plan['label']}: on"
+    assert plan["off"]["label"] == f"{plan['label']}: off"
+    assert plan["on"]["pressed"] == "true" and plan["off"]["pressed"] == "false"
+    assert plan["on"]["on"] is True and plan["off"]["on"] is False
+    assert plan["help"] in plan["on"]["title"], "the paragraph belongs on title"
+    assert plan["help"] not in plan["on"]["label"], (
+        "the help paragraph is in the accessible name again -- focusing the control announces it "
+        "in full, which is how a control becomes unusable by being over-described"
+    )
+    assert len(plan["on"]["label"]) <= 40, plan["on"]["label"]
+
+    # And `app.js` composes neither of them.
+    drawing = without_comments(APP_JS.read_text(encoding="utf-8"))
+    assert "beatBandIdentity(" in drawing and "beatMarkersControlPlan(" in drawing
+    for rederived in ("${beatMarkersOn}:", "BEAT_MARKERS_HELP}`", "${BEAT_MARKERS_LABEL}:"):
+        assert rederived not in drawing, (
+            f"{rederived!r} is composed in the drawing module again; it is a decision and belongs "
+            "in api.js beside its siblings"
+        )
 
 
 def test_beat_markers_thin_to_a_readable_density_at_every_zoom():
@@ -11932,10 +12011,14 @@ def test_the_timeline_paints_the_beat_band_and_the_toggle_changes_only_that():
       // `renderTimeline` from outside it: off first, then back on.
       fire('#beat-markers:click');
       const hidden = {{ band: at('#beat-band').innerHTML, shots: at('#shots-track').innerHTML,
-                       lit: at('#beat-markers').classList.contains('snap-on') }};
+                       lit: at('#beat-markers').classList.contains('snap-on'),
+                       name: at('#beat-markers').attributes['aria-label'],
+                       tip: at('#beat-markers').title }};
       fire('#beat-markers:click');
       const shown = {{ band: at('#beat-band').innerHTML, shots: at('#shots-track').innerHTML,
-                      lit: at('#beat-markers').classList.contains('snap-on') }};
+                      lit: at('#beat-markers').classList.contains('snap-on'),
+                      name: at('#beat-markers').attributes['aria-label'],
+                      tip: at('#beat-markers').title }};
       // Zoomed: the same marks on the same seconds at the new scale. The band is only rewritten
       // when something it depends on moved, so this is also what proves the scale is one of them.
       fire('#zoom-in:click');
@@ -11954,6 +12037,24 @@ def test_the_timeline_paints_the_beat_band_and_the_toggle_changes_only_that():
     assert drawn["shown"]["band"].count("beat-mark") == 4
     assert drawn["shown"]["band"].count("onset-mark") == 3
     assert drawn["shown"]["lit"] is True
+
+    # The plan's two lengths reach the two attributes they were written for, and not each other.
+    # Swapping them is a one-line mis-binding that every source-text check would still pass, and it
+    # would announce the whole help paragraph on every focus -- the 288-character defect this
+    # control already had once.
+    plan = run_module(
+        """
+        import { beatMarkersControlPlan } from './src/music_video_producer/web/assets/api.js';
+        console.log(JSON.stringify({ on: beatMarkersControlPlan(true), off: beatMarkersControlPlan(false) }));
+        """
+    )
+    assert drawn["shown"]["name"] == plan["on"]["label"], drawn["shown"]["name"]
+    assert drawn["shown"]["tip"] == plan["on"]["title"], drawn["shown"]["tip"]
+    assert drawn["hidden"]["name"] == plan["off"]["label"], drawn["hidden"]["name"]
+    assert drawn["hidden"]["tip"] == plan["off"]["title"], drawn["hidden"]["tip"]
+    assert len(drawn["shown"]["name"]) < len(drawn["shown"]["tip"]), (
+        "the accessible name is no shorter than the help paragraph, so the two are swapped"
+    )
 
     # Off: an empty band, and the pressed treatment off with it.
     assert drawn["hidden"]["band"] == ""
@@ -12092,7 +12193,10 @@ def test_there_is_one_client_path_to_the_measurement_and_it_is_never_on_a_timer(
     # URL by hand, and a route that only this client names is a route nothing else checks.
     assert "/api/projects/${id}/timeline/snap-targets" in contract
     server = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
-    assert '@app.get("/api/projects/{project_id}/timeline/snap-targets")' in server
+    assert '@app.get(' in server and '"/api/projects/{project_id}/timeline/snap-targets",' in server
+    assert "response_model=SnapTargetsResponse" in server, (
+        "the declared shape is gone; the route can drop a field again without a test noticing"
+    )
     # ...and the full-measurement endpoint is still there, unchanged, for everyone else.
     assert '@app.get("/api/projects/{project_id}/song/envelope")' in server
 
@@ -12758,8 +12862,9 @@ def test_the_snap_selector_says_what_dragging_will_do_without_being_opened():
 # ------------------------------------------------------------------------------------------
 # A row that cannot pull says so, and offers the fix this application actually holds.
 #
-# Epic 8's headline finding: the server computes twelve absence reasons and serves
-# `measured`/`analysed` on every targets read, and none of it reached the Director anywhere --
+# Epic 8's headline finding: the server declares twelve absence reasons, nine of which a read
+# can produce, and serves `measured`/`analysed` on every targets read -- and none of it reached
+# the Director anywhere --
 # while `POST /song/analyze` had no caller in the interface at all and all five real projects had
 # a song and no analysis. These execute the whole matrix rather than reading the source, because
 # the two defects Epic 8 shipped both passed every source-reading gate.
@@ -14658,7 +14763,9 @@ def test_the_drag_resolves_its_targets_once_and_never_ports_the_gap_rule_into_ja
             assert "napTargets" not in line, line
     # The client's path and the server's route, read off both sides.
     assert "/api/projects/${id}/timeline/snap-targets" in contract
-    assert '@app.get("/api/projects/{project_id}/timeline/snap-targets")' in Path(
+    assert '@app.get(' in Path(
+        "src/music_video_producer/app.py"
+    ).read_text(encoding="utf-8") and '"/api/projects/{project_id}/timeline/snap-targets",' in Path(
         "src/music_video_producer/app.py"
     ).read_text(encoding="utf-8")
 

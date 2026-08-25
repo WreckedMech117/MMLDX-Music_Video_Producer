@@ -5925,6 +5925,37 @@ export const BEAT_MARKERS_HELP =
 // meanings -- `--cyan` already means *approved* and `--blue` is reserved permanently for
 // transitions and reactive bindings -- and a marker is a reference mark, not a state.
 export const BEAT_MARKER_KINDS = { beat: "beat", onset: "onset" };
+
+// When the drawn band would differ, as one string. `songEnvelopeIdentity`'s reason exactly: a key
+// composed where it is used is a decision spelled in `app.js`, and its two siblings from this same
+// epic are both pure functions here. The measurement is compared by identity by the caller rather
+// than folded in -- it is an object, not a value, and stringifying half a megabyte per render to
+// notice it changed would cost more than the repaint it is avoiding.
+export function beatBandIdentity(options) {
+  // `options || {}` rather than a destructuring default: that default fires on `undefined` only,
+  // and a caller reaching for a measurement that is not there hands this `null`. A key function
+  // that throws would stop the band redrawing for the rest of the render.
+  const { enabled = true, pixelsPerSecond = 0, trackWidth = 0, duration = 0 } = options || {};
+  // A non-finite scale is its own key rather than folding into zero: `NaN` and 0 are different
+  // states and a band drawn at one must not survive into the other.
+  const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : String(value));
+  return `${Boolean(enabled)}:${num(pixelsPerSecond)}:${num(trackWidth)}:${num(duration)}`;
+}
+
+// What the beat-marker toggle says it is doing. Two different lengths on purpose, and the reason is
+// recorded rather than inferred: the **accessible name** is the few words a screen reader reads on
+// every focus and every press, and the paragraph explaining the band goes on `title`, read once by
+// someone who went looking. Naming the button with the whole help text made focusing it a
+// 288-character announcement, which is how a control becomes unusable by being over-described.
+export function beatMarkersControlPlan(enabled = true) {
+  const onOff = enabled ? "on" : "off";
+  return {
+    on: Boolean(enabled),
+    pressed: enabled ? "true" : "false",
+    label: `${BEAT_MARKERS_LABEL}: ${onOff}`,
+    title: `${BEAT_MARKERS_LABEL}: ${onOff}. ${BEAT_MARKERS_HELP}`,
+  };
+}
 export const BEAT_MARKER_CLASSES = { beat: "beat-mark", onset: "onset-mark" };
 
 // How close two marks of the same kind may come before the further one is dropped, and how close

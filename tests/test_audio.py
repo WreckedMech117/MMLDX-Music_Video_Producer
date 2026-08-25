@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import subprocess
 import wave
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -56,13 +57,41 @@ def click_track(bpm: float, seconds: float = 30.0, rate: int = DECODE_SAMPLE_RAT
         beat += 1
 
 
-def wav_file(path: Path, samples: np.ndarray, rate: int = 44100) -> Path:
-    with wave.open(str(path), "wb") as target:
+def write_wav(destination, samples: np.ndarray, rate: int) -> None:
+    """The one serialisation: mono, 16-bit, clipped rather than wrapped.
+
+    Takes a path or a file object, because the two callers want different things out of it — a
+    file on disk for the decode tests here, and bytes for the upload tests in `test_api.py`.
+    """
+    with wave.open(destination, "wb") as target:
         target.setnchannels(1)
         target.setsampwidth(2)
         target.setframerate(rate)
         target.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+
+
+def wav_file(path: Path, samples: np.ndarray, rate: int = 44100) -> Path:
+    write_wav(str(path), samples, rate)
     return path
+
+
+def click_wav_bytes(bpm: float = 120.0, seconds: float = 4.0, rate: int = 22050) -> bytes:
+    """`click_track` as an uploadable file — a real, decodable metronome.
+
+    **The same generator, not a second one.** This was a stdlib transcription of `click_track`'s
+    formula living in `test_api.py`: the same `sin(2*pi*1000*t) * exp(-120*t)` over the same
+    0.02 s burst, written out a sample at a time at a different amplitude. Two spellings of one
+    signal is two things to keep in step, and the retrospective's duplication map named it (A12).
+    So the arithmetic is `click_track`'s alone and this adds the container.
+
+    The default silence in `test_api.py`'s `wav_bytes` is a legitimate measurement and therefore
+    useless for telling *measured* from *not measured*. This one has beats in it, so a BPM
+    greater than zero is evidence the analysis actually ran rather than evidence of a defaulted
+    record — which is why the API suite reaches for it rather than for silence.
+    """
+    content = BytesIO()
+    write_wav(content, click_track(bpm, seconds=seconds, rate=rate), rate)
+    return content.getvalue()
 
 
 def test_the_decode_argv_is_the_pipe_it_claims_to_be(tmp_path: Path):

@@ -4,7 +4,6 @@ import copy
 import hashlib
 import inspect
 import json
-import math
 import re
 import subprocess
 import wave
@@ -17,6 +16,17 @@ from typing import get_args
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+
+# The one test-audio generator, shared with the unit suite rather than transcribed. `click_wav_bytes`
+# is `test_audio.click_track` in a WAV container: the same decaying 1 kHz burst per beat whose
+# tempo `test_audio` asserts is recovered exactly. This file used to carry a stdlib transcription
+# of that formula at a different amplitude -- one signal in two languages, which the Epic 8
+# retrospective's duplication map named (A12) -- so a change to the metronome now moves both
+# suites together instead of leaving one measuring a track the other no longer produces.
+#
+# `tests/` is on `sys.path` under pytest's default import mode, which is how
+# `test_frontend_contract` already imports `click_track` from the same module.
+from test_audio import click_wav_bytes
 
 from music_video_producer import models
 from music_video_producer.app import (
@@ -21165,30 +21175,11 @@ def test_the_whole_queue_cancel_is_the_per_job_route_and_not_a_second_settle_pat
 # ---------------------------------------------------------------------------
 
 
-def click_wav_bytes(bpm: float = 120.0, seconds: float = 4.0, rate: int = 22050) -> bytes:
-    """A real, decodable metronome — the smallest thing that measures as *music*.
-
-    `wav_bytes` above is silence, which is a legitimate measurement and therefore useless for
-    telling "measured" from "not measured". This one has beats in it, so a BPM greater than zero
-    is evidence that the analysis actually ran rather than evidence of a defaulted record.
-    """
-    content = BytesIO()
-    period_frames = max(1, round(60.0 / bpm * rate))
-    burst = int(0.02 * rate)
-    frames = bytearray()
-    for index in range(int(rate * seconds)):
-        into_beat = index % period_frames
-        value = 0
-        if into_beat < burst:
-            moment = into_beat / rate
-            value = int(20000 * math.sin(2 * math.pi * 1000 * moment) * math.exp(-moment * 120))
-        frames += int(value).to_bytes(2, "little", signed=True)
-    with wave.open(content, "wb") as target:
-        target.setnchannels(1)
-        target.setsampwidth(2)
-        target.setframerate(rate)
-        target.writeframes(bytes(frames))
-    return content.getvalue()
+# The metronome this section measures is `test_audio.click_wav_bytes`, imported at the top of
+# this file rather than spelled a second time here -- see the note on that import. `wav_bytes`
+# above is still the silent one: silence is a legitimate measurement and therefore useless for
+# telling "measured" from "not measured", which is why this section reaches for a track with
+# beats in it.
 
 
 def import_measured_song(client, project_id: str, *, bpm: float = 120.0, name: str = "beat.wav"):
@@ -21199,6 +21190,57 @@ def import_measured_song(client, project_id: str, *, bpm: float = 120.0, name: s
     )
     assert response.status_code == 200, response.text
     return response
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param({"onsets": None}, id="a-null-array"),
+        pytest.param({"beats": None}, id="the-other-null-array"),
+        pytest.param({"onsets": "0.5"}, id="a-string-where-a-list-belongs"),
+        pytest.param({"onsets": [None]}, id="a-null-inside-the-array"),
+        pytest.param({"band_average": [[0.1]]}, id="nested-lists"),
+    ],
+)
+def test_a_sidecar_the_reader_accepts_but_cannot_be_drawn_is_still_a_200(tmp_path: Path, damage):
+    """A hand-edited sidecar makes the drawing short. It does not make the route an error.
+
+    `read_song_envelope` checks that a key is *present*, never what is under it, and the currency
+    verdict checks only `band_count`, `analysis_rate` and the length of `bands`. So a value a
+    Director typed into the manifest reaches the wire intact. Declaring a response shape made that
+    a `ResponseValidationError` — a 500 on a route whose own docstring says absence is a 200 and
+    that none of these may become an error.
+
+    The browser makes it worse rather than better: one read carries both halves now, and its catch
+    is silent by design, so a 500 here loses the **gap** targets too -- and those never came from
+    the envelope at all. The one-read consolidation is only safe if the envelope half failing
+    cannot take the transcription half with it.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Damaged sidecar"))
+    import_measured_song(client, project.id)
+
+    sidecar = tmp_path / "projects" / project.id / "media" / "analysis" / "song-envelope.json"
+    healthy = json.loads(sidecar.read_text(encoding="utf-8"))
+    served_before = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert served_before["analysed"] is True, served_before
+
+    sidecar.write_text(json.dumps({**healthy, **damage}), encoding="utf-8")
+    response = client.get(f"/api/projects/{project.id}/timeline/snap-targets")
+
+    assert response.status_code == 200, (
+        "a sidecar the reader accepted became an error on the wire", response.text[:200]
+    )
+    body = response.json()
+    # The half that has nothing to do with the envelope must survive it.
+    assert body["gaps"] == served_before["gaps"]
+    assert body["measured"] == served_before["measured"]
+    # And the damaged key is simply absent, rather than served as zeros that look measured.
+    damaged = set(damage)
+    served = body["envelope"] or {}
+    assert damaged.isdisjoint(served), (damaged, sorted(served))
+    for intact in set(served_before["envelope"]) - damaged:
+        assert served[intact] == served_before["envelope"][intact], intact
 
 
 def test_importing_a_song_measures_it_into_a_sidecar_and_records_only_a_pointer(tmp_path: Path):
@@ -21461,6 +21503,132 @@ def test_the_timeline_read_carries_the_marks_without_the_per_frame_series(tmp_pa
     assert half["analysed"] is False and half["beats"] == [] and half["envelope"] is None
 
 
+def test_the_snap_targets_shape_is_declared_and_drops_nothing(tmp_path: Path):
+    """`GET /timeline/snap-targets` answers a declared model, and the model is the whole answer.
+
+    **A `response_model` on a route that already has consumers is a filter.** FastAPI serialises
+    the handler's dict *through* the model, so a field the model omits vanishes from the wire with
+    no error and no log — and two e2e scripts plus the browser read this route. That is the entire
+    risk of retrospective item A13, which asked for the declaration because this was the only
+    `/timeline/` route without one, beside seven siblings that all have one.
+
+    So the shape is held from both ends rather than described. The model's fields are compared
+    against the keys of the handler's own `return` dict, read out of `app.py`'s parse tree, and
+    the served body is compared **byte for byte** with the JSON that dict serialised to before the
+    model existed. A field added to one side and not the other fails here rather than in a
+    browser.
+
+    `GET /song/envelope` is deliberately left undeclared and is checked here as the other side of
+    that: its docstring argues the omission — it serves `audio.py`'s own recorded arrays — and
+    A13 did not overturn it.
+    """
+    from music_video_producer.app import (
+        SERVED_ENVELOPE_KEYS,
+        SnapTargetsEnvelope,
+        SnapTargetsResponse,
+        served_measurement,
+    )
+
+    # The handler's `return {...}` keys, read off the source rather than off a response: a route
+    # that stopped setting a field would otherwise look identical to a model that dropped it.
+    tree = ast.parse(Path("src/music_video_producer/app.py").read_text(encoding="utf-8"))
+    handler = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "read_timeline_snap_targets"
+    )
+    returned = next(
+        node.value
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+    )
+    keys = {key.value for key in returned.keys}
+    assert keys == set(SnapTargetsResponse.model_fields), (
+        "the declared shape and the handler's answer disagree, so a field is being dropped or "
+        f"invented on the wire: {sorted(keys ^ set(SnapTargetsResponse.model_fields))}"
+    )
+    # The nested half is `served_measurement`'s projection, and the two lists must not drift: a
+    # key added to `SERVED_ENVELOPE_KEYS` without a field here would be filtered straight off.
+    assert set(SnapTargetsEnvelope.model_fields) == set(SERVED_ENVELOPE_KEYS)
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Declared"))
+
+    # Every field, in every state the route can answer in. Asserted as the *whole* key set rather
+    # than as "the ones I care about", because dropping is silent and the empty states are where a
+    # default would hide it.
+    def body(label: str) -> dict:
+        response = client.get(f"/api/projects/{project.id}/timeline/snap-targets")
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert set(payload) == set(SnapTargetsResponse.model_fields), (label, sorted(payload))
+        return payload
+
+    songless = body("no song at all")
+    assert songless == {"gaps": [], "beats": [], "measured": False, "analysed": False,
+                        "start": 0.0, "end": 0.0, "envelope": None}
+
+    import_measured_song(client, project.id, bpm=120)
+    analysed = body("measured and analysed")
+    assert analysed["analysed"] is True and analysed["beats"] and analysed["envelope"]
+
+    # Byte-identical to what the bare dict serialised to. Rebuilt from the same two functions the
+    # handler calls, over the same stored project, and compared against the raw response — not
+    # against `.json()`, which would forgive `0` becoming `0.0`.
+    saved = ProjectStore(tmp_path).get(project.id)
+    whole = json.loads(
+        (store.project_dir(project.id) / saved.song.analysis.path).read_text(encoding="utf-8")
+    )
+    targets = drag_snap_targets(saved.song, beats=whole["beats"])
+    expected = {
+        "gaps": targets.gaps,
+        "beats": targets.beats,
+        "measured": targets.measured,
+        "analysed": True,
+        "start": targets.start,
+        "end": targets.end,
+        "envelope": served_measurement(whole),
+    }
+    raw = client.get(f"/api/projects/{project.id}/timeline/snap-targets").content
+    assert raw == json.dumps(
+        expected, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")
+    ).encode("utf-8"), raw
+
+    # Transcribed and not analysed: the gap half alone, and every field still present.
+    saved.song.lyric_words = [("la", 0.5, 1.0), ("la", 2.5, 3.0)]
+    saved.song.vocal_spans = [(0.5, 1.0), (2.5, 3.0)]
+    store.save(saved)
+    (store.project_dir(project.id) / saved.song.path).write_bytes(click_wav_bytes(bpm=90))
+    half = body("transcribed, and the analysis no longer describes the file")
+    assert half["measured"] is True and half["gaps"]
+    assert half["analysed"] is False and half["beats"] == [] and half["envelope"] is None
+
+    # A key `served_measurement` did not carry stays absent rather than becoming `[]`. Unreachable
+    # through the route — `store.read_song_envelope` refuses a sidecar missing a required key — so
+    # it is asserted where it lives, on the model and the flag the route is served with. Without
+    # `response_model_exclude_unset` this is `[]`, which reads as a measurement that found no
+    # onsets rather than one that was never taken.
+    short = SnapTargetsResponse.model_validate(
+        {"gaps": [], "beats": [1.0], "measured": False, "analysed": True, "start": 0.0,
+         "end": 4.0, "envelope": {"beats": [1.0]}}
+    )
+    assert short.model_dump(exclude_unset=True)["envelope"] == {"beats": [1.0]}
+    assert set(short.model_dump()["envelope"]) == set(SERVED_ENVELOPE_KEYS)
+
+    # And the point of declaring it at all: the fields are now discoverable, which is what the
+    # seven siblings have and this route did not.
+    schema = client.get("/openapi.json").json()
+    reference = schema["paths"]["/api/projects/{project_id}/timeline/snap-targets"]["get"][
+        "responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+    declared = schema["components"]["schemas"][reference.rsplit("/", 1)[1]]
+    assert set(declared["properties"]) == set(SnapTargetsResponse.model_fields)
+
+    # `GET /song/envelope` is unchanged and still undeclared, for the reason its docstring gives.
+    envelope_route = schema["paths"]["/api/projects/{project_id}/song/envelope"]["get"][
+        "responses"]["200"]["content"]["application/json"]["schema"]
+    assert "$ref" not in envelope_route, envelope_route
+
+
 def test_the_envelope_is_served_by_its_own_endpoint_and_never_by_a_project_response(
     tmp_path: Path,
 ):
@@ -21668,6 +21836,93 @@ def test_an_undecodable_file_leaves_the_song_intact_and_names_why(tmp_path: Path
         "present": False,
         "reason": SONG_ENVELOPE_UNDECODABLE,
     }
+
+
+def test_the_absence_reasons_split_into_read_and_write():
+    """How many absence reasons there are, derived from `app.py` instead of retyped.
+
+    **This test exists because the number was stated three times and was wrong all three.** A
+    dispatch said "six", and the six propagated into `song_envelope_report`'s docstring -- which
+    then hand-listed five bullets and the envelope, omitting `SONG_ENVELOPE_RECORD_DISAGREES`,
+    which the same function returns seventy lines lower -- into a `deferred-work.md` entry, and
+    into a test docstring that said twelve of a set that is not the one a read can reach. Retro
+    finding S10, action item A11.
+
+    So the split is *derived*: the declared constants from the module's own namespace, and the
+    read-reachable ones from the three functions a read actually passes through, by walking the
+    parse tree for the names they mention. A reason added tomorrow lands in one half or the other
+    and the partition below still holds; what it cannot do is quietly make a stated count wrong,
+    because the counts stated in prose are asserted against these.
+
+    Names are read from `ast.Name` nodes, so a constant *mentioned in a docstring* -- which
+    `song_envelope_report`'s now does, for all twelve -- is not mistaken for one the code returns.
+    """
+    from music_video_producer import app as app_module
+
+    prefixes = ("SONG_ENVELOPE_", "SONG_ANALYSIS_")
+    declared = {
+        name
+        for name, value in vars(app_module).items()
+        if isinstance(value, str) and name.startswith(prefixes)
+    }
+    tree = ast.parse(Path("src/music_video_producer/app.py").read_text(encoding="utf-8"))
+    bodies = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    def mentioned(function: str) -> set[str]:
+        assert function in bodies, f"{function} was renamed, so this test proves nothing"
+        return {
+            node.id
+            for node in ast.walk(bodies[function])
+            if isinstance(node, ast.Name) and node.id.startswith(prefixes)
+        }
+
+    # The three functions a `present: false` passes through: the route's own report, the verdict
+    # it delegates the middle to, and the never-measured branch's own reason.
+    read_reachable = (
+        mentioned("song_envelope_report")
+        | mentioned("song_measurement_verdict")
+        | mentioned("analysis_absence_reason")
+    )
+    write_only = declared - read_reachable
+
+    # The measured truth, and the shape of it rather than only the size: every declared reason is
+    # in exactly one half, so a thirteenth cannot go uncounted by being in neither.
+    assert read_reachable <= declared, sorted(read_reachable - declared)
+    assert read_reachable | write_only == declared
+    assert not (read_reachable & write_only)
+    assert len(declared) == 12, sorted(declared)
+    assert read_reachable == {
+        "SONG_ENVELOPE_WITHOUT_SONG",
+        "SONG_ENVELOPE_AUDIO_PENDING",
+        "SONG_ANALYSIS_MEDIA_MISSING",
+        "SONG_ANALYSIS_FFMPEG_MISSING",
+        "SONG_ENVELOPE_UNDECODABLE",
+        "SONG_ENVELOPE_NOT_TAKEN",
+        "SONG_ENVELOPE_SONG_CHANGED",
+        "SONG_ENVELOPE_FILE_UNREADABLE",
+        "SONG_ENVELOPE_RECORD_DISAGREES",
+    }, sorted(read_reachable)
+    # The write half's three: reported by the analysis path, logged, and never on a read's wire.
+    assert write_only == {
+        "SONG_ANALYSIS_WITHOUT_SONG",
+        "SONG_ANALYSIS_DECODE_FAILED",
+        "SONG_ANALYSIS_WRITE_FAILED",
+    }, sorted(write_only)
+
+    # And every read-reachable sentence really is one a read can answer with -- named in the
+    # docstring that lists them, so the list and the branches cannot drift apart again. The
+    # count is spelled from the derived length rather than typed, which is the whole point.
+    spelled = {9: "nine", 12: "twelve", 3: "three"}
+    report = bodies["song_envelope_report"]
+    docstring = ast.get_docstring(report) or ""
+    assert f"{spelled[len(read_reachable)]} sentences and the envelope" in docstring, docstring
+    for name in read_reachable:
+        assert f"`{name}`" in docstring, f"{name} is returned by a read and named in no docstring"
+    for name in write_only:
+        assert f"`{name}`" in docstring, f"{name} is not named as the write half's"
 
 
 def test_a_manifest_without_the_analysis_field_loads_and_round_trips(tmp_path: Path):
