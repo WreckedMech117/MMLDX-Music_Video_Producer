@@ -11470,6 +11470,47 @@ def test_beat_markers_are_placed_on_their_seconds_and_absence_draws_nothing():
     assert planned["junk"] == [[beat, 2, 32, "beat-mark"]]
 
 
+def test_every_kind_the_band_draws_is_either_snappable_or_named_as_a_reference_mark():
+    """The band draws two kinds; the selector offers one. The Director must be told which.
+
+    Story 8.2 drew beats *and onsets*; Story 8.3 closed the snap kinds at playhead, gap and beat.
+    Neither story was wrong on its own and together they left the Director looking at ticks no
+    drag can land on -- measured on this project's own masters, 279 of them at the 16 px/s
+    default -- while the marker help called the band "the beats and onsets" and the snap side
+    never mentioned onsets at all. That is retrospective finding S1.
+
+    The resolution was to say it rather than to promote onsets: measured, onsets run 2.9-4.1 a
+    second against 2.0-2.1 beats, so they sit ~5.6 px apart at the default zoom and the
+    local-spacing cap would give them a ~1.9 px pull -- a target in name only, bought with the
+    eight lookup tables `api.js` says a fourth kind costs.
+
+    So this asserts the *relationship*, not the wording: a kind the band draws is either a kind
+    the selector offers, or the marker help names it and says it is not somewhere a cut lands.
+    Add a third drawn kind without saying which it is and this fails.
+    """
+    source = API_JS.read_text(encoding="utf-8")
+    drawn = set(re.search(r"BEAT_MARKER_KINDS = \{([^}]*)\}", source).group(1).split())
+    drawn = {piece.split(":")[0] for piece in drawn if ":" in piece}
+    snappable = set(re.search(r"SNAP_TARGET_KINDS = \{([^}]*)\}", source).group(1).split())
+    snappable = {piece.split(":")[0] for piece in snappable if ":" in piece}
+    assert drawn == {"beat", "onset"}, drawn
+    assert "beat" in snappable and "onset" not in snappable, snappable
+
+    help_text = run_module(
+        """
+        import { BEAT_MARKERS_HELP } from './src/music_video_producer/web/assets/api.js';
+        console.log(JSON.stringify(BEAT_MARKERS_HELP));
+        """
+    )
+    lowered = help_text.lower()
+    for kind in drawn - snappable:
+        assert kind in lowered, (kind, help_text)
+    assert "snap target" in lowered, help_text
+    assert "reference mark" in lowered, help_text
+    # The one that *is* snappable must not be described as merely a reference mark.
+    assert lowered.index("snap target") < lowered.index("reference mark"), help_text
+
+
 def test_beat_markers_thin_to_a_readable_density_at_every_zoom():
     """Density, at the three zooms that matter, against the densities a real track produces.
 

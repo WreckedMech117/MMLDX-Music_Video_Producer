@@ -5837,11 +5837,18 @@ export function timelineWheelPlan({
 export const BEAT_MARKERS_BAND = "#beat-band";
 export const BEAT_MARKERS_CONTROL = "#beat-markers";
 export const BEAT_MARKERS_LABEL = "Beat markers";
+// The band draws two kinds and only one of them is a snap target, which is a thing the Director
+// can see and could not otherwise learn: measured on this project's own masters, onsets run
+// 2.9–4.1 a second against 2.0–2.1 beats, so at the 16 px/s default they sit ~5.6 px apart and the
+// local-spacing cap would give them a ~1.9 px pull — a target in name only. Rather than promote
+// them, the band says what each kind is for. A tick the Director cannot land on is fine; a tick
+// they cannot land on and were never told about is the contradiction.
 export const BEAT_MARKERS_HELP =
-  "Draws the beats and onsets the song analysis measured over the master waveform. Display " +
-  "only — showing or hiding them changes nothing about any shot and writes nothing to the " +
-  "project. A song that has not been analysed, or one replaced since it was, simply draws " +
-  "nothing.";
+  "Draws the beats and onsets the song analysis measured over the master waveform. Beats are " +
+  "snap targets; onsets are reference marks, showing where the transients are without being " +
+  "somewhere a cut can land. Display only — showing or hiding them changes nothing about any " +
+  "shot and writes nothing to the project. A song that has not been analysed, or one replaced " +
+  "since it was, simply draws nothing.";
 
 // The two kinds, and the class each is drawn with. **The class is decided here**, not in the
 // template, because it is the other half of the placement decision: a beat is a taller, heavier
