@@ -19190,3 +19190,762 @@ def test_the_queue_panel_ships_the_cancel_all_button_hidden_beside_the_batch_con
     assert " hidden" in button.group(0), button.group(0)
     assert "title=" not in button.group(0), button.group(0)
     assert button.group(1) == exported["label"]
+
+
+# --------------------------------------------------------------------------------------
+# Slice C2 -- the Effects tab.
+#
+# Executed, not grepped. The lesson this epic paid for: a source read proves a convention and
+# never a behaviour, and Epic 8 shipped a story whose pure half was tested in detail while the
+# stateful half -- the part a Director actually touches -- was tested not at all, because the
+# spec asked for source-text guards. So every row of this slice's matrix is run: a card added
+# from a real reply, a real request fired at the real path with the real body, a real refusal
+# drawn into the real panel.
+# --------------------------------------------------------------------------------------
+
+#: A catalogue in exactly the shape `effect_catalogue_report` serves, small enough to reason
+#: about. The mirror test below feeds the *real* one through the same client functions, so this
+#: literal cannot drift into describing a wire shape the server does not send.
+EFFECT_CATALOGUE = {
+    "families": ["geometry", "texture", "grade", "stylize"],
+    "effects": [
+        {
+            "effect": "punch_in", "family": "geometry", "label": "Punch In",
+            "parameters": [{
+                "name": "zoom", "label": "Zoom", "kind": "number", "default": 1.0,
+                "minimum": 1.0, "maximum": 2.0, "integer": False, "choices": [],
+            }],
+        },
+        {
+            "effect": "grain", "family": "texture", "label": "Grain",
+            "parameters": [
+                {"name": "strength", "label": "Strength", "kind": "number", "default": 0.0,
+                 "minimum": 0.0, "maximum": 60.0, "integer": False, "choices": []},
+                {"name": "seed", "label": "Seed", "kind": "number", "default": 0.0,
+                 "minimum": 0.0, "maximum": 65535.0, "integer": True, "choices": []},
+            ],
+        },
+        {
+            "effect": "lut_look", "family": "grade", "label": "LUT Look",
+            "parameters": [
+                {"name": "lut", "label": "Look", "kind": "lut", "default": None,
+                 "minimum": None, "maximum": None, "integer": False, "choices": []},
+                {"name": "interp", "label": "Interpolation", "kind": "choice",
+                 "default": "tetrahedral", "minimum": None, "maximum": None, "integer": False,
+                 "choices": ["nearest", "trilinear", "tetrahedral"]},
+            ],
+        },
+    ],
+    "looks": [{"lut_id": "kodak", "name": "Kodak 2383"}],
+}
+
+EFFECT_CATALOGUE_PATH = "/api/effects/catalogue"
+
+
+def effects_shot(**overrides) -> str:
+    """One Shot as the workspace holds it, as a JavaScript object literal."""
+    shot = {
+        "id": "shot_a", "start": 0, "duration": 4, "prompt": "rooftop wide", "mode": None,
+        "asset_ids": [], "citations": [], "singing": "unknown", "seed": 1, "status": "draft",
+        "prompt_id": "", "approved_output": "", "latest_output": "", "locked": False,
+        "flagged": False, "effects": [],
+    }
+    shot.update(overrides)
+    return json.dumps(shot)
+
+
+def effects_project(shots: str, project_id: str = "p1") -> str:
+    return (
+        f"{{ id: '{project_id}', jobs: [], song: null, assets: [], messages: [], sections: [], "
+        f"shots: [{shots}] }}"
+    )
+
+
+def run_effects_workspace(body: str, responses: dict | None = None, catalogue=EFFECT_CATALOGUE):
+    """Boot the workspace with the catalogue answered (or refused) and run `body`.
+
+    The catalogue is read once at boot, so `await flush()` at the top of every body is what lets
+    the reply land before anything is drawn -- the same shape every other reply-driven test here
+    uses.
+    """
+    canned = {EFFECT_CATALOGUE_PATH: {"body": catalogue}} if catalogue is not None else {}
+    canned.update(responses or {})
+    return run_workspace("await flush();\n" + body, responses=canned)
+
+
+def drawn_effects_panel(shot: str, responses: dict | None = None, catalogue=EFFECT_CATALOGUE,
+                        extra: str = "") -> dict:
+    """Select one Shot, draw the inspector, and report what the two panels ended up holding.
+
+    The two panels are cut out of the inspector's own markup rather than read off two elements:
+    the stub DOM records the markup a render wrote, and reading a nested element's `innerHTML`
+    back would report the empty string for both -- which every assertion below would pass.
+    """
+    drawn = run_effects_workspace(f"""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      state.project = {effects_project(shot)};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      {extra}
+      console.log(JSON.stringify({{
+        html: at('#shot-inspector').innerHTML,
+        activeTab: at('#shot-inspector').dataset.shotTab,
+        infoHidden: Boolean(at('#shot-panel-info').hidden),
+        effectsHidden: Boolean(at('#shot-panel-effects').hidden),
+        infoTab: at('#shot-tab-info').attributes,
+        effectsTab: at('#shot-tab-effects').attributes,
+        requests: requests.map((item) => ({{ path: item.path, method: item.method, body: item.body }})),
+        toasts,
+      }}));
+    """, responses=responses, catalogue=catalogue)
+    drawn["info"], drawn["effects"] = inspector_panels(drawn["html"])
+    return drawn
+
+
+def inspector_panels(html: str) -> tuple[str, str]:
+    """The `Shot Info` panel's markup and the `Effects` panel's, split out of the inspector."""
+    opening = '<div class="shot-tab-panel" id="shot-panel-effects"'
+    assert opening in html, html
+    before, effects = html.split(opening, 1)
+    assert 'id="shot-panel-info"' in before, before
+    return before.split('id="shot-panel-info"', 1)[1], effects
+
+
+def effects_exports() -> dict:
+    return run_module("""
+      import { EFFECTS_CATALOGUE_UNAVAILABLE, EFFECTS_LOCKED_NOTE, EFFECTS_REFUSAL_FLAG,
+               EFFECT_ADD_LABEL, EFFECT_BIND_GLYPH, EFFECT_UNKNOWN_NOTE, CLIP_EFFECTS_CHIP,
+               SHOT_TABS, SHOT_TAB_DEFAULT }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        unavailable: EFFECTS_CATALOGUE_UNAVAILABLE, locked: EFFECTS_LOCKED_NOTE,
+        flag: EFFECTS_REFUSAL_FLAG, add: EFFECT_ADD_LABEL, bind: EFFECT_BIND_GLYPH,
+        unknown: EFFECT_UNKNOWN_NOTE, chip: CLIP_EFFECTS_CHIP,
+        tabs: SHOT_TABS, tabDefault: SHOT_TAB_DEFAULT,
+      }));
+    """)
+
+
+def test_the_inspector_opens_on_two_tabs_with_shot_info_active_and_holding_what_it_held():
+    """Two tabs, `Shot Info` active, and its contents unchanged.
+
+    The last assertion is the one with teeth: `Shot Info` must contain exactly what the inspector
+    contained before this slice, so every control the old panel drew is looked for inside the
+    *info* panel rather than merely somewhere in the inspector -- which a control accidentally
+    left outside the tabs, or drawn into the Effects panel, would also satisfy.
+    """
+    panel = drawn_effects_panel(effects_shot())
+
+    assert panel["activeTab"] == "info"
+    assert panel["infoHidden"] is False
+    assert panel["effectsHidden"] is True
+    assert panel["infoTab"]["aria-selected"] == "true"
+    assert panel["effectsTab"]["aria-selected"] == "false"
+    # A real tablist: each tab names the panel it owns and the panels name them back.
+    assert 'role="tablist"' in panel["html"]
+    assert 'aria-controls="shot-panel-info"' in panel["html"]
+    assert 'aria-controls="shot-panel-effects"' in panel["html"]
+    assert 'aria-labelledby="shot-tab-info"' in panel["html"]
+    assert 'aria-labelledby="shot-tab-effects"' in panel["html"]
+    # One tab stop, the arrows moving inside it.
+    assert panel["infoTab"]["tabindex"] == "0"
+    assert panel["effectsTab"]["tabindex"] == "-1"
+    for control in (
+        'id="shot-start"', 'id="shot-duration"', 'id="shot-mode"', 'id="shot-singing"',
+        'id="shot-prompt"', 'id="shot-seed"', 'id="shot-asset-select"', 'id="shot-song-audio"',
+        'id="shot-locked"', 'id="compile-shot"',
+    ):
+        assert control in panel["info"], control
+        assert control not in panel["effects"], control
+
+
+def test_the_effects_tab_carries_a_trailing_count_of_everything_the_shot_holds():
+    """Including the disabled ones: a retained Effect is work the Director did."""
+    empty = drawn_effects_panel(effects_shot())
+    carrying = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "grain", "enabled": True, "parameters": {}},
+        {"effect": "punch_in", "enabled": False, "parameters": {}},
+    ]))
+
+    assert 'class="shot-tab-count"' not in empty["html"]
+    assert '<span class="shot-tab-count">· 2</span>' in carrying["html"]
+
+
+def test_the_tab_strip_moves_by_arrow_key_and_the_aria_state_follows():
+    """Operated by keyboard, not read. Both arrows, both ends, and a key the strip must ignore."""
+    moved = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot())};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      const read = () => ({{
+        tab: at('#shot-inspector').dataset.shotTab,
+        infoHidden: Boolean(at('#shot-panel-info').hidden),
+        effectsHidden: Boolean(at('#shot-panel-effects').hidden),
+        info: at('#shot-tab-info').attributes['aria-selected'],
+        effects: at('#shot-tab-effects').attributes['aria-selected'],
+      }});
+      const seen = {{ start: read() }};
+      fire('#shot-tab-info:keydown', {{ key: 'ArrowRight', preventDefault() {{}} }});
+      seen.right = read();
+      fire('#shot-tab-effects:keydown', {{ key: 'ArrowRight', preventDefault() {{}} }});
+      seen.wrapped = read();
+      fire('#shot-tab-info:keydown', {{ key: 'ArrowLeft', preventDefault() {{}} }});
+      seen.left = read();
+      fire('#shot-tab-effects:keydown', {{ key: 'Home', preventDefault() {{}} }});
+      seen.home = read();
+      fire('#shot-tab-info:keydown', {{ key: 'End', preventDefault() {{}} }});
+      seen.end = read();
+      fire('#shot-tab-effects:keydown', {{ key: 'PageDown', preventDefault() {{}} }});
+      seen.ignored = read();
+      console.log(JSON.stringify(seen));
+    """)
+
+    assert moved["start"]["tab"] == "info"
+    assert moved["right"]["tab"] == "effects"
+    assert moved["right"]["effectsHidden"] is False
+    assert moved["right"]["infoHidden"] is True
+    assert moved["right"]["effects"] == "true"
+    assert moved["right"]["info"] == "false"
+    # Two tabs, so Right from the last one wraps to the first and Left from the first wraps back.
+    assert moved["wrapped"]["tab"] == "info"
+    assert moved["left"]["tab"] == "effects"
+    assert moved["home"]["tab"] == "info"
+    assert moved["end"]["tab"] == "effects"
+    # A key this strip does not answer to leaves it exactly where it was.
+    assert moved["ignored"]["tab"] == "effects"
+
+
+def test_an_empty_stack_draws_the_picker_and_nothing_pretending_to_be_a_stack():
+    exports = effects_exports()
+    panel = drawn_effects_panel(effects_shot())
+
+    assert escape_for_markup(exports["add"]) in panel["effects"]
+    assert 'id="effect-picker"' in panel["effects"]
+    # Nothing shaped like a card, and no placeholder standing in for one.
+    assert 'class="effect-card' not in panel["effects"]
+    assert "effect-note" not in panel["effects"]
+
+
+def test_the_picker_groups_under_family_headers_in_the_servers_own_order():
+    grouped = run_module(f"""
+      import {{ effectPickerGroups }} from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(effectPickerGroups({json.dumps(EFFECT_CATALOGUE)})));
+    """)
+    panel = drawn_effects_panel(effects_shot())
+
+    assert [group["family"] for group in grouped] == ["geometry", "texture", "grade"]
+    assert grouped[1]["options"] == [{"effect": "grain", "label": "Grain"}]
+    # Drawn as headers over plain named buttons: no thumbnails anywhere in the picker.
+    assert '<span class="effect-family">geometry</span>' in panel["effects"]
+    assert 'id="effect-option-grain">Grain</button>' in panel["effects"]
+    assert "<img" not in panel["effects"]
+
+
+def test_an_effect_whose_family_the_served_order_forgot_is_still_offered():
+    """An effect under no group is one nothing can add, which is worse than one sorted oddly.
+
+    Unreachable through the real catalogue -- `FAMILY_ORDER` covers every entry today -- and that
+    is exactly why it is asserted here: the fallback is the thing that keeps a family added to
+    `effects.py` and forgotten in the order from making its effects unaddable rather than
+    merely last.
+    """
+    forgetful = json.loads(json.dumps(EFFECT_CATALOGUE))
+    forgetful["families"] = ["geometry", "grade"]
+    grouped = run_module(f"""
+      import {{ effectPickerGroups }} from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(effectPickerGroups({json.dumps(forgetful)})));
+    """)
+
+    assert [group["family"] for group in grouped] == ["geometry", "grade", "texture"]
+    assert grouped[2]["options"] == [{"effect": "grain", "label": "Grain"}]
+
+
+def test_an_open_picker_survives_the_background_rebuild():
+    """An open list of twenty effects is an interaction in progress too.
+
+    Carried by the same capture/restore the tab and the held control use, rather than by a third
+    mechanism -- and shut again by the choice itself, so the card that appears is the answer.
+    """
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [json.loads(effects_shot(effects=[
+                 {"effect": "grain", "enabled": True, "parameters": {}}]))]}
+    seen = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot())};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      fire('#effect-add:click', {{}});
+      app.renderShotInspector();
+      const afterReload = Boolean(at('#effect-picker').hidden);
+      await fire('#effect-option-grain:click', {{}});
+      await flush();
+      console.log(JSON.stringify({{ afterReload, afterChoice: Boolean(at('#effect-picker').hidden) }}));
+    """, responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}})
+
+    assert seen["afterReload"] is False
+    assert seen["afterChoice"] is True
+
+
+def test_adding_an_effect_from_the_picker_writes_the_stack_and_draws_the_card():
+    """The whole gesture: open the picker, choose an effect, and let the reply redraw the panel.
+
+    The body is asserted whole. A card added at the catalogue's defaults carries *no* parameters,
+    because storage is sparse by design -- a stack full of frozen defaults is what stops a
+    corrected default from ever reaching an old project.
+    """
+    stored = json.loads(effects_shot(effects=[
+        {"effect": "grain", "enabled": True, "parameters": {}},
+    ]))
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [stored]}
+    added = drawn_effects_panel(
+        effects_shot(),
+        responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}},
+        extra="""
+          requests.length = 0;
+          await fire('#effect-option-grain:click', {});
+          await flush();
+          app.renderShotInspector();
+        """,
+    )
+
+    assert [(item["path"], item["method"]) for item in added["requests"]] == [
+        ("/api/projects/p1/shots/shot_a/effects", "PUT")
+    ]
+    assert json.loads(added["requests"][0]["body"]) == {"effects": [
+        {"effect": "grain", "enabled": True, "parameters": {}},
+    ]}
+    assert 'class="effect-card ' in added["effects"]
+    assert '<span class="effect-name">Grain</span>' in added["effects"]
+    assert '<span class="effect-family">texture</span>' in added["effects"]
+    # And the count on the tab follows the stack the server sent back.
+    assert '<span class="shot-tab-count">· 1</span>' in added["html"]
+
+
+def test_the_picker_is_a_disclosure_that_opens_and_closes_and_ships_closed():
+    """`+ Effect` opens a list; it is closed until it is asked for, and it says which it is."""
+    toggled = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot())};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      const read = () => ({{
+        hidden: Boolean(at('#effect-picker').hidden),
+        expanded: at('#effect-add').attributes['aria-expanded'],
+      }});
+      const seen = {{ start: read() }};
+      fire('#effect-add:click', {{}});
+      seen.opened = read();
+      fire('#effect-add:click', {{}});
+      seen.closed = read();
+      console.log(JSON.stringify(seen));
+    """)
+
+    assert toggled["start"]["hidden"] is True
+    assert toggled["opened"]["hidden"] is False
+    assert toggled["opened"]["expanded"] == "true"
+    assert toggled["closed"]["hidden"] is True
+    assert toggled["closed"]["expanded"] == "false"
+
+
+def test_removing_an_effect_writes_the_shortened_stack_and_an_empty_one_is_a_real_write():
+    """`{"effects": []}` is how a Director takes every card off, and it is a 200.
+
+    Asserted as the literal body, because absence of the key is a 422 by name and a body composed
+    anywhere but `effectStackWrite` is how the key goes missing.
+    """
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [json.loads(effects_shot())]}
+    removed = drawn_effects_panel(
+        effects_shot(effects=[{"effect": "grain", "enabled": True, "parameters": {}}]),
+        responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}},
+        extra="""
+          requests.length = 0;
+          await fire('#effect-remove-0:click', {});
+          await flush();
+          app.renderShotInspector();
+        """,
+    )
+
+    assert [(item["path"], item["method"]) for item in removed["requests"]] == [
+        ("/api/projects/p1/shots/shot_a/effects", "PUT")
+    ]
+    # The key is present and the list is empty: that is a 200, and absence of the key is a 422.
+    assert json.loads(removed["requests"][0]["body"]) == {"effects": []}
+    assert 'class="effect-card' not in removed["effects"]
+
+
+def test_disabling_an_effect_keeps_the_card_with_its_parameters_and_writes_enabled_false():
+    """A disabled Effect is retained, not hidden: FX-5, and the reason the card only dims."""
+    off = json.loads(effects_shot(effects=[
+        {"effect": "grain", "enabled": False, "parameters": {"strength": 12.0}},
+    ]))
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [off]}
+    disabled = drawn_effects_panel(
+        effects_shot(effects=[{"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}}]),
+        responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}},
+        extra="""
+          requests.length = 0;
+          at('#effect-toggle-0').checked = false;
+          await fire('#effect-toggle-0:change', {});
+          await flush();
+          app.renderShotInspector();
+        """,
+    )
+
+    assert json.loads(disabled["requests"][0]["body"]) == {"effects": [
+        {"effect": "grain", "enabled": False, "parameters": {"strength": 12.0}},
+    ]}
+    # The card stays, at 45% through its own class, and its controls stay drawn and readable.
+    assert 'class="effect-card effect-off"' in disabled["effects"]
+    assert 'id="effect-param-0-strength"' in disabled["effects"]
+    assert 'value="12"' in disabled["effects"]
+    assert "Grain: Disabled" in disabled["effects"]
+
+
+def test_a_slider_writes_on_release_and_paints_without_writing_while_it_is_dragged():
+    """`input` paints, `change` writes. A slider that wrote per frame would hammer the route."""
+    moved = json.loads(effects_shot(effects=[
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 30.0}},
+    ]))
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [moved]}
+    dragged = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=[
+          {"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}}]))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      requests.length = 0;
+      at('#effect-param-0-strength').value = '30';
+      fire('#effect-param-0-strength:input', {{}});
+      const midDrag = {{
+        requests: requests.length,
+        readout: at('#effect-readout-0-strength').textContent,
+        stored: JSON.stringify(state.project.shots[0].effects),
+      }};
+      await fire('#effect-param-0-strength:change', {{}});
+      await flush();
+      console.log(JSON.stringify({{
+        midDrag,
+        requests: requests.map((item) => ({{ path: item.path, method: item.method, body: item.body }})),
+      }}));
+    """, responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}})
+
+    # Held: the readout followed the thumb, nothing was sent, and the stack was not touched.
+    assert dragged["midDrag"]["requests"] == 0
+    assert dragged["midDrag"]["readout"] == "30.00"
+    assert json.loads(dragged["midDrag"]["stored"]) == [
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}},
+    ]
+    # Released: exactly one write, carrying the number the readout was already showing.
+    assert [item["path"] for item in dragged["requests"]] == [
+        "/api/projects/p1/shots/shot_a/effects"
+    ]
+    assert json.loads(dragged["requests"][0]["body"]) == {"effects": [
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 30}},
+    ]}
+
+
+def test_a_slider_released_where_it_was_picked_up_sends_nothing_at_all():
+    """The route saves unconditionally, so an unchanged write costs a manifest save for nothing."""
+    still = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=[
+          {"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}}]))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      requests.length = 0;
+      at('#effect-param-0-strength').value = '12';
+      await fire('#effect-param-0-strength:change', {{}});
+      await flush();
+      console.log(JSON.stringify({{ requests: requests.map((item) => item.path) }}));
+    """)
+
+    assert still["requests"] == []
+
+
+def test_a_parameter_returned_to_its_catalogue_default_is_stored_sparsely():
+    """A card back at its defaults writes the card it was added as -- no frozen numbers."""
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [json.loads(effects_shot(effects=[
+                 {"effect": "grain", "enabled": True, "parameters": {}}]))]}
+    reset = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=[
+          {"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}}]))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      requests.length = 0;
+      at('#effect-param-0-strength').value = '0';
+      await fire('#effect-param-0-strength:change', {{}});
+      await flush();
+      console.log(JSON.stringify({{ body: requests[0]?.body || null }}));
+    """, responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}})
+
+    assert json.loads(reset["body"]) == {"effects": [
+        {"effect": "grain", "enabled": True, "parameters": {}},
+    ]}
+
+
+def test_a_refused_write_shows_the_routes_own_sentence_whole_and_leaves_the_stack_alone():
+    """C1 wrote those sentences to be read by a Director; slice B asserts them verbatim.
+
+    The stack is untouched because nothing local is mutated on the way to the route: the panel
+    redraws from `state.project`, which the refusal never reached.
+    """
+    exports = effects_exports()
+    refusal = (
+        "grain's strength is 900.0, and the largest this application composes is 60.0. "
+        "Nothing was composed."
+    )
+    refused = drawn_effects_panel(
+        effects_shot(effects=[{"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}}]),
+        responses={"/api/projects/p1/shots/shot_a/effects": {"status": 422, "body": {"detail": refusal}}},
+        extra="""
+          at('#effect-toggle-0').checked = false;
+          await fire('#effect-toggle-0:change', {});
+          await flush();
+        """,
+    )
+
+    assert escape_for_markup(refusal) in refused["effects"], refused["effects"]
+    assert exports["flag"] in refused["effects"]
+    assert refusal in refused["toasts"]
+    # Left as it was: the card is still enabled and still carries its parameter.
+    assert 'class="effect-card "' in refused["effects"]
+    assert "Grain: Enabled" in refused["effects"]
+    assert 'value="12"' in refused["effects"]
+
+
+def test_a_refusal_does_not_follow_the_director_onto_another_shot():
+    """Keyed to the Shot it was about -- `expansionReport`'s shape, for its reason."""
+    refusal = "grain's strength is 900.0, and the largest this application composes is 60.0."
+    moved = run_effects_workspace(f"""
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [], messages: [], sections: [],
+        shots: [{effects_shot(effects=[{"effect": "grain", "enabled": True, "parameters": {}}])},
+                {effects_shot(id="shot_b", start=4)}] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      at('#effect-toggle-0').checked = false;
+      await fire('#effect-toggle-0:change', {{}});
+      await flush();
+      const onA = at('#shot-inspector').innerHTML;
+      state.selectedShotId = 'shot_b';
+      app.renderShotInspector();
+      console.log(JSON.stringify({{ onA, onB: at('#shot-inspector').innerHTML }}));
+    """, responses={
+        "/api/projects/p1/shots/shot_a/effects": {"status": 422, "body": {"detail": refusal}},
+    })
+
+    assert escape_for_markup(refusal) in inspector_panels(moved["onA"])[1]
+    assert escape_for_markup(refusal) not in inspector_panels(moved["onB"])[1]
+
+
+def test_a_locked_shot_disables_every_writing_control_and_states_the_lock():
+    """FX-7's client half. The route refuses regardless, which is the half that is a guard."""
+    exports = effects_exports()
+    locked = drawn_effects_panel(effects_shot(
+        locked=True,
+        effects=[{"effect": "grain", "enabled": True, "parameters": {}}],
+    ))
+
+    assert escape_for_markup(exports["locked"]) in locked["effects"]
+    # Every control that could write, drawn and disabled rather than hidden, so "why can I not do
+    # this" is answered where it is asked.
+    for control in ("effect-toggle-0", "effect-remove-0", "effect-param-0-strength", "effect-add"):
+        marker = locked["effects"].split(f'id="{control}"', 1)
+        assert len(marker) == 2, control
+        assert "disabled" in marker[1].split(">", 1)[0], control
+
+
+def test_an_unreadable_catalogue_says_so_plainly_and_offers_nothing_to_click():
+    """No silent empty picker: the tab cannot say what any effect is, so it offers none."""
+    exports = effects_exports()
+    dark = drawn_effects_panel(
+        effects_shot(effects=[{"effect": "grain", "enabled": True, "parameters": {}}]),
+        catalogue=None,
+    )
+
+    assert escape_for_markup(exports["unavailable"]) in dark["effects"]
+    assert escape_for_markup(exports["add"]) not in dark["effects"]
+    assert "effect-option" not in dark["effects"]
+    assert 'class="effect-card' not in dark["effects"]
+
+
+def test_the_active_tab_and_a_held_slider_both_survive_the_background_rebuild():
+    """The two-second reload rebuilds this panel under the Director's hands.
+
+    Both halves are carried by `captureInspectorEdit`/`restoreInspectorEdit` -- one mechanism, not
+    two -- so the tab and the edit cannot survive one rebuild and not another.
+    """
+    survived = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=[
+          {"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}}]))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      fire('#shot-tab-effects:click', {{}});
+      // A slider held: moved, painted, and not yet released.
+      const held = at('#effect-param-0-strength');
+      held.id = 'effect-param-0-strength';
+      held.focus = () => {{}};
+      held.value = '44';
+      fire('#effect-param-0-strength:input', {{}});
+      const midDrag = at('#effect-readout-0-strength').textContent;
+      // The Director's hand is still on it when the background reload rebuilds the panel. The
+      // readout is put back to what the *stored* stack draws, because that is what a browser does
+      // -- it replaces the element -- and leaving the stub's own textContent standing would let a
+      // panel that never repaints pass this test.
+      at('#effect-readout-0-strength').textContent = '12.00';
+      globalThis.document.activeElement = held;
+      at('#shot-inspector').contains = () => true;
+      app.renderShotInspector();
+      console.log(JSON.stringify({{
+        tab: at('#shot-inspector').dataset.shotTab,
+        effectsHidden: Boolean(at('#shot-panel-effects').hidden),
+        value: held.value,
+        midDrag,
+        readout: at('#effect-readout-0-strength').textContent,
+      }}));
+    """)
+
+    assert survived["tab"] == "effects"
+    assert survived["effectsHidden"] is False
+    assert survived["midDrag"] == "44.00"
+    assert survived["value"] == "44"
+    # The readout was drawn from the stored 12.0 and repainted from the control the Director is
+    # still holding, so the number and the thumb agree.
+    assert survived["readout"] == "44.00"
+
+
+def test_selecting_a_different_shot_returns_the_inspector_to_shot_info():
+    switched = run_effects_workspace(f"""
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [], messages: [], sections: [],
+        shots: [{effects_shot()}, {effects_shot(id="shot_b", start=4)}] }};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      fire('#shot-tab-effects:click', {{}});
+      const before = at('#shot-inspector').dataset.shotTab;
+      state.selectedShotId = 'shot_b';
+      app.renderShotInspector();
+      console.log(JSON.stringify({{
+        before,
+        after: at('#shot-inspector').dataset.shotTab,
+        infoHidden: Boolean(at('#shot-panel-info').hidden),
+      }}));
+    """)
+
+    assert switched["before"] == "effects"
+    assert switched["after"] == "info"
+    assert switched["infoHidden"] is False
+
+
+def test_a_clip_carrying_effects_says_so_in_the_corner_and_announces_the_count():
+    """A glyph is state by appearance alone unless something announces it."""
+    exports = effects_exports()
+    drawn = run_effects_workspace(f"""
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [], messages: [], sections: [],
+        shots: [{effects_shot(effects=[
+                    {"effect": "grain", "enabled": True, "parameters": {}},
+                    {"effect": "punch_in", "enabled": False, "parameters": {}}])},
+                {effects_shot(id="shot_b", start=4)}] }};
+      state.selectedShotId = 'shot_a';
+      // The zoom control is the shortest path to a real `renderTimeline` from outside it.
+      fire('#zoom-in:click');
+      console.log(JSON.stringify({{ track: at('#shots-track').innerHTML }}));
+    """)
+
+    graded, plain = drawn["track"].split('data-shot-id="shot_b"')
+    assert f'>{exports["chip"]}<' in graded
+    assert 'aria-label="Carries 2 effects"' in graded
+    assert "clip-fx" not in plain
+
+
+def test_the_client_picker_is_executed_against_the_servers_own_catalogue(tmp_path: Path):
+    """The literal above describes a wire shape; this proves the wire shape is that one.
+
+    Nothing tied the picker to the real route before: renaming `families`, `effect` or `label` on
+    the server would leave every JavaScript test here green while the browser drew an empty
+    picker under no headers.
+    """
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.app import create_app
+    from music_video_producer.config import Settings
+    from music_video_producer.store import ProjectStore
+
+    store = ProjectStore(tmp_path)
+    app = create_app(
+        settings=Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy"), store=store
+    )
+    response = TestClient(app).get("/api/effects/catalogue")
+    assert response.status_code == 200, response.text
+    served = response.json()
+
+    grouped = run_module(f"""
+      import {{ effectPickerGroups, effectCardModel }}
+        from './src/music_video_producer/web/assets/api.js';
+      const served = {json.dumps(served)};
+      console.log(JSON.stringify({{
+        groups: effectPickerGroups(served),
+        card: effectCardModel({{ effect: 'grain', enabled: true, parameters: {{}} }}, served, 0, {{}}),
+      }}));
+    """)
+
+    assert [group["family"] for group in grouped["groups"]] == served["families"]
+    offered = [option["effect"] for group in grouped["groups"] for option in group["options"]]
+    # Every effect the server serves is offered by exactly one group. An effect under no group is
+    # one nothing can add.
+    assert sorted(offered) == sorted(item["effect"] for item in served["effects"])
+    assert len(offered) == len(set(offered))
+    # And a card drawn from the real catalogue knows what it is and draws every parameter.
+    assert grouped["card"]["known"] is True
+    assert grouped["card"]["label"] == "Grain"
+    assert [row["name"] for row in grouped["card"]["rows"]] == ["strength", "seed"]
+
+
+def test_an_effect_the_catalogue_does_not_know_is_named_rather_than_dropped():
+    """A card that vanished is a look the Director can neither see nor take off, and the export
+    refuses the whole stack for it."""
+    exports = effects_exports()
+    strange = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "kaleidoscope", "enabled": True, "parameters": {}},
+    ]))
+
+    assert escape_for_markup(exports["unknown"]) in strange["effects"]
+    assert "kaleidoscope" in strange["effects"]
+    assert 'id="effect-remove-0"' in strange["effects"]
+
+
+def test_the_bind_glyph_ships_inert_and_no_effects_control_draws_the_transition_colour():
+    """`--blue` is closed to transitions and reactive bindings, and neither exists in this slice.
+
+    The glyph is drawn now so the row's shape does not change under a Director when Epic 10 makes
+    it live -- but it is `--dim`, carries no handler, and is hidden from the accessibility tree,
+    because a control that looks live and is not is the one thing this interface must never draw.
+    """
+    exports = effects_exports()
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    panel = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "grain", "enabled": True, "parameters": {}},
+    ]))
+
+    assert f'aria-hidden="true">{exports["bind"]}<' in panel["effects"]
+    # No token that does not exist -- the Epic 8 defect where a dropdown lost its background
+    # because a token was never declared -- and no `--blue` at all.
+    root = re.search(r":root\s*\{(.*?)\n\}", styles, re.DOTALL)
+    assert root, "styles.css no longer declares its palette on :root"
+    assert "--blue" not in root.group(1)
+    effects_rules = "\n".join(
+        line for line in styles.splitlines()
+        if line.startswith((".effect", ".shot-tab", ".clip-fx"))
+    )
+    assert effects_rules, "the effects surface has no rules"
+    assert "var(--blue" not in effects_rules
+    for token in set(re.findall(r"var\((--[\w-]+)\)", effects_rules)):
+        assert f"{token}:" in root.group(1), f"{token} is not a palette token"
+    # `--acid` in this surface is the slider fill and the active tab underline, and nothing else.
+    acid = [line for line in effects_rules.splitlines() if "var(--acid" in line]
+    assert len(acid) == 2, acid
+    assert any(line.startswith(".effect-fill ") for line in acid), acid
+    assert any(line.startswith(".shot-tab.active ") for line in acid), acid
+    # No gradients, shadows or preview chrome anywhere in it.
+    for banned in ("gradient", "box-shadow", "text-shadow", "animation", "@keyframes"):
+        assert banned not in effects_rules, banned

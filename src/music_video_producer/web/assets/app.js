@@ -1,4 +1,4 @@
-import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectControlKey, effectControlTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -1705,6 +1705,15 @@ function renderTimeline() {
     // `RENDERING` from `renderingFlag`, no class, no extra sentence.
     const phase = clipRenderPhase(render.inFlight ? state.renderPhase?.[shot.id] : "", percent);
     const band = clipWindowState(windowKinds[shot.id], [cell.label, phase.note].filter(Boolean).join(" "));
+    // Whether this clip says it carries a look, and what it says. Decided by `clipEffectsChip`,
+    // applied here: the glyph, the count and the accessible name all come out of it, because a
+    // corner glyph is state by appearance alone unless something announces it. It shares the
+    // corner with approved and flagged in the reading order the design fixed, and three chips is
+    // the maximum that corner will ever carry.
+    const fx = clipEffectsChip(shot);
+    const fxHtml = fx.shown
+      ? `<span class="clip-fx" role="img" title="${escapeHtml(fx.label)}" aria-label="${escapeHtml(fx.label)}">${escapeHtml(fx.glyph)}</span>`
+      : "";
     const marks = [
       `status-${shot.status || "draft"}`,
       shot.approved_output || shot.status === "approved" ? "approved" : "",
@@ -1714,7 +1723,7 @@ function renderTimeline() {
       phase.className,
       band.className,
     ].filter(Boolean).join(" ");
-    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(phase.flag || renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span><span class="resize-handle right"></span></div>`;
+    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(phase.flag || renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span>${fxHtml}<span class="resize-handle right"></span></div>`;
   }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
@@ -2438,6 +2447,298 @@ function bindClip(clip) {
   });
 }
 
+// ------------------------------------------------------------------------------------------
+// The shot inspector's tab strip and the Effects tab
+// ------------------------------------------------------------------------------------------
+//
+// Everything below draws what `api.js` decided and writes what it was handed. No card text, no
+// enabled rule, no grouping and no "is this worth sending" lives here -- those are pure functions
+// beside their siblings, and re-deriving one of them in a template is this repo's most-issued
+// rejection (Epic 8's retrospective, action item A14).
+
+//: The catalogue every effects control is drawn from, read **once at boot**. Not on `state`: it is
+//: a fact about this application and the machine's looks folder, not about a project, and the
+//: project object is what `PUT /api/projects/{id}` sends back whole -- `renderProgress` and
+//: `vramEject` are out here for exactly that reason.
+//:
+//: Once, and not re-read when the tab opens: the server holds its folder scan for the life of the
+//: process precisely because discovery costs 221 ms cold on the Director's 44 MB pack, and a
+//: picker that rescans on every open is the failure that design exists to avoid.
+let effectCatalogue = null;
+//: Why the catalogue is missing, when it is. Empty means "read, and here it is"; anything else is
+//: what the panel says instead of offering controls it cannot label. Distinguished from an empty
+//: catalogue on purpose -- a served catalogue with no effects would be a different, and much
+//: stranger, thing to report.
+let effectCatalogueError = "";
+//: The last refusal a stack write was given, and the Shot it was about. Kept rather than left to
+//: the toast, because a toast is gone in four seconds and the sentence a Director has to act on
+//: names an effect, a parameter and a bound. Cleared by the next write that lands.
+let lastEffectsRefusal = null;
+
+// Read at boot, beside health and the eject state. A failure is remembered rather than retried:
+// every control on the tab needs the catalogue to say what it is, so there is nothing useful to
+// draw in the meantime and nothing to click that could ask again -- which is what the tab says.
+async function loadEffectCatalogue() {
+  try {
+    effectCatalogue = await api.effectCatalogue();
+    effectCatalogueError = "";
+  } catch (error) {
+    effectCatalogue = null;
+    effectCatalogueError = error.message || "unreadable";
+  }
+}
+
+// The strip. A real tablist: `role="tablist"`, `role="tab"`, `aria-selected`, `aria-controls`
+// naming the panel each tab owns, and a roving `tabindex` so the pair is one tab stop with the
+// arrow keys moving inside it. Every one of those values comes out of `shotTabStrip`.
+function shotTabStripHtml(shot, activeTab) {
+  const tabs = shotTabStrip(shot, activeTab).map((tab) =>
+    `<button type="button" class="shot-tab${tab.active ? " active" : ""}" id="${tab.control}" role="tab" aria-selected="${tab.active}" aria-controls="${tab.panel}" tabindex="${tab.tabIndex}">${escapeHtml(tab.label)}${tab.countLabel ? `<span class="shot-tab-count">${escapeHtml(tab.countLabel)}</span>` : ""}</button>`
+  ).join("");
+  return `<div class="shot-tabs" role="tablist" aria-label="Shot inspector">${tabs}</div>`;
+}
+
+// Put one tab on screen. **Not a rebuild**: the strip's own buttons are what a Director just
+// pressed, and rewriting the inspector's markup to change a tab would destroy the button under
+// the pointer along with its keyboard focus -- the shape of the defect this codebase found on
+// 2026-08-21, where a `dblclick` never fired because `pointerdown` re-rendered every clip.
+//
+// The active tab is recorded on the panel's own dataset, which is what makes it survive the
+// two-second background reload: `captureInspectorEdit` reads it there, keyed to the Shot, so a
+// rebuild for the *same* Shot restores it and a rebuild for a different one does not.
+function showShotTab(inspector, tabId) {
+  const wanted = shotTab(tabId).id;
+  if (inspector.dataset) inspector.dataset.shotTab = wanted;
+  SHOT_TABS.forEach((tab) => {
+    const active = tab.id === wanted;
+    const button = $("#" + tab.control, inspector);
+    if (button) {
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+      button.setAttribute("tabindex", active ? "0" : "-1");
+    }
+    const panel = $("#" + tab.panel, inspector);
+    if (panel) panel.hidden = !active;
+  });
+}
+
+// Open or close the picker, and record which it is on the panel's dataset -- `showShotTab`'s
+// pattern exactly, and for its reasons. The `hidden` attribute is *applied* rather than authored
+// into the markup, so the attribute, the `aria-expanded` the button announces and the state the
+// rebuild carries cannot come to three different views of one disclosure.
+function showEffectPicker(inspector, open) {
+  const picker = $("#effect-picker", inspector);
+  if (!picker) return;
+  if (inspector.dataset) inspector.dataset.effectPicker = open ? "open" : "";
+  picker.hidden = !open;
+  $("#effect-add", inspector)?.setAttribute?.("aria-expanded", String(Boolean(open)));
+}
+
+// Click to select, arrow keys to move. The key's answer is `shotTabAfterKey`'s -- including
+// whether this strip answers to the key at all -- so the wrap and the Home/End ends are executed
+// by a test rather than inferred from the shape of this handler.
+function bindShotTabs(inspector) {
+  SHOT_TABS.forEach((tab) => {
+    const button = $("#" + tab.control, inspector);
+    if (!button) return;
+    button.addEventListener("click", () => showShotTab(inspector, tab.id));
+    button.addEventListener("keydown", (event) => {
+      const wanted = shotTabAfterKey(inspector.dataset?.shotTab, event.key);
+      if (!wanted) return;
+      event.preventDefault?.();
+      showShotTab(inspector, wanted);
+      // Focus follows selection, which is the ARIA tabs pattern for a strip whose panels are
+      // already built: the tab the arrow moved to is the one Tab now leaves from.
+      $("#" + shotTab(wanted).control, inspector)?.focus?.();
+    });
+  });
+}
+
+// One parameter row. Three kinds, three controls, and which one is `row.kind`'s answer rather
+// than a guess made from which fields came back populated.
+//
+// The number row is the mockup's own structure -- a `--line` track, an `--acid` fill, an `--ink`
+// thumb -- built as a track span, a fill span and a transparent range input over both. A native
+// range tinted with `accent-color` would colour the thumb as well, and `--acid` on anything in
+// this surface that is not a slider fill or the active tab underline is closed (DESIGN section 5).
+//
+// The `〜` bind glyph ends every row and **ships inert**: `--dim`, no handler, `aria-hidden`,
+// because Epic 10 is what makes a binding exist and a control that looks live and is not is the
+// one thing this interface must never draw.
+function effectRowHtml(card, row) {
+  const key = effectControlKey(card.index, row.name);
+  const bind = `<span class="effect-bind" title="${escapeHtml(row.bindTitle)}" aria-hidden="true">${escapeHtml(row.bindGlyph)}</span>`;
+  const label = `<label class="effect-label" for="${EFFECT_PARAMETER_ID}${key}">${escapeHtml(row.label)}</label>`;
+  if (row.kind === "number") {
+    return `<div class="effect-row">${label}<span class="effect-slider"><span class="effect-track"></span><span class="effect-fill" id="effect-fill-${key}" style="width:${row.fill}%"></span><input class="effect-number" type="range" id="${EFFECT_PARAMETER_ID}${key}" min="${row.minimum}" max="${row.maximum}" step="${row.step}" value="${row.value}" ${row.disabled ? "disabled" : ""}></span><span class="effect-readout" id="effect-readout-${key}">${escapeHtml(row.readout)}</span>${bind}</div>`;
+  }
+  const options = row.choices.map((choice) =>
+    `<option value="${escapeHtml(choice.value)}" ${row.value === choice.value ? "selected" : ""}>${escapeHtml(choice.label)}</option>`).join("");
+  if (row.kind === "lut") {
+    // A LUT parameter declares no default -- there is no look that means "leave it alone" -- so
+    // "No look chosen" is a real, selectable value rather than a placeholder, and writing it is
+    // refused by the route by name. That refusal is the honest answer to a grade with nothing to
+    // apply; resolving it to whichever file sorted first would put a look on a take nobody asked
+    // for. The list is ids and names only: the server resolves the file from the id it discovered,
+    // and nothing this client sends is ever joined onto a directory.
+    return `<div class="effect-row">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}" ${row.disabled ? "disabled" : ""}><option value="" ${row.value ? "" : "selected"}>No look chosen</option>${options}</select>${bind}</div>`;
+  }
+  return `<div class="effect-row">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}" ${row.disabled ? "disabled" : ""}>${options}</select>${bind}</div>`;
+}
+
+// One effect card: family, name, an enable toggle, a remove, and its rows. Every string and every
+// `disabled` here is applied from `effectCardModel` and none of them is re-decided.
+//
+// A disabled card keeps every control readable and every parameter in place -- it drops to 45%
+// and stays a card (FX-5). The state is in the toggle's own accessible name as well as in the
+// opacity, because opacity alone is state by appearance and this stylesheet says so about every
+// other state it draws.
+function effectCardHtml(card) {
+  const note = card.note ? `<p class="effect-note">${escapeHtml(card.note)}</p>` : "";
+  const head = `<div class="effect-head"><span class="effect-family">${escapeHtml(card.family)}</span><span class="effect-name">${escapeHtml(card.label)}</span><input type="checkbox" class="effect-toggle" id="effect-toggle-${card.index}" title="${escapeHtml(card.toggle.title)}" aria-label="${escapeHtml(card.label)}: ${escapeHtml(card.toggle.label)}" ${card.toggle.checked ? "checked" : ""} ${card.toggle.disabled ? "disabled" : ""}><button type="button" class="effect-remove" id="effect-remove-${card.index}" title="${escapeHtml(card.remove.title)}" aria-label="${escapeHtml(card.remove.title)}" ${card.remove.disabled ? "disabled" : ""}>${escapeHtml(card.remove.label)}</button></div>`;
+  return `<div class="effect-card ${card.className}" data-index="${card.index}">${head}${note}${card.rows.map((row) => effectRowHtml(card, row)).join("")}</div>`;
+}
+
+// The whole Effects panel for one Shot. Three states are settled before this runs -- the
+// catalogue never arrived, the Shot is locked, the stack is empty -- and each of them is a field
+// on the model rather than a branch invented here.
+//
+// An empty stack draws the picker and nothing else. There is deliberately no "no effects yet"
+// box: a placeholder shaped like a card is a thing pretending to be a stack.
+function effectsPanel(shot) {
+  const model = effectsPanelModel(shot, effectCatalogue, { error: effectCatalogueError });
+  const refusal = effectsRefusalNotice(shot.id, lastEffectsRefusal);
+  // The route's own sentence, whole. Those refusals name the offending effect, the parameter and
+  // the bound it broke, and slice B asserts them verbatim -- paraphrasing one here would be a
+  // second wording of the same refusal, in a panel whose whole job is to be readable.
+  const refusalHtml = refusal.shown
+    ? `<div class="shot-readiness blocked" id="effects-refusal"><strong>${escapeHtml(refusal.flag)}</strong><p>${escapeHtml(refusal.message)}</p></div>`
+    : "";
+  if (model.problem) {
+    return { model, html: `${refusalHtml}<p class="effects-problem" id="effects-problem">${escapeHtml(model.problem)}</p>` };
+  }
+  const lockHtml = model.lockNote
+    ? `<p class="control-reason" id="effects-locked">${escapeHtml(model.lockNote)}</p>`
+    : "";
+  const groups = model.picker.groups.map((group) =>
+    `<div class="effect-group"><span class="effect-family">${escapeHtml(group.family)}</span>${group.options.map((option) =>
+      `<button type="button" class="effect-option" id="effect-option-${option.effect}">${escapeHtml(option.label)}</button>`).join("")}</div>`).join("");
+  // A disclosure rather than a select, so the family headers are the Consolas micro-labels the
+  // design asks for -- an `<optgroup>` label is styled by the platform and would be neither. No
+  // thumbnails: a look is not a picture of itself, and the picker is a list of names.
+  const picker = model.picker.shown
+    ? `<button type="button" class="quiet-button full effect-add" id="effect-add" title="${escapeHtml(model.picker.title)}" aria-expanded="false" aria-controls="effect-picker" ${model.picker.disabled ? "disabled" : ""}>${escapeHtml(model.picker.label)}</button><div class="effect-picker" id="effect-picker">${groups}</div>`
+    : "";
+  return {
+    model,
+    html: `${refusalHtml}${lockHtml}<div class="effect-stack" id="effect-stack">${model.cards.map(effectCardHtml).join("")}</div>${picker}`,
+  };
+}
+
+// The one place a stack is written, and the one place a refusal is kept.
+//
+// **Skipped entirely when the stack has not changed.** The route saves unconditionally, so an
+// unchanged write costs a manifest save for nothing -- and a slider picked up and released where
+// it started is exactly that gesture. `effectStackChanged` is the decision; this asks it.
+//
+// The body is `effectStackWrite`'s, which always names `effects`: a body missing the key is a 422
+// by name, and `{"effects": []}` -- how every card comes off -- is a 200.
+//
+// Nothing local is mutated on the way. The stack on screen is `state.project`'s, the reply is the
+// whole Project, and a refusal therefore leaves the panel drawing exactly what was stored, which
+// is what "the stack was left as it was" has to mean on this side too.
+async function writeEffectStack(shotId, next) {
+  if (!requireProject()) return;
+  // The stored stack is re-read from the project rather than from whatever object drew the panel,
+  // so "has it changed" is asked against what the server last sent back.
+  const stored = shotEffectStack(state.project.shots.find((item) => item.id === shotId));
+  if (!effectStackChanged(next, stored)) return;
+  const projectId = state.project.id;
+  try {
+    const project = await api.saveShotEffects(projectId, shotId, effectStackWrite(next));
+    // The Director moved to another project while this was in flight. The write landed on the
+    // server; applying its reply here would show one project's work under another's name.
+    if (state.project?.id !== projectId) return;
+    state.project = project;
+    lastEffectsRefusal = null;
+  } catch (error) {
+    if (state.project?.id !== projectId) return;
+    lastEffectsRefusal = { shotId, message: error.message };
+    toast(error.message, "error");
+  }
+  // Either way: the clip's chip, the tab's count and every card redraw from what is stored.
+  renderTimeline();
+}
+
+// A slider being dragged, painted from the control's own value -- the readout and the fill, and
+// nothing else. **No write and no state change**: the write happens on release, because a slider
+// that wrote per frame would hammer the route, and leaving `state.project` alone until then is
+// what makes "unchanged" answerable at release time.
+//
+// Also called from `restoreInspectorEdit`, so a slider still held when the background reload
+// rebuilt the panel comes back with its readout and its fill agreeing with its thumb.
+function paintEffectSlider(inspector, target, input) {
+  const stack = shotEffectStack(selectedShot());
+  const parameter = effectParameterDefinition(effectCatalogue, stack[target.index]?.effect, target.name);
+  const fill = $("#effect-fill-" + target.key, inspector);
+  if (fill) fill.style.width = `${effectSliderFill(input.min, input.max, input.value)}%`;
+  const readout = $("#effect-readout-" + target.key, inspector);
+  if (readout) readout.textContent = effectParameterReadout(parameter, input.value);
+}
+
+// Every control on the Effects tab, bound to the nodes the `innerHTML` write above just created.
+//
+// A locked Shot's controls ship `disabled`, so nothing here has to ask about the lock a second
+// time: a disabled control dispatches no click and no change, which is what keeps `card.toggle
+// .disabled` the single place that decides whether a stack can be written from this panel. The
+// route refuses regardless, which is the half that is actually a guard.
+function bindEffectsPanel(inspector, shot, model) {
+  const shotId = shot.id;
+  const stack = () => shotEffectStack(selectedShot() || shot);
+  $("#effect-add", inspector)?.addEventListener("click", () => {
+    showEffectPicker(inspector, inspector.dataset?.effectPicker !== "open");
+  });
+  for (const group of model.picker.groups) {
+    for (const option of group.options) {
+      $("#effect-option-" + option.effect, inspector)?.addEventListener("click", () => {
+        // Closed before the write, so the card that appears is the answer to the click rather
+        // than something a Director has to look behind an open list to find.
+        showEffectPicker(inspector, false);
+        writeEffectStack(shotId, effectStackAdd(stack(), option.effect));
+      });
+    }
+  }
+  for (const card of model.cards) {
+    $("#effect-toggle-" + card.index, inspector)?.addEventListener("change", () => {
+      writeEffectStack(shotId, effectStackToggle(stack(), card.index));
+    });
+    $("#effect-remove-" + card.index, inspector)?.addEventListener("click", () => {
+      writeEffectStack(shotId, effectStackRemove(stack(), card.index));
+    });
+    for (const row of card.rows) {
+      const target = { key: effectControlKey(card.index, row.name), index: card.index, name: row.name };
+      const control = $("#" + EFFECT_PARAMETER_ID + target.key, inspector);
+      if (!control) continue;
+      // `input` paints; `change` writes. In every browser a range input fires `change` on
+      // release, which is the whole of "write on release, not on input" -- and a select fires it
+      // on the choice, which is the same moment.
+      if (row.kind === "number") {
+        control.addEventListener("input", () => paintEffectSlider(inspector, target, control));
+      }
+      control.addEventListener("change", () => writeEffectParameter(shotId, stack(), target, control));
+    }
+  }
+}
+
+// One parameter written, from whichever control carries it. The index and the name travel on the
+// control itself, the typing and the sparseness are `api.js`'s, and the "is this worth sending"
+// question is answered by the same `effectStackChanged` every other write here asks.
+function writeEffectParameter(shotId, stack, target, control) {
+  const parameter = effectParameterDefinition(effectCatalogue, stack[target.index]?.effect, target.name);
+  const value = effectParameterValue(parameter, control.value);
+  writeEffectStack(shotId, effectStackSetParameter(stack, target.index, target.name, value, parameter));
+}
+
 // This panel is rebuilt by replies nobody awaited -- a readiness report landing after a shot save
 // calls `renderTimeline`, which lands here. The rebuild is right: readiness decides the blocked
 // flag and the sameness lines, and a panel left alone would keep reporting a block the Director
@@ -2448,20 +2749,45 @@ function bindClip(clip) {
 // Only the focused control, only when it is inside this panel, and only when the panel is being
 // redrawn for the same shot -- a rebuild that follows a selection change must show the new shot's
 // stored text rather than the previous one's uncommitted edit, which is what the stamp is for.
+//
+// **The active tab travels with the edit, in this same object.** It is the same question with the
+// same answer -- what was the Director doing in this panel, and is this rebuild still about the
+// same Shot -- so it is carried here rather than by a parallel mechanism beside it. That is also
+// what makes "a different Shot returns to Shot Info" true without a line saying so: the stamp
+// below fails for a different Shot, nothing is carried, and the strip is drawn at its default.
+//
+// The focused control is now optional. It has to be: a Director on the Effects tab who is reading
+// rather than typing has no focused element at all, and returning `null` for them would drop the
+// tab as well and throw them back to Shot Info every two seconds.
 function captureInspectorEdit(inspector, shotId) {
+  if (inspector?.dataset?.shotId !== shotId) return null;
   const active = document.activeElement;
-  if (!active?.id || inspector.dataset?.shotId !== shotId || !inspector.contains?.(active)) return null;
-  return { id: active.id, value: active.value, start: active.selectionStart, end: active.selectionEnd };
+  const focused = active?.id && inspector.contains?.(active)
+    ? { id: active.id, value: active.value, start: active.selectionStart, end: active.selectionEnd }
+    : null;
+  return { tab: inspector.dataset.shotTab || "", picker: inspector.dataset.effectPicker || "", focused };
 }
 
 function restoreInspectorEdit(inspector, place) {
-  const element = place && $("#" + place.id, inspector);
+  if (!place) return;
+  // The tab first, because the control being restored may be inside the panel that was hidden --
+  // focusing an element in a hidden panel is what a browser refuses, silently.
+  if (place.tab) showShotTab(inspector, place.tab);
+  // An open picker is an interaction in progress too: a Director reading a list of twenty effects
+  // must not have it shut under them by a render landing two seconds in.
+  if (place.picker === "open") showEffectPicker(inspector, true);
+  const element = place.focused && $("#" + place.focused.id, inspector);
   if (!element?.focus) return;
-  if (place.value !== undefined && element.value !== place.value) element.value = place.value;
+  if (place.focused.value !== undefined && element.value !== place.focused.value) element.value = place.focused.value;
   element.focus();
+  // A slider held across the rebuild carries its own value back, but the readout and the fill were
+  // drawn from the *stored* stack -- which is still the old value, because a drag does not write
+  // until it is released. Repainted from the control, so the thumb, the number and the fill agree.
+  const target = effectControlTarget(place.focused.id);
+  if (target) paintEffectSlider(inspector, target, element);
   // `selectionStart` is null on a number input and `setSelectionRange` throws there, so the caret
   // is only restored where the browser reports one.
-  if (typeof place.start === "number" && element.setSelectionRange) element.setSelectionRange(place.start, place.end);
+  if (typeof place.focused.start === "number" && element.setSelectionRange) element.setSelectionRange(place.focused.start, place.focused.end);
 }
 
 // The mode select's options. "Not declared" is a real, selectable value rather than a placeholder:
@@ -2797,9 +3123,30 @@ export function renderShotInspector() {
   const readinessHtml = readiness.blocked || readiness.sameness.length
     ? `<div class="shot-readiness ${readiness.blocked ? "blocked" : "sameness"}">${readiness.blocked ? `<strong>${escapeHtml(readiness.flag)}</strong><p>${escapeHtml(readiness.help)}</p>` : ""}${readiness.sameness.map((line) => `<p>${escapeHtml(line.text)}</p>`).join("")}</div>`
     : "";
-  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}${seedHtml}<label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label><label class="check-row" title="A lock is a deliberate hands-off: sweeps, fills, re-renders and clip swaps all refuse a locked shot until you unlock it here."><input id="shot-locked" type="checkbox" ${lockChecked}> Lock this shot</label>${takeHtml}${takesStripHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}${flagHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  // The strip and the two panels it controls. **`Shot Info` holds exactly what this panel held
+  // before the strip existed** -- the same content, in the same order, bound to the same handlers
+  // -- and everything new lives in the second panel beside it. The eyebrow, the Shot's own name
+  // and its status chip stay *above* the strip: they say which Shot both tabs are about, and a
+  // copy of them inside each panel would be two answers to one question.
+  //
+  // The tab to open on is `place`'s, which is how it survives the background reload; `shotTab`
+  // resolves an absent one to `Shot Info`, which is what a newly selected Shot gets.
+  const wantedTab = shotTab(place?.tab).id;
+  // The Effects panel's markup and the model it was drawn from, together. The binding below walks
+  // that same model rather than querying the markup back out of the DOM, so a control can only be
+  // bound to the card and the parameter it was drawn for.
+  const effects = effectsPanel(shot);
+  const infoHtml = `${readinessHtml}<div class="form-row" style="margin-top:14px"><label>Start<input id="shot-start" type="number" min="0" step=".25" value="${shot.start}"></label><label>Duration<input id="shot-duration" type="number" min=".5" step=".25" value="${shot.duration}"></label></div><label>Generation mode<select id="shot-mode">${shotModeOptions(shot)}</select></label>${specificationHtml}<label>Performance<select id="shot-singing">${SINGING_STATES.map((entry) => `<option value="${entry.value}" ${(shot.singing || "unknown") === entry.value ? "selected" : ""}>${escapeHtml(entry.label)}</option>`).join("")}</select></label><label>Creative intent<textarea id="shot-prompt" rows="8">${escapeHtml(shot.prompt)}</textarea></label>${expandHtml}${seedHtml}<label>Cited assets<select id="shot-asset-select"><option value="">Attach asset…</option>${assets.filter((asset) => !cited.some((citation) => citation.asset_id === asset.id)).map((asset) => `<option value="${asset.id}">${escapeHtml(asset.name)}</option>`).join("")}</select></label><div class="attached-list">${shotCitationRows(shot, assets)}</div><label class="check-row"><input id="shot-song-audio" type="checkbox" ${shot.use_song_audio ? "checked" : ""}> Use master song as H3 audio reference</label><label class="check-row" title="A lock is a deliberate hands-off: sweeps, fills, re-renders and clip swaps all refuse a locked shot until you unlock it here."><input id="shot-locked" type="checkbox" ${lockChecked}> Lock this shot</label>${takeHtml}${takesStripHtml}${takeAudioHtml}${nudgeHtml}${shot.latest_output ? `<button class="quiet-button full" id="analyze-take">Inspect latest take</button>` : ""}${approvalHtml}${markHtml}${againHtml}${flagHtml}<button class="primary-button full" id="compile-shot" style="margin-top:14px">Compile Director data</button>`;
+  inspector.innerHTML = `<span class="eyebrow">Shot inspector</span><h2>${escapeHtml(shot.prompt?.slice(0, 34) || "Untitled shot")}</h2><span class="shot-status">${shot.status}</span>${shotTabStripHtml(shot, wantedTab)}<div class="shot-tab-panel" id="shot-panel-info" role="tabpanel" aria-labelledby="shot-tab-info">${infoHtml}</div><div class="shot-tab-panel" id="shot-panel-effects" role="tabpanel" aria-labelledby="shot-tab-effects">${effects.html}</div>`;
   if (inspector.dataset) inspector.dataset.shotId = shot.id;
+  // Which panel is on screen is decided in one place, never in the template above: the markup
+  // draws both and this hides the one that is not wanted, so the `hidden` attribute, the active
+  // class, `aria-selected` and the roving tabindex cannot come to four different views of it.
+  showShotTab(inspector, wantedTab);
+  showEffectPicker(inspector, false);
   restoreInspectorEdit(inspector, place);
+  bindShotTabs(inspector);
+  bindEffectsPanel(inspector, shot, effects.model);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-song-audio", "shot-locked"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
   // The seed is bound apart from the list above for one reason: typing a number by hand is a
   // statement that you want *that* number, so it clears the randomize toggle. Nothing else in this
@@ -5294,7 +5641,10 @@ async function init() {
   if (session.beatMarkers === false) beatMarkersOn = false;
   syncSnapTargetsControl();
   syncBeatMarkersControl();
-  await Promise.all([loadHealth(), loadVramEject(), api.workflows().catch(() => [])]);
+  // The effect catalogue joins the boot reads rather than the tab's own open, for the reason
+  // `loadEffectCatalogue` records: the server holds its looks scan for the life of the process
+  // precisely so a picker is not a folder read every time it opens.
+  await Promise.all([loadHealth(), loadVramEject(), loadEffectCatalogue(), api.workflows().catch(() => [])]);
   try { await loadProjects(); } catch (error) { toast(error.message, "error"); }
   if (session.panel) document.querySelector(`[data-panel="${session.panel}"]`)?.click();
   if (session.selectedShotId && state.project?.shots.some((shot) => shot.id === session.selectedShotId)) {

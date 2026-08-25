@@ -6101,6 +6101,475 @@ export function songEnvelopeIdentity(projectId, song = null) {
   return `${id}:${path}:${song?.analysis?.song_fingerprint || ""}`;
 }
 
+// ------------------------------------------------------------------------------------------
+// The shot inspector's tab strip and the Effects tab (slice C2)
+// ------------------------------------------------------------------------------------------
+//
+// Every decision this surface makes is here: what a tab is called, what a card says, whether a
+// control can act, how the picker groups, what a write would contain and whether a stack differs
+// from the stored one. `app.js` draws what comes out and writes what it is handed. That split is
+// the rejection this repo issues most often -- Epic 8's retrospective spent action item A14 on a
+// template that re-derived a rule beside the function that already owned it -- and the reason it
+// matters here is that a look is expensive to be wrong about: the export composes the stack, and
+// a panel that decided "enabled" differently from the composer would grade a take one way on
+// screen and another in the file.
+
+//: The inspector's two tabs, in `ASSET_TABS`' idiom one strip over: one list, so the strip, the
+//: panels bound to it and the tests cannot come to different views of what a tab is called or
+//: which panel it owns. `control` and `panel` are element ids rather than composed at each site,
+//: because `aria-controls` and `aria-labelledby` have to name the *same* two ids the markup uses
+//: and a template building them by hand is how one half of that pair goes stale.
+//:
+//: Two, and the order is the reading order: `Shot Info` is what the inspector has always been and
+//: stays the landing tab (SHOT_TAB_DEFAULT), so nothing a Director does today moves.
+export const SHOT_TABS = [
+  { id: "info", label: "Shot Info", control: "shot-tab-info", panel: "shot-panel-info" },
+  { id: "effects", label: "Effects", control: "shot-tab-effects", panel: "shot-panel-effects" },
+];
+
+//: The tab an inspector opens on, and the fallback for a stored value no tab answers to --
+//: `ASSET_TAB_DEFAULT`'s shape exactly. Selecting a different Shot comes back here.
+export const SHOT_TAB_DEFAULT = "info";
+
+export function shotTab(tabId) {
+  return SHOT_TABS.find((tab) => tab.id === tabId)
+    || SHOT_TABS.find((tab) => tab.id === SHOT_TAB_DEFAULT);
+}
+
+//: One Shot's Effect Stack, in the one shape everything here reads. A Shot saved before effects
+//: existed carries no key at all, and a manifest hand-edited to `null` carries the wrong one; both
+//: are an empty stack rather than a crash, on `shotCitations`' precedent.
+export function shotEffectStack(shot) {
+  return Array.isArray(shot?.effects) ? shot.effects : [];
+}
+
+// The strip itself: every tab, whether it is the active one, what it says, and the roving
+// tabindex that makes the pair a single tab stop. Derived rather than templated so the count and
+// the active mark cannot be drawn from two different readings of the same Shot.
+//
+// **The count includes disabled effects**, because a disabled Effect is retained with its
+// parameters (FX-5) and a Shot carrying three cards of which two are off is still a Shot the
+// Director has done work on. The chip is drawn only when there is something to count: a `0`
+// on every unstyled Shot is a number nobody reads.
+export function shotTabStrip(shot, activeId) {
+  const active = shotTab(activeId).id;
+  const count = shotEffectStack(shot).length;
+  return SHOT_TABS.map((tab) => ({
+    id: tab.id,
+    label: tab.label,
+    control: tab.control,
+    panel: tab.panel,
+    active: tab.id === active,
+    // A tablist is one tab stop: the active tab is reachable by Tab, the others by arrow key.
+    tabIndex: tab.id === active ? 0 : -1,
+    count: tab.id === "effects" ? count : 0,
+    countLabel: tab.id === "effects" && count ? `· ${count}` : "",
+  }));
+}
+
+// Which tab a key press moves to, or `""` for a key this strip does not answer to. Pure, so the
+// keyboard contract is executed rather than inferred from the shape of a handler.
+//
+// Wrapping, per the ARIA tabs pattern: with two tabs, Left and Right from either end land on the
+// other one, which is what a Director pressing an arrow twice expects rather than a dead key.
+export function shotTabAfterKey(activeId, key) {
+  const index = SHOT_TABS.findIndex((tab) => tab.id === shotTab(activeId).id);
+  if (key === "Home") return SHOT_TABS[0].id;
+  if (key === "End") return SHOT_TABS[SHOT_TABS.length - 1].id;
+  const step = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
+  if (!step) return "";
+  return SHOT_TABS[(index + step + SHOT_TABS.length) % SHOT_TABS.length].id;
+}
+
+//: The bind glyph that ends every parameter row (DESIGN section 3): `--dim` when inert, `--blue`
+//: when bound to a Band. **It ships inert**, and there is no second state in this slice -- Epic 10
+//: builds the Band panel and makes it live. Drawn now rather than added later so the row's shape
+//: does not change under a Director between two versions, which is the same argument the disabled
+//: Effect makes about keeping its controls readable.
+export const EFFECT_BIND_GLYPH = "〜";
+export const EFFECT_BIND_INERT_TITLE =
+  "Reactive bindings are not built yet. This parameter holds the value set here for the whole shot.";
+
+//: `+ Effect`, the picker's own control, and what it says.
+export const EFFECT_ADD_LABEL = "+ Effect";
+export const EFFECT_ADD_HELP =
+  "Add an effect to this shot's stack. Effects compose in family order at export: geometry, then "
+  + "texture, then grade, then stylize.";
+
+//: Why every writing control on this tab is disabled. **Not the route's refusal**, deliberately:
+//: `SHOT_EFFECTS_LOCKED_REFUSAL` is written about a write that was attempted and refused, and
+//: nothing has been attempted here -- showing it would report a refusal that never happened. It
+//: names the same fact and the same remedy, and the route still refuses regardless of what this
+//: panel draws, which is the half FX-7 puts on the server for exactly this reason.
+export const EFFECTS_LOCKED_NOTE =
+  "This shot is locked, so its effect stack cannot be changed. Unlock the shot on Shot Info to "
+  + "change its look.";
+
+//: What the tab says when the catalogue never arrived. It offers nothing to click, because every
+//: control on this tab needs the catalogue to say what it is: the picker has no effects to list
+//: and a card has no parameters to draw. It says what is *not* wrong as well -- the stack on the
+//: Shot is untouched -- because a panel that has gone blank reads as one that has lost something.
+export const EFFECTS_CATALOGUE_UNAVAILABLE =
+  "The effect catalogue could not be read, so this tab cannot say what any effect is: nothing can "
+  + "be added, and a stack already on this shot cannot be drawn. Nothing has been changed. Reload "
+  + "the workspace to try again.";
+
+//: An effect in the stored stack that this application's catalogue does not know -- a manifest
+//: written by a newer build, or edited by hand. Named rather than skipped: a card silently dropped
+//: from the panel is a look the Director can neither see nor take off, and the export refuses the
+//: whole stack for it (`effects.validate_stack`), so it has to be reachable here.
+export const EFFECT_UNKNOWN_NOTE =
+  "This application's catalogue has no effect by this name, so its controls cannot be drawn and an "
+  + "export will refuse the whole stack. Removing it is the only thing this panel can do with it.";
+
+//: How finely a slider divides its parameter's range, before the step is rounded to one
+//: significant figure so the numbers a Director lands on stay readable (a 60-wide range steps by
+//: 0.3, a 0.04-wide one by 0.0002). An integer parameter steps by 1 whatever its range.
+export const EFFECT_SLIDER_STEPS = 200;
+
+// The step and the readout precision of one number parameter, together, because they are the same
+// decision: a readout rounded to two places under a step of 0.0002 reports a slider that is moving
+// as one that is not.
+function numberSliderScale(parameter) {
+  const minimum = Number(parameter?.minimum ?? 0);
+  const maximum = Number(parameter?.maximum ?? 1);
+  const span = maximum - minimum;
+  if (parameter?.integer || !(span > 0)) return { minimum, maximum, span, step: 1, decimals: 0 };
+  const step = Number((span / EFFECT_SLIDER_STEPS).toPrecision(1));
+  const decimals = Math.min(4, Math.max(2, Math.ceil(-Math.log10(step))));
+  return { minimum, maximum, span, step, decimals };
+}
+
+// How far along its track a slider's thumb sits, as a percentage. Pure, because it is drawn twice
+// -- once from the stored stack when the panel is built, and once from the control's own value
+// while a Director is dragging it -- and two arithmetics for one thumb is how a fill and a readout
+// start disagreeing mid-drag.
+export function effectSliderFill(minimum, maximum, value) {
+  const span = Number(maximum) - Number(minimum);
+  if (!(span > 0)) return 0;
+  const along = ((Number(value) - Number(minimum)) / span) * 100;
+  return Math.min(100, Math.max(0, Number.isFinite(along) ? along : 0));
+}
+
+// What a number parameter's Consolas readout says. Same source as the slider's step, so the digits
+// shown are the digits the control can actually produce.
+export function effectParameterReadout(parameter, value) {
+  const scale = numberSliderScale(parameter);
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return number.toFixed(scale.decimals);
+}
+
+// One parameter row: what it is called, which control draws it, what it currently holds and
+// whether it may be touched. Three kinds come off the wire (`EffectParameterSpec.kind`) and each
+// draws a different control, so the kind is carried out of here rather than inferred from which
+// fields came back populated -- the same argument the route makes for stating it.
+//
+// The value resolves the way `effects.validate_stack` resolves it: what the Shot stored, and the
+// catalogue's default where the Shot stored nothing. Storage is sparse on purpose (a corrected
+// default has to be able to reach old projects), so a card the Director never touched has no
+// parameters at all and every row here is showing a default.
+//
+// A LUT parameter carries **no default** -- there is no look that means "leave it alone" -- so its
+// empty state is a real, selectable "no look chosen" that the route refuses by name if it is
+// written. That refusal is the honest answer; resolving it to whichever file sorted first would
+// put a grade on a take nobody asked for.
+export function effectParameterRow(parameter, spec, { looks = [], disabled = false } = {}) {
+  const stored = (spec?.parameters || {})[parameter?.name];
+  const base = {
+    name: parameter?.name || "",
+    label: parameter?.label || parameter?.name || "",
+    kind: parameter?.kind || "number",
+    disabled: Boolean(disabled),
+    bindGlyph: EFFECT_BIND_GLYPH,
+    bindTitle: EFFECT_BIND_INERT_TITLE,
+  };
+  if (base.kind === "choice") {
+    const value = stored === undefined || stored === null
+      ? String(parameter?.default ?? "")
+      : String(stored);
+    return {
+      ...base,
+      value,
+      readout: value,
+      choices: (parameter?.choices || []).map((choice) => ({ value: choice, label: choice })),
+    };
+  }
+  if (base.kind === "lut") {
+    const value = stored === undefined || stored === null ? "" : String(stored);
+    const chosen = looks.find((look) => look.lut_id === value);
+    return {
+      ...base,
+      value,
+      readout: chosen ? chosen.name : "",
+      choices: looks.map((look) => ({ value: look.lut_id, label: look.name })),
+    };
+  }
+  const scale = numberSliderScale(parameter);
+  const fallback = Number(parameter?.default ?? scale.minimum);
+  const value = stored === undefined || stored === null || !Number.isFinite(Number(stored))
+    ? fallback
+    : Number(stored);
+  return {
+    ...base,
+    kind: "number",
+    value,
+    minimum: scale.minimum,
+    maximum: scale.maximum,
+    step: scale.step,
+    integer: Boolean(parameter?.integer),
+    fill: effectSliderFill(scale.minimum, scale.maximum, value),
+    readout: effectParameterReadout(parameter, value),
+    choices: [],
+  };
+}
+
+// One parameter's catalogue entry, by the effect that owns it and its name. A lookup rather than
+// a decision, kept here for the reason every other lookup on this surface is: the sparse-storage
+// rules -- what a default is, what precision a readout has, whether a value is an integer -- are
+// all read off this object, and a handler that reached into `catalogue.effects` itself would be
+// the second place that knew the catalogue's shape.
+export function effectParameterDefinition(catalogue, effectId, name) {
+  const definition = (catalogue?.effects || []).find((item) => item.effect === effectId) || null;
+  return (definition?.parameters || []).find((parameter) => parameter.name === name) || null;
+}
+
+// What a control's raw value becomes in a stack. A range input hands back a string whatever it
+// draws, and a stack storing `"0.35"` where the export expects a number is the kind of write that
+// passes here and is refused at composition -- so the coercion is decided once, beside the bounds
+// it belongs to, rather than at each of the three handlers that write.
+//
+// An integer parameter rounds. `NumberParameter.integer` exists because a grain seed of 4210.7 is
+// not a seed, and the route's own validator says so; rounding here means the Director sees the
+// number that will be stored rather than one the server silently changes.
+export function effectParameterValue(parameter, raw) {
+  if (!parameter || parameter.kind === "choice" || parameter.kind === "lut") return String(raw ?? "");
+  const number = Number(raw);
+  if (!Number.isFinite(number)) return "";
+  return parameter.integer ? Math.round(number) : number;
+}
+
+//: The prefix every parameter control's element id carries. Named once, because three places have
+//: to agree on it: the markup that writes the id, the binding that finds the control, and the
+//: rebuild that has only a focused element's id to work back from.
+export const EFFECT_PARAMETER_ID = "effect-param-";
+
+//: Which card and which parameter one control belongs to. `index-name`, and the index is the
+//: card's position in the stack -- which is what a write indexes into, so the control and the
+//: stack cannot disagree about which card is being edited.
+export function effectControlKey(index, name) {
+  return `${index}-${name}`;
+}
+
+// The same key read back out of an element id, or `null` for an element that is not one of these
+// controls. This is what lets the panel repaint a slider it did not just draw: after the
+// background reload the only thing carried across is the focused element's id, and parsing it
+// here -- beside the function that composed it -- is what stops the two spellings drifting.
+export function effectControlTarget(elementId) {
+  const id = String(elementId || "");
+  if (!id.startsWith(EFFECT_PARAMETER_ID)) return null;
+  const key = id.slice(EFFECT_PARAMETER_ID.length);
+  const cut = key.indexOf("-");
+  if (cut < 0) return null;
+  const index = Number(key.slice(0, cut));
+  if (!Number.isInteger(index) || index < 0) return null;
+  return { key, index, name: key.slice(cut + 1) };
+}
+
+// One effect card: its family, its name, whether it is on, what its controls may do, and its rows.
+//
+// `enabled` is read the way the server stores it -- anything but an explicit `false` is on, which
+// is `stored_effect_stack`'s `bool(spec.get("enabled", True))` in the other language. A card added
+// by this panel writes it explicitly, so the two only have to agree about stacks written elsewhere.
+//
+// Every control's `disabled` comes from the lock and from nothing else, and the *reason* travels
+// with it: a control that is off with no sentence beside it says only that something is wrong.
+export function effectCardModel(spec, catalogue, index, { locked = false } = {}) {
+  const definition = (catalogue?.effects || []).find((item) => item.effect === spec?.effect) || null;
+  const name = String(spec?.effect ?? "");
+  const enabled = spec?.enabled !== false;
+  const reason = locked ? EFFECTS_LOCKED_NOTE : "";
+  return {
+    index,
+    effect: name,
+    family: definition ? definition.family : "",
+    label: definition ? definition.label : name,
+    known: Boolean(definition),
+    note: definition ? "" : EFFECT_UNKNOWN_NOTE,
+    enabled,
+    // A disabled Effect is retained and drops to 45%, keeping its controls readable (DESIGN 4.2).
+    className: enabled ? "" : "effect-off",
+    toggle: {
+      checked: enabled,
+      disabled: locked,
+      label: enabled ? "Enabled" : "Disabled",
+      title: reason || (enabled
+        ? "Disable this effect. It stays on the shot with its parameters and is skipped at export."
+        : "Enable this effect again. Its parameters were kept."),
+    },
+    remove: {
+      label: "✕",
+      disabled: locked,
+      title: reason || `Remove ${definition ? definition.label : name} from this shot's stack.`,
+    },
+    rows: (definition?.parameters || []).map((parameter) =>
+      effectParameterRow(parameter, spec, { looks: catalogue?.looks || [], disabled: locked })),
+  };
+}
+
+// The picker's groups: the catalogue's effects under their family, in the server's own stage
+// order. `families` is served precisely so this order is not a second copy of `FAMILY_ORDER`
+// living in JavaScript, and the family name is passed through as the server spells it -- the
+// stylesheet uppercases it, so there is no second spelling of "GRADE" here to drift.
+//
+// A family the served order forgot is appended rather than dropped. An effect under no group is
+// one nothing can add, which is a worse failure than one sorted oddly.
+export function effectPickerGroups(catalogue) {
+  const definitions = catalogue?.effects || [];
+  const ordered = [...(catalogue?.families || [])];
+  for (const definition of definitions) {
+    if (!ordered.includes(definition.family)) ordered.push(definition.family);
+  }
+  return ordered
+    .map((family) => ({
+      family,
+      options: definitions
+        .filter((definition) => definition.family === family)
+        .map((definition) => ({ effect: definition.effect, label: definition.label })),
+    }))
+    .filter((group) => group.options.length);
+}
+
+// Everything the Effects tab draws, for one Shot, in one object. The three states a template must
+// never decide between itself are all settled here: the catalogue never arrived, the Shot is
+// locked, and the stack is empty.
+//
+// An empty stack draws **the picker and nothing else**. A placeholder card, or a "no effects yet"
+// box shaped like one, is a thing pretending to be a stack; the honest empty state of a list is
+// the control that adds to it.
+export function effectsPanelModel(shot, catalogue, { error = "" } = {}) {
+  const locked = Boolean(shot?.locked);
+  const problem = error ? EFFECTS_CATALOGUE_UNAVAILABLE : "";
+  const stack = shotEffectStack(shot);
+  return {
+    locked,
+    lockNote: locked ? EFFECTS_LOCKED_NOTE : "",
+    problem,
+    cards: problem
+      ? []
+      : stack.map((spec, index) => effectCardModel(spec, catalogue, index, { locked })),
+    picker: {
+      shown: !problem,
+      disabled: locked,
+      label: EFFECT_ADD_LABEL,
+      title: locked ? EFFECTS_LOCKED_NOTE : EFFECT_ADD_HELP,
+      groups: problem ? [] : effectPickerGroups(catalogue),
+    },
+  };
+}
+
+//: The flag word over a refused write. Consolas, in the `.shot-readiness` idiom the blocked-shot
+//: notice already uses, because this is the same kind of statement: something the Director asked
+//: for did not happen, and the sentence under it says why.
+export const EFFECTS_REFUSAL_FLAG = "NOT WRITTEN";
+
+// Whether the panel is showing a refusal, and which one. Keyed to the Shot it was about, so a
+// refusal for one clip cannot follow the Director onto the next -- the shape `expansionReport`
+// already uses for exactly that reason.
+//
+// The message is carried **whole and unparaphrased**. C1 wrote those sentences to be read by a
+// Director -- they name the offending effect, the parameter and the bound it broke -- and slice
+// B's tests assert them verbatim, so a second wording here would be a second refusal.
+export function effectsRefusalNotice(shotId, refusal) {
+  const shown = Boolean(refusal?.message) && refusal?.shotId === shotId;
+  return { shown, flag: EFFECTS_REFUSAL_FLAG, message: shown ? String(refusal.message) : "" };
+}
+
+// What a stack write contains. **The `effects` key is always present**, because its absence is the
+// one body this route refuses outright: `{"efects": [...]}` answered 200 and erased a Director's
+// grade until C1 made absence a named refusal, and `{"effects": []}` -- how every card comes off --
+// is a 200 and must stay reachable. One function builds the body, so no caller composes one.
+//
+// Normalised as it goes: `enabled` explicit, `parameters` an object. That is also what makes the
+// comparison below meaningful, since two stacks that differ only in a missing `enabled` are the
+// same look and must not cost a manifest save.
+export function effectStackWrite(stack) {
+  return {
+    effects: (stack || []).map((spec) => ({
+      effect: String(spec?.effect ?? ""),
+      enabled: spec?.enabled !== false,
+      parameters: { ...(spec?.parameters || {}) },
+    })),
+  };
+}
+
+// Whether a stack is worth writing. The route saves unconditionally, so an unchanged write costs a
+// manifest save for nothing -- C1's implementer flagged it as worth revisiting once a panel
+// existed, and a slider released exactly where it was picked up is the gesture that makes it real.
+//
+// Compared through `effectStackWrite`, so the comparison is between the two *bodies* rather than
+// between two client objects whose key order or absent `enabled` differ without meaning anything.
+export function effectStackChanged(stack, stored) {
+  return JSON.stringify(effectStackWrite(stack)) !== JSON.stringify(effectStackWrite(stored));
+}
+
+// A card added at the catalogue's defaults -- which is to say with **no parameters at all**.
+// Storage is sparse by design (`stored_effect_stack`): a read returns what was written and the
+// defaults are recomputed at export, so a card the Director never adjusted must not arrive
+// carrying eight numbers they never chose and can never be corrected out of.
+export function effectStackAdd(stack, effectId) {
+  return [...(stack || []), { effect: String(effectId), enabled: true, parameters: {} }];
+}
+
+export function effectStackRemove(stack, index) {
+  return (stack || []).filter((_, position) => position !== index);
+}
+
+export function effectStackToggle(stack, index) {
+  return (stack || []).map((spec, position) =>
+    position === index ? { ...spec, enabled: spec?.enabled === false } : spec);
+}
+
+// One parameter set, sparsely. A value equal to the catalogue's default **removes the key** rather
+// than writing it out, which is what keeps a slider dragged away and back again a no-op write
+// instead of a stack that stores its defaults for ever -- and it is the same sparseness the server
+// stores by, so a card returned to its defaults is byte-identical to the one that was added.
+//
+// An empty string is the "nothing chosen" of a choice or a look, and it is removed for the same
+// reason: the route refuses a `lut_look` naming no look, by name, and that refusal is the honest
+// answer rather than something to encode as `""`.
+export function effectStackSetParameter(stack, index, name, value, parameter = null) {
+  return (stack || []).map((spec, position) => {
+    if (position !== index) return spec;
+    const parameters = { ...(spec?.parameters || {}) };
+    const fallback = parameter?.default;
+    const isDefault = fallback !== null && fallback !== undefined
+      && String(value) === String(fallback);
+    if (value === "" || value === null || value === undefined || isDefault) delete parameters[name];
+    else parameters[name] = value;
+    return { ...spec, parameters };
+  });
+}
+
+//: The clip's effects chip (DESIGN section 3): a Consolas hooked f, `--muted` on `--surface-2`,
+//: sharing the corner with approved and flagged. Three chips is the maximum that corner will ever
+//: carry, which is the reason no fourth may be invented without removing one.
+export const CLIP_EFFECTS_CHIP = "ƒ";
+
+// Whether a clip says it carries a look, and what it says about it. A count rather than a bare
+// yes: the chip is a glyph, and a glyph is state by appearance alone unless something announces
+// it, so the accessible name carries the number the Director would otherwise have to click to
+// find. Decided here because "does this Shot carry effects" is one question, and the tab's own
+// count chip answers it too.
+export function clipEffectsChip(shot) {
+  const count = shotEffectStack(shot).length;
+  return {
+    shown: count > 0,
+    glyph: CLIP_EFFECTS_CHIP,
+    label: count === 1 ? "Carries 1 effect" : `Carries ${count} effects`,
+  };
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.
@@ -6209,6 +6678,20 @@ export const api = {
   // One pointer moves: `output` switches among the shot's own takes (provenance is its
   // job history), `asset_id` attaches a video asset as the shot's clip.
   selectTake: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/select-take`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // The catalogue every effects control is drawn from: the effects, their families, their
+  // parameters and their bounds, plus the looks the machine has on disk. Not project-scoped --
+  // neither half is a fact about a video -- and read **once**, at boot: the server holds the
+  // folder scan for the life of the process precisely so a picker is not a 221 ms disk read every
+  // time it opens, and `?rescan=true` is a Director's explicit "I just added a look", never
+  // something a panel does on its own.
+  effectCatalogue: () => request("/api/effects/catalogue"),
+  // The one route that edits an existing Shot's stack. The body is `effectStackWrite`'s and
+  // nothing else composes one, because the shape is load-bearing: a body naming no `effects` at
+  // all is a 422 by name (a misspelled key used to answer 200 and erase a grade), while
+  // `{"effects": []}` is a 200 and is how every card comes off. The reply is the whole Project,
+  // like every other purpose-built shot action, so the panel redraws from what was stored rather
+  // than from what it hoped it sent.
+  saveShotEffects: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/effects`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(body) }),
   // Deletion, each with its own server-side guard: the project asks for its confirm flag,
   // the asset refuses while cited, the job settles its record as it cancels on ComfyUI.
   deleteProject: (id) => request(`/api/projects/${id}?confirm_delete=true`, { method: "DELETE" }),

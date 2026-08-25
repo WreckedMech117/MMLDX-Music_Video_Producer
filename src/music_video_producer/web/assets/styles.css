@@ -769,6 +769,93 @@ dialog p { color: var(--muted); line-height: 1.5; }
    text over the workspace. The region stays pointer-transparent between toasts. */
 .toast { width: min(380px, calc(100vw - 36px)); padding: 11px 13px; border: 1px solid var(--line-strong); border-left: 3px solid var(--acid); border-radius: var(--radius); background: #1b1e1d; box-shadow: 0 12px 40px #0008; font-size: 12px; pointer-events: auto; cursor: pointer; }
 .toast.error { border-left-color: var(--red); }
+/* The shot inspector's tab strip (DESIGN 4.1). The Assets subtab idiom, in the inspector's own
+   scale: Consolas micro-labels, a 1px --line rule under the strip, the active tab in --ink over a
+   2px --acid underline and the inactive one --dim. The underline is one of exactly two places
+   --acid is allowed in this surface -- the other is a slider fill -- because acid means complete
+   or primary action everywhere else and a grade control is neither.
+   The count chip is --muted so the number reads as a fact about the tab rather than as a second
+   active mark competing with the underline. */
+.shot-tabs { display: flex; gap: 2px; margin-top: 12px; border-bottom: 1px solid var(--line); }
+.shot-tab { border: 0; border-bottom: 2px solid transparent; padding: 9px 11px 7px; background: transparent; color: var(--dim); font: 9px/1.2 Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
+.shot-tab.active { color: var(--ink); border-bottom-color: var(--acid); }
+.shot-tab-count { margin-left: 5px; color: var(--muted); }
+/* Both panels are in the markup and one is hidden, so switching a tab never rewrites the panel a
+   Director is pointing at. The `display: none` is spelled out rather than left to the browser's
+   default `[hidden]` rule, because any `display` on `.shot-tab-panel` would silently outrank it
+   and the failure would be both panels on screen at once. */
+.shot-tab-panel { padding-top: 12px; }
+.shot-tab-panel[hidden] { display: none; }
+/* What the tab says when the catalogue never arrived, and there is nothing to offer instead. */
+.effects-problem { margin: 10px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+/* The effect card (DESIGN 4.2): --surface-1 on --radius inside 1px --line, a header carrying the
+   Consolas family name in --dim and the effect's name in --ink, and the rows under it.
+   A disabled Effect is retained, not hidden: it drops to 45% and every control stays readable and
+   operable, which is what makes taking a look off temporarily a thing a Director can undo. */
+.effect-card { margin-bottom: 9px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-1); overflow: hidden; }
+.effect-card.effect-off { opacity: .45; }
+.effect-head { display: flex; align-items: center; gap: 7px; padding: 8px 9px; border-bottom: 1px solid var(--line); }
+.effect-family { color: var(--dim); font: 9px/1.2 Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
+.effect-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 12px; }
+/* The enable toggle. Deliberately **not** --acid: the mockup drew it acid, and DESIGN's own
+   don'ts close acid in this surface to the slider fill and the tab underline. The on state is
+   --line-strong under an --ink knob, the off state --surface-3 under a --dim one -- and the card's
+   45% and the toggle's own accessible name carry the state as well, so it is never colour alone. */
+.effect-toggle { flex: none; position: relative; width: 24px; height: 13px; margin: 0; padding: 0; appearance: none; -webkit-appearance: none; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-3); }
+.effect-toggle::after { content: ""; position: absolute; top: 1px; left: 1px; width: 9px; height: 9px; border-radius: 50%; background: var(--dim); }
+.effect-toggle:checked { border-color: var(--line-strong); background: var(--line-strong); }
+.effect-toggle:checked::after { left: auto; right: 1px; background: var(--ink); }
+/* The generic `input:focus` rule tints every input's border --acid, which on this toggle put
+   acid on a grade control and fought the on/off the border is already carrying. Keyboard
+   focus keeps the application's own `:focus-visible` outline, so nothing is lost. */
+.effect-toggle:focus { border-color: var(--line-strong); }
+.effect-toggle:disabled, .effect-remove:disabled { opacity: .5; cursor: not-allowed; }
+.effect-remove { flex: none; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--dim); font-size: 12px; line-height: 1; }
+.effect-remove:enabled:hover { background: var(--surface-3); color: var(--red); }
+/* An effect the catalogue does not know: named rather than dropped, because a card that vanished
+   is a look the Director can neither see nor remove and the export refuses the whole stack for it. */
+.effect-note { margin: 0; padding: 7px 9px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; line-height: 1.45; }
+/* The parameter row (DESIGN 4.3): a --muted label, the slider, a Consolas readout, and the bind
+   glyph at the right edge. Nothing here is taller than the form rows this panel already draws. */
+.effect-row { display: flex; align-items: center; gap: 8px; padding: 7px 9px; }
+.effect-label { flex: none; width: 66px; color: var(--muted); font-size: 11px; }
+.effect-row select { flex: 1; min-width: 0; font-size: 11px; }
+/* The slider is three elements rather than a tinted native range: a --line track, an --acid fill
+   over it, and a transparent range input on top carrying the --ink thumb. `accent-color` would
+   paint the thumb acid too, and acid on a thumb is a second acid in a surface that allows one. */
+.effect-slider { position: relative; flex: 1; min-width: 0; height: 13px; }
+.effect-track { position: absolute; top: 5px; right: 0; left: 0; height: 3px; border-radius: 2px; background: var(--line); }
+.effect-fill { position: absolute; top: 5px; left: 0; height: 3px; border-radius: 2px; background: var(--acid); }
+/* The range input is the gesture and nothing else: the three spans above are the whole of
+   what a Director sees. `border`, `border-radius` and `padding` are reset explicitly --
+   the generic `input` rule gives every input in this application a 1px --line border, a 5px
+   radius and 9px of padding, and inherited here it drew a 20px bordered pill around a 3px
+   track. That was on screen and passed every automated gate; it was caught by looking. */
+.effect-number { position: absolute; top: 0; left: 0; width: 100%; height: 13px; margin: 0; padding: 0; border: 0; border-radius: 0; appearance: none; -webkit-appearance: none; background: transparent; cursor: pointer; }
+.effect-number::-webkit-slider-runnable-track { height: 13px; background: transparent; }
+.effect-number::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 11px; height: 11px; margin-top: 1px; border: 0; border-radius: 50%; background: var(--ink); }
+.effect-number::-moz-range-track { height: 13px; background: transparent; }
+.effect-number::-moz-range-thumb { width: 11px; height: 11px; border: 0; border-radius: 50%; background: var(--ink); }
+.effect-number:disabled::-webkit-slider-thumb { background: var(--dim); }
+.effect-number:disabled::-moz-range-thumb { background: var(--dim); }
+.effect-readout { flex: none; width: 36px; color: var(--muted); font: 10px Consolas, monospace; text-align: right; }
+/* The bind glyph ends every row and ships **inert** in --dim. --blue is the reactive-binding
+   colour and it is closed to Epic 10; nothing in this slice may draw it. */
+.effect-bind { flex: none; width: 15px; color: var(--dim); font-size: 13px; text-align: center; }
+/* The picker: a grouped list under Consolas family headers, opened from `+ Effect`. No
+   thumbnails -- an effect is a name and a set of bounds, and a picture of one would be a picture
+   of some other take. */
+.effect-picker { margin-top: 7px; padding: 9px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-1); }
+.effect-picker[hidden] { display: none; }
+.effect-group { margin-bottom: 9px; }
+.effect-group:last-child { margin-bottom: 0; }
+.effect-group .effect-family { display: block; margin-bottom: 4px; }
+.effect-option { display: block; width: 100%; padding: 5px 7px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: var(--ink); font-size: 12px; text-align: left; }
+.effect-option:hover { border-color: var(--line-strong); background: var(--surface-2); }
+/* The clip's effects chip (DESIGN 3): --muted on --surface-2, sharing the clip's bottom-right
+   corner. Held clear of the 12px resize handle, so the corner a Director grabs to trim a shot is
+   never a chip they meant to read. */
+.clip-fx { position: absolute; right: 14px; bottom: 4px; display: grid; place-items: center; width: 15px; height: 15px; border-radius: 3px; background: var(--surface-2); color: var(--muted); font: 10px Consolas, monospace; }
 @media (max-width: 1180px) {
   .topbar { grid-template-columns: 220px minmax(170px, 1fr) auto; }
   .transport-mini { display: none; }
