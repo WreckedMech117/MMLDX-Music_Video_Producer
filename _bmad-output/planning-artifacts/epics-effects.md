@@ -31,7 +31,7 @@ Brownfield, and unusually well-supported: `assembly.py` already re-encodes every
 
 FX-1: Analyze a Song into a Song Envelope — RMS, peak, spectral-flux proxy, per-band envelopes, onsets, beats, estimated BPM; cached, invalidated on song change, never blocking
 FX-2: Show beat and onset markers against the waveform; display only, toggleable
-FX-3: Snap Shot-boundary edits to beats alongside lyric and phrase boundaries; always an assist, never a constraint
+FX-3: Snap Shot-boundary edits to beats alongside the playhead and phrase-gap targets; always an assist, never a constraint. **Corrected 2026-08-24 (R-15):** this said *lyric* boundaries. Verified against the pre-epic code — no lyric or phrase target existed on a boundary drag at all; the only one was the playhead magnet, and lyric/phrase snapping lived solely in the batch "Snap cuts" button. The shipped kinds are playhead, phrase gaps and beats. A lyric-word target was deliberately rejected: the batch snapper clamps into voiceless gaps, so offering word edges would be a second opinion about where a cut belongs
 FX-4: Two tabs in the shot inspector — Shot Info (unchanged) and Effects — with tab selection surviving background rebuilds
 FX-5: Build a Shot's Effect Stack — add, remove, reorder, individually disable; empty stack exports byte-identically to today
 FX-6: Copy an Effect Stack to an explicit set of Shots, reporting what it did and naming refusals
@@ -60,7 +60,7 @@ FX-25: A completed export records the Effect and Transition state it was built f
 FX-NFR-1: The frame grid is inviolable — assembled duration matches the Song within one frame for every combination of Effects and Transitions, in both the Overlap and no-Overlap case
 FX-NFR-2: The export stays a stream-copy join — clips carrying no Effects are never re-encoded on account of a Transition elsewhere
 FX-NFR-3: One engine describes an Effect — no Effect is approximated in the interface by a different mechanism than the one that renders it
-FX-NFR-4: No new runtime dependency — everything through the ffmpeg binary already required and the language already in use
+FX-NFR-4: No new runtime dependency — everything through the ffmpeg binary already required and the language already in use. **Amended 2026-08-24 (R-8):** `numpy` is declared in `pyproject.toml`. It was already locked transitively via `faster-whisper`, so `uv.lock` gained no package and nothing new installs — the declaration made an existing fact honest. Not met literally
 FX-NFR-5: Generated render inputs are pure and comparable — same project, same bytes, asserted by string comparison
 FX-NFR-6: Preview stays inside a measured budget — under one second from change to looping clip for a Shot of typical length
 
@@ -72,7 +72,7 @@ FX-NFR-6: Preview stays inside a measured budget — under one second from chang
 - One pure chain builder with a fixed family order: `trim → GEOMETRY → scale → TEXTURE → GRADE → STYLIZE → pad → fps → setsar → format` (AD-17). Measured 2026-08-21: texture after `pad` leaves the letterbox bar at RGB (1,1,5); before `pad`, (0,0,0)
 - A transition is baked into its own concat intermediate so the join keeps `-c:v copy`; `clip_frames_on_grid` is not modified (AD-18)
 - The Overlap is the only transition geometry — no stored duration, no borrowing from the over-render margin, which external clips do not have (AD-19)
-- The Song Envelope is a sidecar file; the manifest carries only a pointer, the rate, the band count, the BPM, and the song fingerprint (AD-20). Measured: manifests are 110–190 KB, an envelope is ~750 KB, and the manifest rides a 2-second poll
+- The Song Envelope is a sidecar file; the manifest carries only a pointer, the rate, the band count, the BPM, and the song fingerprint (AD-20). Measured 2026-08-24 through the shipped extractor: manifests are 110–190 KB, an envelope is **405 KB** (469 KB on a real 202-second master), and the manifest rides a 2-second poll. The ~750 KB this line carried was an estimate
 - Envelope validity is derived by fingerprint comparison, never stored as a flag (AD-21), following AD-11's read-time discipline
 - A reactive binding compiles to a generated `sendcmd` script, passed as a **cwd-relative filename** — an absolute Windows path's drive colon breaks filter parsing and names the wrong filter (AD-22)
 - Preview renders are a derived cache keyed by a fingerprint; staleness is recomputed, never stored; preview uses libx264 `ultrafast` CRF 28 at half the export's dimensions, and **not** NVENC, which is slower at these clip lengths (AD-23)
@@ -173,7 +173,7 @@ So that later work can be tied to what the music actually does instead of to a g
 **Then** a Song Envelope is produced carrying, at a recorded analysis rate, RMS, peak, a spectral-flux proxy, per-band level envelopes, onset markers, beat markers, and one estimated BPM (FX-1)
 **And** it also carries a whole-song per-band average as a small fixed-size array, for the band selector to draw (AD-26)
 **And** the analysis rate and band count are recorded fields on the envelope, not constants, so tuning them later is not a migration
-**And** no package is added to the runtime dependency set — decoding goes through the ffmpeg binary already required, and the computation is in the application's own language (FX-NFR-4, AD-25)
+**And** the computation is in the application's own language and decoding goes through the ffmpeg binary already required (FX-NFR-4, AD-25) — **amended 2026-08-24 (R-8): `numpy` is declared; see FX-NFR-4**
 **And** `audio.py` imports neither `app.py`, `batch.py`, nor `assembly.py` (AD-25).
 
 **Given** a Song is imported or generated
@@ -219,14 +219,14 @@ So that I can see the structure I am cutting against instead of inferring it.
 ### Story 8.3: Snap Shot Boundaries to Beats
 
 As the Director,
-I want a Shot edge I am dragging to snap to a beat as readily as it snaps to a lyric,
+I want a Shot edge I am dragging to snap to a beat as readily as it snaps to anything else,
 So that a cut lands on the music instead of near it.
 
 **Acceptance Criteria:**
 
 **Given** a valid Song Envelope and a Shot boundary being dragged
 **When** the boundary passes near a beat marker
-**Then** it snaps to that beat, alongside the existing lyric and phrase boundary targets (FX-3).
+**Then** it snaps to that beat, alongside the playhead and phrase-gap targets (FX-3). *Amended 2026-08-24 (R-15): as written this described behaviour the application never had — see FX-3 above.*
 
 **Given** the Director wants a boundary that is not on a beat
 **When** the boundary is placed off every snap target

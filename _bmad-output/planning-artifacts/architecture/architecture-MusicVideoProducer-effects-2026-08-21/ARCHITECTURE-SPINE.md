@@ -102,7 +102,7 @@ Binding, read-only. Not re-derived here.
 
 - **Binds:** FX-1, FX-2, FX-3, FX-13
 - **Prevents:** a three-quarter-megabyte analysis riding the 2-second poll and every atomic manifest write
-- **Rule:** The envelope is written as its own file under the project's media dir. The manifest carries only a small `SongAnalysis` record: the sidecar's relative path, the analysis rate, the band count, the estimated BPM, and the **song fingerprint** it was computed from. Measured 2026-08-21: existing manifests are 110–190 KB, and a 3-minute envelope at 30 Hz with 8 bands is ~750 KB of JSON — four to seven times the whole manifest, re-serialized every poll. The envelope is served by its own read-only endpoint and is never embedded in a Project response.
+- **Rule:** The envelope is written as its own file under the project's media dir. The manifest carries only a small `SongAnalysis` record: the sidecar's relative path, the analysis rate, the band count, the estimated BPM, and the **song fingerprint** it was computed from. **Amended 2026-08-24 (R-8 rulings doc):** measured through the shipped extractor, a 3-minute envelope is **405 KB** of JSON and a real 202-second master's is 469 KB — against manifests of 110–190 KB, so two to four times the manifest rather than four to seven. The estimate this sentence carried (~750 KB) and a later synthetic probe (1.13 MB) were both wrong; 405 KB is the measured figure and the conclusion is unchanged. Since 2026-08-24 the browser is served only the part it reads — `beats`, `onsets`, `band_average`, `band_edges` — and the per-frame series, 98% of the file, stays on disk. The envelope is served by its own read-only endpoint and is never embedded in a Project response.
 
 ### AD-21 — Envelope validity is derived from a fingerprint, never stored as a flag
 
@@ -132,7 +132,7 @@ Binding, read-only. Not re-derived here.
 
 - **Binds:** all of FX-1..FX-25
 - **Prevents:** effect and analysis logic accreting into `app.py` where it cannot be tested by comparison
-- **Rule:** `audio.py` — envelope extraction; its only I/O is an ffmpeg decode to `s16le` on stdin; no new runtime dependency (FX-NFR-4). `effects.py` — filter-stage construction, `sendcmd` generation, and transition-segment argv; entirely pure. Both follow the standing naming convention (one lowercase noun) and neither imports `app.py`, `batch.py`, or `assembly.py`. Routes stay thin delegators.
+- **Rule:** `audio.py` — envelope extraction; its only I/O is an ffmpeg decode to `s16le` on **stdout** (this sentence said stdin and was wrong); **amended 2026-08-24 by Director ruling R-8** — `numpy` is a declared dependency. The evidence that made it acceptable: `git show cab8038 -- uv.lock` adds no new `[[package]]` block, because numpy was already locked transitively through `faster-whisper`. Nothing new installs; a declaration made an existing fact honest. FX-NFR-4's literal reading no longer holds. `effects.py` — filter-stage construction, `sendcmd` generation, and transition-segment argv; entirely pure. Both follow the standing naming convention (one lowercase noun) and neither imports `app.py`, `batch.py`, or `assembly.py`. Routes stay thin delegators.
 
 ### AD-26 — The spectrum strip draws a whole-song average, stored once
 
@@ -190,7 +190,7 @@ Seed. No additions — that is the point.
 | Name | Version | Note |
 | --- | --- | --- |
 | ffmpeg / ffprobe | 7.0 full_build (gyan.dev), GPL, static | `xfade` (58 transitions + `custom`), `lut3d`, `haldclut`, `sendcmd`, and the full colour/texture/stylize/geometry filter set verified present on this machine 2026-08-21 |
-| Everything else | unchanged | No package added to the runtime dependency set (FX-NFR-4) |
+| Everything else | unchanged | `numpy` declared 2026-08-24 (R-8); nothing new installs — it was already locked via `faster-whisper`. FX-NFR-4 amended, not met literally |
 
 Bundled LUT `.cube` files are inert data assets, not a dependency. **Their source and licence are unresolved** — see Deferred.
 
@@ -198,7 +198,7 @@ Bundled LUT `.cube` files are inert data assets, not a dependency. **Their sourc
 
 ```text
 src/music_video_producer/
-  audio.py       # NEW — song envelope: RMS, peak, ZCR, flux proxy, onsets, beats, BPM,
+  audio.py       # NEW — song envelope: RMS, peak, flux proxy, onsets, beats, BPM,
                  #       per-band envelopes + whole-song band averages. ffmpeg decode only.
   effects.py     # NEW — pure: filter-stage construction, sendcmd generation,
                  #       transition-segment argv, effect/transition catalogues.
@@ -207,7 +207,10 @@ src/music_video_producer/
   models.py      # + EffectSpec, ParameterBinding, TransitionSpec, SongAnalysis
                  # + Shot.effects / transition_in / transition_out (all defaulted)
   app.py         # + effects/transition/analysis/preview routes; + _adopt_shot_effects
+  store.py       # + sidecar read/write (added by Epic 8; this list omitted it)
+  timeline.py    # + drag snap targets, from the gap rule it already owns (Epic 8)
   web/assets/    # + effects tab, band panel, spectrum + drive canvases, overlap band
+                 # Epic 8 also shipped: beat-marker band, "Snap to" selector
 data/projects/<id>/
   media/analysis/song-envelope.json   # NEW — the sidecar (AD-20)
   media/previews/<fingerprint>.mp4    # NEW — derived, disposable (AD-23)
@@ -239,7 +242,7 @@ Named, not decided.
 - **Full-resolution export cost of a reactive binding and of transition segments.** Preview cost is measured; export cost is not, and CM-E1 makes any regression a release concern. Measure before the Grade family merges.
 - **NVENC for export.** Present and unused. It loses at preview lengths; whether it wins at export length is unmeasured, and the preview result does not transfer.
 - **Preview cache eviction policy.** The cache is disposable by construction (AD-23), so no policy is required to ship; a size bound is a later refinement.
-- **Analysis rate and band count.** AD-20 fixes them as recorded fields rather than as constants, so they can be tuned without a migration. `[ASSUMPTION: 30 Hz and 8 bands, matching the ported extractor's own rate. Not yet judged against a real song.]`
+- **Analysis rate and band count.** AD-20 fixes them as recorded fields rather than as constants, so they can be tuned without a migration. `[ASSUMPTION: 30 Hz and 8 bands, matching the ported extractor's own rate.]` **Epic 8 shipped on this assumption on 2026-08-24 and it is still unjudged.** One cost is now measured: at 30 Hz, autocorrelation BPM is quantised by integer lag — 90.0 / 128.3 / 139.1 against true 90 / 128 / 140, about ±1.2 BPM near 140, and parabolic interpolation halves that without removing it. The band count is unjudged and stays so until Epic 10's band selector gives it a consumer. Both values are recorded on every envelope, so changing them is a re-measurement and not a migration.
 - **A/B compare on the Monitor.** Raised in UX and deferred there; recorded so it stays an idea rather than a gap.
 - **Section-scoped Effect Stacks.** Explicitly out of PRD scope; the copy target chooser is the substitute and stores nothing at Section level.
 - **GLSL transition packs and `libplacebo` custom shaders.** Both reachable from the installed build; neither needed to ship. Revisit only if the 58 native transitions prove insufficient.

@@ -24,7 +24,7 @@ graph LR
   A -.beat markers, snapping.-> Z["ships on its own"]
 ```
 
-**Two slices start immediately and in parallel: A and B.** They share no files. Everything else descends from them.
+**Two slices start immediately and in parallel: A and B.** ~~They share no files.~~ **Corrected 2026-08-24 (R-9):** they share `effects.py`. AD-28 mandates the one fingerprint function live there and binds FX-1, which is slice A's requirement, so story 8.1 created the file — minimally, holding fingerprinting only. The spine predicted the collision this line denied. Everything else descends from A and B.
 
 ---
 
