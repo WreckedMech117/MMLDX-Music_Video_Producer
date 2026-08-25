@@ -852,6 +852,52 @@ dialog p { color: var(--muted); line-height: 1.5; }
 .effect-group .effect-family { display: block; margin-bottom: 4px; }
 .effect-option { display: block; width: 100%; padding: 5px 7px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: var(--ink); font-size: 12px; text-align: left; }
 .effect-option:hover { border-color: var(--line-strong); background: var(--surface-2); }
+/* A family's run, drawn as a box. This is the reordering rule made visible: the chain composes
+   geometry, then texture, then grade, then stylize, and a card only ever moves inside its own
+   box. A Director who can see where the box ends can see why a drag stops there, which is the
+   difference between a constraint and an interface that has stopped responding. */
+.effect-run { margin-bottom: 12px; padding-left: 8px; border-left: 1px solid var(--line); }
+.effect-run:last-child { margin-bottom: 0; }
+.effect-run .effect-card:last-child { margin-bottom: 0; }
+/* The grip (DESIGN 4.2), drawn only where the card has somewhere to go. `.effect-handle-space`
+   is the alignment it leaves behind on a card that is alone in its family -- no glyph, no border,
+   nothing to take hold of, because a handle that leads nowhere is the control C2 refused to draw
+   and C3 has no more right to. */
+.effect-handle { flex: none; width: 16px; height: 18px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--dim); font: 12px/1 Consolas, monospace; cursor: grab; touch-action: none; }
+.effect-handle-space { flex: none; width: 16px; }
+.effect-handle:enabled:hover { background: var(--surface-3); color: var(--ink); }
+.effect-handle:focus { border: 1px solid var(--line-strong); color: var(--ink); }
+.effect-handle:disabled { opacity: .5; cursor: not-allowed; }
+/* The gesture, while it is happening. The card being carried recedes; the card whose place would
+   be taken is outlined in --line-strong on --surface-2 -- the same "this is the target" pair
+   `.effect-option:hover` already uses, so a drop mark and a hover mean one thing in this panel.
+   Nothing is marked over another family's run, which is FX-5's "not offered" as the Director sees
+   it, and no --acid: acid is the slider fill and the tab underline in this surface and nothing
+   else. */
+.effect-card.effect-dragging { opacity: .5; }
+.effect-card.effect-drop { border-color: var(--line-strong); background: var(--surface-2); }
+/* Copying a stack onto shots the Director names. A disclosure, like the picker, and for the same
+   reason: it is a list that is only wanted once. The announcement sits above the list, so it is
+   read on the way to the choice rather than after it. */
+.effect-copy { margin-top: 9px; }
+.effect-copy-panel { margin-top: 7px; padding: 9px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-1); }
+.effect-copy-panel[hidden] { display: none; }
+.effect-copy-note { margin: 0 0 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.effect-copy-targets { margin-bottom: 8px; }
+.effect-copy-target { display: flex; align-items: center; gap: 7px; padding: 4px 5px; border-radius: 3px; cursor: pointer; }
+.effect-copy-target:hover { background: var(--surface-2); }
+/* The tick, drawn rather than inherited. The generic `input` rule in this stylesheet gives every
+   input `width: 100%`, a 38px height, a 1px --line border and 9px of padding; inherited by a
+   checkbox in a flex row it drew a 38px grey pill *and* squeezed the shot's prompt out of the row
+   entirely -- the C2 slider defect, one control over, caught the same way: by looking. Not
+   --acid either: acid in this surface is the slider fill and the tab underline, and a target
+   chosen is neither (DESIGN 5), so the checked box is --ink like the enable toggle beside it. */
+.effect-copy-target input { flex: none; position: relative; width: 13px; height: 13px; margin: 0; padding: 0; appearance: none; -webkit-appearance: none; border: 1px solid var(--line-strong); border-radius: 3px; background: var(--surface-3); }
+.effect-copy-target input:checked { border-color: var(--ink); background: var(--ink); }
+.effect-copy-target input:checked::after { content: "\2713"; position: absolute; top: 0; left: 1px; color: var(--bg); font: 9px/11px Consolas, monospace; }
+.effect-copy-name { flex: none; color: var(--ink); font: 9px/1.2 Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
+.effect-copy-hint { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 11px; }
+.effect-copy-mark { flex: none; color: var(--muted); font: 9px/1.2 Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
 /* The clip's effects chip (DESIGN 3): --muted on --surface-2, sharing the clip's bottom-right
    corner. Held clear of the 12px resize handle, so the corner a Director grabs to trim a shot is
    never a chip they meant to read. */

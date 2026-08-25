@@ -1,4 +1,4 @@
-import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectControlKey, effectControlTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -2474,6 +2474,37 @@ let effectCatalogueError = "";
 //: the toast, because a toast is gone in four seconds and the sentence a Director has to act on
 //: names an effect, a parameter and a bound. Cleared by the next write that lands.
 let lastEffectsRefusal = null;
+//: A reorder drag in flight, or `null`. `{ shotId, from, candidates, target }`: the Shot it
+//: belongs to, the storage index of the card being carried, the measured boxes it may be dropped
+//: on, and which of them the pointer is over.
+//:
+//: **`pointerdown` with window-level move tracking, not HTML5 `draggable`.** Both idioms are in
+//: this file -- asset cards use `dragstart`/`dataTransfer` (`:1136`), timeline clips and section
+//: edges use pointer tracking (`:2229`, `:1617`) -- and three things chose the second. Every
+//: existing drag a Director performs in this application is the pointer one, so the grip behaves
+//: like the clip edge beside it. It puts the drop affordance in this application's hands, which
+//: matters because the affordance *is* the "not offered" half of FX-5: no highlight over another
+//: family's run is the interface saying no. And WebDriver drives real pointer events but cannot
+//: initiate an HTML5 drag at all, so the browser gate this slice must pass could not have
+//: performed the gesture on the other idiom -- it could only have dispatched synthetic
+//: `DragEvent`s, which is reading the handler rather than performing the drag.
+let effectDrag = null;
+
+//: The copy control's own session state: which Shot it belongs to, whether the disclosure is
+//: open, and which target Shots are ticked. Keyed to the Shot, `lastEffectsRefusal`'s shape and
+//: for its reason -- a set of targets chosen for one clip must not follow the Director onto the
+//: next one and be applied there.
+//:
+//: In module state rather than on the panel's dataset, unlike the picker's open flag. The picker
+//: is opened by mutating the DOM after the render, so its state has to be carried back across a
+//: rebuild by `captureInspectorEdit`; this is *drawn from the model*, so state that lives out
+//: here survives the two-second reload by construction rather than by being carried.
+let effectCopy = { shotId: "", open: false, ids: [] };
+
+//: The last copy's report, and the Shot it was about. Kept rather than left to a toast for
+//: `lastEffectsRefusal`'s reason: a toast is gone in four seconds and this one names the Shots
+//: that were left alone and how to unlock them.
+let lastEffectsCopyReport = null;
 
 // Read at boot, beside health and the eject state. A failure is remembered rather than retried:
 // every control on the tab needs the catalogue to say what it is, so there is nothing useful to
@@ -2586,6 +2617,19 @@ function effectRowHtml(card, row) {
   return `<div class="effect-row">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}" ${row.disabled ? "disabled" : ""}>${options}</select>${bind}</div>`;
 }
 
+// The card's grip (DESIGN 4.2), drawn **only where there is somewhere to go**. C2 left it out on
+// the grounds that a handle doing nothing is the one control this interface must never draw, and
+// that argument survives into C3: a family holding one card has no run to move inside, so its card
+// carries an empty spacer instead of a grip -- which keeps the family and name columns aligned
+// down the whole stack without offering a hold that leads nowhere.
+//
+// A real `<button>`, so it is in the tab order and `Alt+Up`/`Alt+Down` have somewhere to be
+// pressed. Its title is its accessible name, and both are `effectCardModel`'s.
+function effectHandleHtml(card) {
+  if (!card.handle.shown) return `<span class="effect-handle-space" aria-hidden="true"></span>`;
+  return `<button type="button" class="effect-handle" id="effect-handle-${card.index}" title="${escapeHtml(card.handle.title)}" aria-label="${escapeHtml(card.handle.title)}" ${card.handle.disabled ? "disabled" : ""}>${escapeHtml(card.handle.glyph)}</button>`;
+}
+
 // One effect card: family, name, an enable toggle, a remove, and its rows. Every string and every
 // `disabled` here is applied from `effectCardModel` and none of them is re-decided.
 //
@@ -2595,8 +2639,33 @@ function effectRowHtml(card, row) {
 // other state it draws.
 function effectCardHtml(card) {
   const note = card.note ? `<p class="effect-note">${escapeHtml(card.note)}</p>` : "";
-  const head = `<div class="effect-head"><span class="effect-family">${escapeHtml(card.family)}</span><span class="effect-name">${escapeHtml(card.label)}</span><input type="checkbox" class="effect-toggle" id="effect-toggle-${card.index}" title="${escapeHtml(card.toggle.title)}" aria-label="${escapeHtml(card.label)}: ${escapeHtml(card.toggle.label)}" ${card.toggle.checked ? "checked" : ""} ${card.toggle.disabled ? "disabled" : ""}><button type="button" class="effect-remove" id="effect-remove-${card.index}" title="${escapeHtml(card.remove.title)}" aria-label="${escapeHtml(card.remove.title)}" ${card.remove.disabled ? "disabled" : ""}>${escapeHtml(card.remove.label)}</button></div>`;
-  return `<div class="effect-card ${card.className}" data-index="${card.index}">${head}${note}${card.rows.map((row) => effectRowHtml(card, row)).join("")}</div>`;
+  const head = `<div class="effect-head">${effectHandleHtml(card)}<span class="effect-family">${escapeHtml(card.family)}</span><span class="effect-name">${escapeHtml(card.label)}</span><input type="checkbox" class="effect-toggle" id="effect-toggle-${card.index}" title="${escapeHtml(card.toggle.title)}" aria-label="${escapeHtml(card.label)}: ${escapeHtml(card.toggle.label)}" ${card.toggle.checked ? "checked" : ""} ${card.toggle.disabled ? "disabled" : ""}><button type="button" class="effect-remove" id="effect-remove-${card.index}" title="${escapeHtml(card.remove.title)}" aria-label="${escapeHtml(card.remove.title)}" ${card.remove.disabled ? "disabled" : ""}>${escapeHtml(card.remove.label)}</button></div>`;
+  return `<div class="effect-card ${card.className}" id="effect-card-${card.index}" data-index="${card.index}">${head}${note}${card.rows.map((row) => effectRowHtml(card, row)).join("")}</div>`;
+}
+
+// One family's run of cards, as a box. The run is what makes the reordering rule visible: a
+// Director who can see where their family's cards begin and end can see why the card will not go
+// above the box, rather than experiencing a drag that simply does not respond.
+//
+// The order is `effectStackLayout`'s, which is the order the chain composes in -- so what this
+// panel shows top to bottom is what ffmpeg applies first to last. Nothing here decides that.
+function effectRunHtml(run) {
+  return `<div class="effect-run" data-family="${escapeHtml(run.family)}">${run.cards.map(effectCardHtml).join("")}</div>`;
+}
+
+// The copy control: a disclosure holding the announcement, the target list and the button.
+//
+// **The announcement is drawn above the targets, not beside the button**, so it is read on the
+// way to the choice rather than after it. FX-6 asks for the Director to be told a copy replaces
+// before it runs, and a sentence under a button that is already reachable is a sentence read
+// afterwards. Every string here is `effectCopyPanel`'s.
+function effectCopyHtml(copy) {
+  if (!copy.shown) {
+    return copy.note ? `<p class="control-reason" id="effect-copy-none">${escapeHtml(copy.note)}</p>` : "";
+  }
+  const targets = copy.targets.map((target) =>
+    `<label class="effect-copy-target" for="effect-copy-target-${target.id}"><input type="checkbox" id="effect-copy-target-${target.id}" ${target.checked ? "checked" : ""}><span class="effect-copy-name">${escapeHtml(target.label)}</span><span class="effect-copy-hint">${escapeHtml(target.hint)}</span>${target.lockedMark ? `<span class="effect-copy-mark">${escapeHtml(target.lockedMark)}</span>` : ""}</label>`).join("");
+  return `<button type="button" class="quiet-button full effect-copy" id="effect-copy" title="${escapeHtml(copy.title)}" aria-expanded="${copy.open}" aria-controls="effect-copy-panel">${escapeHtml(copy.label)}</button><div class="effect-copy-panel" id="effect-copy-panel" ${copy.open ? "" : "hidden"}><p class="effect-copy-note" id="effect-copy-note">${escapeHtml(copy.announcement)}</p><div class="effect-copy-targets">${targets}</div><button type="button" class="quiet-button full" id="effect-copy-apply" title="${escapeHtml(copy.apply.title)}" ${copy.apply.disabled ? "disabled" : ""}>${escapeHtml(copy.apply.label)}</button><p class="control-reason" id="effect-copy-reason">${escapeHtml(copy.reason)}</p></div>`;
 }
 
 // The whole Effects panel for one Shot. Three states are settled before this runs -- the
@@ -2606,8 +2675,17 @@ function effectCardHtml(card) {
 // An empty stack draws the picker and nothing else. There is deliberately no "no effects yet"
 // box: a placeholder shaped like a card is a thing pretending to be a stack.
 function effectsPanel(shot) {
-  const model = effectsPanelModel(shot, effectCatalogue, { error: effectCatalogueError });
+  const model = effectsPanelModel(shot, effectCatalogue, {
+    error: effectCatalogueError, project: state.project, copy: effectCopy,
+  });
   const refusal = effectsRefusalNotice(shot.id, lastEffectsRefusal);
+  // The last copy's report, in the readiness idiom the refusal above already uses. Counts for
+  // what landed and every refused Shot's own sentence, whole -- `effectCopyReport`'s division,
+  // not one made here.
+  const copied = effectCopyReport(shot.id, lastEffectsCopyReport);
+  const copiedHtml = copied.shown
+    ? `<div class="shot-readiness ${copied.refused ? "blocked" : "sameness"}" id="effects-copy-report"><strong>${escapeHtml(copied.flag)}</strong>${copied.lines.map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>`
+    : "";
   // The route's own sentence, whole. Those refusals name the offending effect, the parameter and
   // the bound it broke, and slice B asserts them verbatim -- paraphrasing one here would be a
   // second wording of the same refusal, in a panel whose whole job is to be readable.
@@ -2631,7 +2709,7 @@ function effectsPanel(shot) {
     : "";
   return {
     model,
-    html: `${refusalHtml}${lockHtml}<div class="effect-stack" id="effect-stack">${model.cards.map(effectCardHtml).join("")}</div>${picker}`,
+    html: `${refusalHtml}${copiedHtml}${lockHtml}<div class="effect-stack" id="effect-stack">${model.runs.map(effectRunHtml).join("")}</div>${picker}${effectCopyHtml(model.copy)}`,
   };
 }
 
@@ -2648,25 +2726,197 @@ function effectsPanel(shot) {
 // whole Project, and a refusal therefore leaves the panel drawing exactly what was stored, which
 // is what "the stack was left as it was" has to mean on this side too.
 async function writeEffectStack(shotId, next) {
-  if (!requireProject()) return;
+  if (!requireProject()) return false;
   // The stored stack is re-read from the project rather than from whatever object drew the panel,
   // so "has it changed" is asked against what the server last sent back.
   const stored = shotEffectStack(state.project.shots.find((item) => item.id === shotId));
-  if (!effectStackChanged(next, stored)) return;
+  // Unchanged is `true` and not `false`: the answer is "the stack is now what you asked for", and
+  // a caller placing the focus after a reorder needs that answer rather than "a request was sent".
+  if (!effectStackChanged(next, stored)) return true;
   const projectId = state.project.id;
+  let landed = false;
   try {
     const project = await api.saveShotEffects(projectId, shotId, effectStackWrite(next));
     // The Director moved to another project while this was in flight. The write landed on the
     // server; applying its reply here would show one project's work under another's name.
-    if (state.project?.id !== projectId) return;
+    if (state.project?.id !== projectId) return false;
     state.project = project;
     lastEffectsRefusal = null;
+    landed = true;
   } catch (error) {
-    if (state.project?.id !== projectId) return;
+    if (state.project?.id !== projectId) return false;
     lastEffectsRefusal = { shotId, message: error.message };
     toast(error.message, "error");
   }
   // Either way: the clip's chip, the tab's count and every card redraw from what is stored.
+  renderTimeline();
+  return landed;
+}
+
+// One card moved onto another card's place, written once, with the focus following it.
+//
+// The move itself is `effectStackMove`'s -- including whether it is a move at all. Nothing here
+// asks about families: a target the chain forbids comes back `moved: false` and this returns
+// without a request, which is the same answer the drag gives by never offering the drop.
+//
+// Focus follows the card and not the position: after the write the panel is rebuilt from what the
+// server stored, so the grip the Director was holding is a different element under a different id.
+// `plan.index` is where that card now sits, and a refused write leaves it where it started -- so
+// the two are told apart by whether the write landed rather than assumed.
+async function moveEffectCard(shotId, from, to) {
+  const plan = effectStackMove(shotEffectStack(selectedShot()), effectCatalogue, from, to);
+  if (!plan.moved) return;
+  const landed = await writeEffectStack(shotId, plan.stack);
+  const inspector = $("#shot-inspector");
+  $("#effect-handle-" + (landed ? plan.index : from), inspector)?.focus?.();
+}
+
+// The boxes a drag may land on: the moving card's own family, measured, plus the card itself.
+//
+// **Every candidate is asked of `effectMoveOffered`**, so which cards are landable is the pure
+// decision and this only measures the ones it names. The moving card is added last and by hand:
+// it is not a legal *move* (`from === to` is not one) but it is part of the run's own span, so a
+// pointer sitting on it must find the run rather than fall off the end of it -- which is how a
+// drag released where it was picked up ends as nothing happening instead of as a jump to the
+// nearest neighbour.
+function effectDragCandidates(inspector, model, stack, from) {
+  const boxes = [];
+  for (const card of model.cards) {
+    if (!effectMoveOffered(stack, effectCatalogue, from, card.index)) continue;
+    const box = $("#effect-card-" + card.index, inspector)?.getBoundingClientRect?.();
+    if (box) boxes.push({ index: card.index, top: box.top, bottom: box.bottom });
+  }
+  const own = $("#effect-card-" + from, inspector)?.getBoundingClientRect?.();
+  if (own) boxes.push({ index: from, top: own.top, bottom: own.bottom });
+  return boxes;
+}
+
+// The drop affordance: the card whose place would be taken, marked. Nothing is marked while the
+// pointer is over another family's run, which is FX-5's "not offered" as the Director sees it.
+function paintEffectDrag(inspector, drag) {
+  for (const box of drag.candidates) {
+    const card = $("#effect-card-" + box.index, inspector);
+    card?.classList?.toggle("effect-drop", box.index === drag.target && box.index !== drag.from);
+  }
+  $("#effect-card-" + drag.from, inspector)?.classList?.toggle("effect-dragging", !drag.done);
+}
+
+// Take hold of a card. Pointer tracking on `window`, the idiom every other drag in this file uses
+// (`bindClip`, the section edges), and for its reasons: the pointer leaves the grip on the first
+// pixel, and the listeners have to outlive whatever is under it.
+//
+// **The inspector rebuild is suppressed for the length of the gesture.** This panel is redrawn by
+// the two-second background reload and by every reply nobody awaited, and this repository has the
+// recorded defect where `pointerdown` re-rendered every clip and the `dblclick` that followed
+// never fired (`:1088`, `:2504`). A drag is worse than a lost click: the cards the Director is
+// aiming at are replaced mid-gesture, so the boxes measured here address elements that no longer
+// exist and the affordance is repainted away under the pointer. Carrying the drag across the
+// rebuild the way `captureInspectorEdit` carries an edit would keep the gesture alive and still
+// lose everything the Director can see of it, which is the C2 lesson exactly: every gate green
+// and the thing wrong on screen. So `renderShotInspector` returns early while `effectDrag` is
+// set, and the drop's own write rebuilds the panel a moment later.
+//
+// The flag cannot leak: `pointerup` clears it, `Escape` clears it, and both run outside this
+// panel's markup on `window`, where nothing this render does can destroy them.
+function startEffectDrag(inspector, model, shotId, from, event) {
+  if (event?.button) return;
+  // `preventDefault` on `pointerdown` stops the text selection a drag across a panel of labels
+  // otherwise sweeps up -- and it also suppresses the compatibility `mousedown`, which is what
+  // would have focused the button. So the focus is placed by hand: the grip has to be the focused
+  // element for `Alt+Up` to reach the card, and a Director who takes hold of one has focused it.
+  event?.preventDefault?.();
+  $("#effect-handle-" + from, inspector)?.focus?.();
+  const stack = shotEffectStack(selectedShot());
+  const candidates = effectDragCandidates(inspector, model, stack, from);
+  // A run of one is not a run. Nothing to aim at means no drag, rather than a drag that can only
+  // ever be released on the card it started from.
+  if (candidates.length < 2) return;
+  effectDrag = { shotId, from, candidates, target: from, done: false };
+  paintEffectDrag(inspector, effectDrag);
+  const move = (moved) => {
+    if (!effectDrag) return;
+    effectDrag.target = effectDropTarget(effectDrag.candidates, moved.clientY);
+    paintEffectDrag($("#shot-inspector"), effectDrag);
+  };
+  const cancel = (pressed) => {
+    // Escape abandons the gesture cleanly -- nothing written, the stack as it was, the panel
+    // redrawn from what is stored. A drag a Director changed their mind about must not be a drag
+    // they have to complete somewhere harmless.
+    if (pressed?.key !== "Escape" || !effectDrag) return;
+    effectDrag.target = -1;
+    up();
+  };
+  const up = () => {
+    window.removeEventListener?.("pointermove", move);
+    window.removeEventListener?.("pointerup", up);
+    window.removeEventListener?.("keydown", cancel);
+    const drag = effectDrag;
+    if (!drag) return;
+    drag.done = true;
+    effectDrag = null;
+    const panel = $("#shot-inspector");
+    paintEffectDrag(panel, drag);
+    for (const box of drag.candidates) {
+      $("#effect-card-" + box.index, panel)?.classList?.remove("effect-drop");
+    }
+    // Released outside the run, or where it was picked up: nothing is written, and the panel is
+    // redrawn because the rebuild it was owed while the drag was in flight never happened. The
+    // grip is focused again afterwards -- the rebuild replaced the element the press focused, and
+    // a Director who has just taken hold of a card and put it back has not stopped working on it.
+    if (drag.target < 0 || drag.target === drag.from) {
+      renderShotInspector();
+      $("#effect-handle-" + drag.from, $("#shot-inspector"))?.focus?.();
+      return;
+    }
+    moveEffectCard(drag.shotId, drag.from, drag.target);
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+  window.addEventListener("keydown", cancel);
+}
+
+// The copy's button and its reason, repainted from the model without rebuilding the panel.
+//
+// A tick must not redraw the inspector. It is the same defect the drag suppresses around: the
+// checkbox the Director just pressed would be replaced under their finger, and the next one they
+// reach for would be a different element. So the two things a tick changes -- how many shots the
+// button says it will write, and whether it may be pressed -- are painted here, `paintEffectSlider`'s
+// shape and for its reason.
+function paintEffectCopy(inspector, shot) {
+  const copy = effectsPanelModel(shot, effectCatalogue, {
+    error: effectCatalogueError, project: state.project, copy: effectCopy,
+  }).copy;
+  const apply = $("#effect-copy-apply", inspector);
+  if (apply) {
+    apply.textContent = copy.apply.label;
+    apply.disabled = copy.apply.disabled;
+    apply.title = copy.apply.title;
+  }
+  const reason = $("#effect-copy-reason", inspector);
+  if (reason) reason.textContent = copy.reason;
+  const note = $("#effect-copy-note", inspector);
+  if (note) note.textContent = copy.announcement;
+}
+
+// One copy, sent as one request. **Never a loop of stack writes**: the route reports atomically
+// and this applies what it answered, which is the whole reason it exists.
+async function runEffectCopy(shotId, ids) {
+  if (!requireProject()) return;
+  const projectId = state.project.id;
+  try {
+    const report = await api.copyShotEffects(projectId, shotId, effectCopyBody(ids));
+    if (state.project?.id !== projectId) return;
+    state.project = report.project || state.project;
+    // The report is kept and the choice is cleared: the copy has happened, and leaving the
+    // targets ticked invites a second identical write on the next glance at the panel.
+    lastEffectsCopyReport = { shotId, ...report };
+    effectCopy = { shotId, open: true, ids: [] };
+  } catch (error) {
+    if (state.project?.id !== projectId) return;
+    lastEffectsCopyReport = null;
+    lastEffectsRefusal = { shotId, message: error.message };
+    toast(error.message, "error");
+  }
   renderTimeline();
 }
 
@@ -2709,6 +2959,29 @@ function bindEffectsPanel(inspector, shot, model) {
     }
   }
   for (const card of model.cards) {
+    // The grip, and the keys that do the same job without one. Both are bound only where the card
+    // may actually move -- a family of one has no grip drawn at all, and a locked Shot's grip is
+    // drawn `disabled` -- so neither handler has to ask about the lock or the run a second time.
+    // `handle.draggable` is `effectCardModel`'s single answer to "may this card be moved".
+    if (card.handle.draggable) {
+      $("#effect-handle-" + card.index, inspector)?.addEventListener("pointerdown", (event) => {
+        startEffectDrag(inspector, model, shotId, card.index, event);
+      });
+      // On the card rather than on the grip, so `Alt+Up` works from wherever inside the card the
+      // Director's focus happens to be -- the grip, the enable toggle, a slider. `Alt` is not a
+      // modifier any of those controls answers to, so nothing is being taken from them.
+      $("#effect-card-" + card.index, inspector)?.addEventListener("keydown", (event) => {
+        if (!event.altKey) return;
+        const direction = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+        if (!direction) return;
+        // Which card the key moves onto -- including "none, this is the first of its family", in
+        // which case nothing at all happens and the key is left to the browser.
+        const wanted = effectNudgeTarget(stack(), effectCatalogue, card.index, direction);
+        if (wanted < 0) return;
+        event.preventDefault?.();
+        moveEffectCard(shotId, card.index, wanted);
+      });
+    }
     $("#effect-toggle-" + card.index, inspector)?.addEventListener("change", () => {
       writeEffectStack(shotId, effectStackToggle(stack(), card.index));
     });
@@ -2728,6 +3001,44 @@ function bindEffectsPanel(inspector, shot, model) {
       control.addEventListener("change", () => writeEffectParameter(shotId, stack(), target, control));
     }
   }
+  bindEffectCopy(inspector, shot, model);
+}
+
+// The copy control: the disclosure, the ticks, and the one button that writes.
+//
+// A tick changes `effectCopy` and repaints the button, never the panel -- the rebuild would
+// replace the checkbox under the Director's finger. Opening and closing does rebuild, because the
+// disclosure's state is drawn from the model and there is nothing under the pointer to lose.
+function bindEffectCopy(inspector, shot, model) {
+  const copy = model.copy;
+  if (!copy.shown) return;
+  const shotId = shot.id;
+  $("#effect-copy", inspector)?.addEventListener("click", () => {
+    effectCopy = { shotId, open: !copy.open, ids: copy.open ? [] : copy.chosen };
+    renderShotInspector();
+  });
+  for (const target of copy.targets) {
+    $("#effect-copy-target-" + target.id, inspector)?.addEventListener("change", (event) => {
+      const wanted = new Set(effectCopy.shotId === shotId ? effectCopy.ids : []);
+      if (event?.target?.checked) wanted.add(target.id);
+      else wanted.delete(target.id);
+      // Kept in the panel's own order rather than in the order they were ticked, so the request
+      // names shots the way the list does and the report reads down the same list.
+      effectCopy = {
+        shotId,
+        open: true,
+        ids: copy.targets.map((item) => item.id).filter((id) => wanted.has(id)),
+      };
+      paintEffectCopy(inspector, shot);
+    });
+  }
+  $("#effect-copy-apply", inspector)?.addEventListener("click", () => {
+    const chosen = effectCopy.shotId === shotId ? effectCopy.ids : [];
+    // The button ships `disabled` with nothing ticked, so this is the belt to that brace and the
+    // route refuses an empty target list by name regardless -- nothing here is the guard.
+    if (!chosen.length) return;
+    runEffectCopy(shotId, chosen);
+  });
 }
 
 // One parameter written, from whichever control carries it. The index and the name travel on the
@@ -2978,6 +3289,13 @@ export function renderShotInspector() {
     if (inspector.dataset) inspector.dataset.shotId = "";
     return;
   }
+  // **A reorder drag in flight owns this panel until it ends.** The two-second reload and every
+  // reply nobody awaited land here, and a rebuild mid-drag replaces the cards the Director is
+  // aiming at: the boxes the gesture measured would address elements that no longer exist and the
+  // drop mark would be repainted away under the pointer. `startEffectDrag` records why this is a
+  // suppression rather than a carry. Bounded by the gesture -- `pointerup` and `Escape` both clear
+  // it on `window`, and the drop's own write rebuilds this panel a moment later.
+  if (effectDrag && effectDrag.shotId === shot.id) return;
   const place = captureInspectorEdit(inspector, shot.id);
   const assets = state.project.assets || [];
   // The refusal sends the Director here -- "Write a prompt in the shot inspector" -- so the panel

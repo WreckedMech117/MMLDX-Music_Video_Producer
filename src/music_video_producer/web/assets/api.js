@@ -6330,7 +6330,7 @@ export function effectParameterRow(parameter, spec, { looks = [], disabled = fal
 // all read off this object, and a handler that reached into `catalogue.effects` itself would be
 // the second place that knew the catalogue's shape.
 export function effectParameterDefinition(catalogue, effectId, name) {
-  const definition = (catalogue?.effects || []).find((item) => item.effect === effectId) || null;
+  const definition = effectDefinition(catalogue, effectId);
   return (definition?.parameters || []).find((parameter) => parameter.name === name) || null;
 }
 
@@ -6376,6 +6376,197 @@ export function effectControlTarget(elementId) {
   return { key, index, name: key.slice(cut + 1) };
 }
 
+// One effect's catalogue entry, or `null` for an effect this build has never heard of. Three
+// things below need it -- a card's family, a parameter's bounds, and the run a card belongs to --
+// and three copies of `(catalogue?.effects || []).find(...)` is three places that know the
+// catalogue's wire shape.
+function effectDefinition(catalogue, effectId) {
+  return (catalogue?.effects || []).find((item) => item.effect === effectId) || null;
+}
+
+// Which family one stored spec belongs to. `""` for an effect the catalogue does not know -- the
+// same `""` `effectCardModel` reports -- so an unknown card forms a run of its own rather than
+// being silently joined to whichever family happened to be drawn last.
+function effectFamilyOf(spec, catalogue) {
+  const definition = effectDefinition(catalogue, spec?.effect);
+  return definition ? definition.family : "";
+}
+
+// The families this stack touches, in the order the **chain** composes them.
+//
+// `catalogue.families` is the server's own `FAMILY_ORDER` on the wire, and it is served precisely
+// so this order is not a second copy of it living in JavaScript. A family the served order forgot
+// is appended rather than dropped, which is `effectPickerGroups`' rule and for its reason: a card
+// nothing can place is a worse failure than one sorted oddly.
+export function effectFamilyOrder(stack, catalogue) {
+  const ordered = [...(catalogue?.families || [])];
+  for (const spec of stack || []) {
+    const family = effectFamilyOf(spec, catalogue);
+    if (!ordered.includes(family)) ordered.push(family);
+  }
+  return ordered;
+}
+
+// **The order the cards are drawn in, which is the order the chain composes them.**
+//
+// This is the whole difficulty of reordering, decided in one place. `build_effect_stages` sorts by
+// family as it reads (AD-31) -- geometry, texture, grade, stylize -- and within a family the
+// Director's own order is kept and is meaningful. A panel that drew the *storage* order would show
+// a Grade card above a Texture card that renders after it, and a drag between them would appear to
+// work, survive a save and come back re-sorted: the "expressed and then rejected" failure FX-5
+// exists to forbid.
+//
+// So the stack is laid out here exactly as the composer reads it, each entry carrying where it
+// sits in its own family's run. A run is contiguous by construction, which is what lets a drop
+// target be confined to one and lets `Alt+Up` on a family's first card have nothing to answer.
+//
+// Sorted by rank with the storage position as the tiebreak, so the sort is stable in every engine
+// rather than only in the ones whose `Array.prototype.sort` happens to be.
+export function effectStackLayout(stack, catalogue) {
+  const specs = stack || [];
+  const families = effectFamilyOrder(specs, catalogue);
+  const entries = specs.map((spec, index) => {
+    const family = effectFamilyOf(spec, catalogue);
+    return { index, family, rank: families.indexOf(family) };
+  });
+  const ordered = entries
+    .map((entry, position) => ({ entry, position }))
+    .sort((one, other) => (one.entry.rank - other.entry.rank) || (one.position - other.position))
+    .map((item) => item.entry);
+  const sizes = new Map();
+  for (const entry of ordered) sizes.set(entry.family, (sizes.get(entry.family) || 0) + 1);
+  const counted = new Map();
+  return ordered.map((entry, place) => {
+    const familyPosition = counted.get(entry.family) || 0;
+    counted.set(entry.family, familyPosition + 1);
+    const familySize = sizes.get(entry.family) || 1;
+    return {
+      ...entry,
+      place,
+      familyPosition,
+      familySize,
+      first: familyPosition === 0,
+      last: familyPosition === familySize - 1,
+    };
+  });
+}
+
+// Whether one card may be moved onto another's place. **Same family and nothing else.**
+//
+// A cross-family move changes nothing about the render -- the chain re-sorts however the stack is
+// stored -- so it must not be expressible. This is the one function that says so: asked by the
+// drag before it offers a drop target, by the keys before they move anything, and by the move
+// itself before it rewrites a thing.
+export function effectMoveOffered(stack, catalogue, from, to) {
+  const specs = stack || [];
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from === to) return false;
+  if (from < 0 || to < 0 || from >= specs.length || to >= specs.length) return false;
+  return effectFamilyOf(specs[from], catalogue) === effectFamilyOf(specs[to], catalogue);
+}
+
+// The stack with one card moved onto another card's place, and where that card now sits.
+//
+// **Only the moving family's own storage slots are rewritten.** Every other card keeps the exact
+// position it had, because storage order is not load-bearing (AD-31) and a reorder that also
+// normalised the rest of the stack would write a manifest diff nobody asked for. What changes is
+// the one thing that *is* load-bearing: the relative order of the family's own members.
+//
+// A move that is not offered returns the stack it was handed, unmoved. Callers ask `moved` rather
+// than comparing, so "nothing happened" is one answer here rather than a comparison at each site.
+export function effectStackMove(stack, catalogue, from, to) {
+  const specs = [...(stack || [])];
+  if (!effectMoveOffered(specs, catalogue, from, to)) {
+    return { moved: false, index: from, stack: stack || [] };
+  }
+  const family = effectFamilyOf(specs[from], catalogue);
+  const slots = specs
+    .map((spec, index) => (effectFamilyOf(spec, catalogue) === family ? index : -1))
+    .filter((index) => index >= 0);
+  const members = slots.map((index) => specs[index]);
+  const [carried] = members.splice(slots.indexOf(from), 1);
+  const destination = slots.indexOf(to);
+  members.splice(destination, 0, carried);
+  const next = [...specs];
+  slots.forEach((slot, position) => { next[slot] = members[position]; });
+  return { moved: true, index: slots[destination], stack: next };
+}
+
+// Which card `Alt+Up` or `Alt+Down` moves onto, or `-1` for a press this stack does not answer to.
+//
+// The neighbour is taken from the **drawn** order, so a key moves a card to where the Director can
+// see it going. `-1` on a family's first card pressing up, and on its last pressing down: nothing
+// happens, rather than the card jumping into the family above and coming back re-sorted.
+export function effectNudgeTarget(stack, catalogue, index, direction) {
+  const layout = effectStackLayout(stack, catalogue);
+  const place = layout.findIndex((entry) => entry.index === index);
+  if (place < 0) return -1;
+  const wanted = layout[place + (direction < 0 ? -1 : 1)];
+  if (!wanted || wanted.family !== layout[place].family) return -1;
+  return wanted.index;
+}
+
+// Which card a drag is over, from the pointer's y and the boxes of the cards it may land on.
+//
+// The candidates are the moving card's own family and nothing else, so a pointer over another
+// family's run finds no target at all: the affordance is not drawn and a release there writes
+// nothing. That is FX-5's "not offered rather than silently ignored", expressed as geometry.
+//
+// Inside the run the nearest candidate wins, so the gaps between cards are not dead. Outside it --
+// above the first card or below the last -- there is no target, which is the boundary of the run
+// and the boundary of what a Director may express.
+//
+// Pure, and handed measured boxes rather than elements: `app.js` measures, this decides.
+export function effectDropTarget(candidates, y) {
+  const boxes = (candidates || []).filter(
+    (box) => Number.isFinite(box?.top) && Number.isFinite(box?.bottom));
+  if (!boxes.length || !Number.isFinite(y)) return -1;
+  const top = Math.min(...boxes.map((box) => box.top));
+  const bottom = Math.max(...boxes.map((box) => box.bottom));
+  if (y < top || y > bottom) return -1;
+  let best = -1;
+  let nearest = Infinity;
+  for (const box of boxes) {
+    const gap = y < box.top ? box.top - y : y > box.bottom ? y - box.bottom : 0;
+    if (gap < nearest) { nearest = gap; best = box.index; }
+  }
+  return best;
+}
+
+//: The grip on a card's header (DESIGN section 4 component 2), which C2 deliberately did not draw
+//: on the grounds that a handle doing nothing is the one control this interface must never draw.
+//: C3 draws it, and draws it **only where there is somewhere to go**: a family holding one card
+//: has no run to move inside, so its card carries no grip at all rather than an inert one.
+export const EFFECT_HANDLE_GLYPH = "≡";
+
+//: What the grip says it does, and the constraint it says it cannot break. The family is named
+//: because "why will this not move above that one" is the question a confined drag provokes, and
+//: the answer is the chain's fixed stage order rather than anything about this card.
+export const EFFECT_HANDLE_HELP =
+  "Drag to reorder {effect} within the {family} run, or press Alt+Up and Alt+Down. The chain "
+  + "always composes geometry, then texture, then grade, then stylize, so nothing moves out of "
+  + "its own family.";
+
+// One card's grip: whether it is drawn, whether it may be taken hold of, and what it says.
+//
+// `place` is the card's entry in `effectStackLayout`. Absent -- which is what a caller that does
+// not lay the stack out gets -- there is no run to speak of and no grip is drawn.
+function effectHandleModel(place, { locked = false, label = "", family = "" } = {}) {
+  const shown = Boolean(place) && place.familySize > 1;
+  return {
+    shown,
+    glyph: EFFECT_HANDLE_GLYPH,
+    // A locked Shot draws it and cannot take hold of it, which is C2's rule for every other
+    // control on this card: disabled with the reason on it, never quietly missing.
+    draggable: shown && !locked,
+    disabled: locked,
+    title: locked
+      ? EFFECTS_LOCKED_NOTE
+      : EFFECT_HANDLE_HELP.replace("{effect}", label).replace("{family}", family || "stack"),
+    up: shown && !locked && !place.first,
+    down: shown && !locked && !place.last,
+  };
+}
+
 // One effect card: its family, its name, whether it is on, what its controls may do, and its rows.
 //
 // `enabled` is read the way the server stores it -- anything but an explicit `false` is on, which
@@ -6384,19 +6575,29 @@ export function effectControlTarget(elementId) {
 //
 // Every control's `disabled` comes from the lock and from nothing else, and the *reason* travels
 // with it: a control that is off with no sentence beside it says only that something is wrong.
-export function effectCardModel(spec, catalogue, index, { locked = false } = {}) {
-  const definition = (catalogue?.effects || []).find((item) => item.effect === spec?.effect) || null;
+export function effectCardModel(spec, catalogue, index, { locked = false, place = null } = {}) {
+  const definition = effectDefinition(catalogue, spec?.effect);
   const name = String(spec?.effect ?? "");
   const enabled = spec?.enabled !== false;
   const reason = locked ? EFFECTS_LOCKED_NOTE : "";
+  const family = definition ? definition.family : "";
+  const label = definition ? definition.label : name;
   return {
     index,
     effect: name,
-    family: definition ? definition.family : "",
-    label: definition ? definition.label : name,
+    family,
+    label,
     known: Boolean(definition),
     note: definition ? "" : EFFECT_UNKNOWN_NOTE,
     enabled,
+    // Where this card sits in its own family's run, and the grip that lets it move inside it.
+    // Both come from the layout rather than from the card's storage index, because the storage
+    // index says nothing about what a Director can see or reach.
+    place: place ? { ...place } : null,
+    first: Boolean(place?.first),
+    last: Boolean(place?.last),
+    alone: !place || place.familySize <= 1,
+    handle: effectHandleModel(place, { locked, label, family }),
     // A disabled Effect is retained and drops to 45%, keeping its controls readable (DESIGN 4.2).
     className: enabled ? "" : "effect-off",
     toggle: {
@@ -6410,7 +6611,7 @@ export function effectCardModel(spec, catalogue, index, { locked = false } = {})
     remove: {
       label: "✕",
       disabled: locked,
-      title: reason || `Remove ${definition ? definition.label : name} from this shot's stack.`,
+      title: reason || `Remove ${label} from this shot's stack.`,
     },
     rows: (definition?.parameters || []).map((parameter) =>
       effectParameterRow(parameter, spec, { looks: catalogue?.looks || [], disabled: locked })),
@@ -6440,6 +6641,130 @@ export function effectPickerGroups(catalogue) {
     .filter((group) => group.options.length);
 }
 
+//: The copy control, and the disclosure it opens. `…` because choosing the shots is the next
+//: step: nothing is written by pressing this.
+export const EFFECT_COPY_LABEL = "Copy stack to…";
+export const EFFECT_COPY_HELP =
+  "Copy this shot's whole stack onto shots you name. Each one you choose has its own stack "
+  + "replaced; nothing is merged.";
+
+//: **The sentence FX-6 requires to be read before the copy runs.** A copy replaces, and a
+//: Director who expects a merge would lose a look they built on a second shot without ever being
+//: told it was at risk. It names the number of effects, because "replaced by this one's stack" is
+//: only concrete once the reader knows how big that stack is.
+export const EFFECT_COPY_REPLACES =
+  "Copying replaces each chosen shot's whole stack with this one's {count}. Whatever those shots "
+  + "carry now comes off. Nothing is merged.";
+
+//: The same announcement for a source that carries nothing. **A copy from an empty stack is a
+//: real write** -- it clears the targets -- and it is the one case where the gesture's name says
+//: least about what it does, so the panel says it outright before the button is reachable.
+export const EFFECT_COPY_CLEARS =
+  "This shot carries no effects, so copying takes every effect off each chosen shot. Nothing is "
+  + "merged and nothing is kept.";
+
+//: Why the apply button is disabled with nothing ticked. Nothing here applies to "all shots": the
+//: Director names the targets, which is the frozen boundary this control is built inside.
+export const EFFECT_COPY_WITHOUT_TARGETS =
+  "Choose the shots to copy onto. Nothing is written until at least one is named — this "
+  + "application has no \"apply to every shot\".";
+
+//: What a project of one shot is told instead of being shown an empty list. A disclosure that
+//: opens onto nothing is the interface failing to answer rather than answering.
+export const EFFECT_COPY_WITHOUT_OTHERS =
+  "This project holds no other shot to copy this look onto.";
+
+//: The Consolas mark on a target that is locked. Drawn rather than the target being hidden or
+//: untickable: a lock is the Shot's own state and the route is the guard, so a Director may name
+//: one and is told by name that it was left alone (FX-6's matrix, and C1's refusal).
+export const EFFECT_COPY_LOCKED_MARK = "LOCKED";
+
+//: The flag over the copy's report. Two, because "it all landed" and "some of it did not" are
+//: different answers and a Director scanning the panel reads the flag first.
+export const EFFECT_COPY_FLAG = "COPIED";
+export const EFFECT_COPY_PARTIAL_FLAG = "PARTLY COPIED";
+
+// Everything the copy control draws, for one Shot, from the project it lives in and whatever the
+// Director has ticked so far.
+//
+// `choice` is the session's own `{shotId, open, ids}` -- which shots are ticked and whether the
+// disclosure is open. It is keyed to the Shot, so a selection made on one clip cannot follow the
+// Director onto the next, which is the shape `effectsRefusalNotice` already uses for its reason.
+//
+// The target list is every *other* Shot, named the way every refusal in this application names
+// one (`shotLabel`) and hinted with the opening of its prompt, because `SHOT 04 (shot_9f2c)` is
+// an identifier and not a memory of which clip that was.
+export function effectCopyPanel(project, shot, choice = null) {
+  const shots = project?.shots || [];
+  const mine = String(shot?.id ?? "");
+  const others = shots.filter((item) => item?.id && item.id !== mine);
+  const ids = new Set(
+    choice && choice.shotId === mine ? (choice.ids || []).map((id) => String(id)) : []);
+  const targets = others.map((item) => ({
+    id: item.id,
+    label: shotLabel(project, item.id),
+    hint: String(item.prompt || "").slice(0, 40),
+    locked: Boolean(item.locked),
+    lockedMark: item.locked ? EFFECT_COPY_LOCKED_MARK : "",
+    checked: ids.has(String(item.id)),
+  }));
+  const chosen = targets.filter((target) => target.checked);
+  const count = shotEffectStack(shot).length;
+  return {
+    shown: others.length > 0,
+    open: Boolean(choice?.open) && choice?.shotId === mine,
+    label: EFFECT_COPY_LABEL,
+    title: EFFECT_COPY_HELP,
+    note: others.length ? "" : EFFECT_COPY_WITHOUT_OTHERS,
+    targets,
+    chosen: chosen.map((target) => target.id),
+    // Said before the button that runs it is reachable, and said differently for an empty stack,
+    // because clearing a shot is what a copy from nothing does and the word "copy" hides it.
+    announcement: count
+      ? EFFECT_COPY_REPLACES.replace("{count}", count === 1 ? "1 effect" : `${count} effects`)
+      : EFFECT_COPY_CLEARS,
+    apply: {
+      label: chosen.length === 1 ? "Copy to 1 shot" : `Copy to ${chosen.length} shots`,
+      disabled: chosen.length === 0,
+      title: chosen.length ? EFFECT_COPY_HELP : EFFECT_COPY_WITHOUT_TARGETS,
+    },
+    reason: chosen.length ? "" : EFFECT_COPY_WITHOUT_TARGETS,
+  };
+}
+
+// What a copy sends. The targets are named explicitly and the key is always present, for
+// `effectStackWrite`'s reason: a body whose target key went missing must be a named refusal at the
+// route rather than a request that means something else.
+export function effectCopyBody(ids) {
+  return { targets: (ids || []).map((id) => String(id)) };
+}
+
+// What the copy's report says. **Counts for what landed, names for what did not** -- FX-6's own
+// division, and the reason for it is that a Director who copied onto eleven shots wants to read
+// one number and the name of the one that refused, not eleven lines.
+//
+// A refusal's sentence is carried **whole**: the route writes them to be read by a Director, they
+// name the Shot and the remedy, and a second wording here would be a second refusal.
+export function effectCopyReport(shotId, report) {
+  const shown = Boolean(report) && report.shotId === shotId;
+  if (!shown) return { shown: false, flag: EFFECT_COPY_FLAG, lines: [], refused: 0 };
+  const applied = report.applied || [];
+  const refused = report.refused || [];
+  const effects = Number(report.effects) || 0;
+  const shots = applied.length === 1 ? "1 shot" : `${applied.length} shots`;
+  const head = effects
+    ? `Copied ${effects === 1 ? "1 effect" : `${effects} effects`} onto ${shots}, replacing what they held.`
+    : `Took every effect off ${shots}.`;
+  return {
+    shown: true,
+    flag: refused.length ? EFFECT_COPY_PARTIAL_FLAG : EFFECT_COPY_FLAG,
+    lines: [head, ...refused.map((item) => String(item?.detail ?? ""))],
+    // How many Shots were left alone -- a count rather than a class name, because which notice
+    // style says "some of this did not happen" is a drawing decision and belongs in `app.js`.
+    refused: refused.length,
+  };
+}
+
 // Everything the Effects tab draws, for one Shot, in one object. The three states a template must
 // never decide between itself are all settled here: the catalogue never arrived, the Shot is
 // locked, and the stack is empty.
@@ -6447,17 +6772,39 @@ export function effectPickerGroups(catalogue) {
 // An empty stack draws **the picker and nothing else**. A placeholder card, or a "no effects yet"
 // box shaped like one, is a thing pretending to be a stack; the honest empty state of a list is
 // the control that adds to it.
-export function effectsPanelModel(shot, catalogue, { error = "" } = {}) {
+export function effectsPanelModel(shot, catalogue, { error = "", project = null, copy = null } = {}) {
   const locked = Boolean(shot?.locked);
   const problem = error ? EFFECTS_CATALOGUE_UNAVAILABLE : "";
   const stack = shotEffectStack(shot);
+  // Drawn in the order the chain composes them, which is what makes a family's run a thing on
+  // screen -- and a run on screen is the only way a Director can see why a move across families is
+  // not offered rather than experiencing it as the interface failing to respond.
+  const cards = problem
+    ? []
+    : effectStackLayout(stack, catalogue).map((place) =>
+      effectCardModel(stack[place.index], catalogue, place.index, { locked, place }));
+  // The same cards again, grouped into their runs. One list of card objects, projected two ways:
+  // `runs` is what the panel draws (a run is a box), `cards` is what the binding walks. A second
+  // *derivation* would be a second opinion about which family a card is in; this is the same
+  // objects in two shapes.
+  const runs = [];
+  for (const card of cards) {
+    const tail = runs[runs.length - 1];
+    if (tail && tail.family === card.family) tail.cards.push(card);
+    else runs.push({ family: card.family, cards: [card] });
+  }
   return {
     locked,
     lockNote: locked ? EFFECTS_LOCKED_NOTE : "",
     problem,
-    cards: problem
-      ? []
-      : stack.map((spec, index) => effectCardModel(spec, catalogue, index, { locked })),
+    cards,
+    runs,
+    // The copy control needs the whole project to name its targets, and the catalogue problem
+    // hides it for the reason it hides everything else: a panel that cannot say what this stack
+    // is must not offer to put it on another shot.
+    copy: problem
+      ? { shown: false, targets: [], chosen: [] }
+      : effectCopyPanel(project, shot, copy),
     picker: {
       shown: !problem,
       disabled: locked,
@@ -6692,6 +7039,12 @@ export const api = {
   // like every other purpose-built shot action, so the panel redraws from what was stored rather
   // than from what it hoped it sent.
   saveShotEffects: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/effects`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // One stack onto explicitly named Shots, in one request. **Not a loop of the write above**: a
+  // client loop cannot report atomically and would half-apply on the first refusal, leaving the
+  // Director with some shots graded, some not, and no single answer about which. The route
+  // validates once, applies to every unlocked target and returns what it did -- counts plus the
+  // refused Shots named as the timeline names them. The body is `effectCopyBody`'s.
+  copyShotEffects: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/effects/copy`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // Deletion, each with its own server-side guard: the project asks for its confirm flag,
   // the asset refuses while cited, the job settles its record as it cancels on ComfyUI.
   deleteProject: (id) => request(`/api/projects/${id}?confirm_delete=true`, { method: "DELETE" }),

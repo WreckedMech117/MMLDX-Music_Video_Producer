@@ -172,6 +172,8 @@ WORKSPACE_HARNESS = """
 const registry = new Map();
 const listeners = new Map();
 const requests = [];
+//: The selector of the element `focus()` was last called on, or "".
+let focused = "";
 const make = (selector) => ({
   selector, value: "", disabled: false, checked: false, textContent: "", innerHTML: "",
   className: "", title: "", src: "", min: "", max: "", required: false,
@@ -185,6 +187,11 @@ const make = (selector) => ({
     contains(name) { return this.flags.has(name); },
   },
   addEventListener(type, handler) { listeners.set(selector + ":" + type, handler); },
+  // Focus is recorded rather than discarded, so "the focus follows the card" is a measurement.
+  // Deliberately **not** wired to `document.activeElement`: that is what `captureInspectorEdit`
+  // reads to decide there is an edit in progress, and making every focus call look like one
+  // would change what the two-second rebuild restores under every test in this file.
+  focus() { focused = this.selector; },
   append() {}, remove() {}, pause() {}, load() {}, click() {},
   // Attributes are recorded rather than discarded. They were no-ops, and that was a hole with a
   // shape: an accessible name is *only* ever set through `setAttribute`, so no test in this file
@@ -196,7 +203,20 @@ const make = (selector) => ({
   removeAttribute(name) { delete this.attributes[name]; },
   getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
   querySelectorAll: () => [],
-  getBoundingClientRect: () => ({ left: 0, top: 0, width: 1000, height: 300 }),
+  // A settable box, so geometry is a thing a test can arrange rather than one constant every
+  // element shares. The drop target of a reorder drag is decided from measured card boxes, and
+  // with one box for the whole document "the pointer is over the second card" is unstateable --
+  // every card would answer to every pointer position and a wrong answer would look right.
+  // `right` and `bottom` are derived rather than omitted: a real `DOMRect` always carries them,
+  // and code reading `box.bottom` off this stub was reading `undefined`.
+  rect: { left: 0, top: 0, width: 1000, height: 300 },
+  getBoundingClientRect() {
+    return {
+      ...this.rect,
+      right: this.rect.left + this.rect.width,
+      bottom: this.rect.top + this.rect.height,
+    };
+  },
   closest() { return this; },
   // A minimal scoped `querySelector`, over the markup this element was just given. Id
   // selectors only, which is every scoped single-element lookup in app.js. It answered `null`
@@ -246,6 +266,10 @@ at("#music-form").elements.preset.value = "balanced";
 globalThis.document = { querySelector: at, querySelectorAll: () => [], createElement: () => make("<created>") };
 globalThis.window = {
   addEventListener(type, handler) { listeners.set("window:" + type, handler); },
+  // Really removed, so a gesture that ends is a gesture nothing can fire again. Without it the
+  // workspace's own `window.removeEventListener` -- every pointer drag in `app.js` releases its
+  // move and up listeners that way -- was a `TypeError` the moment a drag was driven here.
+  removeEventListener(type) { listeners.delete("window:" + type); },
   confirm: (question) => { throw new Error("unanswered confirm: " + question); },
   prompt: () => null,
 };
@@ -19949,3 +19973,988 @@ def test_the_bind_glyph_ships_inert_and_no_effects_control_draws_the_transition_
     # No gradients, shadows or preview chrome anywhere in it.
     for banned in ("gradient", "box-shadow", "text-shadow", "animation", "@keyframes"):
         assert banned not in effects_rules, banned
+
+
+# --------------------------------------------------------------------------------------
+# Slice C3 -- reordering a stack, and copying one
+#
+# The reordering rule is the whole difficulty and it is asserted here rather than described: the
+# chain sorts by family on read (AD-31), so a cross-family move changes nothing about the render
+# and must not be expressible. Every gesture below is *driven* -- the grip is pressed, the pointer
+# is moved, the keys are pressed, the copy's request is the one the workspace really issued --
+# because a reordering handler that is only read is a handler that has never been performed.
+# --------------------------------------------------------------------------------------
+
+#: The catalogue above holds exactly one effect per family, which cannot express a *run* -- and a
+#: run is the only place a move is offered. Two families of two, so "inside its own family" and
+#: "across families" are both drivable. The parameter names mirror `effects.py`'s real ones.
+EFFECT_CATALOGUE_RUNS = {
+    **EFFECT_CATALOGUE,
+    "effects": [
+        *EFFECT_CATALOGUE["effects"],
+        {
+            "effect": "dutch_tilt", "family": "geometry", "label": "Dutch Tilt",
+            "parameters": [{
+                "name": "angle", "label": "Angle", "kind": "number", "default": 0.0,
+                "minimum": -12.0, "maximum": 12.0, "integer": False, "choices": [],
+            }],
+        },
+        {
+            "effect": "vignette", "family": "texture", "label": "Vignette",
+            "parameters": [{
+                "name": "angle", "label": "Falloff", "kind": "number", "default": 0.0,
+                "minimum": 0.0, "maximum": 1.2, "integer": False, "choices": [],
+            }],
+        },
+    ],
+}
+
+#: A stack stored in an order no family agrees with: texture, geometry, texture, geometry. The
+#: chain reads it as geometry (punch_in, dutch_tilt) then texture (grain, vignette), and so must
+#: the panel -- which is the point of laying it out at all.
+INTERLEAVED_STACK = [
+    {"effect": "grain", "enabled": True, "parameters": {}},
+    {"effect": "punch_in", "enabled": True, "parameters": {}},
+    {"effect": "vignette", "enabled": True, "parameters": {}},
+    {"effect": "dutch_tilt", "enabled": True, "parameters": {}},
+]
+
+
+def reorder_decisions(script: str):
+    """Run `script` with the reorder decisions and the run catalogue already imported."""
+    return run_module(f"""
+      import {{ effectDropTarget, effectMoveOffered, effectNudgeTarget, effectStackLayout,
+               effectStackMove }} from './src/music_video_producer/web/assets/api.js';
+      const catalogue = {json.dumps(EFFECT_CATALOGUE_RUNS)};
+      const stack = {json.dumps(INTERLEAVED_STACK)};
+      {script}
+    """)
+
+
+def test_the_stack_is_laid_out_in_the_order_the_chain_composes_it():
+    """The panel's order is `build_effect_stages`' order, and family runs are contiguous in it.
+
+    A panel drawing *storage* order would show a Grade card above a Texture card that renders
+    after it. That is not a cosmetic complaint: it is what makes a cross-family drag look
+    reasonable, and a reasonable-looking drag the chain then undoes is the "expressed and then
+    rejected" failure FX-5 exists to forbid.
+    """
+    laid = reorder_decisions("""
+      console.log(JSON.stringify(effectStackLayout(stack, catalogue)));
+    """)
+
+    assert [entry["index"] for entry in laid] == [1, 3, 0, 2]
+    assert [entry["family"] for entry in laid] == ["geometry", "geometry", "texture", "texture"]
+    assert [entry["first"] for entry in laid] == [True, False, True, False]
+    assert [entry["last"] for entry in laid] == [False, True, False, True]
+    assert {entry["familySize"] for entry in laid} == {2}
+
+
+def test_a_move_across_families_is_not_offered_and_moves_nothing():
+    """FX-5's whole clause, as one answer: not offered, rather than accepted and undone.
+
+    Both halves are asserted, because they are separately losable. `effectMoveOffered` is what the
+    drag asks before it draws a drop target and what the keys ask before they move;
+    `effectStackMove` is the belt to that brace, so a caller that asked neither still cannot
+    express one.
+    """
+    verdicts = reorder_decisions("""
+      console.log(JSON.stringify({
+        acrossFamilies: effectMoveOffered(stack, catalogue, 0, 1),
+        withinFamily: effectMoveOffered(stack, catalogue, 0, 2),
+        ontoItself: effectMoveOffered(stack, catalogue, 0, 0),
+        offTheEnd: effectMoveOffered(stack, catalogue, 0, 9),
+        moved: effectStackMove(stack, catalogue, 0, 1),
+      }));
+    """)
+
+    assert verdicts["acrossFamilies"] is False
+    assert verdicts["withinFamily"] is True
+    assert verdicts["ontoItself"] is False
+    assert verdicts["offTheEnd"] is False
+    # And the move itself refuses the same thing rather than trusting it was asked.
+    assert verdicts["moved"]["moved"] is False
+    assert verdicts["moved"]["stack"] == INTERLEAVED_STACK
+
+
+def test_a_move_within_a_family_rewrites_that_familys_slots_and_nothing_else():
+    """Only the moving family's own storage positions change.
+
+    Storage order is not load-bearing (AD-31) and the chain re-sorts whatever it is handed, so a
+    reorder that also normalised the rest of the stack would write a manifest diff nobody asked
+    for -- and would make every reorder look, in the file, like a change to every card.
+
+    The returned index is the moved card's *new* storage position, which is what the panel focuses
+    afterwards: the grip the Director was holding is a different element under a different id once
+    the panel is rebuilt from what was stored.
+    """
+    moved = reorder_decisions("""
+      console.log(JSON.stringify(effectStackMove(stack, catalogue, 0, 2)));
+    """)
+
+    assert moved["moved"] is True
+    assert [spec["effect"] for spec in moved["stack"]] == [
+        "vignette", "punch_in", "grain", "dutch_tilt"
+    ]
+    # The geometry cards never moved: they still sit at 1 and 3, exactly where they were stored.
+    assert moved["stack"][1] == INTERLEAVED_STACK[1]
+    assert moved["stack"][3] == INTERLEAVED_STACK[3]
+    assert moved["index"] == 2
+
+
+def test_alt_up_on_a_familys_first_card_has_nothing_to_move_onto():
+    """`-1`, and not the family above. A card that jumped into another family would come back
+    re-sorted, which is the silent rejection this whole rule exists to prevent."""
+    keys = reorder_decisions("""
+      console.log(JSON.stringify({
+        firstUp: effectNudgeTarget(stack, catalogue, 1, -1),
+        firstDown: effectNudgeTarget(stack, catalogue, 1, 1),
+        lastUp: effectNudgeTarget(stack, catalogue, 3, -1),
+        lastDown: effectNudgeTarget(stack, catalogue, 3, 1),
+        textureFirstUp: effectNudgeTarget(stack, catalogue, 0, -1),
+        strangerUp: effectNudgeTarget(stack, catalogue, 9, -1),
+      }));
+    """)
+
+    assert keys["firstUp"] == -1
+    assert keys["firstDown"] == 3
+    assert keys["lastUp"] == 1
+    assert keys["lastDown"] == -1
+    # The first card of the *second* run is a first card too: up from it is the family above.
+    assert keys["textureFirstUp"] == -1
+    assert keys["strangerUp"] == -1
+
+
+def test_a_drop_is_offered_inside_the_run_and_nowhere_else():
+    """The geometry of "not offered": above the run and below it there is no target at all.
+
+    Inside it the nearest card wins, so the gaps between cards are not dead zones that make the
+    affordance flicker -- the same reasoning R-16 applies to snap targets, one surface over.
+    """
+    aimed = reorder_decisions("""
+      const boxes = [{ index: 0, top: 100, bottom: 150 }, { index: 2, top: 160, bottom: 210 }];
+      console.log(JSON.stringify({
+        above: effectDropTarget(boxes, 40),
+        onFirst: effectDropTarget(boxes, 120),
+        inTheGap: effectDropTarget(boxes, 154),
+        onSecond: effectDropTarget(boxes, 200),
+        below: effectDropTarget(boxes, 400),
+        nothingToAimAt: effectDropTarget([], 120),
+        noPointer: effectDropTarget(boxes, null),
+      }));
+    """)
+
+    assert aimed["above"] == -1
+    assert aimed["onFirst"] == 0
+    assert aimed["inTheGap"] == 0
+    assert aimed["onSecond"] == 2
+    assert aimed["below"] == -1
+    assert aimed["nothingToAimAt"] == -1
+    assert aimed["noPointer"] == -1
+
+
+#: The four cards of `INTERLEAVED_STACK` placed down the panel, 50px each, in the order the layout
+#: draws them: punch_in, dutch_tilt, grain, vignette. Geometry occupies 0..100, texture 100..200.
+PLACE_THE_CARDS = """
+  const place = (index, top) => { at('#effect-card-' + index).rect =
+    { left: 0, top, width: 300, height: 50 }; };
+  place(1, 0); place(3, 50); place(0, 100); place(2, 150);
+"""
+
+#: The class marks a drag paints, read back off the four cards.
+MARKED = """
+  const marked = (name) => ['#effect-card-0', '#effect-card-1', '#effect-card-2', '#effect-card-3']
+    .filter((selector) => at(selector).classList.contains(name));
+"""
+
+
+def drag_the_stack(moves: str, responses: dict | None = None, locked: bool = False):
+    """Drive a real reorder gesture against the stub DOM and report what the workspace did."""
+    shot = effects_shot(effects=INTERLEAVED_STACK, locked=locked)
+    return run_effects_workspace(f"""
+      state.project = {effects_project(shot)};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      {PLACE_THE_CARDS}
+      {MARKED}
+      requests.length = 0;
+      {moves}
+      await flush();
+      console.log(JSON.stringify({{
+        requests: requests.map((item) => ({{ path: item.path, method: item.method, body: item.body }})),
+        cards: [...at('#shot-inspector').innerHTML.matchAll(/id="effect-card-(\\d+)"/g)]
+          .map((match) => Number(match[1])),
+        dropMarks: marked('effect-drop'),
+        dragging: marked('effect-dragging'),
+        focused,
+      }}));
+    """, responses=responses, catalogue=EFFECT_CATALOGUE_RUNS)
+
+
+#: The reordered project the route answers a within-family drag with: grain and vignette have
+#: swapped their own two slots and the geometry cards have not moved.
+REORDERED_REPLY = {
+    "id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+    "shots": [json.loads(effects_shot(effects=[
+        {"effect": "vignette", "enabled": True, "parameters": {}},
+        {"effect": "punch_in", "enabled": True, "parameters": {}},
+        {"effect": "grain", "enabled": True, "parameters": {}},
+        {"effect": "dutch_tilt", "enabled": True, "parameters": {}},
+    ]))],
+}
+
+REORDER_PATH = "/api/projects/p1/shots/shot_a/effects"
+
+
+def test_dragging_a_card_within_its_family_writes_the_reordered_stack_once():
+    """The gesture, performed: grip pressed, pointer moved onto the sibling, released.
+
+    One request, and its body is the reordered stack -- so "the order changes and the stack is
+    written once" is measured rather than inferred from the shape of a handler.
+    """
+    dragged = drag_the_stack(
+        """
+          fire('#effect-handle-0:pointerdown', { button: 0, preventDefault() {} });
+          fire('window:pointermove', { clientY: 180 });
+          fire('window:pointerup', {});
+        """,
+        responses={REORDER_PATH: {"body": REORDERED_REPLY}},
+    )
+
+    assert [(item["path"], item["method"]) for item in dragged["requests"]] == [
+        (REORDER_PATH, "PUT")
+    ]
+    assert json.loads(dragged["requests"][0]["body"])["effects"] == [
+        {"effect": "vignette", "enabled": True, "parameters": {}},
+        {"effect": "punch_in", "enabled": True, "parameters": {}},
+        {"effect": "grain", "enabled": True, "parameters": {}},
+        {"effect": "dutch_tilt", "enabled": True, "parameters": {}},
+    ]
+    # And the panel redraws from what the server stored, still in the chain's own order.
+    assert dragged["cards"] == [1, 3, 0, 2]
+    # Nothing is left marked once the pointer is up.
+    assert dragged["dropMarks"] == []
+    assert dragged["dragging"] == []
+    # Focus follows the card and not the position: grain is stored at 2 now, so its grip is there.
+    assert dragged["focused"] == "#effect-handle-2"
+
+
+def test_dragging_a_card_toward_another_family_offers_no_drop_and_writes_nothing():
+    """Held over the geometry run, the texture card finds no target -- and releasing there is not
+    a refused write, a toast or a snap to the nearest legal card. It is nothing."""
+    dragged = drag_the_stack("""
+      fire('#effect-handle-0:pointerdown', { button: 0, preventDefault() {} });
+      fire('window:pointermove', { clientY: 20 });
+      fire('window:pointerup', {});
+    """)
+
+    assert dragged["requests"] == []
+    assert dragged["dropMarks"] == []
+
+
+def test_the_drop_mark_appears_over_the_familys_own_run_and_nowhere_else():
+    """The affordance *is* the "not offered" half of FX-5, as a Director experiences it."""
+    marks = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=INTERLEAVED_STACK))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      {PLACE_THE_CARDS}
+      {MARKED}
+      fire('#effect-handle-0:pointerdown', {{ button: 0, preventDefault() {{}} }});
+      const held = marked('effect-drop');
+      const carried = at('#effect-card-0').classList.contains('effect-dragging');
+      fire('window:pointermove', {{ clientY: 180 }});
+      const overSibling = marked('effect-drop');
+      fire('window:pointermove', {{ clientY: 20 }});
+      const overAnotherFamily = marked('effect-drop');
+      fire('window:pointermove', {{ clientY: 400 }});
+      const belowEverything = marked('effect-drop');
+      fire('window:pointerup', {{}});
+      await flush();
+      console.log(JSON.stringify({{ held, carried, overSibling, overAnotherFamily, belowEverything }}));
+    """, catalogue=EFFECT_CATALOGUE_RUNS)
+
+    # Picked up, nothing is offered yet: the pointer is still on the card it came from.
+    assert marks["held"] == []
+    assert marks["carried"] is True
+    assert marks["overSibling"] == ["#effect-card-2"]
+    assert marks["overAnotherFamily"] == []
+    assert marks["belowEverything"] == []
+
+
+def test_a_drag_in_flight_is_not_rebuilt_under_the_pointer():
+    """The trap this repository has already sprung twice, closed deliberately.
+
+    `renderShotInspector` is reached by the two-second reload and by every reply nobody awaited.
+    Mid-drag it must not rewrite the cards the gesture measured: the boxes would address elements
+    that no longer exist and the drop mark would be repainted away under the pointer. So the
+    rebuild is *suppressed* for the length of the gesture -- and the release still lands.
+    """
+    survived = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=INTERLEAVED_STACK))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      {PLACE_THE_CARDS}
+      fire('#effect-handle-0:pointerdown', {{ button: 0, preventDefault() {{}} }});
+      fire('window:pointermove', {{ clientY: 180 }});
+      const before = at('#shot-inspector').innerHTML;
+      at('#shot-inspector').innerHTML = 'REBUILT';
+      app.renderShotInspector();
+      const after = at('#shot-inspector').innerHTML;
+      at('#shot-inspector').innerHTML = before;
+      const stillMarked = at('#effect-card-2').classList.contains('effect-drop');
+      requests.length = 0;
+      fire('window:pointerup', {{}});
+      await flush();
+      console.log(JSON.stringify({{
+        rebuilt: after !== 'REBUILT',
+        stillMarked,
+        wrote: requests.map((item) => item.path),
+      }}));
+    """, responses={REORDER_PATH: {"body": REORDERED_REPLY}}, catalogue=EFFECT_CATALOGUE_RUNS)
+
+    assert survived["rebuilt"] is False, "the inspector was rebuilt with a drag in flight"
+    assert survived["stillMarked"] is True
+    assert survived["wrote"] == [REORDER_PATH]
+
+
+def test_escape_abandons_a_drag_cleanly_and_gives_the_panel_back():
+    """A gesture a Director changed their mind about must not have to be completed somewhere
+    harmless -- and it must give the panel back, since the rebuild it was owed never happened."""
+    abandoned = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=INTERLEAVED_STACK))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      {PLACE_THE_CARDS}
+      fire('#effect-handle-0:pointerdown', {{ button: 0, preventDefault() {{}} }});
+      fire('window:pointermove', {{ clientY: 180 }});
+      requests.length = 0;
+      fire('window:keydown', {{ key: 'Escape' }});
+      await flush();
+      const marked = at('#effect-card-2').classList.contains('effect-drop');
+      const carried = at('#effect-card-0').classList.contains('effect-dragging');
+      // The flag is cleared, so the panel is drawable again rather than frozen for the session.
+      at('#shot-inspector').innerHTML = 'ABANDONED';
+      app.renderShotInspector();
+      console.log(JSON.stringify({{
+        wrote: requests.map((item) => item.path),
+        marked, carried,
+        redrawn: at('#shot-inspector').innerHTML !== 'ABANDONED',
+      }}));
+    """, catalogue=EFFECT_CATALOGUE_RUNS)
+
+    assert abandoned["wrote"] == []
+    assert abandoned["marked"] is False
+    assert abandoned["carried"] is False
+    assert abandoned["redrawn"] is True
+
+
+def test_alt_up_moves_a_card_one_place_and_the_focus_follows_it():
+    """The keyboard half of FX-5, driven: pressed on the card, one place, focus on the card."""
+    nudged = drag_the_stack(
+        """
+          fire('#effect-card-2:keydown', { altKey: true, key: 'ArrowUp', preventDefault() {} });
+        """,
+        responses={REORDER_PATH: {"body": REORDERED_REPLY}},
+    )
+
+    assert [(item["path"], item["method"]) for item in nudged["requests"]] == [
+        (REORDER_PATH, "PUT")
+    ]
+    assert [spec["effect"] for spec in json.loads(nudged["requests"][0]["body"])["effects"]] == [
+        "vignette", "punch_in", "grain", "dutch_tilt"
+    ]
+    assert nudged["focused"] == "#effect-handle-0"
+
+
+def test_alt_up_on_a_familys_first_card_does_nothing_at_all():
+    """Not a refused write, not a toast: nothing. The chain forbids the move, so it is not offered."""
+    still = drag_the_stack("""
+      fire('#effect-card-1:keydown', { altKey: true, key: 'ArrowUp', preventDefault() {} });
+      fire('#effect-card-0:keydown', { altKey: true, key: 'ArrowUp', preventDefault() {} });
+      fire('#effect-card-2:keydown', { altKey: true, key: 'ArrowDown', preventDefault() {} });
+      fire('#effect-card-1:keydown', { key: 'ArrowDown', preventDefault() {} });
+    """)
+
+    assert still["requests"] == []
+
+
+def test_a_family_of_one_card_draws_no_grip_at_all():
+    """Nothing to offer, so nothing is drawn. A grip that leads nowhere is the control C2 refused
+    to draw, and C3 inherits that argument rather than overturning it."""
+    alone = drawn_effects_panel(
+        effects_shot(effects=[
+            {"effect": "grain", "enabled": True, "parameters": {}},
+            {"effect": "punch_in", "enabled": True, "parameters": {}},
+        ]),
+        catalogue=EFFECT_CATALOGUE_RUNS,
+    )
+
+    assert "effect-handle-0" not in alone["effects"]
+    assert "effect-handle-1" not in alone["effects"]
+    # The column is still reserved, so the family labels line up down the whole stack.
+    assert alone["effects"].count('class="effect-handle-space"') == 2
+
+
+def test_a_locked_shot_draws_the_grip_disabled_and_binds_nothing_to_it():
+    """FX-7 reaches the new control too: drawn, stated, inert -- and the route refuses regardless,
+    which is the half that is actually a guard."""
+    exports = effects_exports()
+    panel = drawn_effects_panel(
+        effects_shot(effects=INTERLEAVED_STACK, locked=True), catalogue=EFFECT_CATALOGUE_RUNS)
+    inert = run_effects_workspace(f"""
+      state.project = {effects_project(effects_shot(effects=INTERLEAVED_STACK, locked=True))};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      {PLACE_THE_CARDS}
+      requests.length = 0;
+      const bound = (key) => {{ try {{ fire(key, {{ altKey: true, key: 'ArrowUp',
+        button: 0, preventDefault() {{}} }}); return true; }} catch (error) {{ return false; }} }};
+      const keys = bound('#effect-card-2:keydown');
+      const grip = bound('#effect-handle-0:pointerdown');
+      await flush();
+      console.log(JSON.stringify({{ keys, grip, wrote: requests.map((item) => item.path) }}));
+    """, catalogue=EFFECT_CATALOGUE_RUNS)
+
+    marker = panel["effects"].split('id="effect-handle-0"', 1)
+    assert len(marker) == 2, panel["effects"]
+    assert "disabled" in marker[1].split(">", 1)[0], marker[1]
+    assert escape_for_markup(exports["locked"]) in panel["effects"]
+    # Nothing is bound to either gesture, so the lock is not asked about a second time anywhere.
+    assert inert["keys"] is False
+    assert inert["grip"] is False
+    assert inert["wrote"] == []
+
+
+def test_the_panel_draws_one_box_per_family_run():
+    """The runs are drawn as boxes, which is what makes the constraint legible rather than
+    experienced as an interface that has stopped responding."""
+    panel = drawn_effects_panel(
+        effects_shot(effects=INTERLEAVED_STACK), catalogue=EFFECT_CATALOGUE_RUNS)
+
+    runs = re.findall(r'<div class="effect-run" data-family="([^"]*)"', panel["effects"])
+    assert runs == ["geometry", "texture"]
+    # And the cards are inside them in the chain's order, not the manifest's.
+    assert re.findall(r'id="effect-card-(\d+)"', panel["effects"]) == ["1", "3", "0", "2"]
+
+
+# --- The copy ------------------------------------------------------------------------------
+
+def copy_exports() -> dict:
+    return run_module("""
+      import { EFFECT_COPY_CLEARS, EFFECT_COPY_FLAG, EFFECT_COPY_HELP, EFFECT_COPY_LABEL,
+               EFFECT_COPY_LOCKED_MARK, EFFECT_COPY_PARTIAL_FLAG, EFFECT_COPY_REPLACES,
+               EFFECT_COPY_WITHOUT_OTHERS, EFFECT_COPY_WITHOUT_TARGETS, EFFECT_HANDLE_GLYPH }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        clears: EFFECT_COPY_CLEARS, flag: EFFECT_COPY_FLAG, help: EFFECT_COPY_HELP,
+        label: EFFECT_COPY_LABEL, lockedMark: EFFECT_COPY_LOCKED_MARK,
+        partial: EFFECT_COPY_PARTIAL_FLAG, replaces: EFFECT_COPY_REPLACES,
+        withoutOthers: EFFECT_COPY_WITHOUT_OTHERS, withoutTargets: EFFECT_COPY_WITHOUT_TARGETS,
+        handle: EFFECT_HANDLE_GLYPH,
+      }));
+    """)
+
+
+def copy_project(source_effects: list, others_locked: bool = False) -> str:
+    """Three shots: the source, an ordinary target, and one that may be locked."""
+    shots = ", ".join([
+        effects_shot(id="shot_a", effects=source_effects, prompt="rooftop wide"),
+        effects_shot(id="shot_b", prompt="rooftop close"),
+        effects_shot(id="shot_c", prompt="the stairwell", locked=others_locked),
+    ])
+    return effects_project(shots)
+
+
+def element_text(html: str, element_id: str) -> str:
+    """The text between an element's opening tag and its close, read off the drawn markup."""
+    found = re.search(rf'id="{element_id}"[^>]*>(.*?)</', html, re.DOTALL)
+    assert found, f"{element_id} was not drawn"
+    return found.group(1)
+
+
+def opening_tag(html: str, element_id: str) -> str:
+    found = re.search(rf'<[^<>]*id="{element_id}"[^<>]*>', html)
+    assert found, f"{element_id} was not drawn"
+    return found.group(0)
+
+
+def drawn_copy_panel(source_effects: list, extra: str = "", responses: dict | None = None,
+                     others_locked: bool = False) -> dict:
+    project = copy_project(source_effects, others_locked)
+    return run_effects_workspace(f"""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      state.project = {project};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      requests.length = 0;
+      {extra}
+      console.log(JSON.stringify({{
+        html: at('#shot-inspector').innerHTML,
+        requests: requests.map((item) => ({{ path: item.path, method: item.method, body: item.body }})),
+        toasts,
+      }}));
+    """, responses=responses)
+
+
+def test_the_copy_says_it_replaces_before_it_can_be_run():
+    """FX-6: the Director is told a copy replaces rather than merges, and told it *first*.
+
+    The sentence is above the target list, so it is read on the way to the choice; a sentence
+    under a button that is already reachable is a sentence read afterwards.
+    """
+    exports = copy_exports()
+    panel = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        extra="fire('#effect-copy:click', {});",
+    )
+    html = panel["html"]
+
+    assert element_text(html, "effect-copy-note") == escape_for_markup(
+        exports["replaces"].replace("{count}", "1 effect"))
+    assert "hidden" not in opening_tag(html, "effect-copy-panel")
+    # The announcement precedes the list and the button in the markup, which is the order it is
+    # read in -- not merely present somewhere on the panel.
+    assert html.index('id="effect-copy-note"') < html.index('id="effect-copy-target-shot_b"')
+    assert html.index('id="effect-copy-target-shot_b"') < html.index('id="effect-copy-apply"')
+    # Nothing is written by opening it, and nothing may be until a shot is named.
+    assert panel["requests"] == []
+    assert "disabled" in opening_tag(html, "effect-copy-apply")
+    assert element_text(html, "effect-copy-reason") == escape_for_markup(exports["withoutTargets"])
+
+
+def test_the_copy_disclosure_ships_closed_and_says_which_it_is():
+    """The picker's idiom, one control down: a list that is only wanted once."""
+    exports = copy_exports()
+    panel = drawn_copy_panel([{"effect": "grain", "enabled": True, "parameters": {}}])
+
+    assert escape_for_markup(exports["label"]) in panel["html"]
+    assert "hidden" in opening_tag(panel["html"], "effect-copy-panel")
+    assert 'aria-expanded="false"' in opening_tag(panel["html"], "effect-copy")
+
+
+def test_a_copy_from_an_empty_stack_says_it_clears_the_shots_it_names():
+    """The one write whose name says least about what it does. `Copy` on a shot carrying nothing
+    takes every effect off the shots it names, and the panel says so before the button is live."""
+    exports = copy_exports()
+    panel = drawn_copy_panel([], extra="fire('#effect-copy:click', {});")
+
+    assert element_text(panel["html"], "effect-copy-note") == escape_for_markup(exports["clears"])
+
+
+def test_ticking_a_target_repaints_the_button_without_rebuilding_the_panel():
+    """A tick must not replace the checkbox under the Director's finger -- the same defect the
+    drag suppresses around, and the reason `paintEffectSlider` exists one control over."""
+    project = copy_project([{"effect": "grain", "enabled": True, "parameters": {}}])
+    ticked = run_effects_workspace(f"""
+      state.project = {project};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      fire('#effect-copy:click', {{}});
+      const before = at('#shot-inspector').innerHTML;
+      fire('#effect-copy-target-shot_b:change', {{ target: {{ checked: true }} }});
+      const one = {{ label: at('#effect-copy-apply').textContent,
+                     disabled: at('#effect-copy-apply').disabled }};
+      fire('#effect-copy-target-shot_c:change', {{ target: {{ checked: true }} }});
+      const two = at('#effect-copy-apply').textContent;
+      fire('#effect-copy-target-shot_b:change', {{ target: {{ checked: false }} }});
+      const back = at('#effect-copy-apply').textContent;
+      console.log(JSON.stringify({{
+        one, two, back, rebuilt: before !== at('#shot-inspector').innerHTML,
+      }}));
+    """)
+
+    assert ticked["one"] == {"label": "Copy to 1 shot", "disabled": False}
+    assert ticked["two"] == "Copy to 2 shots"
+    assert ticked["back"] == "Copy to 1 shot"
+    assert ticked["rebuilt"] is False, "ticking a target rebuilt the panel under the pointer"
+
+
+#: What the copy route answers when one of two named shots is locked -- the shape
+#: `ShotEffectsCopyResponse` serves. The mirror test below feeds the *real* reply through the same
+#: client function, so this literal cannot drift into describing a shape the server does not send.
+COPY_REPLY = {
+    "project": {
+        "id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+        "shots": [
+            json.loads(effects_shot(id="shot_a", effects=[
+                {"effect": "grain", "enabled": True, "parameters": {}}])),
+            json.loads(effects_shot(id="shot_b", effects=[
+                {"effect": "grain", "enabled": True, "parameters": {}}])),
+            json.loads(effects_shot(id="shot_c", locked=True)),
+        ],
+    },
+    "source": "SHOT 01 (shot_a)",
+    "effects": 1,
+    "applied": ["SHOT 02 (shot_b)"],
+    "refused": [{
+        "shot_id": "shot_c", "shot": "SHOT 03 (shot_c)",
+        "detail": "SHOT 03 (shot_c) is locked, so its effects were not changed. "
+                  "Unlock the shot to change its look.",
+    }],
+}
+
+
+def test_a_copy_names_its_targets_in_one_request_and_reports_what_it_did():
+    """One request, not a loop of stack writes -- and a report that counts what landed and names
+    what did not, with the route's own refusal carried whole."""
+    exports = copy_exports()
+    copied = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        others_locked=True,
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-target-shot_b:change', { target: { checked: true } });
+          fire('#effect-copy-target-shot_c:change', { target: { checked: true } });
+          requests.length = 0;
+          await fire('#effect-copy-apply:click', {});
+          await flush();
+          app.renderShotInspector();
+        """,
+        responses={"/api/projects/p1/shots/shot_a/effects/copy": {"body": COPY_REPLY}},
+    )
+
+    assert [(item["path"], item["method"]) for item in copied["requests"]] == [
+        ("/api/projects/p1/shots/shot_a/effects/copy", "POST")
+    ]
+    assert json.loads(copied["requests"][0]["body"]) == {"targets": ["shot_b", "shot_c"]}
+    # The count for what landed...
+    assert "Copied 1 effect onto 1 shot" in copied["html"]
+    # ...and the refused Shot's own sentence, whole and unparaphrased.
+    assert escape_for_markup(COPY_REPLY["refused"][0]["detail"]) in copied["html"]
+    assert escape_for_markup(exports["partial"]) in copied["html"]
+    # A partial copy is drawn as a refusal notice rather than a quiet confirmation.
+    assert 'class="shot-readiness blocked" id="effects-copy-report"' in copied["html"]
+    # And the ticks are cleared, so the panel does not invite the same write a second time.
+    assert "checked" not in opening_tag(copied["html"], "effect-copy-target-shot_b")
+
+
+def test_the_copy_report_counts_what_landed_and_names_only_what_did_not():
+    """FX-6's own division, executed. Eleven shots copied is one number; the one that refused is
+    a name, because that is the half a Director has to act on."""
+    reported = run_module(f"""
+      import {{ effectCopyReport }} from './src/music_video_producer/web/assets/api.js';
+      const reply = {json.dumps(COPY_REPLY)};
+      console.log(JSON.stringify({{
+        mine: effectCopyReport('shot_a', {{ shotId: 'shot_a', ...reply }}),
+        someoneElses: effectCopyReport('shot_z', {{ shotId: 'shot_a', ...reply }}),
+        cleared: effectCopyReport('shot_a', {{
+          shotId: 'shot_a', effects: 0, applied: ['SHOT 02 (shot_b)', 'SHOT 03 (shot_c)'],
+          refused: [],
+        }}),
+      }}));
+    """)
+
+    assert reported["mine"]["lines"][0] == "Copied 1 effect onto 1 shot, replacing what they held."
+    assert reported["mine"]["lines"][1] == COPY_REPLY["refused"][0]["detail"]
+    assert reported["mine"]["refused"] == 1
+    # A report for one Shot cannot follow the Director onto another.
+    assert reported["someoneElses"]["shown"] is False
+    # A copy from an empty stack reports the clearing rather than describing it as a grade.
+    assert reported["cleared"]["lines"] == ["Took every effect off 2 shots."]
+    assert reported["cleared"]["refused"] == 0
+
+
+def test_a_project_of_one_shot_says_there_is_nothing_to_copy_onto():
+    """A disclosure that opens onto an empty list is the interface failing to answer."""
+    exports = copy_exports()
+    alone = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "grain", "enabled": True, "parameters": {}},
+    ]))
+
+    assert escape_for_markup(exports["withoutOthers"]) in alone["effects"]
+    assert 'id="effect-copy-apply"' not in alone["effects"]
+
+
+def test_a_locked_target_is_offered_and_marked_rather_than_hidden():
+    """The route is the guard, so the Director may name a locked shot and is told by name that it
+    was left alone. Hiding it would answer a question they never got to ask."""
+    exports = copy_exports()
+    panel = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        others_locked=True,
+        extra="fire('#effect-copy:click', {});",
+    )
+
+    assert 'id="effect-copy-target-shot_c"' in panel["html"]
+    assert f'class="effect-copy-mark">{exports["lockedMark"]}<' in panel["html"]
+    # Named as the rest of this application names a Shot, never by a bare id alone.
+    assert "SHOT 03 (shot_c)" in panel["html"]
+
+
+def copy_client(tmp_path: Path):
+    """A real app over a real store, and a client for it."""
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.app import create_app
+    from music_video_producer.config import Settings
+    from music_video_producer.store import ProjectStore
+
+    store = ProjectStore(tmp_path)
+    app = create_app(
+        settings=Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy"), store=store
+    )
+    return TestClient(app)
+
+
+def copy_fixture(client, *, locked_third: bool = True) -> str:
+    project_id = client.post("/api/projects", json={"name": "Copy"}).json()["id"]
+    shots = [
+        {"id": "a", "start": 0, "duration": 4, "prompt": "one", "status": "draft", "seed": 1},
+        {"id": "b", "start": 4, "duration": 4, "prompt": "two", "status": "draft", "seed": 2},
+    ]
+    if locked_third:
+        shots.append({"id": "c", "start": 8, "duration": 4, "prompt": "three", "status": "draft",
+                      "seed": 3, "locked": True})
+    written = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert written.status_code == 200, written.text
+    return project_id
+
+
+def test_the_copy_route_applies_to_every_unlocked_target_and_names_the_locked_one(tmp_path: Path):
+    """The route itself, against a real store: one validation, one save, one report."""
+    from music_video_producer.app import SHOT_EFFECTS_LOCKED_REFUSAL
+
+    client = copy_client(tmp_path)
+    project_id = copy_fixture(client)
+    written = client.put(f"/api/projects/{project_id}/shots/a/effects", json={"effects": [
+        {"effect": "grain", "parameters": {"strength": 12}},
+        {"effect": "punch_in", "parameters": {}},
+    ]})
+    assert written.status_code == 200, written.text
+
+    response = client.post(
+        f"/api/projects/{project_id}/shots/a/effects/copy", json={"targets": ["b", "c"]})
+
+    assert response.status_code == 200, response.text
+    report = response.json()
+    assert report["source"] == "SHOT 01 (a)"
+    assert report["effects"] == 2
+    assert report["applied"] == ["SHOT 02 (b)"]
+    assert report["refused"] == [{
+        "shot_id": "c", "shot": "SHOT 03 (c)",
+        "detail": SHOT_EFFECTS_LOCKED_REFUSAL.format(shot="SHOT 03 (c)"),
+    }]
+    # Written exactly as the source holds it -- sparsely, so a corrected default still reaches it.
+    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == [
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 12}},
+        {"effect": "punch_in", "enabled": True, "parameters": {}},
+    ]
+    assert client.get(f"/api/projects/{project_id}/shots/c/effects").json()["effects"] == []
+    # And the whole Project comes back, so a client redraws from what was stored.
+    assert [shot["id"] for shot in report["project"]["shots"]] == ["a", "b", "c"]
+
+
+def test_the_copy_route_replaces_rather_than_merges_and_clears_from_an_empty_stack(tmp_path: Path):
+    """Two properties one route proves: a target's own stack is dropped whole, and a source
+    carrying nothing is a real write that empties its targets."""
+    client = copy_client(tmp_path)
+    project_id = copy_fixture(client, locked_third=False)
+    client.put(f"/api/projects/{project_id}/shots/a/effects",
+               json={"effects": [{"effect": "grain", "parameters": {"strength": 8}}]})
+    client.put(f"/api/projects/{project_id}/shots/b/effects",
+               json={"effects": [{"effect": "vignette", "parameters": {}},
+                                 {"effect": "sharpen", "parameters": {}}]})
+
+    replaced = client.post(
+        f"/api/projects/{project_id}/shots/a/effects/copy", json={"targets": ["b"]})
+    assert replaced.status_code == 200, replaced.text
+    # Replaced whole: neither of the target's own two cards survives.
+    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == [
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 8}}
+    ]
+
+    client.put(f"/api/projects/{project_id}/shots/a/effects", json={"effects": []})
+    cleared = client.post(
+        f"/api/projects/{project_id}/shots/a/effects/copy", json={"targets": ["b"]})
+
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["effects"] == 0
+    assert cleared.json()["applied"] == ["SHOT 02 (b)"]
+    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == []
+
+
+def test_the_copy_route_refuses_whole_rather_than_half_applying(tmp_path: Path):
+    """Every whole-request refusal, and the property they share: nothing is written by any of them.
+
+    422 throughout and never 409 -- the Director's 2026-08-18 ruling holds here as it does on the
+    write beside it -- and an unknown target refuses the *whole* copy rather than grading the ids
+    that happened to resolve.
+    """
+    from music_video_producer.app import (
+        SHOT_EFFECTS_COPY_ONTO_ITSELF_REFUSAL,
+        SHOT_EFFECTS_COPY_UNKNOWN_TARGET_REFUSAL,
+        SHOT_EFFECTS_COPY_WITHOUT_TARGETS_REFUSAL,
+    )
+
+    client = copy_client(tmp_path)
+    project_id = copy_fixture(client, locked_third=False)
+    client.put(f"/api/projects/{project_id}/shots/a/effects",
+               json={"effects": [{"effect": "grain", "parameters": {"strength": 8}}]})
+    path = f"/api/projects/{project_id}/shots/a/effects/copy"
+
+    empty = client.post(path, json={"targets": []})
+    missing_key = client.post(path, json={"targts": ["b"]})
+    unknown = client.post(path, json={"targets": ["b", "nowhere"]})
+    itself = client.post(path, json={"targets": ["a"]})
+    stranger = client.post(f"/api/projects/{project_id}/shots/zz/effects/copy",
+                           json={"targets": ["b"]})
+
+    assert empty.status_code == 422, empty.text
+    assert empty.json()["detail"] == SHOT_EFFECTS_COPY_WITHOUT_TARGETS_REFUSAL.format(
+        shot="SHOT 01 (a)")
+    # A misspelled key is the same refusal, and not a successful copy onto nobody -- the failure
+    # `ShotEffectsRequest.effects` records one route over, where `efects` answered 200.
+    assert missing_key.status_code == 422, missing_key.text
+    assert missing_key.json()["detail"] == empty.json()["detail"]
+    assert unknown.status_code == 422, unknown.text
+    assert unknown.json()["detail"] == SHOT_EFFECTS_COPY_UNKNOWN_TARGET_REFUSAL.format(
+        missing="nowhere")
+    assert itself.status_code == 422, itself.text
+    assert itself.json()["detail"] == SHOT_EFFECTS_COPY_ONTO_ITSELF_REFUSAL.format(
+        shot="SHOT 01 (a)")
+    assert stranger.status_code == 404, stranger.text
+    # Not one of them wrote anything: the shot named beside the bad id is untouched.
+    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == []
+
+
+def test_a_copy_whose_every_target_is_locked_saves_nothing_at_all(tmp_path: Path):
+    """Nothing was written, so the manifest is not touched -- `updated_at` is what every
+    optimistic-concurrency check in this application reads, and a save for a write that did not
+    happen would move it."""
+    client = copy_client(tmp_path)
+    project_id = copy_fixture(client)
+    client.put(f"/api/projects/{project_id}/shots/a/effects",
+               json={"effects": [{"effect": "grain", "parameters": {}}]})
+    before = client.get(f"/api/projects/{project_id}").json()["updated_at"]
+
+    response = client.post(
+        f"/api/projects/{project_id}/shots/a/effects/copy", json={"targets": ["c"]})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["applied"] == []
+    assert [item["shot_id"] for item in response.json()["refused"]] == ["c"]
+    assert client.get(f"/api/projects/{project_id}").json()["updated_at"] == before
+
+
+def test_a_locked_source_is_copied_from(tmp_path: Path):
+    """A lock is a fact about that Shot's own stack, and a copy reads it: nothing about the source
+    changes. Refusing here would take away the gesture a finished, graded, locked Shot is most
+    wanted for -- and C2's lock note, "its effect stack cannot be changed", would be untrue as a
+    reason for it."""
+    client = copy_client(tmp_path)
+    project_id = copy_fixture(client, locked_third=False)
+    client.put(f"/api/projects/{project_id}/shots/a/effects",
+               json={"effects": [{"effect": "grain", "parameters": {"strength": 5}}]})
+    locked = client.put(f"/api/projects/{project_id}/shots", json={"shots": [
+        {"id": "a", "start": 0, "duration": 4, "prompt": "one", "status": "draft", "seed": 1,
+         "locked": True},
+        {"id": "b", "start": 4, "duration": 4, "prompt": "two", "status": "draft", "seed": 2},
+    ]})
+    assert locked.status_code == 200, locked.text
+
+    response = client.post(
+        f"/api/projects/{project_id}/shots/a/effects/copy", json={"targets": ["b"]})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["applied"] == ["SHOT 02 (b)"]
+    assert client.get(f"/api/projects/{project_id}/shots/a/effects").json()["effects"] == [
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 5}}
+    ]
+
+
+def test_the_client_report_is_executed_against_the_routes_own_reply(tmp_path: Path):
+    """The literal above describes a wire shape; this proves the wire shape is that one.
+
+    Renaming `applied`, `refused` or `effects` on the response model would leave every JavaScript
+    assertion here green while the panel drew a report of nothing.
+    """
+    client = copy_client(tmp_path)
+    project_id = copy_fixture(client)
+    client.put(f"/api/projects/{project_id}/shots/a/effects",
+               json={"effects": [{"effect": "grain", "parameters": {}}]})
+    served = client.post(
+        f"/api/projects/{project_id}/shots/a/effects/copy", json={"targets": ["b", "c"]}).json()
+
+    rendered = run_module(f"""
+      import {{ effectCopyReport }} from './src/music_video_producer/web/assets/api.js';
+      const served = {json.dumps(served)};
+      console.log(JSON.stringify(effectCopyReport('a', {{ shotId: 'a', ...served }})));
+    """)
+
+    assert rendered["shown"] is True
+    assert rendered["refused"] == 1
+    assert rendered["lines"][0] == "Copied 1 effect onto 1 shot, replacing what they held."
+    # The refusal is carried whole out of the reply, never composed here from a code.
+    assert rendered["lines"][1] == served["refused"][0]["detail"]
+
+
+def test_the_client_layout_is_executed_against_the_servers_own_family_order(tmp_path: Path):
+    """`FAMILY_ORDER` lives on the server; the panel's order must be that one and not a copy.
+
+    A stack laid out by a JavaScript literal of the family names would pass every test above and
+    draw the wrong order the day a family is added or renamed.
+    """
+    from music_video_producer.effects import FAMILY_ORDER
+
+    client = copy_client(tmp_path)
+    served = client.get("/api/effects/catalogue").json()
+    assert served["families"] == list(FAMILY_ORDER), served["families"]
+
+    laid = run_module(f"""
+      import {{ effectStackLayout }} from './src/music_video_producer/web/assets/api.js';
+      const served = {json.dumps(served)};
+      const stack = [
+        {{ effect: 'posterize' }}, {{ effect: 'grain' }}, {{ effect: 'punch_in' }},
+        {{ effect: 'exposure' }}, {{ effect: 'vignette' }},
+      ];
+      console.log(JSON.stringify(effectStackLayout(stack, served)));
+    """)
+
+    assert [entry["family"] for entry in laid] == [
+        "geometry", "texture", "texture", "grade", "stylize"
+    ]
+    assert [entry["index"] for entry in laid] == [2, 1, 4, 3, 0]
+
+
+def test_the_reorder_and_copy_controls_draw_no_transition_colour_and_no_second_acid():
+    """`--blue` is closed to transitions and reactive bindings; `--acid` in this surface is the
+    slider fill and the active tab underline and nothing else. Both new controls are inside that."""
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    root = re.search(r":root\s*\{(.*?)\n\}", styles, re.DOTALL)
+    assert root, "styles.css no longer declares its palette on :root"
+    rules = "\n".join(
+        line for line in styles.splitlines()
+        if line.startswith((".effect-handle", ".effect-run", ".effect-copy",
+                            ".effect-card.effect-dr"))
+    )
+    assert rules, "the reorder and copy controls have no rules"
+
+    assert "var(--blue" not in rules
+    assert "var(--acid" not in rules
+    for token in set(re.findall(r"var\((--[\w-]+)\)", rules)):
+        assert f"{token}:" in root.group(1), f"{token} is not a palette token"
+    for banned in ("gradient", "box-shadow", "text-shadow", "animation", "@keyframes"):
+        assert banned not in rules, banned
+
+
+def test_the_effects_panel_does_not_re_decide_which_moves_are_legal():
+    """Source-level companion to the executed tests above: `app.js` applies the decision.
+
+    The executed tests prove the rule is right and is used; this is what keeps it the only copy.
+    A family comparison written into a handler is a second rule, and the one that is tested would
+    not be the one that ran.
+    """
+    binder = app_js_block("function bindEffectsPanel(inspector, shot, model) {")
+    drag = app_js_block("function startEffectDrag(inspector, model, shotId, from, event) {")
+    candidates = app_js_block("function effectDragCandidates(inspector, model, stack, from) {")
+    body = without_comments(binder) + without_comments(drag) + without_comments(candidates)
+
+    assert "effectNudgeTarget(stack(), effectCatalogue, card.index, direction)" in body
+    assert "effectMoveOffered(stack, effectCatalogue, from, card.index)" in body
+    assert "effectDropTarget(effectDrag.candidates, moved.clientY)" in body
+    assert "card.handle.draggable" in body
+    # No second opinion about families, ranks or which card may move, in any spelling.
+    for redecided in ("family", "FAMILY", "rank", "shot.locked", "familySize"):
+        assert redecided not in body, redecided

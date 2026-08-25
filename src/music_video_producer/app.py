@@ -6935,6 +6935,59 @@ class ShotEffectsResponse(BaseModel):
     effects: list[EffectSpec] = Field(default_factory=list)
 
 
+class ShotEffectsCopyRequest(BaseModel):
+    """Which Shots one stack is copied onto. Named, never inferred.
+
+    `None` and not `[]` as the default, exactly as `ShotEffectsRequest.effects` is and for the
+    same reason: under a defaulting factory a body whose key is misspelled — `{"targts": [...]}` —
+    binds to the empty list and becomes indistinguishable from a deliberate one. Here that would
+    answer "0 shots copied" and report success for a request that named five. So absence is
+    refused by name (`SHOT_EFFECTS_COPY_WITHOUT_TARGETS_REFUSAL`), and so is an explicitly empty
+    list, because a copy onto nobody is not a thing this route does either way.
+    """
+
+    targets: list[str] | None = None
+
+
+class ShotEffectsCopyRefusal(BaseModel):
+    """One target a copy left alone, and the sentence saying why.
+
+    The sentence travels rather than a code, so the client shows it whole. Those refusals are
+    written to be read by a Director — they name the Shot and the act that clears the lock — and a
+    client composing its own wording from a code would be a second refusal for one fact.
+    """
+
+    shot_id: str
+    #: The Shot as this application names one everywhere else: `SHOT 03 (shot_a1b2)`. A bare id
+    #: appears nowhere in the interface, and the report is read beside a timeline.
+    shot: str
+    detail: str
+
+
+class ShotEffectsCopyResponse(BaseModel):
+    """What one copy did: the whole Project back, a count that landed, and every refusal named.
+
+    A `response_model` for retrospective item A13's reason — a route shaped as a bare dict appears
+    in no `/openapi.json` and no client can discover it — and the `Project` is carried for the
+    idiom every purpose-built shot action already follows, so a client redraws from what was
+    stored rather than from what it hoped it sent.
+
+    `applied` is a list of names and not just a number because the count is derived from it here
+    rather than reported alongside it, which is one fewer pair of numbers that can disagree; the
+    client's report says "4 shots" and never enumerates them, which is FX-6's own division.
+
+    `effects` is how many effects were copied, **and zero is a real answer**: a copy from an empty
+    stack clears its targets, and a report that only counted shots would describe that write in
+    exactly the same words as one that graded them.
+    """
+
+    project: Project
+    source: str
+    effects: int = 0
+    applied: list[str] = Field(default_factory=list)
+    refused: list[ShotEffectsCopyRefusal] = Field(default_factory=list)
+
+
 class EffectParameterSpec(BaseModel):
     """One parameter of one catalogue entry, flattened for the wire.
 
@@ -7160,6 +7213,48 @@ SHOT_EFFECT_STACK_LIMIT = 32
 SHOT_EFFECTS_TOO_MANY_REFUSAL = (
     "An effect stack holds at most {limit} effects, and this one names {count}. "
     "Nothing was composed."
+)
+
+
+#: Why a copy that named no shots was refused. **Nothing here applies to "all shots"** — the
+#: frozen boundary of this slice — so an empty target list is a client that has not chosen yet
+#: rather than one asking for everything, and it is answered as a refusal instead of as a
+#: successful copy onto nobody.
+#:
+#: The remedy is in the sentence for `SHOT_EFFECTS_ABSENT_REFUSAL`'s reason: absence has two
+#: causes here, a client that meant to name shots and a client that thinks omission means all of
+#: them, and the reader cannot be assumed to know which one this application saw.
+SHOT_EFFECTS_COPY_WITHOUT_TARGETS_REFUSAL = (
+    "This copy named no shots to copy {shot}'s look onto, so nothing was written. Name every "
+    'target explicitly as "targets": [...] — this route has no "apply to every shot".'
+)
+
+
+#: Why a copy naming a shot this project does not hold was refused **whole**. The alternative —
+#: applying to the ids that resolve and mentioning the rest in the report — is the half-applied
+#: write this route exists to make impossible: a client that mistyped one id would grade four
+#: shots and be told, in a line among others, that the fifth was never a shot at all.
+SHOT_EFFECTS_COPY_UNKNOWN_TARGET_REFUSAL = (
+    "This copy names {missing}, which this project does not hold, so nothing was written. Every "
+    "shot named by a copy is written, or none of them is."
+)
+
+
+#: Why a copy naming its own source was refused. A shot cannot replace its stack with its own
+#: stack meaningfully, and a client that named it has miscounted its target set — which is worth
+#: saying, because the same miscount is what would silently drop a real target.
+SHOT_EFFECTS_COPY_ONTO_ITSELF_REFUSAL = (
+    "{shot} is both the source of this copy and one of its targets, so nothing was written. "
+    "A shot does not need copying onto itself."
+)
+
+
+#: Why a copy was refused for the source's own stack. `validate_stack` runs **once**, before a
+#: byte reaches any target, so a source stack a hand-edited manifest left uncomposable cannot be
+#: multiplied across the plan. The chain's own sentence is carried whole inside it, as
+#: `ASSEMBLY_EFFECTS_REFUSAL` carries one and for its reason.
+SHOT_EFFECTS_COPY_UNCOMPOSABLE_REFUSAL = (
+    "{shot}'s own effect stack cannot be composed, so it was not copied onto anything. {detail}"
 )
 
 
@@ -11839,6 +11934,139 @@ def create_app(
                 raise HTTPException(status_code=422, detail=str(rescanned)) from rescanned
         shot.effects = stored_effect_stack(request.effects)
         return store.save(project)
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/effects/copy",
+        response_model=ShotEffectsCopyResponse,
+    )
+    def copy_shot_effects(
+        project_id: str, shot_id: str, request: ShotEffectsCopyRequest
+    ) -> ShotEffectsCopyResponse:
+        """Copy one Shot's stack onto Shots the caller names, and report what that did.
+
+        **A route rather than a loop of `PUT .../effects`.** A client loop cannot report
+        atomically: the fourth write refusing for a lock leaves three shots graded, one not, and
+        no single answer about which — and the client has to invent the report itself from four
+        replies, which is a decision about what happened living in the caller. One request
+        validates once, applies to every unlocked target, and returns one answer.
+
+        **A copy replaces; it never merges.** The target's whole stack is dropped and this Shot's
+        is written in its place, which is why the panel states it before the button is reachable
+        (`EFFECT_COPY_REPLACES`, and `EFFECT_COPY_CLEARS` for the case below). Merging is
+        unstateable anyway: two stacks that both carry a Grain card would have to agree about
+        whose strength survives, and no answer to that is one a Director would predict.
+
+        **A source carrying nothing clears its targets, and that is a real write.** It is how a
+        Director takes a look back off several shots at once, and it is the write whose name says
+        least about what it does — hence the announcement, and hence `effects: 0` in the reply
+        rather than an empty report that reads like nothing happened.
+
+        The gates, in the order they have to be in:
+
+        - The source is found first, so a request naming nothing is a 404 rather than a lecture.
+        - A body naming no targets is refused by name, and so is an explicitly empty list. Nothing
+          in this application applies to "all shots" without the Director choosing them.
+        - A named id this project does not hold refuses the **whole** copy. The alternative — apply
+          what resolves, mention the rest — is the half-applied write this route exists against.
+        - The source among its own targets is refused, because it is a miscounted target set and
+          the same miscount silently drops real targets.
+        - The source's own stack is validated **once**, before a byte reaches any target, so a
+          manifest hand-edited into something uncomposable cannot be multiplied across the plan.
+
+        Only then is anything written, and `store.save` is the last statement — so every refusal
+        above leaves the manifest untouched, which is what "nothing was written" has to mean at a
+        route as well as in the composer.
+
+        **A locked target is named in the report and the rest still land.** It is *not* a 422 for
+        the request, because the request is not unprocessable — it named ten shots and nine of them
+        were written, and a status code cannot say that. FX-6's matrix asks for exactly this:
+        "Locked targets named, others still applied." The sentence is C1's own
+        `SHOT_EFFECTS_LOCKED_REFUSAL`, carried whole, so a lock refuses in one wording wherever it
+        refuses — and the Director's 2026-08-18 ruling that a lock is a 422 and never a 409 is
+        untouched: no status here is 409, and the whole-request refusals above are all 422.
+
+        **A locked *source* is copied from.** A lock is a fact about that Shot's own stack, and
+        this reads it: nothing about the source changes. Refusing here would take away the one
+        gesture a finished, locked, graded Shot is most wanted for, and C2's lock note — "its
+        effect stack cannot be changed" — would be untrue as a reason for it.
+        """
+        project = get_project(project_id)
+        source = next((item for item in project.shots if item.id == shot_id), None)
+        if not source:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        named = list(request.targets or [])
+        if not named:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_COPY_WITHOUT_TARGETS_REFUSAL.format(
+                    shot=shot_label(project, source)
+                ),
+            )
+        # Deduplicated in the order named. The same id twice means the same shot once, and a
+        # report counting it twice would be reporting a write that did not happen.
+        wanted: list[str] = []
+        for target_id in named:
+            if target_id not in wanted:
+                wanted.append(target_id)
+        held = {item.id: item for item in project.shots}
+        missing = [target_id for target_id in wanted if target_id not in held]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_COPY_UNKNOWN_TARGET_REFUSAL.format(
+                    missing=", ".join(missing)
+                ),
+            )
+        if source.id in wanted:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_COPY_ONTO_ITSELF_REFUSAL.format(
+                    shot=shot_label(project, source)
+                ),
+            )
+        stack = [spec.model_dump() for spec in source.effects]
+        try:
+            # Once, for the whole copy. The looks are resolved only for a stack that names one,
+            # which is `replace_shot_effects`' rule: an empty stack cannot name a LUT, and
+            # clearing several shots at once must not cost a folder read.
+            validate_stack(stack, luts=discovered_looks() if stack else ())
+        except EffectRefusal as refusal:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_COPY_UNCOMPOSABLE_REFUSAL.format(
+                    shot=shot_label(project, source), detail=str(refusal)
+                ),
+            ) from refusal
+        applied: list[str] = []
+        refused: list[ShotEffectsCopyRefusal] = []
+        for target_id in wanted:
+            target = held[target_id]
+            label = shot_label(project, target)
+            if target.locked:
+                refused.append(
+                    ShotEffectsCopyRefusal(
+                        shot_id=target.id,
+                        shot=label,
+                        detail=SHOT_EFFECTS_LOCKED_REFUSAL.format(shot=label),
+                    )
+                )
+                continue
+            # Copied deep, never aliased: two Shots sharing one parameter mapping would have one
+            # slider move both, and the manifest would not show why. `_adopt_shot_effects` copies
+            # for the same reason on the same field.
+            target.effects = [spec.model_copy(deep=True) for spec in source.effects]
+            applied.append(label)
+        # Saved only when something was written. A copy every one of whose targets was locked
+        # changed nothing, and a manifest save for it would touch `updated_at` — which every
+        # optimistic-concurrency check in this application reads — for a write that did not happen.
+        saved = store.save(project) if applied else project
+        return ShotEffectsCopyResponse(
+            project=saved,
+            source=shot_label(saved, source),
+            effects=len(source.effects),
+            applied=applied,
+            refused=refused,
+        )
 
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/select-take", response_model=Project

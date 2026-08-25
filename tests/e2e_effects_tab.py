@@ -33,8 +33,23 @@ What is driven, in order:
    machine whose looks folder is empty, which is the refusal C1 wrote for exactly this moment.
 9. **The active tab survives the rebuild, and a different Shot returns to `Shot Info`.**
 10. **A locked Shot draws every writing control disabled and states the lock.**
+11. **A family run of three, with grips only where a card has somewhere to go** -- the lone
+    geometry card carries none, because a handle that leads nowhere is the one control this
+    interface must never draw.
+12. **A card dragged inside its own family**, performed with real pointer events: the drop mark
+    appears on the card whose place would be taken, the panel is *not* rebuilt mid-gesture, and
+    the release writes the reordered stack exactly once.
+13. **A card dragged toward another family offers no drop at all** -- nothing marked, nothing
+    written, no refusal, because the chain re-sorts by family and a move it would undo must not
+    be expressible (FX-5).
+14. **`Alt+Up` moves a card one place and the focus follows it** to wherever the card now is.
+15. **`Alt+Up` on a family's first card does nothing** -- no write, no toast.
+16. **The stack copied onto two Shots, one of them locked**: the announcement says it replaces
+    rather than merges *before* the button is live, and the report counts what landed and carries
+    the locked Shot's own refusal whole.
 
-A screenshot of the tab carrying two cards, one of them disabled, is written to `test-artifacts/`.
+Screenshots of the tab carrying two cards (one disabled), the drag mid-gesture, a drag held over
+another family, the copy's announcement and the copy's report are written to `test-artifacts/`.
 
 Run from the repo root -- it starts and proves its own server, and takes no base URL::
 
@@ -56,6 +71,7 @@ from pathlib import Path
 from e2e_support import (
     ManagedServer,
     artifact_dir,
+    clear_toasts,
     console_gate,
     edge_driver,
     get_json,
@@ -67,6 +83,7 @@ from e2e_support import (
     visible_and_clickable,
     wait_for_toast,
 )
+from selenium.webdriver import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -75,6 +92,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 NAME = "effects-tab"
 SHOT = "shot_01"
 OTHER = "shot_02"
+#: The copy's second target, locked -- so one gesture drives both halves of FX-6's matrix row:
+#: the unlocked shot is written and the locked one is named in the report.
+LOCKED = "shot_03"
 
 
 def dead_port() -> int:
@@ -85,7 +105,7 @@ def dead_port() -> int:
 
 
 def seed_project(base_url: str) -> str:
-    """Two shots, no effects on either. Everything else this tab needs comes from the catalogue."""
+    """Three shots, no effects on any. Everything else this tab needs comes from the catalogue."""
     project = post_json(f"{base_url}/api/projects", {"name": "Effects tab browser QA"})
     project_id = project["id"]
     put_json(f"{base_url}/api/projects/{project_id}/shots", {"shots": [
@@ -93,6 +113,8 @@ def seed_project(base_url: str) -> str:
          "mode": "text_to_video", "status": "draft", "seed": 11},
         {"id": OTHER, "start": 4, "duration": 4, "prompt": "The same rooftop, close.",
          "mode": "text_to_video", "status": "draft", "seed": 12},
+        {"id": LOCKED, "start": 8, "duration": 4, "prompt": "The stairwell, handheld.",
+         "mode": "text_to_video", "status": "draft", "seed": 13, "locked": True},
     ]})
     return project_id
 
@@ -183,6 +205,7 @@ return {
   effectsTab: tab('shot-tab-effects'),
   focused: document.activeElement ? document.activeElement.id : null,
   cards: [...document.querySelectorAll('.effect-card')].map((card) => ({
+    id: card.id,
     name: card.querySelector('.effect-name')?.textContent || '',
     family: card.querySelector('.effect-family')?.textContent || '',
     familyTransform: getComputedStyle(card.querySelector('.effect-family')).textTransform,
@@ -191,7 +214,53 @@ return {
     rows: card.querySelectorAll('.effect-row').length,
     bind: card.querySelector('.effect-bind')
       ? getComputedStyle(card.querySelector('.effect-bind')).color : null,
+    handle: card.querySelector('.effect-handle') ? {
+      text: card.querySelector('.effect-handle').textContent,
+      disabled: card.querySelector('.effect-handle').disabled,
+      label: card.querySelector('.effect-handle').getAttribute('aria-label'),
+      width: card.querySelector('.effect-handle').getBoundingClientRect().width,
+      colour: getComputedStyle(card.querySelector('.effect-handle')).color,
+      cursor: getComputedStyle(card.querySelector('.effect-handle')).cursor,
+    } : null,
+    remove: getComputedStyle(card.querySelector('.effect-remove')).color,
+    removeOutline: getComputedStyle(card.querySelector('.effect-remove')).outlineColor,
+    marked: card.classList.contains('effect-drop'),
+    carried: card.classList.contains('effect-dragging'),
+    run: card.closest('.effect-run')?.dataset.family || null,
   })),
+  runs: [...document.querySelectorAll('.effect-run')].map((run) => ({
+    family: run.dataset.family,
+    cards: run.querySelectorAll('.effect-card').length,
+    border: getComputedStyle(run).borderLeftColor,
+  })),
+  copy: document.getElementById('effect-copy') ? {
+    label: document.getElementById('effect-copy').textContent,
+    expanded: document.getElementById('effect-copy').getAttribute('aria-expanded'),
+    panelHidden: document.getElementById('effect-copy-panel').hasAttribute('hidden'),
+    panelDisplay: getComputedStyle(document.getElementById('effect-copy-panel')).display,
+    note: document.getElementById('effect-copy-note')?.textContent || '',
+    reason: document.getElementById('effect-copy-reason')?.textContent || '',
+    apply: document.getElementById('effect-copy-apply')?.textContent || '',
+    applyDisabled: document.getElementById('effect-copy-apply')?.disabled ?? null,
+    targets: [...document.querySelectorAll('.effect-copy-target')].map((row) => ({
+      name: row.querySelector('.effect-copy-name')?.textContent || '',
+      hint: row.querySelector('.effect-copy-hint')?.textContent || '',
+      hintWidth: row.querySelector('.effect-copy-hint').getBoundingClientRect().width,
+      mark: row.querySelector('.effect-copy-mark')?.textContent || '',
+      checked: row.querySelector('input').checked,
+      id: row.querySelector('input').id,
+      box: {
+        width: row.querySelector('input').getBoundingClientRect().width,
+        height: row.querySelector('input').getBoundingClientRect().height,
+        border: getComputedStyle(row.querySelector('input')).borderTopWidth,
+        padding: getComputedStyle(row.querySelector('input')).paddingTop,
+      },
+    })),
+  } : null,
+  copyReport: document.getElementById('effects-copy-report')
+    ? [...document.getElementById('effects-copy-report').children].map((line) => line.textContent)
+    : null,
+  copyNone: document.getElementById('effect-copy-none')?.textContent || null,
   refusal: document.getElementById('effects-refusal')?.textContent || null,
   lock: document.getElementById('effects-locked')?.textContent || null,
   problem: document.getElementById('effects-problem')?.textContent || null,
@@ -364,12 +433,20 @@ def main() -> None:
                 lambda stack: [spec["effect"] for spec in stack] == ["grain", "punch_in"],
                 "adding a second effect did not write the stack")
             two = panels(driver)
-            assert [card["name"] for card in two["cards"]] == ["Grain", "Punch In"], two["cards"]
-            assert [card["family"] for card in two["cards"]] == ["texture", "geometry"], two["cards"]
+            # **The chain's order, not the manifest's.** Grain was added first and Punch In
+            # second, and the panel draws geometry above texture because that is the order
+            # `build_effect_stages` composes them in. A panel showing storage order is what makes
+            # a cross-family drag look reasonable, which is the failure FX-5 forbids.
+            assert [card["name"] for card in two["cards"]] == ["Punch In", "Grain"], two["cards"]
+            assert [card["family"] for card in two["cards"]] == ["geometry", "texture"], two["cards"]
+            assert [run["family"] for run in two["runs"]] == ["geometry", "texture"], two["runs"]
+            # Neither family has a second card, so neither card carries a grip that leads nowhere.
+            assert [card["handle"] for card in two["cards"]] == [None, None], two["cards"]
             assert all(card["familyTransform"] == "uppercase" for card in two["cards"]), two["cards"]
             # The card has a real surface of its own rather than the panel's, which is what makes
             # a stack read as a list of cards instead of a run of rows.
             assert two["cards"][0]["background"] != "rgba(0, 0, 0, 0)", two["cards"][0]
+            assert all(run["cards"] == 1 for run in two["runs"]), two["runs"]
             assert two["effectsTab"]["text"].strip().endswith("2"), two["effectsTab"]["text"]
             result["added"] = two["cards"]
 
@@ -384,9 +461,9 @@ def main() -> None:
                 "disabling the second card did not write `enabled: false`")
             settle(driver, "#shot-inspector", quiet_ms=400)
             off = panels(driver)
-            assert [card["name"] for card in off["cards"]] == ["Grain", "Punch In"], off["cards"]
-            assert abs(float(off["cards"][1]["opacity"]) - 0.45) < 0.01, off["cards"][1]
-            assert float(off["cards"][0]["opacity"]) == 1.0, off["cards"][0]
+            assert [card["name"] for card in off["cards"]] == ["Punch In", "Grain"], off["cards"]
+            assert abs(float(off["cards"][0]["opacity"]) - 0.45) < 0.01, off["cards"][0]
+            assert float(off["cards"][1]["opacity"]) == 1.0, off["cards"][1]
             # Retained means operable: the zoom slider on the disabled card is still hit-testable
             # and still enabled, which is what "keeps its controls readable" has to mean.
             zoom = driver.find_element(By.ID, "effect-param-1-zoom")
@@ -395,7 +472,7 @@ def main() -> None:
             shot = driver.find_element(By.ID, "shot-inspector")
             shot.screenshot(str(artifact_dir() / f"{NAME}-two-cards-one-disabled.png"))
             driver.save_screenshot(str(artifact_dir() / f"{NAME}-workspace.png"))
-            result["disabled_card"] = off["cards"][1]
+            result["disabled_card"] = off["cards"][0]
 
             # === 7. The slider writes on release, never on input =============================
             before = resource_hits(driver, "/effects")
@@ -453,7 +530,7 @@ def main() -> None:
             refused = panels(driver)
             assert refused["refusal"], "the panel says nothing about the refused write"
             assert refusal in refused["refusal"], (refusal, refused["refusal"])
-            assert [card["name"] for card in refused["cards"]] == ["Grain", "Punch In"], \
+            assert [card["name"] for card in refused["cards"]] == ["Punch In", "Grain"], \
                 refused["cards"]
             assert len(stored_stack(server.base_url, project_id)) == 2, \
                 stored_stack(server.base_url, project_id)
@@ -521,6 +598,202 @@ def main() -> None:
                 lambda stack: [spec["effect"] for spec in stack] == ["grain"],
                 "removing the second card did not write the shortened stack")
             assert [card["name"] for card in panels(driver)["cards"]] == ["Grain"]
+
+
+            # === 11. A run of three, and grips only where there is somewhere to go ===========
+            for effect in ("vignette", "soft_focus", "punch_in"):
+                driver.find_element(By.ID, "effect-add").click()
+                settle(driver, "#shot-inspector", quiet_ms=300)
+                driver.find_element(By.ID, "effect-option-" + effect).click()
+                settle(driver, "#shot-inspector", quiet_ms=500)
+            wait_for_stack(
+                server.base_url, project_id,
+                lambda stack: [spec["effect"] for spec in stack]
+                == ["grain", "vignette", "soft_focus", "punch_in"],
+                "building the texture run did not write the stack")
+            settle(driver, "#shot-inspector", quiet_ms=400)
+            run = panels(driver)
+            # Drawn in the chain's order: the geometry card added last is drawn first.
+            assert [card["name"] for card in run["cards"]] == [
+                "Punch In", "Grain", "Vignette", "Soft Focus"], run["cards"]
+            assert [(item["family"], item["cards"]) for item in run["runs"]] == [
+                ("geometry", 1), ("texture", 3)], run["runs"]
+            # A grip on each of the three texture cards, and none at all on the lone geometry one.
+            assert run["cards"][0]["handle"] is None, run["cards"][0]
+            grips = [card["handle"] for card in run["cards"][1:]]
+            assert all(grip and grip["disabled"] is False for grip in grips), grips
+            assert all(grip["width"] > 0 and grip["cursor"] == "grab" for grip in grips), grips
+            assert all("Alt+Up" in grip["label"] for grip in grips), grips
+            for index in ("0", "1", "2"):
+                visible_and_clickable(
+                    driver, driver.find_element(By.ID, "effect-handle-" + index),
+                    f"the grip on card {index}")
+            result["run_layout"] = {"cards": [card["name"] for card in run["cards"]],
+                                    "runs": run["runs"], "grip": grips[0]}
+
+            # === 12. Dragging a card within its family ======================================
+            before = resource_hits(driver, "/effects")
+            grip = driver.find_element(By.ID, "effect-handle-0")
+            onto = driver.find_element(By.ID, "effect-card-2")
+            ActionChains(driver).click_and_hold(grip).move_by_offset(0, 12) \
+                .move_to_element(onto).move_by_offset(0, 6).perform()
+            mid = panels(driver)
+            marked = [card["id"] for card in mid["cards"] if card["marked"]]
+            carried = [card["id"] for card in mid["cards"] if card["carried"]]
+            driver.find_element(By.ID, "shot-inspector").screenshot(
+                str(artifact_dir() / f"{NAME}-drag-in-flight.png"))
+            assert marked == ["effect-card-2"], mid["cards"]
+            # Every card's remove control is the one --dim this stylesheet gives it. A drop mark
+            # must not tint anything: the palette is closed, and --blue is transitions only.
+            assert len({card["remove"] for card in mid["cards"]}) == 1,                 [card["remove"] for card in mid["cards"]]
+            assert carried == ["effect-card-0"], mid["cards"]
+            # The two-second background reload lands on this panel; mid-drag it must not rebuild
+            # it, or the card under the pointer is replaced and the mark repainted away.
+            assert [card["name"] for card in mid["cards"]] == [
+                "Punch In", "Grain", "Vignette", "Soft Focus"], mid["cards"]
+            ActionChains(driver).release().perform()
+            settle(driver, "#shot-inspector", quiet_ms=600)
+            wait_for_stack(
+                server.base_url, project_id,
+                lambda stack: [spec["effect"] for spec in stack]
+                == ["vignette", "soft_focus", "grain", "punch_in"],
+                "the drag did not write the reordered stack")
+            assert resource_hits(driver, "/effects") == before + 1, "the drag wrote more than once"
+            dropped = panels(driver)
+            assert [card["name"] for card in dropped["cards"]] == [
+                "Punch In", "Vignette", "Soft Focus", "Grain"], dropped["cards"]
+            assert not any(card["marked"] or card["carried"] for card in dropped["cards"]), dropped
+            result["drag_within_family"] = {
+                "mid_gesture": {"marked": marked, "carried": carried},
+                "after": [card["name"] for card in dropped["cards"]],
+            }
+
+            # === 13. Dragging toward another family: no drop offered ========================
+            before = resource_hits(driver, "/effects")
+            grip = driver.find_element(By.ID, "effect-handle-0")
+            other_family = driver.find_element(By.ID, "effect-card-3")
+            ActionChains(driver).click_and_hold(grip).move_by_offset(0, -12) \
+                .move_to_element(other_family).perform()
+            across = panels(driver)
+            driver.find_element(By.ID, "shot-inspector").screenshot(
+                str(artifact_dir() / f"{NAME}-drag-across-families.png"))
+            assert not any(card["marked"] for card in across["cards"]), across["cards"]
+            ActionChains(driver).release().perform()
+            settle(driver, "#shot-inspector", quiet_ms=600)
+            assert resource_hits(driver, "/effects") == before, \
+                "a drag onto another family's card wrote the stack"
+            assert [spec["effect"] for spec in stored_stack(server.base_url, project_id)] == [
+                "vignette", "soft_focus", "grain", "punch_in",
+            ], stored_stack(server.base_url, project_id)
+            result["drag_across_families"] = {"marked": [], "wrote": 0}
+
+            # === 14. Alt+Up moves one place, and the focus follows the card =================
+            before = resource_hits(driver, "/effects")
+            driver.find_element(By.ID, "effect-handle-2").click()
+            settle(driver, "#shot-inspector", quiet_ms=400)
+            assert panels(driver)["focused"] == "effect-handle-2", panels(driver)["focused"]
+            ActionChains(driver).key_down(Keys.ALT).send_keys(Keys.ARROW_UP) \
+                .key_up(Keys.ALT).perform()
+            settle(driver, "#shot-inspector", quiet_ms=600)
+            wait_for_stack(
+                server.base_url, project_id,
+                lambda stack: [spec["effect"] for spec in stack]
+                == ["vignette", "grain", "soft_focus", "punch_in"],
+                "Alt+Up did not move the card one place inside its family")
+            settle(driver, "#shot-inspector", quiet_ms=400)
+            nudged = panels(driver)
+            assert [card["name"] for card in nudged["cards"]] == [
+                "Punch In", "Vignette", "Grain", "Soft Focus"], nudged["cards"]
+            # Focus follows the *card*: grain is stored at 1 now, so the grip it is on is there.
+            assert nudged["focused"] == "effect-handle-1", nudged["focused"]
+            assert resource_hits(driver, "/effects") == before + 1, "Alt+Up wrote more than once"
+            result["alt_up"] = {"cards": [card["name"] for card in nudged["cards"]],
+                                "focused": nudged["focused"]}
+
+            # === 15. Alt+Up on a family's first card does nothing ===========================
+            before = resource_hits(driver, "/effects")
+            driver.find_element(By.ID, "effect-handle-0").click()
+            settle(driver, "#shot-inspector", quiet_ms=400)
+            assert panels(driver)["focused"] == "effect-handle-0", panels(driver)["focused"]
+            # Cleared first, so "the key said nothing" is about this key. An *error* toast
+            # stays until it is dismissed (`toast`, app.js), so step 8's refusal is still on
+            # screen and is clicked away the way a Director dismisses one.
+            for stale in driver.find_elements(By.CSS_SELECTOR, "#toast-region .toast"):
+                stale.click()
+            clear_toasts(driver)
+            ActionChains(driver).key_down(Keys.ALT).send_keys(Keys.ARROW_UP) \
+                .key_up(Keys.ALT).perform()
+            settle(driver, "#shot-inspector", quiet_ms=500)
+            first = panels(driver)
+            assert resource_hits(driver, "/effects") == before, \
+                "Alt+Up on a family's first card wrote the stack"
+            assert [card["name"] for card in first["cards"]] == [
+                "Punch In", "Vignette", "Grain", "Soft Focus"], first["cards"]
+            spoke = [item.text for item
+                     in driver.find_elements(By.CSS_SELECTOR, "#toast-region .toast")]
+            assert not spoke, f"a key that does nothing said something: {spoke}"
+            result["alt_up_at_the_top"] = {"cards": [card["name"] for card in first["cards"]],
+                                           "wrote": 0}
+
+            # === 16. Copying the stack onto two shots, one of them locked ===================
+            opened = driver.find_element(By.ID, "effect-copy")
+            visible_and_clickable(driver, opened, "the copy control")
+            opened.click()
+            settle(driver, "#shot-inspector", quiet_ms=400)
+            copy = panels(driver)["copy"]
+            assert copy["expanded"] == "true" and copy["panelHidden"] is False, copy
+            assert copy["panelDisplay"] != "none", copy
+            # The Director is told it replaces rather than merges, before the button is live.
+            assert "replaces" in copy["note"] and "merged" in copy["note"], copy["note"]
+            assert copy["applyDisabled"] is True, copy
+            assert [target["name"] for target in copy["targets"]] == [
+                f"SHOT 02 ({OTHER})", f"SHOT 03 ({LOCKED})"], copy["targets"]
+            assert copy["targets"][1]["mark"] == "LOCKED", copy["targets"]
+            # The shot's own prompt is beside its name, and it has room: `SHOT 04 (shot_9f2c)` is
+            # an identifier, not a memory of which clip that was.
+            assert all(target["hint"] and target["hintWidth"] > 30 for target in copy["targets"]),                 copy["targets"]
+            # No inherited chrome. The generic `input` rule gives every input a 38px height, a
+            # 1px --line border and 9px of padding; inherited by these checkboxes it drew grey
+            # pills and squeezed the prompt out of the row -- the C2 slider defect exactly.
+            for target in copy["targets"]:
+                assert target["box"]["width"] <= 14 and target["box"]["height"] <= 14, target
+                assert target["box"]["padding"] == "0px", target
+            # The panel itself, scrolled to, so the artifact shows the sentence rather than the
+            # top of an inspector that has scrolled past it.
+            announcement = driver.find_element(By.ID, "effect-copy-panel")
+            driver.execute_script(
+                "arguments[0].scrollIntoView({ block: 'center' });", announcement)
+            settle(driver, "#shot-inspector", quiet_ms=250)
+            announcement.screenshot(str(artifact_dir() / f"{NAME}-copy-announcement.png"))
+            for target in (OTHER, LOCKED):
+                box = driver.find_element(By.ID, "effect-copy-target-" + target)
+                visible_and_clickable(driver, box, f"the {target} target")
+                box.click()
+            settle(driver, "#shot-inspector", quiet_ms=300)
+            chosen = panels(driver)["copy"]
+            assert chosen["apply"] == "Copy to 2 shots", chosen
+            assert chosen["applyDisabled"] is False, chosen
+            driver.find_element(By.ID, "effect-copy-apply").click()
+            settle(driver, "#shot-inspector", quiet_ms=800)
+            reported = panels(driver)
+            assert reported["copyReport"], "the panel says nothing about the copy"
+            assert reported["copyReport"][0] == "PARTLY COPIED", reported["copyReport"]
+            assert "Copied 4 effects onto 1 shot" in reported["copyReport"][1], \
+                reported["copyReport"]
+            # The route's own refusal, whole, naming the Shot as the timeline names one.
+            assert reported["copyReport"][2] == (
+                f"SHOT 03 ({LOCKED}) is locked, so its effects were not changed. "
+                "Unlock the shot to change its look."), reported["copyReport"]
+            written = driver.find_element(By.ID, "effects-copy-report")
+            driver.execute_script("arguments[0].scrollIntoView({ block: 'center' });", written)
+            settle(driver, "#shot-inspector", quiet_ms=250)
+            written.screenshot(str(artifact_dir() / f"{NAME}-copy-report.png"))
+            assert stored_stack(server.base_url, project_id, OTHER) == \
+                stored_stack(server.base_url, project_id, SHOT), "the copy did not replace"
+            assert stored_stack(server.base_url, project_id, LOCKED) == [], \
+                "a locked shot was written by the copy"
+            result["copy"] = {"report": reported["copyReport"],
+                              "targets": [target["name"] for target in copy["targets"]]}
 
             result["final_stack"] = stored_stack(server.base_url, project_id)
             # The one refusal this script drives on purpose: a grade naming no look, on a machine
