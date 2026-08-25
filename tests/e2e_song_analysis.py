@@ -198,6 +198,13 @@ def main() -> None:
             "the click track measured no beats on import, so nothing below would prove anything",
             imported,
         )
+        # **Both halves off one read.** The marks the band draws ride with the seconds the drag
+        # lands on, so a browser cannot hold a current one and a stale other -- which is what it
+        # did until this route grew, and it did it silently.
+        assert imported["envelope"] and imported["envelope"]["beats"], (
+            "the timeline read carried no measurement, so the beat band has nothing to draw from",
+            imported,
+        )
         stored = manifest(server, project_id)
         recorded = stored["song"]["analysis"]
         assert recorded and recorded.get("song_fingerprint"), recorded
@@ -206,6 +213,7 @@ def main() -> None:
         result["on_import"] = {
             "analysed": imported["analysed"],
             "beats": len(imported["beats"]),
+            "marks_in_the_same_read": len(imported["envelope"]["beats"]),
             "fingerprint": recorded["song_fingerprint"],
             "sidecar_bytes": envelope_file.stat().st_size,
         }
@@ -219,6 +227,9 @@ def main() -> None:
         write_manifest(server, project_id, stored)
         unmeasured = targets(server, project_id)
         assert unmeasured["analysed"] is False and unmeasured["beats"] == [], unmeasured
+        # Absent together, in one body: there is no reply in which one half is current and the
+        # other is not, because there is one computation behind both.
+        assert unmeasured["envelope"] is None, unmeasured
         assert unmeasured["measured"] is False and unmeasured["gaps"] == [], (
             "the click track has a transcription, so the gap row would not be absent", unmeasured,
         )
@@ -373,6 +384,9 @@ def main() -> None:
 
             served = targets(server, project_id)
             assert served["analysed"] is True and served["beats"], served
+            # The marks on the band above and the beats the drag will land on came from this one
+            # read, so the panel's evidence and the waveform's cannot describe different states.
+            assert served["envelope"]["beats"], served
             remeasured = manifest(server, project_id)["song"]["analysis"]
             assert remeasured and remeasured["song_fingerprint"] == recorded["song_fingerprint"]
             assert sidecar(server, project_id, remeasured["path"]).exists()
@@ -386,11 +400,11 @@ def main() -> None:
             # --- 5. A forced re-measurement of a byte-identical file is not a no-op ----------
             #
             # **The trap this story was warned about.** `song_fingerprint` is derived from the
-            # song's bytes, so re-measuring the same file answers the same fingerprint — and both
-            # `songEnvelopeIdentity` and `snapTargetsIdentity` are built on it, and both loaders
-            # return early when their key has not moved. Deleting the sidecar while leaving the
-            # manifest's record alone is exactly that state: the browser is told the song has
-            # never changed, and must still show the new measurement rather than the cached one.
+            # song's bytes, so re-measuring the same file answers the same fingerprint — and
+            # `snapTargetsIdentity` is built on it, so the one loader returns early when its key
+            # has not moved. Deleting the sidecar while leaving the manifest's record alone is
+            # exactly that state: the browser is told the song has never changed, and must still
+            # show the new measurement rather than the cached one.
             sidecar(server, project_id, remeasured["path"]).unlink()
             driver.refresh()
             select_project(driver, wait, project_id)

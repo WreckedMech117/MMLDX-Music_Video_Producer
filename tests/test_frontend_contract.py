@@ -11310,6 +11310,11 @@ def test_the_timeline_tools_carry_undo_redo_and_the_snap_selector():
 
 # A measurement small enough to write out in full, so every mark drawn from it is accounted for
 # by name: four beats a second apart, with an onset between each pair.
+#
+# Seven keys, where a real sidecar has eighteen -- which is the shape the timeline is now served:
+# `served_measurement` in `app.py` trims the per-frame series off the copy that rides the merged
+# read, because `bands`, `rms`, `peak` and `flux` are 98% of the file and the browser reads no byte
+# of any of them. The plan has always tolerated a trimmed envelope; this fixture is why.
 SMALL_ENVELOPE = {
     "version": 1,
     "analysis_rate": 30,
@@ -11646,7 +11651,7 @@ def test_marks_appear_on_a_first_load_with_neither_the_zoom_nor_the_toggle_touch
     deletion means the band is painted empty by `renderAll()`, the measurement lands at a
     signature that has not moved, and **no mark is ever drawn** until the Director happens to
     zoom or toggle. Driven through `#project-select`, so `loadProject` -> `renderAll` ->
-    `loadSongEnvelope` is the real sequence and not a hand-assembled one.
+    `loadSongMeasurement` is the real sequence and not a hand-assembled one.
     """
     project = {
         "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
@@ -11668,34 +11673,40 @@ def test_marks_appear_on_a_first_load_with_neither_the_zoom_nor_the_toggle_touch
                         on: at('#beat-markers').classList.contains('snap-on') };
       console.log(JSON.stringify({
         painted, settled,
-        // What was kept, not merely what was drawn. The slot holds the *envelope*, and a reply
-        // stored whole would still draw correctly today -- `beatMarkerPlan` unwraps either shape
-        // -- while handing every later consumer of this slot a record with no `beats` in it.
-        stored: state.songEnvelope,
-        asked: requests.filter((sent) => sent.path.includes('/song/envelope')).map((s) => s.path),
+        // What was kept, not merely what was drawn. The slot holds the whole reply -- both
+        // halves -- and the measurement sits under `envelope` inside it.
+        stored: state.songMeasurement,
+        asked: requests.filter((sent) => sent.path.includes('/song/envelope')
+          || sent.path.includes('snap-targets')).map((s) => s.path),
       }));
     """,
         responses={
             "/api/projects/p2": {"body": project},
-            "/api/projects/p2/song/envelope": {
-                "body": {"present": True, "reason": "", "envelope": SMALL_ENVELOPE}
-            },
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=True, analysed=True, envelope=SMALL_ENVELOPE)},
         },
     )
 
-    assert drawn["asked"] == ["/api/projects/p2/song/envelope"], (
-        "the envelope was read a number of times other than once on the load path"
+    # **One request for the measurement, and it is the merged one.** Two reads of one measurement
+    # is the drift mechanism this merge exists to remove, and the load path is where it cost two
+    # SHA-256s of the master and two parses of the same sidecar.
+    assert drawn["asked"] == ["/api/projects/p2/timeline/snap-targets"], (
+        "the measurement was read a number of times other than once on the load path", drawn["asked"]
     )
     # Nothing at first, and nothing touched: same scale, toggle still on.
     assert drawn["painted"]["band"] == ""
     assert drawn["settled"]["scale"] == drawn["painted"]["scale"] == 16
     assert drawn["settled"]["on"] is True and drawn["painted"]["on"] is True
-    # The slot holds the measurement itself, unwrapped from the report that carried it.
-    assert "present" not in drawn["stored"], (
-        "the whole report was stored where the envelope belongs; `bands` and `beats` are a level "
-        "down, so every later consumer of state.songEnvelope reads undefined"
+    # The slot holds the reply, and both halves are in it: the drag's targets at the top level
+    # and the measurement under `envelope`. The two `beats` lists are **not** the same list, which
+    # is exactly why the band may not read the top-level one.
+    assert drawn["stored"]["analysed"] is True
+    assert drawn["stored"]["envelope"]["beats"] == SMALL_ENVELOPE["beats"]
+    assert drawn["stored"]["gaps"] == [12.15], drawn["stored"]
+    assert drawn["stored"]["beats"] != SMALL_ENVELOPE["beats"], (
+        "the fixture stopped distinguishing the drag's window-filtered beats from the "
+        "measurement's own, so nothing here would catch a band that drew the wrong list"
     )
-    assert drawn["stored"]["beats"] == SMALL_ENVELOPE["beats"]
     # And then the marks, drawn by the reply alone.
     assert drawn["settled"]["band"].count("beat-mark") == 4
     assert drawn["settled"]["band"].count("onset-mark") == 3
@@ -11711,8 +11722,12 @@ def test_a_reported_absence_empties_the_band_and_a_refused_read_leaves_it_alone(
     client never reaching the server -- it knows nothing new, so it changes nothing, says nothing,
     and leaves its key unclaimed so the next load asks again rather than the band being lost to
     one bad moment. Executed, because "swallowed" and "never called" look identical in source.
+
+    **And both halves move together in each case**, because there is one reply. The reason this
+    matters is not symmetry: Epic 8 executed the asymmetric state and it was silent and wrong --
+    no marks on the waveform while the Director's cut still snapped to a beat that was no longer
+    drawn anywhere, with no toast on either side.
     """
-    reason = envelope_absence_reasons()[0]
     drawn = run_workspace(
         f"""
       const song = {json.dumps(MEASURED_SONG)};
@@ -11731,47 +11746,58 @@ def test_a_reported_absence_empties_the_band_and_a_refused_read_leaves_it_alone(
 
       // A read that finds a measurement.
       state.project = project('p1');
-      await app.loadSongEnvelope('p1');
+      await app.loadSongMeasurement('p1');
       const measured = at('#beat-band').innerHTML;
+      const measuredTargets = JSON.parse(JSON.stringify(state.songMeasurement));
 
-      // A read the server answers with a named absence.
+      // A read the server answers with a named absence: both halves absent, together.
       state.project = project('p2');
-      await app.loadSongEnvelope('p2');
+      await app.loadSongMeasurement('p2');
       const absent = at('#beat-band').innerHTML;
-      const storedWhenAbsent = state.songEnvelope;
+      const storedWhenAbsent = state.songMeasurement;
 
       // Measured again, and then a read the server refuses outright.
       state.project = project('p1');
-      await app.loadSongEnvelope('p1');
+      await app.loadSongMeasurement('p1');
       const back = at('#beat-band').innerHTML;
       state.project = project('p3');
-      await app.loadSongEnvelope('p3');
+      await app.loadSongMeasurement('p3');
       const refused = at('#beat-band').innerHTML;
+      const refusedTargets = state.songMeasurement;
 
       console.log(JSON.stringify({{
-        measured, absent, back, refused,
-        // Null, not the report that said so: a stored `{{present: false}}` is a truthy object
-        // sitting where a measurement belongs.
+        measured, absent, back, refused, measuredTargets, refusedTargets,
+        // The reply that reported the absence, held whole: `envelope: null` is the drawing half
+        // saying it is not there, in the same body the drag's own empty lists arrive in.
         storedWhenAbsent,
         said: spoken.map((element) => element.textContent).filter(Boolean),
       }}));
     """,
         responses={
-            "/api/projects/p1/song/envelope": {
-                "body": {"present": True, "reason": "", "envelope": SMALL_ENVELOPE}
-            },
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": reason}},
-            "/api/projects/p3/song/envelope": {"status": 500, "body": {"detail": "boom"}},
+            "/api/projects/p1/timeline/snap-targets": {
+                "body": served_targets(measured=True, analysed=True, envelope=SMALL_ENVELOPE)},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
+            "/api/projects/p3/timeline/snap-targets": {"status": 500, "body": {"detail": "boom"}},
         },
     )
 
     assert drawn["measured"].count("beat-mark") == 4
-    # Reported absent: the band empties, and the slot holds nothing rather than the refusal.
+    # Reported absent: the band empties, and **both halves say so in the one reply**.
     assert drawn["absent"] == ""
-    assert drawn["storedWhenAbsent"] is None
+    assert drawn["storedWhenAbsent"]["envelope"] is None
+    assert drawn["storedWhenAbsent"]["analysed"] is False
+    assert drawn["storedWhenAbsent"]["beats"] == []
     assert drawn["back"].count("beat-mark") == 4
-    # Refused: it knows nothing new, so it changes nothing.
+    # Refused: it knows nothing new, so it changes nothing -- and **neither half moves**, which is
+    # the state two loaders could reach and one cannot. Epic 8 executed the other one: the envelope
+    # read refused while the targets read succeeded left the Director with no marks on screen and a
+    # cut that still jumped to a beat, with nothing said.
     assert drawn["refused"] == drawn["back"]
+    assert drawn["refusedTargets"] == drawn["measuredTargets"], (
+        "a refused read moved the drag's targets while the band kept its marks, which is the "
+        "half-current state one read exists to make unreachable"
+    )
     # And through all four, not one word to the Director. Absence here is silence, not a message.
     assert drawn["said"] == [], drawn["said"]
 
@@ -11779,13 +11805,18 @@ def test_a_reported_absence_empties_the_band_and_a_refused_read_leaves_it_alone(
 def test_every_song_transition_leaves_no_marks_from_the_song_before_it():
     """The ways the current song changes without a project load, each executed.
 
-    `loadSongEnvelope` clears nothing until a reply lands, which is right for a refresh and wrong
-    for a replacement -- so every transition that swaps the master forgets first. **Import is the
-    sharp one:** the upload route measures the new song inline and answers with the project, so
+    `loadSongMeasurement` clears nothing until a reply lands, which is right for a refresh and
+    wrong for a replacement -- so every transition that swaps the master forgets first. **Import is
+    the sharp one:** the upload route measures the new song inline and answers with the project, so
     without this the band draws the *previous* song's beats over the new master for as long as the
-    envelope request takes, which is the one state `BEAT_MARKERS_HELP` tells the Director cannot
-    happen. Removal is sharper still -- the line above it already clears `state.audioBuffer` for
-    exactly this reason, and the envelope was not added beside it.
+    read takes, which is the one state `BEAT_MARKERS_HELP` tells the Director cannot happen.
+    Removal is sharper still -- the line above it already clears `state.audioBuffer` for exactly
+    this reason, and the measurement was not added beside it.
+
+    **And the magnet goes with the marks**, in the same gesture, because one slot holds both. The
+    gap targets are not derived from the envelope at all, so before the merge they were a second
+    thing to remember to drop -- and forgetting them meant a cut pulled onto a rest measured in a
+    track that is gone.
 
     The fourth transition is the render poll noticing a generated song's audio land. It is
     asserted here as the rule the poll leans on rather than through a canned tick: a song that did
@@ -11804,7 +11835,7 @@ def test_every_song_transition_leaves_no_marks_from_the_song_before_it():
         state.project = {{ id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
                           messages: [], documents: {{}}, song: {{ ...song }} }};
         state.pixelsPerSecond = 16;
-        await app.loadSongEnvelope('p1');
+        await app.loadSongMeasurement('p1');
         return marks();
       }};
 
@@ -11813,6 +11844,7 @@ def test_every_song_transition_leaves_no_marks_from_the_song_before_it():
       answer(true);
       await fire('#remove-song:click', {{}});
       const afterRemove = marks();
+      const targetsAfterRemove = state.songMeasurement;
       await flush();
 
       // 2. A new song is imported. The reply carries a different master, and the band must not
@@ -11822,6 +11854,7 @@ def test_every_song_transition_leaves_no_marks_from_the_song_before_it():
       answer(true);
       await fire('#import-song:click', {{}});
       const afterImport = marks();
+      const targetsAfterImport = state.songMeasurement;
       await flush();
 
       // 3. The project is cleared. No project, no song, no marks.
@@ -11829,26 +11862,31 @@ def test_every_song_transition_leaves_no_marks_from_the_song_before_it():
       answer(true);
       await fire('#project-select:change', {{ target: {{ value: '' }} }});
       const afterClear = marks();
+      const targetsAfterClear = state.songMeasurement;
       await flush();
 
       // 4. What the render poll leans on: an unchanged song asks nothing, a re-measured one asks.
       await measure();
-      const settled = requests.filter((sent) => sent.path.includes('/song/envelope')).length;
-      await app.loadSongEnvelope('p1');
-      const unchangedTick = requests.filter((sent) => sent.path.includes('/song/envelope')).length;
+      const reads = () => requests.filter((sent) => sent.path.includes('snap-targets')).length;
+      const settled = reads();
+      await app.loadSongMeasurement('p1');
+      const unchangedTick = reads();
       state.project.song = {{ ...song, analysis: {{ ...song.analysis, song_fingerprint: 'moved' }} }};
-      await app.loadSongEnvelope('p1');
-      const landedTick = requests.filter((sent) => sent.path.includes('/song/envelope')).length;
+      await app.loadSongMeasurement('p1');
+      const landedTick = reads();
 
       console.log(JSON.stringify({{
         beforeRemove, afterRemove, beforeImport, afterImport, beforeClear, afterClear,
         settled, unchangedTick, landedTick,
+        // The magnet, dropped in the same breath as the marks -- one slot, one forget.
+        targetsAfterRemove, targetsAfterImport, targetsAfterClear,
       }}));
     """,
         responses={
-            "/api/projects/p1/song/envelope": {
-                "body": {"present": True, "reason": "", "envelope": SMALL_ENVELOPE}
-            },
+            "/api/projects/p1/timeline/snap-targets": {
+                "body": served_targets(measured=True, analysed=True, envelope=SMALL_ENVELOPE)},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=False, analysed=False)},
             "/api/projects/p1/song?confirm_song_replacement=true": {"body": songless},
             "/api/projects/p1/song?confirm_song_replacement=false": {"body": songless},
             "/api/projects/p1/songs/upload": {"body": imported},
@@ -11860,9 +11898,14 @@ def test_every_song_transition_leaves_no_marks_from_the_song_before_it():
         assert drawn[f"after{stage}"] == "", (
             f"marks measured from the song before it survived a {stage.lower()}"
         )
+        # Both halves, together: the drag's targets belong to the same song as the marks.
+        assert drawn[f"targetsAfter{stage}"] is None, (
+            f"the previous song's snap targets survived a {stage.lower()}, so a drag would pull a "
+            "cut onto a rest measured in a track this project no longer has"
+        )
 
     assert drawn["unchangedTick"] == drawn["settled"], (
-        "a read where the song had not moved still asked the envelope endpoint"
+        "a read where the song had not moved still asked for the measurement"
     )
     assert drawn["landedTick"] == drawn["settled"] + 1
 
@@ -11882,7 +11925,7 @@ def test_the_timeline_paints_the_beat_band_and_the_toggle_changes_only_that():
       ];
       state.project = {{ id: 'p1', shots, jobs: [], assets: [], sections: [], messages: [],
                         song: {json.dumps(MEASURED_SONG)} }};
-      state.songEnvelope = {json.dumps(SMALL_ENVELOPE)};
+      state.songMeasurement = {json.dumps(SMALL_ENVELOPE)};
       state.pixelsPerSecond = 16;
       const before = {{ project: JSON.stringify(state.project), requests: requests.length }};
       // The toggle is both the gesture under test and the shortest path to a real
@@ -12003,30 +12046,55 @@ def test_the_beat_marker_toggle_survives_a_reload_and_defaults_on():
     assert "beat" not in preferences.lower()
 
 
-def test_the_song_envelope_is_never_read_from_a_polling_path():
-    """The endpoint hashes the song's bytes to decide whether the measurement still describes
-    them. Behind a timer that is a SHA-256 of the master every few seconds to answer a question
-    whose answer changes only when the song does.
+def test_there_is_one_client_path_to_the_measurement_and_it_is_never_on_a_timer():
+    """**One read for one measurement**, held at the source, and the two halves of that claim.
 
-    The render poll may *notice* that a song landed -- `changed.song` is an in-memory comparison
-    the tick already makes, and the read it triggers is gated by the same key everything else is,
-    which the executed transition test drives. What may never happen is a read on a timer, and a
-    timer is the one thing a stub DOM stubs out: `setInterval` returns 0 here, so no run can
-    observe it. Read rather than executed for that reason.
+    *One path.* Two client reads of one measurement is a drift mechanism, and Epic 8 executed all
+    three ways it drifted: a byte change under an unchanged manifest record was invisible to both
+    keys, a refusal of one read while the other landed left the band empty while the cut still
+    snapped, and one project load hashed the master twice and parsed the same 469 KB sidecar
+    twice. So `GET /song/envelope` has **no client entry at all** -- not an unused one, which is
+    the shape a second path comes back in.
+
+    *Never on a timer.* The route hashes the song's bytes to decide whether the measurement still
+    describes them, so behind a timer it is a SHA-256 of the master every few seconds to answer a
+    question whose answer changes only when the song does. The render poll may *notice* that a
+    song landed -- `changed.song` is an in-memory comparison the tick already makes, and the read
+    it triggers is gated by the same key everything else is, which the executed transition test
+    drives. What may never happen is a read on a timer, and a timer is the one thing a stub DOM
+    stubs out: `setInterval` returns 0 here, so no run can observe it. Read rather than executed
+    for that reason.
+
+    **The route itself is untouched and that is asserted here too**, because "the browser stopped
+    calling it" and "it was removed" are different changes and only the first one was made: it is
+    a documented read-only resource for a consumer outside this application, and 31 tests in
+    `test_api.py` hold its shape.
     """
     source = APP_JS.read_text(encoding="utf-8")
+    contract = API_JS.read_text(encoding="utf-8")
 
-    assert source.count("api.songEnvelope(") == 1, "the envelope is fetched from more than one place"
+    assert "songEnvelope(" not in source, (
+        "the workspace reads the full-measurement endpoint again, so there are two client paths "
+        "to one measurement"
+    )
+    assert "/api/projects/${id}/song/envelope" not in contract, (
+        "the client kept an entry for the endpoint the browser no longer calls, which is how the "
+        "second path comes back"
+    )
+    assert source.count("api.snapTargets(") == 1, (
+        "the merged measurement is fetched from more than one place"
+    )
     for line in source.splitlines():
         if "setInterval" in line:
-            assert "nvelope" not in line, line
+            assert "napTargets" not in line and "easurement" not in line, line
 
-    # The client's path and the server's route, read off both sides. `api.songEnvelope` writes
-    # its URL by hand, and a route that only this client names is a route nothing else checks.
-    assert "/api/projects/${id}/song/envelope" in API_JS.read_text(encoding="utf-8")
-    assert '@app.get("/api/projects/{project_id}/song/envelope")' in Path(
-        "src/music_video_producer/app.py"
-    ).read_text(encoding="utf-8")
+    # The client's path and the server's route, read off both sides. `api.snapTargets` writes its
+    # URL by hand, and a route that only this client names is a route nothing else checks.
+    assert "/api/projects/${id}/timeline/snap-targets" in contract
+    server = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/projects/{project_id}/timeline/snap-targets")' in server
+    # ...and the full-measurement endpoint is still there, unchanged, for everyone else.
+    assert '@app.get("/api/projects/{project_id}/song/envelope")' in server
 
 
 def test_the_envelope_key_is_the_measurement_and_not_only_the_file():
@@ -12711,12 +12779,30 @@ def measured_project(song: dict | None = None) -> dict:
     return {**UNSUNG_PROJECT, "song": {**MEASURED_SONG} if song is None else song}
 
 
-def served_targets(measured: bool, analysed: bool, beats: list | None = None) -> dict:
-    """One `timeline/snap-targets` body, exactly as `read_timeline_snap_targets` shapes it."""
+def served_targets(
+    measured: bool,
+    analysed: bool,
+    beats: list | None = None,
+    envelope: dict | None = None,
+) -> dict:
+    """One `timeline/snap-targets` body, exactly as `read_timeline_snap_targets` shapes it.
+
+    **Both halves, because the route serves both from one computation.** `gaps` and `beats` are
+    the seconds a dragged edge may land on; `envelope` is the measurement the waveform draws its
+    marks from, trimmed to what is consumed. The drag's `beats` and the measurement's own are
+    deliberately allowed to differ here -- they are different lists on the wire too, the first
+    window-filtered by `drag_snap_targets` -- so a client that read one where it meant the other
+    is caught rather than accommodated.
+
+    `envelope` is `null` exactly when `analysed` is false, which is the server's own rule: both
+    come from the one `envelope is not None` expression, so they cannot disagree.
+    """
+    marks = beats if beats is not None else [10.0, 20.0]
     return {
         "gaps": [12.15] if measured else [],
-        "beats": beats if beats is not None else ([10.0, 20.0] if analysed else []),
+        "beats": marks if analysed else [],
         "measured": measured, "analysed": analysed, "start": 0.0, "end": 60.0,
+        "envelope": (envelope or {"beats": marks, "onsets": []}) if analysed else None,
     }
 
 
@@ -13060,11 +13146,10 @@ def test_the_selector_says_what_is_missing_the_moment_the_targets_land():
       await fire('#project-select:change', { target: { value: 'p2' } });
       await flush();
       const list = at('#snap-target-kinds');
-      console.log(JSON.stringify({ markup: list.innerHTML, held: state.snapTargets }));
+      console.log(JSON.stringify({ markup: list.innerHTML, held: state.songMeasurement }));
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {
                 "body": served_targets(measured=False, analysed=False)},
         },
@@ -13121,12 +13206,12 @@ def test_a_project_with_no_song_reports_nothing_to_measure_and_offers_no_analysi
       const before = snapPanel();
       // ...and the same project once a generated song has been asked for but has not landed.
       state.project.song = { title: 'Pending', source: 'generated', path: '', duration: 0 };
-      await app.loadSnapTargets('p2');
+      await app.loadSongMeasurement('p2');
       await flush();
       console.log(JSON.stringify({
         before,
         unrendered: snapPanel(),
-        held: state.snapTargets,
+        held: state.songMeasurement,
         asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
       }));
     """,
@@ -13157,14 +13242,14 @@ def test_a_project_with_no_song_reports_nothing_to_measure_and_offers_no_analysi
 def test_removing_the_song_stops_the_panel_describing_it():
     """**Review finding 1, and the demonstration is the test.**
 
-    The sync was attached to `loadSnapTargets` -- to the *loader* -- and `#remove-song` calls
-    `forgetSongEnvelope()` and `renderAll()`, neither of which was one. So the panel went on saying
+    The sync was attached to the *loader* -- and `#remove-song` calls
+    `forgetSongMeasurement()` and `renderAll()`, neither of which was one. So the panel went on saying
     "This song has not been analysed..." about a song that had been removed, with a live Analyze
     button whose only possible outcome was the server's 422. The markup was byte-identical before
     and after the removal while `state.project.song` was null.
 
     `test_a_removed_or_replaced_song_takes_its_snap_targets_with_it` passed throughout, because it
-    reads `state.snapTargets` and never the control -- which is why this reads the control.
+    reads `state.songMeasurement` and never the control -- which is why this reads the control.
     """
     words = snap_words()
     removed = run_workspace(
@@ -13179,12 +13264,11 @@ def test_removing_the_song_stops_the_panel_describing_it():
         before,
         after: at('#snap-target-kinds').innerHTML,
         song: state.project.song,
-        targets: state.snapTargets,
+        targets: state.songMeasurement,
       }));
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {
                 "body": served_targets(measured=False, analysed=False)},
             "/api/projects/p2/song?confirm_song_replacement=false": {"body": UNSUNG_PROJECT},
@@ -13224,13 +13308,12 @@ def test_a_refused_targets_read_does_not_leave_the_previous_projects_sentences_o
         unsonged,
         after: snapPanel(),
         song: state.project.song ? state.project.song.path : null,
-        targets: state.snapTargets,
+        targets: state.songMeasurement,
       }));
     """,
         responses={
             "/api/projects/p1": {"body": {**UNSUNG_PROJECT, "id": "p1"}},
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"status": 500, "body": {"detail": "no"}},
             "/api/projects/p2/timeline/snap-targets": {"status": 500, "body": {"detail": "no"}},
         },
     )
@@ -13255,15 +13338,15 @@ def test_the_row_action_measures_the_song_and_puts_the_result_on_screen_without_
     """**The whole point of A1, and the re-measurement trap, in one run.**
 
     `song_fingerprint` is derived from the song's *bytes*, so re-measuring the same file answers
-    the same fingerprint -- and both `songEnvelopeIdentity` and `snapTargetsIdentity` are built on
-    it, and both loaders return early when their key has not moved. A Director whose sidecar had
-    been deleted would press this, the server would genuinely re-measure, and the browser would
-    show them the cached absence: `force=True`'s entire purpose defeated by a cache.
+    the same fingerprint -- and `snapTargetsIdentity` is built on it, so the loader returns early
+    when its key has not moved. A Director whose sidecar had been deleted would press this, the
+    server would genuinely re-measure, and the browser would show them the cached absence:
+    `force=True`'s entire purpose defeated by a cache.
 
     So the analysis here answers a Project whose song is **byte-identical** -- same path, same
-    fingerprint, everything -- and the two reads must still happen and must still change what is
-    on screen. `forgetSongEnvelope` is what makes that true, and the adoption has to come *before*
-    the reads or their keys are computed from the song as it was and match anyway.
+    fingerprint, everything -- and the read must still happen and must still change what is on
+    screen. `forgetSongMeasurement` is what makes that true, and the adoption has to come *before*
+    it or the key is computed from the song as it was and matches anyway.
 
     The press is delivered on a **child** of the button, which is how a browser delivers one the
     moment the button contains anything at all, and the handler has to walk up to find it.
@@ -13282,8 +13365,7 @@ def test_the_row_action_measures_the_song_and_puts_the_result_on_screen_without_
       await flush();
       const before = {{
         markup: at('#snap-target-kinds').innerHTML,
-        targets: state.snapTargets,
-        envelope: state.songEnvelope,
+        held: state.songMeasurement,
         band: at('#beat-band').innerHTML,
         fingerprint: state.project.song.analysis.song_fingerprint,
       }};
@@ -13293,8 +13375,7 @@ def test_the_row_action_measures_the_song_and_puts_the_result_on_screen_without_
       console.log(JSON.stringify({{
         before,
         markup: at('#snap-target-kinds').innerHTML,
-        targets: state.snapTargets,
-        envelope: state.songEnvelope,
+        held: state.songMeasurement,
         band: at('#beat-band').innerHTML,
         fingerprint: state.project.song.analysis.song_fingerprint,
         sent: requests.map((sent) => sent.method + ' ' + sent.path),
@@ -13305,13 +13386,10 @@ def test_the_row_action_measures_the_song_and_puts_the_result_on_screen_without_
         responses={
             "/api/projects/p2": {"body": measured_project()},
             # Absent first, present after the measurement -- the same path, two answers.
-            "/api/projects/p2/song/envelope": [
-                {"body": {"present": False, "reason": "the sidecar is gone"}},
-                {"body": {"present": True, "envelope": envelope}},
-            ],
             "/api/projects/p2/timeline/snap-targets": [
                 {"body": served_targets(measured=False, analysed=False)},
-                {"body": served_targets(measured=False, analysed=True, beats=envelope["beats"])},
+                {"body": served_targets(
+                    measured=False, analysed=True, beats=envelope["beats"], envelope=envelope)},
             ],
             # The same Song, byte for byte: this is the trap, not an oversight.
             "/api/projects/p2/song/analyze": {"body": measured_project()},
@@ -13320,14 +13398,15 @@ def test_the_row_action_measures_the_song_and_puts_the_result_on_screen_without_
 
     # The starting state is real: the row said so and offered the button.
     assert words["absent"]["beat"] in measured["before"]["markup"]
-    assert measured["before"]["envelope"] is None
+    assert measured["before"]["held"]["envelope"] is None
     assert measured["before"]["band"] == "", "marks were drawn from an absent measurement"
 
-    # One click, one measurement, and both reads re-fired behind it -- and every canned answer was
+    # One click, one measurement, and **one** read behind it -- and every canned answer was
     # consumed, so "it asked again" cannot pass on a client that asked once.
     assert measured["sent"][0] == "POST /api/projects/p2/song/analyze", measured["sent"]
-    assert "GET /api/projects/p2/song/envelope" in measured["sent"], measured["sent"]
-    assert "GET /api/projects/p2/timeline/snap-targets" in measured["sent"], measured["sent"]
+    reads = [sent for sent in measured["sent"] if "snap-targets" in sent]
+    assert reads == ["GET /api/projects/p2/timeline/snap-targets"], measured["sent"]
+    assert not any("song/envelope" in sent for sent in measured["sent"]), measured["sent"]
     assert measured["leftover"] == {}, ("a canned reply was never asked for", measured["leftover"])
 
     # The trap: the song did not move, and the reads happened anyway.
@@ -13342,9 +13421,9 @@ def test_the_row_action_measures_the_song_and_puts_the_result_on_screen_without_
     assert f'data-snap-action="{words["action"]}"' not in measured["markup"], (
         "the action is still offered on a row that can now pull"
     )
-    assert measured["targets"]["analysed"] is True
-    assert measured["targets"]["beats"] == envelope["beats"]
-    assert measured["envelope"] == envelope
+    assert measured["held"]["analysed"] is True
+    assert measured["held"]["beats"] == envelope["beats"]
+    assert measured["held"]["envelope"] == envelope
     assert measured["band"] != "", "the beat band did not repaint from the new measurement"
     assert measured["band"].count("<span") == len(envelope["beats"]) + len(envelope["onsets"]) - 1, (
         measured["band"]
@@ -13379,16 +13458,12 @@ def test_a_successful_analysis_whose_read_back_fails_does_not_report_a_count_it_
       await fire('#snap-target-kinds:click', {snap_press()});
       await flush();
       console.log(JSON.stringify({{
-        toasts, targets: state.snapTargets,
+        toasts, targets: state.songMeasurement,
         markup: at('#snap-target-kinds').innerHTML,
       }}));
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": [
-                {"body": {"present": False, "reason": "the sidecar is gone"}},
-                {"status": 500, "body": {"detail": "no"}},
-            ],
             "/api/projects/p2/timeline/snap-targets": [
                 {"body": served_targets(measured=False, analysed=False)},
                 {"status": 500, "body": {"detail": "no"}},
@@ -13434,7 +13509,7 @@ def test_a_refused_analysis_says_what_the_server_said_and_changes_nothing():
       await flush();
       const before = {{
         markup: at('#snap-target-kinds').innerHTML,
-        targets: JSON.parse(JSON.stringify(state.snapTargets)),
+        targets: JSON.parse(JSON.stringify(state.songMeasurement)),
         project: JSON.parse(JSON.stringify(state.project)),
       }};
       requests.length = 0;
@@ -13443,7 +13518,7 @@ def test_a_refused_analysis_says_what_the_server_said_and_changes_nothing():
       console.log(JSON.stringify({{
         before,
         markup: at('#snap-target-kinds').innerHTML,
-        targets: state.snapTargets,
+        targets: state.songMeasurement,
         project: state.project,
         sent: requests.map((sent) => sent.method + ' ' + sent.path),
         toasts,
@@ -13451,7 +13526,6 @@ def test_a_refused_analysis_says_what_the_server_said_and_changes_nothing():
     """,
             responses={
                 "/api/projects/p2": {"body": measured_project()},
-                "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
                 "/api/projects/p2/timeline/snap-targets": {
                     "body": served_targets(measured=False, analysed=False)},
                 "/api/projects/p2/song/analyze": {"status": status, "body": {"detail": sentence}},
@@ -13519,12 +13593,10 @@ def test_a_measurement_running_on_one_project_says_nothing_about_another():
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {
                 "body": served_targets(measured=False, analysed=False)},
             "/api/projects/p2/song/analyze": {"status": 502, "body": {"detail": "ffmpeg is gone"}},
             "/api/projects/p3": {"body": {**measured_project(), "id": "p3"}},
-            "/api/projects/p3/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p3/timeline/snap-targets": {
                 "body": served_targets(measured=False, analysed=False)},
         },
@@ -13592,7 +13664,6 @@ def test_a_second_press_cannot_start_a_second_measurement():
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {
                 "body": served_targets(measured=False, analysed=False)},
             "/api/projects/p2/song/analyze": {"body": measured_project()},
@@ -13651,7 +13722,6 @@ def test_a_tick_still_moves_without_the_rows_losing_their_place():
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {
                 "body": served_targets(measured=False, analysed=False)},
         },
@@ -13688,13 +13758,12 @@ def test_a_reason_that_changes_its_words_without_changing_the_shape_is_still_re_
       const unread = snapPanel();
       // The same song, the same project: only the read that was refused now lands.
       state.project.song.duration = 61;
-      await app.loadSnapTargets('p2');
+      await app.loadSongMeasurement('p2');
       await flush();
       console.log(JSON.stringify({ unread, panel: snapPanel() }));
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": [
                 {"status": 500, "body": {"detail": "no"}},
                 {"body": served_targets(measured=False, analysed=True)},
@@ -13746,17 +13815,16 @@ def test_a_slow_targets_read_cannot_repaint_over_the_measurement_that_overtook_i
       // The first read is still open. Move the measurement so a second one is asked for, and let
       // that one answer.
       state.project.song.duration = 61;
-      await app.loadSnapTargets('p2');
+      await app.loadSongMeasurement('p2');
       await flush();
-      const overtaken = JSON.parse(JSON.stringify(state.snapTargets));
+      const overtaken = JSON.parse(JSON.stringify(state.songMeasurement));
       // ...and only now does the first one answer.
       release();
       await flush();
-      console.log(JSON.stringify({ overtaken, after: state.snapTargets }));
+      console.log(JSON.stringify({ overtaken, after: state.songMeasurement }));
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": [{"body": stale}, {"body": fresh}],
         },
     )
@@ -13787,7 +13855,7 @@ def test_the_rows_are_rewritten_when_the_measurement_arrives_and_not_before():
       const absent = {{ markup: list.innerHTML, key: list.dataset.kinds }};
       // A re-load of a measurement that has not moved: no request, no rewrite.
       requests.length = 0;
-      await app.loadSnapTargets('p2');
+      await app.loadSongMeasurement('p2');
       await flush();
       const idle = {{
         markup: list.innerHTML, key: list.dataset.kinds,
@@ -13796,18 +13864,14 @@ def test_the_rows_are_rewritten_when_the_measurement_arrives_and_not_before():
       await fire('#snap-target-kinds:click', {snap_press()});
       await flush();
       console.log(JSON.stringify({{
-        absent, idle, markup: list.innerHTML, key: list.dataset.kinds, held: state.snapTargets,
+        absent, idle, markup: list.innerHTML, key: list.dataset.kinds, held: state.songMeasurement,
       }}));
     """,
         responses={
             "/api/projects/p2": {"body": measured_project()},
-            "/api/projects/p2/song/envelope": [
-                {"body": {"present": False, "reason": "none"}},
-                {"body": {"present": True, "envelope": envelope}},
-            ],
             "/api/projects/p2/timeline/snap-targets": [
                 {"body": served_targets(measured=False, analysed=False)},
-                {"body": served_targets(measured=True, analysed=True)},
+                {"body": served_targets(measured=True, analysed=True, envelope=envelope)},
             ],
             "/api/projects/p2/song/analyze": {"body": measured_project()},
         },
@@ -14037,14 +14101,13 @@ def test_the_drag_targets_reach_the_workspace_on_a_load_and_a_refused_read_chang
       await fire('#project-select:change', { target: { value: 'p2' } });
       await flush();
       console.log(JSON.stringify({
-        held: state.snapTargets,
-        onProject: 'snapTargets' in (state.project || {}),
+        held: state.songMeasurement,
+        onProject: 'songMeasurement' in (state.project || {}),
         asked: requests.filter((sent) => sent.path.includes('snap-targets')).map((s) => s.path),
       }));
     """,
         responses={
             "/api/projects/p2": {"body": project},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {"body": served},
         },
     )
@@ -14061,7 +14124,7 @@ def test_the_drag_targets_reach_the_workspace_on_a_load_and_a_refused_read_chang
 def test_a_refused_targets_read_keeps_the_last_known_ones_rather_than_dropping_them():
     """The matrix's "targets request fails" row, and it has to start from something.
 
-    The earlier version of this asserted `state.snapTargets === null` after a refused read from a
+    The earlier version of this asserted the slot was `null` after a refused read from a
     **cold** start, where `null` was already the value -- so it would have passed just as happily
     if the failure path had cleared the slot, which is the behaviour it exists to forbid. Here a
     measurement is held first and the read that follows is refused.
@@ -14070,7 +14133,7 @@ def test_a_refused_targets_read_keeps_the_last_known_ones_rather_than_dropping_t
     news: the server saying "there is no measurement" empties the slot, and this client never
     reaching the server tells it nothing, so it changes nothing and leaves its key unclaimed for
     the next load to try again. A project *change* is different again -- that drops the targets
-    with everything else about the previous song, which is `forgetSongEnvelope`'s job.
+    with everything else about the previous song, which is `forgetSongMeasurement`'s job.
     """
     project = {
         "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
@@ -14084,22 +14147,21 @@ def test_a_refused_targets_read_keeps_the_last_known_ones_rather_than_dropping_t
       await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
       await flush();
       // The route is refused, so nothing arrived and nothing was invented.
-      const cold = state.snapTargets;
+      const cold = state.songMeasurement;
       // Now the Director has a measurement on screen from a read that did land, and the song is
       // re-measured underneath it -- which moves the key, so the route is asked again.
-      state.snapTargets = {json.dumps(served)};
+      state.songMeasurement = {json.dumps(served)};
       state.project.song.duration = 61;
-      await app.loadSnapTargets('p2');
+      await app.loadSongMeasurement('p2');
       await flush();
       console.log(JSON.stringify({{
         cold,
-        after: state.snapTargets,
+        after: state.songMeasurement,
         asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
       }}));
     """,
         responses={
             "/api/projects/p2": {"body": project},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {"status": 500, "body": {"detail": "no"}},
         },
     )
@@ -14115,6 +14177,181 @@ def test_a_refused_targets_read_keeps_the_last_known_ones_rather_than_dropping_t
     )
 
 
+def test_a_refused_read_keeps_both_halves_together_and_claims_no_identity():
+    """**The matrix's refusal row, and the state Epic 8 could reach that this cannot.**
+
+    Executed then (S5): the envelope read was refused while the targets read succeeded, and the
+    result was silent and contradictory -- `state.songEnvelope` null and the band empty, four
+    beats still snappable, a drag at 2.05 s answering `{snapped: true, kind: "beat"}`, and zero
+    toasts. The Director saw no marks and their cut jumped to one. Both `catch` blocks were
+    deliberately silent, and each was right on its own.
+
+    One read makes that unreachable rather than unlikely: there is one request, so there is one
+    outcome, and a refusal leaves *both* halves at their last known values. What survives from the
+    old behaviour is that a refusal is still silent and still recoverable -- the key is left
+    unclaimed, so the next load asks again rather than the timeline losing its marks and its magnet
+    to one unreachable moment.
+
+    Driven from a state that is genuinely current, not from a cold start: after a cold start the
+    slot is `null` anyway, so a failure path that *cleared* it would pass.
+    """
+    project = {
+        "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": [], "song": MEASURED_SONG,
+    }
+    current = served_targets(measured=True, analysed=True, envelope=SMALL_ENVELOPE)
+    kept = run_workspace(
+        """
+      const spoken = [];
+      const made = globalThis.document.createElement;
+      globalThis.document.createElement = (tag) => {
+        const element = made(tag);
+        spoken.push(element);
+        return element;
+      };
+      state.pixelsPerSecond = 16;
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const landed = {
+        held: JSON.parse(JSON.stringify(state.songMeasurement)),
+        band: at('#beat-band').innerHTML,
+      };
+      // The same song, re-measured underneath: the key moves, so the route is asked again -- and
+      // this time it is refused.
+      state.project.song.duration = 61;
+      requests.length = 0;
+      await app.loadSongMeasurement('p2');
+      await flush();
+      const refused = { held: state.songMeasurement, band: at('#beat-band').innerHTML };
+      // ...and the next load asks again, because the failed read claimed no identity.
+      await app.loadSongMeasurement('p2');
+      await flush();
+      console.log(JSON.stringify({
+        landed, refused,
+        asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
+        said: spoken.map((element) => element.textContent).filter(Boolean),
+      }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": project},
+            "/api/projects/p2/timeline/snap-targets": [
+                {"body": current},
+                {"status": 500, "body": {"detail": "no"}},
+            ],
+        },
+    )
+
+    assert kept["landed"]["held"] == current, ("the measurement never landed", kept)
+    assert kept["landed"]["band"].count("beat-mark") == 4, kept["landed"]
+
+    # Both halves kept, together. Neither the marks nor the magnet moved, and neither could have
+    # moved alone: there is one reply and it never arrived.
+    assert kept["refused"]["held"] == current, (
+        "a refused read discarded the last known measurement, so one unreachable moment costs the "
+        "Director their marks and their magnet until the next load"
+    )
+    assert kept["refused"]["band"] == kept["landed"]["band"], kept["refused"]
+
+    # No identity was claimed, so the next attempt asks again rather than this project never
+    # asking for anything ever again.
+    assert kept["asked"] == 2, (
+        "the second read was never attempted, so the key was claimed by a read that failed"
+    )
+    # And not one word about it. A refusal here is silence, exactly as it always was.
+    assert kept["said"] == [], kept["said"]
+
+
+def test_a_measurement_replaced_under_an_unchanged_record_is_learned_on_the_next_read():
+    """**Cross-story finding S4, executed on the client side of the fix.**
+
+    The manifest record is the path and the fingerprint; the *server* decides validity from the
+    song's current bytes. So a re-render landing on the same filename -- which the server's own
+    comment names as the trigger -- flips the read to absent while every field the client keys on
+    stays exactly where it was. Executed in Epic 8: after the server flipped, neither loader
+    refetched, the band kept its marks and the stale beats stayed snappable, and it healed only on
+    a full project load.
+
+    What one read changes is not *when* the browser finds out -- the key is still a function of
+    the record, and nothing may put this route on a timer -- but that finding out is **one event**.
+    Before, the discovery arrived as two independent replies that could land in either order or
+    only one at a time; here the marks and the magnet are dropped by the same reply, so there is no
+    window in which the band is empty and the drag still snaps to what it drew.
+
+    Driven as the Director reaches it: a project switch away and back, which is what `loadProject`
+    does with `forgetSongMeasurement` on a real change.
+    """
+    measured = {
+        "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": [], "song": MEASURED_SONG,
+    }
+    superseded = run_workspace(
+        """
+      state.pixelsPerSecond = 16;
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const drawn = {
+        band: at('#beat-band').innerHTML,
+        held: JSON.parse(JSON.stringify(state.songMeasurement)),
+      };
+      // The song's bytes change under an unchanged record. Nothing the browser can see has moved,
+      // so nothing is asked and nothing is drawn differently -- which is correct, not a defect:
+      // the alternative is hashing a multi-megabyte master on a timer.
+      requests.length = 0;
+      await app.loadSongMeasurement('p2');
+      const quiet = {
+        asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
+        band: at('#beat-band').innerHTML,
+      };
+      // The next read -- here a switch out of the project and back into it, which is what a real
+      // reload is. One request, and both halves are superseded by it.
+      await fire('#project-select:change', { target: { value: 'p1' } });
+      await flush();
+      requests.length = 0;
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      console.log(JSON.stringify({
+        drawn, quiet,
+        band: at('#beat-band').innerHTML,
+        held: state.songMeasurement,
+        asked: requests.filter((sent) => sent.path.includes('snap-targets')).length,
+      }));
+    """,
+        responses={
+            "/api/projects/p1": {"body": UNSUNG_PROJECT},
+            "/api/projects/p2": {"body": measured},
+            "/api/projects/p2/timeline/snap-targets": [
+                # The measurement, and then the same record answering absent because the bytes
+                # behind it changed. `SONG_ENVELOPE_SONG_CHANGED` is the server's own sentence for
+                # this; the client never reads it and never needs to.
+                {"body": served_targets(measured=True, analysed=True, envelope=SMALL_ENVELOPE)},
+                {"body": served_targets(measured=False, analysed=False)},
+            ],
+        },
+    )
+
+    assert superseded["drawn"]["band"].count("beat-mark") == 4, superseded["drawn"]
+    assert superseded["drawn"]["held"]["beats"], superseded["drawn"]
+
+    # A record that has not moved is not re-read, and nothing on screen changes for it.
+    assert superseded["quiet"]["asked"] == 0, "the measurement was re-read on an unchanged record"
+    assert superseded["quiet"]["band"] == superseded["drawn"]["band"]
+
+    # The next read: one request, and the superseded measurement is gone from **both** halves.
+    assert superseded["asked"] == 1, (
+        "the next read asked for the measurement a number of times other than once", superseded,
+    )
+    assert superseded["band"] == "", (
+        "the band still draws the superseded measurement's marks after a read that reported it "
+        "absent"
+    )
+    assert superseded["held"]["envelope"] is None and superseded["held"]["beats"] == [], (
+        "a drag still snaps to the beats of a measurement the server has already superseded",
+        superseded["held"],
+    )
+
+
 def test_a_removed_or_replaced_song_takes_its_snap_targets_with_it():
     """The one state this feature must not be able to reach: a magnet pulling a cut onto the
     beats of a track that is not there any more.
@@ -14122,7 +14359,7 @@ def test_a_removed_or_replaced_song_takes_its_snap_targets_with_it():
     Half these targets -- the voiceless gaps -- are not derived from the envelope at all, so they
     would survive a song replacement on their own if the forget did not name them. Driven through
     `#remove-song`, which is the gesture a Director actually makes, rather than by calling the
-    forget directly: deleting `state.snapTargets = null` from it left the whole suite green.
+    forget directly: deleting `state.songMeasurement = null` from it left the whole suite green.
     """
     song = {**MEASURED_SONG}
     served = {"gaps": [12.15], "beats": [10, 20], "measured": True, "analysed": True,
@@ -14132,17 +14369,16 @@ def test_a_removed_or_replaced_song_takes_its_snap_targets_with_it():
       answer(true);
       await fire('#project-select:change', { target: { value: 'p2' } });
       await flush();
-      const before = state.snapTargets;
+      const before = state.songMeasurement;
       await fire('#remove-song:click', {});
       await flush();
-      console.log(JSON.stringify({ before, after: state.snapTargets }));
+      console.log(JSON.stringify({ before, after: state.songMeasurement }));
     """,
         responses={
             "/api/projects/p2": {"body": {
                 "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
                 "messages": [], "song": song,
             }},
-            "/api/projects/p2/song/envelope": {"body": {"present": False, "reason": "none"}},
             "/api/projects/p2/timeline/snap-targets": {"body": served},
             "/api/projects/p2/song?confirm_song_replacement=false": {"body": {
                 "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
@@ -14199,7 +14435,7 @@ def test_the_targets_are_re_read_exactly_when_the_measurement_behind_them_change
     # And the workspace re-reads on the transcription path, which does not go through loadProject.
     workspace = APP_JS.read_text(encoding="utf-8")
     aligned = workspace.split("api.alignLyrics(", 1)[1].split("catch (error)", 1)[0]
-    assert "loadSnapTargets(" in aligned, (
+    assert "loadSongMeasurement(" in aligned, (
         "a first transcription does not re-read the targets it just created, so gap snapping "
         "arrives one page reload late"
     )
@@ -14251,7 +14487,7 @@ def test_the_drag_resolves_its_targets_once_and_never_ports_the_gap_rule_into_ja
     from music_video_producer.timeline import SNAP_CLEARANCE_SECONDS, SNAP_MINIMUM_GAP_SECONDS
 
     magnet = contract.split("export function dragSnapPlan(", 1)[1].split(
-        "// Which measurement a read set of drag targets belongs to", 1
+        "// Which measurement a read of `GET /timeline/snap-targets` belongs to", 1
     )[0]
     assert "export function edgeSnap(" in magnet, "the section markers moved"
     for banned in ("vocal_gaps", "vocalGaps", "_gap_snap_target", "gapSnapTarget",

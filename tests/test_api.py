@@ -21241,6 +21241,10 @@ def test_the_drag_snap_targets_route_serves_both_halves_and_neither_is_required(
     """Story 8.3's route: every second a dragged Shot edge may land on, computed by `timeline.py`
     so the drag and the batch "Snap cuts" button cannot hold two opinions about where a cut goes.
 
+    Grown since, and `envelope` is the growth: the marks the waveform draws ride the same read, so
+    the band and the drag cannot describe different states. Its own tests are below; what this one
+    holds is that adding it did not move any of the six keys that were already here.
+
     **Absence of either half is a 200 carrying the half that exists.** Beats come from the
     analysis and gap targets from the transcription, and the two are independent: a song nobody
     transcribed keeps its beats, a song nobody analysed keeps its gap targets, and a project with
@@ -21259,7 +21263,11 @@ def test_the_drag_snap_targets_route_serves_both_halves_and_neither_is_required(
     bare = client.get(f"/api/projects/{project.id}/timeline/snap-targets")
     assert bare.status_code == 200, bare.text
     assert bare.json() == {
-        "gaps": [], "beats": [], "measured": False, "analysed": False, "start": 0.0, "end": 0.0
+        "gaps": [], "beats": [], "measured": False, "analysed": False, "start": 0.0, "end": 0.0,
+        # Absent, and absent as `null` rather than as an empty object: a measurement that found
+        # nothing is a different sentence from a song nobody has measured, and this key answers
+        # the second the same way `analysed` does, from the same expression.
+        "envelope": None,
     }
 
     # Analysed but never transcribed: the beats are served, the gap half is honestly empty.
@@ -21275,6 +21283,9 @@ def test_the_drag_snap_targets_route_serves_both_halves_and_neither_is_required(
         (store.project_dir(project.id) / saved.song.analysis.path).read_text(encoding="utf-8")
     )
     assert analysed["beats"] == envelope["beats"]
+    # ...and the drawing half is there beside them, from the same read.
+    assert analysed["envelope"]["beats"] == envelope["beats"]
+    assert analysed["envelope"]["onsets"] == envelope["onsets"]
 
     # Now transcribed as well: the gap targets appear beside the beats, and are exactly the
     # seconds `timeline.py`'s own rule can move a boundary to.
@@ -21374,6 +21385,80 @@ def test_the_analysed_flag_never_disagrees_with_the_beats_it_describes(tmp_path:
     )[1].split("\n    @app.", 1)[0]
     assert "envelope = served if isinstance(served, dict) else None" in route
     assert '"analysed": envelope is not None' in route
+
+
+def test_the_timeline_read_carries_the_marks_without_the_per_frame_series(tmp_path: Path):
+    """One read for one measurement: what the band draws rides with what the drag lands on.
+
+    **The reason this is one route and not two.** Two client reads of one measurement is a drift
+    mechanism, and it drifted three ways in Epic 8, every one of them executed in
+    `epic-8-retro-2026-08-24.md`: a byte change under an unchanged manifest record was invisible to
+    both client keys (S4); one read refused while the other succeeded showed no marks while the cut
+    still snapped (S5); and a single project load hashed the master twice and parsed the same
+    sidecar twice to use 2% of it (S3). Served from one computation, `analysed`, `beats` and
+    `envelope` cannot describe different states, because there is nothing for them to disagree
+    about.
+
+    **What is trimmed and why.** Measured on a real 202 s master: the sidecar is 469,472 bytes, of
+    which `bands`, `rms`, `peak` and `flux` are 460,264 — 98.0%, and not one byte of it is read by
+    the browser. What rides here is what is consumed plus what AD-26's band selector will need, and
+    the rule is asserted from `SERVED_ENVELOPE_KEYS` rather than from a hand-list, so a key added
+    there without a consumer fails this rather than quietly growing the payload back.
+
+    **`GET /song/envelope` is unchanged and is checked here as the other side of that**: it still
+    serves the whole thing, per-frame series included, to anyone who wants it.
+    """
+    from music_video_producer.app import SERVED_ENVELOPE_KEYS
+    from music_video_producer.audio import ENVELOPE_REQUIRED_KEYS
+
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Trimmed"))
+    import_measured_song(client, project.id, bpm=120)
+
+    served = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    saved = ProjectStore(tmp_path).get(project.id)
+    whole = json.loads(
+        (store.project_dir(project.id) / saved.song.analysis.path).read_text(encoding="utf-8")
+    )
+
+    # Exactly the projection, and every value is the sidecar's own rather than a re-derivation.
+    assert set(served["envelope"]) == set(SERVED_ENVELOPE_KEYS)
+    for key in SERVED_ENVELOPE_KEYS:
+        assert served["envelope"][key] == whole[key], key
+    # The two the next epic needs are fixed-size, which is the whole argument for carrying them.
+    assert len(served["envelope"]["band_average"]) == whole["band_count"]
+
+    # The per-frame series are on disk and are not on this wire. Named from the required key set
+    # rather than typed out, so a series added to `audio.py` is caught here too.
+    series = set(ENVELOPE_REQUIRED_KEYS) - set(SERVED_ENVELOPE_KEYS)
+    assert {"bands", "rms", "peak", "flux"} <= series
+    for key in series:
+        assert key not in served["envelope"], key
+
+    # And the full-measurement endpoint is exactly as it was: every key, series included.
+    full = client.get(f"/api/projects/{project.id}/song/envelope").json()
+    assert full["present"] is True and full["reason"] == ""
+    assert set(full["envelope"]) == set(ENVELOPE_REQUIRED_KEYS)
+    assert full["envelope"] == whole
+
+    # A measurement the read path refuses takes both halves with it, together. A replaced song is
+    # the reachable way to that state and is the one S4 was demonstrated with.
+    (store.project_dir(project.id) / saved.song.path).write_bytes(click_wav_bytes(bpm=90))
+    stale = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert stale["analysed"] is False and stale["beats"] == [] and stale["envelope"] is None
+    assert client.get(f"/api/projects/{project.id}/song/envelope").json()["present"] is False
+
+    # ...and the halves are still independent, which is the point of merging the *read* rather
+    # than the two measurements. A song that has been transcribed and not analysed keeps its gap
+    # targets and has no marks to draw, and each says so as itself rather than one being inferred
+    # from the other's emptiness.
+    saved = ProjectStore(tmp_path).get(project.id)
+    saved.song.lyric_words = [("la", 0.5, 1.0), ("la", 2.5, 3.0)]
+    saved.song.vocal_spans = [(0.5, 1.0), (2.5, 3.0)]
+    store.save(saved)
+    half = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert half["measured"] is True and half["gaps"], half
+    assert half["analysed"] is False and half["beats"] == [] and half["envelope"] is None
 
 
 def test_the_envelope_is_served_by_its_own_endpoint_and_never_by_a_project_response(

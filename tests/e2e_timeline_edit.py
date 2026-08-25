@@ -2244,9 +2244,15 @@ def main() -> None:
                 ("the click track has a transcription, so a gap target could be what catches "
                  "the edge below"), served,
             )
+            # One read, both halves. The drag's `beats` are `drag_snap_targets`' window-filtered
+            # set and the measurement's own are every beat the analysis found -- two lists on
+            # purpose, from one computation, so the band and the magnet cannot disagree about
+            # which measurement is current.
+            assert served["envelope"] and served["envelope"]["beats"], served
             beats = sorted(served["beats"])
             beats_result["served"] = {
                 "beats": len(beats), "first": beats[:4], "gaps": served["gaps"],
+                "marks_in_the_same_read": len(served["envelope"]["beats"]),
             }
 
             # **A non-default selection, made before the reload and read back after it.** The

@@ -4675,9 +4675,17 @@ export function edgeSnap({ seconds, plan = null, playing = false } = {}) {
   return best === null ? free : { snapped: true, seconds: best.seconds, kind: best.kind };
 }
 
-// Which measurement a read set of drag targets belongs to. The fetch is keyed on this, so it is
-// re-read exactly when the answer changes and never otherwise -- the route hashes the whole master
-// to decide whether the analysis is current, which is why nothing may ask it on a timer.
+// Which measurement a read of `GET /timeline/snap-targets` belongs to -- **the whole read, both
+// halves**: the marks the band draws and the seconds a drag may land on. The one fetch is keyed on
+// this, so it is re-read exactly when the answer changes and never otherwise -- the route hashes
+// the whole master to decide whether the analysis is current, which is why nothing may ask it on a
+// timer.
+//
+// **Why this key rather than `songEnvelopeIdentity`, now that one read serves both.** It is a
+// strict superset: literally that function's answer with three more fields appended, so it changes
+// whenever the envelope's key would and cannot fail to notice something the narrower one would
+// have. What it costs is a re-read on a first transcription, which is correct -- that is exactly
+// when the gap half appears -- and on a duration correction. More often, never less.
 //
 // It is `songEnvelopeIdentity` plus the three things the *gap* half depends on and the envelope's
 // key does not: the word and span counts, and the song's own duration. A first transcription, or a
@@ -5882,13 +5890,23 @@ export const BEAT_MARKER_CLEARANCE_PIXELS = 2;
 
 // Where every mark goes, and whether there are any at all.
 //
-// `envelope` takes either the endpoint's whole report -- `{present, reason, envelope}` -- or a
-// bare envelope, because absence has a named reason for every way it can happen and **every one
-// of them draws the same nothing here**. Absence is silence: no error, no toast, no refusal text,
-// and a timeline identical to the one this application drew before the feature existed. The named
-// refusal with its `[Analyze song]` action belongs where a consumer genuinely *needs* an envelope;
-// beat markers do not need one, they simply do not draw. Nothing here reads `reason`, so a reason
-// this file has never heard of draws exactly the same nothing as the ones it has.
+// `envelope` takes a **report carrying a measurement** -- the timeline's own merged read
+// `{gaps, beats, measured, analysed, envelope}`, or `GET /song/envelope`'s `{present, reason,
+// envelope}` -- or a bare envelope, because absence has a named reason for every way it can happen
+// and **every one of them draws the same nothing here**. Absence is silence: no error, no toast,
+// no refusal text, and a timeline identical to the one this application drew before the feature
+// existed. The named refusal with its `[Analyze song]` action belongs where a consumer genuinely
+// *needs* an envelope; beat markers do not need one, they simply do not draw. Nothing here reads
+// `reason`, so a reason this file has never heard of draws exactly the same nothing as the ones
+// it has.
+//
+// **The unwrap is a key test, never a duck test, and that is load-bearing.** The merged read
+// carries *two* `beats` lists and they are not the same list: the top-level one is
+// `drag_snap_targets`' window-filtered, NaN-stripped set of seconds a cut may land on, and the
+// measurement's own is every beat the analysis found. A plan that read the report as though it
+// were a bare envelope would draw the drag's targets as marks -- marks that look right and are a
+// different set. So a report is recognised by the keys only a report has, and only then is
+// `envelope` taken out of it.
 //
 // Offsets are `seconds * pixelsPerSecond` -- the same expression the clips are laid out with,
 // deliberately, and *not* a fraction of `trackWidth`. Below `900 / pixelsPerSecond` the waveform
@@ -5921,9 +5939,12 @@ export function beatMarkerPlan({
   if (!Number.isFinite(width) || width <= 0) return empty;
   const report = envelope && typeof envelope === "object" ? envelope : null;
   if (!report) return empty;
-  const measured = "present" in report
-    ? (report.present === true ? report.envelope : null)
-    : report;
+  // A carrier is anything shaped like a reply rather than like a measurement. `envelope` is the
+  // merged read's own key and is present on it even when there is nothing to draw; `gaps` and
+  // `present` are the other two replies' unmistakable marks. A bare envelope has none of the
+  // three, so it is passed through as itself.
+  const carrier = "envelope" in report || "gaps" in report || "present" in report;
+  const measured = carrier ? (report.envelope || null) : report;
   if (!measured || typeof measured !== "object") return empty;
   const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0);
   const song = positive(duration);
@@ -5964,9 +5985,10 @@ export function beatMarkerPlan({
   return { markers: [...onsets, ...beats], beats: beats.length, onsets: onsets.length };
 }
 
-// Which song a read envelope belongs to. The band is keyed on this, so it is re-read exactly when
-// the answer changes and never otherwise -- the endpoint hashes the whole master to decide
-// validity, which is why nothing may ask it on a timer.
+// Which song a measurement belongs to. **Half of `snapTargetsIdentity`, which is what the one read
+// is actually keyed on** -- kept as its own function because it is the half that answers "is this
+// the same measurement of the same file", and because separating it is what makes the superset
+// argument above checkable rather than asserted.
 //
 // The **fingerprint** is in the key, not only the path. A measurement retaken over the same file --
 // the Director pressing Analyze again, a re-render landing on the same output name -- changes the
@@ -6048,19 +6070,17 @@ export const api = {
   // filled from the measurement. First run transcribes (minutes, CPU); the words are kept
   // on the Song so every later run is instant.
   alignLyrics: (id, body = {}) => request(`/api/projects/${id}/song/align-lyrics`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
-  // The Song Envelope, on its own read-only route and never inside a Project: a three-minute
-  // measurement is over a megabyte of JSON against a whole manifest of 110–190 KB, and the
-  // manifest rides a two-second poll. Absence is a **200** carrying `{present: false, reason}`
-  // for every one of its reasons -- no song, no audio yet, a replaced song, a missing or
-  // unreadable sidecar -- so a caller branches on `present` and never on a status code. Read
-  // once on the load path when a song is on screen; it hashes the song file to decide validity,
-  // which is precisely why nothing may put it behind a timer.
-  songEnvelope: (id) => request(`/api/projects/${id}/song/envelope`),
+  // **`GET /song/envelope` is deliberately not here.** It still exists, unchanged, and still
+  // serves a whole measurement to anyone who wants one -- but this browser is not one of them:
+  // `snapTargets` below carries the part the timeline draws beside the seconds a drag lands on,
+  // from one computation on the server. Two client reads of one measurement is what let the band
+  // and the drag describe different states, and re-adding an entry here is how that comes back.
+  //
   // Measure the song again, now, because the Director asked. `force=True` on the server, so it
   // re-measures rather than skipping an analysis it considers current -- the whole difference
   // between this and the measurement that rides a song import. It answers the **Project**, not
-  // the envelope: the envelope is read back through its own endpoint above, which is what keeps
-  // a multi-megabyte measurement off every route that returns a Project.
+  // the measurement: that is read back through `snapTargets` below, which is what keeps a
+  // multi-megabyte measurement off every route that returns a Project.
   //
   // Four refusals a caller must be ready for, all of them the server's own sentence: **422** with
   // no song or no audio yet, **404** for an unknown project or a song file that is gone, and
@@ -6073,8 +6093,17 @@ export const api = {
   // chooses -- the same seconds the batch "Snap cuts" button lands a cut on -- and the beats the
   // song analysis measured. Computed server-side so the drag and the button can never hold two
   // opinions about where a cut belongs. Absence of either half is a 200 carrying the half that
-  // exists, so a caller reads the lists and never a status code. Read once on the load path for
-  // `songEnvelope`'s reason exactly: reaching the beats hashes the master.
+  // exists, so a caller reads the lists and never a status code.
+  //
+  // **And the measurement the waveform draws, under `envelope`**, from the same read: the beats
+  // and onsets, plus the two small per-band arrays AD-26's band selector will want. Not the
+  // per-frame series -- `bands`, `rms`, `peak` and `flux` are 98% of the sidecar and nothing here
+  // reads a byte of them. `null` when the song has no measurement, which is `analysed: false`
+  // said in the shape the band consumes.
+  //
+  // Read once on a load path and **never behind a timer**: reaching the beats hashes the master
+  // to decide whether the measurement still describes it, which is a multi-megabyte read to
+  // answer a question whose answer changes only when the song does.
   snapTargets: (id) => request(`/api/projects/${id}/timeline/snap-targets`),
   // One pointer moves: `output` switches among the shot's own takes (provenance is its
   // job history), `asset_id` attaches a video asset as the shot's clip.

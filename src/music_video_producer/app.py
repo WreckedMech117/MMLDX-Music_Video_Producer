@@ -6651,6 +6651,47 @@ SONG_ENVELOPE_RECORD_DISAGREES = (
     "analyzed."
 )
 
+#: The part of a measurement the *timeline* is served, beside the seconds a drag may land on.
+#:
+#: **Measured on a real 202 s master:** the sidecar is 469,472 bytes, of which `bands`, `rms`,
+#: `peak` and `flux` are 460,264 — 98.0%, and not one byte of it is read by the browser. Those
+#: four are the per-frame time series, one value per analysis frame per band, and they are what
+#: makes an envelope large. The four below are fixed-size or one-per-event: `beats` and `onsets`
+#: are the marks the waveform draws, and `band_average` (8 numbers) and `band_edges` (9) are what
+#: AD-26's band selector needs to name a band and show what it holds. Together they are 8,846
+#: bytes on that same master.
+#:
+#: **This is a projection, not a new shape.** The sidecar on disk is unchanged, `audio.py` still
+#: writes every key, `ENVELOPE_REQUIRED_KEYS` still validates the whole set, and
+#: `GET /song/envelope` still serves all of it to anyone who wants it. What is trimmed is the
+#: copy that rides the timeline's own read, and the rule for trimming it is the honest one: serve
+#: what is consumed, plus what the next epic's selector will need, and leave on disk the arrays
+#: nothing reads.
+#:
+#: **Not `bpm`, deliberately**, however small it is. `grep -rn "bpm" web/assets/` finds nothing —
+#: the estimate appears nowhere in the interface — and a field served on the strength of being
+#: cheap is how this payload grows back. When something draws it, it joins this tuple with a
+#: consumer in the same commit.
+SERVED_ENVELOPE_KEYS = ("beats", "onsets", "band_average", "band_edges")
+
+
+def served_measurement(envelope: dict[str, Any] | None) -> dict[str, Any] | None:
+    """`SERVED_ENVELOPE_KEYS` off a read envelope, or `None` when there is no measurement.
+
+    `None` rather than an empty dict, because the browser branches on it: a dict with no beats in
+    it is a measurement that found nothing, and an absent measurement is a song nobody has
+    analysed. Those are different sentences on the "Snap to" rows and the route already tells
+    them apart with `analysed` — this key answers the same question the same way, from the same
+    expression, so the two cannot disagree.
+
+    Missing keys are carried as missing rather than defaulted, which cannot happen for an envelope
+    `store.read_song_envelope` has validated and is written this way so that a hand-edited sidecar
+    surfaces as a drawing that is short rather than as arrays of zeros that look measured.
+    """
+    if envelope is None:
+        return None
+    return {key: envelope[key] for key in SERVED_ENVELOPE_KEYS if key in envelope}
+
 
 class ShotListRequest(BaseModel):
     shots: list[Shot]
@@ -8150,6 +8191,15 @@ def create_app(
     @app.get("/api/projects/{project_id}/song/envelope")
     def read_song_envelope(project_id: str) -> dict[str, Any]:
         """The Song Envelope, on its own endpoint. Read-only, and never part of a Project.
+
+        **The whole measurement, for anyone who wants the whole thing — and the browser is no
+        longer one of them.** `GET /timeline/snap-targets` carries the part the timeline draws
+        beside the seconds a drag lands on, from one computation, because two client reads of one
+        measurement is what let the band and the drag describe different states. This route is
+        deliberately untouched by that change: it keeps its shape, its statuses and its
+        absence-is-a-200 contract, and it is the documented read-only resource for a consumer
+        outside this application. What it must not become again is a *second* path the browser
+        takes to the same measurement.
 
         Its own endpoint because of the size: a three-minute envelope at 30 Hz with 8 bands is
         hundreds of kilobytes against a whole manifest of 110–190 KB, and the manifest rides a
@@ -12432,7 +12482,30 @@ def create_app(
 
     @app.get("/api/projects/{project_id}/timeline/snap-targets")
     def read_timeline_snap_targets(project_id: str) -> dict[str, Any]:
-        """Every second a dragged Shot edge may land on. Read-only, and one opinion only.
+        """The song's measurement as the timeline uses it: what to draw and what to land on.
+
+        **One read for one measurement.** This served the drag's targets only, and the band's
+        marks came from a second client read of `GET /song/envelope`. Two independent reads of one
+        measurement is a drift mechanism, and it drifted three ways, all demonstrated by execution
+        in `epic-8-retro-2026-08-24.md`: a byte change under an unchanged manifest record was
+        invisible to both keys, so a re-render landing on the same filename left stale marks drawn
+        and stale beats snappable until a full reload (S4); one read refused while the other
+        succeeded showed the Director no marks while their cut still jumped to a beat, silently
+        (S5); and a single project load hashed the master twice and parsed the same 469 KB sidecar
+        twice to use 8.8 KB of it (S3). So the two halves are served from one computation here —
+        one request, one identity, one failure and one answer — and they cannot describe different
+        states because there is nothing for them to disagree about.
+
+        `GET /song/envelope` is **unchanged** and stays the way to read a whole measurement. What
+        rides here is `served_measurement`'s projection of it: the marks and the two small arrays
+        AD-26's band selector will need, and none of the per-frame series, which is 98.0% of the
+        file and is read by nothing in the browser.
+
+        **Why this route rather than the other one.** The gap half comes from a *transcription*
+        that has no envelope in it, so this is the read that already had to happen for a song
+        nobody analysed; and `snapTargetsIdentity` is `songEnvelopeIdentity` with the word count,
+        span count and duration appended, so it is a strict superset and re-reads exactly when
+        either half moves.
 
         **Why this exists at all.** A drag had exactly one target — the playhead. The batch
         "Snap cuts" button had a different and much better one, voiceless gaps, and no drag could
@@ -12488,6 +12561,17 @@ def create_app(
             "analysed": envelope is not None,
             "start": targets.start,
             "end": targets.end,
+            # The drawing half, off the same `envelope` that `analysed` and the beat targets
+            # above it come from. **The whole point of this key is that it is the same object**: the band and the
+            # drag used to be two client reads of two routes, each hashing the master and parsing
+            # the sidecar for itself, and a byte change under an unchanged manifest record moved
+            # one without the other. There is one computation here now, so there is one answer, and
+            # `analysed`, `beats` and this cannot describe different states.
+            #
+            # `null` when there is no measurement, which is `analysed: false` said in the shape the
+            # band consumes. Trimmed by `served_measurement` — see `SERVED_ENVELOPE_KEYS` for what
+            # is left on disk and why.
+            "envelope": served_measurement(envelope),
         }
 
     @app.post(

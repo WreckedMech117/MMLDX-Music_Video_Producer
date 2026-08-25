@@ -4,6 +4,92 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-08-24 — One read for one measurement: the band and the drag stop being able to disagree
+
+Retrospective action item **A5**, closing cross-story findings **S4** and **S5** and taking **A4**
+with them. All three were demonstrated by execution in `epic-8-retro-2026-08-24.md`.
+
+**No render, no ComfyUI call, no model call.**
+
+### The defect was the shape, not any of the three symptoms
+
+The browser asked two questions about one measurement. `GET /song/envelope` filled the beat band and
+`GET /timeline/snap-targets` filled the drag, each with its own client key, its own revision guard
+and its own deliberately silent `catch`. Nothing held the two answers together, and all three ways
+they came apart were executed:
+
+* **S4.** Both client keys derive from the manifest *record*; the server derives validity from the
+  song's *bytes*. A re-render landing on the same filename — the trigger the server's own comment
+  names — flips both reads to absent while every field the keys read stays where it was. After the
+  flip, neither loader refetched: the band kept its marks and the superseded beats stayed snappable.
+* **S5.** The envelope read refused (500) while the targets read succeeded: `state.songEnvelope`
+  null, the band empty, four beats still snappable, a drag at 2.05 s answering
+  `{snapped: true, kind: "beat"}`, and **zero toasts**. The Director saw no marks while their cut
+  jumped to one. Both `catch` blocks were right on their own.
+* **S3/A4.** One project load hashed the 4.65 MB master **twice** and parsed the same sidecar
+  **twice** — measured with counters on both, 2 and 2.
+
+A targeted fix for each leaves the mechanism in place, so the Director's ruling was to change the
+shape: **the timeline's read carries both halves.** One request, one identity, one failure, one
+answer. `analysed`, the drag's `beats` and the measurement now come out of a single
+`song_envelope_report` call in `read_timeline_snap_targets`, so there is nothing for them to
+disagree about.
+
+### `GET /song/envelope` is unchanged, deliberately
+
+Rejected: retiring both routes in favour of one new endpoint. It would have rewritten 31
+shape-asserting tests in `test_api.py`, several by whole-dict equality, and removed a documented
+read-only resource for consumers outside the browser. So the timeline read grew and the full
+measurement endpoint kept its shape, its statuses and its absence-is-a-200 contract. What it lost is
+its *client entry*: `api.songEnvelope` is gone from `api.js` rather than left unused, because an
+unused entry is the shape a second client path comes back in.
+
+### The payload shrank rather than moving
+
+Measured on a real 202 s master: the sidecar is **469,472 bytes**, of which `bands`, `rms`, `peak`
+and `flux` are **460,264 — 98.0%, and not one byte of it is read by the browser**. What the timeline
+is served is `SERVED_ENVELOPE_KEYS`: `beats` and `onsets`, which the band draws, plus `band_average`
+(8 numbers) and `band_edges` (9), which AD-26's band selector will need. 8,846 bytes on that master.
+Not `bpm`, however cheap — it appears nowhere in the interface, and a field served on the strength of
+being small is how a payload grows back.
+
+The sidecar on disk, `audio.py`'s writer and `ENVELOPE_REQUIRED_KEYS` are all untouched. This is a
+projection of the measurement, not a second shape of it. The server still parses the whole file
+once — `store.read_song_envelope` validates the full key set — so the merge halves that cost rather
+than removing it; cutting further would mean a second sidecar or a partial parse, which is a
+different change with its own trade.
+
+### Why the key is the targets one
+
+`snapTargetsIdentity` is literally `songEnvelopeIdentity` with the word count, span count and song
+duration appended, so it is a **strict superset**: it changes whenever the envelope's key would.
+Keying the merged read on it loses nothing and costs a re-read on a first transcription — which is
+correct, because that is exactly when the gap half appears — and on a duration correction. More
+often, never less.
+
+Nothing about the two `beats` lists was flattened. The one at the top of the reply is
+`drag_snap_targets`' window-filtered, NaN-stripped set of seconds a cut may land on; the one inside
+`envelope` is every beat the analysis found, which the band thins for legibility on its own terms.
+`beatMarkerPlan` therefore recognises a reply by the keys only a reply has — `envelope`, `gaps`,
+`present` — and never by the presence of a `beats` array, because reading the wrong list would draw
+marks that look right and are a different set.
+
+### What "one failure" has to mean
+
+A refusal was silent and recoverable on each loader — last known value kept, key left unclaimed —
+and that was right and survives. What changed is that a refusal now leaves *both* halves at their
+last known values **together**, instead of allowing one to advance while the other did not. It is
+executed against the harness from a state that is genuinely current, because from a cold start the
+slot is `null` anyway and a failure path that cleared it would pass.
+
+Two matrix rows are executed rather than read: a refused read keeping both halves and claiming no
+identity, and a measurement replaced under an unchanged record being learned — one request, both
+halves — on the next read.
+
+`state.songEnvelope` and `state.snapTargets` became `state.songMeasurement`; `loadSongEnvelope` and
+`loadSnapTargets` became `loadSongMeasurement`; `forgetSongEnvelope`, which already cleared both
+slots and both keys and said why in its own comment, is the shape the merge collapses into.
+
 ## 2026-08-24 — A dragged cut lands on the song: voiceless gaps, measured beats, and one control that says which
 
 Story 8.3, the last of Epic 8. Before it, a dragged shot edge snapped to exactly one thing — the

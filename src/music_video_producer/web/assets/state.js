@@ -15,31 +15,31 @@ export const state = {
   // The candidate import's own measurement, tied to the File it came from. Kept apart
   // from audioBuffer, which loadPersistedWaveform also writes for the stored song.
   pendingImport: null,
-  // The Song Envelope this browser has read, or `null`. Session-scoped and never persisted: it
-  // is a measurement the server holds in a sidecar, fetched once per project and song file on
-  // the load path, and a copy kept in `localStorage` would be a second truth about a file that
-  // can be replaced between two page loads.
+  // **One slot for one measurement**, as `GET /timeline/snap-targets` serves it: the whole reply,
+  // carrying both halves. `gaps` and `beats` are the seconds a dragged shot edge may land on, as
+  // `timeline.py` itself computed them; `measured` and `analysed` say which halves the song has;
+  // and `envelope` is the marks the waveform draws, or `null`.
   //
-  // `null` until a read comes back `present: true`, which is the same nothing an absent, stale,
-  // unreadable or never-taken measurement leaves behind -- naming *which* absence it was is the
-  // endpoint's job, and nothing on this side branches on it or even counts them. Deliberately NOT
-  // on `state.project`: the project object is what `PUT /api/projects/{id}` sends back whole, and
-  // over a megabyte of arrays folded into it would be written straight into the manifest by the
-  // next ordinary save. It sits beside `audioBuffer`, which is out here for the same reason.
-  songEnvelope: null,
-  // Every second a dragged shot edge may land on, as the server computed them: the voiceless-gap
-  // targets `timeline.py` itself chooses and the beats the analysis measured. Session-scoped and
-  // read-only here -- this application has one snapper, on the server, and this slot holds its
-  // answer rather than a second opinion derived from it.
+  // **This was two slots, and that was the defect.** `songEnvelope` and `snapTargets` were filled
+  // by two reads of two routes with two keys and two silent catches, and nothing held them
+  // together: a measurement replaced under an unchanged manifest record moved neither, and a
+  // refusal of one while the other landed left the band empty while the drag went on snapping to
+  // beats that were no longer on screen. Both were executed in `epic-8-retro-2026-08-24.md` (S4,
+  // S5). One slot, filled by one reply, cannot reach either state -- and the band and the drag
+  // read the same object, so they cannot describe different states.
   //
-  // `null` until a read comes back, which is also what an unreachable route and a project with no
-  // song leave behind: all three mean "no targets", and a drag with no targets is the drag this
-  // application made before Story 8.3. Never persisted -- the route hashes the master to decide
-  // whether the analysis is still current, so a copy in `localStorage` would be a second truth
-  // about a file that can be replaced between two page loads. Deliberately NOT on `state.project`,
-  // beside `songEnvelope` and for its reason: the project object is what `PUT /api/projects/{id}`
-  // sends back whole, and anything folded into it is written into the manifest by the next save.
-  snapTargets: null,
+  // `null` until a read comes back, which is also what a project with no song and an unreachable
+  // route leave behind: no marks and no targets, which is the timeline this application drew
+  // before Epic 8. Nothing here branches on *why* a measurement is absent; the rows in the "Snap
+  // to" panel say that, from `measured` and `analysed`.
+  //
+  // Session-scoped and **never persisted**: the route hashes the master to decide whether the
+  // measurement still describes it, so a copy in `localStorage` would be a second truth about a
+  // file that can be replaced between two page loads. Deliberately **not** on `state.project`
+  // either, beside `audioBuffer` and for its reason: the project object is what
+  // `PUT /api/projects/{id}` sends back whole, and anything folded into it is written straight
+  // into the manifest by the next ordinary save.
+  songMeasurement: null,
   pixelsPerSecond: 16,
   playhead: 0,
   dirty: false,

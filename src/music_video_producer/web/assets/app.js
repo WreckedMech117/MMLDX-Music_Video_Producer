@@ -15,8 +15,9 @@ import { FILL_SECTION_LOOKS_APPLIED, FILL_SECTION_LOOKS_HELP, FILL_SECTION_LOOKS
 import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clampTimelineZoom, timelineWheelPlan, zoomFromSlider, zoomLabelText, zoomSliderValue, zoomViewport } from "./api.js";
 // Beat and onset marks over the master waveform, from the Song Envelope. Where each one goes and
 // which class it takes is `beatMarkerPlan`, and nothing here re-derives any of it: this module
-// reads the envelope once on the load path, positions what the plan returns, and writes nothing.
-import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, BEAT_MARKERS_HELP, BEAT_MARKERS_LABEL, beatMarkerPlan, songEnvelopeIdentity } from "./api.js";
+// reads the measurement once on the load path -- in the same reply that carries the drag's own
+// targets -- positions what the plan returns, and writes nothing.
+import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, BEAT_MARKERS_HELP, BEAT_MARKERS_LABEL, beatMarkerPlan } from "./api.js";
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
@@ -128,8 +129,12 @@ let beatMarkersOn = true;
 // drag and these four are the only things the band's markup depends on, so this is what keeps a
 // few thousand reference marks off the drag path. Not a cache of the *plan* -- the plan is pure
 // and cheap to ask for; this is a record of what is already on screen.
+//
+// The identity held is the **reply**, not the measurement inside it, because the reply is what a
+// read replaces: one loader now fills one slot, so a new object here means a new answer and there
+// is no second read that could hand this the same envelope under a different report.
 let beatBandKey = "";
-let beatBandEnvelope = null;
+let beatBandMeasurement = null;
 // Replace With / Cancel, offered only after a delete was refused. Module state for `snapReport`'s
 // reason exactly -- derived, never saved, never sent back. `replaceForAssetId` is which asset the
 // refusal was about, so the affordance cannot leak onto a different card when the selection moves;
@@ -389,7 +394,7 @@ async function loadProject(id) {
     state.audioBuffer = null;
     // Beside `audioBuffer` and for its reason: with no project on screen there is no song, and a
     // band still drawing the last one's beats would be marks over nothing.
-    forgetSongEnvelope();
+    forgetSongMeasurement();
     clearUndoHistory();
     renderAll();
     return;
@@ -401,7 +406,7 @@ async function loadProject(id) {
   // A measurement describes one project's song, so it is dropped on a real project change and
   // kept across a refresh of the project already on screen -- which is what loadProject mostly
   // is, after every queue action. Clearing it on every call would blank the band on each refresh.
-  if (previousProject !== id) forgetSongEnvelope();
+  if (previousProject !== id) forgetSongMeasurement();
   state.selectedAssetId = null;
   // A reload of the SAME project keeps the working shot: loadProject runs after every
   // queue action and refresh, and being thrown back to shot 1 from shot 23 each time was
@@ -420,10 +425,10 @@ async function loadProject(id) {
   clearUndoHistory();
   renderAll();
   loadPersistedWaveform(id);
-  loadSongEnvelope(id);
-  // Beside it and on the same load path, never on the poll: the seconds a dragged shot edge may
-  // land on. A second request rather than a field on the envelope -- see `loadSnapTargets`.
-  loadSnapTargets(id);
+  // One read for the whole measurement: the marks the waveform draws and the seconds a dragged
+  // shot edge may land on, from one computation on the server. On the load path, never on the
+  // poll -- see `loadSongMeasurement`.
+  loadSongMeasurement(id);
   loadReadiness(id);
   // Refreshed here rather than in each submission handler, because every path that queues a
   // render reloads the project immediately afterwards -- the queue-ready loop, both generate
@@ -461,7 +466,7 @@ async function loadReadiness(projectId) {
 
 // **Every repaint of the whole workspace re-says the "Snap to" rows.**
 //
-// Review finding 1 and 2: the sync was attached to `loadSnapTargets` -- to the *loader* -- and the
+// Review finding 1 and 2: the sync was attached to the *loader*, and the
 // panel's sentences depend on the project and the song as much as on the report. So removing a song
 // left the rows describing the song that had gone, with a live Analyze button that could only be
 // refused; and a project switch whose targets read was refused left the previous project's
@@ -750,92 +755,92 @@ async function loadPersistedWaveform(projectId) {
   }
 }
 
-// One envelope read per *measurement* -- project, song file and the fingerprint the measurement
-// was taken from, which is `songEnvelopeIdentity`. **Never behind a timer.** The endpoint hashes
-// the song's bytes to decide validity, so a poll would be a SHA-256 of the master every few
-// seconds to answer a question whose answer only changes when the song does. The render poll may
-// *notice* that a song landed -- that is `changed.song`, an in-memory comparison the tick already
-// makes -- and this key then decides whether anything is asked for at all, which is the same shape
-// Story 8.1 gave the same problem on the server.
+// One read per *measurement*, and it carries both halves: the marks the waveform draws and the
+// seconds a dragged shot edge may land on. `GET /timeline/snap-targets` serves them from one
+// computation, so they cannot describe different states.
 //
-// Absence is silence, in every one of its forms. A project with no song, a song replaced since it
-// was measured, a machine without ffmpeg, a sidecar someone deleted: all of them answer 200 with
-// `present: false`, and all of them leave the band empty and the timeline exactly as it draws
-// today. Nothing here reads `reason`, raises, or says anything.
+// **This was two loaders and that was the defect.** `loadSongEnvelope` read `GET /song/envelope`
+// for the band and `loadSnapTargets` read this route for the drag, each with its own key, its own
+// revision guard and its own silent `catch`. Three consequences, all executed in
+// `epic-8-retro-2026-08-24.md`:
 //
-// A failed *request* is different from a reported absence and is treated as one: the key is
-// claimed only after a reply has been painted, so the last known measurement stays on screen and
-// the next load tries again rather than the timeline losing its marks to one unreachable moment.
-let songEnvelopeKey = "";
-// `snapTargetsLoadRevision`'s twin, on the same hazard: two envelope reads open at once, and the
-// slower answer painting its band over the faster one's.
-let songEnvelopeLoadRevision = 0;
+// * a measurement replaced under an unchanged manifest record moved **neither** key, so the band
+//   kept its marks and the old beats stayed snappable until a full page reload (S4);
+// * one read refused while the other landed left the Director looking at no marks while their cut
+//   still jumped to a beat, with nothing said either way (S5);
+// * and one project load hashed the master twice and parsed the same 469 KB sidecar twice, to use
+//   8.8 KB of it (S3).
+//
+// One read closes all three by construction rather than by agreement, which is why this is a merge
+// and not three fixes.
+//
+// **Keyed on `snapTargetsIdentity`** -- the song file, the analysis fingerprint, and the word and
+// span counts and duration the gap half depends on. It is `songEnvelopeIdentity` with three fields
+// appended, so keying the merged read on it loses nothing and costs a re-read on a first
+// transcription, which is exactly when the gap half appears.
+//
+// **Never behind a timer.** The route hashes the song's bytes to decide whether the measurement
+// still describes them, so a poll would be a SHA-256 of the master every few seconds to answer a
+// question whose answer only changes when the song does. The render poll may *notice* that a song
+// landed -- `changed.song`, an in-memory comparison the tick already makes -- and this key then
+// decides whether anything is asked for at all.
+//
+// **Absence is silence, in every one of its forms**, and both halves report it together: a project
+// with no song, a song replaced since it was measured, a machine without ffmpeg, a sidecar someone
+// deleted, a song nobody transcribed. All of them answer 200 with the halves that exist, the band
+// draws nothing, the drag keeps whatever targets it was given, and nothing is said. The "Snap to"
+// rows are the one place a missing measurement is named, because that is where a Director is
+// asking what a drag will do.
+//
+// **A failed *request* is different from a reported absence and is treated as one.** The key is
+// claimed only after a reply has been painted, so a refusal leaves the last known measurement --
+// *both* halves of it, together -- exactly where it was, and the next load asks again rather than
+// the timeline losing its marks and its magnet to one unreachable moment.
+let songMeasurementKey = "";
+// Which read is the current one. Two can be open at once -- a project load and the poll noticing a
+// generated song land in the same second -- and without this the slower answer repaints over the
+// faster one, putting a stale measurement under the band, the rows and the drag.
+// `readinessLoadRevision` and `waveformLoadRevision` are the same guard on the same hazard.
+let songMeasurementLoadRevision = 0;
 
-// Everything this browser remembers about *which* song is current, forgotten: the measurement,
-// the key it was read under, the record of what is currently painted, and the seconds a dragged
-// edge may land on.
+// Everything this browser remembers about *which* song is current, forgotten: the measurement
+// itself -- both halves, in one slot -- the key it was read under, and the record of what is
+// currently painted.
 //
-// Called by every transition that changes which song is current, because `loadSongEnvelope` alone
-// is not enough for those: it clears nothing until a reply lands, which is right for a refresh and
-// wrong for a replacement. Between an import landing and its envelope arriving, the band would
-// otherwise draw the *previous* song's beats over the new master -- the one state
-// `BEAT_MARKERS_HELP` tells the Director is impossible.
+// Called by every transition that changes which song is current, because `loadSongMeasurement`
+// alone is not enough for those: it clears nothing until a reply lands, which is right for a
+// refresh and wrong for a replacement. Between an import landing and its measurement arriving, the
+// band would otherwise draw the *previous* song's beats over the new master -- the one state
+// `BEAT_MARKERS_HELP` tells the Director is impossible -- and the drag would pull a cut onto a
+// rest measured in a track that is gone.
 //
-// `beatBandEnvelope` is dropped here too, and not only for correctness: it holds a direct
-// reference to a measurement that is over a megabyte of arrays, and leaving it set after a project
-// switch pins that in memory on a machine whose memory belongs to ComfyUI.
-function forgetSongEnvelope() {
-  state.songEnvelope = null;
-  songEnvelopeKey = "";
+// `beatBandMeasurement` is dropped here too, and not only for correctness: it holds a direct
+// reference to the reply, and leaving it set after a project switch pins that in memory on a
+// machine whose memory belongs to ComfyUI.
+function forgetSongMeasurement() {
+  state.songMeasurement = null;
+  songMeasurementKey = "";
   beatBandKey = "";
-  beatBandEnvelope = null;
-  // The drag's targets belong to the same song and are dropped in the same breath. Half of them
-  // -- the voiceless gaps -- are not derived from the envelope at all, so they would survive a
-  // song replacement on their own and pull a cut onto a rest measured in a track that is gone.
-  state.snapTargets = null;
-  snapTargetsKey = "";
+  beatBandMeasurement = null;
 }
 
-// One targets read per *measurement*: the song file, the analysis fingerprint and the word and
-// span counts, which is `snapTargetsIdentity`. **Never behind a timer**, for `loadSongEnvelope`'s
-// reason exactly -- the route reaches the beats through `song_envelope_report`, which hashes the
-// master to decide whether the analysis is current.
-//
-// It is a second request rather than a field on the envelope read because the two answer different
-// questions from different halves of the project: the envelope is a measurement of the audio, and
-// half of these targets come from a *transcription* that has no envelope in it. Folding them
-// together would make a song nobody analysed lose the gap snapping the batch button already gives
-// it, which is the one thing the frozen matrix says must keep working.
-//
-// Absence in every form is silence: no song, no analysis, no transcription, a route that is not
-// there. Each leaves the drag exactly as it was before this story -- the playhead and nothing
-// else -- and none of them says anything. A failed *request* is different from a reported absence
-// and is treated as one: the last known targets stay, and the key is left unclaimed so the next
-// load asks again rather than the magnet being lost to one unreachable moment.
-let snapTargetsKey = "";
-// Which targets read is the current one. Two reads can be open at once -- a project load and the
-// poll noticing a generated song land in the same second -- and without this the slower answer
-// repaints over the faster one, putting a stale report under the rows and the drag. `readinessLoadRevision`
-// and `waveformLoadRevision` are the same guard on the same hazard; this feature had none.
-let snapTargetsLoadRevision = 0;
-
-// Exported for the executed frontend contract, `loadSongEnvelope`'s reason exactly: what has to be
-// provable is that a reply reaches the drag -- that a load fills the slot, that an absent half
-// leaves the other working, and that a refused read changes nothing -- and none of that is visible
-// to a source read of a function nothing in the suite can call.
-export async function loadSnapTargets(projectId) {
+// Exported for the executed frontend contract: what has to be provable is that a reply reaches
+// both the band and the drag -- that a load fills the slot, that marks appear with nothing
+// touched, that an absent half leaves the other working, and that a refused read changes neither
+// -- and none of that is visible to a source read of a function nothing in the suite can call.
+export async function loadSongMeasurement(projectId) {
   const key = snapTargetsIdentity(projectId, state.project?.song);
   // **Synced before the early return, not after it.** The rows say what the *project and its song*
   // are worth as well as what the report says, and this return is taken whenever neither the song
   // nor its measurement has moved -- which includes a project switch back to one already read.
   syncSnapTargetsControl();
-  if (key === snapTargetsKey) return;
-  const revision = (snapTargetsLoadRevision += 1);
+  if (key === songMeasurementKey) return;
+  const revision = (songMeasurementLoadRevision += 1);
   if (!state.project?.song?.path) {
     // No audio, so nothing measured either way. Anything still held belongs to a song that is not
-    // here any more, and a magnet pulling towards it is the one thing this must not do.
-    state.snapTargets = null;
-    snapTargetsKey = key;
+    // here any more: marks over a track that is gone, and a magnet pulling towards it.
+    if (state.songMeasurement) { state.songMeasurement = null; renderTimeline(); }
+    songMeasurementKey = key;
     // The rows describe this report, so they are re-said whenever it moves -- absent included.
     syncSnapTargetsControl();
     return;
@@ -844,73 +849,41 @@ export async function loadSnapTargets(projectId) {
   try {
     report = await api.snapTargets(projectId);
   } catch {
-    // Unreachable or refused: dragging behaves exactly as it does today, the last known targets
-    // are kept, nothing is said, and the key is left unclaimed so the next load asks again.
+    // Unreachable or refused: the band keeps its marks, the drag keeps its targets, nothing is
+    // said, and the key is left unclaimed so the next load asks again. **Both halves stay
+    // together**, which is the whole of what one loader buys over two -- there is no longer a
+    // state where one advanced and the other did not, because there is one reply.
     //
-    // **Nothing is re-said here, and review finding 2 is why that is now correct.** Keeping the
-    // last known *targets* is right -- one unreachable moment must not cost the Director their
-    // magnet. Keeping the last known *sentences* was not: they described whichever project was on
-    // screen when the last read landed, so a switch into a project whose read is refused left the
-    // panel claiming things about a song that was not open. The fix is above and in `renderAll`,
-    // not here: the rows are re-said at the *top* of this function, before the request is even
-    // made, and nothing this browser knows has changed between there and here. A second call in
-    // this branch reads like the guarantee and is one no test can fail -- which is the same
-    // decoration this whole change exists to take out of the panel.
+    // **Nothing is re-said here.** Keeping the last known *sentences* was a defect of its own:
+    // they described whichever project was on screen when the last read landed, so a switch into
+    // a project whose read is refused left the panel claiming things about a song that was not
+    // open. The fix is at the *top* of this function and in `renderAll`, not here, and nothing
+    // this browser knows has changed between there and here.
     return;
   }
-  // The project moved on while the request was open, or a later read overtook this one; either
-  // way this answer describes a measurement nobody is looking at and the read that replaced it
-  // owns the magnet now.
-  if (state.project?.id !== projectId || revision !== snapTargetsLoadRevision) return;
-  state.snapTargets = report || null;
-  snapTargetsKey = key;
-  // **The selector is repainted, and nothing else is.** Targets are still not *drawn* -- they
-  // change where the next drag lands and nothing on the timeline -- but the "Snap to" rows now say
-  // what each kind is currently worth, and that answer is this report. Without this line the rows
-  // would carry whatever they said when the control was last synced, which on a first load is
-  // "nothing has been read" and stays that way until the Director happens to tick something.
-  //
-  // Here rather than at each of the five call sites: every path that re-reads the targets -- a
-  // project load, a song import, a first transcription, the poll noticing a generated song landing,
-  // and the row's own action -- has the same obligation, and one of them forgetting it is exactly
-  // how a feature arrives a reload late.
-  syncSnapTargetsControl();
-}
-
-// Exported for the executed frontend contract, `renderSnapCuts`' and `syncRenderPolling`'s reason
-// exactly: what has to be provable here is that a reply actually reaches the band -- that marks
-// appear on a first load with nothing touched, that a reported absence empties it, and that a
-// refused request changes nothing -- and none of that is visible to a source read of a function
-// nothing in the suite can call.
-export async function loadSongEnvelope(projectId) {
-  const key = songEnvelopeIdentity(projectId, state.project?.song);
-  if (key === songEnvelopeKey) return;
-  const revision = (songEnvelopeLoadRevision += 1);
-  if (!state.project?.song?.path) {
-    // No audio to measure. Anything still on screen belongs to a song that is not here any more.
-    if (state.songEnvelope) { state.songEnvelope = null; renderTimeline(); }
-    songEnvelopeKey = key;
-    return;
-  }
-  let report = null;
-  try {
-    report = await api.songEnvelope(projectId);
-  } catch {
-    // Unreachable or refused: the last known measurement is kept, nothing is said, and the key is
-    // left unclaimed so the next load asks again. There is no error state for a reference mark.
-    return;
-  }
-  // The project moved on while the request was open, or a later read overtook this one; either
-  // way this answer describes a song nobody is looking at and the read that replaced it owns the
-  // band now.
-  if (state.project?.id !== projectId || revision !== songEnvelopeLoadRevision) return;
-  state.songEnvelope = report?.present === true ? report.envelope || null : null;
-  // **Outside the `try`, deliberately.** A throw from the paint is not an absent envelope, and
+  // The project moved on while the request was open, or a later read overtook this one; either way
+  // this answer describes a measurement nobody is looking at, and the read that replaced it owns
+  // the band and the magnet now.
+  if (state.project?.id !== projectId || revision !== songMeasurementLoadRevision) return;
+  state.songMeasurement = report || null;
+  // **Outside the `try`, deliberately.** A throw from the paint is not an absent measurement, and
   // catching it in that silent `catch` would abort the whole timeline render without a word. And
   // the key is claimed only *after* the paint, so a render that failed is asked for again on the
-  // next load rather than remembered as done.
+  // next load rather than being remembered as done.
   renderTimeline();
-  songEnvelopeKey = key;
+  songMeasurementKey = key;
+  // **The selector is repainted**, after the key is claimed for the reason above. Targets are not
+  // *drawn* -- they change where the next drag lands and nothing on the timeline -- but the
+  // "Snap to" rows now say what each kind is currently worth, and that answer is this report.
+  // Without this line the rows would carry whatever they said when the control was last synced,
+  // which on a first load is "nothing has been read" and stays that way until the Director happens
+  // to tick something.
+  //
+  // Here rather than at each of the call sites: every path that re-reads -- a project load, a song
+  // import, a first transcription, the poll noticing a generated song landing, and the row's own
+  // action -- has the same obligation, and one of them forgetting it is exactly how a feature
+  // arrives a reload late.
+  syncSnapTargetsControl();
 }
 
 async function toggleMasterAudio() {
@@ -1799,11 +1772,15 @@ function renderTimeline() {
     // drawn past the end of the audio whenever a shot runs off the end of the track.
     const songSeconds = state.project?.song?.duration || 0;
     const key = `${beatMarkersOn}:${state.pixelsPerSecond}:${trackWidth}:${songSeconds}`;
-    if (key !== beatBandKey || state.songEnvelope !== beatBandEnvelope) {
+    if (key !== beatBandKey || state.songMeasurement !== beatBandMeasurement) {
       beatBandKey = key;
-      beatBandEnvelope = state.songEnvelope;
+      beatBandMeasurement = state.songMeasurement;
+      // The whole reply goes in and `beatMarkerPlan` takes the measurement out of it. Reaching in
+      // here for `.envelope` would put the unwrap in two places, and the shape it has to be told
+      // apart from is the reply's *own* `beats` -- the drag's window-filtered targets, which are
+      // not the beats this band draws.
       const plan = beatMarkerPlan({
-        envelope: state.songEnvelope,
+        envelope: state.songMeasurement,
         pixelsPerSecond: state.pixelsPerSecond,
         trackWidth,
         duration: songSeconds,
@@ -2280,7 +2257,7 @@ function bindClip(clip) {
     // local-spacing cap every other target takes and crowds the beats around it as they crowd it.
     const snapKinds = mode === "move" ? new Set() : snapTargetKinds;
     const resolveSnapPlan = () => dragSnapPlan({
-      targets: state.snapTargets,
+      targets: state.songMeasurement,
       playhead: state.playhead,
       pixelsPerSecond: state.pixelsPerSecond,
       enabledKinds: snapKinds,
@@ -3194,12 +3171,11 @@ export async function pollRenderStatus() {
     // A generated song's audio lands here and nowhere else: `apply_job_history` fills `Song.path`
     // when the music render settles, and 8.1's route measures it at that moment. `changed.song` is
     // an in-memory comparison this tick already made, so the poll *notices* rather than asks -- and
-    // `loadSongEnvelope`'s key decides whether anything is fetched at all, which on a tick where
-    // the song did not really move is nothing. This is not a poll of the envelope endpoint.
+    // `loadSongMeasurement`'s key decides whether anything is fetched at all, which on a tick
+    // where the song did not really move is nothing. This is not a poll of the measurement.
     if (changed.song) {
       renderSong();
-      loadSongEnvelope(state.project.id);
-      loadSnapTargets(state.project.id);
+      loadSongMeasurement(state.project.id);
     }
     if (changed.shots || progressMoved || phasesMoved) renderTimeline();
     // `renderJobs` re-runs `syncRenderPolling`, which is how the loop stops itself on the tick
@@ -3772,7 +3748,7 @@ function syncSnapTargetsControl() {
   const plan = snapSelectorPlan(snapTargetKinds, {
     project: state.project || null,
     song: state.project?.song || null,
-    targets: state.snapTargets,
+    targets: state.songMeasurement,
     analysing: Boolean(state.project?.id) && snapAnalysisProjects.has(state.project.id),
   });
   summary.classList.toggle("snap-on", plan.any);
@@ -3877,20 +3853,20 @@ function syncSnapTargetsControl() {
 //
 // **Trap one: a content-derived fingerprint makes a forced re-measurement invisible.**
 // `song_fingerprint` is computed from the song's bytes (`effects.py`), so re-measuring the *same
-// file* answers the *same* fingerprint. Both `songEnvelopeIdentity` and `snapTargetsIdentity` are
-// built on it, and both loaders return early when the key they compute matches the one they last
-// claimed -- so the whole point of this route, which is `force=True`, would be a silent no-op
+// file* answers the *same* fingerprint. `snapTargetsIdentity` is built on it, and the loader
+// returns early when the key it computes matches the one it last claimed -- so the whole point of
+// this route, which is `force=True`, would be a silent no-op
 // through the browser: a Director whose sidecar had been deleted would press this, the server
 // would genuinely re-measure, and the row would go on saying the song had never been analysed.
-// `forgetSongEnvelope` is the existing remedy and it is why it is called here on a path that has
+// `forgetSongMeasurement` is the existing remedy and it is why it is called here on a path that has
 // not changed songs at all.
 //
-// **Trap two: the order of the two lines above it.** Both loaders compute their key from
-// `state.project?.song`, so the returned Project is adopted *before* they are called. Adopt after,
-// and the key is computed from the song as it was, matches what was stored, and both no-op --
+// **Trap two: the order of the two lines above it.** The loader computes its key from
+// `state.project?.song`, so the returned Project is adopted *before* it is called. Adopt after,
+// and the key is computed from the song as it was, matches what was stored, and it no-ops --
 // which is the same defect as trap one arriving by a different road.
 //
-// **The running window is the whole window, not just the request.** `forgetSongEnvelope` nulls the
+// **The running window is the whole window, not just the request.** `forgetSongMeasurement` nulls the
 // measurement and the targets, so between the reply landing and the two reads answering there is
 // genuinely nothing to say; holding the flag across both keeps the row reading `Analyzing song…`
 // for that gap instead of flickering back to "this song has not been analysed" a moment after the
@@ -3928,17 +3904,18 @@ async function runSongAnalysis() {
     // nobody is looking at, and adopting it would put one project's measurement on another.
     if (state.project?.id !== projectId) return;
     state.project = project;
-    forgetSongEnvelope();
+    forgetSongMeasurement();
     renderAll();
-    await Promise.all([loadSongEnvelope(projectId), loadSnapTargets(projectId)]);
+    await loadSongMeasurement(projectId);
     if (state.project?.id !== projectId) return;
     // **The count only when there is one.** The read that supplies it can itself be refused, and a
     // measurement that succeeded followed by "0 beats to snap to" is this application reporting a
     // number it does not have -- the honest-status convention, applied to the one sentence a
     // Director would take at face value. The rows say the same thing: with no report read back,
     // the Beats row states its prerequisite rather than claiming the measurement is on screen.
-    const beats = state.snapTargets?.analysed === true && Array.isArray(state.snapTargets?.beats)
-      ? state.snapTargets.beats.length
+    const beats = state.songMeasurement?.analysed === true
+      && Array.isArray(state.songMeasurement?.beats)
+      ? state.songMeasurement.beats.length
       : null;
     toast(beats === null
       ? SNAP_ANALYZE_DONE_UNCOUNTED
@@ -4430,11 +4407,10 @@ function bindEvents() {
       // project, so without this the band draws the old song's beats over the new track for as
       // long as the envelope request takes -- the one thing `BEAT_MARKERS_HELP` promises cannot
       // happen. The reload that follows is what puts the new measurement on screen.
-      forgetSongEnvelope();
+      forgetSongMeasurement();
       $("#import-lyrics").value = ""; $("#import-style").value = "";
       renderAll();
-      loadSongEnvelope(state.project.id);
-      loadSnapTargets(state.project.id);
+      loadSongMeasurement(state.project.id);
       toast("Song imported");
     }
     catch (error) { await recoverFromSongRefusal(error); }
@@ -4484,7 +4460,12 @@ function bindEvents() {
       // is a no-op on a re-run and the whole set on the first one. Without it the gap half of the
       // magnet would not appear until the next project load -- the feature silently late by one
       // reload on the one gesture that just earned it.
-      loadSnapTargets(projectId);
+      //
+      // **The read is the whole measurement now, and that is still right here.** The drawing half
+      // has not moved -- a transcription writes no envelope -- so the band repaints the marks it
+      // already had, from the same object, and nothing on it flickers. What must not happen is the
+      // gap half arriving alone through a second path: there is one read, so it cannot.
+      loadSongMeasurement(projectId);
       toast(`Sections filled from the track: ${project.sections.map((s) => s.label).join(" · ")}`);
     } catch (error) { toast(error.message, "error"); }
     finally {
@@ -4505,7 +4486,7 @@ function bindEvents() {
       state.audioBuffer = null;
       // Beside it, and for exactly the reason the line above exists: a removed song's marks must
       // not reappear and be read as current any more than its waveform may.
-      forgetSongEnvelope();
+      forgetSongMeasurement();
       // The song those two editors described is gone, so what is in them describes nothing; left
       // dirty they would sit there disabled, showing context for a song this project no longer has.
       state.songContextDirty = false;
