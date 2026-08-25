@@ -50,6 +50,7 @@ from music_video_producer.effects import (
     FAMILY_TEXTURE,
     PRE_PAD_FAMILIES,
     PRE_SCALE_FAMILIES,
+    PREVIEW_FINGERPRINT_INPUTS,
     ChoiceParameter,
     EffectRefusal,
     EffectStages,
@@ -63,6 +64,7 @@ from music_video_producer.effects import (
     lut_directory,
     lut_file_argument,
     lut_id_for_name,
+    preview_fingerprint,
     validate_stack,
     write_default_luts,
 )
@@ -1765,3 +1767,123 @@ def test_the_same_stack_renders_the_same_frames_twice_and_the_grain_seed_is_load
     assert len(grained) == 12 * 320 * 240 * 3 // 2
     assert grained == frames(9)
     assert grained != frames(10)
+
+
+# ------------------------------------------------------------------------------------------
+# The preview fingerprint (AD-23, AD-28).
+#
+# Nothing here asserts the digest against a literal. A hash pinned to a constant would fail on
+# every wording change to the payload and prove nothing about the property that matters, which is
+# that the fingerprint moves when — and only when — the picture would.
+# ------------------------------------------------------------------------------------------
+
+
+def a_fingerprint(**changed):
+    """One preview fingerprint over a fixed baseline, with the named inputs moved."""
+    inputs = {
+        "take": "music-video-producer/project_x/shots/shot_a-h3_00001-audio.mp4",
+        "window_start": 4.0,
+        "window_duration": 4.0,
+        "offset": 0.5,
+        "stack": [{"effect": "grain", "enabled": True, "parameters": {"strength": 30.0}}],
+        "bindings": (),
+        "song_fingerprint": "4096-abcdef",
+        "transition": None,
+        "width": 528,
+        "height": 304,
+    }
+    inputs.update(changed)
+    return preview_fingerprint(**inputs)
+
+
+def test_the_preview_fingerprint_names_its_eight_inputs_in_the_documented_order():
+    """AD-28 fixes the list and the order. The names are the contract a later epic fills in."""
+    assert PREVIEW_FINGERPRINT_INPUTS == (
+        "take",
+        "window",
+        "offset",
+        "stack",
+        "bindings",
+        "song",
+        "transition",
+        "geometry",
+    )
+
+
+def test_every_one_of_the_eight_inputs_moves_the_fingerprint_on_its_own():
+    """Each input moved alone produces a different name, so the cached clip it named is no
+    longer the one that answers. This is the whole of staleness: no flag, a name that either
+    matches or does not."""
+    baseline = a_fingerprint()
+    assert a_fingerprint() == baseline
+    moved = {
+        "take": {"take": "shots/shot_a-h3_00002-audio.mp4"},
+        "window start": {"window_start": 4.5},
+        "window duration": {"window_duration": 3.5},
+        "offset": {"offset": 0.75},
+        "stack": {
+            "stack": [{"effect": "grain", "enabled": True, "parameters": {"strength": 31.0}}]
+        },
+        "bindings": {"bindings": [{"parameter": "grain.strength", "band": 2}]},
+        "song fingerprint": {"song_fingerprint": "4096-fedcba"},
+        "transition": {"transition": {"kind": "fade", "seconds": 0.5}},
+        "preview width": {"width": 640},
+        "preview height": {"height": 360},
+    }
+    seen = {baseline: "baseline"}
+    for name, change in moved.items():
+        digest = a_fingerprint(**change)
+        assert digest not in seen, f"{name} collided with {seen.get(digest)}"
+        seen[digest] = name
+
+
+def test_the_bindings_and_transition_slots_are_hashed_before_anything_fills_them():
+    """Epic 10 and Epic 11 fill two of the eight. They are hashed **now**, empty, so that
+    filling them later moves the fingerprint of the Shots that acquire one rather than every
+    Shot in every project at once — which is what leaving them out would cost on the day those
+    epics merge. Their emptiness participates: an explicit empty is the default's answer, and a
+    value is a different one."""
+    assert a_fingerprint(bindings=(), transition=None) == a_fingerprint()
+    assert a_fingerprint(bindings=[]) == a_fingerprint()
+    assert a_fingerprint(bindings=[{"parameter": "grain.strength"}]) != a_fingerprint()
+    assert a_fingerprint(transition={}) != a_fingerprint()
+
+
+def test_two_states_that_compose_to_one_chain_fingerprint_alike():
+    """`1` and `1.0` are one filter string, so they must be one look — a fingerprint that told
+    them apart would re-render a preview that cannot possibly differ. Key order is not a
+    contract either. `True` is **not** `1`, because `bool` is an `int` in Python and a flag
+    where a number belongs is a different stack."""
+    integral = a_fingerprint(
+        stack=[{"effect": "contrast", "enabled": True, "parameters": {"amount": 1}}]
+    )
+    fractional = a_fingerprint(
+        stack=[{"effect": "contrast", "enabled": True, "parameters": {"amount": 1.0}}]
+    )
+    reordered = a_fingerprint(
+        stack=[{"parameters": {"amount": 1.0}, "enabled": True, "effect": "contrast"}]
+    )
+    flagged = a_fingerprint(
+        stack=[{"effect": "contrast", "enabled": True, "parameters": {"amount": True}}]
+    )
+    assert integral == fractional == reordered
+    assert flagged != integral
+    # And a difference a filter string cannot express is not a difference: `_number` formats to
+    # six decimals, which is the resolution the chain itself has.
+    assert a_fingerprint(offset=0.5) == a_fingerprint(offset=0.50000001)
+    assert a_fingerprint(offset=0.5) != a_fingerprint(offset=0.5001)
+
+
+def test_a_stack_the_validator_would_refuse_still_gets_a_name():
+    """The fingerprint is taken before anything decides the stack composes, so a hand-edited
+    manifest holding nested lists, `None`s or mixed key types is named rather than raising. The
+    refusal that follows is a sentence; it must not be a `TypeError` from the hasher."""
+    ugly = [
+        {"effect": "grain", "parameters": {"strength": [1, 2, {"deep": None}]}},
+        {"effect": "nonexistent", "parameters": {1: "one", "b": 2}},
+        {},
+    ]
+    named = a_fingerprint(stack=ugly)
+    assert len(named) == 64
+    assert named == a_fingerprint(stack=ugly)
+    assert named != a_fingerprint()

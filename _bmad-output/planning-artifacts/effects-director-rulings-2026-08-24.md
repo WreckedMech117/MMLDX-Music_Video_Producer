@@ -260,6 +260,52 @@ reading, and the next person to weaken the guard will believe they are weakening
 *Rejected:* a client-side follow-up write after each split, which is not atomic — the split would
 land and its look could fail separately, leaving exactly the ungraded half this fixes.
 
+## R-22 — Supersede means stale, so an identical preview request joins rather than restarts
+
+Slice D1's frozen matrix said *"Request while one is in flight → the in-flight one is cancelled"*,
+without qualifying which requests. Implemented literally, a request whose fingerprint **matches**
+the render already in flight also cancels it and starts an identical one. The implementer flagged
+it rather than quietly carving out an exception, which was right — it was frozen intent.
+
+It is wrong, and the matrix row is the thing at fault. AD-24 exists so that a Director dragging a
+slider is not shown five outdated pictures in sequence: it discards **stale** work. A request for
+the fingerprint already rendering is not stale work — it is asking for exactly what is underway.
+Restarting throws away completed effort to produce a byte-identical answer, and it pushes onto the
+client a guarantee no client can honestly make, since a retry, a poll, or a re-render on window
+focus each produce a duplicate request. Under identical requests arriving faster than a render
+completes — measured at ~116 ms — nothing would land at all.
+
+**The ruling:** supersede applies when the arriving fingerprint **differs**. An identical request
+joins the render in flight and receives its result. A differing request cancels as before, and the
+publish gate is untouched: a superseded render still can never land its output and be served as
+current, which is the property that actually matters and which the fingerprint comparison must not
+weaken.
+
+*Rejected:* requiring the client to fire exactly once per change. That is the same class of demand
+as "do not double-submit a form" — true of a careful client on a good day, and false of every real
+one.
+
+## R-23 — A preview shows the Shot's own window, not the fragment the export ships
+
+Story 9.2 says the Preview Clip *"covers the Shot's exposed window, not the whole over-rendered
+take"*. Under an overlap that is ambiguous, because `assembly_plan` subtracts a later Shot's window
+from an earlier one — so a half-covered Shot ships only its uncovered fragment, and "exposed" could
+mean either the Shot's window or that fragment.
+
+**The ruling: the Shot's own window.** The contrast the sentence draws is window against *take* —
+the failure it names is previewing over-rendered footage that will never ship — and the shipped
+fragment reading would show a Director a clip that begins mid-look, which is the harder thing to
+judge a grade against. Grading is looking, not shipping.
+
+Two consequences follow and are accepted. A preview can show frames the export will not include,
+where a later Shot covers them. And the preview deliberately does **not** honour the export's own
+staleness refusal: a Shot whose window moved since approval refuses at export and previews fine, at
+its current window, because the point of looking is to decide what to ship rather than to be told
+you cannot yet.
+
+This wants revisiting when Epic 11 gives an overlap a transition, since a transition is precisely a
+thing that happens in the covered region.
+
 ---
 
 ## Process rulings

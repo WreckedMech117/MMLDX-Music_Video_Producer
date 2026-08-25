@@ -400,6 +400,23 @@ MASTER_PRESET = ExportPreset(
     audio_filters=(MASTER_SAMPLE_RATE,),
 )
 
+#: The Monitor's Preview Clip (AD-23), and **deliberately not a member of `EXPORT_PRESETS`
+#: below**: it is not a delivery build and must never be selectable at the assemble route. It
+#: lives here rather than in `app.py` because everything else that decides an encode lives here,
+#: and a second place that names an x264 preset is how `draft` and `master` would drift apart.
+#:
+#: `ultrafast` / CRF 28, and not a hardware encoder. Measured 2026-08-21: half-dimension preview
+#: clips cost 270 ms through libx264 and 403–527 ms through NVENC, because encoder initialisation
+#: dominates a sub-second job. The picture quality this trades away is the point — a preview is
+#: judged for its *grade*, and it is re-rendered on every change, so it buys the budget FX-NFR-6
+#: sets rather than spending it.
+#:
+#: Nothing else about the preview's argv differs from the export's: `trim_args` builds both, from
+#: the same stages `effects.build_effect_stages` composes. Reduced in geometry and in these two
+#: literals, identical in every other respect — which is the only reason a preview predicts
+#: anything about the file the export will write.
+PREVIEW_PRESET = ExportPreset(name="preview", x264_preset="ultrafast", crf="28")
+
 #: Name → preset. The route's `Literal` is asserted against these keys, so a preset added
 #: here and not offered on the wire fails loudly rather than becoming unreachable.
 EXPORT_PRESETS: dict[str, ExportPreset] = {

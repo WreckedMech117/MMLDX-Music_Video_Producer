@@ -10,10 +10,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Container, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -28,11 +30,13 @@ from .assembly import (
     ASSEMBLY_FPS,
     DEFAULT_EXPORT_PRESET,
     EXPORT_PRESETS,
+    PREVIEW_PRESET,
     AudioOverlay,
     ClipWindow,
     ExportProgress,
     assembly_plan,
     assembly_refusals,
+    clip_frames_on_grid,
     concat_args,
     concat_manifest,
     parse_progress_us,
@@ -93,6 +97,7 @@ from .effects import (
     build_effect_stages,
     discover_luts,
     fingerprint_size,
+    preview_fingerprint,
     song_fingerprint,
     song_fingerprints_match,
     validate_stack,
@@ -6935,6 +6940,197 @@ class ShotEffectsResponse(BaseModel):
     effects: list[EffectSpec] = Field(default_factory=list)
 
 
+def wake_joiner(future: asyncio.Future[None]) -> None:
+    """Release one waiting preview request. Runs on that request's own event loop.
+
+    A future that is already done is the ordinary case of a client that hung up while its render
+    was running, not an error: the request it belonged to is gone and there is nobody to wake.
+    """
+    if not future.done():
+        future.set_result(None)
+
+
+@dataclass(slots=True)
+class PreviewRender:
+    """The one in-flight preview render for a project, and the guarantees AD-24 needs.
+
+    **Cancellation is a kill, and it is not the guarantee.** Killing the ffmpeg is how a
+    superseded render stops costing CPU, and it is genuinely all it is for. It cannot be the
+    thing that keeps a stale picture off the Monitor, because there is always a moment when the
+    process has already exited successfully and the answer has not been returned yet — and
+    because a supersede can arrive in the window between this record being registered and the
+    subprocess existing at all, when there is nothing to kill.
+
+    **`superseded` is the guarantee.** The render writes to a scratch file named by `token` and
+    the caller publishes it — one atomic rename onto the fingerprint's name — only after reading
+    this flag. A render that was superseded at any point, at any stage, deletes its scratch file
+    instead. So a cancelled render cannot land its output and be served as current, whether it
+    was killed, whether the kill arrived too late, and whether it was ever spawned: the file only
+    ever reaches the cache through a gate that is closed the moment a newer request appears.
+
+    Both directions are covered by `attach`, which is what closes the ordering hole: a supersede
+    that arrives before the process exists sets the flag, and the process kills itself as soon as
+    it is handed over.
+
+    **`join` and `finish` are the pair R-22 needs.** Supersede discards *stale* work; a request
+    whose fingerprint equals this one's is not stale work, it is this exact render asked for a
+    second time, so it joins rather than restarting. `join` hands back something to await;
+    `finish` records the outcome and releases everyone waiting. Every terminal path calls
+    `finish` exactly once — published, failed, superseded, or abandoned by an exception — so a
+    joiner is released whatever happens and can never wait on something that will never publish.
+    Waiting is a future, never a poll: nothing here sleeps and retries.
+
+    `published` is the joiner's half of the publish gate. It is set only on the one path that has
+    already read `superseded` as false, in the same run of synchronous code that renames the
+    scratch file into the cache — so a joiner that sees it knows the clip is there, and a joiner
+    on a render that was superseded at any point sees `False` and is refused like the render it
+    joined.
+    """
+
+    #: Names the scratch file this render writes to, so two renders — the superseded one still
+    #: winding down and its replacement — can never write the same bytes.
+    token: str
+    #: What this render is producing, and, since R-22, what an arriving request is compared
+    #: against: a different fingerprint supersedes this render, an equal one joins it. The
+    #: *publish* gate remains `superseded` alone — a fingerprint comparison at publication time
+    #: would be answering a question nobody asked, since by then the only thing that matters is
+    #: whether something newer arrived.
+    fingerprint: str
+    process: Any = None
+    superseded: bool = False
+    #: True once this render has an outcome, whatever the outcome is.
+    finished: bool = False
+    #: One future per waiting request, paired with the event loop that future belongs to.
+    #:
+    #: **Not an `asyncio.Event`**, which would be the obvious primitive and is the wrong one
+    #: here: an Event binds to the first loop that touches it and refuses every other, so a
+    #: render finishing on one loop cannot release a request parked on another — it raises
+    #: inside the render and leaves the waiter hanging for good. Served by uvicorn there is only
+    #: ever one loop and it would work; under `TestClient`, which starts a fresh loop per
+    #: request, it deadlocks. A primitive that is correct only under a topology the tests do not
+    #: reproduce is a primitive whose failure mode is a hang in somebody else's test, so this
+    #: pairs each future with its loop and wakes it through `call_soon_threadsafe`, which is
+    #: correct on one loop and on several. (`dataclasses.field` is imported aliased because
+    #: `field` is a loop variable in six places in this module and the bare name would
+    #: shadow every one of them.)
+    waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = dataclass_field(
+        default_factory=list
+    )
+    #: Guards `waiters` and `finished` as one fact, so a request cannot register into a list
+    #: that `finish` has already emptied and then wait on nobody. Uncontended whenever there is
+    #: one loop, and never held across an await, a subprocess or any I/O.
+    lock: threading.Lock = dataclass_field(default_factory=threading.Lock)
+    #: True only if the scratch file was renamed into the cache under `fingerprint`.
+    published: bool = False
+    #: Why the render failed, as ffmpeg told it — the `detail` a joiner puts in its own refusal,
+    #: rather than a finished sentence, because a joiner names its own Shot and may not be the
+    #: Shot that started the render.
+    error: str | None = None
+    #: How many requests attached to this render instead of starting one of their own. It is
+    #: here for the same reason the registry is on `app.state`: a join is otherwise invisible
+    #: from outside, and a test that has to infer one from timings is a test that can pass by
+    #: luck. It also names, in one number, the work R-22 did not do.
+    joiners: int = 0
+
+    def attach(self, process: Any) -> None:
+        """Take the live subprocess, and kill it immediately if the supersede already came."""
+        self.process = process
+        if self.superseded:
+            self._kill()
+
+    def supersede(self) -> None:
+        """A newer request has arrived. Close the publish gate first, then stop the work."""
+        self.superseded = True
+        self._kill()
+
+    def join(self) -> asyncio.Future[None] | None:
+        """Attach the calling request to this render, and hand back what it must await.
+
+        `None` means the render finished before this request could attach — not a race lost but
+        a question already answered: `published`, `superseded` and `error` are readable right
+        now, and the caller reads them the same way it would after waiting.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        with self.lock:
+            if self.finished:
+                return None
+            self.waiters.append((loop, future))
+            self.joiners += 1
+        return future
+
+    def finish(self, *, published: bool = False, error: str | None = None) -> None:
+        """Record how this render ended and release everyone waiting on it.
+
+        Idempotent, and that is the point rather than a convenience: the render's own `finally`
+        calls it unconditionally so that a handler killed mid-flight still releases its joiners,
+        and it must not overwrite the outcome the body already recorded a line earlier.
+        """
+        with self.lock:
+            if self.finished:
+                return
+            self.finished = True
+            self.published = published
+            self.error = error
+            waiting = list(self.waiters)
+            self.waiters.clear()
+        for loop, future in waiting:
+            try:
+                loop.call_soon_threadsafe(wake_joiner, future)
+            except RuntimeError:
+                # That request's loop has already closed, so the request itself is gone. There
+                # is nobody to wake and nothing to report; the outcome stands recorded either
+                # way, which is what the publish gate reads.
+                continue
+
+    def _kill(self) -> None:
+        process = self.process
+        if process is None or process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            # Already gone. The publish gate is closed either way, which is the part that
+            # matters; a process that ended between the check and the signal is not a failure.
+            pass
+
+
+class ShotPreviewResponse(BaseModel):
+    """One Preview Clip, and every derived number that decided which clip it is.
+
+    `fingerprint` is the whole staleness story travelling on the wire (AD-23). Nothing stores a
+    stale flag; a client holds the fingerprint it is playing, asks again after a change, and
+    compares. A different fingerprint means a different picture, and that is the only comparison
+    there is — which is why there is no `stale` field here and no percentage anywhere.
+
+    `rendered` says whether this answer came out of a render that ran for it — its own, or the
+    identical one it joined under R-22 — rather than out of a clip that was already on disk. It
+    is a fact about what just happened rather than a property of the clip, and it is here because
+    "nothing was re-rendered" is otherwise unobservable from outside — the AC that the cache is
+    served and nothing re-runs has to be checkable by something. A joiner reports `true`: no
+    second ffmpeg ran, but the clip it is being handed was made just now and a client that
+    re-loads on `rendered` must re-load.
+
+    `width`/`height` are the clip's real dimensions: **half the export's**, never half this
+    take's (AD-29). A Shot whose aspect differs from the project's therefore reports the
+    project's shape and carries the letterbox inside it.
+    """
+
+    shot_id: str
+    fingerprint: str
+    #: Media-relative, under the project's media dir — `previews/<fingerprint>.mp4`.
+    preview: str
+    #: The URL the existing project-media route serves it at, Range service included.
+    preview_url: str
+    width: int
+    height: int
+    #: The window's frames on the export's own 24 fps grid — `clip_frames_on_grid`, the same
+    #: arithmetic the export uses, so the preview is exactly as long as the shipped clip.
+    frames: int
+    window_seconds: float
+    rendered: bool
+
+
 class ShotEffectsCopyRequest(BaseModel):
     """Which Shots one stack is copied onto. Named, never inferred.
 
@@ -7287,6 +7483,80 @@ def _names_an_undiscovered_look(refusal: EffectRefusal) -> bool:
 #: and the refusal's own sentence is carried whole rather than paraphrased: those sentences were
 #: written to be read by a Director and are asserted verbatim in slice B's tests.
 ASSEMBLY_EFFECTS_REFUSAL = "{shot}: {detail}"
+
+
+#: Why a Shot cannot be previewed: there is no approved take to run the chain over. A preview is
+#: a picture of a file, and this Shot has not decided which file yet — so the remedy is the
+#: approval, and the sentence says so rather than only reporting the absence.
+#:
+#: `latest_output` is deliberately not accepted in its place. AD-13 keeps the two apart on
+#: purpose, the export reads `approved_output` and nothing else, and a preview of the unapproved
+#: take would be a picture of a frame the export will not produce — which is the one thing a
+#: preview must never be.
+PREVIEW_NO_TAKE_REFUSAL = (
+    "{shot} has no approved take, so there is nothing to preview. Approve a take for this shot "
+    "and its look can be judged against it."
+)
+
+
+#: Why a preview refused although the Shot is approved: the file the approval names is not on
+#: disk, or is not inside ComfyUI's output root. Names the recorded path, because the useful
+#: information is *which* file went missing — the same shape `ASSEMBLY_TAKE_UNREADABLE_REFUSAL`
+#: uses at the export.
+PREVIEW_TAKE_MISSING_REFUSAL = (
+    "{shot}'s approved take is not on disk, so there is nothing to preview: {path}. "
+    "Re-render the shot and approve the new take."
+)
+
+
+#: Why a preview has no geometry to render at. AD-29 makes preview geometry a fact about the
+#: project — the size the export would normalize to — so this is reached when **no** approved
+#: take in the project could be measured at all, which for the previewed Shot means ffprobe
+#: cannot read the very file the render would decode.
+#:
+#: AD-29 offers a fallback to the take's own dimensions "and says so". It is not taken here, and
+#: this is the reason: the previewed Shot's take is itself approved, so whenever it is readable
+#: it is in the plan and the export geometry is derivable. The only way to reach this branch is a
+#: take nothing can measure — and rendering it at a guessed size would fail in ffmpeg a moment
+#: later with a worse sentence. A refusal that names the measurement is the honest form of
+#: "it fell back", so nothing silently chooses a different frame.
+PREVIEW_NO_GEOMETRY_REFUSAL = (
+    "{shot}'s approved take could not be measured, so the size the export would give it is "
+    "unknown and there is nothing to preview at. Check the take plays, then try again."
+)
+
+
+#: Why this preview was thrown away: a newer request for the same project arrived while it was
+#: rendering, and AD-24 says the newer one wins. **The cancelled render is discarded, never
+#: played** — its output file is deleted rather than published, so nothing that arrives late can
+#: be served as current.
+#:
+#: A refusal rather than a 200 carrying the older picture, because the older picture is exactly
+#: what a Director dragging a slider must not be shown. A client that fired the superseded
+#: request has already fired the one that replaced it; there is nothing for it to do about this
+#: answer, and saying so plainly beats returning a clip that is wrong.
+PREVIEW_SUPERSEDED_REFUSAL = (
+    "{shot}'s preview was replaced by a newer one before it finished, so this one was discarded. "
+    "The newer request is the one that answers."
+)
+
+
+#: Why a preview render failed in ffmpeg. 502 like the export's stage failure and for its reason:
+#: a local tool this application drives returned non-zero, which is not something the request
+#: could have avoided. The Effect Stack is untouched — a preview reads the manifest and never
+#: writes it, so there is nothing to roll back.
+PREVIEW_FAILED_ERROR = "{shot}'s preview could not be rendered: {detail}"
+
+
+#: What a joiner is told when the render it attached to ended without recording an outcome at
+#: all — its handler raised something no branch here anticipated, or was cancelled out from under
+#: it. It is a `detail` for `PREVIEW_FAILED_ERROR` rather than a refusal of its own, because from
+#: the joiner's side that is exactly what happened: the render it was waiting on did not produce
+#: a clip. It exists so that the render's `finally` always has something honest to release its
+#: joiners with; a joiner that is never released is the one outcome R-22 cannot have.
+PREVIEW_ABANDONED_DETAIL = "the render ended without producing a clip"
+
+
 
 
 class ShotListRequest(BaseModel):
@@ -8018,6 +8288,28 @@ def create_app(
     # genuinely holds no usable `.cube` — flattening the two would re-read 44 MB on every
     # request against an empty folder. See `discovered_looks`.
     app.state.looks = None
+    # The one in-flight preview render per project (AD-24), by project id. A dict rather than a
+    # queue *is* the rule: a new request finds whatever is here and either cancels it and puts
+    # itself in its place — a different fingerprint — or joins it and puts nothing here at all,
+    # which is R-22. Either way a dragged slider can never accumulate renders. Empty between
+    # renders, and held on `app.state` so a test can watch a render arrive rather than sleeping
+    # for one.
+    #
+    # What is registered here is always live: a record is replaced the same instant it is
+    # superseded, and removed in the same synchronous stretch that finishes it, so a joiner that
+    # finds a matching fingerprint here is never attaching to something already over.
+    app.state.preview_renders = {}
+    # What ffprobe said about one take's geometry, for the life of the process. Keyed by the
+    # file's path, byte length and modification time together, so a re-render under the same
+    # name is measured again rather than remembered.
+    #
+    # It exists because AD-29 makes preview geometry a fact about the *whole project* — the
+    # largest-area approved take — so answering it honestly means measuring every approved take,
+    # and one ffprobe costs ~20 ms on this machine (measured 2026-08-25). A forty-shot project
+    # would spend 800 ms deciding what size to render before rendering anything, against a
+    # one-second budget for the whole answer. This is a memo of a measurement, not a verdict:
+    # nothing derived from it is stored, and losing it costs a re-measure.
+    app.state.take_dimensions = {}
     # And once, here, for every project on disk: the restart that emptied that set is the
     # event that orphaned the jobs, so this is the moment the verdict is honest, rather than
     # whenever the Director next happens to assemble. Synchronous and inside `create_app`
@@ -12068,6 +12360,341 @@ def create_app(
             refused=refused,
         )
 
+    async def take_dimensions(source: Path) -> tuple[int, int] | None:
+        """One take's `(width, height)` by ffprobe, remembered for the life of the process.
+
+        `None` for a file that cannot be measured — missing, truncated, or not a video — which
+        is an answer rather than an error: the callers below drop such a take from the plan
+        exactly as the export's own refusal report would.
+
+        The memo is keyed by path, byte length and modification time **together**. Neither half
+        is trusted alone: a take re-rendered under the same name changes at least one of them,
+        and this is a memo of a measurement rather than a stored verdict, so a stale entry could
+        only be produced by a file rewritten to the same length in the same nanosecond.
+        `song_fingerprint`'s content-not-mtime rule answers a different question — "is this still
+        the same audio?" — and reading every byte of every approved take to answer "how wide is
+        it?" would cost more than the measurement it guards.
+        """
+        try:
+            stat = source.stat()
+        except OSError:
+            return None
+        key = (source.as_posix(), stat.st_size, stat.st_mtime_ns)
+        remembered = app.state.take_dimensions.get(key)
+        if remembered is not None:
+            return remembered
+        rc, out, _err = await run_tool(probe_take_args(source))
+        lines = out.splitlines() if rc == 0 else []
+        try:
+            width, height = (int(part) for part in lines[0].split(","))
+        except (ValueError, IndexError):
+            return None
+        app.state.take_dimensions[key] = (width, height)
+        return (width, height)
+
+    async def export_geometry(project: Project) -> tuple[int, int] | None:
+        """The dimensions the export would normalize **this project** to, or `None` if no
+        approved take in it can be measured.
+
+        AD-29, and it is computed by calling `assembly_plan` rather than by re-deriving its
+        rule: "the largest-area approved take" is a sentence, and a sentence copied into a
+        second function drifts from the one that ships the video. Two things this delegation
+        gets right that a `max()` here would not — the plan resolves overlaps first, so a take
+        completely covered by a later Shot contributes nothing to a geometry it will not appear
+        at; and if the normalization rule is ever changed, the preview follows it without anyone
+        remembering that a second copy exists.
+
+        `song_seconds` is `0.0` because only `.width` and `.height` are read from the answer.
+        The plan's frame arithmetic and its tiling are the export's business; this asks it one
+        question, which is what size the delivery grid is.
+
+        Shots whose take cannot be resolved or measured are left out entirely. That is the same
+        set the export would refuse over, so the answer is either the export's own geometry or
+        the export was never going to run.
+        """
+        output_root = (settings.comfy_root / "output").resolve()
+        clips: list[ClipWindow] = []
+        dimensions: dict[str, tuple[int, int]] = {}
+        for shot in project.shots:
+            if not shot.approved_output:
+                continue
+            candidate = (output_root / Path(shot.approved_output)).resolve()
+            if output_root not in candidate.parents or not candidate.is_file():
+                continue
+            measured = await take_dimensions(candidate)
+            if measured is None:
+                continue
+            dimensions[shot.id] = measured
+            clips.append(
+                ClipWindow(
+                    shot_id=shot.id,
+                    label=shot.id,
+                    start=shot.start,
+                    duration=shot.duration,
+                    approved_output=shot.approved_output,
+                    approved_start=shot.approved_start,
+                    approved_duration=shot.approved_duration,
+                    source=candidate,
+                )
+            )
+        if not clips:
+            return None
+        plan = assembly_plan(clips, 0.0, dimensions)
+        return plan.width, plan.height
+
+    def preview_side(value: int) -> int:
+        """One export dimension, halved for the preview and kept even.
+
+        Even because `format=yuv420p` — which `trim_args` pins on every clip it builds — has
+        half-resolution chroma planes and refuses an odd dimension. Every size this pipeline
+        renders is a multiple of 32, so the rounding never fires on real media; it is here so
+        that a hand-placed take of an odd width is a smaller preview rather than an ffmpeg
+        failure with a sentence about chroma. Never below 2, for the same reason.
+        """
+        half = value // 2
+        return max(2, half - (half % 2))
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/preview",
+        response_model=ShotPreviewResponse,
+    )
+    async def render_shot_preview(project_id: str, shot_id: str) -> ShotPreviewResponse:
+        """One Shot's exposed window, through the chain the export will run, at half its size.
+
+        The point of the whole slice: judging a grade used to mean exporting the entire video,
+        so a Director graded against imagination. What comes back is the same picture the export
+        will produce, reduced in geometry and in encoder quality and **differing in nothing
+        else** — `assembly.trim_args` builds the argv and `effects.build_effect_stages` composes
+        the stages, exactly as the assemble route composes them, because a preview built by a
+        second chain stops predicting the export, and predicting the export is the only thing it
+        is for.
+
+        **Nothing here is written to the manifest, and that is a load-bearing absence** (AD-23).
+        There is no stored "stale" flag, no cached geometry on the Shot, no record that a preview
+        exists. `preview_fingerprint` names the file, and a name either exists on disk or does
+        not; a state that is derived cannot outlive the thing it describes. `store.save` appears
+        nowhere in this route on any path, refusal or success.
+
+        **The order of the work is the order of the refusals it can raise.** The Shot, then the
+        approval, then the file, then the geometry, then the chain — each the cheapest remaining
+        question whose answer could make the next one meaningless. The chain is composed
+        **before** the cache is consulted, deliberately: a look whose `.cube` has been deleted
+        must refuse by name today even though a clip rendered yesterday still sits in the cache
+        and is still a perfectly good picture of that look. The export would refuse; a preview
+        that quietly served the old picture would be the more comfortable answer and the less
+        honest one.
+
+        **Supersede, never queue** (AD-24). Whatever this project already has in flight with a
+        *different* fingerprint is cancelled before this render starts, and the render writes to
+        a scratch file that is published — one atomic rename — only if `PreviewRender.superseded`
+        is still false when ffmpeg exits. Killing the subprocess is how a superseded render stops
+        burning CPU; the gate is what makes it impossible for its output to be served, including
+        in the two races a kill cannot cover — the process that finished before the signal, and
+        the process that did not exist yet. A cancelled render's answer is a refusal, so nothing
+        late is played.
+
+        **Join an identical render, never restart it** (R-22). AD-24 exists to discard *stale*
+        work, so a Director dragging a slider is not shown five outdated pictures in sequence. A
+        request whose fingerprint equals the one already rendering is not stale work — it is the
+        same work, asked for twice, and there is no client that can promise never to ask twice: a
+        retry, a poll and a re-render on window focus each produce one. So it waits on that
+        render and answers with its result, spawning nothing. Restarting would throw away
+        completed effort for a byte-identical answer, and under identical requests arriving
+        faster than a render finishes (~116 ms here) it would mean nothing ever lands at all.
+
+        **This route neither blocks an export nor waits on one.** No busy check, no job record,
+        no entry in `live_assemblies`, nothing on ComfyUI. A preview is a transcode of a file
+        that already exists, it costs tens of milliseconds, and a Director who cannot grade while
+        a Batch runs is a Director rationed by a queue that had no reason to hold them.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        label = shot_label(project, shot)
+        if not shot.approved_output:
+            raise HTTPException(
+                status_code=422, detail=PREVIEW_NO_TAKE_REFUSAL.format(shot=label)
+            )
+        output_root = (settings.comfy_root / "output").resolve()
+        source = (output_root / Path(shot.approved_output)).resolve()
+        if output_root not in source.parents or not source.is_file():
+            raise HTTPException(
+                status_code=422,
+                detail=PREVIEW_TAKE_MISSING_REFUSAL.format(
+                    shot=label, path=shot.approved_output
+                ),
+            )
+        delivery = await export_geometry(project)
+        if delivery is None:
+            raise HTTPException(
+                status_code=422, detail=PREVIEW_NO_GEOMETRY_REFUSAL.format(shot=label)
+            )
+        width, height = preview_side(delivery[0]), preview_side(delivery[1])
+        # Re-read after the awaits above, and take the Shot again from the fresh manifest: a
+        # slider moved while the takes were being measured must fingerprint as the state that is
+        # true now, or the clip lands under a name describing a look nobody is looking at.
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        stack = [spec.model_dump() for spec in shot.effects]
+        # The composer's geometry is the **preview's**, not the export's, and that is what makes
+        # this the same look rather than the same numbers. `StageContext` describes the delivery
+        # grid a treatment is composed for — `chroma_split` stores a fraction and turns it into
+        # pixels there — so composing against the export's size and rendering at half of it would
+        # show a split twice as wide, relative to the frame, as the export will ship.
+        try:
+            stages = build_effect_stages(
+                stack,
+                width=width,
+                height=height,
+                luts=discovered_looks() if stack else (),
+            )
+        except EffectRefusal as refusal:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSEMBLY_EFFECTS_REFUSAL.format(shot=label, detail=refusal),
+            ) from refusal
+        # The export's own offset rule, resolved from the Shot's own fields exactly as the
+        # assemble route resolves it. The *current* window is used rather than the approved
+        # snapshot: a Director who has moved a boundary is previewing the look they are editing,
+        # and the export's staleness refusal is a decision about shipping, not about looking.
+        offset = shot.latest_take_lead + shot.trim_nudge
+        frames = clip_frames_on_grid(shot.start, shot.start + shot.duration)
+        fingerprint = preview_fingerprint(
+            take=shot.approved_output,
+            window_start=shot.start,
+            window_duration=shot.duration,
+            offset=offset,
+            stack=stack,
+            # Epic 10 and Epic 11 fill these two. They are hashed now, empty, so that filling
+            # them later changes the fingerprint of the Shots that acquire one rather than of
+            # every Shot in every project at once. See `effects.preview_fingerprint`.
+            bindings=(),
+            transition=None,
+            song_fingerprint=(
+                project.song.analysis.song_fingerprint
+                if project.song and project.song.analysis
+                else ""
+            ),
+            width=width,
+            height=height,
+        )
+        previews_root = store.media_dir(project_id) / "previews"
+        relative = f"previews/{fingerprint}.mp4"
+        clip = previews_root / f"{fingerprint}.mp4"
+
+        def answer(*, rendered: bool) -> ShotPreviewResponse:
+            return ShotPreviewResponse(
+                shot_id=shot.id,
+                fingerprint=fingerprint,
+                preview=relative,
+                preview_url=f"/api/projects/{project_id}/media/{relative}",
+                width=width,
+                height=height,
+                frames=frames,
+                window_seconds=frames / ASSEMBLY_FPS,
+                rendered=rendered,
+            )
+
+        # The cache, and the whole of it: the fingerprint names a file, and the file is either
+        # there or it is not. Deleting the folder costs a re-render and nothing else, and no
+        # export ever reads this directory — `exports/` is the assemble route's, and it builds
+        # its own intermediates from the approved takes every time.
+        if clip.is_file():
+            return answer(rendered=False)
+        previews_root.mkdir(parents=True, exist_ok=True)
+        renders = app.state.preview_renders
+        in_flight = renders.get(project_id)
+        # R-22, and the one comparison that decides between the two rules. A *different*
+        # fingerprint is a different picture, so the render underway is stale work and AD-24
+        # discards it. An *equal* fingerprint is this exact render, asked for twice — a retry, a
+        # poll, a re-render on window focus, or simply a second Shot whose look resolves to the
+        # same clip — and restarting it would throw away completed effort to produce a
+        # byte-identical answer. Worse, under identical requests arriving faster than a render
+        # completes, nothing would ever land at all. So it joins.
+        if in_flight is not None and in_flight.fingerprint == fingerprint:
+            # No supersede, no second ffmpeg, no scratch file, and nothing published by this
+            # request: it reads the outcome the render records and answers with it. The publish
+            # gate is untouched — a joiner can only ever be handed a clip that a render already
+            # renamed into the cache after finding `superseded` false.
+            waiter = in_flight.join()
+            if waiter is not None:
+                await waiter
+            if in_flight.published:
+                return answer(rendered=True)
+            if in_flight.superseded:
+                # What it was waiting for will never publish, so it is refused for the same
+                # reason and by the same sentence: something newer is the one that answers.
+                raise HTTPException(
+                    status_code=409, detail=PREVIEW_SUPERSEDED_REFUSAL.format(shot=label)
+                )
+            raise HTTPException(
+                status_code=502,
+                detail=PREVIEW_FAILED_ERROR.format(
+                    shot=label, detail=in_flight.error or PREVIEW_ABANDONED_DETAIL
+                ),
+            )
+        record = PreviewRender(token=new_id("preview"), fingerprint=fingerprint)
+        if in_flight is not None:
+            in_flight.supersede()
+        renders[project_id] = record
+        # Named by this render's own token and hidden by the leading dot, so a half-written file
+        # is neither a cache entry nor a collision with the render that replaced it. The cache is
+        # only ever entered by the rename at the end.
+        scratch = previews_root / f".{record.token}.mp4"
+        try:
+            rc, _out, err = await run_tool(
+                trim_args(
+                    source,
+                    scratch,
+                    frames,
+                    width,
+                    height,
+                    offset=offset,
+                    preset=PREVIEW_PRESET,
+                    geometry_stages=stages.geometry,
+                    treatment_stages=stages.treatment,
+                ),
+                on_start=record.attach,
+            )
+            if record.superseded:
+                # The gate. Whatever ffmpeg managed to write is deleted rather than published,
+                # so a render cancelled at any point — including one that finished before the
+                # kill landed — can never be served as the current picture.
+                scratch.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=409, detail=PREVIEW_SUPERSEDED_REFUSAL.format(shot=label)
+                )
+            if rc != 0 or not scratch.is_file():
+                scratch.unlink(missing_ok=True)
+                record.error = err[-500:] if err else "no error output"
+                raise HTTPException(
+                    status_code=502,
+                    detail=PREVIEW_FAILED_ERROR.format(shot=label, detail=record.error),
+                )
+            # One atomic rename into the cache. A reader either sees no file or sees a complete
+            # one; there is no window in which a partial preview carries a fingerprint's name.
+            #
+            # Everything from `run_tool` returning to here is synchronous, and that is what lets
+            # a joiner trust `published`: no supersede can be interleaved between reading the
+            # gate and passing through it, so `published` is only ever true of a render that was
+            # never superseded.
+            scratch.replace(clip)
+            record.finish(published=True)
+            return answer(rendered=True)
+        finally:
+            # Only if this render is still the registered one. A superseded render must not
+            # clear the entry belonging to the render that replaced it.
+            if renders.get(project_id) is record:
+                del renders[project_id]
+            # Unconditional, and idempotent: whatever happened above — a publish, a refusal, a
+            # supersede, or an exception no branch here wrote — every joiner is released with
+            # the outcome that was recorded, or with `error=None` and `published=False`, which
+            # is the abandoned case and still an answer. Nothing waits forever.
+            record.finish(error=record.error)
+
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/select-take", response_model=Project
     )
@@ -12308,7 +12935,9 @@ def create_app(
         return store.save(project)
 
     async def run_tool(
-        args: list[str], on_progress: Callable[[int], None] | None = None
+        args: list[str],
+        on_progress: Callable[[int], None] | None = None,
+        on_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     ) -> tuple[int, str, str]:
         """One ffmpeg/ffprobe invocation, event loop left free. Returns (rc, stdout, stderr).
 
@@ -12329,6 +12958,14 @@ def create_app(
         `on_progress` receives elapsed *output microseconds*, and is called only for lines
         that carry one; `parse_progress_us` refuses everything else, so a garbled or partial
         line costs a callback, not the export.
+
+        `on_start` hands the caller the live `Process` the moment it exists, and exists for
+        exactly one caller: the preview render, which AD-24 requires be **cancellable** while
+        it runs. Killing an ffmpeg is the only way to stop one, and a caller that only ever
+        sees the return value has nothing to kill. It is called before the first `await` on the
+        process, so a supersede that arrives during the render always finds a handle — and the
+        window before this line is closed by the preview's own publish gate rather than here,
+        because a subprocess that has not been spawned yet cannot be killed by anyone.
         """
         try:
             process = await asyncio.create_subprocess_exec(
@@ -12339,6 +12976,8 @@ def create_app(
             )
         except FileNotFoundError:
             return 127, "", f"{args[0]} is not installed or not on PATH"
+        if on_start is not None:
+            on_start(process)
         if on_progress is None:
             out_bytes, err_bytes = await process.communicate()
             out = out_bytes.decode("utf-8", "replace")

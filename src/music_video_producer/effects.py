@@ -111,6 +111,7 @@ gradients.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -135,6 +136,7 @@ __all__ = [
     "LUT_HEADER_SCAN_BYTES",
     "LUT_SCAN_CHUNK_BYTES",
     "LUT_SUFFIX",
+    "PREVIEW_FINGERPRINT_INPUTS",
     "PRE_PAD_FAMILIES",
     "PRE_SCALE_FAMILIES",
     "ChoiceParameter",
@@ -154,6 +156,7 @@ __all__ = [
     "lut_directory",
     "lut_file_argument",
     "lut_id_for_name",
+    "preview_fingerprint",
     "song_fingerprint",
     "song_fingerprints_match",
     "validate_stack",
@@ -1683,3 +1686,124 @@ def build_effect_stages(
                 continue
             target.extend(EFFECT_CATALOGUE[effect.effect_id].compose(effect.values, context))
     return EffectStages(geometry=tuple(geometry), treatment=tuple(treatment))
+
+
+# ------------------------------------------------------------------------------------------
+# The preview fingerprint (AD-23, AD-28).
+#
+# It lives at the *end* of this module rather than beside `song_fingerprint` because it is a
+# fingerprint of the chain's inputs and it borrows the chain's own number formatter: two states
+# that compose to the same filter text must fingerprint the same, and `_number` is the single
+# function that decides when two floats mean one filter string. Put it above the composers and
+# that relationship reads as an accident.
+# ------------------------------------------------------------------------------------------
+
+
+def _canonical(value: Any) -> str:
+    """One value as text that depends on the value and on nothing else.
+
+    Written out rather than delegated to `json.dumps(..., sort_keys=True)` for two reasons, both
+    of which AD-28 names when it says "never an ad-hoc hash of a dict, whose ordering and float
+    repr are not contracts":
+
+    *Numbers.* A Shot's `parameters` is `dict[str, Any]` on the model — deliberately, because the
+    catalogue in this module is the only thing entitled to say what a parameter is — so pydantic
+    coerces nothing inside it. `{"amount": 1}` and `{"amount": 1.0}` therefore reach here as two
+    different Python objects that compose to **one** filter string, and `json.dumps` would call
+    them two different looks and re-render a preview that cannot possibly differ. `_number` is
+    the formatter the composers use, so the fingerprint changes exactly when the chain does.
+
+    *Types `json` refuses.* This walks a hand-edited manifest's leftovers as readily as a
+    validated stack — the fingerprint is taken **before** anything decides the stack composes, so
+    that an uncomposable stack still gets a name and its refusal is not a `TypeError`.
+
+    A string is quoted and a number is not, so `"1"` and `1` cannot collide; a mapping's keys are
+    ordered by `repr` for `validate_stack`'s reason, that a hand-edited manifest can mix key
+    types and `sorted` over two of them raises the one exception this must never raise.
+    """
+    if value is None:
+        return "null"
+    # Before the number branch: `bool` is an `int` in Python, and `True` would otherwise
+    # fingerprint identically to `1`.
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return _number(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, Mapping):
+        pairs = sorted(value.items(), key=lambda item: repr(item[0]))
+        return "{" + ",".join(f"{_canonical(k)}:{_canonical(v)}" for k, v in pairs) + "}"
+    if isinstance(value, Iterable):
+        return "[" + ",".join(_canonical(item) for item in value) + "]"
+    return json.dumps(repr(value))
+
+
+#: The eight inputs of the preview fingerprint, in the order they are hashed in. A tuple rather
+#: than eight literals inside the function so that the order is a thing a test can read, and so
+#: that adding a ninth is visibly a change to AD-28 rather than a line in a payload.
+PREVIEW_FINGERPRINT_INPUTS: tuple[str, ...] = (
+    "take",
+    "window",
+    "offset",
+    "stack",
+    "bindings",
+    "song",
+    "transition",
+    "geometry",
+)
+
+
+def preview_fingerprint(
+    *,
+    take: str,
+    window_start: float,
+    window_duration: float,
+    offset: float,
+    stack: Iterable[Mapping[str, Any]] = (),
+    bindings: Iterable[Any] = (),
+    song_fingerprint: str = "",
+    transition: Any = None,
+    width: int,
+    height: int,
+) -> str:
+    """The name of the Preview Clip for one state of one Shot: a SHA-256 over the eight
+    inputs of `PREVIEW_FINGERPRINT_INPUTS`, in that order.
+
+    **This is the whole of the staleness mechanism** (AD-23). Nothing stores a flag saying a
+    preview is out of date: a caller recomputes this and either the file it names is on disk or
+    it is not. That is why the answer is a *name* rather than a comparison — a stale entry is
+    inert rather than wrong, and the cache holding a hundred obsolete clips costs disk and
+    nothing else. A stored flag would be a second truth that outlives what it describes, which
+    is the rule AD-21 and AD-23 both exist to keep.
+
+    **The two empty slots are load-bearing.** `bindings` (Epic 10) and `transition` (Epic 11) do
+    not exist on any model yet, and both are hashed *now*, as their empty values. Adding them
+    later then changes the fingerprint only of the Shots that acquire one. Leaving them out and
+    adding them later would reshape the payload for every Shot at once and invalidate every
+    cached preview in every project on the day that epic merges — for looks that did not change.
+
+    `song_fingerprint` is the **stored** content fingerprint of the song the envelope was
+    measured from, not a fresh read of the file: it is here for the bindings that will be driven
+    by that envelope, and re-hashing a multi-megabyte master on every drag of a slider would
+    spend the entire preview budget answering a question about audio no preview yet plays.
+
+    Floats go through `_number`, the composers' own formatter, so this changes exactly when the
+    filter chain changes and never for a difference the chain cannot express — `1` and `1.0` are
+    one look, and so are two zoom values a millionth apart.
+    """
+    fields = (
+        _canonical(take),
+        f"{_number(window_start)}+{_number(window_duration)}",
+        _number(offset),
+        _canonical(list(stack)),
+        _canonical(list(bindings)),
+        _canonical(song_fingerprint),
+        _canonical(transition),
+        f"{int(width)}x{int(height)}",
+    )
+    payload = "\n".join(
+        f"{name}={value}"
+        for name, value in zip(PREVIEW_FINGERPRINT_INPUTS, fields, strict=True)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
