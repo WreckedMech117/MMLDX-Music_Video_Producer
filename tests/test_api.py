@@ -23524,10 +23524,16 @@ def test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack(tmp_path
       is the gesture that would quietly cost a Director every look they had built;
     * `PUT .../shots` inventing one.
 
-    A Shot the stored project does not hold arrives with an empty stack rather than the body's,
-    on the anchor adoption's reading: a stack that came in here was not written by the route
-    that writes stacks.
+    A Shot the stored project does **not** hold is the other half, and it changed on 2026-08-25:
+    it keeps the stack it arrived with, validated first. Split and Duplicate mint a new id and
+    copy the plan — `effects` is plan content — so dropping it sent a Director's second half back
+    ungraded. `test_a_split_saved_the_way_the_browser_saves_it_keeps_the_look_on_both_halves`
+    drives that whole gesture; what is asserted here is the property that makes keeping it safe,
+    which is that the catalogue still answers first and a stack it refuses takes the entire write
+    down with it rather than being quietly dropped from a plan that saves anyway.
     """
+    from music_video_producer.app import SHOT_EFFECTS_UNCOMPOSABLE_REFUSAL
+
     client, _store, _ = make_client(tmp_path)
     project_id = project_with_two_shots(client)
     assert write_stack(
@@ -23576,7 +23582,40 @@ def test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack(tmp_path
     assert forged.status_code == 200, forged.text
     saved = ProjectStore(tmp_path).get(project_id)
     assert [shot.id for shot in saved.shots] == ["shot_one", "shot_two", "shot_smuggled"]
-    assert stacks() == intact + [[]], "a whole-project save planted a look"
+    # The two Shots this project already held keep exactly the stacks the narrow route wrote,
+    # against a body that named a different look for one and cleared the other.
+    assert stacks()[:2] == intact, "a whole-project save planted a look on a stored shot"
+    # The Shot that is new to the plan keeps what it arrived with — which is how a Duplicate
+    # made in the browser and saved through here lands with its look on.
+    assert stacks()[2] == [
+        {"effect": "mirror", "enabled": True, "parameters": {"axis": "horizontal"}}
+    ]
+
+    # 2b. And the catalogue still answers for that new Shot, which is what makes keeping it
+    #     safe: an unvalidated stack would be filter configuration written past the one
+    #     validator (AD-27) that stands between a client's numbers and an ffmpeg filter string.
+    #     The whole write goes down with it — the rename in the same body included — because a
+    #     save that landed the plan and silently dropped one look is the failure being fixed.
+    body = client.get(f"/api/projects/{project_id}").json()
+    body["name"] = "Renamed alongside an uncomposable stack"
+    body["shots"].append(
+        {
+            "id": "shot_unusable",
+            "start": 12,
+            "duration": 4,
+            "prompt": "Invented, and graded past the catalogue",
+            "effects": [{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 9.0}}],
+        }
+    )
+    refused = client.put(f"/api/projects/{project_id}", json=body)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == SHOT_EFFECTS_UNCOMPOSABLE_REFUSAL.format(
+        shot="SHOT 04 (shot_unusable)",
+        detail="punch_in's zoom is 9, above its maximum of 2. Nothing was composed.",
+    )
+    reopened = ProjectStore(tmp_path).get(project_id)
+    assert [shot.id for shot in reopened.shots] == ["shot_one", "shot_two", "shot_smuggled"]
+    assert reopened.name == "Renamed by an ordinary save", "a refused write saved the rest"
 
     # 3. `PUT .../shots`, omitting the field — the timeline's own gesture.
     body = client.get(f"/api/projects/{project_id}").json()
@@ -23589,14 +23628,322 @@ def test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack(tmp_path
     assert ProjectStore(tmp_path).get(project_id).shots[0].start == 0.5
     assert stacks() == intact, "dragging a clip erased every look in the project"
 
-    # 4. `PUT .../shots`, inventing one.
+    # 4. `PUT .../shots`, inventing one on the two Shots this plan already holds.
     body = client.get(f"/api/projects/{project_id}").json()
     shots = [dict(shot) for shot in body["shots"][:2]]
     shots[0]["effects"] = [{"effect": "posterize", "enabled": True, "parameters": {}}]
     shots[1]["effects"] = []
     planted = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
     assert planted.status_code == 200, planted.text
-    assert stacks() == intact, "a shot-list save planted a look"
+    assert stacks()[:2] == intact, "a shot-list save planted a look"
+
+    # 5. The same route, with a Shot that is new to the plan carrying a stack the catalogue
+    #    refuses. This is the sibling that matters most — Split and Duplicate both land here —
+    #    so the refusal names the Shot the way the timeline does and nothing at all is saved.
+    body = client.get(f"/api/projects/{project_id}").json()
+    shots = [dict(shot) for shot in body["shots"]]
+    shots.append(
+        {
+            "id": "shot_unusable",
+            "start": 16,
+            "duration": 4,
+            "prompt": "A half nobody can compose",
+            "effects": [{"effect": "grain", "enabled": True, "parameters": {"strenth": 8}}],
+        }
+    )
+    refused = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert refused.status_code == 422, refused.text
+    # `paramters` one level down is the misspelling this route's docstring argues about; this is
+    # the same class one level further down still, and it is refused rather than composed at the
+    # catalogue's defaults.
+    assert refused.json()["detail"] == SHOT_EFFECTS_UNCOMPOSABLE_REFUSAL.format(
+        shot="SHOT 03 (shot_unusable)",
+        detail=(
+            "grain has no parameter called 'strenth'. It takes seed, strength. "
+            "Nothing was composed."
+        ),
+    )
+    assert [shot.id for shot in ProjectStore(tmp_path).get(project_id).shots] == [
+        "shot_one",
+        "shot_two",
+    ], "a refused write saved the shot list anyway"
+    assert stacks()[:2] == intact
+
+
+def test_a_write_that_names_no_effects_is_refused_rather_than_read_as_an_empty_stack(
+    tmp_path: Path,
+):
+    """A misspelled top-level key destroyed a Director's grade and answered **200**.
+
+    `effects` was `Field(default_factory=list)` under pydantic's `extra="ignore"`, so every one
+    of these bound to `[]`, stored `[]`, and reported success — with `validate_stack` never
+    seeing the body at all:
+
+        PUT .../effects  {"efects": [...]}   -> 200, stored stack becomes []
+        PUT .../effects  {}                  -> 200, stored stack becomes []
+        PUT .../effects  {"other": 1}        -> 200, stored stack becomes []
+
+    This route's own docstring argues at length that a misspelled `paramters` must not quietly
+    do nothing *inside* an entry. One level up, `efects` did worse than nothing.
+
+    **And `{"effects": []}` still works**, which is the constraint the fix had to respect: that
+    is how a Director takes every card off, and a route that could not be cleared would be a
+    second defect traded for the first. Asserted last, against the same graded Shot, so it
+    cannot pass by the stack having been empty all along.
+    """
+    from music_video_producer.app import SHOT_EFFECTS_ABSENT_REFUSAL
+
+    client, store, _ = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    good = [{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}}]
+    assert write_stack(client, project_id, good).status_code == 200
+    manifest = store.project_dir(project_id) / "project.json"
+    untouched = manifest.read_bytes()
+
+    sentence = SHOT_EFFECTS_ABSENT_REFUSAL.format(
+        shot=shot_label(store.get(project_id), store.get(project_id).shots[0])
+    )
+    for body in ({"efects": good}, {}, {"other": 1}, {"effects": None}):
+        refused = client.put(effects_url(project_id), json=body)
+        assert refused.status_code == 422, (body, refused.text)
+        assert refused.json()["detail"] == sentence, body
+        assert manifest.read_bytes() == untouched, f"a refused write moved the manifest: {body}"
+
+    # The Shot is named the way the timeline names it, and the sentence says what to send.
+    assert "SHOT 01 (shot_one)" in sentence
+    assert '"effects": []' in sentence
+
+    # Clearing every card is still one explicit write.
+    assert write_stack(client, project_id, []).status_code == 200
+    assert ProjectStore(tmp_path).get(project_id).shots[0].effects == []
+
+
+def test_an_effect_stack_is_capped_before_it_can_outgrow_a_command_line(tmp_path: Path):
+    """An unbounded stack made the *export* fail with a false diagnosis, so the bound is here.
+
+    Measured 2026-08-25: 985 grain cards composed an argv of 32725 characters and exported;
+    1200 composed 40060 and came back **502 "Assembly failed at the trim stage: ffmpeg is not
+    installed or not on PATH"** — Windows raises `FileNotFoundError [WinError 206] The filename
+    or extension is too long` and `run_tool` maps every `FileNotFoundError` to that sentence.
+    The mapping predates this slice and is recorded separately; what is new is that a client can
+    grow the argv without bound, so the refusal belongs at the write that grows it.
+
+    The cap itself is asserted from the constant rather than written out, because the number is
+    a judgement that may move; what must not move is that the boundary is enforced and that a
+    stack *at* the limit is still accepted.
+    """
+    from music_video_producer.app import (
+        SHOT_EFFECT_STACK_LIMIT,
+        SHOT_EFFECTS_TOO_MANY_REFUSAL,
+    )
+
+    client, _store, _ = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+
+    card = {"effect": "grain", "parameters": {"strength": 1}}
+    over = [dict(card) for _ in range(SHOT_EFFECT_STACK_LIMIT + 1)]
+    refused = write_stack(client, project_id, over)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+        limit=SHOT_EFFECT_STACK_LIMIT, count=SHOT_EFFECT_STACK_LIMIT + 1
+    )
+    assert ProjectStore(tmp_path).get(project_id).shots[0].effects == []
+
+    # The limit is a limit and not one less than one: a stack of exactly this many lands.
+    at_limit = [dict(card) for _ in range(SHOT_EFFECT_STACK_LIMIT)]
+    assert write_stack(client, project_id, at_limit).status_code == 200
+    stored = ProjectStore(tmp_path).get(project_id).shots[0].effects
+    assert len(stored) == SHOT_EFFECT_STACK_LIMIT
+
+    # And a stack this size is nowhere near the 32767 the measurement is about — the cap is
+    # what a stack can plausibly be, not the argv limit converted into cards.
+    assert SHOT_EFFECT_STACK_LIMIT <= 64
+
+
+def test_a_look_dropped_in_while_the_app_runs_is_found_by_the_write_that_names_it(
+    tmp_path: Path,
+):
+    """The Director's actual gesture: drop a `.cube` in the folder, grade with it immediately.
+
+    `discovered_looks` holds its answer for the life of the process — 221 ms cold on a 44.2 MB
+    pack is the reason — and `rescan` was exposed only on `GET /api/effects/catalogue`. So a
+    look that was *in the looks folder* was refused with:
+
+        There is no look called 'midnight-alley' in the looks folder. Nothing was composed.
+
+    a sentence naming the folder as the authority when the authority was a process-lifetime
+    cache, and offering no remedy reachable from this route.
+
+    Counted rather than timed, through the module the route resolves `discover_luts` from,
+    because "it rescanned once" and "it rescans every time" are the two things this has to tell
+    apart and both of them look instant.
+    """
+    from music_video_producer import app as app_module
+    from music_video_producer.effects import (
+        EFFECT_LUT_UNKNOWN_REFUSAL,
+        cube_text,
+        identity_transform,
+        lut_directory,
+    )
+
+    client, _store, _ = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+
+    reads = []
+    real_discover = app_module.discover_luts
+
+    def counted(*args, **kwargs):
+        reads.append(args)
+        return real_discover(*args, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app_module, "discover_luts", counted)
+    try:
+        # The picker opens: one folder read, and the new look does not exist yet.
+        served = client.get("/api/effects/catalogue")
+        assert served.status_code == 200, served.text
+        assert "midnight-alley" not in {entry["lut_id"] for entry in served.json()["looks"]}
+        assert len(reads) == 1
+
+        # The Director drops a file in, with the application still running.
+        (lut_directory(tmp_path) / "Midnight Alley.cube").write_text(
+            cube_text(2, identity_transform, title="Midnight Alley"), encoding="utf-8"
+        )
+
+        graded = write_stack(
+            client, project_id, [{"effect": "lut_look", "parameters": {"lut": "midnight-alley"}}]
+        )
+        assert graded.status_code == 200, graded.text
+        assert len(reads) == 2, "the write did not look again, or looked more than once"
+        assert [spec.parameters["lut"] for spec in
+                ProjectStore(tmp_path).get(project_id).shots[0].effects] == ["midnight-alley"]
+
+        # A look that genuinely is not there is still refused, by the same sentence, after
+        # exactly one more look at the folder — the retry is bounded whatever the answer.
+        missing = write_stack(
+            client, project_id, [{"effect": "lut_look", "parameters": {"lut": "not-a-look"}}]
+        )
+        assert missing.status_code == 422, missing.text
+        assert missing.json()["detail"] == EFFECT_LUT_UNKNOWN_REFUSAL.format(lut="not-a-look")
+        assert len(reads) == 3
+
+        # A refusal that the folder cannot answer — a number out of bounds — costs no read at
+        # all beyond the one the validation itself needs, because re-reading the disk cannot
+        # change what is wrong with it.
+        assert write_stack(
+            client, project_id, [{"effect": "punch_in", "parameters": {"zoom": 9.0}}]
+        ).status_code == 422
+        assert len(reads) == 3
+    finally:
+        monkeypatch.undo()
+
+
+def test_the_catalogue_serves_a_looks_human_name_and_not_its_id(tmp_path: Path):
+    """The picker's own text, which the id-shaped default set cannot prove.
+
+    Every generated look is written as `filmic-contrast.cube`, so its name and its id are the
+    same string and `name=entry.lut_id` served exactly the right answer for all five. A picker
+    listing `midnight-alley` where the Director wrote `Midnight Alley` was invisible to the
+    suite. One file whose name is not already a slug is the whole of the fix.
+    """
+    from music_video_producer.effects import cube_text, identity_transform, lut_directory
+
+    client, _store, _ = make_client(tmp_path)
+    assert client.get("/api/effects/catalogue").status_code == 200
+    (lut_directory(tmp_path) / "Midnight Alley.cube").write_text(
+        cube_text(2, identity_transform, title="Midnight Alley"), encoding="utf-8"
+    )
+
+    looks = client.get("/api/effects/catalogue?rescan=true").json()["looks"]
+    entry = next(item for item in looks if item["lut_id"] == "midnight-alley")
+    assert entry["name"] == "Midnight Alley"
+    assert entry["name"] != entry["lut_id"]
+    # And the id is still what a stack names — the two are served side by side precisely
+    # because they are not the same thing.
+    assert write_stack(
+        client,
+        project_with_two_shots(client, "Named"),
+        [{"effect": "lut_look", "parameters": {"lut": entry["lut_id"]}}],
+    ).status_code == 200
+
+
+def test_a_manifest_written_before_effects_existed_round_trips_through_both_routes(
+    tmp_path: Path,
+):
+    """Every project on the Director's disk has no `effects` key at all. This is that project.
+
+    Proven to *load* by the model's default and nothing more, which is the class of defect that
+    only shows on real data: the read, the write, and the ordinary whole-project save each have
+    to survive a Shot whose stack was never written. The manifest is edited on disk rather than
+    built through the routes, because a project this application created today cannot be one.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    manifest = store.project_dir(project_id) / "project.json"
+
+    body = json.loads(manifest.read_text(encoding="utf-8"))
+    for shot in body["shots"]:
+        shot.pop("effects", None)
+    manifest.write_text(json.dumps(body), encoding="utf-8")
+    assert "effects" not in manifest.read_text(encoding="utf-8")
+
+    # It loads, and both reads answer for it.
+    assert client.get(f"/api/projects/{project_id}").status_code == 200
+    assert client.get(effects_url(project_id)).json() == {"shot_id": "shot_one", "effects": []}
+
+    # It can be graded, and the grade survives an ordinary whole-project save from a client
+    # that has never heard of the field — which is the same body this manifest was written by.
+    assert write_stack(
+        client, project_id, [{"effect": "vignette", "parameters": {"angle": 0.5}}]
+    ).status_code == 200
+    pre_c1 = client.get(f"/api/projects/{project_id}").json()
+    for shot in pre_c1["shots"]:
+        shot.pop("effects", None)
+    saved = client.put(f"/api/projects/{project_id}", json=pre_c1)
+    assert saved.status_code == 200, saved.text
+    assert [
+        spec.model_dump() for spec in ProjectStore(tmp_path).get(project_id).shots[0].effects
+    ] == [{"effect": "vignette", "enabled": True, "parameters": {"angle": 0.5}}]
+
+
+def test_the_effects_routes_are_discoverable_in_the_openapi_document(tmp_path: Path):
+    """A13's own reason for every `response_model` on this slice, asserted rather than cited.
+
+    A route whose shape is a bare dict appears in `/openapi.json` with no schema and no client
+    can discover it — which is why the read declares `ShotEffectsResponse` and the catalogue
+    declares `EffectCatalogueResponse`. Both are here, with the named schema each resolves to,
+    so dropping a `response_model` fails the suite instead of quietly shrinking the document.
+    """
+    client, _store, _ = make_client(tmp_path)
+    document = client.get("/openapi.json")
+    assert document.status_code == 200, document.text
+    paths = document.json()["paths"]
+
+    catalogue = "/api/effects/catalogue"
+    shot_effects = "/api/projects/{project_id}/shots/{shot_id}/effects"
+    assert catalogue in paths and shot_effects in paths
+
+    def schema_name(path: str, method: str) -> str:
+        content = paths[path][method]["responses"]["200"]["content"]["application/json"]
+        return content["schema"]["$ref"].rsplit("/", 1)[-1]
+
+    assert schema_name(catalogue, "get") == "EffectCatalogueResponse"
+    assert schema_name(shot_effects, "get") == "ShotEffectsResponse"
+    # The write answers with the whole Project — the idiom every purpose-built shot action
+    # follows, and what a client needs to redraw and to keep its concurrency stamp. FastAPI
+    # names the serialisation-side variant `Project-Output`, so the schema is identified by
+    # what it holds rather than by a name this application does not choose.
+    written = schema_name(shot_effects, "put")
+    assert written.startswith("Project"), written
+    assert "shots" in document.json()["components"]["schemas"][written]["properties"]
+
+    # The declared shapes are real schemas with the fields the routes promise, not empty
+    # objects that happen to carry a name.
+    schemas = document.json()["components"]["schemas"]
+    assert set(schemas["ShotEffectsResponse"]["properties"]) == {"shot_id", "effects"}
+    assert {"families", "effects", "looks"} <= set(
+        schemas["EffectCatalogueResponse"]["properties"]
+    )
 
 
 def test_the_effect_catalogue_is_one_read_and_never_re_reads_the_looks_folder(tmp_path: Path):

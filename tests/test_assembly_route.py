@@ -1506,3 +1506,85 @@ def test_an_export_refuses_a_stack_it_cannot_compose_and_names_the_shot(
     )
     assert store.get(project_id).jobs == []
     assert comfy.prompts == []
+
+
+def test_an_export_names_every_missing_look_in_one_answer(tmp_path: Path):
+    """The composition loop's own comprehensive report, which it did not have.
+
+    The pre-pass above it collects `validate_stack` refusals into a list precisely so a Director
+    is not sent back three times for three faults. The composition loop below it raised on the
+    **first** `EffectRefusal` — and it is the only place a missing *file* can be seen, since
+    `validate_stack` compares ids against the discovered listing and never touches the disk. So
+    two shots whose `.cube` files had both gone named only `SHOT 01`: restore that one, run
+    again, and be told about `SHOT 02`.
+
+    Both looks are deleted before a single export runs, which is the whole point — the Director
+    did not delete them one at a time either.
+    """
+    from music_video_producer.effects import EFFECT_LUT_FILE_MISSING_REFUSAL, lut_directory
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    looks = client.get("/api/effects/catalogue").json()["looks"]
+    chosen = [looks[0]["lut_id"], looks[1]["lut_id"]]
+    for shot_id, lut in zip(("shot_a", "shot_b"), chosen, strict=True):
+        write_stack(client, project_id, shot_id, [{"effect": "lut_look", "parameters": {"lut": lut}}])
+    gone = []
+    for name in (looks[0]["name"], looks[1]["name"]):
+        path = lut_directory(tmp_path) / f"{name}.cube"
+        path.unlink()
+        gone.append(path)
+
+    refused = client.post(f"/api/projects/{project_id}/assemble")
+    assert refused.status_code == 422, refused.text
+    detail = refused.json()["detail"]
+
+    # One answer, both shots, each carrying the chain's own sentence whole beside the name the
+    # timeline gives it.
+    assert detail.splitlines() == [
+        "SHOT 01 (shot_a): "
+        + EFFECT_LUT_FILE_MISSING_REFUSAL.format(lut=chosen[0], path=gone[0].as_posix()),
+        "SHOT 02 (shot_b): "
+        + EFFECT_LUT_FILE_MISSING_REFUSAL.format(lut=chosen[1], path=gone[1].as_posix()),
+    ]
+    assert store.get(project_id).jobs == [], "a refused export wrote a job record"
+    assert comfy.prompts == []
+
+
+def test_the_export_composes_a_stack_against_the_plans_geometry_and_not_the_takes(
+    tmp_path: Path, monkeypatch
+):
+    """The one thing about the call site that no other route-level export test can see.
+
+    `build_effect_stages(stack, width=plan.width, height=plan.height, ...)` — mutate that to
+    `width=1, height=1` and the entire suite still passed. Only `chroma_split` reads
+    `context.width`, and nothing exported one, so a stack graded at 1920 and exported at 1056
+    would have shifted by the wrong number of pixels with nothing noticing.
+
+    `shot_a`'s own take is **128** wide and the export's delivery geometry is **192** — the
+    largest take present — so the two candidate widths give two different answers for the same
+    stored fraction: `0.02 × 128` rounds to 3 pixels and `0.02 × 192` rounds to 4. The chain has
+    to say 4. That is what a treatment stage is composed for (see `effects.StageContext`): the
+    fraction is stored so the look survives a change of export size, and it is turned into
+    pixels against the size actually being delivered.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    write_stack(
+        client, project_id, "shot_a", [{"effect": "chroma_split", "parameters": {"shift": 0.02}}]
+    )
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    assert commands[0][commands[0].index("-vf") + 1] == (
+        "scale=192:108:force_original_aspect_ratio=decrease,"
+        "chromashift=cbh=4:crh=-4,"
+        "pad=192:108:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    )
+    # 3 is what this shot's *own* take would have produced, and 0 is what a geometry of 1 would
+    # have produced — the mutation that survived. Named here so the assertion above cannot be
+    # read as "some number came out".
+    assert "cbh=3" not in commands[0][commands[0].index("-vf") + 1]
+    assert "chromashift" not in commands[1][commands[1].index("-vf") + 1]
+    assert comfy.prompts == []

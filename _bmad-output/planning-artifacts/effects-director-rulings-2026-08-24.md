@@ -224,6 +224,42 @@ all.
 about a file when they mean the argv, and want amending to say so. The measurement is also carried
 in `docs/BUILD-HANDOFF.md` under the ffmpeg-and-encoding caveats, where slice C will meet it.
 
+## R-21 — A new Shot may arrive carrying a validated stack, and the one-writer claim was never the guard that mattered
+
+Slice C1 shipped `_adopt_shot_effects` giving any Shot the stored project does not hold an
+**empty** stack, and its docstring justified that with a security property: *"`PUT
+.../shots/{shot_id}/effects` is the one writer, and it is what keeps this field out of reach of
+anything a model can call."* Two reviewers then found, independently, that the same rule loses the
+look on **Split and Duplicate** — both are client gestures that mint a new id and save through
+`PUT .../shots`, so the second half of a split came back ungraded. `models.py:840` had already
+called that outcome a defect in the same commit that shipped it.
+
+The fix validates a new Shot's arriving stack through `validate_stack` and keeps it, refusing the
+whole write when it does not compose. **This widens the write surface**, and the one-writer
+sentence is no longer true: a client can now land a stack through `PUT .../shots` and
+`PUT /api/projects/{id}` by inventing a shot id.
+
+**Checked before accepting it, because the docstring staked a security claim on it.** The model
+cannot reach this. `director/chat`'s `apply_shots` constructs a new Shot from three named fields —
+`Shot(start=item.start, duration=item.duration, prompt=item.prompt)` at `app.py:13885` — and
+mutates only those same three on an existing one. It never accepts a client body, and no tool
+schema declares `effects`. So what actually keeps filter configuration away from a model is the
+tool schema and that explicit construction, **not** the adopt guard. The guard's stated reason was
+wrong even while its conclusion was safe.
+
+The two generic routes are reachable by any HTTP client — and any client that can call them can
+equally call `PUT .../effects`. The widening therefore grants no capability to anyone who did not
+already have it, and AD-27 still holds absolutely: nothing reaches a filter string unvalidated.
+
+**The ruling:** an arriving stack on a Shot the store does not hold is kept when it validates and
+refuses the write when it does not. `PUT .../effects` is the one route that changes an **existing**
+Shot's stack, and that narrower sentence is the one to state. A guard's docstring may not claim a
+security property that a different mechanism is actually providing — the claim outlives the
+reading, and the next person to weaken the guard will believe they are weakening a defence.
+
+*Rejected:* a client-side follow-up write after each split, which is not atomic — the split would
+land and its look could fail separately, leaving exactly the ungraded half this fixes.
+
 ---
 
 ## Process rulings

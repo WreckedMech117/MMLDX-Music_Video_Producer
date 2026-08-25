@@ -754,6 +754,47 @@ def test_a_value_of_the_wrong_type_is_refused_naming_the_offender():
         assert fragment in str(refusal.value)
 
 
+def test_an_integer_too_wide_for_a_double_is_refused_and_not_a_crash():
+    """The one unusable number that used to leave by a different door.
+
+    `float()` answers an `int` wider than a double with `OverflowError`, and a validation that
+    converted before it checked raised it straight through `validate_stack` — past every
+    `except EffectRefusal` a caller has. Measured on the write route and again at export: 500,
+    500, zero jobs written. JSON puts no width on an integer literal, so a 401-digit `zoom` is
+    something a client can genuinely send.
+
+    `1e400` was never the same fault: it parses to `inf` and has always refused cleanly. Both
+    forms are asserted here together so the two doors cannot drift apart again.
+    """
+    too_wide = int("9" * 401)
+    sentence = (
+        "punch_in's zoom is a whole number too large for this application to read as a number "
+        "at all. It takes a number between 1 and 2. Nothing was composed."
+    )
+    for value in (too_wide, -too_wide):
+        with pytest.raises(EffectRefusal) as refusal:
+            stages([effect("punch_in", zoom=value)])
+        assert str(refusal.value) == sentence
+        # The refusal is the *only* thing that leaves. An `OverflowError` is a `ValueError`'s
+        # sibling, not a subclass, so a bare `pytest.raises(ValueError)` above would have passed
+        # against the bug — this is the assertion that would not have.
+        with pytest.raises(EffectRefusal):
+            validate_stack([effect("punch_in", zoom=value)])
+
+    # The neighbouring wordings this fix deliberately did not reuse, held in place: `inf` is not
+    # finite and says so, and an ordinary oversized value still reads as a bound broken.
+    with pytest.raises(EffectRefusal) as infinite:
+        stages([effect("punch_in", zoom=float("1e400"))])
+    assert str(infinite.value) == (
+        "punch_in's zoom must be a finite number, and inf is not. Nothing was composed."
+    )
+    with pytest.raises(EffectRefusal) as ordinary:
+        stages([effect("punch_in", zoom=99)])
+    assert str(ordinary.value) == (
+        "punch_in's zoom is 99, above its maximum of 2. Nothing was composed."
+    )
+
+
 def test_a_choice_outside_its_set_is_refused_with_the_set_named():
     with pytest.raises(EffectRefusal) as refusal:
         stages([effect("mirror", axis="diagonal")])

@@ -82,6 +82,7 @@ from .director import (
 from .dp_prompt import DP_SYSTEM_PROMPT, dp_input
 from .effects import (
     EFFECT_CATALOGUE,
+    EFFECT_LUT_UNKNOWN_REFUSAL,
     FAMILY_ORDER,
     ChoiceParameter,
     EffectRefusal,
@@ -2218,7 +2219,12 @@ def _adopt_expansion_maps(project: Project, stored: dict[str, Shot]) -> None:
             )
 
 
-def _adopt_shot_effects(project: Project, stored: dict[str, Shot]) -> None:
+def _adopt_shot_effects(
+    project: Project,
+    stored: dict[str, Shot],
+    *,
+    looks: Callable[[], Sequence[LutEntry]] | None = None,
+) -> None:
     """Server-own `Shot.effects` across the two generic whole-shot writes.
 
     **Written in the same commit as the field**, because this repository's own history says the
@@ -2238,25 +2244,63 @@ def _adopt_shot_effects(project: Project, stored: dict[str, Shot]) -> None:
     a route that never asks the catalogue whether it is composable, past the one validator (AD-27)
     that stands between a client's numbers and an ffmpeg filter string.
 
-    A Shot the stored project does not hold is new and gets an **empty** stack, not the body's —
-    the anchor adoption's `.get(..., "")` reading rather than `_adopt_expansion_maps`' derive-it,
-    and for the anchor's reason: a stack that arrived here was not written on the route that
-    writes stacks. There is nothing to derive a look from either; an unstyled Shot is exactly what
-    a new Shot is.
+    A Shot the stored project does not hold is new, and its stack is **validated and kept** —
+    not dropped, which is what this helper did until 2026-08-25 and what two reviewers found
+    independently. Dropping it looked like the anchor adoption's `.get(..., "")` reading, and it
+    was wrong for this field because of the classification: `effects` is
+    `SHOT_PLAN_CONTENT_FIELDS`, so Split and Duplicate copy the stack onto a new id
+    (`api.newShotFromPlan`) and persist it through `PUT .../shots` — the only order a Director
+    ever produces. The half a Director never touched came back ungraded, and
+    `models.SHOT_PLAN_CONTENT_FIELDS` says exactly why that is the sharp case: "the two halves of
+    one shot are one shot's look, and a half that lost it would grade differently from its own
+    other half."
 
-    Deep-copied rather than shared, because the stored `Shot` objects and the ones about to be
-    saved are different objects and a shared `EffectSpec` would let a later mutation of one show
-    up in the other.
+    Validated rather than trusted, which is what keeps the property this guard actually protects.
+    Nothing client-supplied reaches a filter string without `validate_stack` agreeing first
+    (AD-27) — the same function the narrow route runs and the same one the export runs again — so
+    a new Shot cannot smuggle filter configuration past the catalogue by arriving on a whole-plan
+    write. A stack it refuses refuses **the whole write**, by name, with the chain's own sentence
+    carried whole: a save that landed nine shots and silently dropped the tenth's look is the
+    failure being fixed, not a smaller version of it to introduce here.
 
-    `PUT .../shots/{shot_id}/effects` is the one writer, and it is what keeps this field out of
-    reach of anything a model can call — no tool schema declares it and the Director's context
-    withholds it.
+    It is also atomic. The split and its look land in one request, where a client-side follow-up
+    write to the narrow route could fail — a 409, a closed tab — and leave a half ungraded with
+    nothing saying so. `_adopt_expansion_maps`, the sibling this helper matches, already handles
+    its own new-Shot case by deriving rather than dropping; dropping was never the only option.
+
+    `looks` is a callable rather than a listing because discovery costs 221 ms cold and this
+    helper runs on **every** ordinary save. It is called only when a new Shot actually carries a
+    stack, which is the same rule `replace_shot_effects` follows: a plan of unstyled shots reads
+    the looks folder exactly never.
+
+    An **existing** Shot's stored stack is adopted whatever the body says, in both directions, and
+    that is untouched: a body that omits `effects` cannot blank a look and a body that invents one
+    cannot plant it. Deep-copied rather than shared, because the stored `Shot` objects and the
+    ones about to be saved are different objects and a shared `EffectSpec` would let a later
+    mutation of one show up in the other.
+
+    `PUT .../shots/{shot_id}/effects` is still the one route that *edits* a stack, and it is what
+    keeps this field out of reach of anything a model can call — no tool schema declares it and
+    the Director's context withholds it.
     """
     for shot in project.shots:
         was = stored.get(shot.id)
-        shot.effects = (
-            [spec.model_copy(deep=True) for spec in was.effects] if was is not None else []
-        )
+        if was is not None:
+            shot.effects = [spec.model_copy(deep=True) for spec in was.effects]
+            continue
+        if not shot.effects:
+            continue
+        stack = [spec.model_dump() for spec in shot.effects]
+        try:
+            validate_stack(stack, luts=looks() if looks is not None else ())
+        except EffectRefusal as refusal:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_UNCOMPOSABLE_REFUSAL.format(
+                    shot=shot_label(project, shot), detail=refusal
+                ),
+            ) from refusal
+        shot.effects = stored_effect_stack(stack)
 
 
 #: Everything about a job that this application **recorded** rather than a client supplied. Named
@@ -6862,9 +6906,19 @@ class ShotEffectsRequest(BaseModel):
     A body that is not a list at all is pydantic's 422, which is correct: `validate_stack`'s
     `EFFECT_STACK_NOT_A_LIST_REFUSAL` covers the Python caller handing it a string, and this
     field's declared type covers the wire.
+
+    **`None` is the default and not `[]`**, which is the whole of the difference between a body
+    that clears a stack and a body that names nothing. Under `Field(default_factory=list)` the
+    two were indistinguishable, so `{"efects": [...]}` — pydantic ignores the undeclared key —
+    bound to `[]`, stored `[]`, and answered **200**: a misspelling destroyed a Director's grade
+    and reported success, with `validate_stack` never seeing the body. The route refuses `None`
+    by name (`SHOT_EFFECTS_ABSENT_REFUSAL`) and treats `[]` exactly as it always has, because
+    clearing every card has to stay possible and has to stay explicit. This route's own docstring
+    already argues at length that a misspelled `paramters` must not quietly do nothing one level
+    down; `efects` did worse than nothing one level up.
     """
 
-    effects: list[dict[str, Any]] = Field(default_factory=list)
+    effects: list[dict[str, Any]] | None = None
 
 
 class ShotEffectsResponse(BaseModel):
@@ -7051,6 +7105,83 @@ def stored_effect_stack(specs: Sequence[Mapping[str, Any]]) -> list[EffectSpec]:
 SHOT_EFFECTS_LOCKED_REFUSAL = (
     "{shot} is locked, so its effects were not changed. Unlock the shot to change its look."
 )
+
+
+#: Why a whole-plan write was refused: a Shot it is *adding* carries a stack the catalogue will
+#: not compose. `_adopt_shot_effects` raises it, so it is Split's and Duplicate's refusal.
+#:
+#: Two-layered like `ASSEMBLY_EFFECTS_REFUSAL` and for the same reason — `EffectRefusal` is a pure
+#: function of a stack and has no idea which Shot carries it — and it says the *whole* write was
+#: refused, because it was: nothing is saved. A save that landed nine shots and quietly dropped
+#: the tenth's look is the failure this fix exists against, so the refusal must not read as
+#: "your plan was saved, minus one thing".
+SHOT_EFFECTS_UNCOMPOSABLE_REFUSAL = (
+    "{shot} is new to this plan and arrives with an effect stack that cannot be composed, so "
+    "nothing was saved. {detail}"
+)
+
+
+#: Why a stack write that named no stack was refused, and how to say the thing it probably meant.
+#:
+#: `PUT .../effects {"efects": [...]}` used to answer 200 and store `[]`: pydantic ignores an
+#: undeclared key, the declared one took its default, and a Director's grade was destroyed by a
+#: typo that reported success. `validate_stack` never saw the body at all. So `effects` is
+#: optional-with-no-default on the request model and its **absence** is refused here, while
+#: `{"effects": []}` keeps working untouched — that is how a Director takes every card off, and
+#: it is the one write on this route that costs no folder read.
+#:
+#: The remedy is in the sentence because absence has two very different causes — a misspelled key
+#: and a client that meant to clear the stack — and the reader cannot be assumed to know which
+#: one this application saw.
+SHOT_EFFECTS_ABSENT_REFUSAL = (
+    "This write named no effects at all, so {shot}'s look was left exactly as it was. An effect "
+    'stack is sent as "effects": [...], and "effects": [] is how every effect comes off. '
+    "Nothing was changed."
+)
+
+
+#: How many effects one Shot may carry. The chain goes into a single `-vf` argument and Windows
+#: caps a command line at 32767 characters, so an unbounded stack does not fail as an unbounded
+#: stack: measured 2026-08-25, 985 grain cards built an argv of 32725 characters and exported,
+#: 1200 built 40060 and came back **502 "ffmpeg is not installed or not on PATH"**, because
+#: Windows raises `FileNotFoundError [WinError 206]` and `run_tool` maps every `FileNotFoundError`
+#: to that sentence. That mapping predates this slice and is recorded as its own defect; what is
+#: new here is that a client can grow the argv, so the bound belongs at the write.
+#:
+#: 32 and not 985. The cap is not the argv limit converted into cards — it is what a stack can
+#: plausibly be, with the widest card (a `lut_look`, which carries a whole escaped path) leaving
+#: the argv an order of magnitude clear of the limit. A Director who needs a thirty-third effect
+#: on one Shot has found something this design has not thought about, which is a conversation and
+#: not a number to raise quietly.
+SHOT_EFFECT_STACK_LIMIT = 32
+
+#: Why a stack was refused for its length. Names both numbers, because "too many" without the
+#: bound tells a client nothing about what to send instead.
+SHOT_EFFECTS_TOO_MANY_REFUSAL = (
+    "An effect stack holds at most {limit} effects, and this one names {count}. "
+    "Nothing was composed."
+)
+
+
+#: The opening of `EFFECT_LUT_UNKNOWN_REFUSAL`, up to the id it names — derived from the constant
+#: rather than typed again, so a reworded refusal carries this along with it instead of leaving a
+#: literal here that matches nothing and a rescan that silently stops happening.
+_UNKNOWN_LOOK_OPENING = EFFECT_LUT_UNKNOWN_REFUSAL.split("{lut!r}", 1)[0]
+
+
+def _names_an_undiscovered_look(refusal: EffectRefusal) -> bool:
+    """Whether this refusal is the one that a fresh look at the folder could answer differently.
+
+    `EffectRefusal` carries a sentence and nothing else — it is `effects.py`'s to raise and this
+    module does not get to add a code to it — so the sentence is what identifies it. Read against
+    the constant's own opening, which is what keeps the two together.
+
+    Only the *unknown id* refusal qualifies. Every other one — a number out of bounds, a
+    misspelled key, an unnamed look — is a fact about the body, and re-reading the disk cannot
+    change the answer. The file-missing refusal is not this one either: that id **was** discovered
+    and the file has gone, so a rescan would turn a precise sentence into a vaguer one.
+    """
+    return str(refusal).startswith(_UNKNOWN_LOOK_OPENING)
 
 
 #: Why an export refused a Shot's stack, with the chain's own sentence inside it.
@@ -8350,8 +8481,13 @@ def create_app(
         # carries every field of every Shot and `effects` is defaulted, so an ordinary save from
         # any existing client would blank every look in the project; a body that invented one
         # would write filter configuration past the catalogue validator that stands between a
-        # client's numbers and a filter string. See `_adopt_shot_effects`.
-        _adopt_shot_effects(project, {shot.id: shot for shot in current.shots})
+        # client's numbers and a filter string. A Shot this project does not yet hold keeps the
+        # stack it arrived with — Split and Duplicate are how one gets here — and it is validated
+        # first, so the catalogue still answers before anything is stored. See
+        # `_adopt_shot_effects`.
+        _adopt_shot_effects(
+            project, {shot.id: shot for shot in current.shots}, looks=discovered_looks
+        )
         # Every recorded fact about a job is server-owned here — the *eleventh* time this one
         # route has been the hole for a field a narrower sibling guards, and the second time this
         # particular helper has had to grow to close it. A body carries every field of every job,
@@ -8408,8 +8544,10 @@ def create_app(
         # this field**: dragging a clip, splitting one, or moving a shot's window all write the
         # whole shot list back through here, so a Director who graded ten shots and then nudged
         # one would otherwise lose all ten looks to a gesture that has nothing to do with them.
-        # See `_adopt_shot_effects`.
-        _adopt_shot_effects(project, previous)
+        # **And it is the route Split and Duplicate land on**, so a Shot this plan does not yet
+        # hold keeps the validated stack it arrived with rather than being saved ungraded. See
+        # `_adopt_shot_effects`.
+        _adopt_shot_effects(project, previous, looks=discovered_looks)
         # **This is the route the live defect came in on.** Attach, detach and re-role are all one
         # gesture in the browser — mutate the shot's `citations`, write the whole shot list — so
         # this is where "re-expand automatically when an asset is attached" has to happen. The
@@ -11597,10 +11735,16 @@ def create_app(
     ) -> Project:
         """Write one Shot's Effect Stack — validated against the catalogue before a byte is stored.
 
-        **The one writer of this field**, which is what keeps a look out of reach of everything
-        that is not a Director: the two generic manifest writes re-adopt the stored stack
-        (`_adopt_shot_effects`), no tool schema declares it, and the Director's context withholds
-        it. A look is an eye on a take.
+        **The one route that changes an existing Shot's stack**, which is what keeps a look out of
+        reach of everything that is not a Director: the two generic manifest writes re-adopt the
+        stored stack for every Shot they already hold (`_adopt_shot_effects`), no tool schema
+        declares it, and the Director's context withholds it. A look is an eye on a take.
+
+        The one thing that arrives elsewhere is a Shot that is *new* to the plan, which those
+        writes keep — validated by the same `validate_stack` this route runs — because Split and
+        Duplicate copy the look onto a new id and save the whole list. Nothing there can move a
+        stack that already exists; see `_adopt_shot_effects` for why the halves of one shot have
+        to grade alike.
 
         The order of the three gates below is the order they have to be in. The Shot is found
         first, so a request naming nothing is a 404 rather than a lecture about locks. The lock is
@@ -11609,13 +11753,13 @@ def create_app(
         (drawing the controls disabled) is C2's; a guard that lives only in the interface is not
         one.
 
-        **409 for the lock, where three sibling routes answer 422**, and the divergence is
-        deliberate rather than accidental — it is this slice's frozen contract, and it follows
-        `enhance`'s own stated rule better than those siblings do: *a state conflict is a 409
-        because the same request succeeds once it clears*. Unlocking is exactly that, and it is
-        the Director's own gesture. `render_again`, `mark_ready` and `select_take` still answer
-        422 for a lock; changing them is a change to what existing clients read and is not this
-        slice's to make.
+        **422 for the lock, with `render_again`, `mark_ready` and `select_take`.** The Director
+        settled that split on 2026-08-18 and `mark_ready` carries the reasoning: 409 is for a
+        *live render*, where the same request succeeds once the render lands and nothing about
+        it is unprocessable. A lock is not that. It is a fact about the Shot that no amount of
+        waiting changes — it clears by a deliberate act, never by patience — and that ruling
+        names `locked` on the 422 side by name. This slice's spec asked for 409; keeping it
+        would have reopened the drift the ruling exists to close.
 
         Validation is last and is `effects.validate_stack`, which owns the catalogue and is
         the same function the export runs again, so this route and the chain cannot come to
@@ -11633,6 +11777,25 @@ def create_app(
         The looks are resolved only for a stack that has something in it. An empty stack — the
         common write, since clearing every card is how a Director takes a look back off — cannot
         name a LUT, so it costs no folder read at all.
+
+        **A body naming no `effects` at all is refused rather than read as an empty stack.** See
+        `ShotEffectsRequest.effects` and `SHOT_EFFECTS_ABSENT_REFUSAL`: `{"efects": [...]}` used
+        to answer 200 and erase the grade. `{"effects": []}` is untouched by that and stays the
+        way every card comes off.
+
+        **The stack is capped before it is validated** (`SHOT_EFFECT_STACK_LIMIT`), because the
+        chain becomes one `-vf` argument and an argv over 32767 characters fails on Windows as
+        "ffmpeg is not installed" — a false diagnosis of a fault a client caused. The bound is
+        checked here rather than at the export so the refusal names the write that grew it.
+
+        **A look the catalogue does not know rescans the folder once and asks again.** A Director
+        who drops `brand-new-look.cube` in and immediately grades with it was told "There is no
+        look called 'brand-new-look' in the looks folder" — a sentence naming the folder as the
+        authority when the authority was a process-lifetime cache, and offering no remedy
+        reachable from this route. That is the expected gesture, not an exotic one. Exactly one
+        rescan, and only for that refusal: this must not become a folder read per request (221 ms
+        cold on the Director's 44 MB pack), and every other refusal is a fact about the body that
+        no amount of re-reading the disk can change.
         """
         project = get_project(project_id)
         shot = next((item for item in project.shots if item.id == shot_id), None)
@@ -11649,12 +11812,31 @@ def create_app(
                 status_code=422,
                 detail=SHOT_EFFECTS_LOCKED_REFUSAL.format(shot=shot_label(project, shot)),
             )
+        if request.effects is None:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_ABSENT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        if len(request.effects) > SHOT_EFFECT_STACK_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+                    limit=SHOT_EFFECT_STACK_LIMIT, count=len(request.effects)
+                ),
+            )
         try:
             validate_stack(
                 request.effects, luts=discovered_looks() if request.effects else ()
             )
         except EffectRefusal as refusal:
-            raise HTTPException(status_code=422, detail=str(refusal)) from refusal
+            if not _names_an_undiscovered_look(refusal):
+                raise HTTPException(status_code=422, detail=str(refusal)) from refusal
+            # The one retry, and the only refusal that earns one: a look this process has not
+            # discovered *yet*. One rescan, then the answer stands whatever it is.
+            try:
+                validate_stack(request.effects, luts=discovered_looks(rescan=True))
+            except EffectRefusal as rescanned:
+                raise HTTPException(status_code=422, detail=str(rescanned)) from rescanned
         shot.effects = stored_effect_stack(request.effects)
         return store.save(project)
 
@@ -12128,20 +12310,36 @@ def create_app(
         # nothing half-started behind it rather than failing inside ffmpeg with a message about
         # `clut`. A Shot with no stack gets no entry and therefore no stages at all, which is what
         # keeps its argv the argv this route has always built.
+        #
+        # **Accumulated, then raised once** — the shape the pre-pass above already uses, and for
+        # its reason. This loop is the only place a missing *file* can be seen, since
+        # `validate_stack` checks ids against the discovered listing and never touches the disk,
+        # so two shots whose `.cube` files had both been deleted named only the first: restore
+        # it, run again, be told about the second. Being sent back three times for three faults
+        # is the failure `assembly_refusals` exists against, and a refusal that arrives one at a
+        # time is that failure however few of them there are.
+        #
+        # Judged once per Shot rather than once per clip: a shot nested inside another emits two
+        # `ClipWindow`s that share these stages, and telling a Director the same sentence twice
+        # is a worse answer than telling it once.
         effect_stages: dict[str, EffectStages] = {}
+        composition_refusals: list[str] = []
+        judged: set[str] = set()
         for clip in plan.clips:
             stack = stacks.get(clip.shot_id)
-            if not stack:
+            if not stack or clip.shot_id in judged:
                 continue
+            judged.add(clip.shot_id)
             try:
                 effect_stages[clip.shot_id] = build_effect_stages(
                     stack, width=plan.width, height=plan.height, luts=discovered_looks()
                 )
             except EffectRefusal as refusal:
-                raise HTTPException(
-                    status_code=422,
-                    detail=ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal),
-                ) from refusal
+                composition_refusals.append(
+                    ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
+                )
+        if composition_refusals:
+            raise HTTPException(status_code=422, detail="\n".join(composition_refusals))
 
         exports_root = store.media_dir(project_id) / "exports"
         exports_root.mkdir(parents=True, exist_ok=True)

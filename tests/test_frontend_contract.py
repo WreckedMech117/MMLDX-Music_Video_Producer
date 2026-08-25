@@ -8799,6 +8799,120 @@ def test_a_new_shot_made_from_another_carries_the_plan_and_no_take():
     assert len(set(made["ids"])) == 3
 
 
+def graded_project(tmp_path: Path) -> tuple[object, str, dict]:
+    """A real server holding one real graded Shot, plus that project as a client would hold it.
+
+    The looks folder is never touched — `punch_in` names no LUT — so this costs no discovery.
+    """
+    from fastapi.testclient import TestClient
+
+    from music_video_producer.config import Settings
+    from music_video_producer.store import ProjectStore
+
+    store = ProjectStore(tmp_path)
+    client = TestClient(
+        create_app(
+            settings=Settings(data_root=tmp_path, comfy_root=tmp_path / "comfy"), store=store
+        )
+    )
+    project_id = client.post("/api/projects", json={"name": "Graded"}).json()["id"]
+    laid_out = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={"shots": [{"id": "shot_one", "start": 0, "duration": 4, "prompt": "A corridor"}]},
+    )
+    assert laid_out.status_code == 200, laid_out.text
+    graded = client.put(
+        f"/api/projects/{project_id}/shots/shot_one/effects",
+        json={"effects": [{"effect": "punch_in", "parameters": {"zoom": 1.2}}]},
+    )
+    assert graded.status_code == 200, graded.text
+    project = client.get(f"/api/projects/{project_id}").json()
+    assert project["shots"][0]["effects"] == [
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}}
+    ]
+    return client, project_id, project
+
+
+def browser_shot_save(project: dict, gesture: str, selected: str) -> dict:
+    """Fire one timeline gesture in the real workspace and hand back the body it tried to PUT.
+
+    The body is taken off the recorded `fetch`, not rebuilt from `state`: what a server is
+    handed is what the client actually sent, and a reconstruction of it would agree with a
+    client that composed something else. The request rejects — this harness answers no paths —
+    which is exactly the point: the *body* is the artefact, and it is replayed against a real
+    route by the caller.
+    """
+    sent = run_workspace(f"""
+      state.project = {json.dumps(project)};
+      state.selectedShotId = {json.dumps(selected)};
+      fire('{gesture}:click');
+      await flush();
+      console.log(JSON.stringify(requests.filter((entry) => entry.method === 'PUT')));
+    """)
+    assert [entry["path"] for entry in sent] == [f"/api/projects/{project['id']}/shots"], sent
+    return json.loads(sent[0]["body"])
+
+
+def test_a_split_saved_the_way_the_browser_saves_it_keeps_the_look_on_both_halves(
+    tmp_path: Path,
+):
+    """**The gesture and the save, in the one order a Director ever produces them.**
+
+    Two green tests hid this between them until 2026-08-25.
+    `test_a_new_shot_made_from_another_carries_the_plan_and_no_take` proved the browser copy
+    carries `effects`; `test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack`
+    proved the server assigned a new Shot an empty stack. Both passed. Neither ran the two in
+    sequence, and in sequence the second half of every split came back ungraded:
+
+        FIRST HALF : [{'effect': 'punch_in', 'enabled': True, 'parameters': {'zoom': 1.2}}]
+        SECOND HALF: []
+
+    So this test refuses to stop at browser memory. It grades a Shot through the real route,
+    hands the real project to the real workspace, fires `#split-shot`, takes the body the client
+    actually put on the wire, and replays it against the real server — then reads both halves
+    back through a **fresh** `ProjectStore`, because the response body is the in-memory object
+    the route just built.
+
+    Duplicate is the same gesture on the same code path (`newShotFromPlan`, then
+    `saveShotsSilently`), driven here too, because "the split works" and "a new Shot keeps its
+    stack" are different claims and only the second is what actually shipped.
+    """
+    from music_video_producer.store import ProjectStore
+
+    client, project_id, project = graded_project(tmp_path)
+    look = [{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}}]
+
+    # 1. The split, composed by app.js and landed on the real route.
+    body = browser_shot_save(project, "#split-shot", "shot_one")
+    assert len(body["shots"]) == 2, "the browser did not compose two halves"
+    landed = client.put(f"/api/projects/{project_id}/shots", json=body)
+    assert landed.status_code == 200, landed.text
+
+    halves = ProjectStore(tmp_path).get(project_id).shots
+    assert [shot.duration for shot in halves] == [2.0, 2.0]
+    assert [[spec.model_dump() for spec in shot.effects] for shot in halves] == [look, look], (
+        "a half of one shot came back grading differently from its own other half"
+    )
+
+    # 2. Duplicate, from the plan as it now stands, selecting the half that was minted by the
+    #    split — so the copy's look is one that reached the manifest through this same path.
+    project = client.get(f"/api/projects/{project_id}").json()
+    body = browser_shot_save(project, "#duplicate-shot", project["shots"][1]["id"])
+    assert len(body["shots"]) == 3
+    landed = client.put(f"/api/projects/{project_id}/shots", json=body)
+    assert landed.status_code == 200, landed.text
+
+    copied = ProjectStore(tmp_path).get(project_id).shots
+    assert len(copied) == 3
+    assert [[spec.model_dump() for spec in shot.effects] for shot in copied] == [look] * 3, (
+        "a duplicate came back ungraded"
+    )
+    # And the copy is still a new Shot in every other respect: it carries the plan and no take.
+    assert copied[2].id not in {copied[0].id, copied[1].id}
+    assert copied[2].status == "draft"
+    assert copied[2].latest_output == ""
+
+
 def test_the_client_and_server_agree_on_what_a_new_shot_inherits():
     """One classification, partitioned against the model itself.
 

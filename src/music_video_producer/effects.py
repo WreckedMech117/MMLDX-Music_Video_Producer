@@ -301,6 +301,10 @@ EFFECT_STACK_NOT_A_LIST_REFUSAL = (
 EFFECT_PARAMETER_TYPE_REFUSAL = (
     "{effect}'s {parameter} must be {expected}, and {value!r} is not. Nothing was composed."
 )
+EFFECT_PARAMETER_TOO_LARGE_REFUSAL = (
+    "{effect}'s {parameter} is a whole number too large for this application to read as a "
+    "number at all. It takes a number between {minimum} and {maximum}. Nothing was composed."
+)
 EFFECT_PARAMETER_BELOW_REFUSAL = (
     "{effect}'s {parameter} is {value}, below its minimum of {bound}. Nothing was composed."
 )
@@ -1400,7 +1404,26 @@ def _validate_number(effect_id: str, parameter: NumberParameter, value: Any) -> 
                 value=value,
             )
         )
-    number = float(value)
+    # A Python `int` is unbounded and JSON permits the literal, so a 401-digit `zoom` genuinely
+    # arrives over the wire — and `float()` answers it with `OverflowError`, which is not an
+    # `EffectRefusal` and so escaped every caller's `except EffectRefusal` as a 500, on the write
+    # route and again at export. It is refused here like any other unusable number. Note this is
+    # *not* the non-finite case one line below: a 401-digit integer is perfectly finite, it is
+    # simply wider than a double, and telling a Director it "is not a finite number" would be a
+    # false sentence. The value is named by its parameter and its bounds rather than printed —
+    # `repr` of an integer past 4300 digits raises in its own right, which is the very shape of
+    # fault being closed.
+    try:
+        number = float(value)
+    except OverflowError:
+        raise EffectRefusal(
+            EFFECT_PARAMETER_TOO_LARGE_REFUSAL.format(
+                effect=effect_id,
+                parameter=parameter.name,
+                minimum=_message_number(parameter.minimum),
+                maximum=_message_number(parameter.maximum),
+            )
+        ) from None
     if not math.isfinite(number):
         raise EffectRefusal(
             EFFECT_PARAMETER_TYPE_REFUSAL.format(
