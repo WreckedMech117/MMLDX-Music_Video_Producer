@@ -6899,8 +6899,10 @@ export function effectStackSetParameter(stack, index, name, value, parameter = n
 }
 
 //: The clip's effects chip (DESIGN section 3): a Consolas hooked f, `--muted` on `--surface-2`,
-//: sharing the corner with approved and flagged. Three chips is the maximum that corner will ever
-//: carry, which is the reason no fourth may be invented without removing one.
+//: stacking in a column up the clip's right edge with approved and flagged, in the reading order
+//: `✓ ƒ ⚑`. There is no cap and none is stated (amended 2026-08-25): the old "three chips is the
+//: maximum" was a width constraint wearing a design rule, and the column spends height instead --
+//: the clip's own 82px, which holds four, is the only limit.
 export const CLIP_EFFECTS_CHIP = "ƒ";
 
 // Whether a clip says it carries a look, and what it says about it. A count rather than a bare

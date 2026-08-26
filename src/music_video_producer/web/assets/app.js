@@ -1707,13 +1707,20 @@ function renderTimeline() {
     const band = clipWindowState(windowKinds[shot.id], [cell.label, phase.note].filter(Boolean).join(" "));
     // Whether this clip says it carries a look, and what it says. Decided by `clipEffectsChip`,
     // applied here: the glyph, the count and the accessible name all come out of it, because a
-    // corner glyph is state by appearance alone unless something announces it. It shares the
-    // corner with approved and flagged in the reading order the design fixed, and three chips is
-    // the maximum that corner will ever carry.
+    // corner glyph is state by appearance alone unless something announces it.
+    //
+    // The chips go into one column (DESIGN 3, amended 2026-08-25) rather than side by side in the
+    // corner: `.clip-chips` is bottom-anchored at the clip's right edge and stacks whatever it is
+    // given, so a second chip -- approved, flagged -- is one more entry in this array and no
+    // layout work at all. Written in the reading order the design fixed (`✓ ƒ ⚑`), of which only
+    // `ƒ` exists. `data-chips` is how many were drawn; the stylesheet decides from it whether the
+    // prompt needs holding off the column, because one chip passes under the prompt and does not.
+    // It reports what this line just drew rather than deciding anything a second time.
     const fx = clipEffectsChip(shot);
-    const fxHtml = fx.shown
-      ? `<span class="clip-fx" role="img" title="${escapeHtml(fx.label)}" aria-label="${escapeHtml(fx.label)}">${escapeHtml(fx.glyph)}</span>`
-      : "";
+    const chips = fx.shown
+      ? [`<span class="clip-fx" role="img" title="${escapeHtml(fx.label)}" aria-label="${escapeHtml(fx.label)}">${escapeHtml(fx.glyph)}</span>`]
+      : [];
+    const fxHtml = chips.length ? `<span class="clip-chips">${chips.join("")}</span>` : "";
     const marks = [
       `status-${shot.status || "draft"}`,
       shot.approved_output || shot.status === "approved" ? "approved" : "",
@@ -1723,7 +1730,7 @@ function renderTimeline() {
       phase.className,
       band.className,
     ].filter(Boolean).join(" ");
-    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}" title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(phase.flag || renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span>${fxHtml}<span class="resize-handle right"></span></div>`;
+    return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}"${chips.length ? ` data-chips="${chips.length}"` : ""} title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(phase.flag || renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span>${fxHtml}<span class="resize-handle right"></span></div>`;
   }).join("");
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();

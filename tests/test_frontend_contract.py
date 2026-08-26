@@ -19882,6 +19882,190 @@ def test_a_clip_carrying_effects_says_so_in_the_corner_and_announces_the_count()
     assert "clip-fx" not in plain
 
 
+def css_rule(selector: str) -> dict[str, str]:
+    """One flat rule's declarations, read out of the real stylesheet by name.
+
+    Read rather than restated because the assertions below are about *numbers* -- a chip's
+    height, a column's gap, the inset that holds text off it -- and a number a test carries as a
+    literal is a number that stops describing the stylesheet the moment someone edits it. Where a
+    selector is written more than once -- `.shot-clip` is, twice -- every occurrence is merged in
+    source order, later winning, which is what the cascade does at equal specificity.
+    """
+    bodies = [
+        body for name, body in css_rules(STYLES_CSS.read_text(encoding="utf-8"))
+        if name == selector
+    ]
+    assert bodies, f"{selector} has no rule in styles.css"
+    out: dict[str, str] = {}
+    for declaration in ";".join(bodies).split(";"):
+        if ":" not in declaration:
+            continue
+        name, _, value = declaration.partition(":")
+        out[name.strip()] = value.strip()
+    return out
+
+
+def pixels(value: str) -> float:
+    assert value.endswith("px"), value
+    return float(value[:-2])
+
+
+def test_a_clip_carrying_effects_stacks_its_chips_in_a_bottom_anchored_column():
+    """The chip is drawn by a column, and the lone chip lands where the lone chip always landed.
+
+    DESIGN 3 as amended 2026-08-25: chips stack UP the right edge instead of sitting abreast,
+    because abreast was a width constraint (`min-width: 40px`) wearing a design rule. The single
+    chip is the case that ships, so what is asserted here is that wrapping it changed nothing
+    about where it is -- the column carries the old `right`/`bottom` offsets and the chip keeps
+    its own 15px box, its `--surface-2` ground and its `--muted` ink.
+    """
+    column = css_rule(".clip-chips")
+    chip = css_rule(".clip-fx")
+
+    assert column["position"] == "absolute"
+    assert column["display"] == "flex"
+    assert column["flex-direction"] == "column"
+    # The offsets the lone chip used to carry itself, moved up one box and not otherwise touched.
+    assert column["right"] == "14px"
+    assert column["bottom"] == "4px"
+    # The column has no height of its own: bottom-anchored with auto height, it grows upward as
+    # chips arrive. A height here would fix the box and clip the fourth chip instead.
+    assert "height" not in column and "top" not in column
+    # The chip itself no longer positions -- the column does -- but it is the same box it was.
+    assert "position" not in chip and "right" not in chip and "bottom" not in chip
+    assert chip["width"] == "15px" and chip["height"] == "15px"
+    assert chip["background"] == "var(--surface-2)"
+    assert chip["color"] == "var(--muted)"
+    assert chip["flex"] == "none", "a chip that can flex is a chip a full column squashes"
+    assert "Consolas" in chip["font"]
+
+
+def test_the_clip_holds_four_chips_inside_the_height_it_already_has():
+    """The cap the amendment dropped is replaced by an arithmetic one, and it is checked here.
+
+    Four 15px chips, three gaps and the bottom inset must fit the clip's own content box, or the
+    top chip is silently cut off by `.shot-clip`'s `overflow: hidden` -- which is exactly the
+    failure the old three-chip rule was invented to avoid and which no browser would report.
+    """
+    column = css_rule(".clip-chips")
+    chip = css_rule(".clip-fx")
+    clip = css_rule(".shot-clip")
+
+    tall = pixels(chip["height"]) * 4 + pixels(column["gap"]) * 3 + pixels(column["bottom"])
+    # `.shot-clip` is border-box, so the two 1px borders come out of the 82px before the column.
+    room = pixels(clip["height"]) - 2
+    assert tall <= room, f"four chips need {tall}px and the clip offers {room}px"
+
+
+#: Where the prompt's second clamped line stops painting, measured down from the clip's top edge in
+#: Edge at the shipped font and clamp -- 47.8px on a plain clip, and this, 59.8px, on one that also
+#: carries the `.clip-state` RENDERING line, which pushes the prompt down and is the worst case.
+#: Not derivable from the stylesheet: it is the browser's normal line-height for the 9px Consolas
+#: id row plus the clamped box, so it is measured and cited rather than computed. The run that
+#: produced it writes `test-artifacts/chip-inset-result.json`.
+PROMPT_INK_BOTTOM = 59.8
+
+
+def chip_column_top(count: int) -> float:
+    """How far down the clip the top of a column of `count` chips sits, from the stylesheet."""
+    column = css_rule(".clip-chips")
+    chip = css_rule(".clip-fx")
+    clip = css_rule(".shot-clip")
+    tall = pixels(chip["height"]) * count + pixels(column["gap"]) * (count - 1)
+    # Bottom-anchored inside the clip's padding box, so the clip's bottom border comes off first.
+    return pixels(clip["height"]) - 1 - pixels(column["bottom"]) - tall
+
+
+def test_one_chip_passes_under_the_prompt_and_the_second_chip_does_not():
+    """The threshold the inset is gated on, asserted as geometry rather than taken on trust.
+
+    This is the reason the shipped single chip costs the prompt nothing: its column stops below
+    the last line the prompt paints, even on a clip carrying the RENDERING line. The second chip
+    is 19px higher and lands inside the text. Change a chip's height, the gap, the bottom offset
+    or the clip's height and the threshold moves -- which is what this catches, because the CSS
+    rule below would go on saying "not one" while the geometry underneath it had changed.
+    """
+    assert chip_column_top(1) > PROMPT_INK_BOTTOM, (
+        f"one chip now reaches the prompt's text ({chip_column_top(1)}px vs "
+        f"{PROMPT_INK_BOTTOM}px); the inset can no longer be free at one chip")
+    assert chip_column_top(2) < PROMPT_INK_BOTTOM, (
+        f"two chips no longer reach the prompt ({chip_column_top(2)}px); the inset is being "
+        f"charged for a collision that has stopped happening")
+
+
+def test_the_prompt_is_inset_only_at_the_counts_that_need_it():
+    """One rule, gated on the count, wide enough to clear the column and off at one chip.
+
+    Measured before it was written: with the inset removed, a 96px clip carrying one chip has
+    *zero* glyphs intersecting the chip (0 with the RENDERING line too), two chips have five, and
+    three have fourteen. With the inset on, a wide clip has none at any count and its readable
+    prompt drops from 31 characters to 15 -- so at one chip the inset was 16 characters spent on
+    nothing.
+    """
+    column = css_rule(".clip-chips")
+    chip = css_rule(".clip-fx")
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+
+    # Every rule in the stylesheet that insets a clip's prompt from the right.
+    insets = [
+        (selector, body) for selector, body in css_rules(styles)
+        if ".clip-prompt" in selector and re.search(r"padding(-right)?\s*:", body)
+    ]
+    assert len(insets) == 2, insets
+    base = next(item for item in insets if item[0] == ".shot-clip .clip-prompt")
+    gated = next(item for item in insets if item[0] != base[0])
+    # The base rule is untouched, so a clip below the threshold is inset like any other clip.
+    assert "padding: 0 9px" in base[1], base
+
+    # The gate reads the count the clip drew, and one chip is outside it.
+    assert "[data-chips]" in gated[0], gated[0]
+    assert ':not([data-chips="1"])' in gated[0], gated[0]
+    footprint = pixels(column["right"]) + pixels(chip["width"])
+    padding = css_rule(gated[0])["padding-right"]
+    assert pixels(padding) >= footprint, (padding, footprint)
+    # And no further than it must be: the column plus a gutter, not a round number pulled out of
+    # the air. A whole chip's width of slack means someone stopped measuring.
+    assert pixels(padding) - footprint < pixels(chip["width"]), (padding, footprint)
+
+
+def test_the_chip_column_leaves_the_timelines_own_geometry_alone():
+    """Row geometry does not become content-dependent (DESIGN 3).
+
+    Clip `left` and `width` are arithmetic in `app.js`; the clip's height and the track's
+    min-height are what that arithmetic is drawn into. A chip may not move any of them, and the
+    clip's inline style may still carry nothing but the two numbers it always carried.
+    """
+    assert css_rule(".shot-clip")["height"] == "82px"
+    assert css_rule(".track")["min-height"] == "62px"
+
+    drawn = run_effects_workspace(f"""
+      state.project = {{ id: 'p1', jobs: [], song: null, assets: [], messages: [], sections: [],
+        shots: [{effects_shot(effects=[{"effect": "grain", "enabled": True, "parameters": {}}])},
+                {effects_shot(id="shot_b", start=4)}] }};
+      state.selectedShotId = 'shot_a';
+      fire('#zoom-in:click');
+      console.log(JSON.stringify({{ track: at('#shots-track').innerHTML }}));
+    """)
+
+    graded, plain = drawn["track"].split('data-shot-id="shot_b"')
+    # One column, holding the chip, and the count the stylesheet gates on -- graded clip only.
+    assert '<span class="clip-chips"><span class="clip-fx"' in graded
+    assert 'data-chips="1"' in graded
+    assert "clip-chips" not in plain and "data-chips" not in plain
+    # The class the count replaced is gone from both the markup and the stylesheet, so nothing is
+    # left half-migrated and looking live.
+    assert "has-chips" not in drawn["track"]
+    assert "has-chips" not in STYLES_CSS.read_text(encoding="utf-8")
+    # Nothing but left and width in the inline style, on either clip.
+    for style in re.findall(r'class="shot-clip[^"]*"[^>]*style="([^"]*)"', drawn["track"]):
+        assert re.fullmatch(r"left:[-\d.]+px;width:[\d.]+px", style), style
+    # The attribute carries the count, and only the source can say so: `clipEffectsChip` yields at
+    # most one chip today, so a hard-coded `data-chips="1"` draws identically to the real thing
+    # and would come apart silently on the day a second chip is added -- which is the day the
+    # stylesheet starts reading this number.
+    assert 'data-chips="${chips.length}"' in APP_JS.read_text(encoding="utf-8")
+
+
 def test_the_client_picker_is_executed_against_the_servers_own_catalogue(tmp_path: Path):
     """The literal above describes a wire shape; this proves the wire shape is that one.
 
@@ -19959,7 +20143,8 @@ def test_the_bind_glyph_ships_inert_and_no_effects_control_draws_the_transition_
     assert "--blue" not in root.group(1)
     effects_rules = "\n".join(
         line for line in styles.splitlines()
-        if line.startswith((".effect", ".shot-tab", ".clip-fx"))
+        if line.startswith((".effect", ".shot-tab", ".clip-fx", ".clip-chips",
+                            ".shot-clip[data-chips]"))
     )
     assert effects_rules, "the effects surface has no rules"
     assert "var(--blue" not in effects_rules

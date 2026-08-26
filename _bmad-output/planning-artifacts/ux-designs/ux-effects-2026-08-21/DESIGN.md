@@ -46,7 +46,17 @@ The MVP contract's rule stands: **one state, one colour, everywhere it appears.*
 | Overlap with no Transition set | `--line-strong` hatch, no `--blue`, Consolas `CUT` label — an overlap is a hard cut until a type is chosen, and it must look like one |
 | Parameter bound to a Band | `〜` glyph on the parameter row, `--dim` when inert, `--blue` when bound |
 
-The `ƒ` chip coexists with `⚑` (flagged) and `✓` (approved) in the same corner, in that reading order: `✓ ƒ ⚑`. Three chips is the maximum the corner will ever carry, and it is the reason no fourth chip may be invented without removing one.
+Chips **stack in a column up the clip's right edge**, newest concern nearest the bottom, and are ordered only when there is more than one. The reading order when they coexist is `✓ ƒ ⚑`.
+
+**Amended 2026-08-25 by Director ruling.** This section previously said the chips sat side by side in one corner and that *"three chips is the maximum the corner will ever carry"*. That cap was a **width** constraint wearing a design rule: a clip is `min-width: 40px` — a short Shot, or any Shot at low zoom — and a single 15px chip at its 14px offset already claims 29px of it, so three abreast simply cannot fit a narrow clip. Stacking spends height instead, and a clip is a fixed 82px tall, which holds four 15px chips with their gaps inside the existing box. **No cap is needed and none is stated**; the limit is the clip's own height, which is a real constraint rather than an invented one.
+
+Row geometry does **not** become content-dependent. The clip stays 82px and the track keeps its `min-height`; nothing about a chip changes what the timeline's arithmetic assumes.
+
+**The prompt is inset only at the counts that need it, and one chip does not.** The first draft of this amendment said a clip carrying chips insets its prompt, full stop. Measured 2026-08-25 against painted glyph rectangles rather than element boxes — a `-webkit-line-clamp` box has rectangles for lines it does not paint, and counting those invents collisions — the column's top sits at **62px** for one chip and rises 19px per chip after it, while the prompt stops painting at **47.8px**, or **59.8px** on a clip also carrying a RENDERING line. One chip therefore passes cleanly beneath the prompt, clearing even the worst case by 2.2px, and the collision begins at **two**. A flat inset cost a wide clip 16 of its 31 readable characters to prevent nothing. So the inset is a function of the column's height and starts at the second chip.
+
+One honest limit: on a clip at its `min-width: 40px` the prompt's content box is already zero, so text overflows to the clip's edge whatever the padding says — the overlap there is pre-existing geometry and no inset changes it. And at **four** chips the top of the column reaches the `.clip-id` row, which has no inset of its own, so a short clip loses the tail of "SHOT 01 · 6.0s". The 82px budget genuinely holds four chips; the *readable* budget on a short clip is nearer three. Whoever adds the second chip inherits that.
+
+At the time of writing only `ƒ` exists: approved and flagged are still a border colour and a top border rather than chips, so the reading order above is a rule waiting for a second chip to govern.
 
 ## 4. New components
 

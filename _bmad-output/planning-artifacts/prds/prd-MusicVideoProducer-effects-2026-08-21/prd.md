@@ -158,7 +158,7 @@ The Director can add, remove, reorder, and individually disable Effects on a Sho
 
 **Consequences (testable):**
 - A disabled Effect is retained with its parameters and contributes nothing to preview or export.
-- An empty Effect Stack produces an export byte-identical to today's export for that Shot.
+- An empty Effect Stack produces the byte-identical ffmpeg **command** today's export produces for that Shot. *(Amended 2026-08-25, ruling R-20: the guarantee is about the command and the filter graph's frames, never the encoded file. An mp4 out of this pipeline is not byte-reproducible at all — eight renders of one identical chain produced two distinct pictures, and pinning the encoder to a single thread collapsed them to one. Multi-threaded libx264 is not bit-exact on high-entropy input, so the original wording was untestable as written.)*
 - Removing every Effect from a Shot returns it to the empty state, not to a residual one.
 - The Effect Stack is stored on the Shot in the Project manifest and is fully re-derivable from it.
 - Reordering within the constraints the render chain imposes is the Director's; reordering that the chain forbids is not offered rather than silently ignored.
@@ -346,7 +346,7 @@ For a Shot carrying a Parameter Binding, the Effects tab shows the Drive that is
 
 **Consequences (testable):**
 - No Effect or Transition ever rewrites, replaces, or modifies a Shot's Approved Output file.
-- Removing every Effect and Transition from a Project produces an export byte-identical to the export that Project produces today.
+- Removing every Effect and Transition from a Project produces the byte-identical ffmpeg **command** that Project's export produces today. *(Amended 2026-08-25, ruling R-20 — the encoded file is not byte-reproducible even between two runs of one unchanged export, so the assertion is on the command and the filter graph.)*
 - A Project manifest carries everything needed to reproduce its export's look. Nothing about an Effect lives only in the interface.
 
 #### FX-24: Export refusals name what is wrong
@@ -461,7 +461,7 @@ Inherited from the product PRD §5, with one amendment and several additions.
 - **SM-E2 — The grid never moves.** Across a full test matrix of Effects and Transitions, every exported video's duration matches its Song within one frame. Binary; gates release.
 - **SM-E3 — A reactive binding is legible.** On a finished export, a viewer who was not told about the binding can identify that the picture is responding to the music. Judged, not measured.
 - **SM-E4 — The iteration loop is usable.** The Director can change an Effect parameter and see the faithful result in motion without losing their place or their patience. Target: under one second from change to a looping Preview Clip, for a Shot of typical length.
-- **SM-E5 — Nothing was lost.** A Project exported before this feature existed exports byte-identically after it, with no Effects applied.
+- **SM-E5 — Nothing was lost.** A Project exported before this feature existed builds the byte-identical ffmpeg **command** after it, with no Effects applied. *(Amended 2026-08-25, ruling R-20. Comparing the two mp4s cannot show this: multi-threaded libx264 is not bit-exact, so two runs of the same unchanged export already differ. The command and the filter graph's raw frames are both reproducible, and are what this metric is read against.)*
 
 **Counter-metrics** — signals that this feature has damaged the product:
 

@@ -56,10 +56,17 @@ h1{font-size:15px;margin:0 0 4px}
 .chead{display:flex;align-items:center;gap:7px;padding:8px 9px;border-bottom:1px solid var(--line)}
 .grip{color:var(--dim);font-size:11px}
 .fam{color:var(--dim)} .enm{color:var(--ink);font-size:12px;flex:1}
-.tog{width:24px;height:13px;border-radius:9px;background:var(--acid);position:relative}
+/* Amended 2026-08-25 by Director ruling. This drawing filled the enable toggle with --acid,
+   which DESIGN section 5's own don't-list forbids: inside the effects surface acid is closed to
+   the slider fill and the active tab underline, because acid means *complete* and *primary
+   action* everywhere else and an on/off toggle is neither. The rule stood and the drawing was
+   wrong; this now matches what slice C2 shipped. On is --line-strong with an --ink knob, off is
+   --surface-3 with a --dim one, and the state is also carried by the card's 45% and by the
+   toggle's accessible name, so it is never colour alone. */
+.tog{width:24px;height:13px;border-radius:9px;background:var(--line-strong);position:relative}
 .tog::after{content:"";position:absolute;top:2px;right:2px;width:9px;height:9px;border-radius:50%;
-  background:var(--acid-ink)}
-.card.off .tog{background:var(--line-strong)}
+  background:var(--ink)}
+.card.off .tog{background:var(--surface-3)}
 .card.off .tog::after{left:2px;right:auto;background:var(--dim)}
 .x{color:var(--dim);font-size:12px}
 .row{display:flex;align-items:center;gap:9px;padding:7px 9px}

@@ -33,7 +33,7 @@ FX-1: Analyze a Song into a Song Envelope — RMS, peak, spectral-flux proxy, pe
 FX-2: Show beat and onset markers against the waveform; display only, toggleable
 FX-3: Snap Shot-boundary edits to beats alongside the playhead and phrase-gap targets; always an assist, never a constraint. **Corrected 2026-08-24 (R-15):** this said *lyric* boundaries. Verified against the pre-epic code — no lyric or phrase target existed on a boundary drag at all; the only one was the playhead magnet, and lyric/phrase snapping lived solely in the batch "Snap cuts" button. The shipped kinds are playhead, phrase gaps and beats. A lyric-word target was deliberately rejected: the batch snapper clamps into voiceless gaps, so offering word edges would be a second opinion about where a cut belongs
 FX-4: Two tabs in the shot inspector — Shot Info (unchanged) and Effects — with tab selection surviving background rebuilds
-FX-5: Build a Shot's Effect Stack — add, remove, reorder, individually disable; empty stack exports byte-identically to today
+FX-5: Build a Shot's Effect Stack — add, remove, reorder, individually disable; an empty stack builds the byte-identical export *command* it builds today (R-20: the mp4 itself is not byte-reproducible)
 FX-6: Copy an Effect Stack to an explicit set of Shots, reporting what it did and naming refusals
 FX-7: Refuse Effect edits on a locked Shot, stating the lock as the reason
 FX-8: Grade family — LUT look, exposure, contrast, saturation, temperature, tint, lift/gamma/gain, monochrome
@@ -283,7 +283,8 @@ So that a Shot stops looking like whatever the model happened to produce.
 **When** the project is exported
 **Then** the grade is composed into the existing `-vf` chain in `trim_args` by the one pure builder in `effects.py`, which imports neither `app.py`, `batch.py`, nor `assembly.py` (AD-17, AD-25)
 **And** the Shot's Approved Output file is not modified (FX-23)
-**And** a Project with an empty stack everywhere exports byte-identically to the file it produces today (FX-5, FX-23).
+**And** a Project with an empty stack everywhere builds the byte-identical ffmpeg **command** it builds today (FX-5, FX-23, R-20)
+**And** that is asserted on the argv and on the filter graph's raw frames, never on the exported file, which is not byte-reproducible between two runs of one unchanged export.
 
 **Given** the generic `PUT /api/projects/{project_id}`
 **When** a body is submitted that omits `effects`, or invents them
@@ -334,20 +335,32 @@ As the Director,
 I want grain, glitch and camera moves as well as colour,
 So that I can hide the plastic sheen of generated footage and put motion where the model gave me none.
 
+> **Split 2026-08-25 by Director ruling.** Five of the effects this story names cannot be expressed
+> by the chain as built, and never could have been: **slow zoom** (Geometry), **bloom/halation**
+> (Texture), and **edge treatment**, **scanline/CRT** and **pixel shuffle/sort** (Stylize). Each
+> needs either a *branched* filtergraph (`split`/`blend`) or the clip's own **duration**, and the
+> chain is a single comma-joined linear graph spliced into an argv that carries neither. They move
+> to **Story 9.7**, which is the change to what `trim_args` is handed; this story keeps the fifteen
+> a linear chain composes, all of which shipped in slice B. **9.3 is complete except for those
+> five, and they are blocked on 9.7 rather than on any work here.**
+
 **Acceptance Criteria:**
 
 **Given** the Texture family
 **When** its catalogue is offered
-**Then** it provides at minimum grain, vignette, bloom/halation, soft-focus diffusion and banding suppression (FX-9).
+**Then** it provides at minimum grain, vignette, soft-focus diffusion and banding suppression (FX-9)
+**And** bloom/halation is delivered by Story 9.7, which gives the chain the branch it needs.
 
 **Given** the Stylize family
 **When** its catalogue is offered
-**Then** it provides at minimum RGB/chroma split, pixel shuffle or sort, posterize, edge treatment and a scanline/CRT look (FX-10)
+**Then** it provides at minimum RGB/chroma split and posterize (FX-10)
+**And** pixel shuffle/sort, edge treatment and the scanline/CRT look are delivered by Story 9.7
 **And** every Stylize effect is off by default and none is applied implicitly by any other family.
 
 **Given** the Geometry family
 **When** its catalogue is offered
-**Then** it provides at minimum punch-in, slow zoom, handheld shake, dutch tilt and mirror/flip (FX-11)
+**Then** it provides at minimum punch-in, handheld shake, dutch tilt and mirror/flip (FX-11)
+**And** slow zoom is delivered by Story 9.7, which gives the chain the clip duration it needs
 **And** a Geometry effect never changes the Shot's frame count, its window, or its position on the timeline
 **And** geometry that would sample outside the source frame is bounded so it cannot expose an undefined edge.
 
@@ -385,7 +398,7 @@ So that I can experiment without rebuilding a stack I spent time on.
 
 **Given** a Shot whose every Effect is removed
 **When** the stack is empty
-**Then** the Shot returns to the empty state and not to a residual one, and exports byte-identically to today (FX-5, FX-23).
+**Then** the Shot returns to the empty state and not to a residual one, and builds the byte-identical export **command** it builds today (FX-5, FX-23, R-20 — the command, never the encoded file).
 
 ### Story 9.5: Copy a Look Across the Video
 
@@ -442,6 +455,56 @@ So that what I see is what ships, and a six-month-old project still tells me wha
 **Given** a Project manifest
 **When** it is read on another machine or after a reload
 **Then** everything needed to reproduce the export's look is present in it, and nothing about an Effect lives only in the interface (FX-23).
+
+### Story 9.7: What the Chain Is Handed
+
+As the Director,
+I want a slow zoom, a bloom, a scanline pass and a shake that does not stutter,
+So that the looks the product promised are actually available and the ones I have stop breaking at a seam.
+
+> **Split out of Story 9.3 on 2026-08-25.** Two problems, found separately, share one root: the
+> chain is a single comma-joined **linear** graph, and it is handed neither a **branch** nor the
+> clip's **offset and duration**. Five promised effects need one or the other, and a shot that
+> becomes two clips replays its own motion. Solving them apart means opening the same splice twice.
+> **Story 9.3's remaining five effects are blocked on this story**, which is why this one is
+> numbered after it and sequenced before it.
+
+**Acceptance Criteria:**
+
+**Given** the chain builder
+**When** it composes a stage that needs more than one input
+**Then** it can express a branched filtergraph — `split` into a treated and an untreated leg, recombined by `blend` — without any composer reaching outside the two splice points `trim_args` already exposes (AD-17, AD-25)
+**And** `effects.py` still imports nothing but the standard library, and `assembly.py` still does not import it back.
+
+**Given** a clip being composed
+**When** the chain is built for it
+**Then** the composer is handed that clip's **offset within its Shot** and its **duration**, so a stage can be a function of where the clip sits rather than only of the effect's values
+**And** a Shot with no effects still builds the byte-identical command it builds today (FX-5, R-20).
+
+**Given** a Shot that `assembly_plan` resolved into two or more clips, because a later Shot nests inside it
+**When** a time-dependent effect is composed for it
+**Then** the motion is continuous across the seam — `handheld_shake` does not snap back to phase zero and `grain` does not replay an identical noise sequence — because each clip's stage is offset by where that clip begins in the Shot
+**And** a test asserts the two clips' stage text differs by exactly that offset, rather than being byte-identical as it is today.
+
+**Given** the Texture family
+**When** its catalogue is offered
+**Then** it provides bloom/halation, completing FX-9's stated minimum.
+
+**Given** the Stylize family
+**When** its catalogue is offered
+**Then** it provides pixel shuffle or sort, edge treatment and a scanline/CRT look, completing FX-10's stated minimum
+**And** every one of them is off by default and none is applied implicitly by any other family.
+
+**Given** the Geometry family
+**When** its catalogue is offered
+**Then** it provides slow zoom, completing FX-11's stated minimum
+**And** it never changes the Shot's frame count, its window, or its position on the timeline
+**And** geometry that would sample outside the source frame is bounded so it cannot expose an undefined edge.
+
+**Given** any branched chain
+**When** it is built
+**Then** it is asserted in tests by string comparison, as every other chain in this application is (FX-NFR-5)
+**And** the assembled video still matches the song to within one frame, for every combination of effects.
 
 ## Epic 10: The Picture Moves With the Music
 
