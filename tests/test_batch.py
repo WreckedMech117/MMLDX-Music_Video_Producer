@@ -341,24 +341,29 @@ def test_the_report_is_ordered_by_song_position_and_not_by_manifest_order():
 
 
 def test_a_shot_is_labelled_by_its_position_on_the_timeline_and_carries_its_id():
-    """The clip is drawn `SHOT 01` from *manifest* position; the report is in song order.
+    """The clip is drawn `SHOT 01` from its position in the *song*, and so is every label.
 
     The two orderings differ here on purpose -- the manifest is shuffled -- so a label taken from
-    the report's own ordering would point the Director at the wrong clip. The id rides along
-    because the number changes when Shots are reordered and the id never does.
+    manifest position would point the Director at the wrong clip. Until 2026-08-26 that is exactly
+    what it did, and this test asserted it: `shot_2`, the last clip on the timeline, was labelled
+    `SHOT 01` because it had been moved to the front of the manifest. The id rides along because
+    the number changes when Shots are re-timed and the id never does.
     """
     project = plan("", "", "")
     project.shots = [project.shots[2], project.shots[0], project.shots[1]]
+    # The fixture is only evidence while the two orderings disagree.
+    assert [shot.id for shot in project.shots] != sorted(shot.id for shot in project.shots)
 
     report = readiness_report(project)
 
-    assert shot_label(project, project.shots[0]) == "SHOT 01 (shot_2)"
-    # Song order for the notes, manifest numbering inside each label.
+    # Last in the song, whatever the manifest says.
+    assert shot_label(project, project.shots[0]) == "SHOT 03 (shot_2)"
+    # Song order for the notes, and the same song order inside each label.
     assert report.blocked_ids() == ["shot_0", "shot_1", "shot_2"]
     assert report.blocked_labels() == [
-        "SHOT 02 (shot_0)",
-        "SHOT 03 (shot_1)",
-        "SHOT 01 (shot_2)",
+        "SHOT 01 (shot_0)",
+        "SHOT 02 (shot_1)",
+        "SHOT 03 (shot_2)",
     ]
     # Labels line up with ids note by note, so a client can pair them without a lookup.
     assert all(len(note.labels) == len(note.shot_ids) for note in report.blocking)

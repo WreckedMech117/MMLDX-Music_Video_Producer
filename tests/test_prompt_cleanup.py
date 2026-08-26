@@ -1149,11 +1149,15 @@ def test_a_locked_shot_and_an_in_flight_render_are_skipped_in_the_existing_words
 
     rows = {row["shot_id"]: row for row in body["shots"]}
     assert rows["shot_aa9f610512f6"]["rewritten"] is False
+    # SHOT 06 and SHOT 08, not the manifest positions 5 and 7 these read until 2026-08-26. This
+    # is the Director's real 33-window plan, and four of its windows were appended to the end of
+    # the manifest after being inserted mid-timeline -- one of them at 0.0s -- so every shot past
+    # the first is off by one between the two orderings. The clip says 06; so does the notice.
     assert rows["shot_aa9f610512f6"]["reason"] == EXPANSION_LOCKED_NOTICE.format(
-        shots=f"SHOT 05 ({'shot_aa9f610512f6'})"
+        shots=f"SHOT 06 ({'shot_aa9f610512f6'})"
     )
     assert rows["shot_c8efd34a8333"]["reason"] == EXPANSION_RENDERED_NOTICE.format(
-        shots=f"SHOT 07 ({'shot_c8efd34a8333'})"
+        shots=f"SHOT 08 ({'shot_c8efd34a8333'})"
     )
     assert body["skipped"] == 2
     assert body["rewritten"] == DIRECTOR_ECHOING - 2
@@ -1207,8 +1211,11 @@ def test_a_rendered_or_approved_shot_is_rewritten_and_reported(tmp_path: Path):
     notes = " ".join(body["notes"])
     assert "carry an approved take" in notes
     assert "already hold a take that was rendered" in notes
-    assert "SHOT 01 (shot_59f8da92c2d8)" in notes
-    assert "SHOT 03 (shot_976ca97baa38)" in notes
+    # SHOT 02 and SHOT 04, not the manifest positions 1 and 3. `shot_726472b14106` opens the song
+    # at 0.0s while sitting 30th in this manifest, so the first clip on the timeline pushes every
+    # one of these down by one. See the locked-shot test above for the same accounting.
+    assert "SHOT 02 (shot_59f8da92c2d8)" in notes
+    assert "SHOT 04 (shot_976ca97baa38)" in notes
     # And the honesty note the Director reads before applying.
     assert any("Read every rewrite before applying" in note for note in body["notes"])
 

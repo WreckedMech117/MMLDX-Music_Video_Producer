@@ -1736,9 +1736,14 @@ def assistant_input(project: Project, *, shot_ids: list[str]) -> dict[str, Any]:
     refuses those shots on its own evidence, exactly as expansion does, and a flag would put back
     the state the trimming exists to keep out.
 
-    Shots are ordered by `ordered_shots` — song order — and named by `shot_label`, which is the
-    manifest position the timeline draws. The two orderings differ; the *name* is the timeline's,
-    because it is the name the Director reads on the clip and the name the reply's notices use.
+    Shots are ordered by `ordered_shots` — song order — and named by `shot_label`, which numbers
+    by that same song order. **One ordering, one number**, and it is the number drawn on the clip.
+
+    This paragraph used to say the name was "the manifest position the timeline draws", and it was
+    both wrong about the timeline and describing a real defect: until 2026-08-26 this dict handed
+    the model song-ordered shots carrying manifest-numbered labels, so `shots[2]["label"]` could
+    read `SHOT 01` — both orderings present in one payload, and the sharpest instance of the split
+    `models.shot_label` exists to prevent. The model is now told the number the Director reads.
     """
     ordered = ordered_shots(project)
     position = {shot.id: index for index, shot in enumerate(ordered)}

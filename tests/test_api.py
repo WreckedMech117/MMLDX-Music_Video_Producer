@@ -8108,12 +8108,16 @@ def test_expansion_rejection_refuses_only_what_it_must():
 
 
 def test_the_reply_numbers_a_shot_the_way_the_model_was_told_to(tmp_path: Path):
-    """One number per Shot, across the input and the reply.
+    """One number per Shot, across the input, the reply and the clip.
 
-    `expansion_input` orders by `start`; the manifest is in whatever order shots were added.
-    Numbering the notices by the manifest would tell the model "index 1" for the Shot the reply
-    calls something else — two schemes for one Shot, in a reply the Director reads beside the
-    timeline. The project here is deliberately built out of time order.
+    `expansion_input` orders by `start`; the manifest is in whatever order shots were added. The
+    project here is deliberately built out of time order, so the two disagree.
+
+    The notice used to read `shot index 2 at 90s (shot_late)` — a fifth numbering scheme, 0-based
+    and under a different noun, justified by a claim that the timeline numbered by the manifest.
+    It did not. Since 2026-08-26 the notice is `shot_label`, so `expansion_input`'s `index`, the
+    number on the clip and the number in the reply are one scheme: **index + 1**, asserted below
+    rather than hand-typed, so a change to either side lands here.
     """
     director = ExpandingDirector()
     client, store, _ = make_client(tmp_path, director)
@@ -8132,13 +8136,18 @@ def test_the_reply_numbers_a_shot_the_way_the_model_was_told_to(tmp_path: Path):
     sent = {entry["shot_id"]: entry["index"] for entry in director.inputs[0]["shots"]}
     assert sent == {"shot_early": 0, "shot_middle": 1, "shot_late": 2}
     notice = ProjectStore(tmp_path).get(project.id).messages[-1].content
-    # Every Shot the reply names is numbered by the index the model was given for it.
+    # Every Shot the reply names is numbered by the index the model was given for it, one-based
+    # so it is the number drawn on the clip. Built from `sent` rather than typed out, so the
+    # input and the notice cannot drift apart.
     for shot_id, index in sent.items():
-        assert f"shot index {index} at" in notice, shot_id
-        assert f"({shot_id})" in notice.split(f"shot index {index} at")[1][:40], shot_id
-    # The locked Shot is the one whose manifest position (0) differs from its index (2), which
-    # is what makes this test able to fail.
-    assert "shot index 2 at 90s (shot_late)" in notice.split("locked")[1]
+        assert f"SHOT {index + 1:02d} ({shot_id})" in notice, shot_id
+    # And that number is the server's own `shot_label` for the same Shot -- the whole point of
+    # retiring the "shot index" spelling.
+    for shot in project.shots:
+        assert shot_label(project, shot) in notice, shot.id
+    # The locked Shot is the one whose manifest position (1) differs from its song position (3),
+    # which is what makes this test able to fail.
+    assert "SHOT 03 (shot_late) at 90s" in notice.split("locked")[1]
 
 
 def test_expansion_of_an_unknown_project_is_a_404(tmp_path: Path):

@@ -1100,18 +1100,31 @@ def shot_label(project: Project, shot: Shot) -> str:
     model is told about `SHOT 03` and the Director is told about a different one. `batch.shot_label`
     re-exports this, so every existing importer is unaffected.
 
-    The clip is drawn as `SHOT 01` from the Shot's position in the **manifest** — that is what
-    `renderTimeline` numbers by — while the readiness report is ordered by position in the song. The
-    two orderings differ for any plan whose manifest order is not its time order, so a refusal that
-    carried only a number would point at the wrong clip; one that carried only the id would name
-    something that appears nowhere on screen. Both, therefore, exactly as `expansion_shot_label`
-    carries both for the same reason.
+    The clip is drawn as `SHOT 01` from the Shot's position in the **song** — that is what
+    `renderTimeline` numbers by, and `api.songOrderRanks` is the client's half of this same
+    arithmetic. So the number is the song-order rank here too.
+
+    **This docstring asserted the opposite until 2026-08-26, and the code matched the docstring.**
+    `renderTimeline` moved to song order in `9bd9447` (2026-08-19) and this did not follow, so for
+    seven days every refusal, notice and report named a Shot by its manifest position while the
+    Director read a different number off the clip — including `Delete SHOT 03?` drawn over a clip
+    labelled SHOT 05. The two orderings differ for any plan whose manifest order is not its time
+    order, which is every plan a Shot has been inserted into mid-timeline.
+
+    The id is still carried beside the number, and not as belt-and-braces: a number alone is
+    meaningless the moment the schemes drift again, and an id alone names something that appears
+    nowhere on screen. That redundancy is what kept the seven days survivable.
+
+    Sorted stably by `start`, matching `timeline.ordered_shots` — which is deliberately not
+    imported here, because `timeline` imports this module and not the reverse. `ordered_shots` is
+    the same sort with the same key, and a contract test holds the two equal.
 
     A Shot that is not in this project falls back to its bare id rather than claiming a position
     it does not have.
     """
+    ranked = sorted(project.shots, key=lambda item: item.start)
     position = next(
-        (index + 1 for index, item in enumerate(project.shots) if item.id == shot.id), 0
+        (index + 1 for index, item in enumerate(ranked) if item.id == shot.id), 0
     )
     return f"SHOT {position:02d} ({shot.id})" if position else shot.id
 

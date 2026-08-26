@@ -4087,23 +4087,50 @@ def test_render_again_wordings_are_the_servers_own():
     The lock and the approval are refused by the route and previewed by the panel, and the
     previous-take statement is the server's account of what re-opening does. Two hand-written
     wordings for one rule is how the browser starts describing behaviour the server no longer has.
+
+    **The project is deliberately out of time order**, and that is the whole evidentiary value of
+    this fixture. Until 2026-08-26 the shots here carried no `start` at all, so manifest order and
+    song order coincided, no divergence was expressible, and the test could not fail however wrong
+    the numbering got -- which is how a delete confirmation naming the wrong clip stood for seven
+    days with this file green. `shot_a` is first in the manifest and last in the song; `shot_c` is
+    last in the manifest and second in the song.
+
+    The expected labels are the server's own `shot_label` over the same three shots rather than
+    hand-typed strings, so this holds the two implementations *equal* instead of holding each to a
+    literal that a one-sided change can quietly re-type.
     """
     from music_video_producer.app import (
         RENDER_AGAIN_APPROVED_REFUSAL,
         RENDER_AGAIN_LOCKED_REFUSAL,
         RENDER_AGAIN_PREVIOUS_TAKE,
     )
+    from music_video_producer.models import Project, Shot, shot_label
+
+    project = Project(
+        name="Out of order",
+        shots=[
+            Shot(id="shot_a", start=20, duration=5),
+            Shot(id="shot_b", start=0, duration=5),
+            Shot(id="shot_c", start=10, duration=5),
+        ],
+    )
 
     shared = run_module("""
       import { RENDER_AGAIN_APPROVED, RENDER_AGAIN_LOCKED, RENDER_AGAIN_PREVIOUS_TAKE,
         renderAgainNotice, shotLabel } from './src/music_video_producer/web/assets/api.js';
-      const project = { shots: [{ id: 'shot_a' }, { id: 'shot_b' }, { id: 'shot_c' }] };
+      const project = { shots: [
+        { id: 'shot_a', start: 20, duration: 5 },
+        { id: 'shot_b', start: 0, duration: 5 },
+        { id: 'shot_c', start: 10, duration: 5 },
+      ] };
       console.log(JSON.stringify({
         locked: RENDER_AGAIN_LOCKED,
         approved: RENDER_AGAIN_APPROVED,
         previousTake: RENDER_AGAIN_PREVIOUS_TAKE,
         notice: renderAgainNotice(project, 'shot_c'),
         first: shotLabel(project, 'shot_a'),
+        second: shotLabel(project, 'shot_b'),
+        third: shotLabel(project, 'shot_c'),
         // A shot this client does not have is named by its bare id rather than by a position
         // it does not hold -- exactly what batch.shot_label does.
         absent: shotLabel(project, 'shot_z'),
@@ -4116,9 +4143,88 @@ def test_render_again_wordings_are_the_servers_own():
     assert shared["locked"] == RENDER_AGAIN_LOCKED_REFUSAL.format(shot="This shot")
     assert shared["approved"] == RENDER_AGAIN_APPROVED_REFUSAL.format(shot="This shot")
     assert shared["previousTake"] == RENDER_AGAIN_PREVIOUS_TAKE
-    assert shared["notice"] == RENDER_AGAIN_PREVIOUS_TAKE.format(shot="SHOT 03 (shot_c)")
-    assert shared["first"] == "SHOT 01 (shot_a)"
+    # The two implementations, held equal on a project where the two orderings disagree.
+    for key, shot in zip(("first", "second", "third"), project.shots):
+        assert shared[key] == shot_label(project, shot), key
+    assert shared["notice"] == RENDER_AGAIN_PREVIOUS_TAKE.format(
+        shot=shot_label(project, project.shots[2])
+    )
+    # And pinned to the ordering a Director can actually see, so the pair agreeing on the *wrong*
+    # scheme does not read as a pass. `shot_a` is manifest position 1 and song position 3.
+    assert shared["first"] == "SHOT 03 (shot_a)", shared["first"]
+    assert shared["third"] == "SHOT 02 (shot_c)", shared["third"]
     assert shared["absent"] == "shot_z"
+
+
+def test_the_number_on_the_clip_is_the_number_in_every_sentence_about_it():
+    """One scheme for one Shot: the clip, the client's labels, and the server's.
+
+    This is the guard for the defect this test file could not see for seven days. `renderTimeline`
+    moved to song order on 2026-08-19; `shotLabel` went on counting manifest positions; and so
+    `Delete SHOT 03? ... the shot leaves the plan.` was drawn over a clip reading SHOT 05, on a
+    destructive confirmation whose own comment says the name is there "because 'Delete shot'
+    against the wrong selection is the realistic mistake".
+
+    Three claims, because no two of them imply the third:
+
+    * `renderTimeline` stamps the clip from `songOrderRanks` and does not sort shots itself. That
+      is a source assertion rather than an executed one -- `renderTimeline` needs a canvas -- and
+      it is the one that matters, because the previous code was a correct sort in the wrong place.
+    * `shotLabel` reads the same ranks, executed over a project whose manifest order is not its
+      song order.
+    * The server's `shot_label` agrees with both, over the same project.
+    """
+    from music_video_producer.models import Project, Shot, shot_label
+    from music_video_producer.timeline import ordered_shots
+
+    source = APP_JS.read_text(encoding="utf-8")
+    timeline = source.split("function renderTimeline", 1)[1].split("\nfunction ", 1)[0]
+    assert "songOrderRanks(state.project?.shots)" in timeline
+    # No second sort in the timeline: a hand-rolled ranking beside the shared one is precisely the
+    # shape the bug had, and it read as correct in isolation.
+    assert "sort((a, b) => a.start - b.start)" not in timeline
+    assert "songOrderRanks" in source.split("\n", 1)[0], "imported from api.js, not redefined"
+
+    project = Project(
+        name="Inserted mid-timeline",
+        shots=[
+            Shot(id="shot_opened", start=30, duration=5),
+            Shot(id="shot_closed", start=60, duration=5),
+            # Added after the other two and dropped in between them, which is the gesture that
+            # makes the two orderings differ at all.
+            Shot(id="shot_inserted", start=45, duration=5),
+        ],
+    )
+    assert [shot.id for shot in ordered_shots(project)] != [shot.id for shot in project.shots]
+    # `shot_label` sorts by `start` itself rather than importing `ordered_shots` -- `timeline`
+    # imports `models` and not the reverse -- so the two sorts are held equal here instead.
+    assert [shot_label(project, shot) for shot in ordered_shots(project)] == [
+        "SHOT 01 (shot_opened)",
+        "SHOT 02 (shot_inserted)",
+        "SHOT 03 (shot_closed)",
+    ]
+
+    parsed = run_module("""
+      import { shotLabel, songOrderRanks } from './src/music_video_producer/web/assets/api.js';
+      const project = { shots: [
+        { id: 'shot_opened', start: 30, duration: 5 },
+        { id: 'shot_closed', start: 60, duration: 5 },
+        { id: 'shot_inserted', start: 45, duration: 5 },
+      ] };
+      const ranks = songOrderRanks(project.shots);
+      console.log(JSON.stringify({
+        // What the clip is stamped with, built the way `renderTimeline` builds it.
+        clips: project.shots.map((shot) => `SHOT ${String(ranks.get(shot.id)).padStart(2, "0")}`),
+        labels: project.shots.map((shot) => shotLabel(project, shot.id)),
+      }));
+    """)
+
+    # The inserted Shot is SHOT 02 on the clip, in the delete confirmation, and in every refusal
+    # the server writes about it -- and it is third in the manifest, so none of that is free.
+    assert parsed["clips"] == ["SHOT 01", "SHOT 03", "SHOT 02"]
+    assert parsed["labels"] == [shot_label(project, shot) for shot in project.shots]
+    for clip, label in zip(parsed["clips"], parsed["labels"]):
+        assert label.startswith(f"{clip} ("), (clip, label)
 
 
 def test_the_mark_ready_control_is_decided_by_executing_it_for_every_state():
@@ -5117,9 +5223,11 @@ def server_readiness_report(tmp_path: Path) -> dict:
 
     store = ProjectStore(tmp_path)
     project = store.create(Project(name="Readiness"))
-    # Deliberately in an order the song does not follow: the report is ordered by time while the
-    # labels number by manifest position, so a client that rebuilt the numbering from its own shot
-    # array would disagree with the server about which clip a note is about.
+    # Deliberately in an order the song does not follow, and that is what makes this fixture
+    # evidence: `shot_blank` is third in the manifest and second in the song. A client that
+    # rebuilt the numbering from its own shot array in manifest order would disagree with the
+    # server about which clip a note is about -- which is what the server itself did until
+    # 2026-08-26.
     project.shots = [
         Shot(id="shot_echo", start=10, duration=5, prompt="a  SINGER   turns toward camera"),
         # Same prompt as the one above once case and spacing are ignored: a real sameness warning.
@@ -5162,9 +5270,11 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
 
     parsed = run_module(script)
     # Read off the report rather than written out again, so the labelling scheme stays the
-    # server's: the notes are in song order while the names number by manifest position.
+    # server's: the notes are in song order and so are the numbers inside the names.
     blocked_labels = [label for note in report["blocking"] for label in note["labels"]]
-    assert blocked_labels == ["SHOT 03 (shot_blank)"], report["blocking"]
+    # SHOT 02, not SHOT 03: `shot_blank` sits at 5s between `shot_written` at 0s and `shot_echo`
+    # at 10s, whatever its manifest position. That is the number on the clip.
+    assert blocked_labels == ["SHOT 02 (shot_blank)"], report["blocking"]
 
     # The blocking half: the one Shot with no prompt, named as the server names it.
     assert parsed["blocked"] == ["shot_blank"]
@@ -5184,11 +5294,12 @@ def test_the_client_readiness_parsers_are_executed_against_a_real_server_report(
     assert blocking[0]["reason"] == SHOT_WITHOUT_PROMPT
     assert warnings[0]["reason"] == SHOTS_SHARE_ONE_PROMPT
     assert SHOTS_SHARE_ONE_PROMPT in warnings[0]["text"]
-    # Named by the report's own labels -- `SHOT 02 (id)` -- so the pair can be found on screen. The
-    # numbers are not ascending here on purpose: rebuilding them from the client's shot array would
-    # produce "Shot 01 and Shot 02" for this pair and point at the wrong clips.
-    assert warnings[0]["shots"] == ["SHOT 02 (shot_written)", "SHOT 01 (shot_echo)"]
-    assert "SHOT 02 (shot_written) and SHOT 01 (shot_echo)" in warnings[0]["text"]
+    # Named by the report's own labels -- `SHOT 01 (id)` -- so the pair can be found on screen. The
+    # numbers skip 02 on purpose: `shot_blank` sits between the pair in the song. Rebuilding them
+    # from the client's shot array in manifest order would produce "SHOT 02 and SHOT 01" for this
+    # pair -- both wrong, and reversed -- and point at the wrong clips.
+    assert warnings[0]["shots"] == ["SHOT 01 (shot_written)", "SHOT 03 (shot_echo)"]
+    assert "SHOT 01 (shot_written) and SHOT 03 (shot_echo)" in warnings[0]["text"]
     assert blocking[0]["shots"] == blocked_labels
     # Which half a line came from is in the words, not only in the colour of its marker.
     assert warnings[0]["text"].startswith("Near-duplicate")

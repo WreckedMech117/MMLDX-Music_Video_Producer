@@ -2086,16 +2086,31 @@ def _short(value: str, limit: int = 60) -> str:
     return collapsed if len(collapsed) <= limit else f"{collapsed[:limit]}…"
 
 
-def expansion_shot_label(index: int, shot: Shot) -> str:
-    """Name a Shot by the one number the model was given: its `index` in `expansion_input`.
+def expansion_shot_label(project: Project, shot: Shot) -> str:
+    """Name a Shot in an expansion notice: `shot_label`, plus where it sits in the song.
 
-    The two orderings differ. `expansion_input` orders by `start`, because that is the Shot's
-    position in the song; the timeline draws clips in manifest order. Numbering notices by the
-    manifest would describe a different Shot than the `index` the model answered about, for
-    every plan whose manifest order is not its time order — so this uses the input's index, and
-    carries the start time and the id, which are unambiguous under either ordering.
+    **This was the fifth numbering scheme, and it is retired rather than documented.** It read
+    `shot index 2 at 90s (shot_id)` — a different noun ("index", not "SHOT") and a different base
+    (0, not 1) — on the argument that the notice had to match the `index` `expansion_input` gave
+    the model, because the timeline supposedly numbered by the manifest. Two things killed that
+    argument on 2026-08-26:
+
+    * The timeline numbers by **song order**, which is the order `expansion_input` uses, so the
+      model's `index` and the clip's number were never in conflict — only off by one. Off by one
+      is worse than conflict: a Director reading "shot index 3" beside a clip reading `SHOT 03`
+      finds a plausible wrong shot rather than an obvious mismatch.
+    * The model answers by `shot_id`, never by `index` (`ExpandedShot.shot_id` is the only handle
+      the reply carries), so nothing about the reply depends on the notice repeating the index.
+      `expansion_input` has no thread and no history, so the notice is never read back to it.
+
+    So the audience for this string is the Director alone, and it says what the clip says.
+    `shot_label` is called rather than re-derived from the caller's `enumerate` position, so there
+    is exactly one function in this language that turns a Shot into a number.
+
+    The start time stays. It is not the number — it is what makes the sentence findable on the
+    timeline when a plan has forty shots, and it survives a re-numbering that the number does not.
     """
-    return f"shot index {index} at {shot.start:g}s ({shot.id})"
+    return f"{shot_label(project, shot)} at {shot.start:g}s"
 
 
 def expansion_rejection(prompt: str) -> str:
@@ -15557,11 +15572,12 @@ def create_app(
         if not project.shots:
             raise HTTPException(status_code=422, detail=EXPANSION_WITHOUT_SHOTS)
         shots_by_id = {shot.id: shot for shot in project.shots}
-        # Labelled from `ordered_shots`, the same call `expansion_input` numbers by, so the
-        # notice and the model are talking about the same Shot under the same number.
+        # Labelled by `shot_label`, which numbers by song order — the same order `expansion_input`
+        # gives the model and the same order the timeline draws — so the notice, the model's input
+        # and the clip are all talking about the same Shot under the same number. Still walked in
+        # `ordered_shots` order so the notice reads down the song rather than down the manifest.
         labels = {
-            shot.id: expansion_shot_label(index, shot)
-            for index, shot in enumerate(ordered_shots(project))
+            shot.id: expansion_shot_label(project, shot) for shot in ordered_shots(project)
         }
         written: list[str] = []
         locked: list[str] = []

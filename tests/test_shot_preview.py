@@ -514,15 +514,34 @@ def test_the_preview_cache_is_never_an_input_to_an_export(tmp_path: Path):
 # ------------------------------------------------------------------------------------------
 
 
-def wait_for_a_render_in_flight(app, project_id: str, deadline: float = 20.0):
-    """Block until the server has registered an in-flight preview for this project."""
+def wait_for_a_running_render(app, project_id: str, deadline: float = 20.0):
+    """Block until this project's preview render has a live process attached to it.
+
+    **Registered is not running, and the difference is a whole flaky test.** Until 2026-08-26
+    this helper returned the moment `app.state.preview_renders[project_id]` *existed*, which is
+    the line before the subprocess is spawned. Every race below then fired its second request
+    and hoped the first render was still there to race — and a preview over these fixtures takes
+    about 210 ms end to end, which is not reliably longer than one HTTP round trip on a loaded
+    machine. Measured 2026-08-26 with a deliberate 250 ms pause in exactly the place the
+    scheduler puts one: `superseded` stayed False, both requests answered 200, the supersede
+    test failed, and the two join tests recorded `joiners == 0` with their second request served
+    out of the cache. On an untouched tree the supersede test failed about one full run in two.
+
+    `PreviewRender.process`, with `returncode is None`, is the fact the route already publishes
+    for this: `run_tool` hands the live process to `record.attach` before its first await, so a
+    record carrying an unexited process is a render that has genuinely started and has not yet
+    ended. It is half the guarantee. The other half is `HeldRender`, which stops the render
+    finishing at all until the test says so — because a process that is running when it is
+    observed can still exit a microsecond later. Together they replace a hope with two facts.
+    """
     limit = time.monotonic() + deadline
     while time.monotonic() < limit:
         record = app.state.preview_renders.get(project_id)
-        if record is not None:
+        process = getattr(record, "process", None)
+        if record is not None and process is not None and process.returncode is None:
             return record
         time.sleep(0.002)
-    raise AssertionError("no preview render was ever registered")
+    raise AssertionError("no preview render was ever running")
 
 
 def wait_for_joiners(app, project_id: str, count: int, deadline: float = 20.0):
@@ -550,14 +569,18 @@ class RenderSpy:
     counted — its last argument is the dotted scratch file under `previews/`, which nothing else
     writes — so ffprobe measuring geometry and an export's own ffmpeg pass through uncounted.
 
-    `replacement` swaps the argv of exactly those processes for another command. One test needs
-    a preview render that fails *slowly*: a real ffmpeg fails on a bad take in milliseconds,
-    faster than any second request can arrive, so there would be nothing to join. Everything
-    around it stays real — a real subprocess, a real non-zero return, real stderr, the real
-    `on_start`/`attach` handover and the real route.
+    `replacement` swaps the argv of exactly those processes for another command, and is how
+    every race in this section is sequenced rather than hoped for: a real ffmpeg over these
+    fixtures is finished in about 210 ms, and a real ffmpeg refusing a bad take is finished in
+    milliseconds, neither of which is reliably longer than the round trip the test is racing it
+    against. Either a fixed argv, or a callable taking `(index, argv)` — the 1-based order in
+    which this render was started, and the argv it was about to run — returning a replacement
+    argv, or `None` to let that one run for real. Everything around it stays real: a real
+    subprocess, a real return code, real stderr, the real `on_start`/`attach` handover, the real
+    kill and the real route.
     """
 
-    def __init__(self, monkeypatch, replacement: list[str] | None = None):
+    def __init__(self, monkeypatch, replacement=None):
         self.started: list[list[str]] = []
         self.replacement = replacement
         self._real = asyncio.create_subprocess_exec
@@ -566,9 +589,13 @@ class RenderSpy:
     async def _spawn(self, *args, **kwargs):
         last = str(args[-1]) if args else ""
         if "/previews/." in last and last.endswith(".mp4"):
-            self.started.append([str(arg) for arg in args])
-            if self.replacement is not None:
-                args = tuple(self.replacement)
+            argv = [str(arg) for arg in args]
+            self.started.append(argv)
+            replacement = self.replacement
+            if callable(replacement):
+                replacement = replacement(len(self.started), argv)
+            if replacement is not None:
+                args = tuple(replacement)
         return await self._real(*args, **kwargs)
 
     @property
@@ -576,8 +603,66 @@ class RenderSpy:
         return len(self.started)
 
 
+#: The held render, as a program. It writes a few bytes to the scratch file the render was
+#: handed — so a superseded render has really landed something for the publish gate to throw
+#: away, rather than "nothing was left behind" being true because nothing was ever written —
+#: then waits for the gate file to appear and finally runs the argv it was given, passing that
+#: command's exit code and its stderr straight through.
+HELD_RENDER_SOURCE = """
+import os, subprocess, sys, time
+gate, scratch = sys.argv[1], sys.argv[2]
+with open(scratch, "wb") as partial:
+    partial.write(b"a partly written preview")
+while not os.path.exists(gate):
+    time.sleep(0.005)
+sys.exit(subprocess.call(sys.argv[3:]))
+"""
+
+
+class HeldRender:
+    """A `RenderSpy` replacement that holds the *first* preview render open until released.
+
+    This is the fact these tests were missing. A race between a render and an HTTP request is
+    only the race it claims to be if the render is still underway when the request lands, and
+    nothing about a 210 ms ffmpeg guarantees that — the test thread only has to be descheduled
+    once. So the first render is wrapped in a program that cannot finish until this object says
+    so, and the tests that need it to finish say so only *after* asserting, off the record the
+    route publishes, that the thing they came to observe has happened. A render that is never
+    released is killed where it stands, which is precisely what a supersede is for.
+
+    `then` replaces what runs once the gate opens; left out, the real ffmpeg argv runs, so a
+    released render produces exactly the clip it always did. Only the first render is wrapped —
+    the request that supersedes it, or the one that follows it, gets a real render of its own,
+    which is what the process census and the clip on disk are asserted against.
+    """
+
+    def __init__(self, tmp_path: Path, *, then: list[str] | None = None):
+        self.gate = tmp_path / "release-the-held-render"
+        self.then = then
+
+    def __call__(self, index: int, argv: list[str]) -> list[str] | None:
+        if index != 1:
+            return None
+        return [
+            sys.executable, "-c", HELD_RENDER_SOURCE,
+            self.gate.as_posix(), argv[-1],
+            *(self.then if self.then is not None else argv),
+        ]
+
+    def release(self) -> None:
+        """Let the held render run to its end. Nothing else in these tests writes this file."""
+        self.gate.write_bytes(b"")
+
+
 def slow_stack(client, project_id: str, *, grain: float = 30.0):
-    """A stack heavy enough that the render is comfortably longer than one HTTP round trip."""
+    """A stack heavy enough to be worth cancelling, and a fingerprint input `grain` moves.
+
+    It is **not** the thing that keeps the render in flight long enough to be raced — that was
+    the belief this file was written under and it is wrong: measured 2026-08-26, the whole
+    request takes about 210 ms, which a loaded test thread loses to often enough to have made
+    the supersede test fail about one full run in two. `HeldRender` is what holds a render open
+    now. This just makes the work real and gives `grain` something to change.
+    """
     return client.put(
         f"/api/projects/{project_id}/shots/shot_a/effects",
         json={"effects": [
@@ -638,17 +723,26 @@ def test_a_newer_request_cancels_the_render_in_flight_and_its_clip_is_never_serv
     land its output and then be served as current.
 
     R-22 narrowed supersede to a differing fingerprint and this is the differing case, so the
-    process census is asserted here too: two requests, two renders, nothing joined."""
+    process census is asserted here too: two requests, two renders, nothing joined.
+
+    The first render is a `HeldRender` and that is what makes this a test rather than a coin
+    toss. It was neither until 2026-08-26: the second request was fired the instant the render
+    was *registered* and had roughly 210 ms to arrive before the render finished on its own, at
+    which point there was nothing in flight, both requests answered 200 and the test failed.
+    Held, the render cannot end until it is killed — so the supersede is observed, never raced.
+    Nothing else is faked: it is a real subprocess, really killed, and the bytes it wrote to its
+    scratch file are really deleted by the publish gate."""
     client, _store, _comfy, app = make_client(tmp_path)
     project_id, _shots_dir, media = project_with_one_slow_shot(client, tmp_path)
-    spy = RenderSpy(monkeypatch)
+    spy = RenderSpy(monkeypatch, replacement=HeldRender(tmp_path))
 
     first: dict = {}
     thread = threading.Thread(target=fire_preview, args=(client, project_id, first))
     thread.start()
     try:
-        record = wait_for_a_render_in_flight(app, project_id)
+        record = wait_for_a_running_render(app, project_id)
         superseded_fingerprint = record.fingerprint
+        held = record.process
         # A change the Director could make with one drag, which is the whole scenario: the
         # replacement asks for a different picture, so it cannot be answered by the first.
         assert slow_stack(client, project_id, grain=12.0).status_code == 200
@@ -662,6 +756,10 @@ def test_a_newer_request_cancels_the_render_in_flight_and_its_clip_is_never_serv
         shot="SHOT 01 (shot_a)"
     )
     assert second.json()["fingerprint"] != superseded_fingerprint
+    # Cancelled, and cancelled by the kill rather than by ending on its own: the held render
+    # would have run for as long as it was left alone, so a return code at all is the signal,
+    # and one that is not zero is the signal that it did not get to finish.
+    assert held.returncode not in (None, 0), held.returncode
     # Superseded, not joined: each request ran a render of its own, and the discarded one
     # really was started rather than merely registered.
     assert spy.count == 2, spy.started
@@ -691,31 +789,46 @@ def test_an_identical_request_joins_the_render_in_flight_and_starts_no_second_ff
 
     Under the old rule this test could not pass: the second request superseded the first, the
     first answered 409, and a client that double-fires -- a retry, a poll, a re-render on window
-    focus -- could never be shown anything."""
+    focus -- could never be shown anything.
+
+    The render is held open until `wait_for_joiners` says the second request has actually
+    attached, and only then released to finish for real. Without that hold the second request
+    was racing a 210 ms ffmpeg: when it lost -- measured on a loaded machine -- the clip was
+    already in the cache, the second request was served from it, `joiners` stayed 0 and
+    `rendered` came back False. Those last two assertions are why that showed up as a failure
+    instead of a green run asserting nothing, and the hold is why it no longer happens."""
     client, _store, _comfy, app = make_client(tmp_path)
     project_id, _shots_dir, media = project_with_one_slow_shot(client, tmp_path)
-    spy = RenderSpy(monkeypatch)
+    held = HeldRender(tmp_path)
+    spy = RenderSpy(monkeypatch, replacement=held)
 
     first: dict = {}
-    thread = threading.Thread(target=fire_preview, args=(client, project_id, first))
-    thread.start()
+    second: dict = {}
+    threads = [threading.Thread(target=fire_preview, args=(client, project_id, first))]
+    threads[0].start()
     try:
-        record = wait_for_a_render_in_flight(app, project_id)
-        second = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+        record = wait_for_a_running_render(app, project_id)
+        threads.append(
+            threading.Thread(target=fire_preview, args=(client, project_id, second))
+        )
+        threads[1].start()
+        wait_for_joiners(app, project_id, 1)
+        held.release()
     finally:
-        thread.join(timeout=60)
+        for thread in threads:
+            thread.join(timeout=60)
 
     assert first["status"] == 200, first
-    assert second.status_code == 200, second.text
+    assert second["status"] == 200, second
     # One render, asserted at the process, not inferred from a timing.
     assert spy.count == 1, spy.started
     assert record.joiners == 1
-    assert second.json()["fingerprint"] == first["body"]["fingerprint"] == record.fingerprint
+    assert second["body"]["fingerprint"] == first["body"]["fingerprint"] == record.fingerprint
     # Both were answered by a render that ran just now, so both say so.
     assert first["body"]["rendered"] is True
-    assert second.json()["rendered"] is True
+    assert second["body"]["rendered"] is True
     # And one clip on disk under that fingerprint, with no scratch file abandoned beside it.
-    clip = media / second.json()["preview"]
+    clip = media / second["body"]["preview"]
     assert clip.is_file()
     assert [path.name for path in sorted((media / "previews").iterdir())] == [clip.name]
     assert app.state.preview_renders == {}
@@ -723,17 +836,22 @@ def test_an_identical_request_joins_the_render_in_flight_and_starts_no_second_ff
 
 def test_three_identical_requests_all_join_the_same_render(tmp_path: Path, monkeypatch):
     """Two joiners get the answer, and so do three. The count is the point: a join that only
-    ever released the first waiter would pass the two-request test and strand the rest."""
+    ever released the first waiter would pass the two-request test and strand the rest.
+
+    Held for the same reason as the two-request case, and with more to lose: three requests have
+    to reach the render before it ends, and `wait_for_joiners` is a deadline rather than a
+    guarantee unless something is holding the render open for them to arrive at."""
     client, _store, _comfy, app = make_client(tmp_path)
     project_id, _shots_dir, media = project_with_one_slow_shot(client, tmp_path)
-    spy = RenderSpy(monkeypatch)
+    held = HeldRender(tmp_path)
+    spy = RenderSpy(monkeypatch, replacement=held)
 
     leader: dict = {}
     joined: list[dict] = [{}, {}, {}]
     threads = [threading.Thread(target=fire_preview, args=(client, project_id, leader))]
     threads[0].start()
     try:
-        record = wait_for_a_render_in_flight(app, project_id)
+        record = wait_for_a_running_render(app, project_id)
         for answer in joined:
             thread = threading.Thread(
                 target=fire_preview, args=(client, project_id, answer)
@@ -741,6 +859,7 @@ def test_three_identical_requests_all_join_the_same_render(tmp_path: Path, monke
             threads.append(thread)
             thread.start()
         wait_for_joiners(app, project_id, 3)
+        held.release()
     finally:
         for thread in threads:
             thread.join(timeout=120)
@@ -762,34 +881,42 @@ def test_a_joiner_on_a_failing_render_is_told_why_rather_than_left_waiting(
     own Shot, since a fingerprint can be shared and the Shot that started the render need not be
     the Shot asking again.
 
-    The render is replaced by a subprocess that sleeps and then fails, because a real ffmpeg
-    refusing a bad take returns in milliseconds and there would be no in-flight render to join.
-    Everything else is the real route, a real process and its real stderr."""
+    The render is replaced by a subprocess that fails only once the test has let it, because a
+    real ffmpeg refusing a bad take returns in milliseconds and there would be no in-flight
+    render to join. Until 2026-08-26 the replacement slept 1.5 s and hoped that was enough; it
+    is now held on the same gate as its siblings and released after `wait_for_joiners` has
+    established that the joiner is attached, so no duration is being trusted. Everything else is
+    the real route, a real process, its real exit code and its real stderr."""
     client, _store, _comfy, app = make_client(tmp_path)
     project_id, _shots_dir, media = project_with_one_slow_shot(client, tmp_path)
-    spy = RenderSpy(monkeypatch, replacement=[
+    held = HeldRender(tmp_path, then=[
         sys.executable, "-c",
-        (
-            "import sys, time; time.sleep(1.5);"
-            " sys.stderr.write('the preview encoder gave up'); sys.exit(3)"
-        ),
+        "import sys; sys.stderr.write('the preview encoder gave up'); sys.exit(3)",
     ])
+    spy = RenderSpy(monkeypatch, replacement=held)
 
     first: dict = {}
-    thread = threading.Thread(target=fire_preview, args=(client, project_id, first))
-    thread.start()
+    second: dict = {}
+    threads = [threading.Thread(target=fire_preview, args=(client, project_id, first))]
+    threads[0].start()
     try:
-        record = wait_for_a_render_in_flight(app, project_id)
-        second = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+        record = wait_for_a_running_render(app, project_id)
+        threads.append(
+            threading.Thread(target=fire_preview, args=(client, project_id, second))
+        )
+        threads[1].start()
+        wait_for_joiners(app, project_id, 1)
+        held.release()
     finally:
-        thread.join(timeout=60)
+        for thread in threads:
+            thread.join(timeout=60)
 
     assert first["status"] == 502, first
-    assert second.status_code == 502, second.text
+    assert second["status"] == 502, second
     # It really was a join -- one process for two failed answers.
     assert spy.count == 1, spy.started
     assert record.joiners == 1
-    for detail in (first["body"]["detail"], second.json()["detail"]):
+    for detail in (first["body"]["detail"], second["body"]["detail"]):
         assert detail.startswith("SHOT 01 (shot_a)'s preview could not be rendered")
         assert "the preview encoder gave up" in detail
         # Not the placeholder a render that ended without recording anything would leave.
@@ -808,17 +935,21 @@ def test_a_joiner_is_refused_rather_than_stranded_when_its_render_is_superseded(
     rather than waiting on an event that would never be raised.
 
     `wait_for_joiners` is what makes this the scenario it claims to be: without it the third
-    request could arrive before the second and the test would assert about two supersedes."""
+    request could arrive before the second and the test would assert about two supersedes. It
+    needs a render to still be there to join, though, which is what the `HeldRender` supplies —
+    with a real 210 ms ffmpeg leading, a joiner that arrived late found the clip in the cache
+    instead, and `wait_for_joiners` then failed on its deadline rather than on the claim. The
+    leader is never released: the third request kills it, which is the point."""
     client, _store, _comfy, app = make_client(tmp_path)
     project_id, _shots_dir, media = project_with_one_slow_shot(client, tmp_path)
-    spy = RenderSpy(monkeypatch)
+    spy = RenderSpy(monkeypatch, replacement=HeldRender(tmp_path))
 
     leader: dict = {}
     joiner: dict = {}
     threads = [threading.Thread(target=fire_preview, args=(client, project_id, leader))]
     threads[0].start()
     try:
-        record = wait_for_a_render_in_flight(app, project_id)
+        record = wait_for_a_running_render(app, project_id)
         threads.append(
             threading.Thread(target=fire_preview, args=(client, project_id, joiner))
         )

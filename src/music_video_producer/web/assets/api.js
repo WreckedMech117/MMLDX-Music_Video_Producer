@@ -1182,9 +1182,10 @@ export const BATCH_SKIP_NOUN_UNKNOWN = "blocked";
 
 // Every Shot id a readiness report blocks, under the names the Director sees. Positionally
 // aligned with the ids inside each note, and carried by the report rather than derived here: the
-// server names a Shot `SHOT 01 (shot_id)` by its position in the *manifest* while the notes
-// themselves are in song order, so a browser that recomputed the numbering would disagree with the
-// server for any plan whose manifest order is not its time order.
+// label is the server's word for that Shot, and a browser that re-derived it would be a second
+// implementation of the numbering to keep in step. (`shotLabel` is the client's own, and a
+// contract test holds it equal to the server's `shot_label`; this path does not need a third
+// caller of it, because the report already answered.)
 export function blockedShotLabels(report) {
   return (report?.blocking || []).flatMap((note) => noteLabels(note));
 }
@@ -2284,13 +2285,37 @@ export const RENDER_AGAIN_PREVIOUS_TAKE =
   "What moves is this shot's single latest-take pointer, once the new take lands. This " +
   "application does not track takes, so the older file is on disk and not in a take list.";
 
-// The Shot named as the timeline names it: `SHOT 03 (shot_id)`, matching batch.py's `shot_label`.
+// Every Shot's number as the timeline draws it, as `id -> 1-based rank in SONG order`.
+//
+// **The one place this client turns a Shot into a number.** `renderTimeline` calls it to stamp
+// `SHOT 03` onto the clip and `shotLabel` calls it to name that same Shot in a dialog, a toast or
+// a refusal, so the number in the sentence and the number on the clip cannot disagree: there is
+// only one ranking in the file to be wrong about. Two independent sorts is exactly how
+// `Delete SHOT 03?` came to be drawn over a clip reading SHOT 05 (2026-08-19 to 2026-08-26).
+//
+// Song order, not manifest order, because song order is the only one a Director can see -- see
+// `renderTimeline`: "after a mid-timeline add, the clip at 0:10 must not read SHOT 34". The sort
+// is stable, matching `timeline.ordered_shots`, so Shots sharing a start keep manifest order
+// rather than being reshuffled between two renders of the same project. A Shot with no usable
+// `start` ranks at 0 rather than poisoning the comparator with NaN, which in V8 silently degrades
+// the whole sort to "leave it alone".
+export function songOrderRanks(shots) {
+  const ranks = new Map();
+  [...(shots || [])]
+    .sort((a, b) => (Number(a?.start) || 0) - (Number(b?.start) || 0))
+    .forEach((shot, index) => ranks.set(shot?.id, index + 1));
+  return ranks;
+}
+
+// The Shot named as the timeline names it: `SHOT 03 (shot_id)`, matching models.py's `shot_label`.
 // Both halves, for that function's reason -- the number is what is drawn on the clip and the id is
-// what is unambiguous -- and numbered by manifest position, which is what the timeline draws.
+// what is unambiguous -- and numbered by `songOrderRanks`, which is the ranking `renderTimeline`
+// itself stamps on the clip. A contract test holds this equal to the server's `shot_label` over a
+// project whose manifest order is *not* its song order, which is the only fixture that can tell
+// the two schemes apart.
 export function shotLabel(project, shotId) {
-  const shots = project?.shots || [];
-  const index = shots.findIndex((item) => item?.id === shotId);
-  return index < 0 ? String(shotId ?? "") : `SHOT ${String(index + 1).padStart(2, "0")} (${shotId})`;
+  const rank = songOrderRanks(project?.shots).get(shotId);
+  return rank ? `SHOT ${String(rank).padStart(2, "0")} (${shotId})` : String(shotId ?? "");
 }
 
 // -- A job whose shot is no longer on the plan -------------------------------------------------
