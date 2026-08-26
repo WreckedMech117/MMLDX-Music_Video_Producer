@@ -2644,12 +2644,24 @@ function bindShotTabs(inspector) {
 // The `〜` bind glyph ends every row and **ships inert**: `--dim`, no handler, `aria-hidden`,
 // because Epic 10 is what makes a binding exist and a control that looks live and is not is the
 // one thing this interface must never draw.
+//
+// A row `effectParameterRow` marked refused -- a stored value the export will refuse by name --
+// carries its class, its reason and its empty reading from the model. Nothing here decides that a
+// row is refused, and nothing here writes the sentence; the note is drawn under the row, the input
+// is `aria-invalid` and points at it, so the state is in the accessibility tree as well as in the
+// colour.
 function effectRowHtml(card, row) {
   const key = effectControlKey(card.index, row.name);
   const bind = `<span class="effect-bind" title="${escapeHtml(row.bindTitle)}" aria-hidden="true">${escapeHtml(row.bindGlyph)}</span>`;
   const label = `<label class="effect-label" for="${EFFECT_PARAMETER_ID}${key}">${escapeHtml(row.label)}</label>`;
+  const note = row.note
+    ? `<p class="effect-row-note" id="effect-note-${key}">${escapeHtml(row.note)}</p>`
+    : "";
+  const refused = row.refused
+    ? ` aria-invalid="true" aria-describedby="effect-note-${key}"`
+    : "";
   if (row.kind === "number") {
-    return `<div class="effect-row">${label}<span class="effect-slider"><span class="effect-track"></span><span class="effect-fill" id="effect-fill-${key}" style="width:${row.fill}%"></span><input class="effect-number" type="range" id="${EFFECT_PARAMETER_ID}${key}" min="${row.minimum}" max="${row.maximum}" step="${row.step}" value="${row.value}" ${row.disabled ? "disabled" : ""}></span><span class="effect-readout" id="effect-readout-${key}">${escapeHtml(row.readout)}</span>${bind}</div>`;
+    return `<div class="effect-row ${row.className}">${label}<span class="effect-slider"><span class="effect-track"></span><span class="effect-fill" id="effect-fill-${key}" style="width:${row.fill}%"></span><input class="effect-number" type="range" id="${EFFECT_PARAMETER_ID}${key}" min="${row.minimum}" max="${row.maximum}" step="${row.step}" value="${row.value}"${refused} ${row.disabled ? "disabled" : ""}></span><span class="effect-readout" id="effect-readout-${key}">${escapeHtml(row.readout)}</span>${bind}</div>${note}`;
   }
   const options = row.choices.map((choice) =>
     `<option value="${escapeHtml(choice.value)}" ${row.value === choice.value ? "selected" : ""}>${escapeHtml(choice.label)}</option>`).join("");

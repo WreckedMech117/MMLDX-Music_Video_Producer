@@ -313,7 +313,8 @@ So that I can judge a grade against the song instead of against my imagination.
 **Given** the Effect Stack changes
 **When** the preview becomes out of date
 **Then** the previous picture continues playing with a Consolas `STALE` corner label — never a frozen frame, never a spinner over black, never a percentage (UX-DR11)
-**And** staleness is decided by recomputing a fingerprint over the take, window, offset, stack, bindings, envelope fingerprint, transition and preview geometry, in that order, by the one fingerprint function — nothing stores a stale flag (AD-23, AD-28).
+**And** staleness is decided by recomputing a fingerprint over the take, window, offset, **the chain the stack composes to**, bindings, envelope fingerprint, transition and preview geometry, in that order, by the one fingerprint function — nothing stores a stale flag (AD-23, AD-28)
+**And** the fourth slot is the composed chain rather than the stored stack *(amended 2026-08-26)*, because a corrected composer or catalogue default changes the picture without changing the spec — Epic 9's own scanlines fix was served stale from cache for exactly that reason.
 
 **Given** a parameter being dragged
 **When** changes arrive faster than renders complete

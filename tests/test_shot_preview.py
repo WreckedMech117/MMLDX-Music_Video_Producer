@@ -12,6 +12,7 @@ cache leaves the export unaffected.
 """
 
 import asyncio
+import dataclasses
 import subprocess
 import sys
 import threading
@@ -38,6 +39,7 @@ from music_video_producer.assembly import (
 )
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
+from music_video_producer.effects import EFFECT_CATALOGUE
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import over_render_frames, over_render_lead
 
@@ -454,6 +456,162 @@ def test_each_fingerprint_input_that_exists_today_makes_the_preview_due_again(tm
     # Every earlier clip is still on disk, untouched and unserved. Staleness is a name that no
     # longer matches, never a file that was rewritten.
     assert {path.stem for path in (media / "previews").glob("*.mp4")} == seen
+
+
+def test_a_correction_to_a_composer_makes_the_cached_clip_of_that_look_due_again(
+    tmp_path: Path, monkeypatch
+):
+    """The whole of finding F2, driven through the route.
+
+    `e4aec46` moved Scanlines' grid origin from `x=-1` to `x=-t`, removing a black left-edge
+    bar measured at 26 dark columns at 1920x1080 with `lines=20`. Nothing about the Shot moved,
+    so a name taken from the stored stack did not move either — and nothing in this application
+    evicts `previews/`: no `unlink`, no `rmtree`, no glob, no control. Every clip cached before
+    that commit went on being served with the bar in it, permanently.
+
+    The composer is swapped rather than edited, because the claim is about what the fingerprint
+    is a function of and not about Scanlines. The old clip stays exactly where it was: a stale
+    entry is inert, never rewritten.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
+    media = tmp_path / "projects" / project_id / "media"
+
+    written = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{"effect": "scanlines", "parameters": {"strength": 0.5}}]},
+    )
+    assert written.status_code == 200, written.text
+
+    first = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert first.status_code == 200, first.text
+    assert first.json()["rendered"] is True
+    cached = media / first.json()["preview"]
+    stamp, bytes_before = cached.stat().st_mtime_ns, cached.read_bytes()
+    # Nothing has changed yet, so nothing is due: the baseline the next request is measured
+    # against is a cache hit, not a first request.
+    assert client.post(
+        f"/api/projects/{project_id}/shots/shot_a/preview"
+    ).json()["rendered"] is False
+
+    definition = EFFECT_CATALOGUE["scanlines"]
+
+    def one_pixel_origin(values, context):
+        """The `7db970c` spelling, rebuilt from the shipped stage: `drawgrid=x=-1:…`."""
+        return tuple(
+            "drawgrid=x=-1:" + stage.split(":", 1)[1]
+            for stage in definition.compose(values, context)
+        )
+
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE, "scanlines", dataclasses.replace(definition, compose=one_pixel_origin)
+    )
+
+    after = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+
+    assert after.status_code == 200, after.text
+    assert after.json()["fingerprint"] != first.json()["fingerprint"]
+    assert after.json()["rendered"] is True
+    assert (media / after.json()["preview"]).is_file()
+    # And the clip that named the old chain is untouched and unserved, which is what makes a
+    # stale entry cost disk and nothing else.
+    assert cached.stat().st_mtime_ns == stamp
+    assert cached.read_bytes() == bytes_before
+    assert len(list((media / "previews").glob("*.mp4"))) == 2
+
+
+def test_a_corrected_catalogue_default_makes_the_cached_clip_due_again(
+    tmp_path: Path, monkeypatch
+):
+    """The second half of F2, and the one the storage rule argues for out loud: a stack is
+    stored sparsely so *"a corrected default"* can reach the projects that would benefit from
+    it. It reached the export and not the preview — the manifest holds no `strength` to move, so
+    a name taken from the manifest could not move. It moves now."""
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
+
+    written = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{"effect": "grain", "parameters": {}}]},
+    )
+    assert written.status_code == 200, written.text
+    # The card is stored with nothing in it. That is the point: there is no value here that a
+    # corrected default could contradict.
+    stored = client.get(f"/api/projects/{project_id}").json()["shots"][0]["effects"]
+    assert [(spec["effect"], spec["parameters"]) for spec in stored] == [("grain", {})]
+
+    first = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert first.status_code == 200, first.text
+
+    definition = EFFECT_CATALOGUE["grain"]
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE,
+        "grain",
+        dataclasses.replace(
+            definition,
+            parameters=tuple(
+                dataclasses.replace(parameter, default=12.0)
+                if parameter.name == "strength"
+                else parameter
+                for parameter in definition.parameters
+            ),
+        ),
+    )
+
+    after = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+
+    assert after.status_code == 200, after.text
+    assert after.json()["fingerprint"] != first.json()["fingerprint"]
+    assert after.json()["rendered"] is True
+
+
+def test_the_chain_the_route_renders_is_the_chain_it_names_the_clip_after(tmp_path: Path):
+    """One request composes the chain twice — once for ffmpeg, once inside the fingerprint — and
+    the two must be composed from **one** set of arguments or the name stops describing the
+    picture, which is the defect this slice closes rather than a new spelling of it.
+
+    Both call sites are watched, because they are separate name lookups: `app` holds its own
+    reference to `build_effect_stages` and `effects` calls its module global from inside
+    `preview_fingerprint`. A later epic that gives the preview a `clip_offset`, a different
+    geometry or a different `luts` in one place and not the other fails here."""
+    from music_video_producer import app as app_module
+    from music_video_producer import effects as effects_module
+
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
+    written = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{"effect": "saturation", "parameters": {"amount": 1.4}}]},
+    )
+    assert written.status_code == 200, written.text
+
+    composed = effects_module.build_effect_stages
+    calls = []
+
+    def watched(stack, **kwargs):
+        calls.append((list(stack), kwargs))
+        return composed(stack, **kwargs)
+
+    app_module.build_effect_stages = watched
+    effects_module.build_effect_stages = watched
+    try:
+        response = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    finally:
+        app_module.build_effect_stages = composed
+        effects_module.build_effect_stages = composed
+
+    assert response.status_code == 200, response.text
+    assert len(calls) == 2, calls
+    assert calls[0] == calls[1]
+    # And the arguments are the ones this route is entitled to: the preview's own geometry, the
+    # Shot from its own first frame, and the Shot's own window as the span a ramp is measured
+    # against.
+    _stack, kwargs = calls[0]
+    assert (kwargs["width"], kwargs["height"]) == (
+        response.json()["width"], response.json()["height"]
+    )
+    assert kwargs["clip_offset"] == 0.0
+    assert kwargs["shot_seconds"] == 4.0
 
 
 def test_a_deleted_cache_costs_a_re_render_and_nothing_else(tmp_path: Path):

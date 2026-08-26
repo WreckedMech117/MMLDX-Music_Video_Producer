@@ -6574,6 +6574,98 @@ export const EFFECT_UNKNOWN_NOTE =
   "This application's catalogue has no effect by this name, so its controls cannot be drawn and an "
   + "export will refuse the whole stack. Removing it is the only thing this panel can do with it.";
 
+//: A stored parameter the export refuses -- `{"zoom": 5}` where the maximum is 2, `{"zoom": null}`,
+//: a number quoted as `"1.5"`, a seed of `4210.7` on a whole-number parameter. A manifest is
+//: hand-editable and `EffectSpec.parameters` is a free-form map, so every one of those genuinely
+//: reaches this panel, and `effects.validate_stack` refuses each by name at the preview and at
+//: every export.
+//:
+//: Named here for the reason `EFFECT_UNKNOWN_NOTE` is named: the alternative is a card that draws
+//: an ordinary slider at an ordinary position for a look no export will ever produce, which is the
+//: interface telling a Director the opposite of what the render will tell them. Clamping it
+//: silently would be worse still -- the panel would then show a number the manifest does not hold
+//: and the export would still refuse the one it does.
+//:
+//: **Not the route's own refusal sentence.** Those are written about a write that was attempted
+//: and end "Nothing was composed."; nothing has been attempted by drawing a panel, and reporting a
+//: refusal that never happened is the mistake `EFFECTS_LOCKED_NOTE` refuses to make. It names the
+//: same fault, in the same terms, about the same value.
+//: The closing clause promises nothing about the *write*, and that is deliberate. A write carries
+//: the whole stack and `validate_stack` refuses the whole stack, so on a manifest holding two
+//: faults the first correction is refused as well -- with the route's own sentence, whole, above
+//: the panel. What setting the control certainly does is give this parameter a value the export
+//: will take, and that is all this says.
+export const EFFECT_PARAMETER_REFUSED_NOTE =
+  "{label} holds {value} in this shot's manifest, which {fault}, so an export will refuse the "
+  + "whole stack for it. The control is left empty rather than showing a number this shot does "
+  + "not hold; set it to give this parameter a value the export will take.";
+
+//: The four faults, as clauses of the sentence above. They are the checks `effects._validate_number`
+//: makes, in the order it makes them: a bool or a non-number first (a `bool` is an `int` in Python
+//: and would otherwise sail through as 1), then a whole-number parameter given a fraction, then
+//: the two bounds.
+const EFFECT_PARAMETER_NOT_A_NUMBER = "is not a number";
+const EFFECT_PARAMETER_NOT_WHOLE = "is not a whole number";
+const EFFECT_PARAMETER_BELOW_MINIMUM = "is below its minimum of {bound}";
+const EFFECT_PARAMETER_ABOVE_MAXIMUM = "is above its maximum of {bound}";
+
+//: What the readout says where there is no reading to give. Not the empty string: an empty readout
+//: is what this column already shows while a value is being resolved, and this is a stated absence
+//: of a number rather than a number that has not arrived.
+export const EFFECT_PARAMETER_NO_READING = "—";
+
+//: The class a refused row carries, so the state is in the markup and the stylesheet can put
+//: `--red` on the track and the reading. Decided here with the rest of the row, the way
+//: `effectCardModel` decides `effect-off` -- the markup applies classes and does not choose them.
+export const EFFECT_ROW_REFUSED_CLASS = "effect-row-refused";
+
+// A stored value as a *manifest* spells it, for the sentence above. JSON, because the manifest is
+// JSON and `"1.5"` versus `1.5` is exactly the distinction the fault turns on -- a value printed
+// bare would make the quoted string and the number read identically. Non-finite numbers cannot be
+// JSON and `JSON.stringify` renders them `null`, which would name the wrong fault, so they are
+// spelled out: a 401-digit integer in a hand-edited file parses to `Infinity` here.
+function storedValueText(stored) {
+  if (typeof stored === "number" && !Number.isFinite(stored)) return String(stored);
+  const text = JSON.stringify(stored);
+  return text === undefined ? String(stored) : text;
+}
+
+// A bound as a sentence renders it -- `2`, never `2.0`, which is `effects._message_number`'s rule
+// and for its reason: a bound of `2` reads as a bound and `2.0` reads as a measurement.
+function boundText(value) {
+  return String(Number(value));
+}
+
+// Why the export will refuse what this shot stored for one number parameter, or `""` for a value
+// it will take. The whole sentence, ready to draw, because the row and any test of it should have
+// one place to read the verdict from.
+//
+// **Absence is not a fault.** A parameter the Shot never stored resolves to the catalogue default
+// exactly as `validate_stack` resolves it, and this panel's standing rule is that absence is never
+// presented as an error. A stored `null` is not absence: the key is in the file, `.get(name,
+// default)` hands the route `None`, and the route refuses it -- so the panel says so too.
+export function effectParameterFault(parameter, stored) {
+  if ((parameter?.kind || "number") !== "number" || stored === undefined) return "";
+  const whole = Boolean(parameter?.integer);
+  const minimum = Number(parameter?.minimum);
+  const maximum = Number(parameter?.maximum);
+  let fault = "";
+  if (typeof stored !== "number" || !Number.isFinite(stored)) {
+    fault = whole ? EFFECT_PARAMETER_NOT_WHOLE : EFFECT_PARAMETER_NOT_A_NUMBER;
+  } else if (whole && !Number.isInteger(stored)) {
+    fault = EFFECT_PARAMETER_NOT_WHOLE;
+  } else if (Number.isFinite(minimum) && stored < minimum) {
+    fault = EFFECT_PARAMETER_BELOW_MINIMUM.replace("{bound}", boundText(minimum));
+  } else if (Number.isFinite(maximum) && stored > maximum) {
+    fault = EFFECT_PARAMETER_ABOVE_MAXIMUM.replace("{bound}", boundText(maximum));
+  }
+  if (!fault) return "";
+  return EFFECT_PARAMETER_REFUSED_NOTE
+    .replace("{label}", parameter?.label || parameter?.name || "")
+    .replace("{value}", storedValueText(stored))
+    .replace("{fault}", fault);
+}
+
 //: How finely a slider divides its parameter's range, before the step is rounded to one
 //: significant figure so the numbers a Director lands on stay readable (a 60-wide range steps by
 //: 0.3, a 0.04-wide one by 0.0002). An integer parameter steps by 1 whatever its range.
@@ -6626,6 +6718,10 @@ export function effectParameterReadout(parameter, value) {
 // empty state is a real, selectable "no look chosen" that the route refuses by name if it is
 // written. That refusal is the honest answer; resolving it to whichever file sorted first would
 // put a grade on a take nobody asked for.
+//
+// A stored number the export refuses draws a **refused** row rather than an ordinary one:
+// `effectParameterFault` is the verdict and `EFFECT_PARAMETER_REFUSED_NOTE` says why. See both for
+// the argument.
 export function effectParameterRow(parameter, spec, { looks = [], disabled = false } = {}) {
   const stored = (spec?.parameters || {})[parameter?.name];
   const base = {
@@ -6635,6 +6731,11 @@ export function effectParameterRow(parameter, spec, { looks = [], disabled = fal
     disabled: Boolean(disabled),
     bindGlyph: EFFECT_BIND_GLYPH,
     bindTitle: EFFECT_BIND_INERT_TITLE,
+    // Every row carries these three whatever its kind, so the markup asks one question of every
+    // row rather than asking it only of the kind that can currently answer yes.
+    refused: false,
+    note: "",
+    className: "",
   };
   if (base.kind === "choice") {
     const value = stored === undefined || stored === null
@@ -6659,19 +6760,31 @@ export function effectParameterRow(parameter, spec, { looks = [], disabled = fal
   }
   const scale = numberSliderScale(parameter);
   const fallback = Number(parameter?.default ?? scale.minimum);
-  const value = stored === undefined || stored === null || !Number.isFinite(Number(stored))
-    ? fallback
+  const note = effectParameterFault(parameter, stored);
+  // A refused row draws its control **empty** -- thumb at the low end, no fill, no reading -- and
+  // says why underneath. It is deliberately not the stored value (a slider cannot sit outside its
+  // own track, so a `zoom` of 5 would draw as a confident 2 with the readout agreeing), and
+  // deliberately not the default either (the shot does not hold the default, and a card claiming
+  // it would be this defect with a nicer number on it). The control stays live where the Shot is
+  // unlocked, because moving it is the whole remedy: one drag replaces the unusable value with one
+  // the route and the export will take.
+  const value = note || stored === undefined || stored === null
+      || !Number.isFinite(Number(stored))
+    ? (note ? scale.minimum : fallback)
     : Number(stored);
   return {
     ...base,
     kind: "number",
+    refused: Boolean(note),
+    note,
+    className: note ? EFFECT_ROW_REFUSED_CLASS : "",
     value,
     minimum: scale.minimum,
     maximum: scale.maximum,
     step: scale.step,
     integer: Boolean(parameter?.integer),
-    fill: effectSliderFill(scale.minimum, scale.maximum, value),
-    readout: effectParameterReadout(parameter, value),
+    fill: note ? 0 : effectSliderFill(scale.minimum, scale.maximum, value),
+    readout: note ? EFFECT_PARAMETER_NO_READING : effectParameterReadout(parameter, value),
     choices: [],
   };
 }

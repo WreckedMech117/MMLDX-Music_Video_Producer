@@ -2316,8 +2316,13 @@ def _canonical(value: Any) -> str:
     the formatter the composers use, so the fingerprint changes exactly when the chain does.
 
     *Types `json` refuses.* This walks a hand-edited manifest's leftovers as readily as a
-    validated stack — the fingerprint is taken **before** anything decides the stack composes, so
-    that an uncomposable stack still gets a name and its refusal is not a `TypeError`.
+    validated value, and it has to: `bindings` and `transition` are hashed as they arrive, so a
+    `set` or a `date` that reached one of them must produce a name rather than a `TypeError`
+    raised from inside a fingerprint. (This paragraph used to say the fingerprint is taken
+    "before anything decides the stack composes". That was never true of its only caller, which
+    composes the chain and refuses on it two dozen lines earlier, and it is not true of
+    `preview_fingerprint` at all any more: the stack reaches the payload *as the chain it
+    composes to*, so an uncomposable stack is a refusal rather than a name.)
 
     A string is quoted and a number is not, so `"1"` and `1` cannot collide; a mapping's keys are
     ordered by `repr` for `validate_stack`'s reason, that a hand-edited manifest can mix key
@@ -2430,11 +2435,15 @@ def exported_look(
 #: The eight inputs of the preview fingerprint, in the order they are hashed in. A tuple rather
 #: than eight literals inside the function so that the order is a thing a test can read, and so
 #: that adding a ninth is visibly a change to AD-28 rather than a line in a payload.
+#:
+#: The fourth was called `stack` until 2026-08-26 and hashed the stored spec. It is `chain`
+#: because that is what it holds: the filter text the stack composes to. See
+#: `preview_fingerprint`.
 PREVIEW_FINGERPRINT_INPUTS: tuple[str, ...] = (
     "take",
     "window",
     "offset",
-    "stack",
+    "chain",
     "bindings",
     "song",
     "transition",
@@ -2449,6 +2458,7 @@ def preview_fingerprint(
     window_duration: float,
     offset: float,
     stack: Iterable[Mapping[str, Any]] = (),
+    luts: Sequence[LutEntry] = (),
     bindings: Iterable[Any] = (),
     song_fingerprint: str = "",
     transition: Any = None,
@@ -2479,12 +2489,65 @@ def preview_fingerprint(
     Floats go through `_number`, the composers' own formatter, so this changes exactly when the
     filter chain changes and never for a difference the chain cannot express — `1` and `1.0` are
     one look, and so are two zoom values a millionth apart.
+
+    **The stack is hashed as the chain it composes to, not as the spec it is stored as** — the
+    fourth slot is `chain` for that reason. The stored stack is sparse by design
+    (`models.stored_effect_stack`: *"a manifest full of frozen defaults makes a corrected default
+    unable to reach the projects that would benefit from it"*), so a name taken from the sparse
+    spec cannot move when the catalogue supplies a different default, and cannot move when a
+    composer is corrected either. Both were live: `e4aec46` moved Scanlines' grid origin from
+    `x=-1` to `x=-t`, removing a black left-edge bar measured at 26 dark columns at 1920x1080
+    with `lines=20`, and every clip already cached under the old spelling went on being served —
+    nothing evicts `previews/`, so it was permanent. Composing first costs no disk read the
+    caller has not already made and no arithmetic worth naming, and it makes the name a function
+    of the picture rather than of the words for it.
+
+    **It costs one re-render of everything, once.** The payload changed, so every clip already
+    in every `previews/` folder on this machine is named by the old one and none of them will be
+    hit again. They are not deleted — a stale entry is inert, which is the whole point of naming
+    rather than comparing — so the cost is one render per Shot a Director next looks at (~116 ms
+    each here) and the disk the old clips go on occupying until the folder is emptied. That is
+    the fix for the Scanlines clips above, not a side effect of it: they are exactly the clips
+    that must not be served again.
+
+    Two states that compose to one chain are therefore one name, which is the rule this always
+    stated, applied where it is actually decidable: a card disabled, a card left at a value that
+    composes nothing, and `1` against `1.0` all reach one clip because they all reach one filter
+    string. The two groups are hashed as a pair rather than run together, because `scale` sits
+    between them (`EffectStages`) and a stage that moved from one group to the other would be a
+    different picture.
+
+    **What it composes with, and why those are the right arguments.** The geometry is the
+    preview's own, which is already two of the eight inputs. `clip_offset` is zero and the span
+    is `window_duration`: a preview is always a whole Shot from its own first frame, never one
+    half of a resolved overlap, so both are read off inputs this already hashes rather than taken
+    on trust from a caller. A stack that does not compose — an unknown effect, a look whose
+    `.cube` has gone — raises `EffectRefusal` here rather than returning a name. Its one caller
+    composes the same chain from the same arguments a few lines earlier and has already refused
+    in the catalogue's own words, so that path is unreachable from the route; a direct caller
+    gets that sentence rather than a name for a picture that cannot be made.
+
+    **The boundary: a look's file *content* is not in here.** The chain carries the `.cube`'s
+    path, so switching looks moves the name and rewriting one in place does not — that clip stays
+    cached and stale until the folder is emptied. Closing it means reading and hashing every
+    referenced look on every request, cache hit included, and bypassing the `discovered_looks`
+    hold that exists so a picker does not re-read 44 MB: measured 2026-08-26 at 0.56 ms for a
+    33-cube and 4.24 ms for a 64-cube, against a ~116 ms render. It is left open deliberately,
+    and named here so the next reader does not have to measure it to find out.
     """
+    chain = build_effect_stages(
+        stack,
+        width=width,
+        height=height,
+        luts=luts,
+        clip_offset=0.0,
+        shot_seconds=window_duration,
+    )
     fields = (
         _canonical(take),
         f"{_number(window_start)}+{_number(window_duration)}",
         _number(offset),
-        _canonical(list(stack)),
+        _canonical([list(chain.geometry), list(chain.treatment)]),
         _canonical(list(bindings)),
         _canonical(song_fingerprint),
         _canonical(transition),

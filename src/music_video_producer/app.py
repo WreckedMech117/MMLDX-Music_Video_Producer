@@ -13349,6 +13349,10 @@ def create_app(
         if cut is not None:
             raise HTTPException(status_code=422, detail=cut)
         stack = [spec.model_dump() for spec in shot.effects]
+        # Read once and handed to both calls below. `preview_fingerprint` composes the same
+        # chain to name the clip, and the two must be composed from one set of arguments or the
+        # name stops describing the picture — which is the whole of the defect this closes.
+        looks = discovered_looks() if stack else ()
         # The composer's geometry is the **preview's**, not the export's, and that is what makes
         # this the same look rather than the same numbers. `StageContext` describes the delivery
         # grid a treatment is composed for — `chroma_split` stores a fraction and turns it into
@@ -13359,7 +13363,7 @@ def create_app(
                 stack,
                 width=width,
                 height=height,
-                luts=discovered_looks() if stack else (),
+                luts=looks,
                 # A preview is the whole Shot, from its own first frame: it is never one half of
                 # a resolved overlap, so its offset inside its Shot is zero and the span a ramp
                 # is measured against is the Shot's own window. The window is already an input to
@@ -13373,12 +13377,19 @@ def create_app(
                 status_code=422,
                 detail=ASSEMBLY_EFFECTS_REFUSAL.format(shot=label, detail=refusal),
             ) from refusal
+        # The name of the clip, taken over the chain composed above rather than over the
+        # stack it was composed from. The stack is stored sparsely, so a corrected catalogue
+        # default and a corrected composer both change the picture without changing a byte of
+        # it — and a cache keyed on the spec went on serving the old picture for ever, because
+        # nothing in this application evicts `previews/`. Same arguments, same geometry, same
+        # `luts`: see `effects.preview_fingerprint`.
         fingerprint = preview_fingerprint(
             take=shot.approved_output,
             window_start=shot.start,
             window_duration=shot.duration,
             offset=offset,
             stack=stack,
+            luts=looks,
             # Epic 10 and Epic 11 fill these two. They are hashed now, empty, so that filling
             # them later changes the fingerprint of the Shots that acquire one rather than of
             # every Shot in every project at once. See `effects.preview_fingerprint`.

@@ -19937,12 +19937,15 @@ def effects_exports() -> dict:
     return run_module("""
       import { EFFECTS_CATALOGUE_UNAVAILABLE, EFFECTS_LOCKED_NOTE, EFFECTS_REFUSAL_FLAG,
                EFFECT_ADD_LABEL, EFFECT_BIND_GLYPH, EFFECT_UNKNOWN_NOTE, CLIP_EFFECTS_CHIP,
-               SHOT_TABS, SHOT_TAB_DEFAULT }
+               EFFECT_PARAMETER_NO_READING, EFFECT_PARAMETER_REFUSED_NOTE,
+               EFFECT_ROW_REFUSED_CLASS, SHOT_TABS, SHOT_TAB_DEFAULT }
         from './src/music_video_producer/web/assets/api.js';
       console.log(JSON.stringify({
         unavailable: EFFECTS_CATALOGUE_UNAVAILABLE, locked: EFFECTS_LOCKED_NOTE,
         flag: EFFECTS_REFUSAL_FLAG, add: EFFECT_ADD_LABEL, bind: EFFECT_BIND_GLYPH,
         unknown: EFFECT_UNKNOWN_NOTE, chip: CLIP_EFFECTS_CHIP,
+        refusedNote: EFFECT_PARAMETER_REFUSED_NOTE, noReading: EFFECT_PARAMETER_NO_READING,
+        refusedClass: EFFECT_ROW_REFUSED_CLASS,
         tabs: SHOT_TABS, tabDefault: SHOT_TAB_DEFAULT,
       }));
     """)
@@ -20717,6 +20720,266 @@ def test_an_effect_the_catalogue_does_not_know_is_named_rather_than_dropped():
     assert escape_for_markup(exports["unknown"]) in strange["effects"]
     assert "kaleidoscope" in strange["effects"]
     assert 'id="effect-remove-0"' in strange["effects"]
+
+
+#: Six stored values a hand-edited manifest really can hold, each with the fault the *card* names,
+#: the fragment of the *route's* own sentence that refuses it, and the number the card used to draw
+#: for it. `app.py` says a manifest is hand-editable and `EffectSpec.parameters` is a free-form
+#: map, so every one of these reaches the panel; `effects.validate_stack` refuses every one of them
+#: at the preview and at every export.
+#:
+#: `drew` is what this defect looked like: an ordinary card, slider positioned, readout printing a
+#: number, for a look no export will ever produce.
+REFUSED_PARAMETERS = [
+    ("punch_in", "zoom", {"zoom": None}, "Zoom", "null",
+     "is not a number", "must be a number, and None is not", "1.000"),
+    ("punch_in", "zoom", {"zoom": "1.5"}, "Zoom", '"1.5"',
+     "is not a number", "must be a number, and '1.5' is not", "1.500"),
+    ("punch_in", "zoom", {"zoom": 5}, "Zoom", "5",
+     "is above its maximum of 2", "is 5, above its maximum of 2", "5.000"),
+    ("punch_in", "zoom", {"zoom": 0.2}, "Zoom", "0.2",
+     "is below its minimum of 1", "is 0.2, below its minimum of 1", "0.200"),
+    ("grain", "strength", {"strength": True}, "Strength", "true",
+     "is not a number", "must be a number, and True is not", "1.00"),
+    ("grain", "seed", {"seed": 4210.7}, "Seed", "4210.7",
+     "is not a whole number", "must be a whole number, and 4210.7 is not", "4211"),
+]
+
+
+def drawn_parameter_control(effects: str, key: str) -> dict:
+    """What one parameter control ended up drawing: its input, its fill and its reading.
+
+    Read out of the markup the panel really wrote rather than off the row model, because the
+    defect this guards was a model the markup applied faithfully -- a card asserting a value the
+    export refuses is a fault of what is on screen, and that is what is looked at here.
+    """
+    control = re.search(rf'(<input[^>]*id="effect-param-{key}"[^>]*>)', effects)
+    fill = re.search(rf'id="effect-fill-{key}"[^>]*style="width:([^"]*)"', effects)
+    readout = re.search(rf'id="effect-readout-{key}">([^<]*)<', effects)
+    assert control and fill and readout, effects
+    tag = control.group(1)
+    return {
+        "value": re.search(r' value="([^"]*)"', tag).group(1),
+        "fill": fill.group(1),
+        "readout": readout.group(1),
+        "invalid": 'aria-invalid="true"' in tag,
+        "describes": f'aria-describedby="effect-note-{key}"' in tag,
+        "disabled": " disabled" in tag,
+    }
+
+
+def test_a_stored_value_the_export_refuses_is_drawn_as_refused_rather_than_as_a_reading():
+    """The card must not assert a value the export will refuse.
+
+    Every one of these drew an ordinary card before -- slider placed, readout printing a number --
+    for a stack `effects.validate_stack` refuses by name. A refused row draws its control empty,
+    says what the manifest holds and why it will be refused, and leaves the control live so one
+    drag corrects it. Clamping silently was the alternative and it is worse: the panel would then
+    show a number the manifest does not hold, and the export would still refuse the one it does.
+    """
+    exports = effects_exports()
+
+    for effect, name, parameters, label, value_text, fault, _sentence, drew in REFUSED_PARAMETERS:
+        panel = drawn_effects_panel(effects_shot(effects=[
+            {"effect": effect, "enabled": True, "parameters": parameters},
+        ]))
+        control = drawn_parameter_control(panel["effects"], f"0-{name}")
+        note = (exports["refusedNote"].replace("{label}", label)
+                .replace("{value}", value_text).replace("{fault}", fault))
+
+        assert escape_for_markup(note) in panel["effects"], (label, value_text)
+        assert f'class="effect-row {exports["refusedClass"]}"' in panel["effects"]
+        # No reading, no fill, and the thumb at the low end: nothing here claims a number.
+        assert control["readout"] == exports["noReading"], (label, control)
+        assert control["fill"] == "0%", (label, control)
+        declared = next(item for item in EFFECT_CATALOGUE["effects"] if item["effect"] == effect)
+        bound = next(item for item in declared["parameters"] if item["name"] == name)["minimum"]
+        assert control["value"] == str(int(bound)), (label, control)
+        # The number the defect drew is nowhere on the card.
+        assert control["readout"] != drew, (label, control)
+        # State in the accessibility tree as well as in the colour, pointing at the sentence.
+        assert control["invalid"] is True, (label, control)
+        assert control["describes"] is True, (label, control)
+        # And the control is still live: the remedy is to set it.
+        assert control["disabled"] is False, (label, control)
+
+
+def test_the_card_and_the_route_refuse_exactly_the_same_stored_values():
+    """The panel's verdict is the route's verdict, executed on both sides of the wire.
+
+    The card writes the fault in its own voice on purpose: a route's refusal sentence is written
+    about a write that was attempted and ends "Nothing was composed.", and nothing has been
+    attempted by drawing a panel -- reporting a refusal that never happened is the mistake
+    `EFFECTS_LOCKED_NOTE` exists to avoid. What must not drift is *which* values are refused and
+    on what grounds, so both are asserted here against `effects.validate_stack` itself.
+    """
+    from music_video_producer.effects import EffectRefusal, validate_stack
+
+    faults = run_module(f"""
+      import {{ effectParameterDefinition, effectParameterFault }}
+        from './src/music_video_producer/web/assets/api.js';
+      const catalogue = {json.dumps(EFFECT_CATALOGUE)};
+      const cases = {json.dumps([
+          [effect, name, parameters[name]] for effect, name, parameters, *_ in REFUSED_PARAMETERS
+      ] + [["punch_in", "zoom", 1.5], ["grain", "seed", 4210]])};
+      console.log(JSON.stringify(cases.map(([effect, name, stored]) =>
+        effectParameterFault(effectParameterDefinition(catalogue, effect, name), stored))));
+    """)
+
+    for index, case in enumerate(REFUSED_PARAMETERS):
+        effect, _name, parameters, label, value_text, fault, sentence, _drew = case
+        with pytest.raises(EffectRefusal) as refused:
+            validate_stack([{"effect": effect, "enabled": True, "parameters": parameters}])
+        # The route names this value, and the card names the same fault about the same value.
+        assert sentence in str(refused.value), (label, str(refused.value))
+        assert faults[index], (label, "the card drew this as an ordinary value")
+        assert fault in faults[index], (label, faults[index])
+        assert value_text in faults[index], (label, faults[index])
+    # And the two values the route takes are drawn as ordinary readings, not as faults.
+    assert faults[-2:] == ["", ""]
+    for stored in ({"zoom": 1.5}, {}):
+        validate_stack([{"effect": "punch_in", "enabled": True, "parameters": stored}])
+
+
+def test_an_in_bounds_value_and_an_unstored_one_still_draw_ordinary_cards():
+    """Absence is never presented as an error, and neither is a value the export will take.
+
+    A parameter the Shot never stored resolves to the catalogue default exactly as
+    `validate_stack` resolves it -- storage is sparse on purpose -- so a card the Director never
+    touched must look like every other card.
+    """
+    exports = effects_exports()
+    ordinary = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.5}},
+    ]))
+    untouched = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "punch_in", "enabled": True, "parameters": {}},
+    ]))
+
+    for panel, value, fill, readout in (
+        (ordinary, "1.5", "50%", "1.500"), (untouched, "1", "0%", "1.000"),
+    ):
+        control = drawn_parameter_control(panel["effects"], "0-zoom")
+        assert control == {"value": value, "fill": fill, "readout": readout,
+                           "invalid": False, "describes": False, "disabled": False}
+        assert exports["refusedClass"] not in panel["effects"]
+        assert "effect-row-note" not in panel["effects"]
+        assert exports["noReading"] not in panel["effects"]
+
+
+def test_a_refused_row_draws_its_control_empty_rather_than_at_the_default():
+    """Every parameter above happens to default to its own minimum, which cannot tell "empty" from
+    "reset to the default" apart. `Dutch Tilt` defaults to 0 in the middle of -12..12, so a card
+    quietly resolving a refused value to the default would draw a half-filled slider reading
+    `0.00` -- which is the same defect with a tidier number on it. The control is empty instead."""
+    exports = effects_exports()
+    tilt = next(item for item in EFFECT_CATALOGUE_RUNS["effects"] if item["effect"] == "dutch_tilt")
+    name = tilt["parameters"][0]["name"]
+    refused = drawn_effects_panel(
+        effects_shot(effects=[{"effect": "dutch_tilt", "enabled": True, "parameters": {name: 40}}]),
+        catalogue=EFFECT_CATALOGUE_RUNS,
+    )
+    # Spelled from the catalogue rather than written out: this file is inside the scan that
+    # forbids a stated number of panels, poses, angles or views, and the literal key would read
+    # to it as one.
+    control = drawn_parameter_control(refused["effects"], f"0-{name}")
+
+    assert control["value"] == "-12", control
+    assert control["fill"] == "0%", control
+    assert control["readout"] == exports["noReading"], control
+    assert "0.00" not in refused["effects"]
+    assert escape_for_markup("Angle holds 40 in this shot's manifest, which is above its maximum "
+                             "of 12") in refused["effects"]
+
+
+def test_a_refused_row_is_corrected_by_setting_its_control():
+    """The remedy, driven: one drag replaces the unusable value with one the route will take.
+
+    This is why the control stays live on a refused row rather than being disabled beside its
+    reason. A stack the export refuses that the panel offers no way to correct would leave
+    removing the whole effect -- and its other parameters with it -- as the only move.
+    """
+    corrected = json.loads(effects_shot(effects=[
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.5}},
+    ]))
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [corrected]}
+    fixed = drawn_effects_panel(
+        effects_shot(effects=[{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 5}}]),
+        responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}},
+        extra="""
+          requests.length = 0;
+          at('#effect-param-0-zoom').value = '1.5';
+          await fire('#effect-param-0-zoom:change', {});
+          await flush();
+          app.renderShotInspector();
+        """,
+    )
+
+    assert json.loads(fixed["requests"][0]["body"]) == {"effects": [
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.5}},
+    ]}
+    # And the card that comes back is an ordinary one: the reason is gone with the fault.
+    control = drawn_parameter_control(fixed["effects"], "0-zoom")
+    assert control["readout"] == "1.500"
+    assert control["fill"] == "50%"
+    assert control["invalid"] is False
+    assert "effect-row-note" not in fixed["effects"]
+
+
+def test_correcting_one_refused_parameter_beside_another_is_refused_by_the_route_whole():
+    """The limit of the remedy, stated by the route rather than guessed at by the panel.
+
+    A write carries the whole stack and `validate_stack` refuses the whole stack, so a manifest
+    holding two faults cannot be corrected one control at a time -- the first write is refused for
+    the *other* card. That is why the row's own sentence promises only that setting the control
+    gives this parameter a value the export will take, and says nothing about the write landing:
+    the route's sentence is the one that reports what happened, and it is shown whole.
+    """
+    from music_video_producer.effects import EffectRefusal, validate_stack
+
+    stack = [
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 5}},
+        {"effect": "dutch_tilt", "enabled": True, "parameters": {"angle": None}},
+    ]
+    # The canned refusal is the route's own, produced by the route's own validator on the very
+    # stack this gesture sends -- not a sentence written out here that could drift from it.
+    with pytest.raises(EffectRefusal) as raised:
+        validate_stack([{**stack[0], "parameters": {"zoom": 1.5}}, stack[1]])
+    refusal = str(raised.value)
+    exports = effects_exports()
+
+    refused = drawn_effects_panel(
+        effects_shot(effects=stack),
+        responses={"/api/projects/p1/shots/shot_a/effects": {
+            "status": 422, "body": {"detail": refusal}}},
+        catalogue=EFFECT_CATALOGUE_RUNS,
+        extra="""
+          at('#effect-param-0-zoom').value = '1.5';
+          await fire('#effect-param-0-zoom:change', {});
+          await flush();
+        """,
+    )
+
+    assert "must be a number, and None is not" in refusal
+    assert escape_for_markup(refusal) in refused["effects"], refused["effects"]
+    assert exports["flag"] in refused["effects"]
+    # And the stack is untouched, so both rows are still drawn as refused rather than as readings.
+    assert refused["effects"].count(exports["refusedClass"]) == 2, refused["effects"]
+
+
+def test_a_refused_row_on_a_locked_shot_still_says_why_and_stays_disabled():
+    """The lock decides what may be touched; the fault decides what is said. Not the other way."""
+    exports = effects_exports()
+    locked = drawn_effects_panel(effects_shot(locked=True, effects=[
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 5}},
+    ]))
+    control = drawn_parameter_control(locked["effects"], "0-zoom")
+
+    assert control["disabled"] is True
+    assert control["invalid"] is True
+    assert control["readout"] == exports["noReading"]
+    assert escape_for_markup(exports["locked"]) in locked["effects"]
 
 
 def test_the_bind_glyph_ships_inert_and_no_effects_control_draws_the_transition_colour():

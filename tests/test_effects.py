@@ -30,6 +30,7 @@ misconception the two of them share.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import subprocess
 from pathlib import Path
@@ -1835,12 +1836,17 @@ def a_fingerprint(**changed):
 
 
 def test_the_preview_fingerprint_names_its_eight_inputs_in_the_documented_order():
-    """AD-28 fixes the list and the order. The names are the contract a later epic fills in."""
+    """AD-28 fixes the list and the order. The names are the contract a later epic fills in.
+
+    The fourth is `chain` and not `stack`: what is hashed there is the filter text the stack
+    composes to, and the two are not the same thing — a stored stack is sparse, so a corrected
+    default and a corrected composer both move the picture without moving a byte of it.
+    """
     assert PREVIEW_FINGERPRINT_INPUTS == (
         "take",
         "window",
         "offset",
-        "stack",
+        "chain",
         "bindings",
         "song",
         "transition",
@@ -1890,8 +1896,7 @@ def test_the_bindings_and_transition_slots_are_hashed_before_anything_fills_them
 def test_two_states_that_compose_to_one_chain_fingerprint_alike():
     """`1` and `1.0` are one filter string, so they must be one look — a fingerprint that told
     them apart would re-render a preview that cannot possibly differ. Key order is not a
-    contract either. `True` is **not** `1`, because `bool` is an `int` in Python and a flag
-    where a number belongs is a different stack."""
+    contract either, and neither is how much of the look a manifest happens to spell out."""
     integral = a_fingerprint(
         stack=[{"effect": "contrast", "enabled": True, "parameters": {"amount": 1}}]
     )
@@ -1901,30 +1906,147 @@ def test_two_states_that_compose_to_one_chain_fingerprint_alike():
     reordered = a_fingerprint(
         stack=[{"parameters": {"amount": 1.0}, "enabled": True, "effect": "contrast"}]
     )
-    flagged = a_fingerprint(
-        stack=[{"effect": "contrast", "enabled": True, "parameters": {"amount": True}}]
+    # Every declared parameter written out, against the sparse spelling `stored_effect_stack`
+    # actually writes. One chain, so one name: a fingerprint that told them apart would hand a
+    # Director a re-render for a manifest that was tidied.
+    spelled_out = a_fingerprint(
+        stack=[{"effect": "grain", "enabled": True, "parameters": {"strength": 30.0, "seed": 0}}]
     )
     assert integral == fractional == reordered
-    assert flagged != integral
+    assert spelled_out == a_fingerprint()
     # And a difference a filter string cannot express is not a difference: `_number` formats to
     # six decimals, which is the resolution the chain itself has.
     assert a_fingerprint(offset=0.5) == a_fingerprint(offset=0.50000001)
     assert a_fingerprint(offset=0.5) != a_fingerprint(offset=0.5001)
 
 
-def test_a_stack_the_validator_would_refuse_still_gets_a_name():
-    """The fingerprint is taken before anything decides the stack composes, so a hand-edited
-    manifest holding nested lists, `None`s or mixed key types is named rather than raising. The
-    refusal that follows is a sentence; it must not be a `TypeError` from the hasher."""
+def test_the_two_stage_groups_are_hashed_as_a_pair_and_not_run_together(monkeypatch):
+    """`scale` sits between the geometry group and the treatment group (`EffectStages`), so the
+    same stage on either side of it is not the same picture. The chain slot hashes the two
+    groups as a pair for that reason, and a payload that ran them together would call these two
+    chains one and serve either clip for both.
+
+    Both composers are replaced, because no two entries in this catalogue compose the same text
+    from different families and the case cannot otherwise be built — which is also why it is
+    worth pinning: nothing today would notice if the pair became a concatenation.
+    """
+    geometry = EFFECT_CATALOGUE["mirror"]
+    texture = EFFECT_CATALOGUE["grain"]
+    stack = [
+        {"effect": "mirror", "enabled": True, "parameters": {}},
+        {"effect": "grain", "enabled": True, "parameters": {}},
+    ]
+
+    def composing(*stages):
+        return lambda values, context: stages
+
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE, "mirror", dataclasses.replace(geometry, compose=composing("hflip"))
+    )
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE, "grain", dataclasses.replace(texture, compose=composing("negate"))
+    )
+    assert stages(stack) == EffectStages(geometry=("hflip",), treatment=("negate",))
+    before_the_scale = a_fingerprint(stack=stack)
+
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE, "mirror", dataclasses.replace(geometry, compose=composing())
+    )
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE,
+        "grain",
+        dataclasses.replace(texture, compose=composing("hflip", "negate")),
+    )
+    assert stages(stack) == EffectStages(geometry=(), treatment=("hflip", "negate"))
+
+    assert a_fingerprint(stack=stack) != before_the_scale
+
+
+def test_a_corrected_composer_moves_the_fingerprint_of_a_stack_nobody_touched(monkeypatch):
+    """The defect this slot exists to close, and it was live in shipped code: `e4aec46` moved
+    Scanlines' grid origin from `x=-1` to `x=-t`, removing a black left-edge bar measured at
+    **26 dark columns** on a white 1920x1080 frame at `lines=20`. Every preview already cached
+    under the old spelling went on being served — for ever, because nothing in this application
+    evicts `previews/` and no control clears it.
+
+    No input the Director controls has moved here: the same card, the same values, a different
+    picture. A name taken from the stack cannot express that. A name taken from the chain can,
+    and the composer is *replaced* rather than edited so that the test is about the fingerprint
+    rather than about Scanlines.
+    """
+    stack = [{"effect": "scanlines", "enabled": True, "parameters": {"strength": 0.5}}]
+    shipped = a_fingerprint(stack=stack)
+    definition = EFFECT_CATALOGUE["scanlines"]
+
+    def one_pixel_origin(values, context):
+        """The `7db970c` spelling, rebuilt from the shipped stage: `drawgrid=x=-1:…`."""
+        return tuple(
+            "drawgrid=x=-1:" + stage.split(":", 1)[1]
+            for stage in definition.compose(values, context)
+        )
+
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE, "scanlines", dataclasses.replace(definition, compose=one_pixel_origin)
+    )
+    (patched,) = stages(stack).treatment
+    assert patched.startswith("drawgrid=x=-1:y=0:")
+    assert a_fingerprint(stack=stack) != shipped
+
+
+def test_a_corrected_catalogue_default_moves_the_fingerprint_of_a_stack_nobody_touched(
+    monkeypatch,
+):
+    """The other half, and the one `stored_effect_stack` argues for in its own words: a stack is
+    stored sparsely so that *"a corrected default"* can reach the projects that would benefit
+    from it. A name taken from the sparse spec cannot notice one — the manifest holds no
+    `strength` to move. A name taken from the chain notices, because the default is in it."""
+    stack = [{"effect": "grain", "enabled": True, "parameters": {}}]
+    shipped = a_fingerprint(stack=stack)
+    definition = EFFECT_CATALOGUE["grain"]
+
+    monkeypatch.setitem(
+        EFFECT_CATALOGUE,
+        "grain",
+        dataclasses.replace(
+            definition,
+            parameters=tuple(
+                dataclasses.replace(parameter, default=12.0)
+                if parameter.name == "strength"
+                else parameter
+                for parameter in definition.parameters
+            ),
+        ),
+    )
+    assert a_fingerprint(stack=stack) != shipped
+
+
+def test_a_stack_the_validator_would_refuse_is_refused_here_in_the_catalogues_own_words():
+    """A hand-edited manifest holding nested lists, `None`s or mixed key types used to be
+    *named*, because the fingerprint hashed the spec and a spec always hashes. The chain is
+    hashed now, so it refuses — with the catalogue's own sentence, never a `TypeError` out of
+    the hasher. Nothing reaches it from the wire: the preview route composes the same chain from
+    the same arguments first, and has answered 422 by the time a name is asked for.
+
+    The two slots a later epic fills are **not** composed and go on accepting anything, which is
+    what `_canonical` is for: Epic 10 and Epic 11 will put manifest values in them, and a
+    fingerprint is not the place a hand-edited leftover may raise."""
     ugly = [
         {"effect": "grain", "parameters": {"strength": [1, 2, {"deep": None}]}},
         {"effect": "nonexistent", "parameters": {1: "one", "b": 2}},
         {},
     ]
-    named = a_fingerprint(stack=ugly)
-    assert len(named) == 64
-    assert named == a_fingerprint(stack=ugly)
-    assert named != a_fingerprint()
+    with pytest.raises(EffectRefusal):
+        a_fingerprint(stack=ugly)
+    # `bool` is an `int` in Python, and a flag where a number belongs is refused by the
+    # validator rather than composed as `1`.
+    with pytest.raises(EffectRefusal):
+        a_fingerprint(stack=[{"effect": "contrast", "parameters": {"amount": True}}])
+
+    leftovers = {"bindings": [{1: None, "b": [2, {"c": None}]}], "transition": {"x": [None]}}
+    junk = a_fingerprint(**leftovers)
+    assert len(junk) == 64
+    assert junk == a_fingerprint(**leftovers)
+    assert junk != a_fingerprint()
 
 
 # ------------------------------------------------------------------------------------------

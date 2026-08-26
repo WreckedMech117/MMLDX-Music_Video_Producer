@@ -861,6 +861,19 @@ dialog p { color: var(--muted); line-height: 1.5; }
 .effect-number:disabled::-webkit-slider-thumb { background: var(--dim); }
 .effect-number:disabled::-moz-range-thumb { background: var(--dim); }
 .effect-readout { flex: none; width: 36px; color: var(--muted); font: 10px Consolas, monospace; text-align: right; }
+/* A parameter whose stored value the export refuses by name (`effectParameterFault`). The track
+   carries the red *edge* weight and the reading carries the red *text* weight -- the same division
+   `.shot-readiness.blocked` makes, so a refusal reads the same here as everywhere else in this
+   application. The track is left empty rather than filled: there is no reading to draw, and a fill
+   at any width would be the card asserting a value the export will not take.
+   The reason goes under the row it is about, across the card rather than indented to the control
+   column: this inspector is a 260px rail, and an indent that looked tidy on paper left the
+   sentence 130px wide and ten lines tall. Bordered in the red edge rather than shouted in red
+   text, which is `.shot-readiness.blocked`'s division. `overflow-wrap` because the value it
+   quotes came out of a hand-edited file and may be one long unbroken run of characters. */
+.effect-row-refused .effect-track { background: var(--red-edge); }
+.effect-row-refused .effect-readout { color: var(--red); }
+.effect-row-note { margin: -3px 9px 8px; padding: 1px 0 1px 8px; border-left: 2px solid var(--red-edge); color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
 /* The bind glyph ends every row and ships **inert** in --dim. --blue is the reactive-binding
    colour and it is closed to Epic 10; nothing in this slice may draw it. */
 .effect-bind { flex: none; width: 15px; color: var(--dim); font-size: 13px; text-align: center; }
