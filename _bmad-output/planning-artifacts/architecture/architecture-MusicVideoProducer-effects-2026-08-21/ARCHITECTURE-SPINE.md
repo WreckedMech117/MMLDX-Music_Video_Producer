@@ -36,18 +36,32 @@ graph TD
   APP --> FX[effects.py]
   APP --> AUD[audio.py]
   APP --> ASM[assembly.py]
-  ASM --> FX
   APP --> TL[timeline.py]
   APP --> STORE[store.py]
-  FX --> MODELS[models.py]
-  AUD --> MODELS
-  ASM --> MODELS
+  TL --> MODELS[models.py]
+  STORE --> MODELS
+  STORE --> AUD
   AUD -->|subprocess decode| FFM[(ffmpeg)]
   ASM -->|subprocess| FFM
   APP -->|subprocess, preview| FFM
 ```
 
-`effects.py` and `audio.py` obey the standing dependency rule: neither imports `app.py`, `batch.py`, or `assembly.py`. `assembly.py` imports `effects.py` and not the reverse — the chain builder must not know what a clip is.
+**Corrected 2026-08-26, after Epic 9's retrospective measured the real import graph.** This diagram
+previously drew four edges that do not exist — `ASM --> FX`, `FX --> MODELS`, `AUD --> MODELS` and
+`ASM --> MODELS` — and omitted one that does, `STORE --> AUD` (`store.py:10`, which imports
+`ENVELOPE_REQUIRED_KEYS` and `ENVELOPE_VERSION`). The prose beneath it asserted that *"`assembly.py`
+imports `effects.py` and not the reverse"*; it imports neither.
+
+**The as-built is stricter than this document was, which is the dangerous direction to be wrong in.**
+`effects.py`, `assembly.py` and `audio.py` are **leaf modules**: they import the standard library and
+nothing else from this package (`audio.py` additionally imports numpy). Verified by grep across all
+three — zero internal imports between them, and none to `models.py`. `app.py` is the only module
+that reaches them, and it is the only place that has both a plan and a catalogue.
+
+That matters more than a tidy diagram. An agent reading the old version would have believed
+`effects.py` may import `models`, and taken the first genuine layering violation as licence already
+granted. The standing rule is the stronger one the code actually keeps: **the chain builder knows
+nothing about a clip, a Shot, or a manifest — it is handed values and returns strings.**
 
 ## Inherited Invariants
 
@@ -177,11 +191,41 @@ Inherited table applies verbatim. Deltas:
 | Concern | Convention |
 | --- | --- |
 | Generated render inputs | Any file generated to drive a render (filter chain, concat list, `sendcmd` script) is a pure function of the manifest and asserted by string comparison — the discipline `assembly.py` already applies to argv |
-| ffmpeg file arguments | Filenames inside filter strings are passed **cwd-relative** with the process cwd set to their directory; never an absolute Windows path |
+| ffmpeg file arguments | **Never a bare absolute Windows path** — the filtergraph parser splits at the drive-letter colon and blames the wrong filter. Beyond that the remedy is per-filter, measured, not one rule: `lut3d`'s `file=` takes the **single-quoted, colon-escaped** form `'C\:/x/y.cube'`, and `sendcmd`'s `f=` takes a **cwd-relative** name with the process cwd set to its directory (AD-22). See below before choosing |
 | Derived vs stored | Extended: envelope validity, preview staleness, and effect presence on a clip are all **computed**, never stored as flags |
 | Catalogue data | Effect and transition catalogues are server-side; the frontend renders what the server offers and composes no filter strings |
 | New manifest fields | Defaulted, and — where a whole-manifest PUT could clear them — adopted server-side via the `_adopt_*` idiom |
 | Disposable state | The preview cache is deletable at any time with no consequence beyond a re-render, and is never an export input |
+
+### How a filename reaches a filter — measured, per filter
+
+**Amended 2026-08-26.** This table's `ffmpeg file arguments` row previously read as one blanket
+rule: *"Filenames inside filter strings are passed cwd-relative with the process cwd set to their
+directory."* That is right for `sendcmd` and **wrong for `lut3d`**, and Epic 9 shipped the quoted
+form after measuring it. Epic 10 is the `sendcmd` epic and will read this row, so the correction
+matters before it starts rather than after.
+
+Measured against this project's ffmpeg 7.0 (`effects.py` module docstring carries the full table;
+`docs/BUILD-HANDOFF.md` carries the `sendcmd` half):
+
+| Form | `lut3d` `file=` |
+| --- | --- |
+| `C:/x/y.cube` — bare absolute, either slash | fails always; the error names `clut`, not the path |
+| `C\:/x/y.cube` — unquoted, colon escaped | works until the path holds a `,` or a `;` |
+| bare relative, process cwd set | works until the path holds a `,` or a `;` |
+| `'C\:/x/y.cube'` — **single-quoted, colon escaped** | works for every case but an apostrophe |
+
+So the two filters genuinely differ, and the quoted form is **strictly more robust** than the
+cwd-relative one: it survives commas and semicolons, and it needs no working-directory contract at
+all, which is why the export path was left untouched by Epic 9. `sendcmd=f=` still needs cwd-relative
+(AD-22) — the drive-letter colon there fails with `No option name near 'frame'`, naming a filter that
+is not the problem.
+
+The one case nothing survives is an **apostrophe in the path**, which `effects.py` refuses by name
+rather than passing on.
+
+**The rule to carry forward:** never assume one escaping remedy generalises across ffmpeg filters.
+Each option's parser is its own; measure the filter you are actually writing to.
 
 ## Stack
 
