@@ -19938,6 +19938,9 @@ def effects_exports() -> dict:
       import { EFFECTS_CATALOGUE_UNAVAILABLE, EFFECTS_LOCKED_NOTE, EFFECTS_REFUSAL_FLAG,
                EFFECT_ADD_LABEL, EFFECT_BIND_GLYPH, EFFECT_UNKNOWN_NOTE, CLIP_EFFECTS_CHIP,
                EFFECT_PARAMETER_NO_READING, EFFECT_PARAMETER_REFUSED_NOTE,
+               EFFECT_CHOICE_REFUSED_NOTE, EFFECT_CHOICE_REFUSED_OPTION,
+               EFFECT_LOOK_MISSING_NOTE, EFFECT_LOOK_MISSING_OPTION,
+               EFFECT_LOOK_UNCHOSEN_NOTE, EFFECT_STACK_REFUSED_NOTE,
                EFFECT_ROW_REFUSED_CLASS, SHOT_TABS, SHOT_TAB_DEFAULT }
         from './src/music_video_producer/web/assets/api.js';
       console.log(JSON.stringify({
@@ -19946,6 +19949,9 @@ def effects_exports() -> dict:
         unknown: EFFECT_UNKNOWN_NOTE, chip: CLIP_EFFECTS_CHIP,
         refusedNote: EFFECT_PARAMETER_REFUSED_NOTE, noReading: EFFECT_PARAMETER_NO_READING,
         refusedClass: EFFECT_ROW_REFUSED_CLASS,
+        choiceNote: EFFECT_CHOICE_REFUSED_NOTE, choiceOption: EFFECT_CHOICE_REFUSED_OPTION,
+        lookMissing: EFFECT_LOOK_MISSING_NOTE, lookOption: EFFECT_LOOK_MISSING_OPTION,
+        lookUnchosen: EFFECT_LOOK_UNCHOSEN_NOTE, stackNote: EFFECT_STACK_REFUSED_NOTE,
         tabs: SHOT_TABS, tabDefault: SHOT_TAB_DEFAULT,
       }));
     """)
@@ -20966,6 +20972,9 @@ def test_correcting_one_refused_parameter_beside_another_is_refused_by_the_route
     assert exports["flag"] in refused["effects"]
     # And the stack is untouched, so both rows are still drawn as refused rather than as readings.
     assert refused["effects"].count(exports["refusedClass"]) == 2, refused["effects"]
+    # The panel said this would happen *before* the gesture, so the refusal above is the outcome
+    # a Director was told to expect rather than a dead end found by trying.
+    assert escape_for_markup(exports["stackNote"].replace("{count}", "2")) in refused["effects"]
 
 
 def test_a_refused_row_on_a_locked_shot_still_says_why_and_stays_disabled():
@@ -20980,6 +20989,240 @@ def test_a_refused_row_on_a_locked_shot_still_says_why_and_stays_disabled():
     assert control["invalid"] is True
     assert control["readout"] == exports["noReading"]
     assert escape_for_markup(exports["locked"]) in locked["effects"]
+
+#: The looks this workspace was served, as the *server* holds them, so a mirror test can hand the
+#: same folder to `effects.validate_stack` that the panel was drawn against. One look, and the id
+#: the tests reach for when they want one that is gone is simply not in it -- which is the whole
+#: shape of the fault: the catalogue of looks is machine-global and discovered from a folder, so a
+#: manifest that was correct when it was written becomes a stack every export refuses the moment
+#: the file leaves.
+DISCOVERED_LOOKS = [("kodak", "Kodak 2383")]
+
+
+def drawn_select_control(effects: str, key: str) -> dict:
+    """What one select-drawn parameter ended up offering, and **what a browser would show**.
+
+    `shows` is the crux. A `<select>` whose value matches no `<option>` does not draw an empty
+    control: it draws its *first* option, which is how a stored `bicubic` came to read `nearest`
+    and a stored look that had left the folder came to read "No look chosen". So the browser's own
+    rule is written out here rather than assumed, and every assertion below is made against it.
+    """
+    opening = rf'(<select[^>]*id="effect-param-{key}"[^>]*>)(.*?)</select>'
+    found = re.search(opening, effects, re.DOTALL)
+    assert found, effects
+    tag, body = found.group(1), found.group(2)
+    options = [
+        {"value": item.group(1), "selected": "selected" in item.group(2), "label": item.group(3)}
+        for item in re.finditer(r'<option value="([^"]*)"([^>]*)>(.*?)</option>', body, re.DOTALL)
+    ]
+    assert options, effects
+    chosen = [item["label"] for item in options if item["selected"]]
+    return {
+        "options": options,
+        "shows": chosen[0] if chosen else options[0]["label"],
+        "invalid": 'aria-invalid="true"' in tag,
+        "describes": f'aria-describedby="effect-note-{key}"' in tag,
+        "disabled": " disabled" in tag,
+    }
+
+
+def test_a_choice_outside_its_declared_set_is_drawn_as_stored_rather_than_as_the_first_option():
+    """`{"interp": "bicubic"}` drew `nearest`, which the shot does not hold and the route refuses.
+
+    The browser's rule, not the model's: a select whose value matches no option shows the first
+    one. So the tab named a setting the manifest does not contain, calmly, for a stack
+    `effects.validate_stack` refuses by name. The stored value now has an entry of its own, marked
+    and selected, and the settings the parameter really does take are still offered beneath it --
+    which is the remedy: one choice replaces the unusable value.
+    """
+    exports = effects_exports()
+    panel = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "lut_look", "enabled": True,
+         "parameters": {"lut": "kodak", "interp": "bicubic"}},
+    ]))
+    control = drawn_select_control(panel["effects"], "0-interp")
+    note = (exports["choiceNote"].replace("{label}", "Interpolation")
+            .replace("{value}", '"bicubic"')
+            .replace("{choices}", "nearest, trilinear, tetrahedral"))
+
+    assert control["shows"] == exports["choiceOption"].replace("{value}", "bicubic")
+    # The value the defect drew is offered, unmarked, and is not what the control reads.
+    assert control["shows"] != "nearest"
+    assert [item["label"] for item in control["options"] if not item["selected"]] == [
+        "nearest", "trilinear", "tetrahedral",
+    ]
+    assert escape_for_markup(note) in panel["effects"], panel["effects"]
+    assert f'class="effect-row {exports["refusedClass"]}"' in panel["effects"]
+    assert control["invalid"] is True and control["describes"] is True, control
+    # The one fault on this stack, so the write is not a dead end and nothing says it is.
+    assert 'id="effects-stack-note"' not in panel["effects"]
+
+
+def test_a_look_that_has_left_the_folder_is_named_rather_than_drawn_as_no_look_chosen():
+    """`{"lut": "kodak_missing"}` drew "No look chosen" -- a different value, and a benign one.
+
+    The two are not the same fault and the route does not treat them as one: naming nothing is
+    wrong in the manifest, while naming a look that has gone is a fact about a folder that can
+    change under a project that never moved. The remedy differs with it, so the sentence names the
+    folder first and the list second.
+    """
+    exports = effects_exports()
+    panel = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "lut_look", "enabled": True, "parameters": {"lut": "kodak_missing"}},
+    ]))
+    control = drawn_select_control(panel["effects"], "0-lut")
+    note = (exports["lookMissing"].replace("{label}", "Look")
+            .replace("{value}", '"kodak_missing"'))
+    unchosen = escape_for_markup(exports["lookUnchosen"].replace("{label}", "Look"))
+
+    assert control["shows"] == exports["lookOption"].replace("{value}", "kodak_missing")
+    assert control["shows"] != "No look chosen"
+    # "No look chosen" is still there and still selectable: it is a real value, not a placeholder,
+    # and the looks the folder does hold are still offered under the name that is gone.
+    assert [item["label"] for item in control["options"]] == [
+        "No look chosen",
+        exports["lookOption"].replace("{value}", "kodak_missing"),
+        "Kodak 2383",
+    ], control
+    assert escape_for_markup(note) in panel["effects"], panel["effects"]
+    assert f'class="effect-row {exports["refusedClass"]}"' in panel["effects"]
+    assert control["invalid"] is True and control["describes"] is True, control
+    # Naming a look that is gone is not naming none of them, and the panel does not say it is.
+    assert unchosen not in panel["effects"]
+
+
+def test_naming_no_look_is_refused_switched_on_or_off_and_a_gone_look_only_switched_on():
+    """`_validate_lut`'s division, drawn: one question is about the manifest, one about the folder.
+
+    A grade with nothing to apply is wrong however the card is switched, so it is marked either
+    way -- and it is the one absence on this tab that is a fault at all, because a `LutParameter`
+    declares no default and `validate_stack` reaches for none.
+
+    A look that has left the folder is the other half, and a switched-off card naming one is
+    deliberately **not** refused: one deleted `.cube` would otherwise brick every project that
+    ever held that card. So the row draws no fault -- and still shows the name the manifest holds,
+    because what is stored and what is refused are two different statements.
+    """
+    exports = effects_exports()
+    unchosen = exports["lookUnchosen"].replace("{label}", "Look")
+    panels = {
+        switch: drawn_effects_panel(effects_shot(effects=[
+            {"effect": "lut_look", "enabled": switch, "parameters": {}},
+        ]))
+        for switch in (True, False)
+    }
+    for switch, panel in panels.items():
+        control = drawn_select_control(panel["effects"], "0-lut")
+        assert control["shows"] == "No look chosen", (switch, control)
+        assert escape_for_markup(unchosen) in panel["effects"], switch
+        assert exports["refusedClass"] in panel["effects"], switch
+        assert control["invalid"] is True, (switch, control)
+
+    off = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "lut_look", "enabled": False, "parameters": {"lut": "kodak_missing"}},
+    ]))
+    control = drawn_select_control(off["effects"], "0-lut")
+
+    assert control["shows"] == exports["lookOption"].replace("{value}", "kodak_missing")
+    assert control["invalid"] is False, control
+    assert exports["refusedClass"] not in off["effects"]
+    assert "effect-row-note" not in off["effects"]
+    assert 'id="effects-stack-note"' not in off["effects"]
+
+
+def test_the_card_and_the_route_refuse_exactly_the_same_looks_and_settings():
+    """The mirror the number rows already have, over the two kinds a select draws.
+
+    Both sides are executed: `effectParameterFault` against the catalogue this panel was served,
+    `effects.validate_stack` against the folder that catalogue was built from. What must not drift
+    is *which* values are refused -- including the two gates that make these kinds different from
+    a number: the absent look that is a fault, and the gone look on a switched-off card that is
+    not.
+    """
+    from pathlib import Path as LookPath
+
+    from music_video_producer.effects import EffectRefusal, LutEntry, validate_stack
+
+    looks = [LutEntry(lut_id=lut_id, name=name, path=LookPath(f"{lut_id}.cube"))
+             for lut_id, name in DISCOVERED_LOOKS]
+    #: (stored parameters, the card's switch, the parameter the panel must mark, the route's own
+    #: words for it) -- and `None` for a stack the route takes, which the panel must draw plain.
+    cases = [
+        ({"lut": "kodak", "interp": "bicubic"}, True, "interp",
+         "must be one of nearest, trilinear, tetrahedral, and 'bicubic' is not"),
+        ({"lut": "kodak", "interp": None}, True, "interp",
+         "must be one of nearest, trilinear, tetrahedral, and None is not"),
+        ({"lut": "kodak", "interp": 0}, True, "interp",
+         "must be one of nearest, trilinear, tetrahedral, and 0 is not"),
+        ({"lut": "kodak_missing"}, True, "lut",
+         "There is no look called 'kodak_missing' in the looks folder."),
+        ({}, True, "lut", "lut_look needs a look chosen"),
+        ({"lut": None}, True, "lut", "lut_look needs a look chosen"),
+        ({}, False, "lut", "lut_look needs a look chosen"),
+        ({"lut": "kodak"}, True, None, ""),
+        ({"lut": "kodak", "interp": "nearest"}, True, None, ""),
+        ({"lut": "kodak_missing"}, False, None, ""),
+    ]
+    asked = [[parameters, enabled, name or "lut"] for parameters, enabled, name, _ in cases]
+    faults = run_module(f"""
+      import {{ effectParameterDefinition, effectParameterFault }}
+        from './src/music_video_producer/web/assets/api.js';
+      const catalogue = {json.dumps(EFFECT_CATALOGUE)};
+      const cases = {json.dumps(asked)};
+      console.log(JSON.stringify(cases.map(([parameters, enabled, name]) =>
+        effectParameterFault(effectParameterDefinition(catalogue, 'lut_look', name),
+          parameters[name], {{ looks: catalogue.looks, enabled }}))));
+    """)
+
+    for index, (parameters, enabled, name, sentence) in enumerate(cases):
+        stack = [{"effect": "lut_look", "enabled": enabled, "parameters": parameters}]
+        if name is None:
+            validate_stack(stack, luts=looks)
+            assert faults[index] == "", (parameters, enabled, faults[index])
+            continue
+        with pytest.raises(EffectRefusal) as refused:
+            validate_stack(stack, luts=looks)
+        assert sentence in str(refused.value), (parameters, str(refused.value))
+        assert faults[index], (parameters, enabled, "the card drew this as an ordinary value")
+
+
+def test_a_stack_holding_more_than_one_fault_says_so_above_the_stack():
+    """The dead end, signposted rather than discovered.
+
+    A write carries the whole stack and `validate_stack` refuses the whole stack, so correcting
+    the first card is refused *because of the second* -- and what the panel shows for it is the
+    route's sentence about the other card. A Director following a row's own note lands there with
+    no way out and no explanation, so the panel says plainly, before the gesture, that every fault
+    has to go before any of them can be saved.
+
+    Drawn from two, which is where the dead end begins: at one fault, setting the control lands
+    the write, and a warning that it will not land would be false.
+    """
+    exports = effects_exports()
+    alone = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 5}},
+    ]))
+    both = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 5}},
+        {"effect": "lut_look", "enabled": True, "parameters": {"lut": "kodak_missing"}},
+    ]))
+    # A card the catalogue does not know refuses the whole stack too, so it is counted with them.
+    mixed = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "kaleidoscope", "enabled": True, "parameters": {}},
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 5}},
+    ]))
+    #: Both faults on one card, which is the case a count of *cards* would report as one.
+    together = drawn_effects_panel(effects_shot(effects=[
+        {"effect": "lut_look", "enabled": True,
+         "parameters": {"lut": "kodak_missing", "interp": "bicubic"}},
+    ]))
+    said = escape_for_markup(exports["stackNote"].replace("{count}", "2"))
+
+    assert 'id="effects-stack-note"' not in alone["effects"]
+    for panel in (both, mixed, together):
+        assert said in panel["effects"], panel["effects"]
+    # Above the stack it is about, so it is read before the marks rather than after them.
+    assert both["effects"].index("effects-stack-note") < both["effects"].index('id="effect-stack"')
 
 
 def test_the_bind_glyph_ships_inert_and_no_effects_control_draws_the_transition_colour():

@@ -6614,6 +6614,80 @@ const EFFECT_PARAMETER_ABOVE_MAXIMUM = "is above its maximum of {bound}";
 //: of a number rather than a number that has not arrived.
 export const EFFECT_PARAMETER_NO_READING = "—";
 
+//: A stored **choice** the export refuses -- `{"interp": "bicubic"}` where the parameter declares
+//: nearest, trilinear and tetrahedral, or `{"interp": null}`. `effects._validate_choice` takes a
+//: string from the declared set and nothing else, and `validate_stack` hands it
+//: `given.get(name, default)`: an absent key resolves to the catalogue's default, a key present
+//: holding `null` does not, and the route refuses it.
+//:
+//: The defect this closes is the browser's, not the model's. A `<select>` whose value matches no
+//: `<option>` shows its **first** option, so a manifest holding `bicubic` drew `nearest` -- a
+//: value the shot does not hold, on a stack the route refuses by name. The row carries the stored
+//: value as its own option now, marked, so the control reads what the manifest reads.
+export const EFFECT_CHOICE_REFUSED_NOTE =
+  "{label} holds {value} in this shot's manifest, which is not one of {choices}, so an export "
+  + "will refuse the whole stack for it. It is shown as stored rather than as a setting this shot "
+  + "does not hold; choose one of the listed settings to give this parameter a value the export "
+  + "will take.";
+
+//: A grade naming a look the looks folder does not hold. **Not the same fault as naming nothing**,
+//: and the difference is where the fault lives: the catalogue of looks is machine-global and
+//: discovered from a folder, so a `.cube` that was there when the manifest was written can simply
+//: leave -- and then a manifest that was correct becomes a stack every export refuses, without
+//: anything about the project having changed.
+//:
+//: So the remedy names the folder first. The reload is not decoration: this client holds the
+//: listing it was served at boot, and the route rescans the folder once on precisely this refusal
+//: (`_names_an_undiscovered_look`), so a look put back -- or dropped in for the first time --
+//: after this panel was drawn is one the route will accept and this list has never heard of.
+export const EFFECT_LOOK_MISSING_NOTE =
+  "{label} names {value}, and this workspace's looks folder has no look by that name, so an "
+  + "export will refuse the whole stack for it. Put the file back in the looks folder and reload "
+  + "the workspace, or choose one of the looks in the list.";
+
+//: A grade naming no look at all -- the key absent, `null`, empty, or holding something that is
+//: not a name. `effects._validate_lut` refuses all four the same way and with the same sentence,
+//: and it refuses them **whether the card is switched on or not**: a look that is missing is a
+//: question about the folder, but a grade with nothing to apply is wrong in the manifest.
+//:
+//: This is the one place on this tab where an absent key is a fault, and it is the catalogue that
+//: says so: a `LutParameter` declares no default, because there is no look that means "leave the
+//: take alone" -- that is what having no grade card is. Resolving it to whichever file sorted
+//: first would put a look on a take nobody asked for.
+export const EFFECT_LOOK_UNCHOSEN_NOTE =
+  "Nothing is chosen for {label} in this shot's manifest, so an export will refuse the whole stack "
+  + "for it: a grade with nothing to apply is refused whether the card is switched on or not. "
+  + "Choose one of the looks in the list.";
+
+//: The stored value's own entry in a list that does not offer it, so the control shows what the
+//: manifest holds instead of the first thing the browser could find. Marked, because an unmarked
+//: entry among the real ones would read as a fourth setting or a fifth look.
+export const EFFECT_CHOICE_REFUSED_OPTION = "{value} — not a setting this effect takes";
+export const EFFECT_LOOK_MISSING_OPTION = "{value} — not in the looks folder";
+
+//: What the tab says when a stack holds **more than one** fault, drawn above the stack rather than
+//: on any one row -- because it is not about any one row. A write from this tab carries the whole
+//: stack and `validate_stack` refuses the whole stack, so correcting the first card is refused
+//: *because of the second*, and what the panel then shows is the route's sentence about the other
+//: card. A Director following a row's own note lands there with no way out and no explanation.
+//:
+//: Said rather than left to be discovered. The alternative was to promise more in each row's note,
+//: which cannot be done honestly: a row knows its own parameter and nothing about its siblings.
+//:
+//: **A necessary condition, not a sufficient one**, and worded as one. This panel mirrors the
+//: faults `validate_stack` finds in *declared* parameters; a manifest can also hold a key the
+//: catalogue never declared or an `enabled` that is not a flag, and neither draws a row to mark.
+//: "before ... can be saved" stays true in that case; "and then it will save" would not.
+//:
+//: Drawn only from two, which is where the dead end begins. At one fault, setting the control
+//: lands the write, and a warning that the write will not land would be false.
+export const EFFECT_STACK_REFUSED_NOTE =
+  "This stack holds {count} faults, each marked below, and an export refuses the whole stack for "
+  + "any one of them. A write from this tab carries the whole stack as well, so correcting one "
+  + "while another stands is refused too, and the sentence that comes back is about the other "
+  + "one. Every fault has to be corrected, or its card removed, before a change to this shot's "
+  + "effects can be saved.";
+
 //: The class a refused row carries, so the state is in the markup and the stylesheet can put
 //: `--red` on the track and the reading. Decided here with the rest of the row, the way
 //: `effectCardModel` decides `effect-off` -- the markup applies classes and does not choose them.
@@ -6636,16 +6710,60 @@ function boundText(value) {
   return String(Number(value));
 }
 
-// Why the export will refuse what this shot stored for one number parameter, or `""` for a value
-// it will take. The whole sentence, ready to draw, because the row and any test of it should have
-// one place to read the verdict from.
+// Why the export will refuse this shot's stored **choice**, or `""` for one it will take. The test
+// is `effects._validate_choice`'s whole test: a string, from the declared set. Anything else --
+// `null`, a number, a spelling the catalogue does not offer -- is refused, and the sentence lists
+// what the parameter does take, in the order the catalogue declares them.
+function choiceFault(label, parameter, stored) {
+  const choices = parameter?.choices || [];
+  if (typeof stored === "string" && choices.includes(stored)) return "";
+  return EFFECT_CHOICE_REFUSED_NOTE
+    .replace("{label}", label)
+    .replace("{value}", storedValueText(stored))
+    .replace("{choices}", choices.join(", "));
+}
+
+// Why the export will refuse this shot's stored **look**, or `""` for one it will take.
 //
-// **Absence is not a fault.** A parameter the Shot never stored resolves to the catalogue default
-// exactly as `validate_stack` resolves it, and this panel's standing rule is that absence is never
-// presented as an error. A stored `null` is not absence: the key is in the file, `.get(name,
-// default)` hands the route `None`, and the route refuses it -- so the panel says so too.
-export function effectParameterFault(parameter, stored) {
-  if ((parameter?.kind || "number") !== "number" || stored === undefined) return "";
+// `effects._validate_lut`'s two questions, asked in its order and gated the way it gates them.
+// *Does this name a look at all* is a question about the manifest, so it is asked of a switched-off
+// card as well. *Is that look still in the folder* is a question about the folder, and a disabled
+// card applies no grade -- refusing an export over a `.cube` a switched-off card names would let
+// one deleted file brick every project that ever held that card. So a disabled card naming a look
+// that has gone draws no fault here, and the row still shows the name it holds: what the manifest
+// says is one thing, what the export refuses is another, and only the second is marked.
+function lookFault(label, stored, looks, enabled) {
+  if (typeof stored !== "string" || !stored) {
+    return EFFECT_LOOK_UNCHOSEN_NOTE.replace("{label}", label);
+  }
+  if (!enabled || (looks || []).some((look) => look?.lut_id === stored)) return "";
+  return EFFECT_LOOK_MISSING_NOTE
+    .replace("{label}", label)
+    .replace("{value}", storedValueText(stored));
+}
+
+// Why the export will refuse what this shot stored for one parameter of any kind, or `""` for a
+// value it will take. The whole sentence, ready to draw, because the row and any test of it should
+// have one place to read the verdict from.
+//
+// **Absence is not a fault -- except for a look.** A number or a choice the Shot never stored
+// resolves to the catalogue default exactly as `validate_stack` resolves it, and this panel's
+// standing rule is that absence is never presented as an error. A stored `null` is not absence:
+// the key is in the file, `.get(name, default)` hands the route `None`, and the route refuses it
+// -- so the panel says so too. A `LutParameter` declares no default and `validate_stack` reaches
+// for none, so an absent look is refused like every other unnamed one; `EFFECT_LOOK_UNCHOSEN_NOTE`
+// has the argument.
+//
+// `looks` and `enabled` are asked for by the lut kind alone, and they are the two things
+// `_validate_lut` is given beyond the value: the discovered listing to check the name against, and
+// whether the card is switched on -- because a switched-off card naming a look that has left the
+// folder is deliberately **not** refused, and marking it would be this panel inventing a refusal.
+export function effectParameterFault(parameter, stored, { looks = [], enabled = true } = {}) {
+  const kind = parameter?.kind || "number";
+  const label = parameter?.label || parameter?.name || "";
+  if (kind === "lut") return lookFault(label, stored, looks, enabled);
+  if (stored === undefined) return "";
+  if (kind === "choice") return choiceFault(label, parameter, stored);
   const whole = Boolean(parameter?.integer);
   const minimum = Number(parameter?.minimum);
   const maximum = Number(parameter?.maximum);
@@ -6661,7 +6779,7 @@ export function effectParameterFault(parameter, stored) {
   }
   if (!fault) return "";
   return EFFECT_PARAMETER_REFUSED_NOTE
-    .replace("{label}", parameter?.label || parameter?.name || "")
+    .replace("{label}", label)
     .replace("{value}", storedValueText(stored))
     .replace("{fault}", fault);
 }
@@ -6715,13 +6833,17 @@ export function effectParameterReadout(parameter, value) {
 // parameters at all and every row here is showing a default.
 //
 // A LUT parameter carries **no default** -- there is no look that means "leave it alone" -- so its
-// empty state is a real, selectable "no look chosen" that the route refuses by name if it is
-// written. That refusal is the honest answer; resolving it to whichever file sorted first would
-// put a grade on a take nobody asked for.
+// empty state is a real, selectable "no look chosen", and it is the one absence on this tab that
+// is itself a fault: the route refuses it by name, switched on or off. Resolving it to whichever
+// file sorted first would put a grade on a take nobody asked for.
 //
-// A stored number the export refuses draws a **refused** row rather than an ordinary one:
-// `effectParameterFault` is the verdict and `EFFECT_PARAMETER_REFUSED_NOTE` says why. See both for
-// the argument.
+// A stored value the export refuses draws a **refused** row rather than an ordinary one, whatever
+// kind draws it: `effectParameterFault` is the single verdict, and `EFFECT_PARAMETER_REFUSED_NOTE`,
+// `EFFECT_CHOICE_REFUSED_NOTE`, `EFFECT_LOOK_MISSING_NOTE` and `EFFECT_LOOK_UNCHOSEN_NOTE` say why.
+// See them for the argument. The two select-drawn kinds differ from a slider in one way that
+// matters: a slider cannot sit outside its own track, so a refused number is drawn as no reading at
+// all, while a select can carry any value as an option of its own -- so it carries the stored one,
+// marked, and the row asserts nothing the manifest does not hold.
 export function effectParameterRow(parameter, spec, { looks = [], disabled = false } = {}) {
   const stored = (spec?.parameters || {})[parameter?.name];
   const base = {
@@ -6737,25 +6859,53 @@ export function effectParameterRow(parameter, spec, { looks = [], disabled = fal
     note: "",
     className: "",
   };
+  // What a card holds for a select-drawn parameter, whether or not the list offers it. A `<select>`
+  // whose value matches no `<option>` shows its **first** option, which is how a stored `bicubic`
+  // came to draw `nearest` and a stored look that had left the folder came to draw "No look
+  // chosen" -- in both cases a value the shot does not hold, presented as calmly as one it does.
+  // The stored value gets an entry of its own, marked and at the head of the list, so the control
+  // reads what the manifest reads.
+  // The entry is labelled with the value as the *control* spells it rather than as the note quotes
+  // it: a note distinguishing `"1.5"` from `1.5` earns its quotation marks, and a list of looks
+  // reading `"kodak_2383"` beside `Kodak 2383` does not.
+  const marked = (value, template) => [
+    { value, label: template.replace("{value}", value), refused: true },
+  ];
   if (base.kind === "choice") {
-    const value = stored === undefined || stored === null
-      ? String(parameter?.default ?? "")
-      : String(stored);
+    const note = effectParameterFault(parameter, stored);
+    const value = stored === undefined ? String(parameter?.default ?? "") : String(stored);
+    const offered = (parameter?.choices || [])
+      .map((choice) => ({ value: choice, label: choice, refused: false }));
     return {
       ...base,
+      refused: Boolean(note),
+      note,
+      className: note ? EFFECT_ROW_REFUSED_CLASS : "",
       value,
       readout: value,
-      choices: (parameter?.choices || []).map((choice) => ({ value: choice, label: choice })),
+      choices: note ? [...marked(value, EFFECT_CHOICE_REFUSED_OPTION), ...offered] : offered,
     };
   }
   if (base.kind === "lut") {
     const value = stored === undefined || stored === null ? "" : String(stored);
     const chosen = looks.find((look) => look.lut_id === value);
+    // The card's own switch, read as `effectCardModel` and `stored_effect_stack` read it: anything
+    // but an explicit `false` is on. It decides only whether a look that has left the folder is a
+    // fault -- `lookFault` has the division -- and never whether the name is shown.
+    const note = effectParameterFault(parameter, stored, { looks, enabled: spec?.enabled !== false });
+    const offered = looks.map((look) => ({ value: look.lut_id, label: look.name, refused: false }));
     return {
       ...base,
+      refused: Boolean(note),
+      note,
+      className: note ? EFFECT_ROW_REFUSED_CLASS : "",
       value,
       readout: chosen ? chosen.name : "",
-      choices: looks.map((look) => ({ value: look.lut_id, label: look.name })),
+      // A name the listing does not hold is shown whether or not it is a fault: a switched-off
+      // card naming a look that has gone is not refused, and it still holds that name.
+      choices: chosen || !value
+        ? offered
+        : [...marked(value, EFFECT_LOOK_MISSING_OPTION), ...offered],
     };
   }
   const scale = numberSliderScale(parameter);
@@ -7258,12 +7408,23 @@ export function effectsPanelModel(shot, catalogue, { error = "", project = null,
     if (tail && tail.family === card.family) tail.cards.push(card);
     else runs.push({ family: card.family, cards: [card] });
   }
+  // Everything on this stack that an export refuses, counted once. A card whose effect the
+  // catalogue does not know counts alongside a refused parameter, because `validate_stack` refuses
+  // the stack for either and the dead end below is about the count, not about the kind.
+  const faults = cards.reduce(
+    (total, card) => total + (card.known ? 0 : 1) + card.rows.filter((row) => row.refused).length,
+    0,
+  );
   return {
     locked,
     lockNote: locked ? EFFECTS_LOCKED_NOTE : "",
     problem,
     cards,
     runs,
+    // How many, and the sentence that stops the dead end from having to be discovered. Two is
+    // where it begins: `EFFECT_STACK_REFUSED_NOTE` has the whole argument.
+    faults,
+    stackNote: faults > 1 ? EFFECT_STACK_REFUSED_NOTE.replace("{count}", String(faults)) : "",
     // The copy control needs the whole project to name its targets, and the catalogue problem
     // hides it for the reason it hides everything else: a panel that cannot say what this stack
     // is must not offer to put it on another shot.

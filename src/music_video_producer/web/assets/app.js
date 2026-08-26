@@ -2663,6 +2663,9 @@ function effectRowHtml(card, row) {
   if (row.kind === "number") {
     return `<div class="effect-row ${row.className}">${label}<span class="effect-slider"><span class="effect-track"></span><span class="effect-fill" id="effect-fill-${key}" style="width:${row.fill}%"></span><input class="effect-number" type="range" id="${EFFECT_PARAMETER_ID}${key}" min="${row.minimum}" max="${row.maximum}" step="${row.step}" value="${row.value}"${refused} ${row.disabled ? "disabled" : ""}></span><span class="effect-readout" id="effect-readout-${key}">${escapeHtml(row.readout)}</span>${bind}</div>${note}`;
   }
+  // The stored value's own marked entry, where the list does not offer it, is already at the head
+  // of `row.choices` -- `effectParameterRow` puts it there. Nothing here decides it is marked and
+  // nothing here writes its label.
   const options = row.choices.map((choice) =>
     `<option value="${escapeHtml(choice.value)}" ${row.value === choice.value ? "selected" : ""}>${escapeHtml(choice.label)}</option>`).join("");
   if (row.kind === "lut") {
@@ -2672,9 +2675,13 @@ function effectRowHtml(card, row) {
     // apply; resolving it to whichever file sorted first would put a look on a take nobody asked
     // for. The list is ids and names only: the server resolves the file from the id it discovered,
     // and nothing this client sends is ever joined onto a directory.
-    return `<div class="effect-row">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}" ${row.disabled ? "disabled" : ""}><option value="" ${row.value ? "" : "selected"}>No look chosen</option>${options}</select>${bind}</div>`;
+    //
+    // It is also, being refused, a row `effectParameterRow` marks -- so "No look chosen" reads as
+    // the state it is rather than as a settled choice, and a name the folder no longer holds is
+    // carried in the list beside it instead of collapsing into it.
+    return `<div class="effect-row ${row.className}">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}"${refused} ${row.disabled ? "disabled" : ""}><option value="" ${row.value ? "" : "selected"}>No look chosen</option>${options}</select>${bind}</div>${note}`;
   }
-  return `<div class="effect-row">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}" ${row.disabled ? "disabled" : ""}>${options}</select>${bind}</div>`;
+  return `<div class="effect-row ${row.className}">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}"${refused} ${row.disabled ? "disabled" : ""}>${options}</select>${bind}</div>${note}`;
 }
 
 // The card's grip (DESIGN 4.2), drawn **only where there is somewhere to go**. C2 left it out on
@@ -2758,6 +2765,13 @@ function effectsPanel(shot) {
   const lockHtml = model.lockNote
     ? `<p class="control-reason" id="effects-locked">${escapeHtml(model.lockNote)}</p>`
     : "";
+  // The dead end, signposted above the stack it is about. Not a `.shot-readiness` box: those flag
+  // something that was asked for and did not happen, and nothing has been asked for here. It is
+  // the row note's own red edge at the width of the panel, which is what it is -- the same
+  // statement as the marks below it, made about all of them at once.
+  const stackNoteHtml = model.stackNote
+    ? `<p class="effect-stack-note" id="effects-stack-note">${escapeHtml(model.stackNote)}</p>`
+    : "";
   const groups = model.picker.groups.map((group) =>
     `<div class="effect-group"><span class="effect-family">${escapeHtml(group.family)}</span>${group.options.map((option) =>
       `<button type="button" class="effect-option" id="effect-option-${option.effect}">${escapeHtml(option.label)}</button>`).join("")}</div>`).join("");
@@ -2769,7 +2783,7 @@ function effectsPanel(shot) {
     : "";
   return {
     model,
-    html: `${refusalHtml}${copiedHtml}${lockHtml}<div class="effect-stack" id="effect-stack">${model.runs.map(effectRunHtml).join("")}</div>${picker}${effectCopyHtml(model.copy)}`,
+    html: `${refusalHtml}${copiedHtml}${lockHtml}${stackNoteHtml}<div class="effect-stack" id="effect-stack">${model.runs.map(effectRunHtml).join("")}</div>${picker}${effectCopyHtml(model.copy)}`,
   };
 }
 

@@ -874,6 +874,17 @@ dialog p { color: var(--muted); line-height: 1.5; }
 .effect-row-refused .effect-track { background: var(--red-edge); }
 .effect-row-refused .effect-readout { color: var(--red); }
 .effect-row-note { margin: -3px 9px 8px; padding: 1px 0 1px 8px; border-left: 2px solid var(--red-edge); color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+/* The same division on a select-drawn parameter: the edge on the control, the red text weight on
+   the reading -- and on a select the reading is the closed control's own label, which is the value
+   the manifest holds. The options are put back to --ink explicitly, because a select's popup
+   inherits its colour: red on every choice would say the settings a Director is being offered are
+   refused too, when it is the one they are being offered *instead of* that is. */
+.effect-row-refused .effect-choice { border-color: var(--red-edge); color: var(--red); }
+.effect-row-refused .effect-choice option { color: var(--ink); }
+/* More than one fault on the stack, said once above it (`EFFECT_STACK_REFUSED_NOTE`). The row
+   note's own treatment at the panel's width: same edge, same muted text, so it reads as the same
+   kind of statement as the marks it is about rather than as a second, louder one. */
+.effect-stack-note { margin: 10px 0 6px; padding: 2px 0 2px 9px; border-left: 2px solid var(--red-edge); color: var(--muted); font-size: 11px; line-height: 1.45; }
 /* The bind glyph ends every row and ships **inert** in --dim. --blue is the reactive-binding
    colour and it is closed to Epic 10; nothing in this slice may draw it. */
 .effect-bind { flex: none; width: 15px; color: var(--dim); font-size: 13px; text-align: center; }
