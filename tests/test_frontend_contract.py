@@ -16175,6 +16175,175 @@ def test_the_two_locations_note_is_a_warning_and_not_a_block_anywhere():
 
 
 # --------------------------------------------------------------------------------------------
+# A cited video's soundtrack, drawn. The fifth kind in `window_warnings` and the second that is not
+# about a window at all: H3 is conditioned on a cited video's picture and never on its sound, the
+# take is performed against the master song instead, and until 2026-08-26 the payload sent no
+# `has_audio` so the discarding was silent. It has a branch here rather than riding the
+# unknown-kind fallback because that fallback exists for version skew — a browser older than its
+# server — and shipping a kind with no name of its own on the same day would be using it as an
+# excuse. `NOTE_KIND_WINDOW_UNKNOWN`'s own comment says the remedy is to add a branch.
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_cited_video_soundtrack_note_the_browser_draws_is_the_one_the_server_answers_with():
+    """End to end over a real report, on the two-locations test's argument: a kind renamed on
+    either side leaves the Director's list silent for ever with the whole suite green. The Python
+    sentence is never rewritten here — it is passed through node and asserted to arrive whole."""
+    from music_video_producer.batch import NOTE_KIND_VIDEO_SOUNDTRACK, readiness_report
+
+    project = Project(
+        name="Harder Faster",
+        assets=[
+            Asset(id="lucy", name="Lucy", kind="character", path="assets/lucy.png"),
+            Asset(id="pan", name="Camera pan", kind="video", path="media/pan.mp4"),
+        ],
+        shots=[
+            # A character first, so the number has to come from the payload's own walk: the video
+            # is the second citation and the first video, and the sentence must say `<Video 1>`.
+            Shot(
+                id="cited", start=11.0, duration=5.0, prompt="She sings down the lens.",
+                citations=[
+                    AssetCitation(asset_id="lucy", role="reference", order=0),
+                    AssetCitation(asset_id="pan", role="reference", order=1),
+                ],
+            ),
+            Shot(
+                id="quiet", start=17.0, duration=5.0, prompt="A close on her hands.",
+                citations=[AssetCitation(asset_id="lucy", role="reference", order=0)],
+            ),
+        ],
+    )
+    report = readiness_report(project)
+    payload = json.loads(json.dumps(asdict(report)))
+    drawn = run_module(
+        f"const report = {json.dumps(payload)};"
+        """
+      import { NOTE_KIND_VIDEO_SOUNDTRACK, READINESS_BLOCKING_LABEL,
+               READINESS_SAMENESS_LABEL, READINESS_SETTING_CONFLICT_LABEL,
+               READINESS_STALE_MAP_LABEL, READINESS_TAKE_UNCOVERED_LABEL,
+               READINESS_UNNAMED_NOTE_LABEL, READINESS_VIDEO_SOUNDTRACK_LABEL,
+               READINESS_WINDOW_LONG_LABEL, READINESS_WINDOW_SHORT_LABEL,
+               clipWindowState, readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const byShot = windowWarningsByShot(report);
+      console.log(JSON.stringify({
+        kind: NOTE_KIND_VIDEO_SOUNDTRACK,
+        label: READINESS_VIDEO_SOUNDTRACK_LABEL,
+        others: [READINESS_BLOCKING_LABEL, READINESS_SAMENESS_LABEL, READINESS_STALE_MAP_LABEL,
+                 READINESS_SETTING_CONFLICT_LABEL, READINESS_TAKE_UNCOVERED_LABEL,
+                 READINESS_UNNAMED_NOTE_LABEL, READINESS_WINDOW_LONG_LABEL,
+                 READINESS_WINDOW_SHORT_LABEL],
+        byShot,
+        drawnOnClip: clipWindowState(byShot.cited, 'She sings down the lens.'),
+        lines: readinessLines(report),
+      }));
+        """
+    )
+    # Its own heading, and **nobody else's** — including `READINESS_UNNAMED_NOTE_LABEL`, which is
+    # what it would read as if the branch were dropped and the fallback caught it instead.
+    assert drawn["label"] == "Soundtrack not sent"
+    assert drawn["label"] not in drawn["others"], (
+        "the soundtrack heading is another readiness kind's name, so two different notes reach "
+        "the Director's list under one heading"
+    )
+    # One kind, spelled the same in both languages, and the server decided which shot has it.
+    assert drawn["kind"] == NOTE_KIND_VIDEO_SOUNDTRACK == "video_soundtrack"
+    assert drawn["byShot"] == {"cited": "video_soundtrack"}
+    # One line, under its own heading, carrying the server's whole sentence unreworded.
+    assert len(drawn["lines"]) == 1, drawn["lines"]
+    line = drawn["lines"][0]
+    assert line["kind"] == "video-soundtrack"
+    assert line["reason"] == report.window_warnings[0].reason
+    assert line["text"].startswith(f"{drawn['label']} - SHOT 01 (cited): ")
+    # The slot the payload wires, the Asset's name, and the reassurance, reaching the Director
+    # whole. `<Video 1>` and not `<Picture 2>`: the shot cites the character first.
+    assert "<Video 1> (Camera pan)" in line["reason"]
+    assert "master song" in line["reason"]
+    assert "does not block submission" in line["reason"]
+    # Nothing on the clip: there is no problem to badge, and the rank puts it below every kind
+    # that draws a border so it can never displace one.
+    assert drawn["drawnOnClip"] == {
+        "className": "", "note": "", "label": "She sings down the lens."
+    }
+    # Muted, not amber, and that is a claim this line is entitled to make: `window-short` wears
+    # muted to say "a cost, not a problem", and nothing is wrong with this shot.
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".plan-readiness li.video-soundtrack { color: var(--muted); }" in styles
+
+
+def test_the_cited_video_soundtrack_note_never_paints_a_clip_and_never_hides_one_that_should_be():
+    """The two-locations note's second test, run for this kind, and it caught a real hole.
+
+    Drawing nothing on the clip is only half of it. `windowWarningsByShot` reduces every note a
+    shot carries to the one state its border can wear, so a kind that paints nothing must also
+    *rank below* every kind that does — otherwise a shot that both cites a video and has a window
+    off the end of its take keeps this note, and the amber border the coverage warning earned
+    disappears. Asserting the empty clip state alone passes with the rank wrong, which is what a
+    mutation raising it above the window kinds proved on 2026-08-26.
+    """
+    verdicts = run_module("""
+      import { clipWindowState, readinessLines, windowWarningsByShot }
+        from './src/music_video_producer/web/assets/api.js';
+      const both = [
+        { shot_ids: ['both'], labels: ['SHOT 01'], reason: 'no soundtrack', kind: 'video_soundtrack' },
+        { shot_ids: ['both'], labels: ['SHOT 01'], reason: 'off the end', kind: 'take_uncovered' },
+      ];
+      const long = [
+        both[0],
+        { shot_ids: ['both'], labels: ['SHOT 01'], reason: 'too long', kind: 'window_long' },
+      ];
+      const alone = { window_warnings: [both[0]] };
+      console.log(JSON.stringify({
+        alone: windowWarningsByShot(alone),
+        aloneDrawn: clipWindowState(windowWarningsByShot(alone).both, 'A push-in.'),
+        byShot: windowWarningsByShot({ window_warnings: both }),
+        reversed: windowWarningsByShot({ window_warnings: [...both].reverse() }),
+        withLong: windowWarningsByShot({ window_warnings: long }),
+        withLongReversed: windowWarningsByShot({ window_warnings: [...long].reverse() }),
+        lines: readinessLines({ window_warnings: both }).map((line) => line.kind),
+      }));
+    """)
+    # On its own it puts nothing on the clip: no class, no words, and the label untouched.
+    assert verdicts["alone"] == {"both": "video_soundtrack"}
+    assert verdicts["aloneDrawn"] == {"className": "", "note": "", "label": "A push-in."}
+    # Beside a window state it loses, in either order and against both of the kinds that draw a
+    # border. This is the assertion the rank exists for.
+    assert verdicts["byShot"] == {"both": "take_uncovered"}
+    assert verdicts["reversed"] == verdicts["byShot"], (
+        "the clip's state depends on the order the server listed two notes in, which is not a "
+        "decision anyone made"
+    )
+    assert verdicts["withLong"] == {"both": "window_long"}
+    assert verdicts["withLongReversed"] == verdicts["withLong"]
+    # And both lines are still printed, each under its own kind.
+    assert verdicts["lines"] == ["video-soundtrack", "take-uncovered"], verdicts["lines"]
+
+
+def test_the_cited_video_soundtrack_note_is_a_warning_and_not_a_block_anywhere():
+    """The negative scan the other three ambers get, run for this one. It states how the render
+    works and asks for nothing, so what must not exist is a branch in the client that reads this
+    kind and shuts something, or a server path that files it under `blocking`."""
+    for source, name in ((API_JS, "api.js"), (APP_JS, "app.js")):
+        for line in source.read_text(encoding="utf-8").splitlines():
+            if "video_soundtrack" not in line and "VIDEO_SOUNDTRACK" not in line:
+                continue
+            if line.strip().startswith(("//", "//:", "*")):
+                continue
+            assert "disabled" not in line, f"{name} shuts a control from the soundtrack note: {line}"
+            assert "refus" not in line.lower(), f"{name} refuses from the soundtrack note: {line}"
+    batch_source = Path("src/music_video_producer/batch.py").read_text(encoding="utf-8")
+    blocked_kinds = [
+        segment.split(")", 1)[0]
+        for segment in batch_source.split("blocking.append(")[1:]
+    ]
+    assert blocked_kinds, "no blocking path found, so this scan is passing vacuously"
+    for segment in blocked_kinds:
+        assert "VIDEO_SOUNDTRACK" not in segment, (
+            f"the soundtrack note reaches `blocking`, which is a refusal: {segment}"
+        )
+
+
+# --------------------------------------------------------------------------------------------
 # A window-warning kind this client has no branch for. Until 2026-08-23 `windowNoteKind` fell back
 # to `NOTE_KIND_WINDOW_SHORT`, so the *next* kind the server grew would have reached the Director
 # under the heading "Short window", in the muted colour that says "this is fine", over a sentence

@@ -412,6 +412,130 @@ H3_SPLIT_OFFSETS = {
     "audio": H3_REFERENCE_LIMITS["picture"] + 2 * H3_REFERENCE_LIMITS["video"],
 }
 
+#: The conditioner input each split group is wired into, by the same four names
+#: ``H3_SPLIT_OFFSETS`` keys. Beside the offsets rather than inline in the builder so that the
+#: group a reference lands in, the output index it is read from and the input it is written to
+#: are all decided from one value — ``H3ReferenceSlot.group`` — instead of from three parallel
+#: branches that can each be edited without the others.
+H3_SPLIT_INPUTS = {
+    "picture": "ref_images.ref_image_{slot}",
+    "video": "ref_videos.ref_video_{slot}",
+    "video_audio": "ref_video_audios.ref_video_audio_{slot}",
+    "audio": "ref_audios.ref_audio_{slot}",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class H3ReferenceSlot:
+    """One media slot the loader will fill, and which reference fills it.
+
+    ``index`` is the position in the caller's ``references`` list, ``group`` one of
+    ``H3_SPLIT_OFFSETS``' four keys, and ``slot`` the 0-based position *within that group* —
+    which is the only number the wiring may use, because the splitter's outputs are per-group.
+    """
+
+    index: int
+    group: str
+    slot: int
+
+
+def partition_h3_references(references: list[dict[str, Any]]) -> tuple[H3ReferenceSlot, ...]:
+    """Which media slot each reference lands in, modelled on the loader node's own grouping.
+
+    **This is a mirror, not an import.** ``MiniMaxH3MediaLoader`` lives in the GPL extension
+    ``ComfyUI-Fantastic-MiniMaxH3-PromptBuilder`` (``nodes.py``, the ``_partition`` static method
+    on that class — *not* on ``MiniMaxH3ReferenceSplitter``, which only pads each group to its
+    fixed width and concatenates them). It is outside this project and not a dependency, so its
+    behaviour is modelled here from reading it and its source is not copied. Everything below is
+    a statement about what that node does with a ``media_state`` list; ``tests/test_workflows.py``
+    states the same rules as expectations, so a drift between the two sides fails offline instead
+    of rendering wrongly.
+
+    The rules, as the node applies them, in the order it applies them:
+
+    * **A reference switched off consumes no slot.** The node skips any item whose ``enabled`` is
+      exactly ``False`` — identity, not truthiness, so ``0`` and ``null`` are *not* off — and the
+      numbering closes up around it. This is why ``enabled`` cannot be ignored on this side: the
+      builder deliberately serialises the flag into ``media_state``, so the node acts on it.
+    * **A picture joins the picture group**, in list order.
+    * **A video always joins the video group**, and *always* adds an entry to the paired-audio
+      group, which is therefore positional against the video group: video *N*'s soundtrack is
+      paired-audio *N* and nothing else. The entry is the video's own track when the item both
+      has audio and is ``paired`` (the node's default reading when no ``audio_mode`` is given),
+      and empty otherwise — so a silent video, or one whose audio was routed elsewhere, still
+      holds its place. An empty entry yields no slot here, because there is nothing to wire.
+    * **A video whose audio is ``standalone`` also joins the audio group**, at the point the
+      video appears in the list. It therefore *displaces* every ``audio`` reference after it —
+      the third consequence this function exists to keep both sides agreeing about.
+    * **An audio joins the audio group**, in list order.
+
+    Only values the node branches on matter: it tests ``audio_mode`` against ``"paired"`` and
+    ``"standalone"`` and nothing else, so any other spelling falls through both tests and leaves
+    the soundtrack unsent. A test passing an unrecognised value proves nothing about either rule.
+
+    Returned in **reference order**, so the caller emits its wiring in the order the Director
+    attached the media; a standalone video yields two slots, its video and its audio, in that
+    order. An unwirable ``kind`` is refused here rather than dropped, for *every* item including
+    a disabled one — the node would ignore it silently, and a caller that sent one has a defect
+    the payload cannot express. That is the single deliberate divergence, and it only ever
+    refuses; it never wires anything the node would wire differently.
+    """
+    slots: list[H3ReferenceSlot] = []
+    filled = dict.fromkeys(H3_SPLIT_INPUTS, 0)
+    for index, item in enumerate(references):
+        kind = item.get("kind")
+        if kind not in ("picture", "video", "audio"):
+            raise ValueError(f"Unsupported H3 reference kind: {kind}")
+        if item.get("enabled") is False:
+            continue
+        if kind == "video":
+            slots.append(H3ReferenceSlot(index, "video", filled["video"]))
+            mode = item.get("audio_mode", "paired")
+            carries_audio = bool(item.get("has_audio"))
+            if carries_audio and mode == "paired":
+                # Positional against the video group, so the slot number is the video's own.
+                slots.append(H3ReferenceSlot(index, "video_audio", filled["video"]))
+            filled["video"] += 1
+            if not (carries_audio and mode == "standalone"):
+                continue
+            kind = "audio"
+        slots.append(H3ReferenceSlot(index, kind, filled[kind]))
+        filled[kind] += 1
+    return tuple(slots)
+
+
+def h3_reference_group_counts(
+    references: list[dict[str, Any]], slots: tuple[H3ReferenceSlot, ...]
+) -> dict[str, int]:
+    """How many of each kind ``H3_REFERENCE_LIMITS`` bounds a payload against. **The larger of two.**
+
+    The loader node counts its own media *twice*, in two places, and the two disagree — which is
+    why this cannot be one number. Both have to be satisfied or a payload passes here and is
+    refused after submission, which reaches the Director as an opaque 502.
+
+    * Its ``VALIDATE_INPUTS`` counts every item of a kind in ``media_state``, **including the
+      switched-off ones**, and refuses more than nine pictures or three videos before the graph
+      runs at all. So a tenth picture is a tenth picture even when it is off.
+    * Its ``_partition`` skips the switched-off ones and then *truncates* each group to the same
+      ceilings, dropping the overflow without a word. That is the count the wiring has to fit
+      inside, and it is not bounded by the attached count: a ``standalone`` video's soundtrack
+      joins the audio group, so three attached audios plus one such video is four audios — and
+      the fourth would be wired to a splitter output that does not exist. Nothing checks audios
+      in ``VALIDATE_INPUTS`` at all, so this is the only count that catches it.
+
+    Taking the larger satisfies both, and each kind's number is then the one the Director is
+    told: whichever count overflowed is the count quoted. ``video_audio`` appears in neither,
+    because it can never exceed the video group it is positional against.
+    """
+    attached = {
+        kind: sum(1 for item in references if item.get("kind") == kind)
+        for kind in H3_REFERENCE_LIMITS
+    }
+    wired = {
+        kind: sum(1 for entry in slots if entry.group == kind) for kind in H3_REFERENCE_LIMITS
+    }
+    return {kind: max(attached[kind], wired[kind]) for kind in H3_REFERENCE_LIMITS}
+
 
 #: The range ``LoraLoaderModelOnly.strength_model`` declares. Outside it ComfyUI rejects
 #: the whole prompt at ``/prompt`` validation, which reaches the Director as an opaque 502
@@ -1177,10 +1301,13 @@ def build_h3_reference_payload(
         aspect_ratio=aspect_ratio,
         multiple=multiple,
     )
-    counts = {
-        kind: sum(1 for item in references if item.get("kind") == kind)
-        for kind in H3_REFERENCE_LIMITS
-    }
+    # The partition, resolved once and used three times — for the ceilings below, for the
+    # emptiness check under them, and for the wiring itself. One call because the bug this
+    # replaced was two implementations of the loader's grouping that had drifted: the ceilings
+    # counted raw kinds while the wiring counted its own indices, and neither counted what the
+    # node would actually put in each group. See `partition_h3_references`.
+    slots = partition_h3_references(references)
+    counts = h3_reference_group_counts(references, slots)
     for kind, limit in H3_REFERENCE_LIMITS.items():
         if counts[kind] > limit:
             # Names the kind that overflowed and the number actually counted, because the
@@ -1194,6 +1321,16 @@ def build_h3_reference_payload(
             )
     if not references:
         raise ValueError("At least one H3 reference is required")
+    if not slots:
+        # References were attached and every one of them is switched off, so the loader would
+        # hand the splitter four empty groups and the conditioner would be wired to no media at
+        # all — the "it would sample noise" failure the line above exists against, reached by a
+        # different route and therefore said in different words. Refused here rather than at the
+        # ceilings, because nothing overflowed.
+        raise ValueError(
+            f"All {len(references)} H3 references are switched off, so the render would be "
+            f"conditioned on no media at all"
+        )
     if ref_image_size not in {"match", "max"}:
         raise ValueError("ref_image_size must be 'match' or 'max'")
     _finite("Shot duration", duration)
@@ -1242,30 +1379,16 @@ def build_h3_reference_payload(
         "width": width, "height": height, "length": length,
         "ref_image_size": ref_image_size,
     }
-    picture_index = video_index = audio_index = 0
-    for item in references:
-        kind = item.get("kind")
-        if kind == "picture":
-            condition_inputs[f"ref_images.ref_image_{picture_index}"] = [
-                "mvp:split", H3_SPLIT_OFFSETS["picture"] + picture_index,
-            ]
-            picture_index += 1
-        elif kind == "video":
-            condition_inputs[f"ref_videos.ref_video_{video_index}"] = [
-                "mvp:split", H3_SPLIT_OFFSETS["video"] + video_index,
-            ]
-            if item.get("has_audio") and item.get("audio_mode", "paired") == "paired":
-                condition_inputs[f"ref_video_audios.ref_video_audio_{video_index}"] = [
-                    "mvp:split", H3_SPLIT_OFFSETS["video_audio"] + video_index,
-                ]
-            video_index += 1
-        elif kind == "audio":
-            condition_inputs[f"ref_audios.ref_audio_{audio_index}"] = [
-                "mvp:split", H3_SPLIT_OFFSETS["audio"] + audio_index,
-            ]
-            audio_index += 1
-        else:
-            raise ValueError(f"Unsupported H3 reference kind: {kind}")
+    # One statement of the wiring, over the partition the ceilings were counted from: the
+    # conditioner input, the splitter output index and the group a reference landed in all come
+    # from the same `H3ReferenceSlot`, so a slot the node did not fill cannot be wired and a slot
+    # it did fill cannot be missed. This loop used to count its own picture/video/audio indices
+    # and knew nothing about `enabled` or about a standalone video's soundtrack, which put every
+    # later reference of its kind on an output the loader had left empty.
+    for entry in slots:
+        condition_inputs[H3_SPLIT_INPUTS[entry.group].format(slot=entry.slot)] = [
+            "mvp:split", H3_SPLIT_OFFSETS[entry.group] + entry.slot,
+        ]
     # Every node downstream of the loader reads this one name, so a profile that inserts
     # a LoRA moves the whole graph onto it rather than leaving a node behind on the
     # unpatched model — which would silently sample half-adapted.

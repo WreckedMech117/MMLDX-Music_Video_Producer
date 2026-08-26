@@ -1922,6 +1922,13 @@ export const READINESS_TAKE_UNCOVERED_LABEL = "Past the take";
 //: of the problem. Amber, never a block; the server's sentence carries the two names and the
 //: evidence.
 export const READINESS_SETTING_CONFLICT_LABEL = "Two locations";
+//: The fifth, and the second that is not about a window: this shot cites a video, and H3 is given
+//: the clip's picture and never its sound. Named for what is missing rather than for the decision
+//: behind it -- a Director reading this list wants to know what the take will and will not hear,
+//: and "Soundtrack not sent" is that in three words. It is the one line here that names no remedy,
+//: because there is nothing to fix: the server's sentence states how the render works and says the
+//: take is performed against the master song instead.
+export const READINESS_VIDEO_SOUNDTRACK_LABEL = "Soundtrack not sent";
 //: And the heading for a kind this client has no name for -- see `NOTE_KIND_WINDOW_UNKNOWN`. It
 //: says only that the server sent a note, which is the whole of what is known. Deliberately not
 //: "Unknown warning" or anything else that editorialises: the sentence that follows is the
@@ -1967,6 +1974,11 @@ export const NOTE_KIND_TAKE_UNCOVERED = "take_uncovered";
 //: nothing here re-derives it. A client-side version would need the asset library and the sections
 //: together, and would be a second opinion about a rule that already has one.
 export const NOTE_KIND_SETTING_CONFLICT = "setting_conflict";
+//: `batch.NOTE_KIND_VIDEO_SOUNDTRACK`, pinned by a contract test. The server decides it, from the
+//: same `numbered_references` walk the payload appends media by, and nothing here re-derives it: a
+//: client-side version would have to know that a keyframe role is a picture and that a citation
+//: whose Asset is gone is one too, which is a second opinion about a rule that already has one.
+export const NOTE_KIND_VIDEO_SOUNDTRACK = "video_soundtrack";
 //: **Not a kind the server sends.** It is what this client calls a kind it does not recognise, so
 //: that the fallback has a name of its own instead of borrowing a real one.
 //:
@@ -1991,6 +2003,7 @@ function windowNoteKind(note) {
   if (note?.kind === NOTE_KIND_WINDOW_LONG) return NOTE_KIND_WINDOW_LONG;
   if (note?.kind === NOTE_KIND_TAKE_UNCOVERED) return NOTE_KIND_TAKE_UNCOVERED;
   if (note?.kind === NOTE_KIND_SETTING_CONFLICT) return NOTE_KIND_SETTING_CONFLICT;
+  if (note?.kind === NOTE_KIND_VIDEO_SOUNDTRACK) return NOTE_KIND_VIDEO_SOUNDTRACK;
   return NOTE_KIND_WINDOW_UNKNOWN;
 }
 
@@ -2021,6 +2034,10 @@ function windowNoteKind(note) {
 //: border that a kind with a branch earned.
 const WINDOW_KIND_RANK = {
   [NOTE_KIND_WINDOW_UNKNOWN]: -2,
+  //: Below every kind that draws a border, beside the setting conflict and for its reason: this
+  //: one is not about the window either, and a clip must not wear it. It states how the render
+  //: works rather than that anything is wrong, so there is nothing for a badge to say.
+  [NOTE_KIND_VIDEO_SOUNDTRACK]: -1,
   [NOTE_KIND_SETTING_CONFLICT]: -1,
   [NOTE_KIND_WINDOW_SHORT]: 0,
   [NOTE_KIND_WINDOW_LONG]: 1,
@@ -2113,6 +2130,7 @@ const WINDOW_LINE_KINDS = {
   [NOTE_KIND_WINDOW_SHORT]: "window-short",
   [NOTE_KIND_TAKE_UNCOVERED]: "take-uncovered",
   [NOTE_KIND_SETTING_CONFLICT]: "setting-conflict",
+  [NOTE_KIND_VIDEO_SOUNDTRACK]: "video-soundtrack",
   [NOTE_KIND_WINDOW_UNKNOWN]: "window-note",
 };
 const WINDOW_LINE_LABELS = {
@@ -2120,6 +2138,7 @@ const WINDOW_LINE_LABELS = {
   [NOTE_KIND_WINDOW_SHORT]: READINESS_WINDOW_SHORT_LABEL,
   [NOTE_KIND_TAKE_UNCOVERED]: READINESS_TAKE_UNCOVERED_LABEL,
   [NOTE_KIND_SETTING_CONFLICT]: READINESS_SETTING_CONFLICT_LABEL,
+  [NOTE_KIND_VIDEO_SOUNDTRACK]: READINESS_VIDEO_SOUNDTRACK_LABEL,
   [NOTE_KIND_WINDOW_UNKNOWN]: READINESS_UNNAMED_NOTE_LABEL,
 };
 

@@ -984,6 +984,15 @@ def numbered_references(project: Project, shot: Shot) -> list[NumberedReference]
     slot lists, so `<Picture 2>` and `<Video 2>` are different slots and neither is "the second
     reference" — see `h3_prompt.REFERENCE_TAG_NAMES`.
 
+    **This numbers the tags; `workflows.partition_h3_references` numbers the slots, and today
+    they agree by construction rather than by a shared rule.** That partition mirrors the H3
+    loader node, which skips a reference whose `enabled` is `False` and gives a `standalone`
+    video's soundtrack a slot in the audio group — either of which would make `<Picture 3>` here
+    name a different picture from the one the payload wires. Neither is reachable: the submit
+    route sends every reference enabled and sends no `audio_mode` at all. If a control for either
+    is ever added, this walk has to learn the same rule or the two numberings drift the way the
+    expansion and the route drifted in 2026-08-20 — see the paragraph above for what that cost.
+
     The walk is `citations_in_prompt_order`, which is the single definition of the order a prompt
     may number citations in, and the same walk the payload appends its media by. Kind is the
     route's own classification: a keyframe role is a picture (see `KEYFRAME_TAG_ROLES`), then

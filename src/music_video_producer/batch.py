@@ -66,12 +66,14 @@ __all__ = [
     "NOTE_KIND_SETTING_CONFLICT",
     "NOTE_KIND_STALE_MAP",
     "NOTE_KIND_TAKE_UNCOVERED",
+    "NOTE_KIND_VIDEO_SOUNDTRACK",
     "NOTE_KIND_WINDOW_LONG",
     "NOTE_KIND_WINDOW_SHORT",
     "PLACEHOLDER_PROMPT",
     "READINESS_REFUSAL",
     "SHOT_AFTER_FAILED_RENDER",
     "SHOT_SETTING_FIGHTS_SECTION",
+    "SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED",
     "SHOT_WITH_STALE_REFERENCE_MAP",
     "TERMINAL_JOB_STATUSES",
     "JobProgress",
@@ -99,6 +101,7 @@ __all__ = [
     "stamp_job_settled",
     "supersede_target_jobs",
     "take_coverage_note",
+    "video_soundtrack_note",
     "window_band_note",
 ]
 
@@ -280,6 +283,14 @@ NOTE_KIND_TAKE_UNCOVERED = "take_uncovered"
 #: It is its own kind, and never folded into another, because the fix is a different action: not a
 #: drag and not a re-render, but a citation or a section prompt.
 NOTE_KIND_SETTING_CONFLICT = "setting_conflict"
+#: The fifth non-blocking kind, and the second that is not about a window: this shot cites a video
+#: and only the video's *picture* is conditioned. It is its own kind for the setting conflict's
+#: reason — the fact is different and there is no action to take, so folding it into a
+#: window kind would put a remedy sentence over a statement of how the render works. A client that
+#: does not know this kind yet draws it through `api.js`'s `NOTE_KIND_WINDOW_UNKNOWN` fallback,
+#: which prints the sentence whole under a heading that claims nothing and gives the clip no
+#: badge — which is right here, because there is nothing wrong with the shot.
+NOTE_KIND_VIDEO_SOUNDTRACK = "video_soundtrack"
 
 #: How far a window may sit outside its take before it is reported: half a frame at H3's rate.
 #: Both sides of the comparison are manifest floats and one of them is a division, so an exact
@@ -354,6 +365,35 @@ SHOT_SETTING_FIGHTS_SECTION = (
     "told the location is somewhere else. Cite {rival} instead, reword the section's look, or "
     "leave it as it is, because a contradiction is sometimes the shot you want. This does not "
     "block submission."
+)
+
+# --------------------------------------------------------------------------------------------
+# A cited video's soundtrack. The H3 loader can pair a video's own audio track with it, or route
+# that track into the standalone audio group, and it does neither unless the payload says
+# `has_audio` — which `generate_h3` did not send, at all, until 2026-08-26. So a Director could
+# drop an mp4 into the library (`app.js` derives `video` from the MIME type), cite it, and get a
+# take conditioned on the clip's picture with its sound silently discarded.
+#
+# The decision recorded on the route beside the payload: **it stays off, and it is now said out
+# loud in both directions** — `has_audio: False` on the wire, and this sentence to the Director.
+# A reference shot is performed against the *master song*, which `use_song_audio` attaches as an
+# audio reference and which the whole over-render window exists to line the take up against; a
+# clip's own soundtrack conditioned alongside it is unrelated music in the same sampling pass.
+# Turning it on by default would change what every existing citation renders, and there is
+# nothing here to decide it with — no Asset field records whether a video carries an audio
+# stream, and no control offers the paired/standalone choice the node reads.
+#
+# It states how the render works and asks for nothing, so it never blocks and names no remedy:
+# a note whose fix is "do nothing" is a note a Director learns to skip past, and the sentences
+# either side of it in this list are ones that do want an action.
+#
+# One note per shot rather than one per cited video, and every cited video named in it: this is
+# one fact about how the shot renders, and repeating it per citation would count a single
+# statement several times in a list a Director reads by length.
+SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED = (
+    "This shot cites {references} as video {reference_word}. H3 is conditioned on the picture "
+    "only and no soundtrack is sent alongside, so the take is performed against the master song "
+    "rather than against any audio the cited media carries. This does not block submission."
 )
 
 # The one refusal wording, used by every path that can submit a Shot: the single-Shot route and
@@ -438,8 +478,9 @@ class ReadinessReport:
 
     `window_warnings` is every **per-shot warning that never blocks**: the shot-length band
     (`SHOT_WINDOW_BELOW_BAND`, `SHOT_WINDOW_ABOVE_BAND`); for a shot whose take carries a window
-    snapshot, whether that window still sits inside the take (`take_coverage_note`); and whether
-    the shot is being given two locations at once (`setting_conflict_note`). The name is the
+    snapshot, whether that window still sits inside the take (`take_coverage_note`); whether
+    the shot is being given two locations at once (`setting_conflict_note`); and whether a cited
+    video's soundtrack is being dropped (`video_soundtrack_note`). The name is the
     window notes it was built for and is kept because it is on the wire — a client reads
     `report.window_warnings` — while the membership rule was always the broader one: per shot,
     never `ready`, drawn under its own kind. It is a **third list rather than more entries in
@@ -637,6 +678,37 @@ def _quoted_words(words: set[str]) -> str:
     if len(listed) == 1:
         return listed[0]
     return f"{', '.join(listed[:-1])} and {listed[-1]}"
+
+
+def video_soundtrack_note(project: Project, shot: Shot) -> tuple[str, str]:
+    """Whether this shot cites a video whose sound will not reach H3: ``(kind, sentence)``.
+
+    `setting_conflict_note`'s shape and its terms — per shot, never blocks — and the one note in
+    this list that reports a *deliberate* property of the render rather than something the
+    Director might want to change. See `SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED` for the decision and
+    why it is stated here at all: the payload sent no `has_audio` until 2026-08-26, so the
+    soundtrack was discarded in silence, and being silent about it is the one option that was
+    ruled out.
+
+    **Which citations count is `numbered_references`' answer, not a second one.** It is the same
+    walk the payload appends media by, so the `<Video N>` this sentence prints is the slot the
+    render actually wires — a shot citing a picture and then a video is told about `<Video 1>`,
+    which is what the map and the expansion call it too. A citation whose Asset this project no
+    longer holds travels as a picture there and so is silent here, correctly: nothing is known
+    about it, least of all whether it has a soundtrack.
+
+    Asked of every shot on `window_band_note`'s argument, including one whose prompt is still
+    blank, because it is true of the shot either way.
+    """
+    cited = [entry for entry in numbered_references(project, shot) if entry.kind == "video"]
+    if not cited:
+        return "", ""
+    return NOTE_KIND_VIDEO_SOUNDTRACK, SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED.format(
+        references=", ".join(
+            f"{entry.tag} ({entry.asset.name})" for entry in cited if entry.asset
+        ),
+        reference_word="reference" if len(cited) == 1 else "references",
+    )
 
 
 def setting_conflict_note(project: Project, shot: Shot) -> tuple[str, str]:
@@ -881,6 +953,19 @@ def readiness_report(project: Project, *, include_warnings: bool = True) -> Read
                     labels=[shot_label(project, shot)],
                     reason=conflict_reason,
                     kind=conflict_kind,
+                )
+            )
+        # And whether a cited video's soundtrack is being dropped. Fourth for this shot, on the
+        # same terms as the three above, and last because it is the only one of them that asks
+        # for nothing: the others name a thing to fix and this one states how the render works.
+        soundtrack_kind, soundtrack_reason = video_soundtrack_note(project, shot)
+        if soundtrack_kind:
+            window_warnings.append(
+                ReadinessNote(
+                    shot_ids=[shot.id],
+                    labels=[shot_label(project, shot)],
+                    reason=soundtrack_reason,
+                    kind=soundtrack_kind,
                 )
             )
         rejection = prompt_rejection(shot.prompt)

@@ -11660,13 +11660,34 @@ def create_app(
                         )
                     )
                     continue
-                references.append(
-                    {
-                        "kind": numbered.kind,
-                        "file": str(resolve_asset_path(project_id, asset)),
-                        "label": label,
-                    }
-                )
+                reference: dict[str, Any] = {
+                    "kind": numbered.kind,
+                    "file": str(resolve_asset_path(project_id, asset)),
+                    "label": label,
+                }
+                if numbered.kind == "video":
+                    # **A cited video travels as a picture reference and nothing more.** Said in
+                    # the payload rather than left to the loader's default, because until today
+                    # this route sent neither `has_audio` nor `audio_mode` and the node's
+                    # `bool(item.get("has_audio"))` therefore read false every time — the
+                    # soundtrack was never conditioned and nothing anywhere said so. The
+                    # behaviour is unchanged and now it is a decision on the wire.
+                    #
+                    # It is off rather than on for two reasons, in order of weight. A reference
+                    # shot is *performed against the master song*: `use_song_audio` appends that
+                    # song as an audio reference and the whole over-render window exists to make
+                    # the take land on real song seconds. A clip's own soundtrack conditioned
+                    # alongside it is a second, unrelated piece of music in the same pass, and
+                    # turning that on by default would silently change what every existing
+                    # citation renders. And there is nothing to decide it with: no Asset field
+                    # records whether a video has an audio stream, no control offers the
+                    # paired/standalone choice the node reads, and inventing both here would be
+                    # guessing at a creative decision that is the Director's.
+                    #
+                    # The Director is told, rather than left to infer it from a silent payload:
+                    # `batch.video_soundtrack_note` reports it per shot in the readiness list.
+                    reference["has_audio"] = False
+                references.append(reference)
                 tags.append(f"{numbered.tag} is {tag_label}")
             if shot.use_song_audio:
                 if not project.song or not project.song.path:

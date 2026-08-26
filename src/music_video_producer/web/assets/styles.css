@@ -675,6 +675,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    the clip, and a fourth border colour on the timeline would be a state the Director has to learn
    to read for a problem the timeline cannot fix. */
 .plan-readiness li.setting-conflict { color: var(--amber); }
+/* The cited-video soundtrack line, muted rather than amber, which is the second line here to wear
+   that colour and the second entitled to. Muted is `window-short`'s claim -- "a cost, not a
+   problem" -- and this sentence makes the same one: nothing is wrong with the shot, the render
+   simply does not hear the clip, and painting it amber would send a Director looking for a fix
+   that does not exist. No .shot-clip rule, for `setting-conflict`'s reason and one more: a
+   badge on the clip would say "attention" about a fact that wants none. */
+.plan-readiness li.video-soundtrack { color: var(--muted); }
 /* A window note whose kind this client has no branch for -- an older browser against a newer
    server. Amber rather than muted, because muted is the claim `window-short` makes ("a cost, not a
    problem") and nothing here is entitled to make it about a note it cannot name. It has no

@@ -97,6 +97,7 @@ from music_video_producer.workflows import (
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
     normalize_to_divisor,
+    partition_h3_references,
     patch_ltx25_dimension_boundary,
     reachable_node_ids,
     resolve_h3_attention,
@@ -1181,7 +1182,16 @@ def test_h3_reference_payload_refuses_a_kind_it_cannot_wire():
 
 
 def test_h3_reference_payload_wires_a_video_and_its_paired_soundtrack():
-    """The `video` kind, which no other test builds, and its optional paired audio."""
+    """The `video` kind, which no other test builds, and its optional paired audio.
+
+    **`"separate"` is not evidence about `audio_mode`.** The loader node branches on `"paired"`
+    and `"standalone"` only, so this third spelling falls through both tests and leaves the
+    soundtrack unsent — it agreed with the builder by coincidence rather than by rule. Kept as
+    written because the *outcome* it asserts is right and pinning it costs nothing; the two
+    branches the node actually has are pinned by
+    `test_h3_partition_sends_no_soundtrack_for_an_audio_mode_the_node_does_not_know` and
+    `test_h3_partition_gives_a_standalone_videos_track_an_audio_slot_of_its_own`.
+    """
     paired = h3_reference_payload(
         [
             {"kind": "video", "file": "F:/refs/take.mp4", "has_audio": True},
@@ -1199,6 +1209,245 @@ def test_h3_reference_payload_wires_a_video_and_its_paired_soundtrack():
     assert conditioner["ref_video_audios.ref_video_audio_0"] == ["mvp:split", 12]
     assert "ref_video_audios.ref_video_audio_1" not in conditioner
     assert "ref_video_audios.ref_video_audio_2" not in conditioner
+
+
+# --- The loader node's partition, mirrored ---------------------------------------------
+#
+# `partition_h3_references` models `MiniMaxH3MediaLoader._partition` in the GPL extension
+# `ComfyUI-Fantastic-MiniMaxH3-PromptBuilder`. That node cannot be imported — outside this
+# project, not a dependency — so these tests are the pin: each one states a rule of the node's,
+# read off its source, as its expectation. If the node changes, the mirror is wrong and these
+# say which rule it now disagrees with. Everything here is offline; no render proves or is
+# needed to prove any of it.
+#
+# The rules being pinned, in the node's own order of application:
+#   1. an item whose `enabled` is exactly `False` is skipped and consumes no slot;
+#   2. a picture joins the picture group in list order;
+#   3. a video always joins the video group and always adds one entry to the paired-audio
+#      group, so the two are positional — video N's soundtrack is paired-audio N;
+#   4. that entry is the video's own track only when it has audio and `audio_mode` reads
+#      `paired` (the default when the key is absent), and is empty otherwise;
+#   5. a video with audio in `standalone` mode *also* joins the audio group, where the video
+#      sits in the list, displacing every `audio` reference after it;
+#   6. an `audio` joins the audio group in list order.
+
+
+def slot_tuples(references: list[dict]) -> list[tuple[str, int, int]]:
+    """The partition as `(group, slot, source index)`, which is all these tests read."""
+    return [(entry.group, entry.slot, entry.index) for entry in partition_h3_references(references)]
+
+
+def wired_slots(payload: dict) -> dict[str, list]:
+    """Only the four media groups' wiring out of a built conditioner."""
+    prefixes = ("ref_images.", "ref_videos.", "ref_video_audios.", "ref_audios.")
+    return {
+        name: value
+        for name, value in payload["mvp:condition"]["inputs"].items()
+        if name.startswith(prefixes)
+    }
+
+
+def test_h3_partition_closes_the_numbering_up_around_a_switched_off_reference():
+    """Rule 1, on its own: a disabled item takes no slot and shifts nothing after it.
+
+    The defect this replaced wired the third picture to split output 2 while the loader had put
+    it at output 1, so the conditioner read a slot the node never filled and the slot it did
+    fill went nowhere. Both halves are asserted: the numbering, and the payload built from it.
+    """
+    references = [
+        {"kind": "picture", "file": "F:/refs/a.png"},
+        {"kind": "picture", "file": "F:/refs/b.png", "enabled": False},
+        {"kind": "picture", "file": "F:/refs/c.png"},
+    ]
+    assert slot_tuples(references) == [("picture", 0, 0), ("picture", 1, 2)]
+    assert wired_slots(h3_reference_payload(references)) == {
+        "ref_images.ref_image_0": ["mvp:split", 0],
+        "ref_images.ref_image_1": ["mvp:split", 1],
+    }
+    # And with several off in a row, across two kinds, so the closing-up is not accidentally
+    # right for a single gap only.
+    several = [
+        {"kind": "picture", "file": "F:/refs/a.png"},
+        {"kind": "picture", "file": "F:/refs/b.png", "enabled": False},
+        {"kind": "picture", "file": "F:/refs/c.png", "enabled": False},
+        {"kind": "audio", "file": "F:/refs/x.flac", "enabled": False},
+        {"kind": "picture", "file": "F:/refs/d.png"},
+        {"kind": "audio", "file": "F:/refs/y.flac"},
+    ]
+    assert slot_tuples(several) == [("picture", 0, 0), ("picture", 1, 4), ("audio", 0, 5)]
+    assert wired_slots(h3_reference_payload(several)) == {
+        "ref_images.ref_image_0": ["mvp:split", 0],
+        "ref_images.ref_image_1": ["mvp:split", 1],
+        "ref_audios.ref_audio_0": ["mvp:split", 15],
+    }
+
+
+def test_h3_partition_reads_enabled_by_identity_the_way_the_node_does():
+    """The node's test is `is False`, not falsiness, and the two differ for real payloads.
+
+    `enabled: 0` and `enabled: null` survive a JSON round trip into `media_state` and are *not*
+    off to the node. A mirror written as `not item.get("enabled", True)` would drop them, and
+    every later slot of that kind would then be wired one place below where the loader put it —
+    the original defect, reintroduced from the other side.
+    """
+    for kept in (0, None, "", "false"):
+        references = [
+            {"kind": "picture", "file": "F:/refs/a.png", "enabled": kept},
+            {"kind": "picture", "file": "F:/refs/b.png"},
+        ]
+        assert slot_tuples(references) == [("picture", 0, 0), ("picture", 1, 1)], kept
+
+
+def test_h3_partition_keeps_a_disabled_video_from_shifting_the_soundtracks():
+    """Rules 1 and 3 together: the paired group stays positional against the video group."""
+    references = [
+        {"kind": "video", "file": "F:/refs/v1.mp4", "has_audio": True},
+        {"kind": "video", "file": "F:/refs/v2.mp4", "has_audio": True, "enabled": False},
+        {"kind": "video", "file": "F:/refs/v3.mp4", "has_audio": True},
+    ]
+    assert slot_tuples(references) == [
+        ("video", 0, 0), ("video_audio", 0, 0), ("video", 1, 2), ("video_audio", 1, 2),
+    ]
+    assert wired_slots(h3_reference_payload(references)) == {
+        "ref_videos.ref_video_0": ["mvp:split", 9],
+        "ref_video_audios.ref_video_audio_0": ["mvp:split", 12],
+        "ref_videos.ref_video_1": ["mvp:split", 10],
+        "ref_video_audios.ref_video_audio_1": ["mvp:split", 13],
+    }
+
+
+def test_h3_partition_holds_a_silent_videos_place_in_the_paired_group():
+    """Rules 3 and 4: a video with no audio still occupies its paired slot, unwired.
+
+    The third video's soundtrack must be `video_audio_2`, not `video_audio_0`. Counting only
+    the videos that *have* audio is the shape this test exists to fail.
+    """
+    references = [
+        {"kind": "video", "file": "F:/refs/silent.mp4"},
+        {"kind": "video", "file": "F:/refs/quiet.mp4", "has_audio": False},
+        {"kind": "video", "file": "F:/refs/loud.mp4", "has_audio": True},
+    ]
+    assert slot_tuples(references) == [
+        ("video", 0, 0), ("video", 1, 1), ("video", 2, 2), ("video_audio", 2, 2),
+    ]
+    assert wired_slots(h3_reference_payload(references)) == {
+        "ref_videos.ref_video_0": ["mvp:split", 9],
+        "ref_videos.ref_video_1": ["mvp:split", 10],
+        "ref_videos.ref_video_2": ["mvp:split", 11],
+        "ref_video_audios.ref_video_audio_2": ["mvp:split", 14],
+    }
+
+
+def test_h3_partition_gives_a_standalone_videos_track_an_audio_slot_of_its_own():
+    """Rule 5, and the reason it matters: it displaces every `audio` reference after it.
+
+    The node appends the extracted track to the `audios` group where the *video* sits in the
+    list. So the master song that follows it is `audio_2`, and a builder that numbered the
+    cited audios by themselves would wire the song to `audio_1` — the slot holding the video's
+    soundtrack. The take would then be performed against a clip's audio while the payload said
+    it was performed against the song.
+    """
+    after = [
+        {"kind": "video", "file": "F:/refs/v.mp4", "has_audio": True, "audio_mode": "standalone"},
+        {"kind": "audio", "file": "F:/refs/song.flac"},
+    ]
+    assert slot_tuples(after) == [("video", 0, 0), ("audio", 0, 0), ("audio", 1, 1)]
+    assert wired_slots(h3_reference_payload(after)) == {
+        "ref_videos.ref_video_0": ["mvp:split", 9],
+        "ref_audios.ref_audio_0": ["mvp:split", 15],
+        "ref_audios.ref_audio_1": ["mvp:split", 16],
+    }
+    # And an audio *before* the video keeps slot 0: the group fills in list order, so only what
+    # follows the video moves. Asserted because "standalone audio always wins slot 0" would
+    # pass the case above and be wrong here.
+    before = [
+        {"kind": "audio", "file": "F:/refs/song.flac"},
+        {"kind": "video", "file": "F:/refs/v.mp4", "has_audio": True, "audio_mode": "standalone"},
+    ]
+    assert slot_tuples(before) == [("audio", 0, 0), ("video", 0, 1), ("audio", 1, 1)]
+
+
+def test_h3_partition_sends_no_soundtrack_for_an_audio_mode_the_node_does_not_know():
+    """Rule 4's edge, on values the node *actually* branches on and one it does not.
+
+    The node compares `audio_mode` against `"paired"` and `"standalone"` and nothing else, so
+    any third spelling falls through both and the track goes nowhere. `test_h3_reference_
+    payload_wires_a_video_and_its_paired_soundtrack` passes `"separate"` — one of those third
+    spellings — which is why it is not evidence about either branch: it agreed with the old
+    builder by accident. Both real branches are pinned here.
+    """
+    absent = [{"kind": "video", "file": "F:/refs/v.mp4", "has_audio": True}]
+    named = [{"kind": "video", "file": "F:/refs/v.mp4", "has_audio": True, "audio_mode": "paired"}]
+    assert slot_tuples(absent) == slot_tuples(named) == [("video", 0, 0), ("video_audio", 0, 0)]
+    for unknown in ("separate", "", "PAIRED", "Standalone", None):
+        stray = [
+            {"kind": "video", "file": "F:/refs/v.mp4", "has_audio": True, "audio_mode": unknown},
+            {"kind": "audio", "file": "F:/refs/song.flac"},
+        ]
+        # No paired slot and no extra audio: the song keeps `audio_0`.
+        assert slot_tuples(stray) == [("video", 0, 0), ("audio", 0, 1)], unknown
+
+
+def test_h3_reference_payload_refuses_a_plan_whose_every_reference_is_switched_off():
+    """Nothing overflows, nothing is unknown, and nothing would reach the model.
+
+    Distinct from the empty-list refusal because the cause is distinct: references were
+    attached and all of them are off. Before the partition was shared this built a payload
+    wired to four slots the loader leaves empty, which renders at full cost on no media.
+    """
+    references = [
+        {"kind": "picture", "file": "F:/refs/a.png", "enabled": False},
+        {"kind": "audio", "file": "F:/refs/y.flac", "enabled": False},
+    ]
+    with pytest.raises(ValueError, match="All 2 H3 references are switched off"):
+        h3_reference_payload(references)
+
+
+def test_h3_reference_ceilings_satisfy_both_of_the_nodes_own_two_counts():
+    """The loader counts its media twice and the two disagree, so the ceiling is the larger.
+
+    `VALIDATE_INPUTS` counts every item of a kind in `media_state`, switched-off ones included,
+    and refuses a tenth picture before the graph runs — so a payload that let a disabled tenth
+    through would be refused *after* submission, as an opaque 502 rather than as this sentence.
+    `_partition` skips the disabled ones and then truncates each group, and a `standalone`
+    video's soundtrack joins the audio group where nothing counted it, so three attached audios
+    plus one such video is four — and the fourth would be wired to split output 18, which the
+    splitter does not have. Neither count alone catches both; the larger catches each.
+    """
+    off = [*h3_references("picture", 9), {"kind": "picture", "file": "F:/refs/x", "enabled": False}]
+    # Refused on the attached count even though only nine would be wired, because that is the
+    # count the node's own validator makes and the number it would quote back.
+    with pytest.raises(ValueError, match=r"at most 9 picture references .* has 10"):
+        h3_reference_payload(off)
+    assert h3_reference_payload(off[:-1])
+
+    over = [
+        {"kind": "video", "file": "F:/refs/v.mp4", "has_audio": True, "audio_mode": "standalone"},
+        *h3_references("audio", 3),
+    ]
+    with pytest.raises(ValueError, match=r"at most 3 audio references .* has 4"):
+        h3_reference_payload(over)
+    # Exactly at the ceiling with the video's track counted still builds, so the check has not
+    # simply moved the off-by-one somewhere else.
+    assert h3_reference_payload(over[:-1])
+
+
+def test_h3_reference_payload_still_names_a_kind_it_cannot_wire_when_that_kind_is_off():
+    """The mirror's one deliberate divergence, and the direction it fails in.
+
+    The node skips a disabled item before it ever looks at `kind`, so an unwirable one is
+    silently ignored there. This builder refuses it anyway: a caller that sent `kind: "image"`
+    has a defect, and it is the same defect whether or not the item happens to be switched off
+    today. The divergence only ever refuses — it can never wire a slot differently from the
+    node — which is the only direction a mirror is allowed to differ in.
+    """
+    with pytest.raises(ValueError, match="Unsupported H3 reference kind: image"):
+        h3_reference_payload(
+            [
+                {"kind": "picture", "file": "F:/refs/a.png"},
+                {"kind": "image", "file": "F:/refs/b.png", "enabled": False},
+            ]
+        )
 
 
 def test_h3_reference_payload_carries_the_reference_size_to_the_conditioner():

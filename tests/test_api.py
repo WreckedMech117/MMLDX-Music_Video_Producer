@@ -9604,14 +9604,14 @@ def test_the_generic_project_put_can_neither_clear_nor_forge_a_recorded_bundle(t
 #: shapes from the other fixture; these are the same graph under the two turbo bundles, which had
 #: no digest before today.
 H3_BUNDLE_PAYLOAD_DIGESTS = {
-    "default": "6af5e442ca01963ae15f2b062a1f55b90666af15080de5309f051fe4e38c3c86",
-    "turbo": "da307c97c213d73f14ec5b9062ebf03c0af6a0247263000285cb16c566661c4b",
-    "turbo-references2v": "1c01241557d3c274aaf9f645c97d32b9567846cc091e652311714ae119cdf23f",
+    "default": "f7a5197c39b329c27cc39e4d210b0db5e6cb6d4d362572c910a30f85483f81e3",
+    "turbo": "d62217ef0dd91c104c2b45a8a7460edd464406c35acdd5c31db493127271e303",
+    "turbo-references2v": "2e7e25563d244a0f09d489d03bc054ec916f95e98d61c051f1b31c54b0d89160",
 }
 H3_BUNDLE_STEP_OVERRIDE_DIGESTS = {
-    "default": "ded6461122860452ee9910dbde4e021e0f6755b47fe3951806d48ead35c26748",
-    "turbo": "8ccf2da12ee7b68e7c63e4f9af9fcb59dccf5b27f333468e912f116602a9fda8",
-    "turbo-references2v": "4d247e1d583e5aacb083a60538bd799c0a7461b5747ed78fa22d1629ae75e4a3",
+    "default": "b7de76e734a57c5f8f347cea5070b5d7a55df0499f3288c9f60f40b54d71aa77",
+    "turbo": "f187ef1dd352638b35e3350bdebbbd49a769258dcf3e2afd0f87bd679d53f136",
+    "turbo-references2v": "cc888d9ced6cb33af4ee338e3dca7bb78a323fc788ac101c968c7b9a118a9e14",
 }
 
 
@@ -10416,7 +10416,18 @@ def test_the_route_offers_every_aspect_ratio_the_selector_knows(tmp_path: Path):
 # Re-pinned again 2026-08-19 (later the same day) for SONG_AUDIO_CONTINUITY_CLAUSE: every
 # song-audio prompt now ends "Stable face and wardrobe, one continuous take." after run 2
 # shot 07's take cut to the character sheet itself mid-shot. Only the prompt string moved.
-H3_REFERENCE_PAYLOAD_DIGEST = "6af5e442ca01963ae15f2b062a1f55b90666af15080de5309f051fe4e38c3c86"
+#
+# Re-pinned 2026-08-26 for the cited video's soundtrack, and this is a *decision* rather than a
+# drift: the route now states `has_audio: False` on a video reference instead of omitting the key
+# and letting the loader's default decide. This fixture's Shot cites `Camera pan`, a video Asset,
+# so its `media_state` gains exactly one field and every digest taken over it moves — including
+# both bundle tables further up this file, which render the same Shot. **Nothing else moved, and that was proved
+# rather than eyeballed**: with `has_audio` stripped back out of `media_state`, every one of these
+# seven payloads digests to the value it carried before. What is submitted is unchanged; what the
+# payload *says* is not. See `test_a_cited_video_declares_its_soundtrack_is_not_conditioned` for
+# the decision, `batch.SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED` for the Director's half of it, and
+# `workflows.partition_h3_references` for the node rule it pins against.
+H3_REFERENCE_PAYLOAD_DIGEST = "f7a5197c39b329c27cc39e4d210b0db5e6cb6d4d362572c910a30f85483f81e3"
 H3_TEXT_PAYLOAD_DIGEST = "d7d657a7b20c6d85b3895e23a8bd65304ef3fe014d8376ccff8d03a8c56dac8d"
 
 DIGEST_PROJECT_ID = "project_deadbeef0001"
@@ -10511,6 +10522,45 @@ def test_both_existing_shot_shapes_still_build_the_byte_identical_payload(tmp_pa
 
     assert payload_digest(comfy.prompts[0], tmp_path) == H3_REFERENCE_PAYLOAD_DIGEST
     assert payload_digest(comfy.prompts[1], tmp_path) == H3_TEXT_PAYLOAD_DIGEST
+
+
+def test_a_cited_video_declares_its_soundtrack_is_not_conditioned(tmp_path: Path):
+    """The decision, on the wire, where the loader node reads it.
+
+    Until 2026-08-26 this route sent a video reference with neither `has_audio` nor `audio_mode`,
+    so the node's `bool(item.get("has_audio"))` read false every submission and the clip's sound
+    was discarded without a word anywhere. The behaviour is deliberately unchanged — a reference
+    shot is performed against the **master song**, which `use_song_audio` attaches beside it, and
+    a clip's own soundtrack in the same sampling pass is unrelated music — but the silence is not.
+
+    Stated rather than left to the node's default because a default is the node's to change and
+    this decision is not: if the loader ever started probing the file, an omitted key would flip
+    what every existing citation renders while every test on this side went on passing. The
+    mirror in `workflows.partition_h3_references` cannot catch that; this field can.
+
+    The Director's half of the same decision is `batch.video_soundtrack_note`, which says it in
+    the readiness list rather than leaving it to be inferred from a payload nobody reads.
+    """
+    client, _, comfy = digest_project(tmp_path)
+    assert submit_h3(client, DIGEST_PROJECT_ID, DIGEST_SHOT_REFERENCE).status_code == 202
+
+    media = json.loads(comfy.prompts[0]["mvp:references"]["inputs"]["media_state"])
+    video = [item for item in media if item["kind"] == "video"]
+    assert len(video) == 1, media
+    assert video[0]["has_audio"] is False
+    # And no `audio_mode`: the node only reads it when `has_audio` is true, so a value here would
+    # be a claim about a branch that cannot be taken — and would read as a decision about
+    # paired-versus-standalone that nothing in this application has made.
+    assert "audio_mode" not in video[0]
+    # The soundtrack slot is therefore wired to nothing, and the video's picture still is. Both
+    # halves, because "no video_audio input" alone would also pass on a payload that had lost the
+    # video too.
+    conditioner = comfy.prompts[0]["mvp:condition"]["inputs"]
+    assert conditioner["ref_videos.ref_video_0"] == ["mvp:split", 9]
+    assert not [name for name in conditioner if name.startswith("ref_video_audios.")]
+    # The pictures and the master song are untouched by any of it.
+    assert conditioner["ref_images.ref_image_0"] == ["mvp:split", 0]
+    assert conditioner["ref_audios.ref_audio_0"] == ["mvp:split", 15]
 
 
 def test_migrating_a_shot_to_citations_does_not_move_the_payload_either(tmp_path: Path):

@@ -24,6 +24,7 @@ from music_video_producer.batch import (
     NOTE_KIND_SETTING_CONFLICT,
     NOTE_KIND_STALE_MAP,
     NOTE_KIND_TAKE_UNCOVERED,
+    NOTE_KIND_VIDEO_SOUNDTRACK,
     NOTE_KIND_WINDOW_LONG,
     NOTE_KIND_WINDOW_SHORT,
     PENDING_SUBMISSION_PROMPT_ID,
@@ -32,6 +33,7 @@ from music_video_producer.batch import (
     READINESS_REFUSAL,
     REFUSAL_NAME_LIMIT,
     SHOT_SETTING_FIGHTS_SECTION,
+    SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED,
     SHOT_WINDOW_ABOVE_BAND,
     SHOT_WINDOW_BEFORE_TAKE,
     SHOT_WINDOW_BELOW_BAND,
@@ -68,6 +70,7 @@ from music_video_producer.batch import (
     stamp_job_settled,
     supersede_target_jobs,
     take_coverage_note,
+    video_soundtrack_note,
     window_band_note,
 )
 from music_video_producer.comfy import ComfyError, HistoryResult
@@ -942,6 +945,105 @@ def located(
     )
     project.shots = [shot]
     return project, shot
+
+
+# --------------------------------------------------------------------------------------------
+# A cited video's soundtrack. Reachable from the shipped interface today — `app.js` derives the
+# `video` kind from an upload's MIME type and `models.citation_slot_kind` wires it through — and
+# until 2026-08-26 the submit route sent no `has_audio`, so the clip's sound was dropped in
+# silence. The decision is that it stays dropped and stops being silent; this is the Director's
+# half of saying so.
+# --------------------------------------------------------------------------------------------
+
+
+def with_video(*names: str, kind: str = "video") -> tuple[Project, Shot]:
+    """One shot citing a character and then each named Asset, of `kind`."""
+    project = Project(name="Cited media")
+    project.assets = [Asset(id="asset_lucy", name="Lucy", kind="character", path="a/l.png")]
+    project.assets += [
+        Asset(id=f"asset_{index}", name=name, kind=kind, path=f"media/{index}.mp4")
+        for index, name in enumerate(names)
+    ]
+    shot = Shot(
+        id="shot_0",
+        start=0.0,
+        duration=5.0,
+        prompt="She sings straight down the lens.",
+        citations=[
+            AssetCitation(asset_id="asset_lucy", role="reference", order=0),
+            *(
+                AssetCitation(asset_id=f"asset_{index}", role="reference", order=index + 1)
+                for index in range(len(names))
+            ),
+        ],
+    )
+    project.shots = [shot]
+    return project, shot
+
+
+def test_a_shot_citing_a_video_is_told_its_soundtrack_is_not_conditioned():
+    """The note exists, names the slot the payload actually wires, and never blocks.
+
+    `<Video 1>`, not `<Picture 2>`: the shot cites a character first, and the number comes from
+    `models.numbered_references` — the same walk the payload appends media by — so the sentence
+    names the slot the render wires rather than the citation's position in the list.
+    """
+    project, shot = with_video("Camera pan")
+
+    kind, reason = video_soundtrack_note(project, shot)
+
+    assert kind == NOTE_KIND_VIDEO_SOUNDTRACK
+    assert reason == SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED.format(
+        references="<Video 1> (Camera pan)", reference_word="reference"
+    )
+    assert "<Video 1> (Camera pan)" in reason
+    # It warns, and the sentence says so. Nothing here is wrong with the shot; this states how
+    # the render works, which is the thing that was missing rather than a fault to fix.
+    report = readiness_report(project)
+    assert report.ready is True
+    assert report.blocking == []
+    assert "does not block submission" in reason
+    assert [note.kind for note in report.window_warnings] == [NOTE_KIND_VIDEO_SOUNDTRACK]
+    assert report.window_warnings[0].shot_ids == ["shot_0"]
+    assert report.window_warnings[0].labels == [shot_label(project, shot)]
+
+
+def test_every_cited_video_is_named_in_one_note_rather_than_one_note_each():
+    """Two videos, one sentence, both numbered — it is one fact about the shot."""
+    project, shot = with_video("Camera pan", "Crowd plate")
+
+    kind, reason = video_soundtrack_note(project, shot)
+
+    assert kind == NOTE_KIND_VIDEO_SOUNDTRACK
+    assert reason == SHOT_VIDEO_SOUNDTRACK_UNCONDITIONED.format(
+        references="<Video 1> (Camera pan), <Video 2> (Crowd plate)",
+        reference_word="references",
+    )
+    assert len(readiness_report(project).window_warnings) == 1
+
+
+def test_a_shot_citing_no_video_says_nothing_about_soundtracks():
+    """Silence for every shape that has no video in it, including the ones that look like one."""
+    # A character and a still image: the picture series, which carries no audio to discard.
+    assert video_soundtrack_note(*with_video("Reference sheet", kind="image")) == ("", "")
+    # An audio Asset is cited *as* audio and is conditioned in full — nothing is being dropped.
+    assert video_soundtrack_note(*with_video("Vocal stem", kind="audio")) == ("", "")
+    # And a shot citing nothing but its character.
+    assert video_soundtrack_note(*with_video()) == ("", "")
+
+
+def test_a_video_cited_by_a_shot_whose_asset_is_gone_says_nothing():
+    """A citation whose Asset this project no longer holds travels as a picture, and is silent.
+
+    `citation_slot_kind` puts an unresolvable citation in the picture series because nothing is
+    known about it — least of all whether it has a soundtrack — and this note must not claim
+    otherwise. Asserted because the walk hands back a `NumberedReference` either way, and reading
+    `entry.kind` off the citation's *Asset* rather than off the walk would guess here.
+    """
+    project, shot = with_video("Camera pan")
+    project.assets = [asset for asset in project.assets if asset.id != "asset_0"]
+
+    assert video_soundtrack_note(project, shot) == ("", "")
 
 
 def test_a_shot_whose_setting_fights_its_sections_look_warns_and_names_both():
