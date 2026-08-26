@@ -1637,6 +1637,56 @@ class SamplingBundle(BaseModel):
     lora_strength: float = 0.0
 
 
+class ExportLook(BaseModel):
+    """What an export's *picture* was built from, beside the takes `RenderJob.inputs` names.
+
+    FX-25. `inputs` answers "which takes went in"; nothing answered "and what was done to them",
+    so a six-month-old export could not be told from one made before an Effect existed. This is
+    that half of the record, and it is written by the assemble route at the moment the job record
+    is created — before any ffmpeg process starts, so a crashed export still says what it was
+    attempting.
+
+    **Every slot is a defaulted list, and an empty one means "carried none of these" — never
+    "unrecorded".** A `RenderJob` written before this model existed loads with all three empty and
+    therefore reads as an export that applied no look, which is what an export made before Epic 9
+    genuinely was. That is deliberately *not* `SamplingBundle`'s `None`-means-unknown convention,
+    and the difference is which mistake each field can make: a bundle defaulted to `"default"`
+    would claim a sampling nobody performed, whereas an effects list defaulted to empty claims
+    only that nothing was applied — the state every export in this application's history before
+    slice C1 was actually in. The narrow window where the two part company is an export written
+    between C1 and this field, which did carry a look and will read as carrying none; there are no
+    such exports outside a manifest hand-made to hold one, and pretending the whole history is
+    "unknown" to cover that case would make the field unreadable for the ninety-nine cases it is
+    for. `tests/test_assembly_route.py` pins the reading rather than leaving it to be assumed.
+
+    **`bindings` and `transitions` are present and empty on purpose**, exactly as
+    `effects.PREVIEW_FINGERPRINT_INPUTS` reserves the same two slots. Neither exists on any model
+    yet — bindings are Epic 10 and transitions Epic 11 — and declaring them now means the epic
+    that ships one fills a slot every already-written record already has, rather than reshaping
+    what every export has been writing. A reader six months from now sees three questions asked of
+    every export and can tell "no transition" from "this build could not say".
+
+    **What an entry records is what the export *used*, resolved, not a pointer to the Shot.** The
+    Shot's stack is editable and will have moved on; each entry is `effects.exported_look`'s
+    canonical text of one agreed effect — its id and *every* declared parameter filled in, the
+    catalogue's defaults included — prefixed with the shot it belonged to, as
+    `"<shot_id>=<effect>:{...}"`. `inputs`' own `"<shot_id>=<value>"` shape, in the same block, for
+    the same reason: one line per thing the export consumed, readable without a parser.
+
+    Only the effects that actually composed a stage are listed. A disabled entry stays in the
+    manifest and contributes nothing to the picture, so listing it here would describe a look the
+    export did not have. What the Director *configured* is the manifest's question, and the
+    manifest keeps answering it; this answers what ran.
+    """
+
+    #: One entry per effect that composed a stage, in plan order then chain order.
+    effects: list[str] = Field(default_factory=list)
+    #: Epic 10's envelope bindings. Present and empty; see the class docstring.
+    bindings: list[str] = Field(default_factory=list)
+    #: Epic 11's transitions. Present and empty; see the class docstring.
+    transitions: list[str] = Field(default_factory=list)
+
+
 class RenderJob(BaseModel):
     id: str = Field(default_factory=lambda: new_id("job"))
     # `edit` is the H3 image-edit (AI Mod) — an asset-producing GPU render like `flux`
@@ -1656,6 +1706,14 @@ class RenderJob(BaseModel):
     # as `"<shot_id>=<approved_output>"` strings. Empty for every ComfyUI job — their
     # inputs are the submitted graph, which `prompt_id` already names.
     inputs: list[str] = Field(default_factory=list)
+    #: FR-24's other half (FX-25): what this export did to the takes above. Empty on every job
+    #: that is not an assembly, and on every assembly whose shots carried no look. **Server-owned
+    #: like every other recorded fact about a job** — `app.JOB_RECORDED_FIELDS` names it and
+    #: `app._adopt_job_measurements` re-adopts it across the generic whole-project `PUT`, because
+    #: a defaulted model that every existing client omits arrives blank and one ordinary save
+    #: would otherwise erase the record of what every export in the project looked like, while a
+    #: body that invented one would plant a look for a render nobody graded. See `ExportLook`.
+    look: ExportLook = Field(default_factory=ExportLook)
     error: str = ""
     #: Percent complete, 0-100, for the local work that can actually measure itself: assembly
     #: reads ffmpeg's own `-progress` clock and writes it here as the export runs (AD-9). A

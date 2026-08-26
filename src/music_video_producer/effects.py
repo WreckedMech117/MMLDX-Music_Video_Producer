@@ -151,6 +151,7 @@ __all__ = [
     "build_effect_stages",
     "cube_text",
     "discover_luts",
+    "exported_look",
     "fingerprint_size",
     "identity_transform",
     "lut_directory",
@@ -1737,6 +1738,48 @@ def _canonical(value: Any) -> str:
     if isinstance(value, Iterable):
         return "[" + ",".join(_canonical(item) for item in value) + "]"
     return json.dumps(repr(value))
+
+
+def exported_look(
+    stack: Iterable[Mapping[str, Any]], *, luts: Sequence[LutEntry] = ()
+) -> tuple[str, ...]:
+    """One stack as the record of what an export applied: `"<effect>:{canonical values}"`, in
+    chain order, for the effects that actually composed a stage.
+
+    FX-25's half of the provenance. `RenderJob.inputs` records the takes an assembly consumed;
+    this records what was done to them, and it lives here rather than in the route because the
+    catalogue is the only thing entitled to say what an effect's parameters are (AD-27). The
+    values are `validate_stack`'s **resolved** ones — every declared parameter filled in, the
+    catalogue's defaults included — so the record answers what the export was built with even for
+    a parameter the Director never touched, and stays readable after the Shot's stack has moved
+    on or the catalogue's defaults have changed.
+
+    Ordered by `FAMILY_ORDER` then by the Director's own order within a family, which is
+    `build_effect_stages`' order and therefore the order the filter chain ran in. Storage order is
+    not load-bearing (AD-31), so recording it would make two records of one look differ over
+    nothing.
+
+    Disabled entries are omitted: they compose no stage, and a record naming one would describe a
+    picture the export did not produce. `Shot.effects` keeps them, which is where the question
+    "what did the Director configure" is answered.
+
+    `_canonical` is the formatter, so this is the same text the preview fingerprint hashes and two
+    parameter states that compose to one filter string record as one look — `{"zoom": 1}` and
+    `{"zoom": 1.0}` are not two different exports.
+
+    Refuses exactly as `validate_stack` does, for a stack that does not compose. Every caller
+    reaches this only after the same stack has been agreed, so the refusal is unreachable there;
+    it is not caught and re-worded here because a second wording of an existing refusal is the one
+    thing this surface may not grow.
+    """
+    resolved = validate_stack(stack, luts=luts)
+    ordered = [
+        effect
+        for family in FAMILY_ORDER
+        for effect in resolved
+        if effect.enabled and effect.family == family
+    ]
+    return tuple(f"{effect.effect_id}:{_canonical(effect.values)}" for effect in ordered)
 
 
 #: The eight inputs of the preview fingerprint, in the order they are hashed in. A tuple rather

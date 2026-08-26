@@ -31,6 +31,7 @@ from .assembly import (
     DEFAULT_EXPORT_PRESET,
     EXPORT_PRESETS,
     PREVIEW_PRESET,
+    AssemblyPlan,
     AudioOverlay,
     ClipWindow,
     ExportProgress,
@@ -96,6 +97,7 @@ from .effects import (
     NumberParameter,
     build_effect_stages,
     discover_luts,
+    exported_look,
     fingerprint_size,
     preview_fingerprint,
     song_fingerprint,
@@ -115,6 +117,7 @@ from .models import (
     Asset,
     AssetCitation,
     EffectSpec,
+    ExportLook,
     MessageNotice,
     Project,
     RenderJob,
@@ -2337,6 +2340,7 @@ JOB_RECORDED_FIELDS = (
     "render_seconds_source",
     "render_frames",
     "sampling_bundle",
+    "look",
     "updated_at",
 )
 
@@ -2376,6 +2380,18 @@ def _adopt_job_measurements(project: Project, stored: dict[str, RenderJob]) -> N
     the settle moment, and half of the `record`-sourced span — and because a body that omits it
     gets a fresh `now_utc()` from the default factory, which would silently redate every settled
     job to whenever somebody last pressed save.
+
+    `look` joined on 2026-08-25 with `RenderJob.look` itself, in the same commit as the field
+    rather than after the first save that ate one, and it answers the tuple's own question the same
+    way the four above it do: the assemble route composed that record from the plan it was about
+    to run, no client ever supplies it, and it must not be moveable in either direction. Both ways
+    it fails are the familiar ones. `ExportLook` is defaulted and every client that exists omits
+    it, so it arrives as three empty lists and one ordinary save would erase the record of what
+    every export in the project looked like — the very thing this field is for, deleted through
+    the route that has now been the hole twelve times. And a body that *invented* one would be
+    provenance for a grade nobody applied: `Shot.effects` is already server-owned on this route
+    (`_adopt_shot_effects`), so an unguarded `look` would be the way to claim a look the manifest
+    itself refuses to hold.
 
     `created_at` is deliberately **not** adopted: it is not measured, a client round-trips it
     faithfully, and adopting it would mean this route could never carry a job the store does not
@@ -7485,6 +7501,210 @@ def _names_an_undiscovered_look(refusal: EffectRefusal) -> bool:
 ASSEMBLY_EFFECTS_REFUSAL = "{shot}: {detail}"
 
 
+# ------------------------------------------------------------------------------------------
+# The export's pre-flight, as a registered list of checks (FX-24).
+#
+# What this replaces: two accumulators written inline in the assemble route, one per feature,
+# each with its own list, its own loop and its own `raise`. That shape works and it does not
+# scale — the binding case (Epic 10) and the transition case (Epic 11) are both coming, and
+# each would have arrived as a third and a fourth loop edited into the middle of a 400-line
+# route, with the report's ordering an accident of where somebody inserted their block.
+#
+# So the checks are named functions in an ordered tuple, and adding one is appending to the
+# tuple. What has *not* changed is the promise the accumulators existed for: every reason an
+# export cannot run comes back in one answer, because a Director fixing a fifteen-shot plan one
+# refusal at a time is a Director being rationed. Nor have the sentences: every wording is the
+# one that was already there, produced by the same code, and slices B and C1 assert them
+# verbatim.
+#
+# **Two stages, because the plan is not free.** A check that needs only the clips runs before
+# `assembly_plan` is laid out; one that needs the export's own geometry runs after. That split is
+# real rather than tidiness: `assembly_plan` presumes clips that passed the first stage — a clip
+# whose take is missing has `source=None` — so the geometry genuinely cannot exist until the
+# window checks have agreed. A composition check may also *produce* what the export then runs,
+# which is why it is handed an `ExportComposition` to fill in; a plan check gets no such thing
+# and can only report.
+# ------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ExportSubject:
+    """Everything an export check may read about the export it is judging, and nothing it may
+    write.
+
+    Frozen, and the plan arrives by `dataclasses.replace` rather than by assignment, so a check
+    cannot reach sideways and edit the thing the next check is about to judge. What a composition
+    check produces goes into `ExportComposition` instead, which is the one mutable half.
+
+    `looks` is the *callable* rather than the discovered listing, and that is load-bearing:
+    `discovered_looks` reads and validates every `.cube` on the machine on its first call --
+    221 ms cold on the Director's 48-file pack — and a project with no stack anywhere must go on
+    reading the looks folder exactly never. A check calls it only once it knows it has something
+    to judge.
+    """
+
+    #: One per Shot, in no particular order; every check that reports per clip sorts for itself.
+    clips: tuple[ClipWindow, ...]
+    #: ffprobe's reading of the song that will play, never the stored field.
+    song_seconds: float
+    #: Shot id → the stack as `validate_stack` reads it, for the Shots that carry one. A Shot
+    #: with an empty stack is absent, so `if not subject.stacks` is "this project has no look".
+    stacks: Mapping[str, list[dict[str, Any]]]
+    #: Every look this machine holds, on demand. See above for why it is not the listing itself.
+    looks: Callable[..., Sequence[LutEntry]]
+    #: The export's own geometry and per-clip frame counts — `None` for every plan-stage check,
+    #: which runs before it can exist.
+    plan: AssemblyPlan | None = None
+
+
+@dataclass(slots=True)
+class ExportComposition:
+    """What the composition stage builds for the export to run, filled in by its checks.
+
+    A composition check both reports and produces: `build_effect_stages` is the only thing that
+    can see a look whose `.cube` has left the folder, and it is also what the trim is driven with,
+    so the refusal and the artifact come out of one pass. Epic 11's composed transitions land
+    beside `effect_stages` here.
+
+    Empty is a complete answer: an export whose Shots carry no look composes nothing, and
+    `trim_args` then receives the empty groups it has always defaulted to.
+    """
+
+    #: Shot id → its composed chain, for the Shots that have one. Absent means no stages, which
+    #: is what `EffectStages()` at the call site turns into "the argv this route always built".
+    effect_stages: dict[str, EffectStages] = dataclass_field(default_factory=dict)
+    #: The provenance record of the same composition — what goes onto `RenderJob.look` (FX-25).
+    #: Built here rather than at the job write so it cannot describe a different composition from
+    #: the one the export is about to run.
+    look: ExportLook = dataclass_field(default_factory=ExportLook)
+
+
+def _window_refusals(subject: ExportSubject) -> list[str]:
+    """Every reason the *plan* cannot assemble: approval, staleness, the take on disk, the trim
+    offsets, and the tiling of the song. `assembly.assembly_refusals` unchanged, registered."""
+    return assembly_refusals(list(subject.clips), subject.song_seconds)
+
+
+def _effect_stack_refusals(subject: ExportSubject) -> list[str]:
+    """Every Shot whose Effect Stack the catalogue will not agree to, named by its label.
+
+    Judged here rather than only at composition because the catalogue's verdict needs no
+    geometry, so it can join the same answer as everything else wrong with the plan — a Director
+    with an unapproved shot *and* two impossible stacks is told all three at once, where a stack
+    judged only at composition would stay silent behind the approval refusal and be discovered one
+    run later. The composition check below re-derives the verdict; `validate_stack` is pure and
+    costs nothing to run twice, and the pair is what keeps the answer honest at both moments.
+
+    **AD-21:** nothing stored says a stack is valid. The write said so at the time, and this asks
+    again, because a manifest is hand-editable and the catalogue's bounds are not stored beside it.
+    """
+    if not subject.stacks:
+        return []
+    luts = subject.looks()
+    refusals: list[str] = []
+    for clip in sorted(subject.clips, key=lambda item: item.start):
+        stack = subject.stacks.get(clip.shot_id)
+        if not stack:
+            continue
+        try:
+            validate_stack(stack, luts=luts)
+        except EffectRefusal as refusal:
+            refusals.append(
+                ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
+            )
+    return refusals
+
+
+def _compose_effect_chains(
+    subject: ExportSubject, composition: ExportComposition
+) -> list[str]:
+    """Compose each Shot's chain against the export's delivery geometry, and record what it was.
+
+    The geometry is the *export's* target and not the take's, which is what a treatment stage is
+    composed for (`effects.StageContext`). Run before the job record is written, so a look whose
+    `.cube` has gone missing since it was chosen refuses the export with nothing half-started
+    behind it rather than failing inside ffmpeg with a message about `clut`.
+
+    **Accumulated, not raised on the first fault**, and this loop is the only place a missing
+    *file* can be seen — `validate_stack` checks ids against the discovered listing and never
+    touches the disk. Two shots whose `.cube` files had both been deleted used to name only the
+    first: restore it, run again, be told about the second.
+
+    Judged once per Shot rather than once per clip: a shot nested inside another emits two
+    `ClipWindow`s that share these stages, and telling a Director the same sentence twice is a
+    worse answer than telling it once.
+
+    The provenance goes in beside the stages, from the same stack and the same agreed values, so
+    what the record claims and what the argv does cannot drift.
+    """
+    plan = subject.plan
+    if plan is None or not subject.stacks:
+        return []
+    luts = subject.looks()
+    refusals: list[str] = []
+    judged: set[str] = set()
+    for clip in plan.clips:
+        stack = subject.stacks.get(clip.shot_id)
+        if not stack or clip.shot_id in judged:
+            continue
+        judged.add(clip.shot_id)
+        try:
+            composition.effect_stages[clip.shot_id] = build_effect_stages(
+                stack, width=plan.width, height=plan.height, luts=luts
+            )
+        except EffectRefusal as refusal:
+            refusals.append(
+                ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
+            )
+            continue
+        composition.look.effects.extend(
+            f"{clip.shot_id}={entry}" for entry in exported_look(stack, luts=luts)
+        )
+    return refusals
+
+
+#: Every check the export runs before its plan exists, in the order their sentences are reported.
+#: The window checks first, so the report reads top to bottom the way the timeline does, and the
+#: look after them.
+#:
+#: **This is the list Epic 10 appends to.** A binding refusal — an envelope that was never
+#: measured, a parameter no effect declares — is a fact about the stack and the song, needs no
+#: geometry, and belongs here as a third entry with nothing else edited.
+EXPORT_PLAN_CHECKS: tuple[Callable[[ExportSubject], list[str]], ...] = (
+    _window_refusals,
+    _effect_stack_refusals,
+)
+
+#: Every check that needs the export's own geometry, and may build what the export then runs.
+#:
+#: **This is the list Epic 11 appends to.** A transition is composed against the plan — it needs
+#: both neighbours' frame counts and the delivery size — so it registers here, fills its own slot
+#: on `ExportComposition`, and reports into the same one answer.
+EXPORT_COMPOSITION_CHECKS: tuple[
+    Callable[[ExportSubject, ExportComposition], list[str]], ...
+] = (_compose_effect_chains,)
+
+
+def export_plan_refusals(subject: ExportSubject) -> list[str]:
+    """Every registered plan-stage check, run in order, into one report."""
+    return [line for check in EXPORT_PLAN_CHECKS for line in check(subject)]
+
+
+def compose_export(subject: ExportSubject) -> tuple[ExportComposition, list[str]]:
+    """Every registered composition check, run in order: what the export will run, and every
+    reason it cannot.
+
+    The composition is returned whether or not the report is empty — a caller that is about to
+    refuse discards it, and a half-filled one has driven nothing, since the route raises before
+    the job record is written.
+    """
+    composition = ExportComposition()
+    refusals = [
+        line for check in EXPORT_COMPOSITION_CHECKS for line in check(subject, composition)
+    ]
+    return composition, refusals
+
+
 #: Why a Shot cannot be previewed: there is no approved take to run the chain over. A preview is
 #: a picture of a file, and this Shot has not decided which file yet — so the remedy is the
 #: approval, and the sentence says so rather than only reporting the absence.
@@ -8875,12 +9095,17 @@ def create_app(
         _adopt_shot_effects(
             project, {shot.id: shot for shot in current.shots}, looks=discovered_looks
         )
-        # Every recorded fact about a job is server-owned here — the *eleventh* time this one
-        # route has been the hole for a field a narrower sibling guards, and the second time this
-        # particular helper has had to grow to close it. A body carries every field of every job,
-        # and all of them are defaulted, so without this one ordinary save from any existing
-        # client would blank the render costs *and* the sampling bundles this application records,
-        # while a body that invented either would plant provenance for a render nobody ran. See
+        # Every recorded fact about a job is server-owned here — the *eleventh* and now the
+        # *thirteenth* time this one route has been the hole for a field nothing else may write,
+        # and the third time this particular helper has had to grow to close it. A body carries
+        # every field of every job, and all of them are defaulted, so without this one ordinary
+        # save from any existing client would blank the render costs, the sampling bundles *and*
+        # the record of what every export looked like, while a body that invented any of them
+        # would plant provenance for a render nobody ran or a grade nobody applied. This is the
+        # **only** generic route a `RenderJob` can arrive on — `PUT .../shots` carries a
+        # `ShotListRequest`, which has no `jobs` — and that is asserted rather than assumed by
+        # `test_the_whole_project_put_is_the_only_route_a_job_record_can_arrive_on`, because the
+        # twelfth instance of this hole was a spec naming one of two routes. See
         # `_adopt_job_measurements`.
         _adopt_job_measurements(project, {job.id: job for job in current.jobs})
         # The generic write is the widest citation writer there is: a body carries every field of
@@ -13139,74 +13364,41 @@ def create_app(
                     has_audio=has_audio,
                 )
             )
-        # The Effect Stacks, judged in the same comprehensive report as everything else about the
-        # plan. A stack is validated here rather than only at composition because
-        # `assembly_refusals` exists to tell a Director *every* reason an export cannot run in one
-        # answer — being sent back three times for three shots is the failure it was written
-        # against — and the catalogue's verdict needs no geometry, so it can be reached before the
-        # plan is laid out. The composition below re-derives it; `validate_stack` is pure and
-        # costs nothing to run twice, and the pair is what keeps the answer honest at both moments.
+        # The pre-flight, run as `EXPORT_PLAN_CHECKS` rather than as a chain of accumulators
+        # written into this route (FX-24). Every registered check reports into one answer, so a
+        # Director with an unapproved shot, a hole in the timeline and two impossible stacks is
+        # told all four at once — being sent back four times for four faults is the failure the
+        # comprehensive report exists against. Epic 10's binding check and Epic 11's transition
+        # check register into those tuples; nothing here changes when they do.
         #
-        # Only a Shot with a stack is looked at, and only then are the looks discovered, so a
-        # project with no effects at all reads the looks folder exactly never.
-        stacks = {
-            shot.id: [spec.model_dump() for spec in shot.effects]
-            for shot in project.shots
-            if shot.effects
-        }
-        effect_refusals: list[str] = []
-        if stacks:
-            for clip in sorted(clips, key=lambda item: item.start):
-                stack = stacks.get(clip.shot_id)
-                if not stack:
-                    continue
-                try:
-                    validate_stack(stack, luts=discovered_looks())
-                except EffectRefusal as refusal:
-                    effect_refusals.append(
-                        ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
-                    )
-        refusals = assembly_refusals(clips, song_seconds) + effect_refusals
+        # Only a Shot with a stack appears in `stacks`, and `ExportSubject.looks` is the callable
+        # rather than the listing, so a project with no effects at all reads the looks folder
+        # exactly never.
+        subject = ExportSubject(
+            clips=tuple(clips),
+            song_seconds=song_seconds,
+            stacks={
+                shot.id: [spec.model_dump() for spec in shot.effects]
+                for shot in project.shots
+                if shot.effects
+            },
+            looks=discovered_looks,
+        )
+        refusals = export_plan_refusals(subject)
         if refusals:
             raise HTTPException(status_code=422, detail="\n".join(refusals))
         plan = assembly_plan(clips, song_seconds, dimensions)
-        # The chain itself, composed once per clip against the plan's own delivery geometry —
-        # which is the export's target and not the take's, and is what a treatment stage is
-        # composed for (see `effects.StageContext`). Built here, before the job record is written,
-        # so a look whose `.cube` has gone missing since it was chosen refuses the export with
-        # nothing half-started behind it rather than failing inside ffmpeg with a message about
-        # `clut`. A Shot with no stack gets no entry and therefore no stages at all, which is what
-        # keeps its argv the argv this route has always built.
-        #
-        # **Accumulated, then raised once** — the shape the pre-pass above already uses, and for
-        # its reason. This loop is the only place a missing *file* can be seen, since
-        # `validate_stack` checks ids against the discovered listing and never touches the disk,
-        # so two shots whose `.cube` files had both been deleted named only the first: restore
-        # it, run again, be told about the second. Being sent back three times for three faults
-        # is the failure `assembly_refusals` exists against, and a refusal that arrives one at a
-        # time is that failure however few of them there are.
-        #
-        # Judged once per Shot rather than once per clip: a shot nested inside another emits two
-        # `ClipWindow`s that share these stages, and telling a Director the same sentence twice
-        # is a worse answer than telling it once.
-        effect_stages: dict[str, EffectStages] = {}
-        composition_refusals: list[str] = []
-        judged: set[str] = set()
-        for clip in plan.clips:
-            stack = stacks.get(clip.shot_id)
-            if not stack or clip.shot_id in judged:
-                continue
-            judged.add(clip.shot_id)
-            try:
-                effect_stages[clip.shot_id] = build_effect_stages(
-                    stack, width=plan.width, height=plan.height, luts=discovered_looks()
-                )
-            except EffectRefusal as refusal:
-                composition_refusals.append(
-                    ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
-                )
+        # The composition stage: the checks that need the export's own delivery geometry, which
+        # is why they could not run above. They build what the export is driven with as well as
+        # reporting on it — `build_effect_stages` is the only thing that can see a look whose
+        # `.cube` has left the folder, and it is also what produces the chain — so the artifact
+        # and the refusal come out of one pass, before the job record is written and with nothing
+        # half-started behind a fault. A Shot with no stack gets no entry and therefore no stages
+        # at all, which is what keeps its argv the argv this route has always built.
+        composition, composition_refusals = compose_export(replace(subject, plan=plan))
         if composition_refusals:
             raise HTTPException(status_code=422, detail="\n".join(composition_refusals))
+        effect_stages = composition.effect_stages
 
         exports_root = store.media_dir(project_id) / "exports"
         exports_root.mkdir(parents=True, exist_ok=True)
@@ -13221,12 +13413,18 @@ def create_app(
         export_name = f"assembly_{max(taken, default=0) + 1:05d}.mp4"
 
         # The job is written before any work so provenance survives a crash. `inputs` is
-        # FR-24 adapted: the exact takes this export was built from, by shot.
+        # FR-24 adapted: the exact takes this export was built from, by shot. `look` is FX-25,
+        # the other half of that question — what was *done* to those takes — taken from the
+        # composition the export is about to be driven with rather than re-derived from the
+        # Shots, so the record cannot describe a different look from the argv. Empty for a
+        # project whose Shots carry none, which is what every job written before this field
+        # existed also reads as; see `models.ExportLook`.
         job = RenderJob(
             kind="post",
             status="running",
             target_id="assembly",
             inputs=[f"{clip.shot_id}={clip.approved_output}" for clip in plan.clips],
+            look=composition.look,
         )
         project.jobs.append(job)
         store.save(project)

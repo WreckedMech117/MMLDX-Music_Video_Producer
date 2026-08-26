@@ -1588,3 +1588,365 @@ def test_the_export_composes_a_stack_against_the_plans_geometry_and_not_the_take
     assert "cbh=3" not in commands[0][commands[0].index("-vf") + 1]
     assert "chromashift" not in commands[1][commands[1].index("-vf") + 1]
     assert comfy.prompts == []
+
+
+# ----------------------------------------------------------------------------------------------
+# Story 9.6 — honest export with effects. Three of the four acceptance groups already held; these
+# are the four that did not: the provenance record (FX-25), the pre-flight as a registered list
+# of checks (FX-24), the untouched-neighbour claim (FX-NFR-2), and "nothing about an Effect lives
+# only in the interface" (FX-23), which was true and unasserted.
+# ----------------------------------------------------------------------------------------------
+
+
+def test_an_export_records_the_look_it_ran_and_the_record_outlives_the_shot(
+    tmp_path: Path, monkeypatch
+):
+    """FX-25. `inputs` said which takes went in; nothing said what was done to them, so an export
+    six months old could not be told from one made before an Effect existed.
+
+    The record is taken from the composition the export is about to be **driven with**, not
+    re-derived from the Shots afterwards, and this test is written so that the difference shows:
+    the stack is rewritten and then deleted after the export finishes, and the record of what ran
+    is unmoved. That is the whole of the second property the story asks of it — readable long
+    after the Shot has moved on, because it holds what the export used rather than a pointer to
+    state that will have changed.
+
+    Three further things the shape has to get right, each asserted here rather than argued:
+
+    * The values are the **resolved** ones. `grain`'s `seed` is in the record and the Director
+      never typed it; a record of only what was typed would not answer what the picture was.
+    * Chain order, not storage order. The stack is written texture-first and comes back
+      geometry-first, because that is the order `build_effect_stages` ran the filters in and
+      storage order is not load-bearing (AD-31).
+    * A Shot carrying no look contributes no entry, so an unstyled project's record is empty
+      rather than a row of nothings.
+
+    And `bindings` and `transitions` are present and empty on the record this build writes, which
+    is the slot Epic 10 and Epic 11 fill without reshaping what every export has already written.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    write_stack(
+        client,
+        project_id,
+        "shot_a",
+        [
+            {"effect": "grain", "parameters": {"strength": 0.2}},
+            {"effect": "punch_in", "parameters": {"zoom": 1.4}},
+            {"effect": "vignette", "enabled": False, "parameters": {"angle": 1.0}},
+        ],
+    )
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+
+    job = store.get(project_id).jobs[-1]
+    assert job.kind == "post" and job.status == "complete"
+    # `inputs` untouched: the takes half of the same question, exactly as it was.
+    assert job.inputs == [
+        f"shot_a=music-video-producer/{project_id}/shots/shot_a-h3_00001-audio.mp4",
+        f"shot_b=music-video-producer/{project_id}/shots/shot_b-h3_00001-audio.mp4",
+    ]
+    # Chain order, resolved values, the disabled entry absent, and `shot_b` contributing nothing.
+    assert job.look.effects == [
+        'shot_a=punch_in:{"zoom":1.4}',
+        'shot_a=grain:{"seed":0,"strength":0.2}',
+    ]
+    assert job.look.bindings == [] and job.look.transitions == []
+    # And what it claims is what ran: every effect named in the record is in the argv the export
+    # was actually driven with, and the shot that carries none got the chain it always got.
+    graded = commands[0][commands[0].index("-vf") + 1]
+    assert "crop=" in graded and "noise=" in graded
+    assert commands[1][commands[1].index("-vf") + 1] == (
+        "scale=192:108:force_original_aspect_ratio=decrease,"
+        "pad=192:108:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    )
+
+    # The Shot moves on: regraded, then stripped entirely. The export's record does not move.
+    write_stack(client, project_id, "shot_a", [{"effect": "posterize", "parameters": {"levels": 4}}])
+    write_stack(client, project_id, "shot_a", [])
+    reread = ProjectStore(tmp_path).get(project_id).jobs[-1]
+    assert reread.look.effects == [
+        'shot_a=punch_in:{"zoom":1.4}',
+        'shot_a=grain:{"seed":0,"strength":0.2}',
+    ]
+    assert comfy.prompts == []
+
+
+def test_an_export_made_before_the_look_was_recorded_reads_as_carrying_none(tmp_path: Path):
+    """The first property the story states of the record, said in a test rather than assumed.
+
+    A manifest written before this field existed has no `look` key at all — not an empty one, no
+    key — and it must load as an export that applied **no** look rather than as one whose look is
+    unknown. That is deliberately not `sampling_bundle`'s `None`-means-unknown convention, and
+    the difference is which mistake each field can make: a bundle defaulted to a name would claim
+    a sampling nobody performed, while an effects list defaulted to empty claims only that
+    nothing was applied, which is what every export in this application's history before Epic 9
+    genuinely was.
+
+    Driven through the real store rather than by constructing the model, because the claim is
+    about a file on disk that nobody is going to rewrite.
+    """
+    store = ProjectStore(tmp_path)
+    project = store.create(Project(name="Before the record"))
+    project.jobs = [
+        RenderJob(
+            id="job_old",
+            kind="post",
+            status="complete",
+            target_id="assembly",
+            inputs=["shot_a=takes/one.mp4"],
+            output_files=["exports/assembly_00001.mp4"],
+        )
+    ]
+    store.save(project)
+
+    # The manifest as this application wrote them until 2026-08-25: every key a job has ever
+    # carried, and no `look` at all. Not an empty one — no key.
+    manifest = tmp_path / "projects" / project.id / "project.json"
+    body = json.loads(manifest.read_text(encoding="utf-8"))
+    before = body["jobs"][0].pop("look")
+    assert before == {"effects": [], "bindings": [], "transitions": []}
+    manifest.write_text(json.dumps(body), encoding="utf-8")
+
+    loaded = ProjectStore(tmp_path).get(project.id).jobs[0]
+    assert loaded.look.effects == []
+    assert loaded.look.bindings == []
+    assert loaded.look.transitions == []
+    # And it round-trips with one more key and no other change, so reading an old manifest and
+    # saving it is not a rewrite of anything else.
+    ProjectStore(tmp_path).save(ProjectStore(tmp_path).get(project.id))
+    after = json.loads(manifest.read_text(encoding="utf-8"))
+    assert set(after["jobs"][0]) - set(body["jobs"][0]) == {"look"}
+    assert after["jobs"][0] == {**body["jobs"][0], "look": before}
+
+
+def test_the_recorded_look_cannot_be_blanked_or_forged_through_the_whole_project_put(
+    tmp_path: Path,
+):
+    """The guard, landed in the same commit as the field, on a real export's own record.
+
+    `tests/test_api.py` runs every name in `JOB_RECORDED_FIELDS` through the generic `PUT` and
+    requires each to come back unmoved; this is the same guard met at the surface it protects,
+    with a look a real export actually composed rather than a constructed one.
+
+    Both directions, because both are how this route has been the hole twelve times before. The
+    **blank** is the ordinary case and the dangerous one: `ExportLook` is defaulted and every
+    client that exists omits it, so one save from any of them would erase the record of what
+    every export in the project looked like. The **forgery** is the other: `Shot.effects` is
+    already server-owned here, so an unguarded `look` would be the way to claim a grade the
+    manifest itself refuses to hold.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    write_stack(client, project_id, "shot_a", [{"effect": "punch_in", "parameters": {"zoom": 1.2}}])
+    assert client.post(f"/api/projects/{project_id}/assemble").status_code == 200
+    recorded = store.get(project_id).jobs[-1].look.effects
+    assert recorded == ['shot_a=punch_in:{"zoom":1.2}']
+
+    # 1. The save every existing client sends: the whole manifest with no `look` on any job.
+    body = json.loads(store.get(project_id).model_dump_json())
+    for job in body["jobs"]:
+        job.pop("look")
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    assert store.get(project_id).jobs[-1].look.effects == recorded
+
+    # 2. A look for a grade nobody applied.
+    body = json.loads(store.get(project_id).model_dump_json())
+    body["jobs"][-1]["look"] = {
+        "effects": ['shot_b=lut_look:{"interp":"tetrahedral","lut":"never-chosen"}'],
+        "bindings": ["shot_a.zoom=envelope"],
+        "transitions": ["shot_a>shot_b=dissolve"],
+    }
+    assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200
+    settled = store.get(project_id).jobs[-1].look
+    assert settled.effects == recorded
+    assert settled.bindings == [] and settled.transitions == []
+    assert comfy.prompts == []
+
+
+def test_a_clip_carrying_no_effects_is_encoded_once_and_identically_whatever_its_neighbour_wears(
+    tmp_path: Path, monkeypatch
+):
+    """FX-NFR-2, which the acceptance criteria state and nothing measured: a clip carrying no
+    Effects is not re-encoded a second time on account of anything elsewhere in the timeline.
+
+    Determined rather than asserted, by running the same two-shot project twice — once with
+    neither shot graded, once with the *neighbour* heavily graded — and comparing what the
+    unstyled clip's ffmpeg was driven with. The claim has two halves and both are here:
+
+    * **Once.** One trim per clip, both times. There is no second pass over the joined video and
+      no re-encode of a clip on account of a neighbour, so the count is the count of clips.
+    * **Identically.** `shot_b`'s argv is byte-for-byte the same in both runs, including the
+      `-vf` chain and the frame count, so a Director who grades one shot pays for that shot.
+
+    The comparison is between two real runs rather than against a written-out constant on
+    purpose: a constant would answer the question "is this the chain we expected", and the
+    question here is "did the neighbour change anything".
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    recording, first = recorded_trims(client, monkeypatch, project_id)
+    assert first.status_code == 200, first.text
+    # Snapshotted before the second run: `recorded_trims` wraps whatever `trim_args` is at the
+    # time, so the second call's recorder sits on top of this one and keeps feeding its list.
+    plain = [list(command) for command in recording]
+
+    write_stack(
+        client,
+        project_id,
+        "shot_a",
+        [
+            {"effect": "punch_in", "parameters": {"zoom": 1.8}},
+            {"effect": "grain", "parameters": {"strength": 0.4}},
+            {"effect": "posterize", "parameters": {"levels": 6}},
+        ],
+    )
+    graded, second = recorded_trims(client, monkeypatch, project_id)
+    assert second.status_code == 200, second.text
+
+    # One ffmpeg per clip, both runs. A second encode of anything would show up as a third argv.
+    assert len(plain) == 2 and len(graded) == 2
+    # The graded neighbour really did change — otherwise the comparison below proves nothing.
+    assert graded[0][graded[0].index("-vf") + 1] != plain[0][plain[0].index("-vf") + 1]
+    # And the untouched clip's command is the same command, argument for argument, apart from
+    # the scratch directory each run writes its intermediates into.
+    def without_paths(command):
+        return [part for part in command if "\\.work-" not in part and "/.work-" not in part]
+
+    assert without_paths(graded[1]) == without_paths(plain[1])
+    assert comfy.prompts == []
+
+
+def test_an_exports_look_is_reproducible_from_the_manifest_alone(tmp_path: Path, monkeypatch):
+    """FX-23, which was true and unasserted: nothing about an Effect lives only in the interface.
+
+    The test that would fail if any part of a look were held in the client. A second
+    `ProjectStore` opened on the same folder reads the manifest as a cold reader would — no
+    request, no session, nothing the browser sent — and from that manifest and the export's own
+    delivery geometry it recomposes the chain. It must equal the `-vf` the export was driven
+    with, character for character.
+
+    A LUT is in the stack deliberately, because a look chosen from a picker is the part most
+    likely to have been carried only on the wire: the client names it, the server discovers the
+    file, and the filter argument is a path neither of them typed. If any of that lived only in
+    the interface, the recomposition would not produce the same `lut3d`.
+
+    `interp` is never sent by this test at all, which is the second half of the same claim: the
+    catalogue's default is part of the look, it is on the server, and a manifest holding only
+    what was typed still recomposes the whole chain.
+    """
+    from music_video_producer.effects import build_effect_stages, discover_luts
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    chosen = client.get("/api/effects/catalogue").json()["looks"][0]["lut_id"]
+    write_stack(
+        client,
+        project_id,
+        "shot_a",
+        [
+            {"effect": "lut_look", "parameters": {"lut": chosen}},
+            {"effect": "dutch_tilt", "parameters": {"angle": 3.5}},
+        ],
+    )
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    ran = commands[0][commands[0].index("-vf") + 1]
+
+    # The cold reader: a different store object, a different `discover_luts` call, and nothing
+    # in hand but the folder on disk.
+    cold = ProjectStore(tmp_path).get(project_id)
+    shot = next(item for item in cold.shots if item.id == "shot_a")
+    width, height = response.json()["width"], response.json()["height"]
+    stages = build_effect_stages(
+        [spec.model_dump() for spec in shot.effects],
+        width=width,
+        height=height,
+        luts=discover_luts(tmp_path),
+    )
+    rebuilt = ",".join(
+        [
+            *stages.geometry,
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+            *stages.treatment,
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+            "fps=24",
+            "setsar=1",
+            "format=yuv420p",
+        ]
+    )
+    assert rebuilt == ran
+    assert "lut3d=file=" in ran and "interp=tetrahedral" in ran and "rotate=" in ran
+    assert comfy.prompts == []
+
+
+def test_a_check_registered_into_the_pre_flight_reports_without_the_route_being_touched(
+    tmp_path: Path, monkeypatch
+):
+    """FX-24. The refusal report is a list of checks that Epic 10 and Epic 11 append to, and this
+    is that claim executed: two checks nobody has written yet are registered from a test, and
+    both of their sentences come back in the export's one answer with not a line of the route
+    changed.
+
+    Both stages, because the two coming epics need different ones. A binding refusal is a fact
+    about the stack and the song and needs no geometry, so it registers into the plan stage; a
+    transition is composed against the plan's own frame counts and delivery size, so it registers
+    into the composition stage and is handed the `ExportComposition` it would fill in.
+
+    The plan-stage check runs first and its refusal stands alone, which is not a quirk of the
+    registry but the ordering the report has always had: the composition stage cannot run until
+    the plan exists, and the plan does not exist while anything is refusing it.
+    """
+    import music_video_producer.app as app_module
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    write_stack(client, project_id, "shot_a", [{"effect": "punch_in", "parameters": {"zoom": 1.1}}])
+
+    # 1. The composition stage: a check that sees the plan, and can write into what the export
+    #    will run. Epic 11's shape.
+    seen = {}
+
+    def transition_check(subject, composition):
+        seen["width"] = subject.plan.width
+        seen["clips"] = len(subject.plan.clips)
+        seen["stages"] = dict(composition.effect_stages)
+        return ["SHOT 02 (shot_b): a transition longer than the clip it lands on."]
+
+    monkeypatch.setattr(
+        app_module,
+        "EXPORT_COMPOSITION_CHECKS",
+        (*app_module.EXPORT_COMPOSITION_CHECKS, transition_check),
+    )
+    refused = client.post(f"/api/projects/{project_id}/assemble")
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == (
+        "SHOT 02 (shot_b): a transition longer than the clip it lands on."
+    )
+    # It was handed the real plan, and the chains the checks before it had already composed.
+    assert seen == {"width": 192, "clips": 2, "stages": seen["stages"]}
+    assert list(seen["stages"]) == ["shot_a"]
+    assert store.get(project_id).jobs == [], "a refused export wrote a job record"
+
+    # 2. The plan stage: a check that runs before any geometry exists, beside the ones already
+    #    registered, and lands in the same report as them. Epic 10's shape.
+    def binding_check(subject):
+        assert subject.plan is None
+        return [f"SHOT 01 (shot_a): {len(subject.stacks)} stack(s) bind to an unmeasured song."]
+
+    monkeypatch.setattr(
+        app_module, "EXPORT_PLAN_CHECKS", (*app_module.EXPORT_PLAN_CHECKS, binding_check)
+    )
+    assert client.post(f"/api/projects/{project_id}/shots/shot_b/unapprove").status_code == 200
+    refused = client.post(f"/api/projects/{project_id}/assemble")
+    assert refused.status_code == 422, refused.text
+    # One answer: the registered check's sentence beside the window check's own, in registration
+    # order, and the composition stage never reached because the plan never existed.
+    assert refused.json()["detail"].splitlines() == [
+        ASSEMBLY_UNAPPROVED_REFUSAL.format(shot="SHOT 02 (shot_b)"),
+        "SHOT 01 (shot_a): 1 stack(s) bind to an unmeasured song.",
+    ]
+    assert comfy.prompts == []

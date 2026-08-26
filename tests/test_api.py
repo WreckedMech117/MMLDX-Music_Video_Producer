@@ -20459,6 +20459,13 @@ def test_a_job_the_store_never_saw_arrives_with_no_measurement_however_the_body_
         "render_seconds": 7920.0,
         "render_seconds_source": "comfy",
         "render_frames": 221,
+        # And a look for an export nobody ran, on the same argument: `RenderJob.look` joined
+        # this guard on 2026-08-25, and a record nobody composed carries no composition.
+        "look": {
+            "effects": ['shot_a=lut_look:{"interp":"tetrahedral","lut":"never-chosen"}'],
+            "bindings": ["forged"],
+            "transitions": ["forged"],
+        },
         "created_at": "2026-08-22T01:00:00Z",
         "updated_at": "2026-08-22T03:12:00Z",
     })
@@ -20470,6 +20477,7 @@ def test_a_job_the_store_never_saw_arrives_with_no_measurement_however_the_body_
     assert (forged.render_seconds, forged.render_seconds_source, forged.render_frames) == (
         0.0, "", 0,
     )
+    assert (forged.look.effects, forged.look.bindings, forged.look.transitions) == ([], [], [])
     # `updated_at` equal to `created_at` is this record's documented way of saying "never
     # settled", which is the honest thing to say about a job nothing here ever measured.
     assert forged.updated_at == forged.created_at
@@ -20879,14 +20887,20 @@ def test_every_field_a_settle_path_measures_is_covered_by_the_routes_guard():
     # The harness reads the real function rather than an empty set that would pass vacuously.
     assert {"render_seconds", "render_seconds_source", "updated_at"} <= written
     assert written <= set(JOB_RECORDED_FIELDS)
-    # Two fields no settle path writes, both recorded by the submission route at the single
-    # moment each is true, and both for the same reason: what they describe is edited or
-    # re-chosen afterwards, so re-deriving either later describes a render that never happened.
-    # `render_frames` — `Shot.duration` moves under an edge drag. `sampling_bundle` —
-    # `Project.sampling_profile` is a standing choice the Director changes between renders, which
-    # is exactly why a project's takes became a mixture. They are named in the guard for the same
-    # reason as the rest, and the test below proves the naming has teeth rather than reciting it.
-    assert set(JOB_RECORDED_FIELDS) - written == {"render_frames", "sampling_bundle"}
+    # Three fields no settle path writes, each recorded at the single moment it is true, and all
+    # for the same reason: what they describe is edited or re-chosen afterwards, so re-deriving
+    # any of them later describes a render that never happened. `render_frames` — `Shot.duration`
+    # moves under an edge drag. `sampling_bundle` — `Project.sampling_profile` is a standing
+    # choice the Director changes between renders, which is exactly why a project's takes became
+    # a mixture. `look` — written by the assemble route when it creates the job record, from the
+    # composition it is about to run, and `Shot.effects` is edited the moment the export is over.
+    # They are named in the guard for the same reason as the rest, and the test below proves the
+    # naming has teeth rather than reciting it.
+    assert set(JOB_RECORDED_FIELDS) - written == {
+        "render_frames",
+        "sampling_bundle",
+        "look",
+    }
 
 
 def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
@@ -20910,6 +20924,14 @@ def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
                 "name": "turbo", "steps": 4, "sampler": "euler", "scheduler": "beta",
                 "lora": "forged.safetensors", "lora_strength": 0.7,
             },
+            # A look for an export nobody graded, which is the other direction this field fails
+            # in: `Shot.effects` is already server-owned on this route, so an unguarded `look`
+            # would be the way to claim a grade the manifest itself refuses to hold.
+            "look": {
+                "effects": ["shot_a=lut_look:{\"interp\":\"tetrahedral\",\"lut\":\"forged\"}"],
+                "bindings": [],
+                "transitions": [],
+            },
             "updated_at": "2030-01-01T00:00:00Z",
         }[name]
         body = json.loads(store.get(project_id).model_dump_json())
@@ -20919,6 +20941,160 @@ def test_the_guard_has_teeth_for_every_field_it_names(tmp_path: Path):
         assert client.put(f"/api/projects/{project_id}", json=body).status_code == 200, name
 
         assert getattr(timing_of(store, project_id, job_id), name) == held, name
+
+
+
+def _routes_whose_body_can_carry_a_job(app) -> dict[str, str]:
+    """Every route whose request body can reach a `RenderJob`, and the field path that gets there.
+
+    Read off the live routing table and pydantic's own field annotations rather than off source
+    text, so a route added tomorrow with a job-bearing body appears here by existing.
+    """
+    from fastapi.routing import APIRoute
+    from pydantic import BaseModel
+
+    def trail(annotation, seen, so_far):
+        for candidate in (annotation, *get_args(annotation)):
+            if candidate is RenderJob:
+                return so_far
+            if (
+                isinstance(candidate, type)
+                and issubclass(candidate, BaseModel)
+                and candidate not in seen
+            ):
+                seen.add(candidate)
+                for name, field in candidate.model_fields.items():
+                    found = trail(field.annotation, seen, [*so_far, f"{candidate.__name__}.{name}"])
+                    if found:
+                        return found
+        return None
+
+    found = {}
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or route.body_field is None:
+            continue
+        path = trail(route.body_field.field_info.annotation, set(), [])
+        if path is not None:
+            found[f"{min(route.methods)} {route.path}"] = " -> ".join(path)
+    return found
+
+
+def test_every_route_a_job_record_can_arrive_on_is_enumerated(tmp_path: Path):
+    """The twelfth instance of the `replace_project` guard hole was a spec that named one of the
+    two routes a `Shot` can arrive on, and the implementer had to find the other. So the routes a
+    **job** can arrive on are enumerated here rather than assumed, from the routing table itself.
+
+    There are six, not one, and the shape of the sixth is worth stating: five of them are
+    report-then-confirm routes whose request body *is* the response model they echo, and that
+    response model carries the saved `Project` — jobs and all. `PLAN_DIGEST_EXCLUDE` leaves
+    `project` out of the plan digest, so a client can put anything it likes in there and the
+    fingerprint still matches. None of those five ever reads it: each writes onto the project it
+    read from the store and saves that. `test_a_job_record_forged_inside_a_confirmed_plan_is_
+    never_written` is that claim executed rather than argued.
+
+    The one route that does bind a client's job records is the generic whole-project `PUT`, and
+    `_adopt_job_measurements` is what stands in front of it.
+
+    A new entry here is not a failure to suppress. It is a route that has to answer the question
+    this list exists to ask: can a client's job record reach the store through it?
+    """
+    client, _store, _comfy = make_client(tmp_path)
+
+    assert _routes_whose_body_can_carry_a_job(client.app) == {
+        "PUT /api/projects/{project_id}": "Project.jobs",
+        "POST /api/projects/{project_id}/sections/fill-looks":
+            "SectionLooksRequest.plan -> SectionLooksResponse.project -> Project.jobs",
+        "POST /api/projects/{project_id}/timeline/lay-out":
+            "LayOutRequest.plan -> LayOutResponse.project -> Project.jobs",
+        "POST /api/projects/{project_id}/timeline/line-up":
+            "LineUpRequest.plan -> LayOutResponse.project -> Project.jobs",
+        "POST /api/projects/{project_id}/timeline/fill-in":
+            "FillInRequest.plan -> LineUpResponse.project -> Project.jobs",
+        "POST /api/projects/{project_id}/timeline/clean-prompts":
+            "CleanPromptsRequest.plan -> CleanPromptsResponse.project -> Project.jobs",
+    }
+
+
+def test_a_job_record_forged_inside_a_confirmed_plan_is_never_written(tmp_path: Path):
+    """The five plan-echo routes, proved inert rather than argued inert.
+
+    A confirm's body is the report it echoes, and that report model carries a whole `Project`.
+    `PLAN_DIGEST_EXCLUDE` leaves `project` out of the digest deliberately — it is one of the two
+    fields a confirm is *allowed* to differ on — so a forged project inside a plan does not break
+    the fingerprint and reaches the route intact. The question is whether anything reads it.
+
+    Driven through `sections/fill-looks`, whose confirm asks no model at all: the plan is built by
+    hand with the route's own `plan_fingerprint`, a forged job record with a forged `look` and a
+    forged render cost is planted inside `plan.project`, and the confirm is sent. It must do the
+    work it was asked to do — the section look really is written, which is what makes this a test
+    of a route that writes rather than of a refusal — and the job record must be untouched.
+    """
+    from music_video_producer.app import SectionLooksResponse, plan_fingerprint
+    from music_video_producer.models import ExportLook, SongSection
+
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Plan echo"))
+    project.sections = [SongSection(id="sec_1", label="Chorus", start=0.0, duration=8.0)]
+    project.jobs = [
+        RenderJob(
+            id="job_export",
+            kind="post",
+            status="complete",
+            target_id="assembly",
+            look=ExportLook(effects=['shot_a=punch_in:{"zoom":1.25}']),
+            render_seconds=12.5,
+            render_seconds_source="record",
+        )
+    ]
+    project = store.save(project)
+
+    plan = {
+        "applied": False,
+        "filled": 1,
+        "skipped": 0,
+        "sections": [
+            {
+                "section_id": "sec_1",
+                "label": "Chorus",
+                "start": 0.0,
+                "filled": True,
+                "prompt": "Sodium amber, hard backlight.",
+                "previous": "",
+                "reason": "",
+            }
+        ],
+        "message": "1 filled, 0 left alone",
+        "stray": 0,
+        "updated_at": project.updated_at.isoformat().replace("+00:00", "Z"),
+    }
+    plan["plan_id"] = plan_fingerprint(
+        project, SectionLooksResponse.model_validate({**plan, "plan_id": ""})
+    )
+    # The forgery, in the one field the digest does not cover.
+    forged = json.loads(project.model_dump_json())
+    forged["jobs"][0]["look"] = {
+        "effects": ['shot_z=lut_look:{"interp":"tetrahedral","lut":"never-chosen"}'],
+        "bindings": ["forged"],
+        "transitions": ["forged"],
+    }
+    forged["jobs"][0]["render_seconds"] = 7920.0
+    plan["project"] = forged
+
+    applied = client.post(
+        f"/api/projects/{project.id}/sections/fill-looks",
+        json={"confirm_apply": True, "plan": plan},
+    )
+
+    assert applied.status_code == 200, applied.text
+    saved = store.get(project.id)
+    # The route did its job, so this is a test of a write and not of a refusal.
+    assert applied.json()["applied"] is True
+    assert saved.sections[0].prompt == "Sodium amber, hard backlight."
+    # And the job record it was handed went nowhere.
+    assert saved.jobs[0].look.effects == ['shot_a=punch_in:{"zoom":1.25}']
+    assert saved.jobs[0].look.bindings == [] and saved.jobs[0].look.transitions == []
+    assert saved.jobs[0].render_seconds == 12.5
+    assert comfy.prompts == []
 
 
 # ----------------------------------------------------------------------------------------------
