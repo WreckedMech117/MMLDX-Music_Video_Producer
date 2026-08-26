@@ -31,6 +31,10 @@ import { SNAP_ANALYZE_ACTION, SNAP_ANALYZE_DONE, SNAP_ANALYZE_DONE_UNCOUNTED, SN
 // The Clips tab's honest state when ComfyUI is not running, and the Assets panel's named attach
 // target -- two of the four interaction defects cleared on 2026-08-21.
 import { CLIP_RECHECK_LABEL, attachToShotControl, clipCardFace, clipPreviewState } from "./api.js";
+// The Song page's analysis strip, whose BPM and Sections cells were hardcoded `Not analyzed`
+// in the markup with nothing ever writing to either. What each says is a decision and lives in
+// api.js beside the rest of them; this file writes the two strings out.
+import { songSectionsCell, songTempoCell, songTimelineCell } from "./api.js";
 // The shot-length band, as the server judges it: the report carries the verdict and the clip
 // reads it. Nothing on this side re-derives the band -- see `clipWindowState` for why.
 import { clipWindowState, windowWarningsByShot } from "./api.js";
@@ -512,7 +516,7 @@ export function renderSong() {
   $("#song-title").textContent = song?.title || "Load or generate a song";
   $("#song-source").textContent = song?.source?.toUpperCase() || "EMPTY";
   $("#duration-value").textContent = song?.duration ? formatTime(song.duration) : "—";
-  $("#timeline-value").textContent = song?.duration ? `${state.project?.shots.length || 0} shots · ready` : "Waiting for song";
+  renderSongAnalysisStrip();
   $("#analyze-song").disabled = !song || !song.path;
   $("#remove-song").disabled = !song;
   $("#send-treatment").disabled = !song;
@@ -524,6 +528,33 @@ export function renderSong() {
   $("#three-quarter-time").textContent = duration ? formatTime(duration * .75).slice(0, 5) : "—";
   $("#end-time").textContent = duration ? formatTime(duration).slice(0, 5) : "—";
   if (state.audioBuffer) drawWaveform($("#waveform"), state.audioBuffer, "#d4f75e");
+}
+
+// The three strip cells whose words are a decision: the measured tempo, how many sections are
+// marked, and what the plan on the timeline amounts to. `#duration-value` stays in `renderSong`
+// because formatting a number that is right there is not a decision.
+//
+// **Its own function rather than six more lines in `renderSong`, because it has a second
+// caller.** `renderSong` runs on a project load; the tempo also moves when the *measurement*
+// arrives, which is `loadSongMeasurement` -- a path that repaints the timeline and the snap rows
+// and does not rebuild the Song stage (nor should it: the stage carries the Director's own
+// unsaved lyric sheet). Without the second call the cell would say what it said before the read
+// landed and stay there until the next project load: the feature arriving a reload late, which is
+// the shape of defect this page has already shipped twice.
+//
+// Every cell writes a `title` unconditionally, empty string included. A stale tooltip left over
+// from a previous song is the same class of falsehood as a stale value, and it is invisible.
+function renderSongAnalysisStrip() {
+  const cells = [
+    ["#bpm-value", songTempoCell(state.project, state.songMeasurement)],
+    ["#sections-value", songSectionsCell(state.project)],
+    ["#timeline-value", songTimelineCell(state.project)],
+  ];
+  for (const [selector, cell] of cells) {
+    const element = $(selector);
+    element.textContent = cell.text;
+    element.title = cell.title;
+  }
 }
 
 // The loaded song's lyric sheet and style description, seeded from the stored Song.
@@ -843,6 +874,9 @@ export async function loadSongMeasurement(projectId) {
     songMeasurementKey = key;
     // The rows describe this report, so they are re-said whenever it moves -- absent included.
     syncSnapTargetsControl();
+    // And so does the tempo cell, for the same reason and on the same terms: a song with no audio
+    // has no measurement, and the cell must not go on showing the last one's estimate.
+    renderSongAnalysisStrip();
     return;
   }
   let report = null;
@@ -871,6 +905,10 @@ export async function loadSongMeasurement(projectId) {
   // the key is claimed only *after* the paint, so a render that failed is asked for again on the
   // next load rather than being remembered as done.
   renderTimeline();
+  // The tempo cell, from the reply that just landed. **Here rather than inside `renderTimeline`**:
+  // that runs on every pointermove of a clip drag, and the strip is not part of the timeline. This
+  // is the one place a measurement becomes current, so it is the one place the cell is re-said.
+  renderSongAnalysisStrip();
   songMeasurementKey = key;
   // **The selector is repainted**, after the key is claimed for the reason above. Targets are not
   // *drawn* -- they change where the next drag lands and nothing on the timeline -- but the

@@ -6250,6 +6250,166 @@ export function songEnvelopeIdentity(projectId, song = null) {
 }
 
 // ------------------------------------------------------------------------------------------
+// The Song page's analysis strip: the tempo cell and the sections cell
+// ------------------------------------------------------------------------------------------
+//
+// Both cells were authored into `index.html` as the literal string `Not analyzed` and nothing
+// ever wrote to either, so a Director who imported a song -- which measures it -- read that it
+// had not been measured. That is worse than a blank cell: it is a confident false statement,
+// sitting beside a Duration cell that is live, and it outlived Epic 8 shipping the measurement
+// that could have filled it.
+//
+// What each cell says is a decision, so both are made here and `app.js` writes out two strings.
+//
+// **The tempo and the right to show it come from different places, deliberately.** The number is
+// `SongAnalysis.bpm`, which every `GET /api/projects/{id}` already carries -- no new route, and
+// no second hash of the master, which is what reading `GET /song/envelope` beside the targets
+// read would have cost (the retrospective's S3: one load hashing the master twice). Whether that
+// number still describes the audio on disk is `analysed`, off the served targets, which the
+// server derives at read time from a fingerprint of the master and never remembers (AD-21). A
+// stored `bpm` outlives the song it was measured from -- the routes that replace a song do not
+// know the field exists -- so the record supplies the digits and the served flag supplies the
+// right to print them. Neither half is trusted for the other's question.
+//
+// **Three states for the tempo, not two**, exactly as `snapSelectorPlan`'s rows have three: a
+// measurement that is current, one the server has said is absent, and one this browser has not
+// been told about yet. Only the middle is a claim about the song. A targets read that has not
+// landed or was refused is not evidence of absence, and "Not analyzed" flickering for the length
+// of a request would trade the old falsehood for a shorter one.
+//
+// **Nothing here is an error and nothing here takes an accent.** A song nobody has analysed, and
+// a song nobody has marked sections on, are the ordinary state of every project that predates
+// each feature. The palette stays closed and the words stay plain.
+
+//: What a strip cell says when it has nothing to say -- `#duration-value`'s own em dash, so the
+//: four cells of one row fall silent in the same character instead of in three different ones.
+export const SONG_STRIP_SILENT = "—";
+
+//: The tempo cell's three spoken forms.
+//:
+//: `Not analyzed` is kept verbatim from the markup it replaces. It was the only true half of the
+//: two hardcoded strings, and it is now said exactly when the served flag says it -- the whole
+//: difference between a sentence and a decoration.
+export const SONG_TEMPO_UNANALYSED = "Not analyzed";
+//: Analysed, and the estimator found nothing. **Not an error, and not a zero.** `audio.py` returns
+//: `0.0` for a track with no periodicity it can find -- a silent or featureless master really does
+//: produce it -- and drawing an estimated `0` would report a song at rest as a song at nought
+//: beats a minute.
+export const SONG_TEMPO_UNFOUND = "No steady tempo";
+//: The mark on a tempo that was found, carrying the one thing `SongAnalysis.bpm` documents about
+//: itself: it is **an estimate wherever it is shown**, its precision bounded by the analysis rate,
+//: and nothing in this application refuses on its value. A bare `128.3` under a label reading BPM
+//: claims an exactness the estimator does not have; one character says otherwise and costs no room.
+export const SONG_TEMPO_ESTIMATE_MARK = "≈";
+
+//: What the sections cell says with nothing marked -- and the reason it does not say `Not
+//: analyzed`, which is what the markup said and what the cell beside it says.
+//:
+//: **`Song.sections` is not analysis-derived and no analyser produces it.** `SongSection`'s own
+//: docstring settles it: "Nothing infers sections; the Director marks them by ear, or accepts
+//: populate's proposal once one exists." So "not analyzed" is not merely false here, it is a
+//: category error -- it sends a Director looking for an analysis that would fill the row, and the
+//: only thing that ever fills it is a person. `None marked` states the same absence about the
+//: thing that is actually absent, and the count that replaces it is the same sentence with a
+//: number in it, so the cell reads in one vocabulary whether or not any marks exist.
+export const SONG_SECTIONS_NONE = "None marked";
+
+//: The cells' tooltips, short on purpose: Epic 8 shipped a 288-character accessible name once and
+//: had to take it back, and a strip cell is read at a glance. Each names where the thing it
+//: describes comes from, because an absence with no door is the dead end this repo rejects.
+export const SONG_TEMPO_HELP = "Estimated tempo, from the song analysis.";
+export const SONG_TEMPO_UNANALYSED_HELP =
+  "Analyze song, in the timeline's Snap to panel, measures it.";
+export const SONG_TEMPO_UNREAD_HELP = "This song's measurement has not been read yet.";
+export const SONG_TEMPO_UNFOUND_HELP = "The analysis found no steady tempo in this track.";
+export const SONG_SECTIONS_HELP =
+  "Marked by hand, or filled from the lyric sheet by Analyze structure.";
+
+// The tempo cell: what `#bpm-value` says, and the tooltip under it.
+//
+// `targets` is the served snap-targets body -- the one measurement read this browser makes -- and
+// `null` is its honest starting value rather than a missing argument defaulted away.
+export function songTempoCell(project = null, targets = null) {
+  const song = project?.song || null;
+  const silent = (title) => ({ text: SONG_STRIP_SILENT, title });
+  // No song at all: the heading above already reads "Load or generate a song", and a second
+  // sentence about the measurement of nothing is noise.
+  if (!song) return silent("");
+  // A Song asked for whose render has not landed: named, with no audio to measure. The snap
+  // panel's own sentence, because it is the same fact about the same song, and two wordings of
+  // one fact is how they come to disagree.
+  if (!song.path) return silent(SNAP_TARGET_UNRENDERED);
+  const analysed = targets?.analysed;
+  // **`undefined` is not `false`.** No read has landed, one was refused, or a body from a build
+  // without the flag answered -- none of those is evidence, so the cell says nothing rather than
+  // asserting the song is unmeasured.
+  if (analysed === undefined || analysed === null) return silent(SONG_TEMPO_UNREAD_HELP);
+  if (!analysed) return { text: SONG_TEMPO_UNANALYSED, title: SONG_TEMPO_UNANALYSED_HELP };
+  const bpm = Number(song.analysis?.bpm);
+  if (!Number.isFinite(bpm) || bpm <= 0) {
+    return { text: SONG_TEMPO_UNFOUND, title: SONG_TEMPO_UNFOUND_HELP };
+  }
+  // One decimal and no trailing `.0`: `audio.py` rounds the estimate to a tenth, so a second
+  // decimal here would be a digit this application made up, and `60.0` for a round number is
+  // precision theatre in a thirteen-pixel cell.
+  return {
+    text: `${SONG_TEMPO_ESTIMATE_MARK} ${Number(bpm.toFixed(1))}`,
+    title: SONG_TEMPO_HELP,
+  };
+}
+
+// The sections cell: what `#sections-value` says, and the tooltip under it.
+//
+// A count, and nothing cleverer. The marks are a list on the **Project**, not on the Song, and
+// they are whatever a Director put there -- so there is no measurement to be current or stale
+// about, no served flag to consult, and nothing here that can fall out of date with the audio.
+// That is why this takes no `targets` argument: it would be a currency check on a hand-written
+// field, which is the same fabrication as the analysis that does not exist.
+//
+// Gated on the Song for one reason: the strip describes the loaded track, and a marked section
+// cannot outlive the song whose seconds it names. With no song this cell falls silent with the
+// three beside it.
+export function songSectionsCell(project = null) {
+  if (!project?.song) return { text: SONG_STRIP_SILENT, title: "" };
+  const sections = Array.isArray(project.sections) ? project.sections : [];
+  if (!sections.length) return { text: SONG_SECTIONS_NONE, title: SONG_SECTIONS_HELP };
+  return { text: `${sections.length} marked`, title: SONG_SECTIONS_HELP };
+}
+
+//: The timeline cell, which was the strip's **third** false sentence and the one a Director acts
+//: on. It read `${shots} shots · ready` for any song with a duration -- so an empty plan said
+//: `0 shots · ready`, and a plan the readiness gate would refuse said `ready` too. The word was
+//: unconditional: nothing computed it, and no test covered this cell at all.
+//:
+//: **It is dropped rather than re-derived, and that is a deliberate choice against the obvious
+//: fix.** `readinessSummary` already owns the honest sentence -- "N of M shots have a prompt; K
+//: cannot be submitted" -- and it is already drawn, in the Readiness panel, directly above the
+//: button that acts on it. Printing a *second* readiness verdict here would put two surfaces on
+//: one question, fed by a report this cell would have to guess the arrival of; the merged
+//: measurement read exists in this file because exactly that arrangement let the band and the
+//: drag describe different states. And "readiness" is a fact about the plan's prompts, not about
+//: the timeline this cell is labelled for.
+//:
+//: So the cell says what it can count with certainty and stops. The count is honest with no
+//: report at all, which is the state this browser is in for the first moment of every load.
+export const SONG_TIMELINE_WITHOUT_SONG = "Waiting for song";
+//: A song with a plan of nothing. Named rather than counted, because `0 shots` invites the reader
+//: to check the arithmetic and this is a state, not a total.
+export const SONG_TIMELINE_WITHOUT_SHOTS = "No shots yet";
+//: ...and where the verdict this cell no longer pretends to make actually lives.
+export const SONG_TIMELINE_HELP =
+  "Shots on the timeline. Whether the plan can be submitted is the Readiness panel's line.";
+
+export function songTimelineCell(project = null) {
+  // Gated on the duration rather than on the Song, exactly as the line it replaces was: the
+  // timeline's spine is the song's length, and a Song whose render has not landed has none.
+  if (!project?.song?.duration) return { text: SONG_TIMELINE_WITHOUT_SONG, title: "" };
+  const shots = Array.isArray(project.shots) ? project.shots.length : 0;
+  if (!shots) return { text: SONG_TIMELINE_WITHOUT_SHOTS, title: SONG_TIMELINE_HELP };
+  return { text: `${shots} ${shots === 1 ? "shot" : "shots"}`, title: SONG_TIMELINE_HELP };
+}
+
+// ------------------------------------------------------------------------------------------
 // The shot inspector's tab strip and the Effects tab (slice C2)
 // ------------------------------------------------------------------------------------------
 //

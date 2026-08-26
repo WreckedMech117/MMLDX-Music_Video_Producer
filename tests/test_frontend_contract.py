@@ -14145,6 +14145,323 @@ def test_the_rows_are_rewritten_when_the_measurement_arrives_and_not_before():
 
 
 
+# ------------------------------------------------------------------------------------------
+# The Song page's analysis strip. Epic 8 measured every imported song into an envelope carrying
+# a tempo, and the cell that should have shown it read the literal `Not analyzed` -- authored
+# into `index.html`, written to by nothing. So the page told a Director that a measured song was
+# unmeasured, which is worse than a blank cell: it is a false statement made confidently, beside
+# a Duration cell that is live.
+#
+# Executed, not grepped. The two ways to get this wrong are both invisible to a source read: the
+# cell drawing the *stored* `bpm` for a song the server says was replaced since it was measured,
+# and the cell never being re-said when the measurement finally lands -- the feature arriving a
+# reload late, which is a defect this page has shipped before.
+# ------------------------------------------------------------------------------------------
+
+
+def strip_words() -> dict:
+    """Every string the strip's two cells are built from, read off api.js rather than retyped."""
+    return run_module("""
+      import { SONG_STRIP_SILENT, SONG_TEMPO_UNANALYSED, SONG_TEMPO_UNFOUND,
+               SONG_TEMPO_ESTIMATE_MARK, SONG_SECTIONS_NONE, SONG_TEMPO_HELP,
+               SONG_TEMPO_UNANALYSED_HELP, SONG_TEMPO_UNREAD_HELP, SONG_TEMPO_UNFOUND_HELP,
+               SONG_SECTIONS_HELP }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        silent: SONG_STRIP_SILENT, unanalysed: SONG_TEMPO_UNANALYSED, unfound: SONG_TEMPO_UNFOUND,
+        mark: SONG_TEMPO_ESTIMATE_MARK, noSections: SONG_SECTIONS_NONE, help: SONG_TEMPO_HELP,
+        unanalysedHelp: SONG_TEMPO_UNANALYSED_HELP, unreadHelp: SONG_TEMPO_UNREAD_HELP,
+        unfoundHelp: SONG_TEMPO_UNFOUND_HELP, sectionsHelp: SONG_SECTIONS_HELP,
+      }));
+    """)
+
+
+def marked_sections(count: int) -> list[dict]:
+    """`count` of the Director's own section marks, as `GET /api/projects/{id}` serves them."""
+    return [
+        {
+            "id": f"section_{index}", "label": f"Verse {index + 1}",
+            "start": index * 10.0, "duration": 10.0, "end": index * 10.0 + 10.0, "prompt": "",
+        }
+        for index in range(count)
+    ]
+
+
+def test_the_tempo_cell_shows_the_measurement_and_never_the_record_alone():
+    """**The defect, and the guard that keeps its fix honest, in one run.**
+
+    `MEASURED_SONG` carries `analysis.bpm: 60` in the manifest throughout this test -- the number
+    never moves. What moves is the server's answer to *whether that number still describes the
+    audio on disk*, which is `analysed` on the served targets and is derived at read time from a
+    fingerprint of the master (AD-21). So this executes both halves of the split the cell is built
+    on:
+
+    * **the record alone is not enough.** The first targets read says `analysed: false` -- a
+      stored measurement the server will not stand behind, which is what a song replaced since it
+      was analysed looks like -- and the cell must say `Not analyzed` while a `60` sits in the
+      Song it was just handed. A cell that read `song.analysis.bpm` and drew it would pass every
+      other test in this file and print a tempo measured from a track the project no longer has.
+    * **and the cell is re-said when the measurement lands.** The analysis is driven through the
+      row's own action, which adopts the Project and repaints the Song stage *before* the
+      measurement is re-read -- so the strip is `—` at that moment and stays `—` for ever unless
+      the loader re-draws it. That second caller is the whole difference between this working and
+      it working on the next project load.
+    """
+    words = strip_words()
+    drawn = run_workspace(
+        f"""
+      await fire('#project-select:change', {{ target: {{ value: 'p2' }} }});
+      await flush();
+      const read = () => ({{ text: at('#bpm-value').textContent, title: at('#bpm-value').title }});
+      const stale = read();
+      await fire('#snap-target-kinds:click', {snap_press()});
+      await flush();
+      console.log(JSON.stringify({{
+        stale, current: read(),
+        stored: state.project.song.analysis.bpm,
+        analysed: state.songMeasurement.analysed,
+        leftover: unconsumed(),
+      }}));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p2/timeline/snap-targets": [
+                {"body": served_targets(measured=False, analysed=False)},
+                {"body": served_targets(measured=True, analysed=True)},
+            ],
+            "/api/projects/p2/song/analyze": {"body": measured_project()},
+        },
+    )
+
+    assert drawn["stored"] == 60, "the fixture stopped carrying a stored tempo, so this proves nothing"
+    assert drawn["analysed"] is True, "the second targets read never landed"
+    assert drawn["leftover"] == {}, "the measurement was never re-read, so nothing was proved"
+    # The record was there the whole time, and it was not printed until the server stood behind it.
+    assert drawn["stale"]["text"] == words["unanalysed"], (
+        "the tempo cell drew a stored measurement the server reported absent -- a tempo measured "
+        "from a track this project no longer has, stated as this song's tempo"
+    )
+    assert drawn["stale"]["title"] == words["unanalysedHelp"]
+    assert str(drawn["stored"]) not in drawn["stale"]["text"]
+    # And when the measurement arrives, the estimate is drawn, marked as the estimate it is.
+    assert drawn["current"]["text"] == f"{words['mark']} 60", (
+        "the tempo cell did not follow the measurement that just landed, so a Director who "
+        "analysed their song is still told it was never analysed"
+    )
+    assert drawn["current"]["title"] == words["help"]
+
+
+def test_an_unread_measurement_is_silence_and_not_a_claim_that_the_song_is_unmeasured():
+    """**`undefined` is not `false`**, one cell over from where that rule was already written.
+
+    The targets read is refused here -- nothing answers that path -- so this browser has been told
+    nothing at all about the song's measurement. `Not analyzed` in that state is a claim made from
+    no evidence, and it would flicker on every load of every measured project for the length of a
+    request. The cell falls silent instead and its tooltip says why, which is what the snap rows'
+    `SNAP_TARGET_NEEDS` does with the same three-state distinction.
+    """
+    words = strip_words()
+    drawn = run_workspace(
+        """
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      console.log(JSON.stringify({
+        text: at('#bpm-value').textContent, title: at('#bpm-value').title,
+        held: state.songMeasurement,
+      }));
+    """,
+        responses={"/api/projects/p2": {"body": measured_project()}},
+    )
+
+    assert drawn["held"] is None, "the targets read was answered, so this tests something else"
+    assert drawn["text"] == words["silent"], (
+        "a refused measurement read was drawn as evidence that the song has never been analysed"
+    )
+    assert drawn["text"] != words["unanalysed"]
+    assert drawn["title"] == words["unreadHelp"]
+
+
+def test_the_sections_cell_counts_the_directors_marks_and_does_not_call_them_unanalysed():
+    """**Sections are not analysis-derived, so the cell must not report them as an analysis.**
+
+    `SongSection`'s docstring is the authority: "Nothing infers sections; the Director marks them
+    by ear." Nothing in `audio.py` produces one and no route measures one, so `Not analyzed` here
+    was not only false, it pointed at an analysis that does not exist and never will. The cell
+    counts what is on the Project, says `None marked` when there is nothing, and falls silent with
+    the rest of the strip when there is no song for a section to belong to.
+    """
+    words = strip_words()
+    drawn = run_workspace(
+        """
+      const read = () => ({
+        sections: at('#sections-value').textContent, title: at('#sections-value').title,
+        bpm: at('#bpm-value').textContent,
+      });
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const unmarked = read();
+      await fire('#project-select:change', { target: { value: 'p3' } });
+      await flush();
+      const marked = read();
+      await fire('#project-select:change', { target: { value: 'p4' } });
+      await flush();
+      console.log(JSON.stringify({ unmarked, marked, songless: read() }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p3": {
+                "body": {**measured_project(), "id": "p3", "sections": marked_sections(3)},
+            },
+            "/api/projects/p4": {"body": {**UNSUNG_PROJECT, "id": "p4"}},
+        },
+    )
+
+    assert drawn["unmarked"]["sections"] == words["noSections"], (
+        "a song with no section marks is reported as un-analysed, which names an analysis that "
+        "does not exist and sends the Director looking for it"
+    )
+    assert drawn["unmarked"]["sections"] != words["unanalysed"]
+    assert drawn["unmarked"]["title"] == words["sectionsHelp"]
+    assert drawn["marked"]["sections"] == "3 marked", drawn["marked"]
+    # No song, no strip: a section mark names seconds of a track, and with no track there is
+    # nothing for either cell to describe.
+    assert drawn["songless"]["sections"] == words["silent"], drawn["songless"]
+    assert drawn["songless"]["bpm"] == words["silent"], drawn["songless"]
+
+
+def test_an_analysed_song_with_no_tempo_is_not_reported_as_zero_beats_a_minute():
+    """`audio.py` answers `0.0` for a track it can find no periodicity in -- a silent or
+    featureless master really does produce it, and its own docstring calls that an ordinary
+    outcome rather than a failure. Drawn arithmetically, `0` is a claim that the song has a tempo
+    and that the tempo is nought; drawn as an absence with an accent it would be an error state
+    this application says it is not. It is neither: the cell names what happened, in plain words.
+    """
+    words = strip_words()
+    silent_song = {**MEASURED_SONG, "analysis": {**MEASURED_SONG["analysis"], "bpm": 0}}
+    drawn = run_workspace(
+        """
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      console.log(JSON.stringify({
+        text: at('#bpm-value').textContent, title: at('#bpm-value').title,
+        analysed: state.songMeasurement.analysed,
+      }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project(silent_song)},
+            "/api/projects/p2/timeline/snap-targets": {
+                "body": served_targets(measured=True, analysed=True),
+            },
+        },
+    )
+
+    assert drawn["analysed"] is True, "the measurement never landed, so this tests something else"
+    assert drawn["text"] == words["unfound"], drawn
+    assert drawn["title"] == words["unfoundHelp"]
+    assert "0" not in drawn["text"]
+
+
+def test_the_timeline_cell_counts_the_plan_and_never_calls_one_ready_on_its_own():
+    """**The strip's third false sentence, and the only one a Director would act on.**
+
+    The cell read ``${shots} shots · ready`` for any song with a duration. Nothing computed the
+    word: an empty plan said `0 shots · ready`, and so did a plan the readiness gate would refuse
+    on sight. No test covered this cell at all, which is how a hardcoded verdict survives beside
+    two hardcoded absences.
+
+    The word is dropped rather than re-derived. `readinessSummary` owns the honest sentence and is
+    already drawn above the button that acts on it; a second verdict here would be a second
+    surface answering one question from a report whose arrival this cell would have to guess. So
+    the cell counts, which it can do with certainty and with no report at all -- and the tooltip
+    names where the verdict actually lives, so dropping the claim does not leave a dead end.
+    """
+    words = run_module("""
+      import { SONG_TIMELINE_WITHOUT_SONG, SONG_TIMELINE_WITHOUT_SHOTS, SONG_TIMELINE_HELP }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        songless: SONG_TIMELINE_WITHOUT_SONG, shotless: SONG_TIMELINE_WITHOUT_SHOTS,
+        help: SONG_TIMELINE_HELP,
+      }));
+    """)
+    shot = {"id": "shot_1", "start": 0.0, "duration": 5.0, "prompt": "a room"}
+    drawn = run_workspace(
+        """
+      const read = () => ({ text: at('#timeline-value').textContent, title: at('#timeline-value').title });
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const empty = read();
+      await fire('#project-select:change', { target: { value: 'p3' } });
+      await flush();
+      const one = read();
+      await fire('#project-select:change', { target: { value: 'p4' } });
+      await flush();
+      const many = read();
+      await fire('#project-select:change', { target: { value: 'p5' } });
+      await flush();
+      console.log(JSON.stringify({ empty, one, many, songless: read() }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": measured_project()},
+            "/api/projects/p3": {"body": {**measured_project(), "id": "p3", "shots": [shot]}},
+            "/api/projects/p4": {
+                "body": {
+                    **measured_project(), "id": "p4",
+                    "shots": [{**shot, "id": f"shot_{index}"} for index in range(3)],
+                },
+            },
+            "/api/projects/p5": {"body": {**UNSUNG_PROJECT, "id": "p5"}},
+        },
+    )
+
+    assert drawn["empty"]["text"] == words["shotless"], (
+        "a song with no shots at all was reported ready to render"
+    )
+    # The word itself, gone from every one of the four states -- which is the assertion that would
+    # have caught the original line, and the one no test made.
+    for case, cell in drawn.items():
+        assert "ready" not in cell["text"], (case, cell)
+    assert drawn["one"]["text"] == "1 shot", drawn["one"]
+    assert drawn["many"]["text"] == "3 shots", drawn["many"]
+    assert drawn["songless"]["text"] == words["songless"], drawn["songless"]
+    # The verdict this cell stopped claiming is named where it actually lives, so the Director is
+    # not left with a count and no route to "can I submit this".
+    assert drawn["many"]["title"] == words["help"]
+    assert "Readiness" in words["help"]
+
+
+def test_the_strip_ships_no_sentence_the_renderer_has_not_written():
+    """The one thing the executed tests above cannot see: what the *markup* says before any script
+    runs. The stub DOM starts every element empty, so a cell hardcoded in `index.html` and a cell
+    the renderer wrote are indistinguishable to it -- which is exactly how `Not analyzed` sat in
+    both cells through Epic 8 with nothing writing to either. A browser with the script blocked,
+    or reading the page between load and first paint, must not be handed a claim about a song.
+    """
+    strip = re.search(
+        r'<div class="analysis-strip">.*?</div>\s*</div>',
+        INDEX_HTML.read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert strip, "the Song page's analysis strip is no longer in the markup"
+    values = re.findall(r'<strong id="([^"]+)">([^<]*)</strong>', strip.group(0))
+    assert [name for name, _ in values] == [
+        "duration-value", "bpm-value", "sections-value", "timeline-value",
+    ], values
+    assert "Not analyzed" not in strip.group(0), (
+        "the strip still ships a hardcoded analysis verdict, which is a statement about a song "
+        "the page has not loaded yet"
+    )
+    # The Timeline cell keeps a word, and it has to be the renderer's own first answer rather than
+    # a fourth sentence maintained here -- which is what `ready` was.
+    timeline = dict(values)["timeline-value"]
+    assert timeline == run_module("""
+      import { SONG_TIMELINE_WITHOUT_SONG } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(SONG_TIMELINE_WITHOUT_SONG));
+    """), timeline
+    assert "ready" not in strip.group(0), (
+        "the strip still ships a hardcoded readiness verdict for a plan it has not seen"
+    )
+
+
 def test_a_stored_selection_tells_absent_from_empty_and_ignores_a_kind_it_does_not_know():
     """**Three states, and flattening two of them is the specific bug this exists to prevent.**
 

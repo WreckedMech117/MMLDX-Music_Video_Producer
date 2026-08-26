@@ -148,10 +148,24 @@
               <div class="waveform-empty" id="waveform-empty"><b>Waveform appears here</b><span>Song duration sets the master timeline.</span></div>
             </div>
             <div class="time-ruler"><span>00:00</span><span id="quarter-time">—</span><span id="half-time">—</span><span id="three-quarter-time">—</span><span id="end-time">—</span></div>
+            <!-- Every cell here is a placeholder that app.js overwrites: renderSong writes the
+                 duration, and renderSongAnalysisStrip writes the other three from api.js's
+                 songTempoCell, songSectionsCell and songTimelineCell.
+
+                 Three of the four used to state something the application knew to be false.
+                 BPM and Sections shipped as the literal "Not analyzed" with nothing ever writing
+                 to either, so an imported song -- which is measured on import -- was reported
+                 unmeasured; and Timeline read "N shots · ready" for any song with a duration, so
+                 an empty plan said "0 shots · ready" and so did a plan the readiness gate would
+                 refuse. The first two are em dashes now for the reason #duration-value is one: a
+                 cell whose value is not known yet says nothing, and a browser that never runs the
+                 script must not be left holding a claim about a song it has not seen. The third
+                 keeps its "Waiting for song", which is songTimelineCell's own first answer and is
+                 true of a page that has loaded no project. -->
             <div class="analysis-strip">
               <div><span>Duration</span><strong id="duration-value">—</strong></div>
-              <div><span>BPM</span><strong id="bpm-value">Not analyzed</strong></div>
-              <div><span>Sections</span><strong id="sections-value">Not analyzed</strong></div>
+              <div><span>BPM</span><strong id="bpm-value">—</strong></div>
+              <div><span>Sections</span><strong id="sections-value">—</strong></div>
               <div><span>Timeline</span><strong id="timeline-value">Waiting for song</strong></div>
             </div>
             <!-- The loaded song's own context, editable after the fact so a song imported before
@@ -159,7 +173,10 @@
                  re-imported to gain them. It belongs to the song on screen, which is why it lives
                  in the stage beside the waveform rather than in the import block. Saving it sends
                  only these two fields: the audio, the duration and the provenance are not editable
-                 text. Nothing here parses or sections the lyrics — no analyser exists. -->
+                 text. Nothing here parses or sections the lyrics: saving this sheet stores it and
+                 nothing more. "Analyze structure", above, is what times its [Tag] blocks against
+                 the track and fills the Sections row — this comment said no analyser existed,
+                 which stopped being true when that button shipped. -->
             <div class="song-context">
               <div class="block-heading"><h2>Song context</h2><span>Reaches the Director</span></div>
               <!-- Who sings the track, declared before the treatment so the cast is settled before

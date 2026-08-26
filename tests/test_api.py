@@ -17,6 +17,11 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+# The read-modify-write window, held open on purpose. Shared with `test_assembly_route`
+# rather than transcribed into both — the export's job-record save is the same defect as
+# the races below, and one gate keeps them provably the same test.
+from race_support import Interleaved, park_the_next_read
+
 # The one test-audio generator, shared with the unit suite rather than transcribed. `click_wav_bytes`
 # is `test_audio.click_track` in a WAV container: the same decaying 1 kHz burst per beat whose
 # tempo `test_audio` asserts is recovered exactly. This file used to carry a stdlib transcription
@@ -61,6 +66,7 @@ from music_video_producer.app import (
     GENERIC_WRITE_APPROVAL_REFUSAL,
     H3_ADAPTERS,
     JOB_RECORDED_FIELDS,
+    MANIFEST_WRITE_GUARDS,
     MARK_READY_ALREADY_RENDERED_REFUSAL,
     MARK_READY_APPROVED_REFUSAL,
     MARK_READY_IN_FLIGHT_REFUSAL,
@@ -121,6 +127,9 @@ from music_video_producer.app import (
     TAKE_MISSING_FILE_REFUSAL,
     TAKE_NOT_RENDERED_REFUSAL,
     UNAPPROVE_NOT_APPROVED_REFUSAL,
+    WRITE_GUARD_COMPARE_AND_SWAP,
+    WRITE_GUARD_LAST_WRITER_WINS,
+    WRITE_GUARD_REREAD,
     DirectorRequest,
     DocumentName,
     SongContextField,
@@ -23682,6 +23691,59 @@ def test_a_locked_shot_refuses_every_effects_write_by_name(tmp_path: Path):
     assert write_stack(client, project_id, [{"effect": "vignette"}], "shot_two").status_code == 200
 
 
+def test_a_smuggled_stack_is_counted_as_well_as_validated(tmp_path: Path):
+    """The cap belongs on both doors, because `validate_stack` does not count.
+
+    `_adopt_shot_effects` keeps a new Shot's arriving stack when it composes, which is what lets a
+    Split carry its look (R-21). `validate_stack` answers "is every card composable", one card at
+    a time, so a thousand composable cards are a thousand valid answers -- and the cap that
+    `replace_shot_effects` applies *before* it calls the validator did not travel with the widening.
+    The editing route was capped and this branch was widened in the same session, which is the
+    sibling-door shape this route's own comments have now counted twelve times.
+
+    Measured before the fix: 985 cards on an invented shot id survived here and built a
+    34,686-character `-vf`, past the 32,767 Windows allows a command line -- so the export failed
+    reporting a working ffmpeg as missing, a fault a client caused and the machine got blamed for.
+
+    Every PUT re-reads first, deliberately. The whole-project route is now a compare-and-swap, and
+    a body built once and sent twice is refused by *that* on its second use -- a 409 which is not
+    this cap and would make this test pass for the wrong reason.
+    """
+    from music_video_producer.app import SHOT_EFFECT_STACK_LIMIT, SHOT_EFFECTS_TOO_MANY_REFUSAL
+
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Counted", shots=[Shot(start=0.0, duration=2.0, prompt="a")]))
+
+    def smuggle(count: int, shot_id: str):
+        body = client.get(f"/api/projects/{project.id}").json()
+        body["shots"] = list(body["shots"]) + [
+            {
+                **body["shots"][0],
+                "id": shot_id,
+                "effects": [
+                    {"effect": "grain", "parameters": {"strength": 10}} for _ in range(count)
+                ],
+            }
+        ]
+        response = client.put(f"/api/projects/{project.id}", json=body)
+        stored = store.get(project.id)
+        held = next((len(s.effects) for s in stored.shots if s.id == shot_id), None)
+        return response, held
+
+    at_the_cap, held = smuggle(SHOT_EFFECT_STACK_LIMIT, "shot_at_cap")
+    assert at_the_cap.status_code == 200, at_the_cap.text
+    assert held == SHOT_EFFECT_STACK_LIMIT
+
+    for count in (SHOT_EFFECT_STACK_LIMIT + 1, 985):
+        refused, held = smuggle(count, f"shot_over_{count}")
+        assert refused.status_code == 422, (count, refused.text)
+        assert refused.json()["detail"] == SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+            limit=SHOT_EFFECT_STACK_LIMIT, count=count
+        )
+        # Refused whole: the shot the body invented is not in the manifest at all.
+        assert held is None
+
+
 def test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack(tmp_path: Path):
     """**The guard.** `_adopt_shot_effects`, on both whole-shot write paths, both directions.
 
@@ -24242,3 +24304,431 @@ def test_the_director_chat_is_never_shown_a_shots_effect_stack(tmp_path: Path):
     # And the plan facts the Director *is* meant to read are still there, so this is a
     # withholding rather than an emptied dump.
     assert "A corridor" in serialised
+
+
+# --------------------------------------------------------------------------------------------
+# Read-modify-write races. Sites of one mechanism: a route reads the manifest, time passes, and
+# the whole manifest is written back from the copy it read. `tests/race_support.py` holds the
+# window open, so each of these is a race that definitely happened rather than one that might.
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_document_restore_that_races_another_write_refuses_rather_than_swapping_blind(
+    tmp_path: Path,
+):
+    """There is exactly **one** kept version, and this route both reads it and writes it.
+
+    Two restores that overlap swap the same pair twice and leave the document where it started
+    with the slot spent; a restore overlapping a hand edit or a chat turn writes the pre-turn
+    text back over a document the Director had just accepted. Neither is detectable afterwards
+    -- both leave a well-formed pair of strings, and both requests answer 200 -- which is why
+    this is the one document route that cannot be left last-writer-wins.
+
+    Refused rather than retried: a retry belongs to a loop that re-derives its verdict, and
+    this is a click on a specific pair of documents the Director can see.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Restore races"))
+    held = store.get(project.id)
+    held.treatment = "The second draft"
+    held.treatment_previous = "The first draft"
+    store.save(held)
+    gate = Interleaved()
+    park_the_next_read(store, gate)
+
+    restore, saved = gate.run(
+        lambda: client.post(f"/api/projects/{project.id}/documents/treatment/restore"),
+        lambda: client.put(
+            f"/api/projects/{project.id}/documents",
+            json={
+                "creative_brief": "",
+                "treatment": "A third draft, typed by hand",
+                "style_bible": "",
+            },
+        ),
+    )
+
+    assert gate.fired == [True], "the second write never landed inside the restore"
+    assert saved.status_code == 200, saved.text
+    assert restore.status_code == 409, restore.text
+    assert restore.json()["detail"] == SAVE_RACE_REFUSAL
+    stored = store.get(project.id)
+    assert stored.treatment == "A third draft, typed by hand"
+    # And nothing of the refused restore is on disk: not the swap, not the spent slot, and not
+    # the system message that would claim in the thread that a restore happened.
+    assert stored.treatment_previous == "The first draft"
+    assert stored.messages == []
+
+
+def a_song_and_one_shot(client, name: str) -> str:
+    """A project whose Song is a real file and whose plan is one ordinary, unrendered Shot."""
+    project_id = client.post("/api/projects", json={"name": name}).json()["id"]
+    imported = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Spine", "duration": "180"},
+        files={"file": ("song.wav", wav_bytes(0.25), "audio/wav")},
+    )
+    assert imported.status_code == 200, imported.text
+    saved = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={"shots": [{"id": "shot_a", "start": 0, "duration": 4, "prompt": "A corridor"}]},
+    )
+    assert saved.status_code == 200, saved.text
+    return project_id
+
+
+def test_detaching_a_song_cannot_revert_a_shot_saved_while_it_read(tmp_path: Path):
+    """**"Shots are left exactly as they are" is a claim about a whole-manifest write.**
+
+    `remove_song` changes one field and rewrites every other one from a copy read a moment
+    earlier, so a `PUT /shots` landing inside that moment is not merely lost -- it is lost
+    *through* the no-deletion guarantee, the shot list reverting to whatever it held when the
+    detach was clicked while the reply reports a clean removal.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id = a_song_and_one_shot(client, "Detach races a shot save")
+    gate = Interleaved()
+    park_the_next_read(store, gate)
+
+    removed, saved = gate.run(
+        lambda: client.delete(
+            f"/api/projects/{project_id}/song?confirm_song_replacement=true"
+        ),
+        lambda: client.put(
+            f"/api/projects/{project_id}/shots",
+            json={
+                "shots": [
+                    {
+                        "id": "shot_a",
+                        "start": 0,
+                        "duration": 4,
+                        "prompt": "Typed while the song was being detached",
+                    }
+                ]
+            },
+        ),
+    )
+
+    assert gate.fired == [True], "the shot save never landed inside the detach"
+    assert saved.status_code == 200, saved.text
+    assert removed.status_code == 409, removed.text
+    assert removed.json()["detail"] == SAVE_RACE_REFUSAL
+    stored = store.get(project_id)
+    assert [shot.prompt for shot in stored.shots] == [
+        "Typed while the song was being detached"
+    ]
+    # Nothing of the refused detach landed either, which is what makes the 409 honest: the
+    # Director re-reads and sees a song that is still attached.
+    assert stored.song is not None
+
+
+def test_a_shot_save_cannot_put_back_a_song_detached_while_it_read(tmp_path: Path):
+    """The same race from the other side, and the direction `updated_at` cannot see.
+
+    The revision token is compared at the *top* of `replace_shots`, against a manifest that
+    still had the Song; the detach lands after that comparison and before the save. This body
+    sends no token at all -- the wire has always allowed that, and a client that omits it used
+    to have nothing between its stale shot list and the whole manifest.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id = a_song_and_one_shot(client, "Shot save races a detach")
+    gate = Interleaved()
+    park_the_next_read(store, gate)
+
+    saved, removed = gate.run(
+        lambda: client.put(
+            f"/api/projects/{project_id}/shots",
+            json={
+                "shots": [
+                    {"id": "shot_a", "start": 0, "duration": 4, "prompt": "Nudged a clip"}
+                ]
+            },
+        ),
+        lambda: client.delete(
+            f"/api/projects/{project_id}/song?confirm_song_replacement=true"
+        ),
+    )
+
+    assert gate.fired == [True], "the detach never landed inside the shot save"
+    assert removed.status_code == 200, removed.text
+    assert saved.status_code == 409, saved.text
+    assert saved.json()["detail"] == SAVE_RACE_REFUSAL
+    stored = store.get(project_id)
+    assert stored.song is None, "the shot save put back a Song the Director detached"
+    assert [shot.prompt for shot in stored.shots] == ["A corridor"]
+
+
+def test_a_second_music_generation_does_not_erase_the_first_ones_job_record(tmp_path: Path):
+    """Two generations at once is the easiest concurrent state in this application to reach.
+
+    Every music job carries `target_id="song"` and neither generate route refuses an in-flight
+    sibling, so the Director clicking twice -- or two tabs -- puts two `/prompt` calls in the
+    air at once. The route that saved the project it read *before* its submission took the
+    other one's whole job record with it, leaving a prompt running on the card that
+    `reconcilable_jobs` cannot count, the poll never asks about, and whose audio
+    `apply_job_history` can never adopt.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project = store.create(Project(name="Two generations"))
+    gate = Interleaved()
+    prompt_ids = iter(["p-first", "p-second"])
+
+    async def submit(prompt, client_id=None):
+        comfy.prompts.append(prompt)
+        answer = type("Submission", (), {"prompt_id": next(prompt_ids), "number": 1})()
+        # After the id is taken and before the route writes it: the `/prompt` round trip this
+        # application allows thirty seconds.
+        gate.pause()
+        return answer
+
+    comfy.submit = submit
+
+    def generate(title: str):
+        return client.post(
+            f"/api/projects/{project.id}/generate/music",
+            json={"title": title, "caption": "A slow build", "duration": 30},
+        )
+
+    first, second = gate.run(lambda: generate("First"), lambda: generate("Second"))
+
+    assert gate.fired == [True], "the second generation never landed inside the first"
+    assert (first.status_code, second.status_code) == (202, 202), first.text
+    stored = store.get(project.id)
+    assert len(stored.jobs) == 2, "one generation's job record was erased by the other"
+    assert sorted(job.prompt_id for job in stored.jobs) == ["p-first", "p-second"]
+    # Both records are accepted rather than left on the pre-submission sentinel, so the
+    # reconciler asks ComfyUI about each of them.
+    assert {job.status for job in stored.jobs} == {"queued"}
+    # The Song is still one Song, and it is the one whose route wrote last -- a take that
+    # matches no `Song.prompt_id` stays recoverable from its own job's `output_files`.
+    assert stored.song is not None
+    assert stored.song.prompt_id in {"p-first", "p-second"}
+
+
+def test_the_chat_merge_follows_the_shots_the_model_saw_not_their_positions(tmp_path: Path):
+    """`PlannedShot` carries no id, so position is the only correspondence there is.
+
+    It is a correspondence with the project as it stood when the prompt was built, and the
+    route re-reads after the call -- deliberately, so a lock or a document committed during a
+    model call that runs for many seconds is not reverted. One Shot added while the model was
+    thinking shifts every index past it, and `start`, `duration` and `prompt` then land on a
+    Shot the model never described. A wrong window is visible; a plausible prompt on the wrong
+    Shot reads as intentional forever.
+    """
+    gate = Interleaved()
+
+    class ParkedPlanningDirector(PlanningDirector):
+        async def plan(self, **kwargs):
+            answer = await super().plan(**kwargs)
+            gate.pause()
+            return answer
+
+    director = ParkedPlanningDirector(
+        shots=[(0.0, 4.0, "For the first window"), (4.0, 4.0, "For the second window")]
+    )
+    client, store = make_client_with_director(tmp_path, director)
+    project = store.create(Project(name="Chat merge races an insert"))
+    held = store.get(project.id)
+    held.shots = [
+        Shot(id="shot_a", start=0, duration=4, prompt="The corridor"),
+        Shot(id="shot_b", start=4, duration=4, prompt="The clearing"),
+    ]
+    store.save(held)
+
+    reply, saved = gate.run(
+        lambda: client.post(
+            f"/api/projects/{project.id}/director/chat",
+            json={"message": "Retime the plan", "apply_shots": True},
+        ),
+        lambda: client.put(
+            f"/api/projects/{project.id}/shots",
+            json={
+                "shots": [
+                    {
+                        "id": "shot_z",
+                        "start": 0,
+                        "duration": 2,
+                        "prompt": "Inserted while the model was thinking",
+                    },
+                    {"id": "shot_a", "start": 0, "duration": 4, "prompt": "The corridor"},
+                    {"id": "shot_b", "start": 4, "duration": 4, "prompt": "The clearing"},
+                ]
+            },
+        ),
+    )
+
+    assert gate.fired == [True], "the insert never landed inside the model call"
+    assert saved.status_code == 200, saved.text
+    assert reply.status_code == 200, reply.text
+    stored = store.get(project.id)
+    assert [shot.id for shot in stored.shots] == ["shot_z", "shot_a", "shot_b"]
+    assert [shot.prompt for shot in stored.shots] == [
+        "Inserted while the model was thinking",
+        "For the first window",
+        "For the second window",
+    ]
+
+
+def app_py_saving_routes() -> dict[str, str]:
+    """Every route in `app.py` whose own body writes the manifest, by name, with its source.
+
+    Enumerated off the live app rather than listed, so a route added, renamed or moved is
+    classified the moment it exists -- `test_frontend_contract`'s submission enumeration,
+    applied to the other property every route in that module has. Comments are dropped first:
+    each of these routes explains its guard in prose that quotes the guard's own name, and an
+    assertion matching the explanation rather than the code would be measuring itself.
+    """
+    from music_video_producer.app import create_app
+
+    saving: dict[str, str] = {}
+    for route in create_app().routes:
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            continue
+        try:
+            source = inspect.getsource(endpoint)
+        except (OSError, TypeError):  # pragma: no cover - a builtin or C-level endpoint
+            continue
+        code = "\n".join(
+            line for line in source.splitlines() if not line.strip().startswith("#")
+        )
+        if "store.save(" in code or "record_submission(" in code:
+            saving[endpoint.__name__] = code
+    return saving
+
+
+def test_every_manifest_write_is_classified():
+    """`MANIFEST_WRITE_GUARDS` is the inventory, and this is what keeps it from being a wish.
+
+    The table exists because the same read-modify-write hole was found in a sibling route six
+    separate times, each by its own audit, with nothing anywhere saying which routes had been
+    through and which had not. A table nobody enforces has exactly that failure mode again: a
+    route added next month joins no group and is invisible until the next audit.
+
+    Two claims, and the second is the one with teeth. First, the key set is exactly the routes
+    that write -- so a new saving route fails here until somebody decides what guards it.
+    Second, the classification is checked against the code rather than taken on trust: a route
+    called a compare-and-swap must pass `if_generation`, one called last-writer-wins must not,
+    and one called re-read-and-patch must write through a helper that re-reads.
+    """
+    saving = app_py_saving_routes()
+    assert set(saving) == set(MANIFEST_WRITE_GUARDS), (
+        "a route writes the manifest without being classified in MANIFEST_WRITE_GUARDS"
+    )
+    rereaders = ("record_submission(", "settle(", "settle_unsubmitted_jobs(")
+    for name, code in sorted(saving.items()):
+        guard = MANIFEST_WRITE_GUARDS[name]
+        if guard == WRITE_GUARD_COMPARE_AND_SWAP:
+            assert "if_generation" in code, f"{name} is not a compare-and-swap"
+        elif guard == WRITE_GUARD_LAST_WRITER_WINS:
+            assert "if_generation" not in code, (
+                f"{name} passes if_generation but is classified as last writer wins"
+            )
+        else:
+            assert guard == WRITE_GUARD_REREAD, f"{name}: unknown guard {guard!r}"
+            assert any(marker in code for marker in rereaders), (
+                f"{name} writes nothing through a re-reading helper"
+            )
+    # And the reason the table is worth reading: all three groups are populated, so it
+    # describes a distribution rather than a policy nobody follows.
+    assert len(set(MANIFEST_WRITE_GUARDS.values())) == 3
+
+
+def test_the_two_recovery_slot_restores_are_written_the_same_way():
+    """The document restore and the song-context restore are twins, and were not written alike.
+
+    `restore_song_context`'s own docstring says it matches the document restore "exactly". That
+    has to include how it is written, or the sentence is false in the way that costs something:
+    both routes read a single kept version and write it back, both guard text nothing else can
+    reproduce, and a swap made from a stale copy leaves a well-formed manifest either way. One
+    of two identical doors closed reads as done to whoever comes next.
+    """
+    saving = app_py_saving_routes()
+    for name in ("restore_document", "restore_song_context", "replace_song_context"):
+        assert MANIFEST_WRITE_GUARDS[name] == WRITE_GUARD_COMPARE_AND_SWAP, name
+        assert "get_project_for_update(" in saving[name], name
+
+
+def test_a_song_context_restore_that_races_another_write_refuses(tmp_path: Path):
+    """The document restore's twin, driven the same way and refused the same way.
+
+    A lyric sheet is the largest hand-authored text this application accepts and the one it can
+    least reproduce -- pasted in from somewhere the app cannot reach -- so the slot holding the
+    previous one is the last thing that may be spent by a swap read from a stale copy.
+    """
+    client, store, _ = make_client(tmp_path)
+    project_id = a_song_and_one_shot(client, "Lyrics restore races")
+    held = store.get(project_id)
+    held.song.lyrics = "The second sheet"
+    held.song.lyrics_previous = "The first sheet"
+    store.save(held)
+    gate = Interleaved()
+    park_the_next_read(store, gate)
+
+    restore, saved = gate.run(
+        lambda: client.post(f"/api/projects/{project_id}/song/context/lyrics/restore"),
+        lambda: client.put(
+            f"/api/projects/{project_id}/song/context",
+            json={"lyrics": "A third sheet, pasted by hand", "caption": ""},
+        ),
+    )
+
+    assert gate.fired == [True], "the second write never landed inside the restore"
+    assert saved.status_code == 200, saved.text
+    assert restore.status_code == 409, restore.text
+    assert restore.json()["detail"] == SAVE_RACE_REFUSAL
+    stored = store.get(project_id)
+    assert stored.song.lyrics == "A third sheet, pasted by hand"
+    assert stored.song.lyrics_previous == "The second sheet"
+
+
+def test_a_second_render_does_not_erase_the_first_ones_job_record(tmp_path: Path):
+    """The submission race at the hottest route there is, and the one Generate All drives.
+
+    `generate_h3` read the project, saved the record, awaited `/prompt`, then wrote the shot's
+    queued state onto that same pre-await object -- so two renders in the air at once left one
+    of the two records nowhere, and the shot it belonged to still reading `ready` with a prompt
+    running on the card.
+    """
+    client, store, comfy = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Two renders"}).json()["id"]
+    saved = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={
+            "shots": [
+                {
+                    "id": "shot_a", "start": 0, "duration": 4,
+                    "prompt": "A corridor", "status": "ready",
+                },
+                {
+                    "id": "shot_b", "start": 4, "duration": 4,
+                    "prompt": "A clearing", "status": "ready",
+                },
+            ]
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    gate = Interleaved()
+    prompt_ids = iter(["p-shot-a", "p-shot-b"])
+
+    async def submit(prompt, client_id=None):
+        comfy.prompts.append(prompt)
+        answer = type("Submission", (), {"prompt_id": next(prompt_ids), "number": 1})()
+        gate.pause()
+        return answer
+
+    comfy.submit = submit
+
+    def render(shot_id: str):
+        return client.post(f"/api/projects/{project_id}/shots/{shot_id}/generate/h3", json={})
+
+    first, second = gate.run(lambda: render("shot_a"), lambda: render("shot_b"))
+
+    assert gate.fired == [True], "the second render never landed inside the first"
+    assert (first.status_code, second.status_code) == (202, 202), first.text
+    stored = store.get(project_id)
+    assert len(stored.jobs) == 2, "one render's job record was erased by the other"
+    assert sorted(job.prompt_id for job in stored.jobs) == ["p-shot-a", "p-shot-b"]
+    # And both Shots carry the render that is actually on the card.
+    assert [shot.status for shot in stored.shots] == ["queued", "queued"]
+    assert sorted(shot.prompt_id for shot in stored.shots) == ["p-shot-a", "p-shot-b"]

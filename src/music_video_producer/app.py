@@ -2300,6 +2300,22 @@ def _adopt_shot_effects(
         if not shot.effects:
             continue
         stack = [spec.model_dump() for spec in shot.effects]
+        # Counted here as well as on the editing route, because `validate_stack` does not count.
+        # It answers "is every card composable", one card at a time, and a thousand composable
+        # cards are a thousand valid answers -- so the cap that `replace_shot_effects` applies
+        # before it calls the validator has to be applied before this call too. Without it this
+        # branch was the wider of two doors past `SHOT_EFFECT_STACK_LIMIT`: measured at 985 cards
+        # on an invented shot id it builds a 34,686-character `-vf`, past the 32,767 Windows
+        # allows a command line, and the export then reports a working ffmpeg as missing. The
+        # editing route was capped in the same session this branch was widened to keep a Split's
+        # look, and the cap did not come with it.
+        if len(stack) > SHOT_EFFECT_STACK_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+                    limit=SHOT_EFFECT_STACK_LIMIT, count=len(stack)
+                ),
+            )
         try:
             validate_stack(stack, luts=looks() if looks is not None else ())
         except EffectRefusal as refusal:
@@ -6805,10 +6821,21 @@ SONG_ENVELOPE_RECORD_DISAGREES = (
 #: what is consumed, plus what the next epic's selector will need, and leave on disk the arrays
 #: nothing reads.
 #:
-#: **Not `bpm`, deliberately**, however small it is. `grep -rn "bpm" web/assets/` finds nothing —
-#: the estimate appears nowhere in the interface — and a field served on the strength of being
-#: cheap is how this payload grows back. When something draws it, it joins this tuple with a
-#: consumer in the same commit.
+#: **Still not `bpm`, and the reason has changed.** This said the estimate "appears nowhere in the
+#: interface" and that it would join this tuple the moment something drew it. Something draws it
+#: now — the Song page's analysis strip, 2026-08-26 — and it still does not belong here, because
+#: it never needed to travel this way. `SongAnalysis.bpm` is already on the wire in every project
+#: read, which is where `songEnvelopeIdentity` has always got `song_fingerprint` from, so serving
+#: it again would be a second copy rather than a first.
+#:
+#: The strip reads the number from the stored record and its *right to print it* from `analysed`
+#: on this route — the record supplies the digits, the served flag supplies the currency, and the
+#: flag is recomputed from a fingerprint at read time rather than stored (AD-21). Two sources for
+#: two different questions is not the "one question, two answers" shape this project rejects; it
+#: would become that only if the currency were also derivable from the record, and it is not.
+#:
+#: The standing rule the old wording got right: a field served on the strength of being cheap is
+#: how this payload grows back. A consumer is necessary and not sufficient.
 SERVED_ENVELOPE_KEYS = ("beats", "onsets", "band_average", "band_edges")
 
 
@@ -8395,6 +8422,123 @@ def _vision_media(path: Path) -> tuple[bytes, str]:
         return contact.read_bytes(), "image/jpeg"
 
 
+# ------------------------------------------------------------------------------------------
+# Which manifest write is guarded, and by what.
+#
+# **Read this before adding a route that calls `store.save`.** Every route in this module
+# reads the whole project, changes part of it, and writes the whole thing back. Nothing about
+# that is atomic: two requests that overlap both read the same manifest and the second one to
+# save silently reverts the first, with both answering 200. It is not hypothetical. On
+# 2026-08-19 one background shot save reverted thirty-two prompts and four singing flags in a
+# single `PUT /shots`, which is what `ShotListRequest.updated_at` was added for.
+#
+# The mechanisms all exist. `ProjectStore.save`'s `if_generation` is a compare-and-swap on the
+# process's own write counter, `read_for_update` hands out the token, `handle_save_race` turns
+# the refusal into one 409 carrying `SAVE_RACE_REFUSAL`, and `record_submission` is the
+# re-read-and-patch shape for a write that must not be refused. What was missing was any
+# record of *which routes reach for them*, so each hole had to be found one audit at a time —
+# and the same hole was found in a sibling route six separate times. This table is that
+# record. It is enumerated off the live app and asserted against the source by
+# `test_every_manifest_write_is_classified`, so a route added here without a classification
+# fails the suite rather than quietly joining the bottom group.
+#
+# The three answers, and when each is right:
+#
+# * `WRITE_GUARD_COMPARE_AND_SWAP` — read through `get_project_for_update`, save with
+#   `if_generation`. The loser is refused with a 409 it can act on. This is the answer for a
+#   **user-initiated write that can be retried**: the Director clicked something, they can look
+#   and click again. It is the only answer for a write whose loss is undetectable afterwards —
+#   a recovery slot swapped, a Song detached, a whole shot list replaced — because there both
+#   outcomes are a well-formed manifest and nothing downstream can tell them apart.
+#
+# * `WRITE_GUARD_REREAD` — re-read the manifest and write only the fields this route owns
+#   (`record_submission`, `settle_unsubmitted_jobs`, `assemble_project`'s `settle`). This is
+#   the answer for a write that **must not be refused**: a graph ComfyUI has already accepted,
+#   an export already running. Refusing there would leave real work in flight with nothing
+#   recorded to receive it, so the write lands on whatever manifest is current and touches
+#   nothing else.
+#
+# * `WRITE_GUARD_LAST_WRITER_WINS` — no guard. Honest rather than approving: these are the
+#   routes nobody has been through yet. Each is a plain read, mutate, save whose window is
+#   short (no await between the read and the save) and whose loss is usually visible — a
+#   rename that did not take, an approval that has to be clicked again. Short is not zero:
+#   FastAPI runs a sync endpoint in a threadpool, so two of these genuinely overlap. Converting
+#   one is two lines, and the reason it is not done wholesale is that each route has to be able
+#   to say what its own write owns before it can be told it lost.
+#
+# A revision token (`updated_at`, `plan_id`) is a *different* guard and does not appear here:
+# it catches a request built against a revision the server has already moved past, is compared
+# at the top of the route, and says nothing about what lands between that comparison and the
+# save. `replace_project` and `replace_shots` carry both, which is what two guards for two
+# different lies about one manifest looks like.
+# ------------------------------------------------------------------------------------------
+
+WRITE_GUARD_COMPARE_AND_SWAP = "compare-and-swap"
+WRITE_GUARD_REREAD = "re-read and patch"
+WRITE_GUARD_LAST_WRITER_WINS = "last writer wins"
+
+#: Every route in this module that writes the manifest, by the guard on its write.
+MANIFEST_WRITE_GUARDS: dict[str, str] = {
+    # Refused when it loses, because the Director can look and click again.
+    "assistant_fill": WRITE_GUARD_COMPARE_AND_SWAP,
+    "director_chat": WRITE_GUARD_COMPARE_AND_SWAP,
+    "expand_shot_prompts": WRITE_GUARD_COMPARE_AND_SWAP,
+    "read_render_status": WRITE_GUARD_COMPARE_AND_SWAP,
+    "remove_song": WRITE_GUARD_COMPARE_AND_SWAP,
+    "replace_project": WRITE_GUARD_COMPARE_AND_SWAP,
+    "replace_shots": WRITE_GUARD_COMPARE_AND_SWAP,
+    "replace_song_context": WRITE_GUARD_COMPARE_AND_SWAP,
+    "restore_document": WRITE_GUARD_COMPARE_AND_SWAP,
+    "restore_song_context": WRITE_GUARD_COMPARE_AND_SWAP,
+    # Never refused: a graph is already accepted or an export is already running.
+    "assemble_project": WRITE_GUARD_REREAD,
+    "edit_asset": WRITE_GUARD_REREAD,
+    "enhance_with_ltx25": WRITE_GUARD_REREAD,
+    "fill_assets": WRITE_GUARD_REREAD,
+    "generate_flux": WRITE_GUARD_REREAD,
+    "generate_h3": WRITE_GUARD_REREAD,
+    "generate_multiview": WRITE_GUARD_REREAD,
+    "generate_music": WRITE_GUARD_REREAD,
+    "generate_songplanner": WRITE_GUARD_REREAD,
+    "restore_song_audio": WRITE_GUARD_REREAD,
+    # Not yet been through. Two lines each; see the note above for why not wholesale.
+    "align_song_lyrics": WRITE_GUARD_LAST_WRITER_WINS,
+    "analyze_asset": WRITE_GUARD_LAST_WRITER_WINS,
+    "analyze_latest_take": WRITE_GUARD_LAST_WRITER_WINS,
+    "analyze_song_now": WRITE_GUARD_LAST_WRITER_WINS,
+    "approve_take": WRITE_GUARD_LAST_WRITER_WINS,
+    "cancel_job": WRITE_GUARD_LAST_WRITER_WINS,
+    "clean_shot_prompts": WRITE_GUARD_LAST_WRITER_WINS,
+    "copy_shot_effects": WRITE_GUARD_LAST_WRITER_WINS,
+    "delete_asset": WRITE_GUARD_LAST_WRITER_WINS,
+    "expand_plan_prompts": WRITE_GUARD_LAST_WRITER_WINS,
+    "expand_shot_prompt": WRITE_GUARD_LAST_WRITER_WINS,
+    "fill_in_timeline": WRITE_GUARD_LAST_WRITER_WINS,
+    "fill_section_looks": WRITE_GUARD_LAST_WRITER_WINS,
+    "generate_batch": WRITE_GUARD_LAST_WRITER_WINS,
+    "lay_out_timeline": WRITE_GUARD_LAST_WRITER_WINS,
+    "line_up_timeline": WRITE_GUARD_LAST_WRITER_WINS,
+    "populate_timeline": WRITE_GUARD_LAST_WRITER_WINS,
+    "read_job": WRITE_GUARD_LAST_WRITER_WINS,
+    "rename_asset": WRITE_GUARD_LAST_WRITER_WINS,
+    "render_again": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_asset_citations": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_character_slot": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_consistency_prompt": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_default_setting": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_documents": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_sampling_profile": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_sections": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_shot_effects": WRITE_GUARD_LAST_WRITER_WINS,
+    "replace_song_vocal_type": WRITE_GUARD_LAST_WRITER_WINS,
+    "select_shot_take": WRITE_GUARD_LAST_WRITER_WINS,
+    "snap_timeline_cuts": WRITE_GUARD_LAST_WRITER_WINS,
+    "unapprove_take": WRITE_GUARD_LAST_WRITER_WINS,
+    "upload_asset": WRITE_GUARD_LAST_WRITER_WINS,
+    "upload_song": WRITE_GUARD_LAST_WRITER_WINS,
+}
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -8643,16 +8787,31 @@ def create_app(
     def get_project_for_update(project_id: str) -> tuple[Project, int]:
         """`get_project`, plus the write generation to hand back to `save(if_generation=...)`.
 
-        For the background writer only — see `RENDER_STATUS_SAVE_ATTEMPTS`. A route the Director
-        triggered keeps `get_project`: it wants last-writer-wins and a 409 it can show, not a
-        silent retry.
+        Two kinds of caller, and they want opposite things from the same token. The background
+        writer passes it so it can *retry* — see `RENDER_STATUS_SAVE_ATTEMPTS`, which re-reads
+        and re-derives rather than telling anyone. A user-initiated route passes it so it can be
+        *refused*: `handle_save_race` turns the store's `ProjectChangedDuringSave` into one 409
+        carrying `SAVE_RACE_REFUSAL`, which is the answer a Director can act on. What no route
+        may do is read here and then save without the token — that is the plain read-mutate-save
+        this repair exists to remove, and it is silent by construction.
+
+        Most routes still read through `get_project` and are still last-writer-wins. That is a
+        retrofit per route, not a property of this helper: each one has to be able to say what
+        its own write owns before it can be told it lost. Which routes have which guard is
+        `MANIFEST_WRITE_GUARDS`, above `create_app`, and it is asserted rather than maintained
+        by hand.
         """
         try:
             return store.read_for_update(project_id)
         except ProjectNotFound as error:
             raise HTTPException(status_code=404, detail="Project not found") from error
 
-    def settle_unsubmitted_jobs(project: Project, *jobs: RenderJob) -> None:
+    def settle_unsubmitted_jobs(
+        project_id: str,
+        *jobs: RenderJob,
+        accepted: Sequence[RenderJob] = (),
+        patch: Callable[[Project], None] | None = None,
+    ) -> None:
         """Close the records whose graphs were never accepted, and write the manifest.
 
         The other half of the record-first ordering (the Director's 2026-08-21 ruling). Every
@@ -8670,29 +8829,109 @@ def create_app(
         created does not exist, and the Song was not replaced. That is what "leaves no phantom
         in-flight shot" means here — there is no state to restore.
 
+        **Onto a re-read, not onto the caller's project.** This is called after `comfy.submit`
+        has been awaited, so the object the route is holding predates the whole `/prompt` round
+        trip; writing it back would revert everything committed during it while the caller is on
+        its way to a 502 about something else entirely. Only the records named here are settled,
+        and `accepted`/`patch` carry the two things a partial batch still has to commit — the
+        graphs that *did* go out, and what they created. `record_submission` is the same rule on
+        the success path.
+
         **A save race here is swallowed, not raised.** The caller is on its way to a 502 that
         names why the submission failed, which is the fact the Director needs; converting it
         into a 409 about the manifest would report the wrong failure. What is left behind when
         this save is refused is a record still carrying `PENDING_SUBMISSION_PROMPT_ID`, which
         the reconciler settles with this same sentence after three unknown ticks.
         """
-        for job in jobs:
-            job.status = "error"
-            job.error = JOB_NEVER_SUBMITTED
-            job.missing_ticks = 0
+        try:
+            fresh = get_project(project_id)
+        except HTTPException:
+            # The project went away while `/prompt` was answering. There is no manifest to
+            # settle anything on, and the caller's 502 is still the fact worth reporting.
+            return
+        recorded = {item.id: item for item in fresh.jobs}
+
+        def close(record: RenderJob) -> None:
+            record.status = "error"
+            record.error = JOB_NEVER_SUBMITTED
+            record.missing_ticks = 0
             # Stamped like every other settle, though what it records is the seconds a
             # submission spent being refused — nothing rendered here, and nothing may read it
             # as though something had. See `batch.render_timing_summary`.
-            stamp_job_settled(job)
+            stamp_job_settled(record)
+
+        for job in accepted:
+            held = recorded.get(job.id)
+            if held is None:
+                fresh.jobs.append(job)
+            else:
+                accept_submission(held, job.prompt_id)
+        for job in jobs:
+            # Both objects, because they are two parses of one record and the caller keeps its
+            # own: `generate_batch` reads back the job it just failed to submit. Same inputs and
+            # the same `created_at`, so the two settles agree on the span they stamp.
+            close(job)
+            held = recorded.get(job.id)
+            if held is None:
+                fresh.jobs.append(job)
+            else:
+                close(held)
+        if patch is not None:
+            patch(fresh)
         try:
-            store.save(project)
+            store.save(fresh)
         except ProjectChangedDuringSave:
             logger.warning(
                 "Could not settle %d unsubmitted job record(s) on project %s; the reconciler "
                 "will settle them from the pending prompt id",
                 len(jobs),
-                project.id,
+                project_id,
             )
+
+    def record_submission(
+        project_id: str,
+        *jobs: RenderJob,
+        patch: Callable[[Project], None] | None = None,
+    ) -> None:
+        """Write what an accepted submission bought onto a **fresh** manifest.
+
+        Nine routes share one shape: read the project, save the job record, await
+        `comfy.submit`, then write the accepted prompt id and whatever the acceptance implies
+        for the target — an Asset created, a Shot marked queued, the Song replaced. Every one of
+        them used to write that second save onto the object read *before* the await, which is
+        the read-modify-write revert this codebase keeps meeting. The window is a `/prompt`
+        round trip, which this application allows thirty seconds, and it is not idle time: the
+        Director is in the interface that just queued the render.
+
+        What that stale save costs is worse than the field it meant to write. It reverts *every*
+        field of the manifest, and the likeliest victim is a sibling submission's own job record
+        — trivially reachable on the music routes, where every job carries `target_id="song"`
+        and neither route refuses an in-flight sibling, and reachable on any of them from two
+        tabs. A lost record is a prompt running on the card that `reconcilable_jobs` cannot
+        count, the poll never asks about, and whose output nothing will ever adopt.
+
+        So only two things are written here: the accepted prompt id onto each named record, and
+        whatever `patch` says this route owns. A record the fresh manifest no longer holds is
+        re-appended rather than dropped — the graph is on the card either way, and the record is
+        the only thing that can ever settle it. `settle_unsubmitted_jobs` is the same rule on
+        the failure path.
+
+        **Not a 409**, and this is the line between the two remedies in this module. A
+        user-initiated write that loses a race is owed the refusal because it can be retried —
+        see `handle_save_race`. These cannot: the graph is already accepted, and refusing here
+        would leave a render running whose result nothing is recorded to receive.
+        """
+        fresh = get_project(project_id)
+        recorded = {item.id: item for item in fresh.jobs}
+        for job in jobs:
+            held = recorded.get(job.id)
+            if held is None:
+                fresh.jobs.append(job)
+            else:
+                accept_submission(held, job.prompt_id)
+        if patch is not None:
+            patch(fresh)
+        store.save(fresh)
 
     def resolve_asset_path(project_id: str, asset: Asset) -> Path:
         root = (
@@ -8988,7 +9227,12 @@ def create_app(
     def replace_project(
         project_id: str, project: Project, confirm_song_replacement: bool = False
     ) -> Project:
-        current = get_project(project_id)
+        # With the write generation, for `replace_shots`' reason and on the same argument: the
+        # revision token below is compared here, at the top, and this route rewrites the whole
+        # manifest at the bottom. Anything that lands between the two passes the token and is
+        # then reverted by the save — the widest such window in the application, because this
+        # body carries every field of every Shot, Asset, job, section and document at once.
+        current, generation = get_project_for_update(project_id)
         if project.id != project_id:
             raise HTTPException(status_code=422, detail="Project ID cannot be changed")
         if project.updated_at != current.updated_at:
@@ -9178,11 +9422,20 @@ def create_app(
         # or edits an overlap is held to the rule that every reader of the field depends on.
         if project.sections != current.sections:
             project.sections = legal_sections(project.sections)
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
     def replace_shots(project_id: str, request: ShotListRequest) -> Project:
-        project = get_project(project_id)
+        # Read with the write generation, because the token below is not the whole guard and
+        # never was. `updated_at` catches a request built against a revision the server has
+        # already moved past — the 2026-08-19 stale tab — and it is compared *here*, before the
+        # gates and the adopt helpers below run. Anything that lands between that comparison and
+        # the save at the bottom passes it, and this route rewrites the whole manifest: the
+        # ledger's own example is `remove_song` detaching a Song inside that window and this save
+        # putting it straight back, which no later read can tell from a Director who never
+        # detached it. A client that sends no token at all — the wire has always allowed it —
+        # has only this. Two guards for two different lies about the same list.
+        project, generation = get_project_for_update(project_id)
         # Enforced only when sent — see `ShotListRequest.updated_at`. The wording is
         # `replace_project`'s, because it is the same rule met on the other manifest write.
         if request.updated_at is not None and request.updated_at != project.updated_at:
@@ -9214,7 +9467,7 @@ def create_app(
         # reasserts the pre-refresh `h3_prompt` on its next gesture and the sweep must catch that
         # too, where a diff would see no citation change and let it stand.
         refresh_reference_maps(project)
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.put("/api/projects/{project_id}/documents", response_model=Project)
     def replace_documents(project_id: str, request: ProjectDocumentsRequest) -> Project:
@@ -9251,8 +9504,20 @@ def create_app(
 
         An empty slot refuses with 409 rather than silently blanking the live document with
         "" — the exact data loss AD-14 exists to stop.
+
+        **The write is a compare-and-swap**, because a swap read from a stale copy is the same
+        data loss by a different door. There is exactly one kept version, and this route both
+        reads it and writes it: two restores that overlap swap the same pair twice and leave the
+        document where it started with the slot spent, and a restore overlapping a chat turn
+        writes the pre-turn text back over a document the Director had just accepted. Neither is
+        detectable afterwards — both leave a well-formed pair of strings. `save`'s
+        `if_generation` refuses on the generation this read was taken at, so the loser is told
+        `SAVE_RACE_REFUSAL` by `handle_save_race` and can look before clicking again. Refused
+        rather than retried, on `RENDER_STATUS_SAVE_ATTEMPTS`' own rule: a retry belongs to a
+        loop that re-derives its verdict, and this one is a Director's click on a specific pair
+        of documents they can see.
         """
-        project = get_project(project_id)
+        project, generation = get_project_for_update(project_id)
         previous = getattr(project, f"{document}_previous")
         if not previous.strip():
             raise HTTPException(
@@ -9270,7 +9535,7 @@ def create_app(
                 content=document_restore_notice(document, reversible=bool(displaced.strip())),
             )
         )
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.post("/api/projects/{project_id}/songs/upload", response_model=Project)
     async def upload_song(
@@ -9377,8 +9642,14 @@ def create_app(
         The two fields are independent. Editing the lyric sheet moves the lyric slot and leaves
         the style description's alone, because they are two separate pieces of work and one save
         button is an implementation detail of the screen rather than a fact about the text.
+
+        **The write is a compare-and-swap**, for `restore_song_context`'s reason and with more at
+        stake: this is the route that *fills* the single recovery slot, so a save laid over a
+        newer manifest displaces the wrong stored text into it and the lyric sheet the Director
+        thought was recoverable is the one that is gone. Both outcomes are a well-formed manifest
+        carrying two strings, which is why nothing downstream can notice.
         """
-        project = get_project(project_id)
+        project, generation = get_project_for_update(project_id)
         if project.song is None:
             raise HTTPException(status_code=404, detail=SONG_CONTEXT_WITHOUT_SONG)
         submitted = {
@@ -9396,7 +9667,7 @@ def create_app(
                 continue
             setattr(project.song, f"{field}{RECOVERY_SLOT_SUFFIX}", stored)
             setattr(project.song, field, text)
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.put("/api/projects/{project_id}/song/vocal-type", response_model=Project)
     def replace_song_vocal_type(
@@ -9611,8 +9882,18 @@ def create_app(
         kept" with two different codes. Nothing about *which* states refuse moved with it — only
         the number — and a route test asserts the two restores stay equal, because the drift is
         what the change exists to close.
+
+        **And the write is a compare-and-swap, which is `restore_document`'s guard and the same
+        argument.** "Matching the document restore exactly" has to include how it is written or
+        it is not matching: there is one kept version, this route both reads it and writes it,
+        and two swaps that overlap leave the field where it started with the slot spent. What is
+        at stake here is larger than a document's — an 8,000-character lyric sheet the Director
+        pasted in from somewhere this application cannot reach — and a swap read from a stale
+        copy is undetectable afterwards, because either outcome is a well-formed pair of
+        strings. Refused rather than retried: see `RENDER_STATUS_SAVE_ATTEMPTS` for whose write
+        may retry, and it is not a click on a specific field the Director is looking at.
         """
-        project = get_project(project_id)
+        project, generation = get_project_for_update(project_id)
         if project.song is None:
             raise HTTPException(status_code=404, detail=SONG_CONTEXT_WITHOUT_SONG)
         slot = f"{field}{RECOVERY_SLOT_SUFFIX}"
@@ -9624,7 +9905,7 @@ def create_app(
             )
         setattr(project.song, slot, getattr(project.song, field))
         setattr(project.song, field, previous)
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.delete("/api/projects/{project_id}/jobs", response_model=CancellationReport)
     async def cancel_open_jobs(
@@ -10361,13 +10642,25 @@ def create_app(
         generated song's audio lives in ComfyUI's output and stays listed on its render job's
         `output_files`, which is the only record tying that take to this project once the
         Song reference is gone.
+
+        **"Shots are left exactly as they are" is a claim about a whole-manifest write**, and
+        that is why the save is a compare-and-swap. This route changes one field and rewrites
+        every other one from a copy read a moment earlier, so a `PUT /shots` that lands inside
+        that moment is not merely lost — it is lost *through the sentence above*, the shot list
+        reverting to whatever it held when the detach was clicked while the reply reports a
+        clean removal. The direction reverses just as easily: a shot save that read before the
+        detach landed puts the Song back. `save`'s `if_generation` closes it from this side, and
+        `replace_shots` carries the same guard for the other; whichever request read first is
+        refused with `SAVE_RACE_REFUSAL` and re-reads. Refused rather than retried, because a
+        detach is a destructive decision the Director made about a Song they were looking at —
+        see `RENDER_STATUS_SAVE_ATTEMPTS` for whose write may retry instead.
         """
-        project = get_project(project_id)
+        project, generation = get_project_for_update(project_id)
         if project.song is None:
             raise HTTPException(status_code=404, detail="This project has no song to remove")
         _require_song_replacement_confirmation(project, confirm_song_replacement)
         project.song = None
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.post("/api/projects/{project_id}/assets/upload", response_model=Project)
     async def upload_asset(
@@ -10487,7 +10780,7 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
         # **The Song is replaced only once the graph is accepted**, and that is the one thing
@@ -10495,7 +10788,11 @@ def create_app(
         # destructive — it is why `_require_song_replacement_confirmation` exists — and doing
         # it for a graph ComfyUI then refused would trade a lost job record for a lost song,
         # which is the expensive direction the ruling exists to avoid.
-        project.song = Song(
+        #
+        # Onto a re-read rather than onto `project`, which was read before `comfy.submit` — see
+        # `record_submission` for what the stale save costs a second generation running beside
+        # this one.
+        song = Song(
             title=request.title,
             source="generated",
             duration=request.duration,
@@ -10517,7 +10814,10 @@ def create_app(
         # `test_a_completing_music_job_matches_the_song_by_prompt_id_not_by_source` pins —
         # would stay empty forever. That is a real loss traded for cleanup the three-tick
         # settle already performs. See `batch.supersede_target_jobs`.
-        store.save(project)
+        def replace_the_song(fresh: Project) -> None:
+            fresh.song = song
+
+        record_submission(project_id, job, patch=replace_the_song)
         return job
 
     @app.post(
@@ -10571,12 +10871,13 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
         # And the Song is replaced only once the graph is accepted, for `generate_music`'s
-        # reason: the replacement is the destructive act the confirmation gate guards.
-        project.song = Song(
+        # reason: the replacement is the destructive act the confirmation gate guards. Onto a
+        # re-read for `generate_music`'s other reason — see `record_submission`.
+        song = Song(
             title=request.title,
             source="generated",
             duration=request.duration,
@@ -10587,7 +10888,10 @@ def create_app(
         # Not superseded either, for `generate_music`'s reason and by the same argument: a
         # song planned here and a song generated there are both `kind="music"` on
         # `target_id="song"`, and neither may lose its record of where its audio landed.
-        store.save(project)
+        def replace_the_song(fresh: Project) -> None:
+            fresh.song = song
+
+        record_submission(project_id, job, patch=replace_the_song)
         return job
 
     @app.post(
@@ -10630,12 +10934,19 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
         asset.prompt_id = submission.prompt_id
-        project.assets.append(asset)
-        store.save(project)
+
+        # Onto a re-read, never onto `project`: that object was read before `comfy.submit` and
+        # writing it back would revert everything committed while `/prompt` answered. The Asset
+        # is new, so appending it to the fresh manifest is the whole of what this route owns
+        # besides the accepted prompt id. See `record_submission`.
+        def add_the_asset(fresh: Project) -> None:
+            fresh.assets.append(asset)
+
+        record_submission(project_id, job, patch=add_the_asset)
         return job
 
     @app.post(
@@ -10732,12 +11043,18 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
         child.prompt_id = submission.prompt_id
-        project.assets.append(child)
-        store.save(project)
+
+        # Onto a re-read, for `generate_flux`'s reason and by the same rule: the child is new,
+        # so it is appended to whatever manifest is current rather than to the copy this route
+        # read before the submission. See `record_submission`.
+        def add_the_child(fresh: Project) -> None:
+            fresh.assets.append(child)
+
+        record_submission(project_id, job, patch=add_the_child)
         return job
 
     @app.post(
@@ -10835,12 +11152,18 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
         child.prompt_id = submission.prompt_id
-        project.assets.append(child)
-        store.save(project)
+
+        # Onto a re-read, for `generate_flux`'s reason and by the same rule: the child is new,
+        # so it is appended to whatever manifest is current rather than to the copy this route
+        # read before the submission. See `record_submission`.
+        def add_the_child(fresh: Project) -> None:
+            fresh.assets.append(child)
+
+        record_submission(project_id, job, patch=add_the_child)
         return job
 
     @app.post(
@@ -10892,6 +11215,20 @@ def create_app(
         if reconcilable_jobs(project):
             raise HTTPException(status_code=409, detail=ASSET_FILL_RENDERS_OPEN_REFUSAL)
         submitted: list[AssetFillSubmission] = []
+        # What actually queued, in submission order, and the two things each one owns: the Asset
+        # it creates and the record that will answer for it. Kept apart from `project` because
+        # neither is written onto that object any more — every commit below lands on a re-read.
+        landed: list[tuple[Asset, RenderJob]] = []
+
+        def commit_the_accepted_assets(fresh: Project) -> None:
+            """The Assets of the graphs that went out, onto whatever manifest is current.
+
+            Used by both endings. A partial batch commits exactly this much and no more: the
+            proposals whose graphs ComfyUI took, with the records for the rest settled beside
+            them in the same write.
+            """
+            fresh.assets.extend(asset for asset, _record in landed)
+
         # Every record first, then every graph (the Director's 2026-08-21 ruling). One save
         # covers the whole batch rather than one per proposal: the property the ruling is
         # about is that a save race is answered *before* any GPU time is spent, and a batch
@@ -10934,18 +11271,29 @@ def create_app(
                 # settled rather than left open, which is also what writes the accepted half
                 # of the batch to disk.
                 settle_unsubmitted_jobs(
-                    project, *(entry[2] for entry in pending[index:])
+                    project_id,
+                    *(entry[2] for entry in pending[index:]),
+                    accepted=[record for _asset, record in landed],
+                    patch=commit_the_accepted_assets,
                 )
                 raise HTTPException(status_code=502, detail=str(error)) from error
             accept_submission(job, submission.prompt_id)
             asset.prompt_id = submission.prompt_id
-            project.assets.append(asset)
+            landed.append((asset, job))
             submitted.append(
                 AssetFillSubmission(
                     asset_id=asset.id, name=asset.name, kind=asset.kind, job_id=job.id
                 )
             )
-        store.save(project)
+        # The whole batch, onto a re-read. This loop holds the manifest across as many `/prompt`
+        # round trips as there are proposals, which is the widest submission window in the
+        # application; saving `project` at the end of it would revert every one of those
+        # seconds. See `record_submission`.
+        record_submission(
+            project_id,
+            *(record for _asset, record in landed),
+            patch=commit_the_accepted_assets,
+        )
         return AssetFillResponse(message=result.message, submitted=submitted)
 
     @app.post("/api/projects/{project_id}/assets/{asset_id}/analyze", response_model=Project)
@@ -11623,38 +11971,58 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
-        shot.status = "queued"
-        shot.prompt_id = submission.prompt_id
-        # The take this job produces begins `take_lead` seconds before the shot's window
-        # (0 for every non-song path). Recorded at the moment of truth because it cannot
-        # be derived later; the Monitor, the nudge control and assembly all cut from it.
-        shot.latest_take_lead = take_lead
-        # And the window it begins that far before, snapshotted with it (2026-08-21). The
-        # lead alone does not describe a take: `start` and `duration` are edited afterwards
-        # — dragging a rendered clip's left edge moves `start` while `trim_nudge`
-        # compensates — and every number `restore_song_audio` reported was read off the
-        # live window as though it were the take's. Two fields written where one already
-        # was, in the same statement, so a take can never carry half a description. See
-        # `Shot.latest_take_start`.
-        shot.latest_take_start = shot.start
-        shot.latest_take_duration = shot.duration
-        # Job-record hygiene, after the accept and not a gate. Every refusal above stands —
-        # in particular the `status != "ready"` one, which is what normally makes a second
-        # render for a live shot impossible. It stopped being enough when a whole-manifest write
-        # walked the status back underneath a live job; both generic writes now refuse that
-        # (`_require_in_flight_status_kept`, 2026-08-20), so no shipped route produces the state
-        # any more. It is still reachable by a manifest edited on disk, restored from a backup,
-        # or saved by a build older than the gate, and in that state the older record is not
-        # merely untidy: `apply_job_history` adopts by `target_id`, so a
-        # late answer to it would move `latest_output` back onto the older take and drop the
-        # newer one's review with it. See `batch.supersede_target_jobs`.
-        supersede_target_jobs(
-            project, kinds={"h3"}, target_id=shot.id, keep_job_id=job.id
-        )
-        store.save(project)
+
+        def take_the_shot(fresh: Project) -> None:
+            """What this accepted render means for the Shot, onto a **fresh** manifest.
+
+            `project` was read before `comfy.submit` and saving it back would revert everything
+            committed while `/prompt` answered — including, on a Generate All, the record and
+            the shot state of the render submitted immediately before this one, because that
+            loop calls this route once per shot. See `record_submission`.
+
+            The window numbers are the *pre-await* ones deliberately: they describe the picture
+            that was actually asked for, and the payload was built from the shot as it stood
+            when this route read it. A Shot deleted while `/prompt` answered leaves the record
+            standing and writes nothing — the graph is on the card, and there is no Shot left
+            to mark queued.
+            """
+            live = next((item for item in fresh.shots if item.id == shot.id), None)
+            if live is None:
+                return
+            live.status = "queued"
+            live.prompt_id = submission.prompt_id
+            # The take this job produces begins `take_lead` seconds before the shot's window
+            # (0 for every non-song path). Recorded at the moment of truth because it cannot
+            # be derived later; the Monitor, the nudge control and assembly all cut from it.
+            live.latest_take_lead = take_lead
+            # And the window it begins that far before, snapshotted with it (2026-08-21). The
+            # lead alone does not describe a take: `start` and `duration` are edited afterwards
+            # — dragging a rendered clip's left edge moves `start` while `trim_nudge`
+            # compensates — and every number `restore_song_audio` reported was read off the
+            # live window as though it were the take's. Two fields written where one already
+            # was, in the same statement, so a take can never carry half a description. See
+            # `Shot.latest_take_start`.
+            live.latest_take_start = shot.start
+            live.latest_take_duration = shot.duration
+            # Job-record hygiene, after the accept and not a gate. Every refusal above stands
+            # — in particular the `status != "ready"` one, which is what normally makes a second
+            # render for a live shot impossible. It stopped being enough when a whole-manifest
+            # write walked the status back underneath a live job; both generic writes now refuse
+            # that (`_require_in_flight_status_kept`, 2026-08-20), so no shipped route produces
+            # the state any more. It is still reachable by a manifest edited on disk, restored
+            # from a backup, or saved by a build older than the gate, and in that state the older
+            # record is not merely untidy: `apply_job_history` adopts by `target_id`, so a late
+            # answer to it would move `latest_output` back onto the older take and drop the newer
+            # one's review with it. Read from the fresh manifest, so a record written while
+            # `/prompt` answered is seen. See `batch.supersede_target_jobs`.
+            supersede_target_jobs(
+                fresh, kinds={"h3"}, target_id=shot.id, keep_job_id=job.id
+            )
+
+        record_submission(project_id, job, patch=take_the_shot)
         return job
 
     @app.post(
@@ -11919,10 +12287,14 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
-        store.save(project)
+        # Onto a re-read, never onto `project`: this route holds nothing of the target's to
+        # write, so the record *is* the write, and laying the pre-submission manifest back over
+        # a newer one would revert every unrelated edit made while `/prompt` answered — for the
+        # sake of one field on one job. See `record_submission`.
+        record_submission(project_id, job)
         return job
 
     @app.post(
@@ -12166,10 +12538,14 @@ def create_app(
         try:
             submission = await comfy.submit(payload)
         except ComfyError as error:
-            settle_unsubmitted_jobs(project, job)
+            settle_unsubmitted_jobs(project_id, job)
             raise HTTPException(status_code=502, detail=str(error)) from error
         accept_submission(job, submission.prompt_id)
-        store.save(project)
+        # Onto a re-read, never onto `project`: this route holds nothing of the target's to
+        # write, so the record *is* the write, and laying the pre-submission manifest back over
+        # a newer one would revert every unrelated edit made while `/prompt` answered — for the
+        # sake of one field on one job. See `record_submission`.
+        record_submission(project_id, job)
         matched = (
             abs(lengths["requested_picture_seconds"] - lengths["audio_seconds"])
             <= RESTORE_AUDIO_LENGTH_TOLERANCE
@@ -13544,8 +13920,20 @@ def create_app(
             inputs=[f"{clip.shot_id}={clip.approved_output}" for clip in plan.clips],
             look=composition.look,
         )
-        project.jobs.append(job)
-        store.save(project)
+        # Appended to a **fresh** read, never to `project`. That object was read before the
+        # per-shot probes above — one ffprobe per sourced shot and two for a shot that mixes its
+        # take's audio — and saving it back would lay every Shot field in the project as it stood
+        # before the first of those awaits. Grading is exactly what a Director does while an
+        # export churns, so the window is not theoretical: a prompt typed, a stack changed, a
+        # nudge dragged, all silently reverted by the record of the export they were watching.
+        # This is `settle`'s rule twenty lines below applied to the one write on this route that
+        # used to be the exception to it, and it is what makes the docstring's "the manifest is
+        # re-read before every job write" true. Only the job is added; nothing else of the
+        # pre-probe object reaches the disk, and the export still runs against the plan validated
+        # above, which `job.inputs` records.
+        fresh = get_project(project_id)
+        fresh.jobs.append(job)
+        store.save(fresh)
         app.state.live_assemblies.add(job.id)
         workdir = exports_root / f".work-{job.id}"
         workdir.mkdir(parents=True, exist_ok=True)
@@ -14950,7 +15338,13 @@ def create_app(
         # hand-edited — would otherwise be silently reverted by the stale snapshot on save.
         # Every decision below reads the fresh state: the lock that says do not touch this,
         # the existing text the guard compares against, and the slot being spent.
-        project = get_project(project_id)
+        # Read with the write generation, so this turn's own save cannot become the thief. The
+        # re-read above closes the long window -- the model call -- and this closes the short one
+        # after it: another writer that lands between the read and the save would otherwise be
+        # reverted by a whole-manifest write, silently, with both requests answering 200. The
+        # asymmetry is what makes it worth the token: `PUT /shots` is refused when it loses this
+        # race, so without it the same collision is refused one way and lost the other.
+        project, generation = get_project_for_update(project_id)
         project.messages.append(TreatmentMessage(role="user", content=request.message))
         notices: list[MessageNotice] = []
         replaced: list[str] = []
@@ -15059,22 +15453,41 @@ def create_app(
                 )
         project.messages.append(assistant_reply(message, notices))
         if request.apply_shots and result.shots:
-            merged_shots: list[Shot] = []
+            # **Aligned to the Shots the model was shown, not to positions in a list read
+            # afterwards.** `PlannedShot` carries no id, so position is the only correspondence
+            # there is — and it is a correspondence with `snapshot`, the project as it stood when
+            # the prompt was built. The re-read above exists so a document, a lock or a Shot
+            # committed during a model call that runs for many seconds is not reverted, and that
+            # same re-read is what makes a position in `project.shots` a different thing from a
+            # position in `result.shots`: one Shot added, deleted or split while the model was
+            # thinking shifts every index past it, and `start`, `duration` and `prompt` then land
+            # on a Shot the model never described. A wrong window is at least visible; a
+            # plausible prompt on the wrong Shot reads as intentional forever, which is the
+            # argument `expand_shot_prompts` already makes for keying by id.
+            #
+            # A Shot the model described that no longer exists is dropped rather than recreated:
+            # re-creating it would invent a window on a plan the Director has just changed, which
+            # is the one thing this merge must not do. It is silent because the browser hardcodes
+            # `apply_shots: false` — this path is API-only today, and a notice nobody can reach
+            # would be a wire contract bought for nothing.
+            described = [shot.id for shot in snapshot.shots]
+            live = {shot.id: shot for shot in project.shots}
+            added: list[Shot] = []
             for index, item in enumerate(result.shots):
-                if index < len(project.shots):
-                    shot = project.shots[index]
-                    if not shot.locked:
-                        shot.start = item.start
-                        shot.duration = item.duration
-                        shot.prompt = item.prompt
-                    merged_shots.append(shot)
-                else:
-                    merged_shots.append(
+                if index >= len(described):
+                    added.append(
                         Shot(start=item.start, duration=item.duration, prompt=item.prompt)
                     )
-            merged_shots.extend(project.shots[len(result.shots) :])
-            project.shots = merged_shots
-        return store.save(project)
+                    continue
+                shot = live.get(described[index])
+                if shot is not None and not shot.locked:
+                    shot.start = item.start
+                    shot.duration = item.duration
+                    shot.prompt = item.prompt
+            # `live`'s values are the stored objects, so the writes above are already on the
+            # plan; only the Shots the model added past the end of what it saw are new.
+            project.shots = [*project.shots, *added]
+        return store.save(project, if_generation=generation)
 
     @app.post("/api/projects/{project_id}/director/expand", response_model=Project)
     async def expand_shot_prompts(
@@ -15133,7 +15546,11 @@ def create_app(
         # Re-read after the await, for the reason `director_chat` documents — and here it is
         # also what makes id-keying meaningful: a Shot added, deleted or split while the model
         # was thinking is in this project and not in the snapshot the result answers.
-        project = get_project(project_id)
+        #
+        # With the write generation, and refused rather than laid over a newer manifest, for
+        # `director_chat`'s reason exactly: the re-read closes the model call's window and the
+        # token closes the one after it.
+        project, generation = get_project_for_update(project_id)
         # Re-checked, not assumed from the snapshot: every Shot can be deleted while the model
         # is thinking, and saving a reply about a plan the pre-call guard would have refused
         # would leave the thread asserting an expansion of nothing.
@@ -15257,7 +15674,7 @@ def create_app(
         # separator followed by notices.
         message = result.message.strip() or EXPANSION_EMPTY_MESSAGE
         project.messages.append(assistant_reply(message, notices))
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/expand-prompt",
@@ -15514,7 +15931,21 @@ def create_app(
         # Re-read after the await, for the reason `director_chat` documents, and here it is also
         # what makes the selection meaningful: a Shot deleted, locked or rendered while the model
         # was thinking is in this project and not in the snapshot the answer was written against.
-        project = get_project(project_id)
+        #
+        # **And with the write generation, which matters more here than anywhere else in this
+        # module.** This is the widest read-modify-write window in the application: the re-read
+        # below is followed by an expansion sweep that spends one model call *per requested
+        # shot*, and this project's own measurements put a single call at up to 300 seconds. A
+        # whole-manifest save at the end of that would revert minutes of anything the Director
+        # did meanwhile, silently, with this turn answering 200.
+        #
+        # The cost of refusing instead is stated plainly because it is real: a turn refused here
+        # has already spent every one of those calls, and `SAVE_RACE_REFUSAL` tells the Director
+        # nothing was saved. That is the trade this codebase has already made once — reverting
+        # thirty-two prompts silently is the failure that produced `ShotListRequest.updated_at`
+        # — and the better answer, re-applying the turn's own writes onto a fresh manifest the
+        # way `record_submission` does, is a restructuring of this route rather than a token.
+        project, generation = get_project_for_update(project_id)
         shots_by_id = {shot.id: shot for shot in project.shots}
         position = {shot.id: index for index, shot in enumerate(project.shots)}
         present = [shot_id for shot_id in requested if shot_id in shots_by_id]
@@ -15809,7 +16240,7 @@ def create_app(
         # re-cited and re-expanded keeps the expansion the model just wrote — that one is already
         # against the new citations and its recorded map says so, and this pass finds it fresh.
         refresh_reference_maps(project)
-        return store.save(project)
+        return store.save(project, if_generation=generation)
 
     @app.get(
         "/api/projects/{project_id}/render-status", response_model=RenderStatusReport

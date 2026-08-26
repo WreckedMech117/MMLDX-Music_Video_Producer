@@ -19,6 +19,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+# The read-modify-write window, held open on purpose. The same gate `test_api` drives the four
+# other sites of this defect with, so the export's job-record save is provably the same test.
+from race_support import Interleaved
+
+from music_video_producer import app as app_module
 from music_video_producer.app import (
     ASSEMBLY_BUSY_REFUSAL,
     ASSEMBLY_NO_SONG_REFUSAL,
@@ -2102,4 +2107,55 @@ def test_the_two_clips_of_one_shot_differ_by_exactly_the_second_clips_offset(
         text=True,
     ).stdout.strip()
     assert counted == "192,108,192"
+    assert comfy.prompts == []
+
+
+def test_the_export_job_record_does_not_revert_a_shot_edited_while_it_probed(tmp_path: Path):
+    """**Grading is exactly what a Director does while an export churns.**
+
+    This route re-reads the manifest before it judges the plan, then awaits an ffprobe per
+    sourced shot -- two for a shot that mixes its take's audio -- and every one of those is a
+    window a shot edit can land in. The job record was the one write on the route that saved
+    the object read before them, so the record of the export reverted the work being watched:
+    a prompt typed, a document, a nudge, all silently back to where they stood when Export was
+    clicked, with the route answering 200. `settle` states the rule for every other write here.
+
+    Nothing about the export itself changes: the plan was validated above the probes and
+    `job.inputs` records the takes it ran on.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    gate = Interleaved()
+    real_probe = app_module.probe_take_args
+
+    def probing(source):
+        args = real_probe(source)
+        gate.pause()
+        return args
+
+    app_module.probe_take_args = probing
+    try:
+        stored = store.get(project_id)
+        edited = [shot.model_dump(mode="json") for shot in stored.shots]
+        edited[0]["prompt"] = "Typed while the export was probing"
+        response, saved = gate.run(
+            lambda: client.post(f"/api/projects/{project_id}/assemble"),
+            lambda: client.put(
+                f"/api/projects/{project_id}/shots", json={"shots": edited}
+            ),
+        )
+    finally:
+        app_module.probe_take_args = real_probe
+
+    assert gate.fired == [True], "the shot edit never landed inside the probing"
+    assert saved.status_code == 200, saved.text
+    assert response.status_code == 200, response.text
+    stored = store.get(project_id)
+    assert [shot.prompt for shot in stored.shots] == [
+        "Typed while the export was probing",
+        "Blue room",
+    ]
+    # And the export still happened, settled on the same fresh manifest.
+    assert [job.status for job in stored.jobs] == ["complete"]
+    assert stored.jobs[0].output_files == ["exports/assembly_00001.mp4"]
     assert comfy.prompts == []
