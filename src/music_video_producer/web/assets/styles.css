@@ -336,6 +336,21 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    is the absence of a band rather than an empty one -- and app.js writes "" for that case. */
 .monitor-note { position: absolute; top: 0; left: 0; right: 0; z-index: 1; margin: 0; padding: 6px 10px; background: #12141ae6; border-bottom: 2px solid var(--amber); color: var(--ink); font: 11px Consolas, monospace; text-align: center; pointer-events: none; }
 .monitor-note:empty { display: none; }
+/* STALE, bottom-left, over moving picture. Amber on a near-opaque plate because the thing under
+   it is a *moving* video and 11px Consolas over an unknown frame is unreadable without one — the
+   same plate `.monitor-note` uses. A left edge rather than a box: this repository has a recorded
+   defect where a control drawn as a bordered pill read as a button, and this is a state, not
+   something to press. No spinner and no percentage live here; see UX-DR11. */
+.monitor-stale { position: absolute; left: 10px; bottom: 10px; z-index: 2; margin: 0; padding: 3px 8px; border-left: 2px solid var(--amber); background: #12141ae6; color: var(--amber); font: 11px Consolas, monospace; letter-spacing: .14em; pointer-events: none; }
+.monitor-stale:empty { display: none; }
+/* The two Preview Clip layers, stacked on the take. Both are always laid out — swapping by
+   `display` would stop the layer that is about to be shown from decoding — and only the one
+   carrying `.on` inside a `.previewing` Monitor is opaque. So "no preview here" and "this
+   Shot's clip has not landed yet" are both simply a transparent layer with the take showing
+   through, and neither costs a reload. Opaque black of their own: the clip carries the export's
+   letterbox and must not composite over a take of a different shape. */
+.monitor-preview { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; opacity: 0; pointer-events: none; }
+.timeline-monitor.previewing .monitor-preview.on { opacity: 1; }
 .timeline-monitor.showing-take video { display: block; }
 .timeline-monitor:not(.showing-take) video { display: none; }
 /* The bar under the Monitor. It carries the transport, the edit tools, the zoom, the line mutes and

@@ -306,6 +306,40 @@ you cannot yet.
 This wants revisiting when Epic 11 gives an overlap a transition, since a transition is precisely a
 thing that happens in the covered region.
 
+## R-24 — A preview shows the take the export will ship, so it can change footage as well as grade
+
+Slice D2 surfaced an edge nobody chose: the preview renders `approved_output`, because that is what
+an export ships, while the Monitor plays `latest_output`. Where a Shot has a newer take that has not
+been approved, turning on a look therefore changes **which footage is on screen** as well as how it
+is graded, and nothing says so.
+
+**The ruling: the preview stays on the approved take.** A preview whose only job is to predict the
+export must be of the footage the export will use; previewing the latest take would grade a picture
+that is not going to ship, which is a worse lie than a surprising cut. This is the same reasoning as
+R-23 — a preview answers *what will this look like*, and the answer has to be about the thing that
+goes out.
+
+Two consequences, both accepted and both now handled rather than silent:
+
+- A Shot carrying a stack and a take that has **never been approved** would have shown an ungraded
+  picture and said nothing at all — the "control that appears to do nothing" failure this repo
+  rejects. It now carries a named note and makes no request, since the route would refuse by name
+  anyway.
+- Where latest and approved differ, the footage changes when the look goes on. Left as it is,
+  because the alternative is worse, but it is the kind of surprise that earns a sentence in the
+  interface the first time a Director reports it.
+
+**Also settled here, because D2's spec did not flag it:** the Preview Clip **free-runs and loops
+while the transport is stopped**, and follows the playhead only while it is playing. Story 9.2 asks
+for a looping preview and forbids a frozen frame, and the Monitor's video is otherwise paused
+whenever the transport is — so honouring both meant changing what a Shot **with** effects shows
+while stopped. A Shot with no effects is untouched, which is what the Ask First boundary protected.
+
+**A correction of fact for anyone reading D2's spec:** it says "when the Shot is selected"
+throughout. The Monitor shows the Shot under the **playhead**, and selecting a clip does not move
+the playhead. The implementation is keyed to the playhead, which is the only thing "the Monitor
+plays" can mean.
+
 ---
 
 ## Process rulings

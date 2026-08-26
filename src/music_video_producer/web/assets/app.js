@@ -1,4 +1,4 @@
-import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -4904,6 +4904,164 @@ const MONITOR_DRIFT_SECONDS = 2 / 24;
 // The take URL currently loaded in the Monitor's video element, so a playhead move inside
 // one shot seeks instead of reloading, and a move across shots swaps the source once.
 let monitorLoadedUrl = "";
+// The Preview Clip this browser is holding for each Shot: what it is a picture of (`key`), the
+// server's own name for it (`fingerprint`) and where to play it from. Per Shot rather than one
+// slot, so a playhead crossing back into a graded Shot plays its look immediately instead of
+// re-asking for a clip that has not changed. Nothing here is persisted -- a preview is derived,
+// and a derived thing that outlives what it describes is the stale flag AD-23 refused to store.
+const monitorPreviews = new Map();
+// The `previewInputKey` of the request in flight, "" when none. One slot, so a Director moving
+// fast supersedes their own request: the reply to anything but the newest key is dropped, which
+// is the client half of AD-24 and is why a 409 for work nobody is waiting for reaches no toast.
+let previewRequestKey = "";
+// The refusal the last preview request came back with, kept against the key that caused it so
+// it neither follows the Director onto the next Shot nor turns a broken look into a request
+// storm -- the same shape `lastEffectsRefusal` uses, and for the second reason as well.
+let previewProblem = null;
+// Which of the two preview layers is the one on screen.
+let monitorPreviewLayer = "a";
+
+const previewLayer = (name) => $("#monitor-preview-" + name);
+//: The layer that is *not* on screen — the one an incoming clip loads onto. Named rather than
+//: read back off the element, because the name is what `showPreviewLayer` swaps by.
+const previewSpareName = () => (monitorPreviewLayer === "a" ? "b" : "a");
+
+// Ask for the Preview Clip this Shot's look would produce, once per look.
+//
+// Deliberate rather than incidental: the request fires when the inputs the Director touched have
+// moved away from the clip in hand, and never otherwise. D1's R-22 makes a duplicate cheap -- an
+// identical fingerprint joins the render in flight instead of restarting it -- but "it would be
+// safe to ask twice" is not a reason to ask twice.
+function ensureMonitorPreview(view) {
+  if (!state.project || !monitorShowsTake(view)) return;
+  const wanted = shotPreviewWanted(view.shot);
+  if (!wanted.wanted) return;
+  // Already holding a clip of exactly this look, already asking for it, or already told why it
+  // cannot be made. The last is what stops a deleted `.cube` from being re-asked about on every
+  // playhead tick for the rest of the session.
+  if (monitorPreviews.get(view.shot.id)?.key === wanted.key) return;
+  if (previewRequestKey === wanted.key) return;
+  if (previewProblem?.key === wanted.key) return;
+  requestMonitorPreview(view.shot.id, wanted.key);
+}
+
+async function requestMonitorPreview(shotId, key) {
+  previewRequestKey = key;
+  const projectId = state.project.id;
+  let answer = null;
+  let refusal = "";
+  try {
+    answer = await api.shotPreview(projectId, shotId);
+  } catch (error) {
+    refusal = error.message;
+  }
+  // Superseded, or the Director has moved to another project. Either way this answer describes a
+  // look nobody is looking at, and a *refusal* for one is the 409 D1 raises when a newer render
+  // took the work over -- an expected outcome of asking twice quickly, and not a thing to say.
+  if (previewRequestKey !== key || state.project?.id !== projectId) return;
+  previewRequestKey = "";
+  if (refusal) {
+    previewProblem = { shotId, key, message: refusal };
+    // The reason, whole and unparaphrased, exactly as the effects panel reports its refusals.
+    // The stack is untouched: nothing on this path writes to the project at all.
+    toast(refusal, "error");
+  } else {
+    // The fingerprint comparison, and the whole of staleness (AD-23). An equal answer is the clip
+    // already playing -- the key is refreshed so the label clears, and the element is not touched.
+    const held = monitorPreviews.get(shotId);
+    const adopted = previewAdoption(held, answer);
+    const keep = Boolean(held) && !adopted.swap;
+    monitorPreviews.set(shotId, {
+      key,
+      fingerprint: keep ? held.fingerprint : adopted.fingerprint,
+      url: keep ? held.url : adopted.url,
+    });
+    previewProblem = null;
+  }
+  syncMonitor();
+}
+
+// The two layers, painted. Nothing here decides anything: `view` already says whether there is a
+// clip, which one, where in it, and whether it is stale.
+function paintMonitorPreview(view, playing) {
+  const flag = $("#monitor-stale");
+  if (flag) flag.textContent = view.stale || "";
+  const frame = $("#timeline-monitor");
+  const shown = previewLayer(monitorPreviewLayer);
+  // One fingerprint is one file, so two Shots sharing a take, a window and a look are handed the
+  // same clip. The one already decoded is this Shot's picture too; claiming it here is what stops
+  // that pair from hiding and re-loading an identical file at every crossing.
+  if (shown && view.previewUrl && shown.dataset.url === view.previewUrl) {
+    shown.dataset.shot = view.shot?.id || "";
+  }
+  // **The layer is shown only while the clip on it belongs to this Shot.** A previous look of
+  // the same Shot is kept -- that is the stale case, and it is the picture the Director is
+  // judging the change against. A clip belonging to the Shot before this one is not kept for a
+  // frame: the take underneath is this Shot's own picture and is the honest thing to fall back
+  // to. The two are told apart by the Shot the clip was loaded for, which is why it is recorded.
+  frame.classList.toggle(
+    "previewing", Boolean(view.previewUrl) && shown?.dataset?.shot === view.shot?.id,
+  );
+  if (!view.previewUrl) {
+    if (shown && !shown.paused) shown.pause();
+    return;
+  }
+  if (shown?.dataset?.url !== view.previewUrl) {
+    const spareName = previewSpareName();
+    const spare = previewLayer(spareName);
+    // Loaded on the layer nobody is looking at, and shown by `loadeddata` once it has a frame.
+    // The picture on screen is untouched until then, which is the whole of "never blacks out a
+    // picture that exists in order to show that a newer one is coming".
+    if (spare && spare.dataset.url !== view.previewUrl) {
+      spare.dataset.url = view.previewUrl;
+      spare.dataset.shot = view.shot?.id || "";
+      spare.src = view.previewUrl;
+    } else if (spare && spare.readyState >= 2) {
+      // The clip wanted is already decoded on the spare -- a look returned to, or a Shot whose
+      // neighbour renders to the same fingerprint. It is shown here rather than waited for,
+      // because `loadeddata` fired long ago and will not fire again.
+      //
+      // **And `syncMonitor` is asked again rather than this repainting itself.** The label was
+      // written from a view computed before this swap, and it says the picture is out of date;
+      // it is not, a moment later, and nothing else would repaint it -- a paused Monitor gets no
+      // further ticks, so a `STALE` written here would stay on screen for the rest of the
+      // session. Measured in a browser on 2026-08-25, dragging a slider back to the value its
+      // clip was already rendered at. One re-entry, and it terminates: the layer now carries
+      // exactly the URL the next pass asks for.
+      showPreviewLayer(spareName);
+      syncMonitor();
+      return;
+    }
+    // Whatever is on screen keeps playing while that happens.
+    if (shown?.dataset?.url) playPreviewLayer(shown, view, playing);
+    return;
+  }
+  playPreviewLayer(shown, view, playing);
+}
+
+// The clip runs, and only follows the clock while the clock is running. A Director grading with
+// the transport stopped is looking at a **moving** picture -- the loop is the point of it, and
+// seeking a paused Monitor's preview back to the playhead every tick would be the frozen frame
+// this slice exists to refuse.
+function playPreviewLayer(layer, view, playing) {
+  if (!layer) return;
+  if (playing && Math.abs(layer.currentTime - view.previewTime) > MONITOR_DRIFT_SECONDS) {
+    layer.currentTime = view.previewTime;
+  }
+  if (layer.paused) layer.play?.().catch?.(() => {});
+}
+
+function showPreviewLayer(name) {
+  monitorPreviewLayer = name;
+  for (const other of ["a", "b"]) {
+    const layer = previewLayer(other);
+    if (!layer) continue;
+    layer.classList.toggle("on", other === name);
+    // The layer that just left the screen stops decoding. Its source is left alone: it becomes
+    // the spare, and the next clip overwrites it.
+    if (other !== name && !layer.paused) layer.pause();
+  }
+}
 // The two line mutes from the Director's workflow: audition controls, session-only by
 // design -- never persisted, never touching the manifest. Muting the song never stops
 // the clock; the element keeps driving the playhead with its output silenced.
@@ -4918,7 +5076,27 @@ function syncMonitor() {
   audio.muted = songLineMuted;
   // One decision function owns what this moment shows -- the same offset rule assembly
   // cuts by, so the preview and the export cannot disagree about which slice plays.
-  const view = monitorState(state.project, state.playhead);
+  //
+  // `monitorPreviewView` layers the Preview Clip onto that answer: the same picture the export
+  // will ship where there is a stack and a clip in hand, and the take exactly as before where
+  // there is not. It decides the kind, the seek, the corner flag and the sentence; this function
+  // only draws them.
+  const settled = monitorState(state.project, state.playhead);
+  const shotId = settled.shot?.id || "";
+  const onScreen = previewLayer(monitorPreviewLayer);
+  const view = monitorPreviewView(settled, {
+    held: monitorPreviews.get(shotId) || null,
+    failed: previewProblem?.shotId === shotId
+      && previewProblem?.key === shotPreviewWanted(settled.shot).key,
+    // What the Director is actually looking at, and only when it belongs to *this* Shot. A clip
+    // left on a layer by the previous Shot is not a picture of this one at any staleness, and
+    // `paintMonitorPreview` hides it for the same reason.
+    playing: onScreen?.dataset?.shot === shotId ? (onScreen.dataset.url || "") : "",
+  });
+  // Asked here because this is the one function that knows which Shot the Monitor is on, and it
+  // is called by every gesture that can change that -- a playhead move, a transport change, a
+  // redraw after a stack was written. The decision to ask at all is `ensureMonitorPreview`'s.
+  ensureMonitorPreview(settled);
   // The one text layer the Monitor had is the overlay, and `.showing-take` display:none's it --
   // so while a take was on screen the Monitor could say nothing at all, and a previous take with
   // a newer render in flight played in sync, framed exactly like a settled one. The note is a
@@ -4931,6 +5109,9 @@ function syncMonitor() {
     $("#monitor-overlay").textContent = "Video line muted";
     say("");
     if (!video.paused) video.pause();
+    // A muted video line means no picture at all, and a Preview Clip is a picture. The mute is
+    // about the line, not about the take, so both layers go with it.
+    paintMonitorPreview(settled, false);
     return;
   }
   if (!monitorShowsTake(view)) {
@@ -4938,6 +5119,9 @@ function syncMonitor() {
     $("#monitor-overlay").textContent = view.label;
     say("");
     if (!video.paused) video.pause();
+    // A gap, or a Shot with no take. Nothing belonging to the last Shot may survive that --
+    // `settled` carries no `previewUrl`, so this stops and hides both layers.
+    paintMonitorPreview(settled, false);
     return;
   }
   frame.classList.add("showing-take");
@@ -4963,6 +5147,10 @@ function syncMonitor() {
   } else if (video.paused) {
     video.play().catch(() => {});
   }
+  // The take above still runs the clock and still carries whatever audio the acceptance flag
+  // accepted; the Preview Clip is laid over it and is the picture when there is one. Painted
+  // last, so nothing above it can leave a graded frame on screen for a Shot that has none.
+  paintMonitorPreview(view, !audio.paused);
 }
 
 // The same decision the button was drawn from, asked again at the click. The button is already
@@ -5634,6 +5822,36 @@ function bindEvents() {
     saveShotsSilently("split");
     renderTimeline();
   });
+  // The swap, and the only thing that performs one: a Preview Clip becomes the picture when it
+  // has a frame to show and never a moment before. `loadeddata` rather than `canplay` -- one
+  // decoded frame is exactly the condition for "there is something here to look at".
+  for (const name of ["a", "b"]) {
+    const layer = previewLayer(name);
+    layer?.addEventListener("loadeddata", () => {
+      showPreviewLayer(name);
+      syncMonitor();
+    });
+    // A clip that will not load. The cache is a folder of files named by fingerprint and deleting
+    // it is a supported thing to do, so the URL in hand can stop resolving between one glance and
+    // the next. The clip is dropped and the take underneath is the picture again -- never a
+    // broken element over a take that plays perfectly well.
+    layer?.addEventListener("error", () => {
+      const url = layer.dataset.url;
+      layer.dataset.url = "";
+      layer.dataset.shot = "";
+      if (!url) return;
+      for (const [shotId, held] of [...monitorPreviews]) {
+        if (held.url !== url) continue;
+        monitorPreviews.delete(shotId);
+        // Recorded against the key, so the same unplayable clip is not asked for again in a
+        // circle -- the route would answer with it, being a file that exists. A change to the
+        // stack is a different key and is asked for normally.
+        previewProblem = { shotId, key: held.key, message: PREVIEW_UNPLAYABLE };
+        toast(PREVIEW_UNPLAYABLE, "error");
+      }
+      syncMonitor();
+    });
+  }
   $("#monitor-fullscreen")?.addEventListener("click", () => {
     const monitor = $("#timeline-monitor");
     if (document.fullscreenElement) document.exitFullscreen();

@@ -327,7 +327,22 @@
                  inspector player, where its diagnostic value lives. -->
             <div class="timeline-monitor" id="timeline-monitor">
               <video id="monitor-video" muted playsinline preload="auto"></video>
+              <!-- The Preview Clip: the Shot's window through the export's own chain, laid over
+                   the take. **Two elements, and that is the whole point of them.** Setting `src`
+                   on a video element blanks it, so a single layer would flash black at every
+                   change to the stack — which is exactly the thing this slice may never do. The
+                   incoming clip loads on the layer nobody is looking at and the swap happens
+                   only once it has a frame to show. The take underneath keeps playing: it is the
+                   audio the acceptance flag decides, and it is the picture that is still there
+                   if a preview ever fails to load. -->
+              <video id="monitor-preview-a" class="monitor-preview" muted playsinline loop preload="auto"></video>
+              <video id="monitor-preview-b" class="monitor-preview" muted playsinline loop preload="auto"></video>
               <div class="monitor-overlay" id="monitor-overlay">No shot under the playhead</div>
+              <!-- STALE, in the corner, over moving picture. It appears when the look has moved
+                   since the clip on screen was rendered and clears when the new one lands. There
+                   is no spinner and no percentage here by design (UX-DR11): a preview is either
+                   current or stale, and progress this pipeline cannot measure is not shown. -->
+              <p class="monitor-stale" id="monitor-stale"></p>
               <!-- What the overlay structurally cannot say: the overlay is hidden the moment a
                    take is on screen, so a previous take with a newer render in flight played in
                    sync and framed exactly like a settled one, with nothing saying so. This layer

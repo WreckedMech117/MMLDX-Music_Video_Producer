@@ -268,11 +268,15 @@ uv run --with selenium python tests/e2e_section_looks.py         # default port 
 uv run --with selenium python tests/e2e_seed_and_asset_tabs.py   # default port 8774
 uv run --with selenium python tests/e2e_clips_and_attach.py      # default port 8776
 uv run --with selenium python tests/e2e_clip_overlap_and_split.py # default port 8777
+uv run --with selenium python tests/e2e_effects_tab.py           # default port 8778
+uv run --with selenium python tests/e2e_monitor_preview.py       # default port 8779
 ```
 
-These twelve **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
+These fourteen **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
 
-**Two pairs share a default port** — 8768 and 8769, marked above. `ManagedServer` refuses a bound port by name rather than reusing it, so the collision costs a failed start and never a run against the wrong server; it does mean those two pairs cannot run at the same time without `--port`. This list was five entries long and said "these five" while there were twelve, which is why the ports were never noticed to overlap.
+**Two pairs share a default port** — 8768 and 8769, marked above. `ManagedServer` refuses a bound port by name rather than reusing it, so the collision costs a failed start and never a run against the wrong server; it does mean those two pairs cannot run at the same time without `--port`. This list was five entries long and said "these five" while there were twelve, which is why the ports were never noticed to overlap. Two more were missing from it again on 2026-08-25 — the Effects tab's and the Monitor preview's — so **add the line when you add the script**; a gate nobody can find is a gate nobody runs.
+
+`e2e_monitor_preview.py` needs **ffmpeg on PATH**: it synthesizes its own takes and every preview it drives is an ffmpeg transcode. It is the D2 gate and most of what that slice can be checked by — it samples the Monitor every animation frame and asserts on the picture itself, so a black flash, a frozen frame or a frame belonging to the previous Shot is a failed section rather than something a human has to notice.
 
 Prerequisites: nothing listening on the port, Microsoft Edge plus its WebDriver, and `music_video_producer` importable from this checkout's `src/`. **ComfyUI does not need to be running** and no language-model host is needed. None of them spends GPU time or reaches `/prompt`.
 

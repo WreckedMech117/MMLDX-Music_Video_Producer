@@ -21143,3 +21143,405 @@ def test_the_effects_panel_does_not_re_decide_which_moves_are_legal():
     # No second opinion about families, ranks or which card may move, in any spelling.
     for redecided in ("family", "FAMILY", "rank", "shot.locked", "familySize"):
         assert redecided not in body, redecided
+
+
+# The Shot the Monitor grades against: an approved take, a window with a lead and a nudge, and a
+# stack whose result is unmistakable. Its neighbour carries no stack at all, which is the case
+# that must cost nothing — no request, no layer, no change of any kind.
+PREVIEW_GRADED_SHOT = {
+    "id": "graded", "start": 4, "duration": 4,
+    "latest_output": "shots/g.mp4", "approved_output": "shots/g.mp4",
+    "status": "complete", "latest_take_lead": 0.25, "trim_nudge": 0.125,
+    "effects": [{"effect": "monochrome", "enabled": True, "parameters": {}}],
+}
+PREVIEW_BARE_SHOT = {
+    "id": "bare", "start": 0, "duration": 4,
+    "latest_output": "shots/b.mp4", "approved_output": "shots/b.mp4", "status": "complete",
+}
+
+
+def preview_answer(fingerprint: str) -> dict:
+    """One `ShotPreviewResponse`, as the route composes it."""
+    return {
+        "shot_id": "graded",
+        "fingerprint": fingerprint,
+        "preview": f"previews/{fingerprint}.mp4",
+        "preview_url": f"/api/projects/p1/media/previews/{fingerprint}.mp4",
+        "width": 480, "height": 270, "frames": 96, "window_seconds": 4.0, "rendered": True,
+    }
+
+
+def test_the_monitor_decides_the_preview_clip_without_asking_the_server_for_a_stale_flag():
+    """Every decision this slice makes, executed: whether a Shot wants a preview, whether the
+    clip in hand is a picture of the look as it stands, and what is said about it when it is not.
+
+    The settled cases are pinned against `monitorState`'s own answer, because "say more about a
+    graded Shot" must not become "say something different about every Shot".
+    """
+    from music_video_producer.effects import preview_fingerprint
+
+    shots = [PREVIEW_BARE_SHOT, PREVIEW_GRADED_SHOT]
+    seen = run_module(f"""
+      import {{ MONITOR_PREVIEW, MONITOR_STALE_PREVIEW, PREVIEW_FAILED_NOTE, PREVIEW_STALE_FLAG,
+               PREVIEW_STALE_NOTE, PREVIEW_WITHOUT_APPROVED_TAKE, monitorPreviewView,
+               monitorShowsTake, monitorState, previewAdoption, previewInputKey,
+               shotPreviewWanted, TAKE_DISPLACED_BY_RENDER }}
+        from './src/music_video_producer/web/assets/api.js';
+      const project = {{ shots: {json.dumps(shots)} }};
+      const graded = project.shots[1];
+      const bare = project.shots[0];
+      const held = {{ key: previewInputKey(graded), fingerprint: 'fp1', url: '/clip/fp1.mp4' }};
+      const gradedView = monitorState(project, 5.0);
+      const bareView = monitorState(project, 1.0);
+      // The same Shot after one parameter moved: a different look, so a different key.
+      const moved = {{ ...graded, effects: [{{ effect: 'monochrome', parameters: {{ amount: 0.4 }} }}] }};
+      // The same look written two ways -- `enabled` absent is `enabled: true`, and that is what
+      // `effectStackWrite` normalises. A key that told them apart would re-render on a redraw.
+      const respelled = {{ ...graded, effects: [{{ effect: 'monochrome', parameters: {{}} }}] }};
+      // A second Shot whose take, window and look are the same. One picture, one key.
+      const twin = {{ ...graded, id: 'twin' }};
+      console.log(JSON.stringify({{
+        flag: PREVIEW_STALE_FLAG,
+        staleNote: PREVIEW_STALE_NOTE,
+        failedNote: PREVIEW_FAILED_NOTE,
+        withoutTake: PREVIEW_WITHOUT_APPROVED_TAKE,
+        kinds: [MONITOR_PREVIEW, MONITOR_STALE_PREVIEW],
+        wanted: {{
+          bare: shotPreviewWanted(bare),
+          graded: shotPreviewWanted(graded),
+          unapproved: shotPreviewWanted({{ ...graded, approved_output: '' }}),
+          nothing: shotPreviewWanted(null),
+        }},
+        keys: {{
+          moved: previewInputKey(moved) !== previewInputKey(graded),
+          respelled: previewInputKey(respelled) === previewInputKey(graded),
+          twin: previewInputKey(twin) === previewInputKey(graded),
+          key: previewInputKey(graded),
+        }},
+        adoption: {{
+          same: previewAdoption(held, {{ fingerprint: 'fp1', preview_url: '/clip/fp1.mp4' }}),
+          different: previewAdoption(held, {{ fingerprint: 'fp2', preview_url: '/clip/fp2.mp4' }}),
+          first: previewAdoption(null, {{ fingerprint: 'fp1', preview_url: '/clip/fp1.mp4' }}),
+          empty: previewAdoption(held, {{}}),
+        }},
+        // The unchanged views as JSON, so "untouched" is asserted as identity rather than by
+        // listing the keys that happen to be looked at.
+        settledJson: JSON.stringify(gradedView),
+        bareJson: JSON.stringify(monitorPreviewView(bareView, {{ held: null }})),
+        bareSettledJson: JSON.stringify(bareView),
+        // A Shot with a stack and no clip yet: the take, unannounced. Nothing is out of date.
+        awaitingJson: JSON.stringify(monitorPreviewView(gradedView, {{ held: null }})),
+        current: monitorPreviewView(gradedView, {{ held }}),
+        stale: monitorPreviewView(gradedView, {{ held: {{ ...held, key: previewInputKey(moved) }} }}),
+        failed: monitorPreviewView(gradedView, {{
+          held: {{ ...held, key: previewInputKey(moved) }}, failed: true,
+        }}),
+        failedWithoutClip: monitorPreviewView(gradedView, {{ held: null, failed: true }}),
+        // The clip has landed and the browser has not decoded a frame of it yet: what is on
+        // screen is still the previous look, so it still says so.
+        landing: monitorPreviewView(gradedView, {{ held, playing: '/clip/fp0.mp4' }}),
+        decoded: monitorPreviewView(gradedView, {{ held, playing: '/clip/fp1.mp4' }}),
+        unapproved: monitorPreviewView(
+          monitorState({{ shots: [{{ ...graded, approved_output: '' }}] }}, 5.0), {{ held: null }}),
+        // A stack, nothing approved, and a newer render in flight. The more urgent sentence wins;
+        // a preview note never displaces one.
+        displaced: monitorPreviewView(
+          monitorState({{ shots: [{{ ...graded, approved_output: '', status: 'running' }}] }}, 5.0),
+          {{ held: null }}),
+        // No picture at all. A preview cannot rescue a gap and does not try.
+        gap: monitorPreviewView(monitorState(project, 99), {{ held }}),
+        shows: [
+          monitorPreviewView(gradedView, {{ held }}),
+          monitorPreviewView(gradedView, {{ held: {{ ...held, key: 'moved' }} }}),
+        ].map(monitorShowsTake),
+        displacedSentence: TAKE_DISPLACED_BY_RENDER,
+      }}));
+    """)
+
+    # No stack is no request: nothing to ask for, and nothing to say about not asking.
+    assert seen["wanted"]["bare"] == {"wanted": False, "key": "", "note": ""}
+    assert seen["wanted"]["nothing"] == {"wanted": False, "key": "", "note": ""}
+    assert seen["wanted"]["graded"]["wanted"] is True
+    assert seen["wanted"]["graded"]["key"]
+    # A stack with nothing approved is also no request — the route refuses that by name — but it
+    # is worth saying, because the Director has built a look and the Monitor shows none of it.
+    assert seen["wanted"]["unapproved"]["wanted"] is False
+    assert seen["wanted"]["unapproved"]["note"] == seen["withoutTake"]
+
+    assert seen["keys"]["moved"] is True
+    assert seen["keys"]["respelled"] is True
+    assert seen["keys"]["twin"] is True
+    # The key is this client's trigger, not a second copy of the server's name for the clip, and
+    # nothing may read like one: a fingerprint is a hex digest and this is not.
+    assert not re.fullmatch(r"[0-9a-f]{8,}", seen["keys"]["key"])
+
+    # Staleness, decided by comparing fingerprints and by nothing else. The equal answer is the
+    # clip already playing: it is kept, because reloading to arrive at the same frames is how a
+    # swap that had nothing to swap flashes black.
+    assert seen["adoption"]["same"]["swap"] is False
+    assert seen["adoption"]["different"]["swap"] is True
+    assert seen["adoption"]["different"]["url"] == "/clip/fp2.mp4"
+    assert seen["adoption"]["first"]["swap"] is True
+    assert seen["adoption"]["empty"]["swap"] is False
+
+    # A Shot with no stack, and a Shot whose clip has not landed: `monitorState`'s answer, whole.
+    assert seen["bareJson"] == seen["bareSettledJson"]
+    assert seen["awaitingJson"] == seen["settledJson"]
+    assert '"kind":"take"' in seen["bareJson"]
+    assert "previewUrl" not in seen["bareJson"]
+
+    # The clip in hand, playing. `takeTime` folds the offset in and the clip is already cut at it,
+    # so the seek is the window's own second — 1.0 here, not 1.375.
+    current = seen["current"]
+    settled = json.loads(seen["settledJson"])
+    assert current["kind"] == seen["kinds"][0]
+    assert current["previewUrl"] == "/clip/fp1.mp4"
+    assert settled["takeTime"] == 1.375
+    assert current["previewTime"] == 1.0
+    assert current["stale"] == ""
+    assert current["label"] == settled["label"] == ""
+    # The mix is untouched: a preview changes the picture, never which audio is accepted.
+    assert current["muted"] == settled["muted"]
+
+    # The look moved. The picture does not: the same URL, the same seek, plus a label.
+    stale = seen["stale"]
+    assert stale["kind"] == seen["kinds"][1]
+    assert stale["previewUrl"] == current["previewUrl"]
+    assert stale["previewTime"] == current["previewTime"]
+    assert stale["stale"] == seen["flag"] == "STALE"
+    assert stale["label"] == seen["staleNote"]
+    # Never a spinner and never a percentage — not in the flag, not in the sentence.
+    assert "%" not in seen["staleNote"] + seen["flag"] + seen["failedNote"]
+
+    # A refused render says so and keeps the clip that is on screen.
+    assert seen["failed"]["previewUrl"] == current["previewUrl"]
+    assert seen["failed"]["label"] == seen["failedNote"]
+    assert seen["failed"]["stale"] == seen["flag"]
+    # Refused before anything ever landed: the take, and the reason, and no false claim that a
+    # preview on screen is out of date.
+    assert seen["failedWithoutClip"]["label"] == seen["failedNote"]
+    assert "previewUrl" not in seen["failedWithoutClip"]
+
+    # Landed but not yet decoded is still stale, and stale by the only measure that matters:
+    # what the Director is looking at is not a picture of the look as it stands.
+    assert seen["landing"]["stale"] == seen["flag"]
+    assert seen["landing"]["label"] == seen["staleNote"]
+    assert seen["decoded"]["stale"] == ""
+
+    assert seen["unapproved"]["label"] == seen["withoutTake"]
+    assert seen["displaced"]["label"] == seen["displacedSentence"]
+    # A gap is a gap. Holding a clip for some other Shot changes nothing about it.
+    assert seen["gap"]["kind"] == "gap"
+    assert "previewUrl" not in seen["gap"]
+    # Both preview kinds put a picture on the screen, which is what `.showing-take` keys off.
+    assert seen["shows"] == [True, True]
+
+    # And the server agrees about what a preview is a picture of: every input this client keys on
+    # is one the route's own fingerprint hashes. A change to either that the other did not follow
+    # would be a look the Monitor never re-asks for.
+    signature = inspect.signature(preview_fingerprint)
+    for hashed in ("take", "window_start", "window_duration", "offset", "stack"):
+        assert hashed in signature.parameters
+
+
+def test_the_monitor_plays_the_preview_and_keeps_playing_it_while_the_next_one_renders():
+    """The wiring, executed against the stub DOM: the request, the swap, the label, and the two
+    layers that make a swap possible without a black frame.
+
+    A stub DOM cannot see a flash. What it *can* see is the thing that causes one — a `src`
+    written onto the element that is currently on screen — and that is what is asserted here:
+    while a new clip loads, the visible layer still carries the old clip's URL. The browser run
+    watches the screen itself.
+    """
+    # A second graded Shot, so "no frame belonging to the Shot before this one" is a case with a
+    # preview on both sides of it rather than a Shot that wanted no preview anyway.
+    neighbour = {
+        **PREVIEW_GRADED_SHOT, "id": "second", "start": 8,
+        "latest_output": "shots/n.mp4", "approved_output": "shots/n.mp4",
+    }
+    shots = [PREVIEW_BARE_SHOT, PREVIEW_GRADED_SHOT, neighbour]
+    path = "/api/projects/p1/shots/graded/preview"
+    next_path = "/api/projects/p1/shots/second/preview"
+    painted = run_workspace(
+        f"""
+      state.project = {{ id: 'p1', shots: {json.dumps(shots)}, jobs: [], assets: [] }};
+      const frame = at('#timeline-monitor');
+      const clock = at('#master-audio');
+      const layer = (name) => at('#monitor-preview-' + name);
+      layer('a').currentTime = 0;
+      layer('b').currentTime = 0;
+      const look = () => ({{
+        previewing: frame.classList.contains('previewing'),
+        showing: frame.classList.contains('showing-take'),
+        note: at('#monitor-note').textContent,
+        stale: at('#monitor-stale').textContent,
+        a: {{ url: layer('a').dataset.url || '', on: layer('a').classList.contains('on'),
+             at: layer('a').currentTime }},
+        b: {{ url: layer('b').dataset.url || '', on: layer('b').classList.contains('on'),
+             at: layer('b').currentTime }},
+        asked: requests.filter((sent) => sent.path.endsWith('/preview'))
+          .map((sent) => sent.method + ' ' + sent.path),
+      }});
+      const paint = async (seconds) => {{
+        clock.currentTime = seconds;
+        fire('#master-audio:timeupdate');
+        await flush();
+        return look();
+      }};
+      const landed = async (name) => {{
+        fire('#monitor-preview-' + name + ':loadeddata');
+        await flush();
+        return look();
+      }};
+      const overBare = await paint(1.0);
+      const requested = await paint(5.0);
+      const showing = await landed('b');
+      // The stack moves under the clip that is playing, exactly as a written parameter leaves it.
+      state.project.shots[1].effects = [{{ effect: 'monochrome', parameters: {{ amount: 0.4 }} }}];
+      const stale = await paint(5.0);
+      const swapped = await landed('a');
+      // Back to the look the *other* layer is already showing. Its clip is decoded and
+      // `loadeddata` will never fire again, so the swap has to happen on the spot — and the
+      // label, written a moment earlier from a view that was true then, has to be rewritten.
+      layer('b').readyState = 4;
+      state.project.shots[1].effects = [{{ effect: 'monochrome', parameters: {{}} }}];
+      const returned = await paint(5.0);
+      // And once more, onto a render that refuses.
+      state.project.shots[1].effects = [{{ effect: 'monochrome', parameters: {{ amount: 0.2 }} }}];
+      const failed = await paint(5.0);
+      // Asked again on every tick would be a request storm against a look that cannot be made.
+      const settled = await paint(5.0);
+      const away = await paint(1.0);
+      // Onto the neighbour, whose own clip is answered at once. The layer on screen still holds
+      // the first Shot's picture, and must not be shown for a frame while this one loads.
+      const crossed = await paint(9.0);
+      const settledThere = await landed('a');
+      console.log(JSON.stringify({{
+        overBare, requested, showing, stale, swapped, returned, failed, settled, away,
+        crossed, settledThere,
+        leftover: unconsumed(),
+      }}));
+    """,
+        responses={
+            path: [
+                {"body": preview_answer("fp1")},
+                {"body": preview_answer("fp2")},
+                {"body": preview_answer("fp1")},
+                {"status": 502,
+                 "body": {"detail": "The preview of Shot 02 failed: no such filter"}},
+            ],
+            next_path: {"body": {**preview_answer("fp3"), "shot_id": "second"}},
+        },
+    )
+
+    # 1. A Shot with no stack asks for nothing at all, and the Monitor is exactly what it was.
+    assert painted["overBare"]["asked"] == []
+    assert painted["overBare"]["previewing"] is False
+    assert painted["overBare"]["showing"] is True
+
+    # 2. The graded Shot asks once, and the clip loads on the layer nobody is looking at.
+    assert painted["requested"]["asked"] == [f"POST {path}"]
+    assert painted["requested"]["b"]["url"].endswith("previews/fp1.mp4")
+    assert painted["requested"]["b"]["on"] is False
+    assert painted["requested"]["a"]["url"] == ""
+
+    # 3. It becomes the picture when it has a frame to show, and says nothing while it is current.
+    assert painted["showing"]["b"]["on"] is True
+    assert painted["showing"]["previewing"] is True
+    assert painted["showing"]["stale"] == ""
+    assert painted["showing"]["note"] == ""
+    # Seeked to the window's own second, the offset already cut into the clip.
+    assert painted["showing"]["b"]["at"] == 1.0
+
+    # 4. The stack changed. **The picture on screen is untouched**: the layer that is on still
+    # carries the clip it was playing, and the new one loads on the other one.
+    assert painted["stale"]["b"]["on"] is True
+    assert painted["stale"]["b"]["url"].endswith("previews/fp1.mp4")
+    assert painted["stale"]["a"]["url"].endswith("previews/fp2.mp4")
+    assert painted["stale"]["a"]["on"] is False
+    assert painted["stale"]["previewing"] is True
+    assert painted["stale"]["stale"] == "STALE"
+    assert painted["stale"]["note"].startswith("The look changed")
+    assert painted["stale"]["asked"] == [f"POST {path}"] * 2
+
+    # 5. The new clip lands: the swap happens and the label clears.
+    assert painted["swapped"]["a"]["on"] is True
+    assert painted["swapped"]["b"]["on"] is False
+    assert painted["swapped"]["stale"] == ""
+    assert painted["swapped"]["note"] == ""
+
+    # 5b. And a look returned to, whose clip is already decoded on the other layer: the swap
+    # happens on the spot, and **the label goes with it**. A `STALE` written from the view that
+    # was true a moment before would otherwise stay on screen for the rest of the session — a
+    # paused Monitor gets no further ticks to correct it. Found in a browser, 2026-08-25.
+    assert painted["returned"]["b"]["on"] is True
+    assert painted["returned"]["a"]["on"] is False
+    assert painted["returned"]["stale"] == ""
+    assert painted["returned"]["note"] == ""
+    assert painted["returned"]["previewing"] is True
+
+    # 6. A refused render names its reason, keeps the picture that is playing, and is not asked
+    # for again on the next tick — one refusal, not one per timeupdate.
+    assert painted["failed"]["b"]["on"] is True
+    assert painted["failed"]["b"]["url"].endswith("previews/fp1.mp4")
+    assert painted["failed"]["previewing"] is True
+    assert painted["failed"]["stale"] == "STALE"
+    assert painted["failed"]["note"] == "The preview failed — this is the previous picture"
+    assert painted["settled"]["asked"] == painted["failed"]["asked"] == [f"POST {path}"] * 4
+    assert painted["leftover"] == {}
+
+    # 7. Off the graded Shot: no frame belonging to it survives the move.
+    assert painted["away"]["previewing"] is False
+    # The layer keeps its class and its clip — it is the frame that is withheld, not the state
+    # torn down, so crossing back costs no reload.
+    assert painted["away"]["b"]["on"] is True
+
+    # 8. And the same rule with a preview waiting on the other side of the move: the neighbour's
+    # clip is in hand and still loading, and what is on screen belongs to the Shot just left — so
+    # the layers are withheld and the neighbour's own take is the picture until its clip decodes.
+    assert painted["crossed"]["previewing"] is False
+    assert painted["crossed"]["b"]["on"] is True
+    assert painted["crossed"]["b"]["url"].endswith("previews/fp1.mp4")
+    assert painted["crossed"]["a"]["url"].endswith("previews/fp3.mp4")
+    assert painted["settledThere"]["previewing"] is True
+    assert painted["settledThere"]["a"]["on"] is True
+    assert painted["settledThere"]["stale"] == ""
+    assert painted["away"]["stale"] == ""
+    assert painted["away"]["asked"] == [f"POST {path}"] * 4
+
+
+def test_the_stale_label_is_a_corner_label_over_the_picture_and_the_layers_are_two():
+    """The three files the drawing is spread across, and the properties that make it drawable.
+
+    Two video elements or the swap has nowhere to happen; `loop` or the picture stops between
+    the Director's glances; a plate under the label or 11 px of Consolas sits unreadable over
+    whatever frame the clip happens to be showing.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+
+    layers = re.findall(r'<video[^>]*id="monitor-preview-[ab]"[^>]*>', markup)
+    assert len(layers) == 2, "the swap needs a layer to load onto and a layer to keep showing"
+    for layer in layers:
+        assert "loop" in layer, layer
+        assert "muted" in layer, layer
+    assert 'id="monitor-stale"' in markup
+
+    # The label: Consolas, over the picture, hidden when there is nothing to say — and never
+    # covering the picture the way the overlay does.
+    stale = re.search(r"\.monitor-stale \{[^}]*\}", styles)
+    assert stale, "the STALE label has no rule"
+    assert "Consolas" in stale.group(0)
+    assert "position: absolute" in stale.group(0)
+    assert "inset: 0" not in stale.group(0)
+    assert "var(--amber)" in stale.group(0)
+    assert ".monitor-stale:empty { display: none; }" in styles
+    # The layers are laid out even when hidden: `display: none` would stop the incoming clip
+    # decoding, and the swap waits on exactly that.
+    layer_rule = re.search(r"\.monitor-preview \{[^}]*\}", styles)
+    assert layer_rule and "opacity: 0" in layer_rule.group(0)
+    assert "display: none" not in layer_rule.group(0)
+    assert ".timeline-monitor.previewing .monitor-preview.on { opacity: 1; }" in styles
+    # The palette is closed: no blue, no seventh accent, no gradient behind any of this.
+    for banned in ("--blue", "linear-gradient", "box-shadow"):
+        assert banned not in stale.group(0) + layer_rule.group(0), banned

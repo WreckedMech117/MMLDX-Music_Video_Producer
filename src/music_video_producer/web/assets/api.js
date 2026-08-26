@@ -5487,10 +5487,158 @@ export function monitorState(project, seconds) {
 // `.showing-take` both have to agree that a displaced take is still shown -- a surface that
 // tested `kind === "take"` would black out the only take there is.
 export const MONITOR_PREVIOUS_TAKE = "previous-take";
-export const MONITOR_TAKE_KINDS = ["take", MONITOR_PREVIOUS_TAKE];
+// The two Preview Clip kinds join the take kinds rather than replacing them, for the reason the
+// comment above gives: every one of these four puts a picture on the screen, and a surface that
+// asks `kind === "take"` blacks out three of them. `.showing-take` is the class all four carry.
+export const MONITOR_PREVIEW = "preview";
+export const MONITOR_STALE_PREVIEW = "stale-preview";
+export const MONITOR_TAKE_KINDS = [
+  "take", MONITOR_PREVIOUS_TAKE, MONITOR_PREVIEW, MONITOR_STALE_PREVIEW,
+];
 
 export function monitorShowsTake(view) {
   return MONITOR_TAKE_KINDS.includes(view?.kind);
+}
+
+// ------------------------------------------------------------------------------------------
+// The Preview Clip on the Monitor: the Shot's own window through the chain the export will run.
+//
+// Three decisions live here, and `syncMonitor` makes none of them: whether a Shot wants a
+// preview at all, whether the clip already playing is a picture of the look as it stands now,
+// and what is said about it when it is not.
+// ------------------------------------------------------------------------------------------
+
+//: The corner label a stale Preview Clip carries. Four letters, Consolas, over the moving
+//: picture -- never a spinner, never a percentage, and never in place of the picture. UX-DR11:
+//: a preview is either current or stale and it says which, because "63%" is a claim about
+//: work whose progress this pipeline cannot measure.
+export const PREVIEW_STALE_FLAG = "STALE";
+//: What the note bar says beside that flag. The picture is kept and the sentence explains why
+//: it is not the newest one -- the same division `TAKE_DISPLACED_BY_RENDER` makes for a take.
+export const PREVIEW_STALE_NOTE =
+  "The look changed — this is the previous preview, and the new one is rendering";
+//: A refused render. The reason itself reaches the Director whole, in a toast, because an
+//: ffmpeg failure is five hundred characters of detail and the note bar is one line over the
+//: picture. What the bar carries is the fact that matters at a glance: what you are looking at
+//: is not the look you just asked for.
+export const PREVIEW_FAILED_NOTE = "The preview failed — this is the previous picture";
+//: A clip the route named and the browser could not play. The cache is a folder of files named
+//: by fingerprint, and deleting it is a supported thing to do, so a URL in hand can stop
+//: resolving between one glance and the next. Named rather than retried in a circle: an answer
+//: whose file cannot be played would be answered identically the next time it is asked for.
+export const PREVIEW_UNPLAYABLE =
+  "This Shot's preview clip could not be played, so the take is on screen instead. Changing the stack renders a new one.";
+//: A Shot carrying a stack whose take has never been approved. The preview renders the
+//: *approved* take, because the export does; with none there is nothing to grade and the
+//: Monitor would otherwise show an ungraded picture and say nothing about it, which is the
+//: "control that appears to do nothing" this repository keeps rediscovering.
+export const PREVIEW_WITHOUT_APPROVED_TAKE =
+  "This Shot's effects are not previewed yet: a preview is the approved take through the export's chain, and nothing is approved here";
+
+// What a Preview Clip would be a picture of, as a single string this client can compare.
+//
+// **Not the server's fingerprint and it must not pretend to be.** That one hashes the delivery
+// geometry and the song too, which this side cannot compute -- so this is the narrower question
+// "have the inputs *the Director just touched* changed", and it is the trigger for asking. The
+// answer comes back carrying the real fingerprint, and that comparison is what decides whether
+// a clip is actually a different picture (`previewAdoption`).
+//
+// The one gap that leaves, named rather than papered over: approving a take on *another* Shot
+// can move the export's geometry, which changes the server's fingerprint without changing this
+// key, so a Shot already previewed is not re-asked for. The clip on screen is then the right
+// look at the previous size. A Director who re-selects the Shot after such a change gets no new
+// request either; touching the stack does.
+export function previewInputKey(shot) {
+  // The Shot's id is deliberately **not** in here. This names a picture, and two Shots sharing a
+  // take, a window and a look are a picture of the same thing -- which is exactly the case the
+  // server answers with one fingerprint and one cached clip. What is held per Shot is the clip;
+  // what is compared is the look.
+  return JSON.stringify([
+    shot?.approved_output || "",
+    Number(shot?.start) || 0,
+    Number(shot?.duration) || 0,
+    effectiveOffset(shot),
+    effectStackWrite(shotEffectStack(shot)).effects,
+  ]);
+}
+
+// Whether this Shot wants a Preview Clip, and the reason when it does not.
+//
+// **An empty stack is not previewed at all**, and no request is made for one: story 9.2's AC is
+// "Given a Shot carrying an Effect Stack", and with no stack the preview is the take with extra
+// steps -- a transcode, a cache entry and a swapped video element to arrive back at the picture
+// the Monitor is already playing.
+export function shotPreviewWanted(shot) {
+  if (!shotEffectStack(shot).length) return { wanted: false, key: "", note: "" };
+  // The route refuses this by name (`PREVIEW_NO_TAKE_REFUSAL`), so asking would be asking for a
+  // toast. The refusal is worth *saying*, once, over the picture -- it is not worth sending.
+  if (!shot?.approved_output) {
+    return { wanted: false, key: "", note: PREVIEW_WITHOUT_APPROVED_TAKE };
+  }
+  return { wanted: true, key: previewInputKey(shot), note: "" };
+}
+
+// What to do with the route's answer: keep the clip that is playing, or swap to a new one.
+//
+// **This is the whole staleness mechanism** (AD-23). The route serves no `stale` field, and it
+// could not -- the server does not know which clip this browser is holding. So the client holds
+// the fingerprint it is playing and compares it against the one that just came back. Equal means
+// the answer is the clip already on screen, and reloading a video element to arrive at the same
+// frames is how a swap that had nothing to swap flashes black.
+//
+// Equal answers are not a curiosity: two Shots sharing a take, a window and a look fingerprint
+// identically, and so does a change that normalises away.
+export function previewAdoption(held, answer) {
+  const fingerprint = String(answer?.fingerprint || "");
+  const url = String(answer?.preview_url || "");
+  return {
+    swap: Boolean(fingerprint) && Boolean(url) && fingerprint !== (held?.fingerprint || ""),
+    fingerprint,
+    url,
+  };
+}
+
+// The Monitor's view with the Preview Clip folded in -- or exactly the view it was handed.
+//
+// Layered onto `monitorState` rather than written inside it, because the preview is not a fact
+// about the project: it is a clip this browser happens to be holding, and `monitorState` stays a
+// pure function of the manifest and the second.
+//
+// `held` is `{ key, fingerprint, url }` for the clip the Monitor has for this Shot, or null.
+// `failed` says the last request for the *current* key was refused. `playing` is the clip the
+// Director is looking at **right now**, which is not always the one in hand: a clip that has
+// landed still has to decode a frame before it can be shown, and for those milliseconds the
+// picture on screen is the previous look. Saying "current" then would be a small lie told at
+// exactly the moment the Director is watching for the change.
+//
+// Four answers:
+//
+// * **No picture at all** -- a gap, or a Shot with no take. A preview cannot rescue that and does
+//   not try; the honest placeholder is the answer.
+// * **No stack** (or a stack with nothing approved to run it over). Today's Monitor, untouched.
+//   The note is written only where there was nothing else to say: a take with a newer render in
+//   flight has a more urgent sentence and keeps it.
+// * **A stack, and a clip in hand.** The clip plays. It is stale exactly when the look has moved
+//   since it was made, and stale keeps the picture and adds the label -- it never blanks it.
+// * **A stack and no clip yet.** The take plays, unannounced. Nothing is out of date; there is
+//   simply no preview yet, and that lasts about as long as a transcode.
+export function monitorPreviewView(view, { held = null, failed = false, playing = "" } = {}) {
+  if (!monitorShowsTake(view)) return view;
+  const wanted = shotPreviewWanted(view.shot);
+  if (!wanted.wanted) return wanted.note ? { ...view, label: view.label || wanted.note } : view;
+  if (!held?.url) return failed ? { ...view, label: view.label || PREVIEW_FAILED_NOTE } : view;
+  const stale = held.key !== wanted.key || (Boolean(playing) && playing !== held.url);
+  return {
+    ...view,
+    kind: stale ? MONITOR_STALE_PREVIEW : MONITOR_PREVIEW,
+    previewUrl: held.url,
+    // The clip *is* the window: `trim_args` cut it at the offset and it starts at its first
+    // frame, so the take's offset arithmetic must be taken back off. Seeking a preview to
+    // `takeTime` would land the lead's worth of frames late on every nudged Shot.
+    previewTime: Math.max(0, view.takeTime - effectiveOffset(view.shot)),
+    stale: stale ? PREVIEW_STALE_FLAG : "",
+    label: stale ? (failed ? PREVIEW_FAILED_NOTE : PREVIEW_STALE_NOTE) : view.label,
+  };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -7047,6 +7195,13 @@ export const api = {
   // validates once, applies to every unlocked target and returns what it did -- counts plus the
   // refused Shots named as the timeline names them. The body is `effectCopyBody`'s.
   copyShotEffects: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/effects/copy`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // One Shot's window through the export's own chain, at half its size, so the Monitor can play
+  // the look instead of the ungraded take. No body: everything the render is decided from is
+  // already in the manifest, and a client that sent its own copy of the stack could ask for a
+  // picture of a look nobody has saved. Nothing is written -- there is no stored preview, no
+  // stale flag and no cached geometry; the answer's `fingerprint` names the clip and is the
+  // whole of how this side tells one picture from another.
+  shotPreview: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/preview`, { method: "POST" }),
   // Deletion, each with its own server-side guard: the project asks for its confirm flag,
   // the asset refuses while cited, the job settles its record as it cancels on ComfyUI.
   deleteProject: (id) => request(`/api/projects/${id}?confirm_delete=true`, { method: "DELETE" }),
