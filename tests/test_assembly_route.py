@@ -1928,7 +1928,9 @@ def test_a_check_registered_into_the_pre_flight_reports_without_the_route_being_
     )
     # It was handed the real plan, and the chains the checks before it had already composed.
     assert seen == {"width": 192, "clips": 2, "stages": seen["stages"]}
-    assert list(seen["stages"]) == ["shot_a"]
+    # Keyed by the clip's index in the plan rather than by its Shot's id (story 9.7): shot_a is
+    # the first clip, and a Shot that another nests inside would be two entries here, not one.
+    assert list(seen["stages"]) == [0]
     assert store.get(project_id).jobs == [], "a refused export wrote a job record"
 
     # 2. The plan stage: a check that runs before any geometry exists, beside the ones already
@@ -1949,4 +1951,155 @@ def test_a_check_registered_into_the_pre_flight_reports_without_the_route_being_
         ASSEMBLY_UNAPPROVED_REFUSAL.format(shot="SHOT 02 (shot_b)"),
         "SHOT 01 (shot_a): 1 stack(s) bind to an unmeasured song.",
     ]
+    assert comfy.prompts == []
+
+
+# ------------------------------------------------------------------------------------------
+# Story 9.7 — the seam. A Shot that another nests inside becomes two clips, and the two are
+# no longer handed the same filter text.
+# ------------------------------------------------------------------------------------------
+
+
+def project_with_a_nested_shot(client, store, tmp_path: Path):
+    """An 8 s song under one Shot that covers all of it, with a second Shot laid over its
+    middle two seconds.
+
+    `assembly_plan` resolves that into **three** clips carrying **two** shot ids: the
+    underneath from 0 to 3, the overlay from 3 to 5, and the underneath again from 5 to 8 with
+    its take offset advanced by exactly the five seconds it skipped. It is the only shape in
+    this application where one Shot's Effect Stack is composed more than once, and therefore
+    the only shape where the two compositions can disagree.
+    """
+    project_id = client.post("/api/projects", json={"name": "Seam"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Seam Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(8.0), "audio/wav")},
+    )
+    assert upload.status_code == 200, upload.text
+
+    shots_dir = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    )
+    synthesize_take(shots_dir / "under-h3_00001-audio.mp4", 8.5, colour="red")
+    synthesize_take(
+        shots_dir / "over-h3_00001-audio.mp4", 2.5, size="192x108", colour="blue"
+    )
+    prefix = f"music-video-producer/{project_id}/shots"
+    shots = [
+        {
+            "id": "under",
+            "start": 0,
+            "duration": 8.0,
+            "prompt": "The whole song",
+            "status": "complete",
+            "latest_output": f"{prefix}/under-h3_00001-audio.mp4",
+        },
+        {
+            "id": "over",
+            "start": 3.0,
+            "duration": 2.0,
+            "prompt": "Laid over the middle",
+            "status": "complete",
+            "latest_output": f"{prefix}/over-h3_00001-audio.mp4",
+        },
+    ]
+    saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert saved.status_code == 200, saved.text
+    for shot_id in ("under", "over"):
+        approved = client.post(f"/api/projects/{project_id}/shots/{shot_id}/approve")
+        assert approved.status_code == 200, approved.text
+    return project_id, shots_dir
+
+
+def test_the_two_clips_of_one_shot_differ_by_exactly_the_second_clips_offset(
+    tmp_path: Path, monkeypatch
+):
+    """Story 9.7's measurement, taken through the route rather than argued about.
+
+    Until this story the export keyed its composed chains by **shot id**, so the two clips a
+    nested overlay carves out of one Shot received byte-identical filter text — and `trim_args`
+    prepends `setpts=PTS-STARTPTS` to the second of them, which restarts the graph's clock at
+    zero. A shake snapped back to phase zero five seconds into a Shot nobody cut, and grain ran
+    the same noise sequence over again, on the exact frame the eye is already looking at.
+
+    The assertion is the whole claim in one line: the second clip's chain is the first clip's
+    chain, with the trim pair in front of it and **the offset substituted** — `(t+0)` become
+    `(t+5)` wherever a stage reads the clock, and grain's seed advanced by the same five seconds
+    in milliseconds. Nothing else in it moves, because nothing else about the Shot changed.
+
+    Three stages are exercised on purpose and they fail three different ways. `handheld_shake`
+    reads `t` directly. `slow_zoom` reads it as a fraction of the Shot's whole length, which is
+    the one that would restart rather than jump — and it is a *branched* filtergraph, so this is
+    also the branch reaching a real export argv. `grain` has no expression to offset at all and
+    carries the seam in its seed instead.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_a_nested_shot(client, store, tmp_path)
+    write_stack(
+        client,
+        project_id,
+        "under",
+        [
+            {"effect": "slow_zoom", "parameters": {"zoom": 1.4, "direction": "in"}},
+            {"effect": "handheld_shake", "parameters": {"amplitude": 0.02, "frequency": 3}},
+            {"effect": "grain", "parameters": {"strength": 8, "seed": 7}},
+        ],
+    )
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # One Shot became two clips: three trims for two Shots.
+    assert body["clip_count"] == 3
+    assert len(commands) == 3
+
+    chains = [command[command.index("-vf") + 1] for command in commands]
+    first, middle, last = chains
+
+    # The overlay carries no stack at all, so its chain is the one this route always built —
+    # no branch, no guard, no treatment. A Shot with no effects is untouched by any of this.
+    assert middle == (
+        "scale=192:108:force_original_aspect_ratio=decrease,"
+        "pad=192:108:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p"
+    )
+
+    # Each of the three stages named on its own, on both sides of the seam. The substitution
+    # below cannot tell a term that *moved* from one that was never written: a stage that
+    # quietly stopped reading the offset would leave both clips alike and pass it. So the shake
+    # reads the clock directly, the zoom reads it as a fraction of the Shot's whole length, and
+    # grain — which has no expression to offset — carries the seam in its seed.
+    assert "sin(2*PI*3*(t+0))" in first and "sin(2*PI*3*(t+5))" in last
+    assert r"min((t+0)/8\,1)" in first and r"min((t+5)/8\,1)" in last
+    assert "all_seed=7" in first and "all_seed=5007" in last
+    assert "(t+5)" not in first
+
+    # The measurement. `trim=start_frame=120` is the second clip's own cut, five seconds at
+    # 24 fps into the same take; everything after it is the first clip's chain with the offset
+    # moved through it.
+    assert last == "trim=start_frame=120,setpts=PTS-STARTPTS," + first.replace(
+        "(t+0)", "(t+5)"
+    ).replace("all_seed=7", "all_seed=5007")
+
+    # And the state this story replaced: the two are no longer the same text.
+    assert last.removeprefix("trim=start_frame=120,setpts=PTS-STARTPTS,") != first
+
+    # The branch reached the real argv, and the guard came with it.
+    assert first.startswith("tpad=stop=1:stop_mode=clone,")
+    assert "split=2[fx0a][fx0b];" in first
+
+    # The frame rule, on the file this export actually wrote: 8 s at 24 fps, branch and all.
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+    assert body["total_frames"] == 192
+    counted = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,nb_read_frames", "-of", "csv=p=0",
+            export.as_posix(),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert counted == "192,108,192"
     assert comfy.prompts == []

@@ -30,6 +30,7 @@ misconception the two of them share.
 
 from __future__ import annotations
 
+import itertools
 import subprocess
 from pathlib import Path
 
@@ -38,6 +39,7 @@ import pytest
 
 from music_video_producer.assembly import trim_args
 from music_video_producer.effects import (
+    BRANCH_FRAME_GUARD,
     DEFAULT_LUT_SIZE,
     DEFAULT_LUTS,
     EFFECT_CATALOGUE,
@@ -438,8 +440,8 @@ def test_a_handheld_shake_insets_its_window_by_the_amplitude_on_all_four_sides()
     assert stages([effect("handheld_shake", amplitude=0.03, frequency=3.5)]).geometry == (
         (
             "crop=w=iw*0.94:h=ih*0.94"
-            ":x=(iw-ow)/2+iw*0.03*sin(2*PI*3.5*t)"
-            ":y=(ih-oh)/2+ih*0.03*cos(2*PI*4.795*t)"
+            ":x=(iw-ow)/2+iw*0.03*sin(2*PI*3.5*(t+0))"
+            ":y=(ih-oh)/2+ih*0.03*cos(2*PI*4.795*(t+0))"
         ),
     )
     # At the amplitude's own maximum the inset is at its largest: 1 - 2*0.05 = 0.9, a window
@@ -447,8 +449,8 @@ def test_a_handheld_shake_insets_its_window_by_the_amplitude_on_all_four_sides()
     assert stages([effect("handheld_shake", amplitude=0.05, frequency=10)]).geometry == (
         (
             "crop=w=iw*0.9:h=ih*0.9"
-            ":x=(iw-ow)/2+iw*0.05*sin(2*PI*10*t)"
-            ":y=(ih-oh)/2+ih*0.05*cos(2*PI*13.7*t)"
+            ":x=(iw-ow)/2+iw*0.05*sin(2*PI*10*(t+0))"
+            ":y=(ih-oh)/2+ih*0.05*cos(2*PI*13.7*(t+0))"
         ),
     )
 
@@ -567,8 +569,8 @@ def test_an_omitted_parameter_takes_the_catalogues_default():
     assert stages([effect("handheld_shake", amplitude=0.02)]).geometry == (
         (
             "crop=w=iw*0.96:h=ih*0.96"
-            ":x=(iw-ow)/2+iw*0.02*sin(2*PI*2*t)"
-            ":y=(ih-oh)/2+ih*0.02*cos(2*PI*2.74*t)"
+            ":x=(iw-ow)/2+iw*0.02*sin(2*PI*2*(t+0))"
+            ":y=(ih-oh)/2+ih*0.02*cos(2*PI*2.74*(t+0))"
         ),
     )
     # A spec carrying no `parameters` key at all is the same thing as one carrying an empty map.
@@ -655,7 +657,7 @@ def test_every_declared_default_is_pinned_as_a_literal():
     a default that drifted from 1 to 0 satisfies it exactly as well, and a Contrast card that
     silently defaulted to 0 would ship a black frame with every test in this file green.
 
-    So the twenty rows below are the contract. They are asserted on the *resolved values*
+    So the twenty-five rows below are the contract. They are asserted on the *resolved values*
     rather than on stage text because an effect sitting at its identity now composes no stage
     at all — the point is that a default cannot drift unnoticed, not that it produces a filter.
     `lut_look` is the one entry with a parameter that declares no default at all, so its look
@@ -663,6 +665,7 @@ def test_every_declared_default_is_pinned_as_a_literal():
     """
     expected: dict[str, dict[str, object]] = {
         "punch_in": {"zoom": 1.0},
+        "slow_zoom": {"zoom": 1.0, "direction": "in"},
         "handheld_shake": {"amplitude": 0.0, "frequency": 2.0},
         "dutch_tilt": {"angle": 0.0},
         "mirror": {"axis": "horizontal"},
@@ -671,6 +674,7 @@ def test_every_declared_default_is_pinned_as_a_literal():
         "soft_focus": {"sigma": 0.0},
         "sharpen": {"amount": 0.0},
         "banding_suppression": {"threshold": 0.0001},
+        "bloom": {"intensity": 0.0, "threshold": 0.7, "radius": 8.0},
         "lut_look": {"lut": "a-look-the-folder-need-not-hold", "interp": "tetrahedral"},
         "exposure": {"amount": 0.0},
         "contrast": {"amount": 1.0},
@@ -682,6 +686,9 @@ def test_every_declared_default_is_pinned_as_a_literal():
         "chroma_split": {"shift": 0.0},
         "posterize": {"levels": 256},
         "pixelate": {"size": 1},
+        "edge_treatment": {"strength": 0.0, "low": 0.08, "high": 0.2},
+        "scanlines": {"strength": 0.0, "lines": 200},
+        "pixel_shuffle": {"amount": 0.0, "block": 8, "seed": 0},
     }
     assert set(expected) == set(EFFECT_CATALOGUE), "every catalogue entry must be pinned"
 
@@ -693,13 +700,16 @@ def test_every_declared_default_is_pinned_as_a_literal():
         (resolved,) = validate_stack([spec])
         assert dict(resolved.values) == values, effect_id
 
-    # Three of those are counts rather than fractions, and the difference is not visible in a
+    # Six of those are counts rather than fractions, and the difference is not visible in a
     # comparison — `0 == 0.0` — but it is visible in a filter string, where `seed=0.0` is not a
     # seed ffmpeg accepts. So the whole-number parameters are asserted to come back whole.
     for effect_id, parameter_name in (
         ("grain", "seed"),
         ("posterize", "levels"),
         ("pixelate", "size"),
+        ("scanlines", "lines"),
+        ("pixel_shuffle", "block"),
+        ("pixel_shuffle", "seed"),
     ):
         (resolved,) = validate_stack([{"effect": effect_id}])
         assert isinstance(resolved.values[parameter_name], int), effect_id
@@ -876,8 +886,8 @@ def test_a_refusal_prints_the_number_it_was_given_and_not_a_filter_rounding():
     ).geometry == (
         (
             "crop=w=iw*0.98:h=ih*0.98"
-            ":x=(iw-ow)/2+iw*0.01*sin(2*PI*0.123457*t)"
-            ":y=(ih-oh)/2+ih*0.01*cos(2*PI*0.169136*t)"
+            ":x=(iw-ow)/2+iw*0.01*sin(2*PI*0.123457*(t+0))"
+            ":y=(ih-oh)/2+ih*0.01*cos(2*PI*0.169136*(t+0))"
         ),
     )
 
@@ -1518,6 +1528,7 @@ def test_every_stage_the_catalogue_can_emit_is_accepted_by_this_projects_ffmpeg(
     luts = discover_luts(tmp_path)
     exercised: dict[str, dict[str, object]] = {
         "punch_in": {"zoom": 1.4},
+        "slow_zoom": {"zoom": 1.5, "direction": "out"},
         "handheld_shake": {"amplitude": 0.03, "frequency": 3.5},
         "dutch_tilt": {"angle": -8.5},
         "mirror": {"axis": "both"},
@@ -1526,6 +1537,7 @@ def test_every_stage_the_catalogue_can_emit_is_accepted_by_this_projects_ffmpeg(
         "soft_focus": {"sigma": 3.5},
         "sharpen": {"amount": 1.25},
         "banding_suppression": {"threshold": 0.02},
+        "bloom": {"intensity": 0.65, "threshold": 0.55, "radius": 9.5},
         "lut_look": {"lut": luts[0].lut_id, "interp": "trilinear"},
         "exposure": {"amount": 0.2},
         "contrast": {"amount": 1.6},
@@ -1537,6 +1549,9 @@ def test_every_stage_the_catalogue_can_emit_is_accepted_by_this_projects_ffmpeg(
         "chroma_split": {"shift": 0.008},
         "posterize": {"levels": 6},
         "pixelate": {"size": 4},
+        "edge_treatment": {"strength": 0.6, "low": 0.12, "high": 0.35},
+        "scanlines": {"strength": 0.45, "lines": 120},
+        "pixel_shuffle": {"amount": 0.4, "block": 6, "seed": 4242},
     }
     assert set(exercised) == set(EFFECT_CATALOGUE), "every catalogue entry must be exercised"
 
@@ -1554,6 +1569,11 @@ def test_every_stage_the_catalogue_can_emit_is_accepted_by_this_projects_ffmpeg(
             width=320,
             height=240,
             luts=luts,
+            # A clip that begins a third of the way into a two-second Shot, so the two stages
+            # that read the clock and the one that ramps over the Shot are all exercised away
+            # from the zero every other test in this file composes at.
+            clip_offset=0.75,
+            shot_seconds=2.0,
         )
         dest = tmp_path / f"{effect_id}.mp4"
         result = subprocess.run(
@@ -1579,23 +1599,27 @@ def test_every_stage_the_catalogue_can_emit_is_accepted_by_this_projects_ffmpeg(
         assert frame_grid(dest) == (320, 240, 6), effect_id
 
 
-def test_all_twenty_effects_stacked_at_once_render_through_the_real_chain(tmp_path: Path):
+def test_the_whole_catalogue_stacked_at_once_renders_through_the_real_chain(tmp_path: Path):
     """One render of a *combination*, because every other real render in this file is one
     effect — or grain and a vignette — and combinations are string-only otherwise.
 
     The whole catalogue at once is the extreme of the matrix: four families, both insertion
-    points, two effects that compose to more than one stage, a geometry group that crops three
-    separate times before `scale` and a treatment group of seventeen filters between `scale`
-    and `pad`. It is also the only place the escaped comma inside Dutch Tilt's `max()` shares a
-    chain with twenty-two other comma-separated stages.
+    points, three effects that compose to more than one stage, four branched filtergraphs
+    sharing one comma-joined chain with twenty unbranched filters, and both of the stages that
+    read the clip's place inside its Shot. It is also the only place the escaped comma inside
+    Dutch Tilt's `max()` shares a chain with everything else that escapes one — Slow Zoom's
+    `min()`, Bloom's `if(gt(...))` and Scanlines' two `max()`es.
 
-    The frame grid is the assertion that matters: twenty filters deep, six frames in at the
-    export's geometry must still be six frames out at the export's geometry.
+    The frame grid is the assertion that matters: twenty-nine filters deep and four branches in,
+    six frames in at the export's geometry must still be six frames out at the export's
+    geometry. That is the claim `BRANCH_FRAME_GUARD` exists to keep, and without it this is
+    exactly the render that comes back one frame short.
     """
     write_default_luts(lut_directory(tmp_path), size=5)
     luts = discover_luts(tmp_path)
     everything = [
         effect("punch_in", zoom=1.2),
+        effect("slow_zoom", zoom=1.3, direction="in"),
         effect("handheld_shake", amplitude=0.02, frequency=3),
         effect("dutch_tilt", angle=-6),
         effect("mirror", axis="both"),
@@ -1604,6 +1628,7 @@ def test_all_twenty_effects_stacked_at_once_render_through_the_real_chain(tmp_pa
         effect("soft_focus", sigma=1.5),
         effect("sharpen", amount=0.8),
         effect("banding_suppression", threshold=0.01),
+        effect("bloom", intensity=0.5, threshold=0.6, radius=6),
         effect("lut_look", lut=luts[0].lut_id, interp="trilinear"),
         effect("exposure", amount=0.1),
         effect("contrast", amount=1.3),
@@ -1615,15 +1640,26 @@ def test_all_twenty_effects_stacked_at_once_render_through_the_real_chain(tmp_pa
         effect("chroma_split", shift=0.006),
         effect("posterize", levels=12),
         effect("pixelate", size=3),
+        effect("edge_treatment", strength=0.5, low=0.1, high=0.3),
+        effect("scanlines", strength=0.35, lines=90),
+        effect("pixel_shuffle", amount=0.3, block=6, seed=7),
     ]
     assert {spec["effect"] for spec in everything} == set(EFFECT_CATALOGUE)
 
-    built = build_effect_stages(everything, width=320, height=240, luts=luts)
-    # Six geometry stages before `scale` from four effects — Dutch Tilt is two of them and
-    # Mirror on both axes is two more — and seventeen treatments from sixteen effects, the
-    # extra being Lift/Gamma/Gain's inseparable pair.
-    assert len(built.geometry) == 6
-    assert len(built.treatment) == 17
+    built = build_effect_stages(
+        everything, width=320, height=240, luts=luts, clip_offset=1.25, shot_seconds=4.0
+    )
+    # Eight geometry stages before `scale` from five effects — Dutch Tilt is two of them, Mirror
+    # on both axes is two more, and the first is the branch guard, which is a stage no effect
+    # asked for — and twenty-one treatments from twenty effects, the extra being
+    # Lift/Gamma/Gain's inseparable pair.
+    assert built.geometry[0] == BRANCH_FRAME_GUARD
+    assert len(built.geometry) == 8
+    assert len(built.treatment) == 21
+    # Four of those twenty-nine are filtergraphs rather than filters: Slow Zoom, Bloom, Edge
+    # Treatment and Pixel Shuffle. Scanlines is the fifth new effect and is not one of them.
+    branches = [stage for stage in (*built.geometry, *built.treatment) if ";" in stage]
+    assert len(branches) == 4, branches
 
     source = tmp_path / "source.mp4"
     assert (
@@ -1887,3 +1923,338 @@ def test_a_stack_the_validator_would_refuse_still_gets_a_name():
     assert len(named) == 64
     assert named == a_fingerprint(stack=ugly)
     assert named != a_fingerprint()
+
+
+# ------------------------------------------------------------------------------------------
+# Story 9.7 — the branch, the frame it costs, and the clip's place inside its Shot.
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_branch_is_one_stage_and_a_whole_filtergraph():
+    """The shape, pinned as text like every other chain in this application.
+
+    One string, spliced into the comma-joined chain by a `trim_args` that knows nothing about
+    it: three chains separated by `;`, the first ending on two labelled outputs so the comma
+    that follows the whole thing belongs to the *last* chain, and exactly one unlabelled input
+    and one unlabelled output left over — which is what makes it legal for `-vf`.
+    """
+    (branch,) = stages([effect("bloom", intensity=0.5, threshold=0.6, radius=6)]).treatment
+    assert branch == (
+        "split=2[fx0a][fx0b];"
+        r"[fx0b]lutyuv=y=if(gt(val\,147)\,val\,0):u=0:v=0,gblur=sigma=6[fx0c];"
+        "[fx0a][fx0c]blend=all_mode=screen:all_opacity=0.5"
+    )
+    # A comma-joined chain of one branch and one plain filter is still one `-vf` argument, and
+    # the plain filter joins the branch's *last* chain rather than opening a fourth one.
+    built = stages(
+        [
+            effect("bloom", intensity=0.5, threshold=0.6, radius=6),
+            effect("vignette", angle=0.7),
+        ]
+    )
+    assert ",".join(built.treatment).endswith(
+        "[fx0a][fx0c]blend=all_mode=screen:all_opacity=0.5,vignette=angle=0.7"
+    )
+
+
+def test_two_branches_of_the_same_effect_do_not_share_a_label():
+    """Nothing forbids two Blooms in one stack, and two branches named alike is an ffmpeg
+    error rather than a different picture. The labels carry the effect's slot, so they cannot
+    collide however many of one effect a Director stacks."""
+    built = stages(
+        [
+            effect("bloom", intensity=0.4, radius=4),
+            effect("bloom", intensity=0.8, radius=20),
+        ]
+    )
+    assert len(built.treatment) == 2
+    assert "[fx0a][fx0b]" in built.treatment[0]
+    assert "[fx1a][fx1b]" in built.treatment[1]
+
+
+def test_a_branchs_labels_are_counted_over_the_composed_order_and_not_the_stored_one():
+    """AD-31, applied to the one thing that could have made storage order load-bearing again.
+
+    The slot a branch names its links from is its position in the *composed* chain — family
+    order first, the Director's order within a family — so a stack stored the other way round
+    composes to the same text rather than to a graph whose labels ran backwards.
+    """
+    ordered = stages(
+        [effect("bloom", intensity=0.5), effect("pixel_shuffle", amount=0.3, block=6, seed=1)]
+    )
+    stored_backwards = stages(
+        [effect("pixel_shuffle", amount=0.3, block=6, seed=1), effect("bloom", intensity=0.5)]
+    )
+    assert ordered == stored_backwards
+    # Texture is composed before Stylize, so Bloom is slot 0 in both.
+    assert "[fx0a][fx0b]" in ordered.treatment[0]
+    assert "[fx1a][fx1b]" in ordered.treatment[1]
+
+
+def test_the_guard_arrives_with_the_first_branch_and_never_without_one():
+    """It is a property of the chain rather than of any effect in it, so it is decided once
+    over the finished groups — one framesync filter costs the chain one frame at its `fps`
+    stage and four cost it the same one — and it goes at the head of the whole chain, which is
+    the head of the geometry group whether or not any geometry effect is in the stack."""
+    unbranched = stages([effect("grain", strength=8), effect("punch_in", zoom=1.2)])
+    assert not unbranched.branched
+    assert BRANCH_FRAME_GUARD not in unbranched.geometry
+
+    treatment_only = stages([effect("bloom", intensity=0.5)])
+    assert treatment_only.branched
+    assert treatment_only.geometry == (BRANCH_FRAME_GUARD,)
+
+    four = stages(
+        [
+            effect("slow_zoom", zoom=1.5),
+            effect("bloom", intensity=0.5),
+            effect("edge_treatment", strength=0.4),
+            effect("pixel_shuffle", amount=0.3),
+        ],
+        shot_seconds=6.0,
+    )
+    assert four.geometry[0] == BRANCH_FRAME_GUARD
+    assert len([stage for stage in (*four.geometry, *four.treatment) if ";" in stage]) == 4
+    # One guard, not four.
+    assert list(four.geometry).count(BRANCH_FRAME_GUARD) == 1
+
+
+def test_the_branch_guard_is_the_frame_the_branch_would_otherwise_cost(tmp_path: Path):
+    """The measurement, run rather than quoted — and the reason this story's riskiest change is
+    the splice itself.
+
+    Measured 2026-08-26 against this project's ffmpeg 7.0: a framesync filter — `blend`,
+    `overlay`, every two-input filter there is — reports end-of-file at the **last frame's**
+    presentation timestamp rather than one frame's duration past it, so the `fps` stage that
+    closes every chain emits one frame fewer than it was handed, with `1 frames dropped` in
+    ffmpeg's own accounting and **exit code zero**. Twenty-four frames in, twenty-three out, on
+    a chain nothing reports a problem with. Every later Shot in the export would then sit one
+    frame early against the song, and go on doing it for every branched Shot in the timeline.
+
+    Both halves are asserted, because pinning only the fix would let the fix quietly become
+    unnecessary and stay: without the guard the render really is short, and with it the count
+    is exactly right. If a later ffmpeg stops dropping the frame, the first half of this fails
+    and says so — and the guard is still harmless then, because `trim_args` always closes with
+    `-frames:v`, which caps the count from above whichever way `fps` behaves.
+    """
+    source = tmp_path / "source.mp4"
+    assert (
+        ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=s=320x240:d=1:r=24", "-frames:v", "24",
+            "-pix_fmt", "yuv420p", str(source),
+        ).returncode
+        == 0
+    )
+    built = stages([effect("bloom", intensity=0.6, threshold=0.5, radius=6)])
+    assert built.geometry == (BRANCH_FRAME_GUARD,)
+
+    def render(name: str, geometry: tuple[str, ...]) -> tuple[int, int, int]:
+        dest = tmp_path / f"{name}.mp4"
+        result = subprocess.run(
+            trim_args(
+                source, dest, frames=24, width=320, height=240,
+                geometry_stages=geometry, treatment_stages=built.treatment,
+            ),
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr.strip()
+        return frame_grid(dest)
+
+    # The source holds exactly the frames asked for, which is the case the loss is visible in:
+    # a take with frames to spare never reaches the end of the graph and never sees it.
+    assert render("guarded", built.geometry) == (320, 240, 24)
+    assert render("unguarded", ()) == (320, 240, 23)
+
+
+def test_a_branch_at_its_identity_renders_the_frames_it_was_handed(tmp_path: Path):
+    """The guard bought a frame back; this is the proof that it did not buy back a *different*
+    frame, and that a branch is otherwise transparent.
+
+    Bloom composed above every pixel in the source is the identity by construction: its leg
+    finds no highlight, `screen(a, 0) = a` on all three planes, and the two copies recombine
+    into the frame they were split from. So a branched chain — split, threshold, blur, blend,
+    guard and all — must produce the **bit-identical** frames of a chain with no effects in it.
+    Compared as frame checksums rather than as PSNR, because bit-identical is the claim; R-20
+    forbids asserting on the encoded file, and `framemd5` reads the decoded frames.
+
+    The clip is cut at an offset, because that is the case the compensating frame cannot be
+    added at the *end* of the chain: `setpts=PTS-STARTPTS` zeroes every frame's duration, so a
+    clone appended after the branch inherits the previous frame's timestamp and `fps` throws it
+    away as a duplicate. Measured — it comes back one frame short with the guard at the end and
+    exactly right with it at the front.
+    """
+    source = tmp_path / "source.mp4"
+    # Clamped below Bloom's own maximum threshold, so nothing in the frame can bloom whatever
+    # the blur does with it.
+    assert (
+        ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=s=320x240:d=1:r=24",
+            "-vf", r"lutyuv=y=clip(val\,16\,200)",
+            "-frames:v", "24", "-pix_fmt", "yuv420p", str(source),
+        ).returncode
+        == 0
+    )
+    built = stages([effect("bloom", intensity=1.0, threshold=1.0, radius=8)])
+    assert built.branched and built.geometry == (BRANCH_FRAME_GUARD,)
+
+    def checksums(name: str, composed: EffectStages) -> list[str]:
+        dest = tmp_path / f"{name}.mp4"
+        result = subprocess.run(
+            trim_args(
+                source, dest, frames=18, width=320, height=240, offset=0.25,
+                geometry_stages=composed.geometry, treatment_stages=composed.treatment,
+            ),
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr.strip()
+        digests = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", dest.as_posix(), "-f", "framemd5", "-"],
+            capture_output=True, text=True, check=False,
+        )
+        assert digests.returncode == 0, digests.stderr.strip()
+        return [
+            line.rsplit(",", 1)[-1].strip()
+            for line in digests.stdout.splitlines()
+            if line and not line.startswith("#")
+        ]
+
+    plain = checksums("plain", EffectStages())
+    branched = checksums("branched", built)
+    assert len(plain) == 18
+    assert branched == plain
+
+
+def test_scanlines_draw_rows_and_no_column_at_all(tmp_path: Path):
+    """The one measured fact `drawgrid` does not advertise: it always draws a *vertical* line
+    too, and the default placement puts it down the very first column of the picture.
+
+    Measured 2026-08-26 on a white frame: with a cell one frame wide, column 0 samples 126
+    against 255 everywhere else — a dark stripe down the left edge of every scanlined shot,
+    which nobody asked for and a still of the middle of the frame would never show. A cell
+    twice the frame's width with its origin one pixel outside puts every column the grid would
+    draw beyond the picture, and none survives. The rows are unaffected, which is the other
+    half of the assertion.
+    """
+    source = tmp_path / "white.mp4"
+    assert (
+        ffmpeg(
+            "-f", "lavfi", "-i", "color=c=white:s=64x60:d=1:r=24",
+            "-frames:v", "2", "-pix_fmt", "yuv420p", str(source),
+        ).returncode
+        == 0
+    )
+    built = build_effect_stages(
+        [effect("scanlines", strength=0.5, lines=20)], width=64, height=60
+    )
+    assert built.treatment == (
+        r"drawgrid=x=-1:y=0:w=iw*2:h=max(2\,trunc(ih/20)):t=max(1\,trunc(ih/20/2)):c=black@0.5",
+    )
+    dest = tmp_path / "scanlined.mp4"
+    assert (
+        subprocess.run(
+            trim_args(
+                source, dest, frames=2, width=64, height=60,
+                treatment_stages=built.treatment,
+            ),
+            capture_output=True, check=False,
+        ).returncode
+        == 0
+    )
+    raw = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", dest.as_posix(), "-frames:v", "1",
+            "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+        ],
+        capture_output=True, check=False,
+    ).stdout
+    frame = np.frombuffer(raw, dtype=np.uint8).reshape(60, 64, 3)
+    # A frame 60 rows tall at 20 lines is a cell of 3 and a line of 1: every third row dark.
+    column = [int(value) for value in frame[:, 32, 0]]
+    assert column[0] < 200 and column[1] == 255 and column[2] == 255
+    assert column[3] < 200
+    # And no column is darker than its neighbours anywhere, the left edge included.
+    undarkened = frame[1, :, 0]
+    assert int(undarkened.min()) == 255, list(undarkened[:4])
+
+
+def test_slow_zoom_ramps_across_a_seam_as_one_move_and_never_samples_outside(tmp_path: Path):
+    """The effect that needed the Shot's own length, and the reason `shot_seconds` is the
+    **Shot's** window rather than the clip's.
+
+    A ramp measured against the clip would restart at the seam, which is the defect the pairing
+    exists to remove; measured against the Shot, the second clip picks it up where the first one
+    left it. Both are written out below at a seam five seconds into an eight-second Shot: the
+    same denominator, and only the numerator moved.
+
+    The scale factor never goes below 1 in either direction, which is FX-11's bound as
+    arithmetic — a factor under 1 would show the frame's own edge — and the real render at the
+    end is the frame rule: the branch changes the picture, not the grid it is on.
+    """
+    first = stages(
+        [effect("slow_zoom", zoom=1.4, direction="in")], clip_offset=0.0, shot_seconds=8.0
+    )
+    second = stages(
+        [effect("slow_zoom", zoom=1.4, direction="in")], clip_offset=5.0, shot_seconds=8.0
+    )
+    assert first.geometry[1] == (
+        "split=2[fx0a][fx0b];"
+        r"[fx0b]scale=w=trunc(iw*(1+0.4*min((t+0)/8\,1))/2)*2"
+        r":h=trunc(ih*(1+0.4*min((t+0)/8\,1))/2)*2:eval=frame[fx0c];"
+        "[fx0a][fx0c]overlay=x=(W-w)/2:y=(H-h)/2:eval=frame"
+    )
+    assert second.geometry[1] == first.geometry[1].replace("(t+0)", "(t+5)")
+
+    # Zooming out starts at the target and returns to 1, so the factor is still never below it.
+    out = stages(
+        [effect("slow_zoom", zoom=1.4, direction="out")], clip_offset=0.0, shot_seconds=8.0
+    )
+    assert r"trunc(iw*(1.4-0.4*min((t+0)/8\,1))/2)*2" in out.geometry[1]
+
+    # No span, no ramp: refused by name rather than dividing by a length nobody gave it.
+    with pytest.raises(EffectRefusal) as refusal:
+        stages([effect("slow_zoom", zoom=1.4)])
+    assert str(refusal.value) == (
+        "'slow_zoom' ramps over its Shot's own length, and no length was given to compose it "
+        "against. Nothing was composed."
+    )
+
+    # And it really zooms, measured on the picture: a white square on black grows with the ramp
+    # and the frame it grows inside does not.
+    source = tmp_path / "square.mp4"
+    assert (
+        ffmpeg(
+            "-f", "lavfi", "-i", "color=c=black:s=160x120:d=2:r=24",
+            "-vf", "drawbox=x=60:y=40:w=40:h=40:color=white:t=fill",
+            "-frames:v", "48", "-pix_fmt", "yuv420p", str(source),
+        ).returncode
+        == 0
+    )
+    built = stages(
+        [effect("slow_zoom", zoom=2.0, direction="in")], clip_offset=0.0, shot_seconds=2.0
+    )
+    dest = tmp_path / "zoomed.mp4"
+    assert (
+        subprocess.run(
+            trim_args(
+                source, dest, frames=48, width=160, height=120,
+                geometry_stages=built.geometry, treatment_stages=built.treatment,
+            ),
+            capture_output=True, check=False,
+        ).returncode
+        == 0
+    )
+    assert frame_grid(dest) == (160, 120, 48)
+    raw = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", dest.as_posix(), "-frames:v", "48",
+            "-pix_fmt", "gray", "-f", "rawvideo", "-",
+        ],
+        capture_output=True, check=False,
+    ).stdout
+    frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 120, 160)
+    white = [int((frame > 200).sum()) for frame in frames]
+    # The square starts its own size and ends near four times it, because area goes as the
+    # square of a zoom that reaches 2. Monotone throughout: one move, not a stutter.
+    assert 1500 <= white[0] <= 1700
+    assert white[-1] > 3 * white[0]
+    assert all(later >= earlier - 8 for earlier, later in itertools.pairwise(white))

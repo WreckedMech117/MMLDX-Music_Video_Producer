@@ -106,6 +106,64 @@ keyword.
 The grid is **33 cubed**: measured during research at 330 ms per 120 1080p frames against 319 ms
 for 17 cubed, so the finer lattice is very nearly free, while 17 cubed visibly quantises
 gradients.
+
+---
+
+**A stage may be a filtergraph rather than a filter** (story 9.7). `-vf` takes a whole graph
+description, not only a comma-joined chain: `;` separates chains and `[label]` names a link, and
+a graph is still legal for `-vf` as long as exactly one input and one output are left unlabelled.
+So a composer that needs two inputs emits **one** string that happens to contain semicolons, and
+`assembly.trim_args` joins it with its neighbours by a comma exactly as before, knowing nothing
+about it. The shape is always the same, and `_branch_stage` is the only thing that writes it:
+
+```
+split=2[fx3a][fx3b];[fx3b]<the treated leg>[fx3c];[fx3a][fx3c]<the recombination>
+```
+
+The first chain ends on two *labelled* outputs, so the comma that follows it in the joined chain
+is the separator of the last chain rather than of the first — which is why the branch has to be
+written as three chains and not as a `split` whose legs are spliced in separately. The labels
+carry the effect's **slot**, its position in the composed chain, because nothing forbids a stack
+from holding two Blooms and two branches sharing a label name is an ffmpeg error, not a
+different picture. The slot is counted over the *composed* order, so storage order stays
+un-load-bearing (AD-31).
+
+**A branch costs one frame, and the frame is bought back at the head of the chain.** Measured
+2026-08-26 against this project's ffmpeg 7.0: any framesync filter — `blend`, `overlay`, every
+two-input filter there is — reports end-of-file at the *last frame's* presentation timestamp
+rather than one frame's duration past it, and the `fps` stage that closes every chain therefore
+emits one frame fewer than it was handed. 48 frames in, 47 out, with `1 frames dropped` in
+ffmpeg's own accounting, at every branch count from one to four (the loss is a property of the
+graph's end, not of how many branches are in it). It is worse than a rounding: with
+`setpts=PTS-STARTPTS` upstream — which every clip at a non-zero offset gets — frame durations
+are zeroed, so nothing appended *after* the branch can restore the frame either, because a
+cloned frame inherits the previous one's timestamp and `fps` discards it as a duplicate.
+
+`BRANCH_FRAME_GUARD` is the answer, and it is placed **first in the whole effect chain**, ahead
+of the geometry group, where frame durations are still the decoder's. It clones one frame onto
+the end of the stream, `fps` drops one, and the count is exactly what it was. Verified as
+content and not only as a count: a branch composed at its identity values, guard and all, is
+**bit-identical** to the same chain with no effects at all — 20 of 20 frames at `inf` PSNR — so
+the cloned frame never reaches the file. And it cannot over-deliver either, because `trim_args`
+always closes with `-frames:v`, which caps the count from above whether or not `fps` drops
+anything.
+
+**A composer knows where its clip sits inside its Shot.** `assembly_plan` resolves a Shot with
+another nested inside it into *two* `ClipWindow`s carrying one shot id, and `trim_args` restarts
+the graph clock at zero for each of them. A stage that reads `t` would therefore replay itself
+partway through the Shot — `handheld_shake` snapping back to phase zero, `grain` running the
+same noise sequence twice. So `StageContext` carries `clip_offset`, the seconds from the Shot's
+first frame to this clip's first frame, and every stage that is a function of time is a function
+of `t + clip_offset` instead. The offset is always written, including the `+ 0` of a Shot that
+was never split, so that the difference between two clips of one Shot is visible in the text as
+exactly their difference in the timeline.
+
+`shot_seconds` is the other half, and it is the **Shot's** whole window rather than the clip's
+own length. A slow zoom given the clip's length would restart its ramp at the seam, which is the
+defect this pairing exists to remove; given the Shot's, the second clip picks the ramp up where
+the first one left it. Neither number is discoverable here — `effects.py` imports the standard
+library and nothing else, and `assembly.py` does not import this module back — so both arrive
+through the caller, from the `ClipWindow` the export is already iterating.
 """
 
 from __future__ import annotations
@@ -121,6 +179,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "BRANCH_FRAME_GUARD",
     "DEBAND_FLOOR",
     "DEFAULT_LUTS",
     "DEFAULT_LUT_SIZE",
@@ -136,9 +195,12 @@ __all__ = [
     "LUT_HEADER_SCAN_BYTES",
     "LUT_SCAN_CHUNK_BYTES",
     "LUT_SUFFIX",
+    "MAX_LUMA_CODE",
+    "MIN_LUMA_CODE",
     "PREVIEW_FINGERPRINT_INPUTS",
     "PRE_PAD_FAMILIES",
     "PRE_SCALE_FAMILIES",
+    "SEAM_SEED_PER_SECOND",
     "ChoiceParameter",
     "EffectDefinition",
     "EffectRefusal",
@@ -334,6 +396,15 @@ EFFECT_LUT_PATH_UNUSABLE_REFUSAL = (
     "The look {lut!r} cannot be loaded because its path contains an apostrophe, which ffmpeg's "
     "filter parser has no escape for: {path}. Rename the folder or move the looks elsewhere. "
     "Nothing was composed."
+)
+#: Why an effect that ramps over its Shot could not be composed. Unreachable from the
+#: application — a Shot's duration is `gt=0` on the model and both callers read it from a
+#: `ClipWindow` — so this is a guard on the *caller*, not a sentence a Director is expected to
+#: meet: a `build_effect_stages` that was handed no span would otherwise divide by zero inside a
+#: filter expression and fail in ffmpeg with a message about the wrong thing entirely.
+EFFECT_NO_SPAN_REFUSAL = (
+    "{effect!r} ramps over its Shot's own length, and no length was given to compose it "
+    "against. Nothing was composed."
 )
 
 
@@ -796,11 +867,28 @@ class StageContext:
 
     Geometry composers run before `scale` and therefore address the take's pixels through ffmpeg's
     own `iw`/`ih`, which is why none of them read these numbers at all.
+
+    **`clip_offset` and `shot_seconds` are where this clip sits inside its Shot**, and they are
+    the reason a time-dependent stage does not replay itself at a seam. See the module
+    docstring: a Shot with another nested inside it becomes two clips, each of which starts the
+    filter graph's clock at zero, so every stage that reads `t` reads `t + clip_offset` instead.
+    `shot_seconds` is the **Shot's** whole window and never the clip's own length — a ramp
+    measured against the clip would restart at the seam, which is the whole defect.
+
+    **`slot` is this effect's position in the composed chain**, and it exists for exactly one
+    purpose: naming the links of a branched stage. Nothing forbids a stack from holding two
+    Blooms, and two branches sharing a label is an ffmpeg error rather than a different picture.
+    It counts the *composed* order rather than the stored one, so a stack copied or hand-edited
+    out of family order still composes to the same text (AD-31). No composer may read it for
+    anything else; it is a name, not a number about the picture.
     """
 
     width: int
     height: int
     lut_arguments: Mapping[str, str] = field(default_factory=dict)
+    clip_offset: float = 0.0
+    shot_seconds: float = 0.0
+    slot: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -843,6 +931,55 @@ def _message_number(value: float) -> str:
     return repr(float(value)).removesuffix(".0")
 
 
+#: The one stage no effect asks for and every branched chain needs, placed **first** in the whole
+#: chain — ahead of the geometry group, where a frame still carries the duration the decoder gave
+#: it. See the module docstring for the measurement: a framesync filter reports end-of-file at the
+#: last frame's timestamp rather than a frame's duration past it, so the `fps` stage that closes
+#: every chain emits one frame fewer than it received, and the frame rule is broken by a graph
+#: that ffmpeg reports no error about. This clones one frame onto the end; `fps` drops one; the
+#: count is what it was. It is emitted only when something in the chain actually branched, so an
+#: unbranched chain is the chain it has always been, stage for stage.
+BRANCH_FRAME_GUARD = "tpad=stop=1:stop_mode=clone"
+
+#: The luma code range a `lutyuv` threshold is written in. A parameter stored as 0..1 means
+#: "where between black and white", and these are what black and white are on the wire — written
+#: out rather than left as 0..255, because a threshold of 0 that lands at code 0 would sit below
+#: every pixel in a legal-range picture and a threshold of 1 at 255 above every one of them.
+MIN_LUMA_CODE = 16
+MAX_LUMA_CODE = 235
+
+#: How a clip's offset within its Shot is turned into a seed step, for the one stage that has no
+#: expression to offset. A millisecond is finer than a frame at every rate this application
+#: renders, so two clips of one Shot can only land on the same seed by beginning at the same
+#: moment — and two clips beginning at the same moment are one clip.
+SEAM_SEED_PER_SECOND = 1000
+
+
+def _branch_stage(
+    context: StageContext, *, leg: str, join: str, leg_on_top: bool = False
+) -> str:
+    """One stage that is a filtergraph rather than a filter: `split`, a treated leg, a rejoin.
+
+    The only writer of a branch in this module, so the label convention lives in exactly one
+    place. `leg` is the chain the copy is put through — one filter or several, comma-joined like
+    any other chain — and `join` is the two-input filter that puts it back together with the
+    untouched copy.
+
+    `leg_on_top` picks which of the two the rejoin reads first, and it is not cosmetic: `blend`
+    treats its **first** input as the top layer and mixes as `top*(1-opacity) + f(top, bottom)`
+    for a mode, or `top*opacity + bottom*(1-opacity)` for `normal` — measured 2026-08-26. So an
+    effect whose dial means "how much of the treatment" wants the untouched copy on top for a
+    mode like `screen`, and the treated copy on top for `normal`, and in both cases an opacity
+    of zero must reproduce the input exactly. Every composer below states which it chose.
+
+    The labels carry `context.slot` because two Blooms in one stack are a legal stack and two
+    branches named alike are an ffmpeg error.
+    """
+    tag = f"fx{context.slot}"
+    inputs = f"[{tag}c][{tag}a]" if leg_on_top else f"[{tag}a][{tag}c]"
+    return f"split=2[{tag}a][{tag}b];[{tag}b]{leg}[{tag}c];{inputs}{join}"
+
+
 # --- Geometry: before `scale`, addressing the take's own pixels through `iw`/`ih`. ---
 
 
@@ -859,6 +996,57 @@ def _compose_punch_in(values: Mapping[str, Any], context: StageContext) -> tuple
         return ()
     zoom = _number(values["zoom"])
     return (f"crop=w=iw/{zoom}:h=ih/{zoom}:x=(iw-ow)/2:y=(ih-oh)/2",)
+
+
+def _compose_slow_zoom(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    r"""A push in or out that takes the Shot's whole length to arrive — the one geometry stage
+    that is a function of time *and* of how long the Shot is.
+
+    **Why it is a branch.** A zoom is a crop whose window changes size, and `crop` cannot do
+    that: its `w` and `h` are evaluated once when the link is configured, and this build has no
+    `eval` option on `crop` at all (`Option not found`, measured). `zoompan` is the filter for
+    the job and cannot be used here either — its output size is an `image_size`, not an
+    expression, so it would have to be told a number, and a geometry stage runs before `scale`
+    and does not know the take's shape. What it *can* do is scale by an expression: `scale` takes
+    `eval=frame` and reads `t`. So the frame is split, one copy is scaled up by the ramp, and
+    `overlay` puts it back over the untouched copy — and `overlay`'s output is the size of its
+    **main** input, which is the untouched copy, so the frame that leaves is the size of the
+    frame that arrived on every frame of the clip. The scaled copy is always the larger of the
+    two and is centred, so it covers the frame completely and the untouched copy underneath is
+    never seen; it is there to hold the geometry, not to be looked at.
+
+    The scale factor is never below 1, in either direction, which is FX-11's bound expressed as
+    arithmetic: a zoom that sampled below 1 would show the frame's own edge. "In" ramps 1 →
+    `zoom`, "out" starts at `zoom` and returns to 1, and both are clamped at the end of the
+    Shot rather than allowed to run past it.
+
+    Both dimensions are rounded down to an even number, because `yuv420p` has half-resolution
+    chroma planes and an odd intermediate size is a shape ffmpeg has to guess at.
+
+    A zoom of exactly 1 is no movement at all: the identity, and no stage.
+    """
+    zoom = float(values["zoom"])
+    if zoom == 1.0:
+        return ()
+    if context.shot_seconds <= 0.0:
+        raise EffectRefusal(EFFECT_NO_SPAN_REFUSAL.format(effect="slow_zoom"))
+    # `t` restarts at zero for every clip of a Shot; the offset is what makes the ramp of a Shot
+    # that became two clips one ramp rather than two. Always written, `+ 0` included, so the
+    # difference between two clips is legible in the text as their difference on the timeline.
+    progress = (
+        rf"min((t+{_number(context.clip_offset)})/{_number(context.shot_seconds)}\,1)"
+    )
+    span = _number(zoom - 1.0)
+    if values["direction"] == "out":
+        factor = f"({_number(zoom)}-{span}*{progress})"
+    else:
+        factor = f"(1+{span}*{progress})"
+    leg = f"scale=w=trunc(iw*{factor}/2)*2:h=trunc(ih*{factor}/2)*2:eval=frame"
+    return (
+        _branch_stage(
+            context, leg=leg, join="overlay=x=(W-w)/2:y=(H-h)/2:eval=frame"
+        ),
+    )
 
 
 def _compose_dutch_tilt(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
@@ -910,6 +1098,13 @@ def _compose_handheld_shake(values: Mapping[str, Any], context: StageContext) ->
     The vertical frequency is offset from the horizontal by an irrational-ish ratio so the two
     axes do not return to the same place together and the motion does not read as a circle.
 
+    **The clock is the Shot's, not the clip's.** `trim_args` prepends `setpts=PTS-STARTPTS` to
+    any clip cut at an offset, so `t` is zero at the start of every clip — and a Shot with
+    another nested inside it *is* two clips. Reading `t` alone, the shake snapped back to phase
+    zero partway through the Shot, on a frame the Director never asked to be a cut. Reading
+    `t + clip_offset` it does not, and the offset is written even when it is zero so that the
+    two clips of one Shot differ in this text by exactly their difference on the timeline.
+
     Amplitude zero is a window the size of the frame that never moves, whatever the frequency
     says: the identity, and no stage.
     """
@@ -920,10 +1115,11 @@ def _compose_handheld_shake(values: Mapping[str, Any], context: StageContext) ->
     vertical_frequency = _number(float(values["frequency"]) * 1.37)
     window = _number(1.0 - 2.0 * amplitude)
     swing = _number(amplitude)
+    clock = f"(t+{_number(context.clip_offset)})"
     stage = (
         f"crop=w=iw*{window}:h=ih*{window}"
-        f":x=(iw-ow)/2+iw*{swing}*sin(2*PI*{frequency}*t)"
-        f":y=(ih-oh)/2+ih*{swing}*cos(2*PI*{vertical_frequency}*t)"
+        f":x=(iw-ow)/2+iw*{swing}*sin(2*PI*{frequency}*{clock})"
+        f":y=(ih-oh)/2+ih*{swing}*cos(2*PI*{vertical_frequency}*{clock})"
     )
     return (stage,)
 
@@ -939,12 +1135,25 @@ def _compose_grain(values: Mapping[str, Any], context: StageContext) -> tuple[st
     seeded from the clock and the same manifest would render a different file every time. That
     would break the standing rule that a render input is a pure function of the manifest.
 
+    **The seed carries the clip's place in its Shot**, and it has to, because `noise` offers no
+    other handle on time. Its `t` flag makes the pattern move frame to frame, but the sequence of
+    patterns is a function of the seed and of how many frames have gone by since the filter
+    started — and `trim_args` starts a new filter graph for every clip. A Shot that became two
+    clips therefore ran the *same* noise twice, which is the one thing grain must never do,
+    because identical grain over a cut is the frame the eye lands on. There is no expression to
+    offset, so the offset moves the seed instead: milliseconds into the Shot, which is finer than
+    a frame at any rate this application renders, so two clips of one Shot cannot collide unless
+    they begin at the same moment — in which case they are one clip.
+
+    A clip that starts at the beginning of its Shot adds nothing, so an unsplit Shot's stage is
+    the stage it has always been, character for character.
+
     Strength zero is grain nobody would see, and the default: no stage.
     """
     if float(values["strength"]) == 0.0:
         return ()
     strength = _number(values["strength"])
-    seed = _number(values["seed"])
+    seed = _number(float(values["seed"]) + round(context.clip_offset * SEAM_SEED_PER_SECOND))
     return (f"noise=alls={strength}:allf=t+u:all_seed={seed}",)
 
 
@@ -985,6 +1194,44 @@ def _compose_banding_suppression(
         return ()
     threshold = _number(values["threshold"])
     return (f"deband=1thr={threshold}:2thr={threshold}:3thr={threshold}:4thr={threshold}",)
+
+
+def _compose_bloom(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    r"""Halation: the picture's own highlights, blurred wide and screened back over it.
+
+    **Why it is a branch.** A glow is the frame combined with a *changed copy of itself*, and no
+    single filter takes two versions of one input. So the frame is split, one copy is reduced to
+    its highlights and blurred, and `blend` screens the two back together.
+
+    The highlight pass is a `lutyuv` that keeps luma above the threshold and takes everything
+    below it to **zero**, and the chroma planes to zero with it. Zero is not black here, it is
+    `screen`'s identity: `screen(a, 0) = a` on every plane, so a bloom leg that found no
+    highlight leaves the picture untouched rather than lifting its blacks or casting its colour.
+    Measured: a threshold above every pixel in the frame renders `inf` PSNR against the same
+    chain with no Bloom in it, on all three planes. Taking the floor to legal black (16) instead
+    lifts every shadow in the frame by up to 16 codes, which is a bloom nobody asked for.
+
+    The untouched copy is the **top** input, so `intensity` mixes from the picture toward the
+    bloomed picture and an intensity of zero is exactly the picture. Zero is the default and
+    composes to no stage at all.
+    """
+    intensity = float(values["intensity"])
+    if intensity == 0.0:
+        return ()
+    threshold = _number(
+        round(MIN_LUMA_CODE + float(values["threshold"]) * (MAX_LUMA_CODE - MIN_LUMA_CODE))
+    )
+    leg = (
+        rf"lutyuv=y=if(gt(val\,{threshold})\,val\,0):u=0:v=0,"
+        f"gblur=sigma={_number(values['radius'])}"
+    )
+    return (
+        _branch_stage(
+            context,
+            leg=leg,
+            join=f"blend=all_mode=screen:all_opacity={_number(intensity)}",
+        ),
+    )
 
 
 # --- Grade. ---
@@ -1141,14 +1388,119 @@ def _compose_pixelate(values: Mapping[str, Any], context: StageContext) -> tuple
     return (f"pixelize=w={size}:h={size}:mode=avg",)
 
 
+def _compose_edge_treatment(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    r"""Canny edges mixed back into the picture, at a strength the Director sets.
+
+    **Why it is a branch.** `edgedetect=mode=colormix` already mixes its edges into the frame,
+    but it mixes them all the way: the only dials it offers are the two thresholds, which decide
+    *which* edges are found rather than how much of them is seen, so an edge look was either
+    fully on or absent. Splitting the frame and crossfading the detected version back over the
+    original turns that into a dial, and the two thresholds go on meaning what they mean.
+
+    The thresholds are ffmpeg's own numbers rather than a friendly pair, the same decision
+    Banding Suppression made: what the catalogue declares and what the filter receives are one
+    number, and a Director reading the filter's documentation is reading about this control.
+
+    The **treated** copy is on top here, because `blend`'s `normal` mode is
+    `top*opacity + bottom*(1-opacity)` — measured 2026-08-26 — so with the edges on top an
+    opacity of `strength` runs from the untouched picture at 0 to the full edge pass at 1. Zero
+    is the default, and composes to nothing.
+    """
+    strength = float(values["strength"])
+    if strength == 0.0:
+        return ()
+    leg = (
+        f"edgedetect=low={_number(values['low'])}:high={_number(values['high'])}:mode=colormix"
+    )
+    return (
+        _branch_stage(
+            context,
+            leg=leg,
+            join=f"blend=all_mode=normal:all_opacity={_number(strength)}",
+            leg_on_top=True,
+        ),
+    )
+
+
+def _compose_scanlines(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    r"""A CRT's horizontal line structure, drawn as a grid with no vertical lines in it.
+
+    The one effect here that is a picture of a *display* rather than of a lens, and the cheapest
+    of the five: `drawgrid` writes translucent black rows straight into the frame, with none of
+    the per-pixel arithmetic a `geq` scanline would cost on every frame of every export.
+
+    **`drawgrid` always draws a vertical line too**, and the trick is where it is put. The grid's
+    columns land at `x = x0 + k*w`, so a cell width of `iw` puts one down the very first column
+    of the picture — measured on a white frame, column 0 at 126 against 255 everywhere else. A
+    cell twice the frame's width with the origin one pixel to the left of it puts every column
+    the grid would draw outside the picture, and nothing vertical survives. Measured on the same
+    frame: every column at 255, and the rows still at 126.
+
+    The spacing is a fraction of `ih` rather than a count of pixels, so a look survives a change
+    of export size — the same argument Chroma Split makes for storing its shift as a fraction —
+    and it is read off the frame the stage is actually handed rather than off the delivery grid,
+    which is `pad`'s business and comes later. Thickness is half the spacing, so the duty cycle
+    is the same at every size, and both are floored at what a picture can represent: a cell of
+    two rows and a line of one, which is a scanline every other row and the tightest a CRT look
+    can honestly get.
+
+    Strength zero is a grid drawn in nothing at all: the default, and no stage.
+    """
+    strength = float(values["strength"])
+    if strength == 0.0:
+        return ()
+    spacing = rf"max(2\,trunc(ih/{int(values['lines'])}))"
+    thickness = rf"max(1\,trunc(ih/{int(values['lines'])}/2))"
+    return (
+        f"drawgrid=x=-1:y=0:w=iw*2:h={spacing}:t={thickness}:c=black@{_number(strength)}",
+    )
+
+
+def _compose_pixel_shuffle(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
+    r"""Blocks of the frame swapped with each other, mixed back over the frame they came from.
+
+    **Why it is a branch.** `shufflepixels` is total: it permutes every block in the frame and
+    offers no strength, so on its own it is a scramble rather than a look. Crossfading the
+    shuffled copy back over the original is what makes it a dial, from an untouched picture at 0
+    to a full datamosh at 1, with the interesting range in between.
+
+    The seed is **always written**, for the same reason Grain's is: `shufflepixels` seeds itself
+    from the clock when it is not told, and a manifest that renders a different file every time
+    is not a render input. Unlike Grain's it carries no clip offset, and that is not an
+    oversight — the permutation is spatial and identical on every frame, so a Shot that became
+    two clips shows the same arrangement across the seam, which is continuity rather than a
+    repeat.
+
+    The **shuffled** copy is on top, so `amount` runs from the picture at 0 to the shuffle at 1
+    under `normal`'s `top*opacity + bottom*(1-opacity)`. Zero is the default and no stage.
+    """
+    amount = float(values["amount"])
+    if amount == 0.0:
+        return ()
+    block = int(values["block"])
+    leg = (
+        f"shufflepixels=mode=block:width={block}:height={block}"
+        f":seed={_number(values['seed'])}"
+    )
+    return (
+        _branch_stage(
+            context,
+            leg=leg,
+            join=f"blend=all_mode=normal:all_opacity={_number(amount)}",
+            leg_on_top=True,
+        ),
+    )
+
+
 #: The catalogue itself. Insertion order is the order a picker would list them in; it has no
 #: effect at all on the chain, which is ordered by family and then by the Director.
 #:
-#: **Deliberately absent, and belonging to story 9.3 rather than to this slice:** slow zoom,
-#: bloom/halation, edge treatment, scanline/CRT and pixel sort. Every one of them needs either a
-#: branched filtergraph (`split`/`blend`) or the clip's own duration, and this chain is a single
-#: comma-joined linear graph spliced into an argv that knows neither. Adding them is a change to
-#: how `trim_args` is built, which is not this slice's to make.
+#: **The five that used to be missing are here** (story 9.7): Slow Zoom, Bloom, Edge Treatment,
+#: Scanlines and Pixel Shuffle. Every one of them needed either a branched filtergraph or the
+#: clip's place inside its Shot, and until the chain could be handed both they could not be
+#: written at all. Four of the five are branches; Scanlines is the one that is not, and it is
+#: here with them because `drawgrid` turned out to do honestly and cheaply what the other four
+#: need two inputs for. FX-9, FX-10 and FX-11's stated minimums are complete at this line.
 _CATALOGUE: tuple[EffectDefinition, ...] = (
     EffectDefinition(
         effect_id="punch_in",
@@ -1158,6 +1510,16 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
             NumberParameter("zoom", "Zoom", default=1.0, minimum=1.0, maximum=2.0),
         ),
         compose=_compose_punch_in,
+    ),
+    EffectDefinition(
+        effect_id="slow_zoom",
+        family=FAMILY_GEOMETRY,
+        label="Slow Zoom",
+        parameters=(
+            NumberParameter("zoom", "Zoom", default=1.0, minimum=1.0, maximum=2.0),
+            ChoiceParameter("direction", "Direction", default="in", choices=("in", "out")),
+        ),
+        compose=_compose_slow_zoom,
     ),
     EffectDefinition(
         effect_id="handheld_shake",
@@ -1241,6 +1603,17 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
             ),
         ),
         compose=_compose_banding_suppression,
+    ),
+    EffectDefinition(
+        effect_id="bloom",
+        family=FAMILY_TEXTURE,
+        label="Bloom",
+        parameters=(
+            NumberParameter("intensity", "Intensity", default=0.0, minimum=0.0, maximum=1.0),
+            NumberParameter("threshold", "Threshold", default=0.7, minimum=0.0, maximum=1.0),
+            NumberParameter("radius", "Radius", default=8.0, minimum=0.5, maximum=40.0),
+        ),
+        compose=_compose_bloom,
     ),
     EffectDefinition(
         effect_id="lut_look",
@@ -1352,6 +1725,44 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
             ),
         ),
         compose=_compose_pixelate,
+    ),
+    EffectDefinition(
+        effect_id="edge_treatment",
+        family=FAMILY_STYLIZE,
+        label="Edge Treatment",
+        parameters=(
+            NumberParameter("strength", "Strength", default=0.0, minimum=0.0, maximum=1.0),
+            NumberParameter("low", "Low Threshold", default=0.08, minimum=0.0, maximum=1.0),
+            NumberParameter("high", "High Threshold", default=0.2, minimum=0.0, maximum=1.0),
+        ),
+        compose=_compose_edge_treatment,
+    ),
+    EffectDefinition(
+        effect_id="scanlines",
+        family=FAMILY_STYLIZE,
+        label="Scanlines",
+        parameters=(
+            NumberParameter("strength", "Strength", default=0.0, minimum=0.0, maximum=1.0),
+            NumberParameter(
+                "lines", "Lines", default=200.0, minimum=20.0, maximum=600.0, integer=True
+            ),
+        ),
+        compose=_compose_scanlines,
+    ),
+    EffectDefinition(
+        effect_id="pixel_shuffle",
+        family=FAMILY_STYLIZE,
+        label="Pixel Shuffle",
+        parameters=(
+            NumberParameter("amount", "Amount", default=0.0, minimum=0.0, maximum=1.0),
+            NumberParameter(
+                "block", "Block Size", default=8.0, minimum=2.0, maximum=64.0, integer=True
+            ),
+            NumberParameter(
+                "seed", "Seed", default=0.0, minimum=0.0, maximum=65535.0, integer=True
+            ),
+        ),
+        compose=_compose_pixel_shuffle,
     ),
 )
 
@@ -1632,6 +2043,18 @@ class EffectStages:
     def __bool__(self) -> bool:
         return bool(self.geometry or self.treatment)
 
+    @property
+    def branched(self) -> bool:
+        """Whether any stage here is a filtergraph rather than a filter.
+
+        A semicolon is the whole test, and it is exact rather than a heuristic: `;` separates
+        chains and nothing else in ffmpeg's grammar, no filter option this catalogue writes
+        contains one, and `_branch_stage` is the only thing in this module that emits one. It is
+        what decides whether `BRANCH_FRAME_GUARD` is needed, and it is read by tests that want
+        to know a branch really reached the argv.
+        """
+        return any(";" in stage for stage in (*self.geometry, *self.treatment))
+
 
 def build_effect_stages(
     stack: Iterable[Mapping[str, Any]],
@@ -1639,8 +2062,10 @@ def build_effect_stages(
     width: int,
     height: int,
     luts: Sequence[LutEntry] = (),
+    clip_offset: float = 0.0,
+    shot_seconds: float = 0.0,
 ) -> EffectStages:
-    """A stack and the export's geometry in; the ordered stages out, in their two groups.
+    """A stack, the export's geometry and the clip's place in its Shot in; the stages out.
 
     **Sorted by family as it reads** (AD-31). The outer loop walks `FAMILY_ORDER` and the inner
     loop walks the stack, which is a stable sort: the fixed order between families, and the
@@ -1654,6 +2079,19 @@ def build_effect_stages(
 
     LUT files are resolved *before* anything is composed, so a look whose file has gone since it
     was discovered is refused by name with nothing half-built behind it.
+
+    **`clip_offset` and `shot_seconds` describe the clip, not the effect.** They default to a
+    clip that begins where its Shot begins and a Shot whose length nothing said, which is what
+    every caller that composes a whole Shot at once wants — the preview, and every clip of a
+    Shot no later Shot nests inside. The one thing the defaults cannot do is compose Slow Zoom,
+    which refuses by name rather than dividing by a length nobody gave it.
+
+    **The branch guard is prepended here rather than by a composer** (see the module docstring).
+    It is a property of the chain and not of any effect in it: one framesync filter anywhere
+    costs the chain one frame at its `fps` stage, and four cost it the same one. So it is
+    decided once, over the finished groups, and it goes at the head of the geometry group —
+    which is the head of the whole chain, the last point at which a frame still carries the
+    duration the decoder gave it. A chain with no branch in it never sees it.
     """
     resolved = validate_stack(stack, luts=luts)
     entries = {entry.lut_id: entry for entry in luts}
@@ -1677,16 +2115,34 @@ def build_effect_stages(
                 )
             lut_arguments[lut_id] = lut_file_argument(entry.path, lut_id=lut_id)
 
-    context = StageContext(width=width, height=height, lut_arguments=lut_arguments)
     geometry: list[str] = []
     treatment: list[str] = []
+    slot = 0
     for family in FAMILY_ORDER:
         target = geometry if family in PRE_SCALE_FAMILIES else treatment
         for effect in resolved:
             if not effect.enabled or effect.family != family:
                 continue
+            # One context per effect, and the only thing that differs between them is the slot:
+            # its position in *this* order, which is what a branch's link labels are named from.
+            # Counted over the composed order rather than the stored one, so a stack that was
+            # copied or hand-edited out of family order composes to the same text (AD-31).
+            context = StageContext(
+                width=width,
+                height=height,
+                lut_arguments=lut_arguments,
+                clip_offset=clip_offset,
+                shot_seconds=shot_seconds,
+                slot=slot,
+            )
+            slot += 1
             target.extend(EFFECT_CATALOGUE[effect.effect_id].compose(effect.values, context))
-    return EffectStages(geometry=tuple(geometry), treatment=tuple(treatment))
+    stages = EffectStages(geometry=tuple(geometry), treatment=tuple(treatment))
+    if not stages.branched:
+        return stages
+    return EffectStages(
+        geometry=(BRANCH_FRAME_GUARD, *stages.geometry), treatment=stages.treatment
+    )
 
 
 # ------------------------------------------------------------------------------------------

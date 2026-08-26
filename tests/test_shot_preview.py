@@ -224,6 +224,54 @@ def test_the_effect_stack_is_actually_applied_by_the_exports_own_chain(tmp_path:
     assert max(grey) - min(grey) <= 8, grey
 
 
+def test_a_branched_effect_previews_at_the_previews_own_geometry(tmp_path: Path):
+    """The preview is the export's chain at half the size, and story 9.7 gave that chain a
+    shape it had never carried: a stage that is a whole filtergraph rather than one filter.
+
+    This is the only other place `build_effect_stages` is called, so it is the only other place
+    a branch reaches ffmpeg — and it reaches it through a different preset, a different
+    geometry and a different offset rule. A Slow Zoom is the branch used, because it is also the
+    stage that needs the Shot's own length, which the preview reads off the Shot rather than off
+    a `ClipWindow`: a preview is always the whole Shot from its own first frame, so its offset
+    inside the Shot is zero and the span is the Shot's window.
+
+    The frame count is asserted because a preview one frame short is a picture of a clip the
+    export will not produce, which is the one thing a preview must never be. It is **not** a
+    test of `BRANCH_FRAME_GUARD`, and saying so is the honest half: a take here runs longer than
+    its window, as every real take does, so the graph never reaches its own end and the frame a
+    branch costs at `fps` is never taken. Removing the guard leaves this test green — measured.
+    The guard's own test is `test_the_branch_guard_is_the_frame_the_branch_would_otherwise_cost`
+    in `tests/test_effects.py`, which renders a source holding exactly the frames asked for.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
+    media = tmp_path / "projects" / project_id / "media"
+
+    written = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{"effect": "slow_zoom", "parameters": {"zoom": 1.6}}]},
+    )
+    assert written.status_code == 200, written.text
+    response = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    clip = media / body["preview"]
+    assert (body["width"], body["height"]) == (96, 54)
+    assert probe(clip, "stream=width,height") == "96,54"
+    # Four seconds of window at 24 fps, and every frame of it: the branch cost the chain
+    # nothing, which is what the guard at the head of it is for.
+    assert body["frames"] == 96
+    counted = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", clip.as_posix(),
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert counted == "96"
+
+
 def test_a_shot_whose_aspect_differs_previews_with_the_letterbox_it_will_ship_with(
     tmp_path: Path,
 ):

@@ -7570,9 +7570,17 @@ class ExportComposition:
     `trim_args` then receives the empty groups it has always defaulted to.
     """
 
-    #: Shot id → its composed chain, for the Shots that have one. Absent means no stages, which
-    #: is what `EffectStages()` at the call site turns into "the argv this route always built".
-    effect_stages: dict[str, EffectStages] = dataclass_field(default_factory=dict)
+    #: **The clip's index in `plan.clips`** → its composed chain, for the clips that have one.
+    #: Absent means no stages, which is what `EffectStages()` at the call site turns into "the
+    #: argv this route always built".
+    #:
+    #: Keyed by clip and not by Shot, which it was until story 9.7. A Shot with a later one
+    #: nested inside it resolves into two clips, and the whole point of that story is that the
+    #: two do **not** get the same filter text: the second one's stages carry where it begins
+    #: inside its Shot, so a shake does not snap back to phase zero and grain does not run the
+    #: same noise twice. The refusals and the provenance below are still judged once per Shot —
+    #: they are facts about the stack, and a Director told the same sentence twice is worse off.
+    effect_stages: dict[int, EffectStages] = dataclass_field(default_factory=dict)
     #: The provenance record of the same composition — what goes onto `RenderJob.look` (FX-25).
     #: Built here rather than at the job write so it cannot describe a different composition from
     #: the one the export is about to run.
@@ -7630,33 +7638,63 @@ def _compose_effect_chains(
     touches the disk. Two shots whose `.cube` files had both been deleted used to name only the
     first: restore it, run again, be told about the second.
 
-    Judged once per Shot rather than once per clip: a shot nested inside another emits two
-    `ClipWindow`s that share these stages, and telling a Director the same sentence twice is a
-    worse answer than telling it once.
+    **Composed once per clip, reported once per Shot.** A Shot with a later one nested inside it
+    resolves into two `ClipWindow`s carrying one shot id, and story 9.7 is the story of those two
+    not being handed identical filter text: each is composed against *where it begins inside its
+    Shot*, so a time-dependent stage carries on across the seam instead of restarting. What is
+    wrong with a stack, though, is wrong with it once — the catalogue's verdict has nothing to do
+    with which clip is being cut — so a refusal is said once and the provenance is recorded once.
 
-    The provenance goes in beside the stages, from the same stack and the same agreed values, so
-    what the record claims and what the argv does cannot drift.
+    **Where a clip sits inside its Shot is read off the `ClipWindow` itself**, and it survives
+    the split for free: `assembly_plan` resolves an overlap with `replace(clip, ...)`, which
+    moves `start`, `duration` and `offset` and leaves the *approved snapshot* alone. So
+    `start - approved_start` is the seconds from the Shot's first frame to this clip's first
+    frame, and `approved_duration` is the Shot's whole window — for every survivor of the split,
+    from the same two fields. They are the snapshot rather than the live window on purpose: the
+    live window is what the split just moved, and the staleness check that ran before this
+    (`EXPORT_PLAN_CHECKS`, and the route raises on its report) has already refused every Shot
+    whose snapshot and window disagree, so the snapshot is the Shot's window here by proof.
+
+    Neither number reaches `assembly.trim_args`, which goes on receiving two lists of finished
+    strings and knowing nothing about the catalogue. They go to `effects.build_effect_stages`,
+    from the plan, in this route — which is the only place that has both.
     """
     plan = subject.plan
     if plan is None or not subject.stacks:
         return []
     luts = subject.looks()
     refusals: list[str] = []
-    judged: set[str] = set()
-    for clip in plan.clips:
+    # Two sets and not one, because they answer different questions about the same Shot.
+    # `reported` is "this Shot's refusal has been said"; `recorded` is "this Shot's look is in
+    # the provenance". Conflating them silences a refusal raised on a Shot's *second* clip
+    # after its first composed cleanly — a `.cube` deleted between the two, which is a
+    # microsecond-wide race and exactly the shape that ships an export missing an effect
+    # nobody was told about (FX-24: never silently dropped).
+    reported: set[str] = set()
+    recorded: set[str] = set()
+    for index, clip in enumerate(plan.clips):
         stack = subject.stacks.get(clip.shot_id)
-        if not stack or clip.shot_id in judged:
+        if not stack:
             continue
-        judged.add(clip.shot_id)
         try:
-            composition.effect_stages[clip.shot_id] = build_effect_stages(
-                stack, width=plan.width, height=plan.height, luts=luts
+            composition.effect_stages[index] = build_effect_stages(
+                stack,
+                width=plan.width,
+                height=plan.height,
+                luts=luts,
+                clip_offset=clip.start - clip.approved_start,
+                shot_seconds=clip.approved_duration,
             )
         except EffectRefusal as refusal:
-            refusals.append(
-                ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
-            )
+            if clip.shot_id not in reported:
+                reported.add(clip.shot_id)
+                refusals.append(
+                    ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
+                )
             continue
+        if clip.shot_id in recorded:
+            continue
+        recorded.add(clip.shot_id)
         composition.look.effects.extend(
             f"{clip.shot_id}={entry}" for entry in exported_look(stack, luts=luts)
         )
@@ -12775,6 +12813,13 @@ def create_app(
                 width=width,
                 height=height,
                 luts=discovered_looks() if stack else (),
+                # A preview is the whole Shot, from its own first frame: it is never one half of
+                # a resolved overlap, so its offset inside its Shot is zero and the span a ramp
+                # is measured against is the Shot's own window. The window is already an input to
+                # the fingerprint below (`window_duration`), so a Director who drags a boundary
+                # gets a new clip rather than a cached picture of the old ramp.
+                clip_offset=0.0,
+                shot_seconds=shot.duration,
             )
         except EffectRefusal as refusal:
             raise HTTPException(
@@ -13486,13 +13531,18 @@ def create_app(
                 zip(plan.clips, plan.frames, strict=True)
             ):
                 dest = workdir / f"clip_{index:03d}.mp4"
-                # This Shot's look, at the two insertion points AD-17 fixed — geometry before
-                # `scale`, treatment before `pad`. `EffectStages()` for a Shot with no stack, and
-                # both of its groups are empty, which is what `trim_args` already defaults them
-                # to: the argv for an unstyled Shot is the argv this route built before effects
-                # existed, argument for argument. `tests/test_assembly.py`'s `TODAYS_TRIM_ARGV`
-                # pins that at the builder and `test_assembly_route` pins it at this call site.
-                composed = effect_stages.get(clip.shot_id, EffectStages())
+                # This clip's look, at the two insertion points AD-17 fixed — geometry before
+                # `scale`, treatment before `pad`. `EffectStages()` for a clip whose Shot has no
+                # stack, and both of its groups are empty, which is what `trim_args` already
+                # defaults them to: the argv for an unstyled Shot is the argv this route built
+                # before effects existed, argument for argument. `tests/test_assembly.py`'s
+                # `TODAYS_TRIM_ARGV` pins that at the builder and `test_assembly_route` pins it
+                # at this call site.
+                #
+                # Keyed by the clip's own index, not by its Shot's id: a Shot that another nests
+                # inside is two clips here, and story 9.7 composed them apart on purpose so the
+                # second carries on where the first stopped rather than replaying it.
+                composed = effect_stages.get(index, EffectStages())
                 rc, _out, err = await run_tool(
                     with_progress(
                         trim_args(
