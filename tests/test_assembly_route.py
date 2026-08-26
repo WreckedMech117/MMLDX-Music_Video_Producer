@@ -30,6 +30,8 @@ from music_video_producer.app import (
     ASSEMBLY_ORPHANED_ERROR,
     ASSEMBLY_RENDERS_OPEN_REFUSAL,
     ASSEMBLY_SONG_FILE_REFUSAL,
+    SHOT_EFFECT_STACK_LIMIT,
+    SHOT_EFFECTS_TOO_MANY_REFUSAL,
     create_app,
 )
 from music_video_producer.assembly import (
@@ -40,7 +42,7 @@ from music_video_producer.assembly import (
 from music_video_producer.batch import render_timing_summary
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.models import EffectSpec, Project, RenderJob
+from music_video_producer.models import EffectSpec, Project, RenderJob, shot_label
 from music_video_producer.store import ProjectStore
 
 
@@ -274,6 +276,64 @@ def test_every_blocking_reason_lands_in_one_422_and_no_job_is_written(tmp_path: 
     assert store.get(project_id).jobs == []
     assert comfy.prompts == []
     assert not (tmp_path / "projects" / project_id / "media" / "exports").exists()
+
+
+def test_a_manifest_edited_past_the_stack_cap_is_refused_by_the_cap_and_not_by_ffmpeg(
+    tmp_path: Path,
+):
+    """The third door. Both write routes cap a stack; a manifest edited by hand does not.
+
+    `replace_shot_effects` caps before it validates, and `_adopt_shot_effects` caps a stack
+    arriving on a Shot the store does not hold — so no client can build one of these. A manifest
+    edited by hand can, and so can one written before either cap existed, and the failure it used
+    to produce was the least useful in this application: the chain becomes a single `-vf`
+    argument, Windows refuses a command line past 32,767 characters, and the `FileNotFoundError`
+    that comes back was reported as *"ffmpeg is not installed or not on PATH"* — sending a
+    Director to reinstall a binary that was working the whole time, over an argv this application
+    built.
+
+    Measured 2026-08-25: 985 grain cards build 32,725 characters and export; 1,200 build 40,060
+    and do not. The cap is 32, so this is three orders of magnitude past anything a Director can
+    reach through the interface.
+
+    The check registers into `EXPORT_PLAN_CHECKS`, which story 9.6 built to be appended to — so
+    it joins the one report every other plan fault joins rather than raising alone. Asserted here
+    beside a *second* fault, because being told one thing at a time is what that registry exists
+    to prevent.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+
+    # Hand-edit the manifest the way nothing routed can: past the cap, on the first Shot.
+    project = store.get(project_id)
+    oversized = [
+        EffectSpec(effect="grain", parameters={"strength": 10.0})
+        for _ in range(SHOT_EFFECT_STACK_LIMIT + 1)
+    ]
+    project.shots[0].effects = oversized
+    # And a second, independent fault, so the report has to carry both.
+    project.shots[1].effects = [EffectSpec(effect="nope_not_an_effect", parameters={})]
+    store.save(project)
+
+    refused = client.post(f"/api/projects/{project_id}/assemble", json={})
+    assert refused.status_code == 422, refused.text
+    detail = refused.json()["detail"]
+
+    # The cap's own sentence, naming the Shot as the timeline names it.
+    assert SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+        limit=SHOT_EFFECT_STACK_LIMIT, count=SHOT_EFFECT_STACK_LIMIT + 1
+    ) in detail
+    assert shot_label(store.get(project_id), store.get(project_id).shots[0]) in detail
+
+    # Both faults in one answer, not the first one alone.
+    assert "nope_not_an_effect" in detail, detail
+
+    # Nothing ffmpeg said, and nothing about an installation.
+    assert "not installed" not in detail
+    assert "not on PATH" not in detail
+
+    # And nothing was written or queued.
+    assert store.get(project_id).jobs == []
 
 
 def test_a_window_moved_after_approval_is_refused_stale_by_id(tmp_path: Path):

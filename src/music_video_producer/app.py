@@ -7448,6 +7448,23 @@ SHOT_EFFECTS_ABSENT_REFUSAL = (
 )
 
 
+#: Windows' own error number for a command line past its 32,767-character ceiling. Named because
+#: `FileNotFoundError` is raised for both a missing binary and an over-long argv, and only the
+#: number tells them apart — a bare `except FileNotFoundError` reported a working ffmpeg as
+#: missing, which is the sort of message that sends a Director to reinstall something.
+_COMMAND_LINE_TOO_LONG = 206
+
+#: What that fault actually is, said to the person who can act on it. It names the tool so the
+#: sentence reads like its sibling, and the length so the number is a fact rather than an
+#: adjective — a Director who sees 40,060 knows the difference between "slightly over" and "this
+#: is not what the control is for".
+TOOL_COMMAND_TOO_LONG = (
+    "The command built for {tool} is {length} characters long, and Windows will not accept one "
+    "past 32767. {tool} itself is fine. Something in this project asked for more work in one "
+    "step than a single command can carry."
+)
+
+
 #: How many effects one Shot may carry. The chain goes into a single `-vf` argument and Windows
 #: caps a command line at 32767 characters, so an unbounded stack does not fail as an unbounded
 #: stack: measured 2026-08-25, 985 grain cards built an argv of 32725 characters and exported,
@@ -7755,11 +7772,50 @@ def _compose_effect_chains(
 #: The window checks first, so the report reads top to bottom the way the timeline does, and the
 #: look after them.
 #:
+def _oversized_stack_refusals(subject: ExportSubject) -> list[str]:
+    """Every Shot carrying more effects than one command line can hold, named by its label.
+
+    The cap is enforced on both write doors — `replace_shot_effects` before it validates, and
+    `_adopt_shot_effects` before it validates a stack arriving on a Shot the store does not hold.
+    So no client reaches this. A **manifest edited by hand** does, and so does one written before
+    either cap existed, and the failure it produces is the least useful in the application: the
+    chain becomes one `-vf` argument, Windows refuses a command line past 32,767 characters, and
+    the `FileNotFoundError` that comes back used to be reported as a missing ffmpeg. Measured
+    2026-08-25: 985 grain cards build 32,725 characters and export, 1,200 build 40,060 and do not.
+
+    Registered here rather than checked at composition because it is a fact about the stack alone
+    — it needs no geometry — so it joins the one report every other plan fault joins, and a
+    Director with two oversized Shots is told about both at once.
+
+    The bound is the same constant the write routes use. A cap that lived at two of three doors
+    would be the shape this project has now counted twelve times. Said once per Shot, like its
+    sibling: a Shot with a later one nested inside it resolves into two clips carrying one id,
+    and an oversized stack is oversized once.
+    """
+    refusals: list[str] = []
+    seen: set[str] = set()
+    for clip in sorted(subject.clips, key=lambda item: item.start):
+        stack = subject.stacks.get(clip.shot_id)
+        if not stack or len(stack) <= SHOT_EFFECT_STACK_LIMIT or clip.shot_id in seen:
+            continue
+        seen.add(clip.shot_id)
+        refusals.append(
+            ASSEMBLY_EFFECTS_REFUSAL.format(
+                shot=clip.label,
+                detail=SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+                    limit=SHOT_EFFECT_STACK_LIMIT, count=len(stack)
+                ),
+            )
+        )
+    return refusals
+
+
 #: **This is the list Epic 10 appends to.** A binding refusal — an envelope that was never
 #: measured, a parameter no effect declares — is a fact about the stack and the song, needs no
 #: geometry, and belongs here as a third entry with nothing else edited.
 EXPORT_PLAN_CHECKS: tuple[Callable[[ExportSubject], list[str]], ...] = (
     _window_refusals,
+    _oversized_stack_refusals,
     _effect_stack_refusals,
 )
 
@@ -13708,7 +13764,16 @@ def create_app(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-        except FileNotFoundError:
+        except FileNotFoundError as missing:
+            # `FileNotFoundError` carries two very different faults on Windows and this handler
+            # used to report both as the same one. `WinError 206` is the command line being too
+            # long — the binary is there and working, and the argv this application built is what
+            # cannot be passed. Telling a Director their ffmpeg is missing sends them to install
+            # something they already have, over a fault entirely of this application's making.
+            # Measured 2026-08-25: 1200 grain cards build a 40,060-character argv against the
+            # 32,767 Windows allows, and it surfaced as "ffmpeg is not installed".
+            if getattr(missing, "winerror", None) == _COMMAND_LINE_TOO_LONG:
+                return 127, "", TOOL_COMMAND_TOO_LONG.format(tool=args[0], length=len(" ".join(args)))
             return 127, "", f"{args[0]} is not installed or not on PATH"
         if on_start is not None:
             on_start(process)
