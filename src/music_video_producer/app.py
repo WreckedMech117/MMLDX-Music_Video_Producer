@@ -44,6 +44,7 @@ from .assembly import (
     probe_duration_args,
     probe_streams_args,
     probe_take_args,
+    take_cut_refusal,
     trim_args,
     verification_problems,
     with_progress,
@@ -7696,7 +7697,14 @@ def _compose_effect_chains(
             continue
         recorded.add(clip.shot_id)
         composition.look.effects.extend(
-            f"{clip.shot_id}={entry}" for entry in exported_look(stack, luts=luts)
+            # The plan's own geometry, because one composer's identity is a function of it:
+            # `chroma_split` turns a stored *fraction* into pixels, so whether it composes
+            # anything at all depends on how wide the delivery is. `exported_look` defaults to a
+            # deliberately huge probe when it is told nothing, which errs toward recording an
+            # effect that did not run; the export knows the real width one line above, so it says
+            # so and the record is exact rather than conservative.
+            f"{clip.shot_id}={entry}"
+            for entry in exported_look(stack, luts=luts, width=plan.width, height=plan.height)
         )
     return refusals
 
@@ -8557,9 +8565,9 @@ def create_app(
     # superseded, and removed in the same synchronous stretch that finishes it, so a joiner that
     # finds a matching fingerprint here is never attaching to something already over.
     app.state.preview_renders = {}
-    # What ffprobe said about one take's geometry, for the life of the process. Keyed by the
-    # file's path, byte length and modification time together, so a re-render under the same
-    # name is measured again rather than remembered.
+    # What ffprobe said about one take's geometry *and length*, for the life of the process.
+    # Keyed by the file's path, byte length and modification time together, so a re-render under
+    # the same name is measured again rather than remembered.
     #
     # It exists because AD-29 makes preview geometry a fact about the *whole project* — the
     # largest-area approved take — so answering it honestly means measuring every approved take,
@@ -8567,7 +8575,7 @@ def create_app(
     # would spend 800 ms deciding what size to render before rendering anything, against a
     # one-second budget for the whole answer. This is a memo of a measurement, not a verdict:
     # nothing derived from it is stored, and losing it costs a re-measure.
-    app.state.take_dimensions = {}
+    app.state.take_measurements = {}
     # And once, here, for every project on disk: the restart that emptied that set is the
     # event that orphaned the jobs, so this is the moment the verdict is honest, rather than
     # whenever the Director next happens to assemble. Synchronous and inside `create_app`
@@ -12623,12 +12631,21 @@ def create_app(
             refused=refused,
         )
 
-    async def take_dimensions(source: Path) -> tuple[int, int] | None:
-        """One take's `(width, height)` by ffprobe, remembered for the life of the process.
+    async def take_measurement(source: Path) -> tuple[int, int, float | None] | None:
+        """One take's `(width, height, seconds)` by ffprobe, remembered for the life of the
+        process.
 
         `None` for a file that cannot be measured — missing, truncated, or not a video — which
         is an answer rather than an error: the callers below drop such a take from the plan
         exactly as the export's own refusal report would.
+
+        The length rides along because `probe_take_args` reads it in the same probe the
+        dimensions come from, and the preview needs both: the geometry decides what size to
+        render, and the length decides whether the cut fits inside the take at all
+        (`assembly.take_cut_refusal`). One probe answers both questions, as it does for the
+        export. A container that reports no readable duration answers `None` for that third
+        value alone and keeps its dimensions — an unmeasurable length is undecidable rather
+        than a fault, which is what `assembly_refusals` has always done with one.
 
         The memo is keyed by path, byte length and modification time **together**. Neither half
         is trusted alone: a take re-rendered under the same name changes at least one of them,
@@ -12643,7 +12660,7 @@ def create_app(
         except OSError:
             return None
         key = (source.as_posix(), stat.st_size, stat.st_mtime_ns)
-        remembered = app.state.take_dimensions.get(key)
+        remembered = app.state.take_measurements.get(key)
         if remembered is not None:
             return remembered
         rc, out, _err = await run_tool(probe_take_args(source))
@@ -12652,8 +12669,13 @@ def create_app(
             width, height = (int(part) for part in lines[0].split(","))
         except (ValueError, IndexError):
             return None
-        app.state.take_dimensions[key] = (width, height)
-        return (width, height)
+        try:
+            seconds: float | None = float(lines[1])
+        except (ValueError, IndexError):
+            seconds = None
+        measured = (width, height, seconds)
+        app.state.take_measurements[key] = measured
+        return measured
 
     async def export_geometry(project: Project) -> tuple[int, int] | None:
         """The dimensions the export would normalize **this project** to, or `None` if no
@@ -12684,10 +12706,10 @@ def create_app(
             candidate = (output_root / Path(shot.approved_output)).resolve()
             if output_root not in candidate.parents or not candidate.is_file():
                 continue
-            measured = await take_dimensions(candidate)
+            measured = await take_measurement(candidate)
             if measured is None:
                 continue
-            dimensions[shot.id] = measured
+            dimensions[shot.id] = measured[:2]
             clips.append(
                 ClipWindow(
                     shot_id=shot.id,
@@ -12739,8 +12761,11 @@ def create_app(
         nowhere in this route on any path, refusal or success.
 
         **The order of the work is the order of the refusals it can raise.** The Shot, then the
-        approval, then the file, then the geometry, then the chain — each the cheapest remaining
-        question whose answer could make the next one meaningless. The chain is composed
+        approval, then the file, then the geometry, then whether the cut lands inside the take,
+        then the chain — each the cheapest remaining question whose answer could make the next
+        one meaningless. The cut question is the export's own, asked in the export's own words
+        (`assembly.take_cut_refusal`), and it comes before the chain because it is a fact about
+        the media that no Effect Stack can change. The chain is composed
         **before** the cache is consulted, deliberately: a look whose `.cube` has been deleted
         must refuse by name today even though a clip rendered yesterday still sits in the cache
         and is still a perfectly good picture of that look. The export would refuse; a preview
@@ -12788,6 +12813,15 @@ def create_app(
                     shot=label, path=shot.approved_output
                 ),
             )
+        # This take's own measurement, taken here so that every await in this route happens
+        # before the manifest is re-read below. `export_geometry` measures it too — same memo,
+        # same key, no second ffprobe — but what it answers is the *project's* delivery grid,
+        # and the question the overrun check asks is about this one file's length.
+        # `None` from an unmeasurable take is carried through as an unknown length rather than
+        # invented as zero: it is the same take `export_geometry` will drop, and a preview that
+        # gets that far fails at ffmpeg with its own sentence, exactly as it did before.
+        measurement = await take_measurement(source)
+        take_seconds = measurement[2] if measurement is not None else None
         delivery = await export_geometry(project)
         if delivery is None:
             raise HTTPException(
@@ -12801,6 +12835,51 @@ def create_app(
         shot = next((item for item in project.shots if item.id == shot_id), None)
         if not shot:
             raise HTTPException(status_code=404, detail="Shot not found")
+        # The export's own offset rule, resolved from the Shot's own fields exactly as the
+        # assemble route resolves it. The *current* window is used rather than the approved
+        # snapshot: a Director who has moved a boundary is previewing the look they are editing,
+        # and the export's staleness refusal is a decision about shipping, not about looking.
+        offset = shot.latest_take_lead + shot.trim_nudge
+        frames = clip_frames_on_grid(shot.start, shot.start + shot.duration)
+        # And the export's own two refusals about the cut, in the export's own words
+        # (`assembly.take_cut_refusal`, the one function both routes call). Without them this
+        # route computed `frames` from the *window*, took `offset` on trust, and rendered
+        # whatever came out. Both failures were reachable and both were published.
+        #
+        # **Off the end.** A forward trim nudge past the take's tail, or the overflow branch of
+        # `timeline.over_render_lead` plus any nudge at all, and ffmpeg returns 0 having written
+        # a clip one or more frames short — `-frames:v` is a cap, not a demand. Measured at
+        # preview geometry on the 5.167 s take a 4 s window is really rendered for: at a 1.25 s
+        # nudge the response said `frames: 96, window_seconds: 4.0` over a file holding **94**,
+        # and at 2 s over one holding 76.
+        #
+        # **Before the beginning**, and this one is worse, because the file is the right length
+        # and the wrong picture. `trim_args` writes its trim pair only `if skip > 0`, so a
+        # negative offset is not clamped, reported or honoured — it is silently discarded, and
+        # the preview shows the take from its first frame as though that were the window.
+        # Measured on a take whose luma encodes its frame index: at nudges of 0, -0.5 and -1.0
+        # the route answered **three different fingerprints** — three cache entries, three
+        # different claimed cuts — over **one byte-identical file**, every one of them starting
+        # at take frame 0. Nothing about the response says so: 96 frames were asked for and 96
+        # were delivered.
+        #
+        # In both cases the clip was published under the look's fingerprint, so every later
+        # request served it from the cache without re-rendering. A preview exists to predict
+        # the export; the one thing it must never do is show a picture the export refuses to
+        # make.
+        #
+        # Asked *before* the chain is composed, unlike the look refusals below: where the cut
+        # lands inside its take is a fact about the media, true or false whatever the Effect
+        # Stack does to the picture, and composing a chain for a cut that cannot be made is
+        # work with nowhere to go.
+        cut = take_cut_refusal(
+            label=label,
+            offset=offset,
+            duration=shot.duration,
+            take_seconds=take_seconds,
+        )
+        if cut is not None:
+            raise HTTPException(status_code=422, detail=cut)
         stack = [spec.model_dump() for spec in shot.effects]
         # The composer's geometry is the **preview's**, not the export's, and that is what makes
         # this the same look rather than the same numbers. `StageContext` describes the delivery
@@ -12826,12 +12905,6 @@ def create_app(
                 status_code=422,
                 detail=ASSEMBLY_EFFECTS_REFUSAL.format(shot=label, detail=refusal),
             ) from refusal
-        # The export's own offset rule, resolved from the Shot's own fields exactly as the
-        # assemble route resolves it. The *current* window is used rather than the approved
-        # snapshot: a Director who has moved a boundary is previewing the look they are editing,
-        # and the export's staleness refusal is a decision about shipping, not about looking.
-        offset = shot.latest_take_lead + shot.trim_nudge
-        frames = clip_frames_on_grid(shot.start, shot.start + shot.duration)
         fingerprint = preview_fingerprint(
             take=shot.approved_output,
             window_start=shot.start,

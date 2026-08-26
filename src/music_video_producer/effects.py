@@ -161,7 +161,13 @@ exactly their difference in the timeline.
 `shot_seconds` is the other half, and it is the **Shot's** whole window rather than the clip's
 own length. A slow zoom given the clip's length would restart its ramp at the seam, which is the
 defect this pairing exists to remove; given the Shot's, the second clip picks the ramp up where
-the first one left it. Neither number is discoverable here — `effects.py` imports the standard
+the first one left it — **to within half a frame**. The residue is real and it is recorded:
+`clip_offset` is the un-rounded timeline offset, while the picture resumes at
+`round(clip.offset * 24)` frames into the take, so the clock and the frame it is applied to can
+differ by up to half a frame at a seam (measured: 16.667 ms, 0.4 frame, on a real plan). It is a
+sub-frame continuity error and not a count, dimension or timestamp defect — see the
+`spec-9-7-audit-fixes.md` entry in `deferred-work.md` for the measurement and the repair.
+Neither number is discoverable here — `effects.py` imports the standard
 library and nothing else, and `assembly.py` does not import this module back — so both arrive
 through the caller, from the `ClipWindow` the export is already iterating.
 """
@@ -180,6 +186,7 @@ from typing import Any
 
 __all__ = [
     "BRANCH_FRAME_GUARD",
+    "BRANCH_LEG_FORMAT",
     "DEBAND_FLOOR",
     "DEFAULT_LUTS",
     "DEFAULT_LUT_SIZE",
@@ -191,6 +198,9 @@ __all__ = [
     "FAMILY_STYLIZE",
     "FAMILY_TEXTURE",
     "FINGERPRINT_CHUNK_BYTES",
+    "LOOK_PROBE_HEIGHT",
+    "LOOK_PROBE_SECONDS",
+    "LOOK_PROBE_WIDTH",
     "LUT_DIRECTORY_NAME",
     "LUT_HEADER_SCAN_BYTES",
     "LUT_SCAN_CHUNK_BYTES",
@@ -941,6 +951,49 @@ def _message_number(value: float) -> str:
 #: unbranched chain is the chain it has always been, stage for stage.
 BRANCH_FRAME_GUARD = "tpad=stop=1:stop_mode=clone"
 
+#: The pixel format a branch pins itself to, on the way **in** and on the way **out** of the
+#: treated leg, when the leg's own filter negotiates something wider.
+#:
+#: **It is there for the leg that is *not* written.** `split` has one format for its input and
+#: both its outputs, so a leg filter that wants `gbrp` or `yuv444p` decides the format of the
+#: pristine copy too — and because the stage upstream of every treatment branch is `scale`,
+#: which will output whatever it is asked for, ffmpeg satisfies that by negotiating **`scale`
+#: itself** to the wide format and converting *both* outputs of `split` back afterwards:
+#:
+#:     [Parsed_scale_1] w:320 h:240 fmt:yuv420p -> fmt:gbrp csp:gbr range:pc
+#:     [Parsed_blend_5] auto-inserting filter 'auto_scale_1' between 'Parsed_split_2' and
+#:                      'Parsed_blend_5'
+#:
+#: So the copy the branch exists to preserve takes a 4:2:0 -> 4:4:4 -> 4:2:0 round trip, and
+#: `_branch_stage`'s invariant — an opacity of zero reproduces the input exactly — is broken.
+#: Measured 2026-08-26 on the real `trim_args` chain, at a dial the validator accepts and
+#: `_number` renders `"0"`, against the same chain with no effect in it: `edge_treatment` came
+#: back `y:43.21 u:35.67 v:33.24` and `pixel_shuffle` `y:49.40 u:36.84 v:34.02`.
+#:
+#: **Both ends are needed and neither alone is enough**, which is the part that is easy to get
+#: wrong — measured as frame checksums against the effect-free chain, all four combinations:
+#:
+#: | pin | edge_treatment | pixel_shuffle |
+#: |---|---|---|
+#: | neither | differs | differs |
+#: | the leg's end only | differs | differs |
+#: | before `split` only | differs | differs |
+#: | **both** | **bit-identical** | **bit-identical** |
+#:
+#: The one before `split` fixes a filter's *output* format, which fixes `split`'s input, which is
+#: what stops `scale` being dragged wide; the one closing the leg fixes what `blend` has to agree
+#: on, which is what stops the pristine output of `split` being converted for it. Take either
+#: away and the round trip comes back.
+#:
+#: Only the branches that need it carry it. `bloom` (`lutyuv`, `gblur`) and `slow_zoom` (`scale`,
+#: `overlay`) are 4:2:0-native, nothing drags the graph for them — bloom at an opacity of zero is
+#: already bit-identical, measured the same way — and two conversion passes on every frame of
+#: every export are not free.
+#:
+#: `yuv420p` rather than "whatever arrived", because it is what the chain is: `trim_args` pins
+#: `format=yuv420p` as its last stage on every clip it builds, preview and export alike.
+BRANCH_LEG_FORMAT = "format=yuv420p"
+
 #: The luma code range a `lutyuv` threshold is written in. A parameter stored as 0..1 means
 #: "where between black and white", and these are what black and white are on the wire — written
 #: out rather than left as 0..255, because a threshold of 0 that lands at code 0 would sit below
@@ -956,7 +1009,12 @@ SEAM_SEED_PER_SECOND = 1000
 
 
 def _branch_stage(
-    context: StageContext, *, leg: str, join: str, leg_on_top: bool = False
+    context: StageContext,
+    *,
+    leg: str,
+    join: str,
+    leg_on_top: bool = False,
+    pin_format: bool = False,
 ) -> str:
     """One stage that is a filtergraph rather than a filter: `split`, a treated leg, a rejoin.
 
@@ -972,12 +1030,22 @@ def _branch_stage(
     mode like `screen`, and the treated copy on top for `normal`, and in both cases an opacity
     of zero must reproduce the input exactly. Every composer below states which it chose.
 
+    **That invariant is not free.** The untouched copy is only untouched if the graph never has
+    to convert it, and whether it does is decided by the *other* leg's pixel format: `split`
+    carries one format for its input and both of its outputs. `pin_format` is the answer, and it
+    writes `BRANCH_LEG_FORMAT` at **both** ends of the branch — read that constant for the
+    measurement, and for why one end alone leaves the defect exactly where it was. The two
+    composers whose leg filter negotiates a wider format ask for it; the two that are
+    4:2:0-native do not, and compose the text they always composed.
+
     The labels carry `context.slot` because two Blooms in one stack are a legal stack and two
     branches named alike are an ffmpeg error.
     """
     tag = f"fx{context.slot}"
     inputs = f"[{tag}c][{tag}a]" if leg_on_top else f"[{tag}a][{tag}c]"
-    return f"split=2[{tag}a][{tag}b];[{tag}b]{leg}[{tag}c];{inputs}{join}"
+    head = f"{BRANCH_LEG_FORMAT}," if pin_format else ""
+    tail = f",{BRANCH_LEG_FORMAT}" if pin_format else ""
+    return f"{head}split=2[{tag}a][{tag}b];[{tag}b]{leg}{tail}[{tag}c];{inputs}{join}"
 
 
 # --- Geometry: before `scale`, addressing the take's own pixels through `iw`/`ih`. ---
@@ -1028,19 +1096,26 @@ def _compose_slow_zoom(values: Mapping[str, Any], context: StageContext) -> tupl
     zoom = float(values["zoom"])
     if zoom == 1.0:
         return ()
-    if context.shot_seconds <= 0.0:
+    # The guard is on the **text**, not on the value, because the text is the denominator. A span
+    # under 5e-7 is a positive float that `_number` renders `"0"`, and the expression then reads
+    # `min((t+0)/0\,1)` — which ffmpeg does not refuse: measured 2026-08-26 at 1e-9, 4.9e-7 and
+    # 5e-7, all three rendered rc=0, 24 frames, correct dimensions, contrary to what this
+    # refusal's own sentence predicts. `Shot.duration` is only `Field(gt=0)` and the preview route
+    # hands it through with no window check, so a span that small is reachable; the export refuses
+    # a sub-frame window before it gets here. Both halves are kept: the value catches zero and
+    # every negative, the text catches the positive values that compose as zero.
+    span = _number(context.shot_seconds)
+    if context.shot_seconds <= 0.0 or span == "0":
         raise EffectRefusal(EFFECT_NO_SPAN_REFUSAL.format(effect="slow_zoom"))
     # `t` restarts at zero for every clip of a Shot; the offset is what makes the ramp of a Shot
     # that became two clips one ramp rather than two. Always written, `+ 0` included, so the
     # difference between two clips is legible in the text as their difference on the timeline.
-    progress = (
-        rf"min((t+{_number(context.clip_offset)})/{_number(context.shot_seconds)}\,1)"
-    )
-    span = _number(zoom - 1.0)
+    progress = rf"min((t+{_number(context.clip_offset)})/{span}\,1)"
+    reach = _number(zoom - 1.0)
     if values["direction"] == "out":
-        factor = f"({_number(zoom)}-{span}*{progress})"
+        factor = f"({_number(zoom)}-{reach}*{progress})"
     else:
-        factor = f"(1+{span}*{progress})"
+        factor = f"(1+{reach}*{progress})"
     leg = f"scale=w=trunc(iw*{factor}/2)*2:h=trunc(ih*{factor}/2)*2:eval=frame"
     return (
         _branch_stage(
@@ -1405,6 +1480,10 @@ def _compose_edge_treatment(values: Mapping[str, Any], context: StageContext) ->
     `top*opacity + bottom*(1-opacity)` — measured 2026-08-26 — so with the edges on top an
     opacity of `strength` runs from the untouched picture at 0 to the full edge pass at 1. Zero
     is the default, and composes to nothing.
+
+    `edgedetect=mode=colormix` negotiates `gbrp`, which is a format the rest of the chain does
+    not use, so the branch is pinned — read `BRANCH_LEG_FORMAT` for why that is a fact about the
+    *untouched* copy rather than about the edges.
     """
     strength = float(values["strength"])
     if strength == 0.0:
@@ -1418,6 +1497,7 @@ def _compose_edge_treatment(values: Mapping[str, Any], context: StageContext) ->
             leg=leg,
             join=f"blend=all_mode=normal:all_opacity={_number(strength)}",
             leg_on_top=True,
+            pin_format=True,
         ),
     )
 
@@ -1432,9 +1512,26 @@ def _compose_scanlines(values: Mapping[str, Any], context: StageContext) -> tupl
     **`drawgrid` always draws a vertical line too**, and the trick is where it is put. The grid's
     columns land at `x = x0 + k*w`, so a cell width of `iw` puts one down the very first column
     of the picture — measured on a white frame, column 0 at 126 against 255 everywhere else. A
-    cell twice the frame's width with the origin one pixel to the left of it puts every column
-    the grid would draw outside the picture, and nothing vertical survives. Measured on the same
-    frame: every column at 255, and the rows still at 126.
+    cell twice the frame's width is what moves every column but the first one past the right
+    edge, and the origin is what has to move the first one past the left edge.
+
+    **The origin is a whole thickness out, not one pixel out**, because a grid line spans
+    `[x, x+t-1]`: thickness extends *forward* from `x`, so `x=-1` leaves columns `0 .. t-2`
+    inside the picture and only `t=1` hides them. That is a real delivery's ordinary case, not
+    a corner — measured on a white frame, sampling a row no scanline is on (2026-08-26):
+
+    | height | lines | thickness | dark columns at `x=-1` | at `x=-t` |
+    |---|---|---|---|---|
+    | 1080 | 200 (the default) | 2 | 1 | 0 |
+    | 1080 | 100 | 5 | 4 | 0 |
+    | 1080 | 40 | 13 | 12 | 0 |
+    | 1080 | 20 | 27 | **26** | 0 |
+    | 720 | 200 | 1 | 0 | 0 |
+
+    So the origin is `-t`, which puts the line's whole span at `-t .. -1` and nothing vertical
+    survives at any height. The rows are unaffected either way, which is the other half of what
+    was measured: at `x=-t` every column of a non-scanline row reads 255 and the scanline rows
+    still read 126.
 
     The spacing is a fraction of `ih` rather than a count of pixels, so a look survives a change
     of export size — the same argument Chroma Split makes for storing its shift as a fraction —
@@ -1452,7 +1549,10 @@ def _compose_scanlines(values: Mapping[str, Any], context: StageContext) -> tupl
     spacing = rf"max(2\,trunc(ih/{int(values['lines'])}))"
     thickness = rf"max(1\,trunc(ih/{int(values['lines'])}/2))"
     return (
-        f"drawgrid=x=-1:y=0:w=iw*2:h={spacing}:t={thickness}:c=black@{_number(strength)}",
+        (
+            f"drawgrid=x=-{thickness}:y=0:w=iw*2:h={spacing}:t={thickness}"
+            f":c=black@{_number(strength)}"
+        ),
     )
 
 
@@ -1473,6 +1573,10 @@ def _compose_pixel_shuffle(values: Mapping[str, Any], context: StageContext) -> 
 
     The **shuffled** copy is on top, so `amount` runs from the picture at 0 to the shuffle at 1
     under `normal`'s `top*opacity + bottom*(1-opacity)`. Zero is the default and no stage.
+
+    `shufflepixels` negotiates `yuv444p`, which is a format the rest of the chain does not use,
+    so the branch is pinned — read `BRANCH_LEG_FORMAT` for why that is a fact about the
+    *untouched* copy rather than about the shuffled one.
     """
     amount = float(values["amount"])
     if amount == 0.0:
@@ -1488,6 +1592,7 @@ def _compose_pixel_shuffle(values: Mapping[str, Any], context: StageContext) -> 
             leg=leg,
             join=f"blend=all_mode=normal:all_opacity={_number(amount)}",
             leg_on_top=True,
+            pin_format=True,
         ),
     )
 
@@ -2027,6 +2132,30 @@ def validate_stack(
 # ------------------------------------------------------------------------------------------
 
 
+def _is_a_filtergraph(stage: str) -> bool:
+    """Whether one composed stage is a graph — several chains — rather than a single chain.
+
+    ffmpeg's quoting, read the way ffmpeg reads it: a single-quoted run is literal to its closing
+    quote, a backslash outside one escapes the next character, and a `;` that is neither is what
+    separates one chain from the next. Written out as a scan rather than as `";" in stage`
+    because the only client-influenced text this module can emit — a look's filename, quoted by
+    `lut_file_argument` — may contain a semicolon, and `EffectStages.branched` says why that
+    mattered.
+    """
+    quoted = False
+    characters = iter(stage)
+    for character in characters:
+        if quoted:
+            quoted = character != "'"
+        elif character == "'":
+            quoted = True
+        elif character == "\\":
+            next(characters, "")
+        elif character == ";":
+            return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class EffectStages:
     """The two groups `assembly.trim_args` splices in, and the only shape it needs to know.
@@ -2045,15 +2174,31 @@ class EffectStages:
 
     @property
     def branched(self) -> bool:
-        """Whether any stage here is a filtergraph rather than a filter.
+        r"""Whether any stage here is a filtergraph rather than a filter.
 
-        A semicolon is the whole test, and it is exact rather than a heuristic: `;` separates
-        chains and nothing else in ffmpeg's grammar, no filter option this catalogue writes
-        contains one, and `_branch_stage` is the only thing in this module that emits one. It is
-        what decides whether `BRANCH_FRAME_GUARD` is needed, and it is read by tests that want
-        to know a branch really reached the argv.
+        A semicolon is the whole test — but a *bare* one, which is not the same as a semicolon
+        anywhere in the text, and the difference is reachable. The old test said "no filter
+        option this catalogue writes contains one"; `lut_file_argument` contradicts that in its
+        own docstring, where surviving "spaces, commas, semicolons, brackets" is the point of the
+        quoting. A look the Director dropped in the folder as `warm;cool.cube` composes
+        `lut3d=file='C\:/looks/warm;cool.cube':interp=tetrahedral`, which held a `;` with no
+        `split=` anywhere in it — and this predicate is the one thing that decides whether
+        `BRANCH_FRAME_GUARD` is emitted, so a linear chain was getting the frame guard.
+
+        Measured 2026-08-26: the picture is unharmed (`tpad` on a linear chain is a no-op by
+        `framemd5`) and the count is unharmed while the take covers its window, which is what the
+        export's overrun check guarantees — but a 12-frame source asked for 24 renders 12 frames
+        without the guard and **13** with it. Latent on the export path, not on every path, and
+        load-bearing for the one thing that keeps the frame rule.
+
+        So the scan is ffmpeg's own grammar rather than a substring: inside single quotes
+        everything is literal — which is exactly why `lut_file_argument` refuses an apostrophe,
+        since ffmpeg offers no escape that reaches the file inside them — and outside them a
+        backslash escapes whatever follows, which is the `\,` every expression in this catalogue
+        is written with. A `;` that survives both is a chain separator by definition, and
+        `_branch_stage` is the only thing here that writes one.
         """
-        return any(";" in stage for stage in (*self.geometry, *self.treatment))
+        return any(_is_a_filtergraph(stage) for stage in (*self.geometry, *self.treatment))
 
 
 def build_effect_stages(
@@ -2196,8 +2341,32 @@ def _canonical(value: Any) -> str:
     return json.dumps(repr(value))
 
 
+#: The delivery `exported_look` decides "composed nothing" against when its caller does not name
+#: one, and the span it probes `slow_zoom` with.
+#:
+#: Only one composer's identity depends on either: `chroma_split` stores its shift as a fraction
+#: and turns it into pixels against the width, so a shift too small to move a whole pixel at this
+#: width composes nothing. Probing at a delivery larger than anything this application produces
+#: makes the default answer the conservative one — an effect is dropped from the record only if
+#: it composes nothing at **every** size — so the record can name something that composed no
+#: stage at the real width, and can never lose something that did. A caller with the export's own
+#: geometry should pass it and get the exact answer; `app._compose_effect_chains` has it, one
+#: line above the call it already makes to `build_effect_stages`.
+#:
+#: The span exists because `slow_zoom` refuses a Shot with no length rather than dividing by it,
+#: and a record is not the place to raise. Any positive value answers the identity question,
+#: which `slow_zoom` decides on `zoom` alone and before the span is looked at.
+LOOK_PROBE_WIDTH = 7680
+LOOK_PROBE_HEIGHT = 4320
+LOOK_PROBE_SECONDS = 1.0
+
+
 def exported_look(
-    stack: Iterable[Mapping[str, Any]], *, luts: Sequence[LutEntry] = ()
+    stack: Iterable[Mapping[str, Any]],
+    *,
+    luts: Sequence[LutEntry] = (),
+    width: int = LOOK_PROBE_WIDTH,
+    height: int = LOOK_PROBE_HEIGHT,
 ) -> tuple[str, ...]:
     """One stack as the record of what an export applied: `"<effect>:{canonical values}"`, in
     chain order, for the effects that actually composed a stage.
@@ -2219,6 +2388,15 @@ def exported_look(
     picture the export did not produce. `Shot.effects` keeps them, which is where the question
     "what did the Director configure" is answered.
 
+    **So is an entry that is enabled and composes nothing anyway**, which is the same rule and
+    was the same sentence, applied to the other way of reaching zero stages. Every effect in this
+    catalogue has a value that means "leave it alone" and composes to no filter at all, and since
+    story 9.7 all five of the newest ones **default** to it — so a Director who adds a Bloom card
+    and leaves it alone was putting `bloom:{"intensity":0,...}` in the job record of an export
+    that never ran a bloom. The test is the composer's own answer rather than a list of identity
+    values kept here, because the catalogue is the only thing entitled to say what an effect's
+    identity is, and a second copy of that would be a second truth.
+
     `_canonical` is the formatter, so this is the same text the preview fingerprint hashes and two
     parameter states that compose to one filter string record as one look — `{"zoom": 1}` and
     `{"zoom": 1.0}` are not two different exports.
@@ -2229,11 +2407,22 @@ def exported_look(
     thing this surface may not grow.
     """
     resolved = validate_stack(stack, luts=luts)
+    # The look's file argument is never read: `lut_look` composes a stage at every value it has,
+    # so the placeholder cannot change the answer, and a record must not touch the disk to say
+    # what an export recorded.
+    context = StageContext(
+        width=width,
+        height=height,
+        lut_arguments={entry.lut_id: "" for entry in luts},
+        shot_seconds=LOOK_PROBE_SECONDS,
+    )
     ordered = [
         effect
         for family in FAMILY_ORDER
         for effect in resolved
-        if effect.enabled and effect.family == family
+        if effect.enabled
+        and effect.family == family
+        and EFFECT_CATALOGUE[effect.effect_id].compose(effect.values, context)
     ]
     return tuple(f"{effect.effect_id}:{_canonical(effect.values)}" for effect in ordered)
 

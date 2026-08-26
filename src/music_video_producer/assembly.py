@@ -34,6 +34,33 @@ BOUNDARY_TOLERANCE_SECONDS = 1 / (2 * ASSEMBLY_FPS)
 
 #: FR-22's own bound, applied to the plan's coverage of the song and to the verified
 #: export: within one frame.
+#:
+#: **The comparison is `>`, and that is deliberate** (re-examined 2026-08-26, after an audit
+#: reported it as a blind spot: a shortfall of exactly one frame is `1/24`, which is not
+#: `> 1/24`, so a single clip losing its last frame could ship unflagged). It stays `>` for
+#: four reasons, the last of them measured:
+#:
+#: * the rule this bound *is* — stated here, in `EXPORT_DURATION_PROBLEM`'s own sentence ("off
+#:   by more than one frame"), in `AGENTS.md` and in `docs/ROADMAP.md` — is **within** one
+#:   frame. A discrepancy of exactly one frame is within one frame;
+#: * `test_the_boundary_tolerance_is_half_a_frame_and_coverage_is_one_frame` already pins that
+#:   reading on the plan half: a plan short of the song by exactly `one_frame` is accepted;
+#: * `web/assets/api.js` mirrors this constant and its `>` for the timeline's head/tail
+#:   warnings, held equal by a contract test, so the operator is not this module's alone;
+#: * and it would change nothing. Measured 2026-08-26: over 100 000 random song lengths from
+#:   30 s to 300 s, a one-frame-short export flags 49 968 times under `>` and **the same 49 968
+#:   times** under `>=` — not one case differs. `export_seconds` arrives from ffprobe as six
+#:   decimals, so a one-frame difference reaches this comparison already rounded a few tenths
+#:   of a microsecond either side of `1/24`; which side is noise, and it decides the answer
+#:   where the operator does not. Real exports one and two frames short, built and probed the
+#:   way the assemble route builds and probes them, were both flagged as they stand.
+#:
+#: **The honest limit, recorded rather than fixed.** This is a whole-file duration check, so it
+#: cannot distinguish a rounding artefact from a real per-clip frame loss, and at one frame it
+#: cannot reliably see either. Two frames it always sees. The thing that actually guarantees
+#: the frame rule per clip is `effects.BRANCH_FRAME_GUARD` and the `-frames:v` cap in
+#: `trim_args`; this bound is the backstop, not the guarantee, and tightening the operator
+#: would not make it one.
 COVERAGE_TOLERANCE_SECONDS = 1 / ASSEMBLY_FPS
 
 # ------------------------------------------------------------------------------------------
@@ -142,6 +169,54 @@ class ClipWindow:
         return self.start + self.duration
 
 
+def take_cut_refusal(
+    *, label: str, offset: float, duration: float, take_seconds: float | None
+) -> str | None:
+    """The cut, judged against the take it is a cut of. One sentence, or `None`.
+
+    Two ways a cut can fail to land inside its take and they are mutually exclusive, which is
+    why they are one function rather than two: it begins before the take does — a nudge pulled
+    further back than the recorded lead — or it runs off the end — a nudge pushed past the
+    tail, or the lead of a last shot that has already spent the whole over-render margin. A cut
+    cannot be both, so at most one sentence is ever true and the caller appends or raises it.
+
+    Extracted from `assembly_refusals` so that the export and the **preview** cannot answer
+    this differently. The export collects the sentence into its comprehensive report; the
+    preview raises it alone, because a preview is one Shot and there is no second fault to
+    collect. Two callers, one rule, one wording — a preview that rendered a cut the export
+    refuses would be a picture of a video that will never exist, and a preview that refused one
+    the export accepts would ration a Director over nothing.
+
+    `None` is the green light. It is also the overrun answer for a take whose length could not
+    be measured: an undecidable overflow must not fabricate a refusal, which is the rule
+    `assembly_refusals` has always applied to a `take_seconds` of `None`. The negative test
+    needs no measurement at all — a cut before a take's first frame is impossible whatever the
+    take turns out to hold — so it is decided even for a file nothing could probe.
+
+    The overrun's slack is `BOUNDARY_TOLERANCE_SECONDS` — half a frame — because a take that
+    supplies *exactly* its window supplies it. That equality is not a corner case:
+    `over_render_lead`'s overflow branch grows the lead until the take's tail lands on the
+    song's last second, so the last shot of every song is cut to the take's final frame, and
+    refusing at equality would refuse the ordinary case. The negative side gets no slack, and
+    that asymmetry is deliberate: zero is a real offset that every shot at 0.0 s carries, and
+    anything below it is a number the Director's own client clamps away.
+    """
+    if offset < 0:
+        return ASSEMBLY_OFFSET_NEGATIVE_REFUSAL.format(shot=label, behind=-offset)
+    if take_seconds is None:
+        return None
+    needed = offset + duration
+    if needed <= take_seconds + BOUNDARY_TOLERANCE_SECONDS:
+        return None
+    return ASSEMBLY_OFFSET_OVERRUN_REFUSAL.format(
+        shot=label,
+        take=take_seconds,
+        offset=offset,
+        duration=duration,
+        needed=needed,
+    )
+
+
 def assembly_refusals(clips: list[ClipWindow], song_seconds: float) -> list[str]:
     """Every reason this plan cannot assemble, one sentence each, all at once.
 
@@ -187,28 +262,17 @@ def assembly_refusals(clips: list[ClipWindow], song_seconds: float) -> list[str]
         # The over-render offset, judged against the take the manifest actually holds. A
         # negative offset is a nudge pulled past the recorded lead; an overrun is a cut
         # that needs more take than the file measures. Both name every number the fix
-        # needs, and both are decidable only here — the client clamps, but the manifest
-        # is writable by clients that do not.
-        if clip.offset < 0:
-            refusals.append(
-                ASSEMBLY_OFFSET_NEGATIVE_REFUSAL.format(
-                    shot=clip.label, behind=-clip.offset
-                )
-            )
-        elif (
-            clip.take_seconds is not None
-            and clip.offset + clip.duration
-            > clip.take_seconds + BOUNDARY_TOLERANCE_SECONDS
-        ):
-            refusals.append(
-                ASSEMBLY_OFFSET_OVERRUN_REFUSAL.format(
-                    shot=clip.label,
-                    take=clip.take_seconds,
-                    offset=clip.offset,
-                    duration=clip.duration,
-                    needed=clip.offset + clip.duration,
-                )
-            )
+        # needs, both are decidable only here — the client clamps, but the manifest is
+        # writable by clients that do not — and both are `take_cut_refusal`'s, so the
+        # preview route refuses the same two cuts in the same two sentences.
+        cut = take_cut_refusal(
+            label=clip.label,
+            offset=clip.offset,
+            duration=clip.duration,
+            take_seconds=clip.take_seconds,
+        )
+        if cut is not None:
+            refusals.append(cut)
         if clip.mix_audio and clip.has_audio is False:
             refusals.append(ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL.format(shot=clip.label))
     refusals.extend(tiling_refusals(ordered, song_seconds))
@@ -792,6 +856,10 @@ def verification_problems(
     Duration within one frame of the song, exactly one video and one audio stream. The
     sentence carries the measured numbers — a failed verification whose message is "failed"
     would send the Director to ffprobe the file themselves, which is this function's job.
+
+    *Within* one frame, and the `>` that says so is deliberate — see
+    `COVERAGE_TOLERANCE_SECONDS`, which carries the 2026-08-26 re-examination and the
+    measurement showing that `>=` would change no outcome at all.
     """
     problems: list[str] = []
     if abs(export_seconds - song_seconds) > COVERAGE_TOLERANCE_SECONDS:

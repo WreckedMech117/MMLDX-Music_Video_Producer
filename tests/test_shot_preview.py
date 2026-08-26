@@ -20,6 +20,7 @@ import wave
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from music_video_producer.app import (
@@ -28,10 +29,17 @@ from music_video_producer.app import (
     PREVIEW_SUPERSEDED_REFUSAL,
     create_app,
 )
-from music_video_producer.assembly import EXPORT_PRESETS, PREVIEW_PRESET
+from music_video_producer.assembly import (
+    ASSEMBLY_FPS,
+    ASSEMBLY_OFFSET_NEGATIVE_REFUSAL,
+    ASSEMBLY_OFFSET_OVERRUN_REFUSAL,
+    EXPORT_PRESETS,
+    PREVIEW_PRESET,
+)
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.store import ProjectStore
+from music_video_producer.timeline import over_render_frames, over_render_lead
 
 
 class FakeComfy:
@@ -73,7 +81,9 @@ def wav_bytes(seconds: float, rate: int = 8000) -> bytes:
 
 
 def synthesize_take(path: Path, seconds: float, size: str = "128x72", colour: str = "red"):
-    """A real tiny take: colour source, 24 fps, yuv420p — deliberately longer than its window."""
+    """A real tiny take: colour source, 24 fps, yuv420p, `over_render_frames(4.0)` long — the
+    124 frames H3's grid actually renders for a 4 s window, so how much of it a window consumes
+    is decided by the shot's lead, exactly as it is in the app."""
     path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
@@ -97,6 +107,33 @@ def probe(path: Path, entries: str) -> str:
     return result.stdout.strip()
 
 
+def counted_frames(path: Path) -> int:
+    """Frames actually decoded out of a clip — never the container's own claim, because the
+    defect this file has to be able to see is a file whose header and whose picture disagree."""
+    return int(
+        subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path.as_posix(),
+            ],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    )
+
+
+def nudge_shot(client, project_id: str, shot_id: str, nudge: float):
+    """The Director's trim nudge, written the way the browser writes it: the whole shot list
+    back through `PUT /shots`, approval fields and all."""
+    project = client.get(f"/api/projects/{project_id}").json()
+    shots = project["shots"]
+    for shot in shots:
+        if shot["id"] == shot_id:
+            shot["trim_nudge"] = nudge
+    saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert saved.status_code == 200, saved.text
+    return saved
+
+
 def pixel(path: Path, x: int, y: int) -> tuple[int, int, int]:
     """One RGB sample from the first frame of a clip, indexed out of the raw frame."""
     width, height = (int(part) for part in probe(path, "stream=width,height").split(","))
@@ -116,7 +153,21 @@ def pixel(path: Path, x: int, y: int) -> tuple[int, int, int]:
 def project_with_two_approved_takes(
     client, tmp_path: Path, *, first_size: str = "128x72", second_size: str = "192x108"
 ):
-    """An 8 s song tiled by two approved, on-disk, snapshotted takes of different sizes."""
+    """An 8 s song tiled by two approved, on-disk, snapshotted takes of different sizes.
+
+    **`shot_b` carries the lead a real last shot carries**, and that is not decoration. Its
+    window ends where the song ends, so `timeline.over_render_lead` takes its overflow branch
+    and grows the lead until the take's *tail* lands on the song's last second — which spends
+    the whole over-render margin ahead of the window and leaves the cut ending on the take's
+    final frame. The lead is computed here from that function rather than typed as a number, so
+    the fixture cannot drift from the rule that produces it.
+
+    Until 2026-08-26 both shots had a lead of zero and both takes therefore ran a whole margin
+    longer than their windows, which is a property of the fixture and not of real takes: the
+    branched chain never reached its own end, so the frame a branch costs at `fps` was never
+    taken and `BRANCH_FRAME_GUARD` could be deleted with every test here still green. It is
+    exercised now, on the shot that exercises it in the app.
+    """
     project_id = client.post("/api/projects", json={"name": "Preview"}).json()["id"]
     upload = client.post(
         f"/api/projects/{project_id}/songs/upload",
@@ -126,8 +177,15 @@ def project_with_two_approved_takes(
     assert upload.status_code == 200, upload.text
 
     shots_dir = tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
-    synthesize_take(shots_dir / "shot_a-h3_00001-audio.mp4", 4.458, first_size, "red")
-    synthesize_take(shots_dir / "shot_b-h3_00001-audio.mp4", 4.458, second_size, "blue")
+    picture_seconds = over_render_frames(4.0) / ASSEMBLY_FPS
+    synthesize_take(shots_dir / "shot_a-h3_00001-audio.mp4", picture_seconds, first_size, "red")
+    synthesize_take(shots_dir / "shot_b-h3_00001-audio.mp4", picture_seconds, second_size, "blue")
+    # 1.1667 s — the whole margin, because a shot ending on the song's end takes the overflow
+    # branch. `shot_a` starts at 0.0 s, where there is no song to lead into, so its lead is 0.
+    trailing_lead = over_render_lead(
+        start=4.0, duration=4.0, picture_seconds=picture_seconds, song_duration=8.0
+    )
+    assert trailing_lead == pytest.approx(picture_seconds - 4.0), trailing_lead
 
     prefix = f"music-video-producer/{project_id}/shots"
     shots = [
@@ -140,6 +198,7 @@ def project_with_two_approved_takes(
             "id": "shot_b", "start": 4.0, "duration": 4.0, "prompt": "Blue room",
             "status": "complete",
             "latest_output": f"{prefix}/shot_b-h3_00001-audio.mp4",
+            "latest_take_lead": trailing_lead,
         },
     ]
     saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
@@ -236,23 +295,26 @@ def test_a_branched_effect_previews_at_the_previews_own_geometry(tmp_path: Path)
     inside the Shot is zero and the span is the Shot's window.
 
     The frame count is asserted because a preview one frame short is a picture of a clip the
-    export will not produce, which is the one thing a preview must never be. It is **not** a
-    test of `BRANCH_FRAME_GUARD`, and saying so is the honest half: a take here runs longer than
-    its window, as every real take does, so the graph never reaches its own end and the frame a
-    branch costs at `fps` is never taken. Removing the guard leaves this test green — measured.
-    The guard's own test is `test_the_branch_guard_is_the_frame_the_branch_would_otherwise_cost`
-    in `tests/test_effects.py`, which renders a source holding exactly the frames asked for.
+    export will not produce, which is the one thing a preview must never be — and **this is a
+    test of `BRANCH_FRAME_GUARD`**, which it was not until 2026-08-26. It previews `shot_b`, the
+    last shot of the song, whose lead takes `over_render_lead`'s overflow branch and spends the
+    whole over-render margin ahead of the window: the cut ends on the take's final frame, the
+    branched graph therefore reaches its own end, and the frame `fps` drops at a branch is a
+    frame there is nothing left to replace. Measured at this geometry with the guard's clone
+    removed: **95 frames where 96 were asked for**. `shot_a` starts at 0.0 s, has no lead, and
+    consumes 96 of its take's 124 frames, which is why the same assertion on that shot could not
+    see the guard at all.
     """
     client, _store, _comfy, _app = make_client(tmp_path)
     project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
     media = tmp_path / "projects" / project_id / "media"
 
     written = client.put(
-        f"/api/projects/{project_id}/shots/shot_a/effects",
+        f"/api/projects/{project_id}/shots/shot_b/effects",
         json={"effects": [{"effect": "slow_zoom", "parameters": {"zoom": 1.6}}]},
     )
     assert written.status_code == 200, written.text
-    response = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    response = client.post(f"/api/projects/{project_id}/shots/shot_b/preview")
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -262,14 +324,7 @@ def test_a_branched_effect_previews_at_the_previews_own_geometry(tmp_path: Path)
     # Four seconds of window at 24 fps, and every frame of it: the branch cost the chain
     # nothing, which is what the guard at the head of it is for.
     assert body["frames"] == 96
-    counted = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-            "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", clip.as_posix(),
-        ],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    assert counted == "96"
+    assert counted_frames(clip) == 96
 
 
 def test_a_shot_whose_aspect_differs_previews_with_the_letterbox_it_will_ship_with(
@@ -865,6 +920,122 @@ def test_a_take_that_has_gone_from_disk_is_refused_by_name(tmp_path: Path):
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert "SHOT 01 (shot_a)" in detail and "shot_a-h3_00001-audio.mp4" in detail
+
+
+def test_a_cut_that_runs_off_the_end_of_its_take_is_refused_in_the_exports_own_words(
+    tmp_path: Path,
+):
+    """The window asks for four seconds the take does not hold, so there is no picture to show.
+
+    Until 2026-08-26 this route computed `frames` from the Shot's window and rendered whatever
+    the take happened to hold. ffmpeg returns 0 for that — `-frames:v` is a cap, not a demand —
+    so the response came back 200 saying `frames: 96` and `window_seconds: 4.0` over a file that
+    held **94** frames at this nudge, and 76 at a two-second one. Worse than being wrong once:
+    the short clip was published under the look's fingerprint, so every later request for the
+    same look was served it from the cache without re-rendering, and the only way back was
+    deleting the folder.
+
+    A 1.25 s nudge is barely past the edge — the take runs 1.1667 s longer than its window — and
+    it is the least dramatic version of the two reachable paths. The other needs no nudge at
+    all: on the last shot of a song the lead has already spent the whole margin, so any forward
+    nudge whatsoever runs off the end.
+
+    The sentence is `ASSEMBLY_OFFSET_OVERRUN_REFUSAL`, unaltered, because it is the same fault
+    the export refuses and a Director should not have to learn it twice. The second half of this
+    test is that claim, checked rather than asserted in prose: the assemble route on the same
+    manifest answers with the identical string.
+    """
+    client, _store, comfy, _app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, tmp_path)
+    take_seconds = float(probe(shots_dir / "shot_a-h3_00001-audio.mp4", "format=duration"))
+    nudge_shot(client, project_id, "shot_a", 1.25)
+
+    response = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == ASSEMBLY_OFFSET_OVERRUN_REFUSAL.format(
+        shot="SHOT 01 (shot_a)",
+        take=take_seconds,
+        offset=1.25,
+        duration=4.0,
+        needed=5.25,
+    )
+    # Nothing rendered, nothing cached, nothing on ComfyUI: the refusal is raised before the
+    # chain is composed, so there is no scratch file to leak and no folder to clean out.
+    assert not (tmp_path / "projects" / project_id / "media" / "previews").exists()
+    assert comfy.prompts == []
+
+    # One rule, two callers.
+    refused = client.post(f"/api/projects/{project_id}/assemble")
+    assert refused.status_code == 422, refused.text
+    assert response.json()["detail"] in refused.json()["detail"]
+
+
+def test_a_cut_that_begins_before_its_take_does_is_refused_rather_than_quietly_ignored(
+    tmp_path: Path,
+):
+    """The nudge reaches further back than the take’s recorded lead, so the first frame the
+    window asks for was never rendered. This is the overrun's mirror and it is the worse of the
+    two, because the file it produced was the **right length and the wrong picture**.
+
+    `trim_args` writes `trim=start_frame={skip},setpts=PTS-STARTPTS` only `if skip > 0`, and
+    `round(-0.5 * 24)` is not. So a negative offset was neither clamped, nor reported, nor
+    honoured — it was discarded, and the preview showed the take from its own first frame as
+    though that were the Shot's window. Measured 2026-08-26 on a take whose luma encodes its
+    frame index: previews at nudges of 0, -0.5 and -1.0 came back as **three distinct
+    fingerprints** over **one byte-identical file**, all three starting at take frame 0, each
+    cached under its own name and served from there for good. A short clip at least announces
+    itself to anyone who counts the frames; this one counts correctly and lies about what it
+    is a picture of.
+
+    The sentence is `ASSEMBLY_OFFSET_NEGATIVE_REFUSAL`, unaltered — `take_cut_refusal` answers
+    both this and the overrun, so the export and the preview cannot drift apart on either.
+    """
+    client, _store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
+    nudge_shot(client, project_id, "shot_a", -0.5)
+
+    response = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == ASSEMBLY_OFFSET_NEGATIVE_REFUSAL.format(
+        shot="SHOT 01 (shot_a)", behind=0.5
+    )
+    assert not (tmp_path / "projects" / project_id / "media" / "previews").exists()
+    assert comfy.prompts == []
+
+    # One rule, two callers — and the negative case needs no measured take to decide, so it is
+    # the export's answer here for the same reason it is the export's answer there.
+    refused = client.post(f"/api/projects/{project_id}/assemble")
+    assert refused.status_code == 422, refused.text
+    assert response.json()["detail"] in refused.json()["detail"]
+
+
+def test_a_take_that_supplies_exactly_its_window_is_previewed_rather_than_refused(
+    tmp_path: Path,
+):
+    """The equality is the ordinary case, not the corner one.
+
+    `shot_b` is the last shot of the song, so `over_render_lead` takes its overflow branch and
+    the whole margin goes in front of the window: the cut ends on the take's final frame and
+    `offset + duration` is the take's own length exactly. An overrun check written as `<` rather
+    than `<=`, or one with no half-frame slack, would refuse the last shot of every song — so
+    this pins the tolerance, and the file is counted rather than trusted.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, tmp_path)
+    project = client.get(f"/api/projects/{project_id}").json()
+    shot_b = next(shot for shot in project["shots"] if shot["id"] == "shot_b")
+    take_seconds = float(probe(shots_dir / "shot_b-h3_00001-audio.mp4", "format=duration"))
+    assert shot_b["latest_take_lead"] + 4.0 == pytest.approx(take_seconds, abs=1e-6)
+
+    response = client.post(f"/api/projects/{project_id}/shots/shot_b/preview")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    clip = tmp_path / "projects" / project_id / "media" / body["preview"]
+    assert body["frames"] == 96
+    assert counted_frames(clip) == 96
 
 
 def test_a_look_whose_file_has_gone_refuses_by_name_and_leaves_the_stack_untouched(
