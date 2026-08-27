@@ -1978,3 +1978,67 @@ class Project(BaseModel):
     shots: list[Shot] = Field(default_factory=list)
     messages: list[TreatmentMessage] = Field(default_factory=list)
     jobs: list[RenderJob] = Field(default_factory=list)
+
+    def section_of(self, shot: Shot) -> SongSection | None:
+        """The `SongSection` whose window holds this Shot's midpoint, or ``None``.
+
+        **The one implementation of section membership in this application.** It lives on the
+        model rather than beside its first caller because it now has two kinds of reader that
+        must not be able to disagree: every Python caller reaches it through
+        `timeline.song_section`, which is a one-line delegation, and the browser reads
+        `shot_sections` below off the wire rather than deciding anything for itself. There is no
+        second copy of the tie clause to drift from — which is exactly what a fourth instance of
+        this repository's oldest defect would have been (`shotLabel` numbered by manifest
+        position on one side and song position on the other, the H3 adapter mirroring the node's
+        partition, the preview fingerprint hashing the stored stack while the picture came from
+        the composed chain). A `<` where the other has `<=` is invisible until a Shot starts
+        precisely on a boundary, and there is no other side here to hold the `<=`.
+
+        The slot `timeline.song_section` held empty for two days is filled the way it predicted:
+        not by an analyser, but by the Director's own marks (`Project.sections`, 2026-08-19).
+        The midpoint decides membership because a shot straddling a boundary belongs to
+        whichever section owns more of it; a later start wins a tie, matching the tiling grid's
+        rule that a boundary belongs to the window it opens. Empty sections still mean unknown —
+        callers omit rather than fabricate.
+
+        The Shot is read for its **window** and never looked up by id, so a copy carrying an
+        edited window (`song_audio_prose` passes one with the stored expansion blanked) answers
+        about the seconds it names rather than about the seconds the manifest holds.
+        """
+        if not self.sections:
+            return None
+        midpoint = shot.start + shot.duration / 2
+        best: SongSection | None = None
+        for section in self.sections:
+            if section.start <= midpoint < section.end and (
+                best is None or section.start > best.start
+            ):
+                best = section
+        return best
+
+    @computed_field
+    @property
+    def shot_sections(self) -> dict[str, str]:
+        """Which section each Shot belongs to, by id — `section_of`'s answer, on the wire.
+
+        This is how the browser targets a Section without owning a second copy of the rule: it
+        looks a Shot's id up in this map. It decides nothing, so there is nothing for it to
+        decide differently.
+
+        **Derived, and therefore never stored.** `store.save` excludes it, and
+        `test_the_steps_add_no_field_to_a_saved_manifest` fails if that is ever forgotten — a
+        manifest carrying this map would be carrying an answer that can outlive its question,
+        which is the thing this codebase refuses to keep (AD-21, on why no "this stack is valid"
+        flag is stored). It is recomputed on every serialisation instead, so it cannot go stale:
+        there is no cache to invalidate and no key to compare, and every reply carrying a
+        Project carries the membership that Project has at the moment it was sent.
+
+        A Shot in no section is **absent from the map**, never mapped to `""`. Sections need not
+        tile the song, and this codebase's rule for an absent answer is to omit it rather than
+        to report a confident empty one.
+        """
+        return {
+            shot.id: section.id
+            for shot in self.shots
+            if (section := self.section_of(shot)) is not None
+        }

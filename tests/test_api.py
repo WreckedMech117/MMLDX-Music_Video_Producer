@@ -14792,6 +14792,67 @@ def test_sections_route_sorts_refuses_overlap_and_reaches_the_expansion(tmp_path
     assert "lyrics" not in section
 
 
+def test_the_section_map_rides_every_reply_and_is_never_written_to_the_manifest(
+    tmp_path: Path,
+):
+    """`Project.shot_sections` — served so the browser can target a Section without owning a
+    second copy of the midpoint rule, and derived, so it is never written down.
+
+    Both halves are load-bearing. **Served**, and on the same reply as the shots and sections it
+    describes: a map fetched separately, or cached under a key, would let the panel tick a set
+    that was true a moment ago, and the whole point of the field is that the browser holds no
+    opinion it has to keep fresh. Recomputed on every serialisation, it cannot be stale — the
+    `PUT` below moves a shot across a boundary and the reply that lands *from that write*
+    already says so.
+
+    **Not saved**: a manifest carrying this map would be carrying a claim about the relationship
+    between `shots` and `sections` that outlives either of them moving, which is the kind of
+    stored verdict this codebase refuses (AD-21). `store.DERIVED_NOT_STORED` is the exclusion and
+    this is the alarm on it; `test_the_steps_add_no_field_to_a_saved_manifest` catches it from
+    the other end, generically.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project = store.create(Project(name="Section map"))
+    project.song = Song(title="S", source="imported", path="m.mp3", duration=60.0)
+    project.sections = [
+        SongSection(id="section_verse", label="Verse", start=0, duration=24),
+        SongSection(id="section_chorus", label="Chorus", start=24, duration=20),
+    ]
+    project.shots = [
+        Shot(id="shot_a", start=4, duration=6, prompt="at the mic"),
+        Shot(id="shot_b", start=30, duration=6, prompt="on the bed"),
+        # Past the last section's end: sections need not tile the song, and a shot in a gap is
+        # absent from the map rather than mapped to "".
+        Shot(id="shot_gap", start=50, duration=6, prompt="the stairwell"),
+    ]
+    store.save(project)
+
+    served = client.get(f"/api/projects/{project.id}")
+    assert served.status_code == 200
+    assert served.json()["shot_sections"] == {
+        "shot_a": "section_verse", "shot_b": "section_chorus",
+    }
+
+    manifest = json.loads(
+        (tmp_path / "projects" / project.id / "project.json").read_text(encoding="utf-8")
+    )
+    assert "shot_sections" not in manifest
+
+    # Dragged across the boundary: the reply carrying the write already carries the new answer,
+    # so nothing on the client has a stale map to notice or a key to compare.
+    moved = [dict(shot) for shot in served.json()["shots"]]
+    moved[0]["start"] = 30
+    written = client.put(f"/api/projects/{project.id}/shots", json={"shots": moved})
+    assert written.status_code == 200
+    assert written.json()["shot_sections"] == {
+        "shot_a": "section_chorus", "shot_b": "section_chorus",
+    }
+    stored = json.loads(
+        (tmp_path / "projects" / project.id / "project.json").read_text(encoding="utf-8")
+    )
+    assert "shot_sections" not in stored
+
+
 def test_the_generic_project_put_holds_sections_to_the_same_rule_as_the_sections_route(
     tmp_path: Path,
 ):

@@ -950,23 +950,20 @@ def build_director_timeline(
 def song_section(project: Project, shot: Shot):
     """The `SongSection` whose window holds this Shot's midpoint, or ``None``.
 
-    The slot this function held empty for two days is filled the way it predicted: not by
-    an analyser, but by the Director's own marks (`Project.sections`, 2026-08-19). The
-    midpoint decides membership because a shot straddling a boundary belongs to whichever
-    section owns more of it; a later start wins a tie, matching the tiling grid's rule
-    that a boundary belongs to the window it opens. Empty sections still mean unknown --
-    callers omit rather than fabricate.
+    One line, deliberately. The rule itself moved onto `Project.section_of` when the
+    browser gained a reader for it (Story 9.5's Section target), and that docstring
+    carries the midpoint, the tie-break and the argument for there being exactly one copy
+    of them. This name stays because a dozen call sites and the expansion's wrong-verse
+    fix are written against it, and because `Project` is the wrong place to look for the
+    *timeline's* vocabulary.
+
+    Delegation rather than re-spelling, and pinned as one:
+    `test_the_wire_map_and_song_section_answer_from_one_rule` asserts both answers at a
+    Shot whose midpoint lands exactly on a boundary — the one input a second spelling
+    gets wrong first — and `test_section_membership_is_spelled_once_in_the_whole_package`
+    fails if the comparison ever appears twice in the package at all.
     """
-    if not project.sections:
-        return None
-    midpoint = shot.start + shot.duration / 2
-    best = None
-    for section in project.sections:
-        if section.start <= midpoint < section.end and (
-            best is None or section.start > best.start
-        ):
-            best = section
-    return best
+    return project.section_of(shot)
 
 
 #: Below this much measured voice in a window, a `singing` mark is physically impossible:

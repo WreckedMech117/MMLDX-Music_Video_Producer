@@ -778,6 +778,14 @@ SHOT_DIRECTOR_WITHHELD_FIELDS = _withheld_fields(
 # into the prompt by omission. See `director_chat` for why that matters.
 DIRECTOR_CONTEXT_EXCLUDE: dict[str, Any] = {
     "jobs": True,
+    # `Project.shot_sections` is a derived map from shot id to section id, added for the browser
+    # so the Section target does not re-derive `section_of`'s rule. It is withheld here for the
+    # reason `notices` is: the model is already told each Shot's section, by *name*, where it can
+    # use it — `expansion_input` writes `section` onto the shot entry — and a second encoding of
+    # the same fact as opaque id pairs would spend prompt on a restatement the model cannot read
+    # any better than the first. Withholding it also keeps every Director prompt byte-identical
+    # to what it was before this field existed, which is what makes the field safe to add.
+    "shot_sections": True,
     # `notices` goes out whole, and that is the invariant Story 2.2 established extended to this
     # route. A notice's `raw` field holds the degraded output a refusal is about, and this dump is
     # what the *next* Director call is handed — so leaving it in would make the guard that catches

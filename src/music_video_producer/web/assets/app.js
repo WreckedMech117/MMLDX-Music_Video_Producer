@@ -2732,7 +2732,29 @@ function effectCopyHtml(copy) {
   }
   const targets = copy.targets.map((target) =>
     `<label class="effect-copy-target" for="effect-copy-target-${target.id}"><input type="checkbox" id="effect-copy-target-${target.id}" ${target.checked ? "checked" : ""}><span class="effect-copy-name">${escapeHtml(target.label)}</span><span class="effect-copy-hint">${escapeHtml(target.hint)}</span>${target.lockedMark ? `<span class="effect-copy-mark">${escapeHtml(target.lockedMark)}</span>` : ""}</label>`).join("");
-  return `<button type="button" class="quiet-button full effect-copy" id="effect-copy" title="${escapeHtml(copy.title)}" aria-expanded="${copy.open}" aria-controls="effect-copy-panel">${escapeHtml(copy.label)}</button><div class="effect-copy-panel" id="effect-copy-panel" ${copy.open ? "" : "hidden"}><p class="effect-copy-note" id="effect-copy-note">${escapeHtml(copy.announcement)}</p><div class="effect-copy-targets">${targets}</div><button type="button" class="quiet-button full" id="effect-copy-apply" title="${escapeHtml(copy.apply.title)}" ${copy.apply.disabled ? "disabled" : ""}>${escapeHtml(copy.apply.label)}</button><p class="control-reason" id="effect-copy-reason">${escapeHtml(copy.reason)}</p></div>`;
+  return `<button type="button" class="quiet-button full effect-copy" id="effect-copy" title="${escapeHtml(copy.title)}" aria-expanded="${copy.open}" aria-controls="effect-copy-panel">${escapeHtml(copy.label)}</button><div class="effect-copy-panel" id="effect-copy-panel" ${copy.open ? "" : "hidden"}><p class="effect-copy-note" id="effect-copy-note">${escapeHtml(copy.announcement)}</p>${effectCopySectionHtml(copy.section)}<div class="effect-copy-targets">${targets}</div><button type="button" class="quiet-button full" id="effect-copy-apply" title="${escapeHtml(copy.apply.title)}" ${copy.apply.disabled ? "disabled" : ""}>${escapeHtml(copy.apply.label)}</button><p class="control-reason" id="effect-copy-reason">${escapeHtml(copy.reason)}</p></div>`;
+}
+
+// The Section target, drawn **above the target list and below the announcement**: the Director
+// reads what a copy does, names the section, and then reads the set it produced on the way to the
+// button that writes it. Drawn the other side of the list it would be a shortcut found after the
+// choice had already been made by hand.
+//
+// One element either way, and never both: a button when there is a section with other shots in
+// it, and otherwise the sentence saying which of the three absences this is. **Nothing is drawn
+// disabled here.** A greyed button states that something is impossible without stating why, and
+// each of these absences has a different reason a Director can act on -- mark some sections, move
+// this shot, or nothing at all because a one-shot section is legitimate.
+//
+// Every string is `effectCopyPanel`'s, including the count in the label; nothing is decided here.
+function effectCopySectionHtml(section) {
+  if (!section) return "";
+  if (section.shown) {
+    return `<button type="button" class="quiet-button full" id="effect-copy-section" title="${escapeHtml(section.title)}">${escapeHtml(section.label)}</button>`;
+  }
+  return section.note
+    ? `<p class="control-reason" id="effect-copy-section-note">${escapeHtml(section.note)}</p>`
+    : "";
 }
 
 // The whole Effects panel for one Shot. Three states are settled before this runs -- the
@@ -2949,6 +2971,20 @@ function startEffectDrag(inspector, model, shotId, from, event) {
   window.addEventListener("keydown", cancel);
 }
 
+// The copy control's model, rebuilt from what is ticked **now**.
+//
+// Both callers below need this rather than the model the panel was drawn from, and for one
+// reason: a tick repaints without rebuilding, so `effectCopy` moves on while the markup -- and
+// every closure bound while it was written -- still describes the moment of the last render.
+// `paintEffectCopy` reads it to repaint the two things a tick changes; the Section button reads
+// it because "does this press add the section or take it off" is a question about the ticks as
+// they stand, and answering it from a stale model made the press a no-op after any hand tick.
+function currentEffectCopy(shot) {
+  return effectsPanelModel(shot, effectCatalogue, {
+    error: effectCatalogueError, project: state.project, copy: effectCopy,
+  }).copy;
+}
+
 // The copy's button and its reason, repainted from the model without rebuilding the panel.
 //
 // A tick must not redraw the inspector. It is the same defect the drag suppresses around: the
@@ -2957,9 +2993,7 @@ function startEffectDrag(inspector, model, shotId, from, event) {
 // button says it will write, and whether it may be pressed -- are painted here, `paintEffectSlider`'s
 // shape and for its reason.
 function paintEffectCopy(inspector, shot) {
-  const copy = effectsPanelModel(shot, effectCatalogue, {
-    error: effectCatalogueError, project: state.project, copy: effectCopy,
-  }).copy;
+  const copy = currentEffectCopy(shot);
   const apply = $("#effect-copy-apply", inspector);
   if (apply) {
     apply.textContent = copy.apply.label;
@@ -2970,6 +3004,13 @@ function paintEffectCopy(inspector, shot) {
   if (reason) reason.textContent = copy.reason;
   const note = $("#effect-copy-note", inspector);
   if (note) note.textContent = copy.announcement;
+  // The Section button flips between "Tick" and "Untick" as the last of its shots is ticked or
+  // unticked by hand, so it is repainted here with the apply button rather than left saying it
+  // will do the thing it just stopped doing. Which shots are *in* the section cannot change on a
+  // tick, so `shown` and the sentence beside it are not repainted -- they move only when the
+  // project does, and that already rebuilds the panel.
+  const section = $("#effect-copy-section", inspector);
+  if (section && copy.section?.shown) section.textContent = copy.section.label;
 }
 
 // One copy, sent as one request. **Never a loop of stack writes**: the route reports atomically
@@ -3109,6 +3150,22 @@ function bindEffectCopy(inspector, shot, model) {
       paintEffectCopy(inspector, shot);
     });
   }
+  // The Section target. **A rebuild, unlike a tick**: this press changes the `checked` attribute
+  // of every shot in the section at once, and there is no checkbox under the Director's finger to
+  // be replaced -- the same reason the disclosure above rebuilds and a tick does not.
+  //
+  // The whole resulting tick set is `copy.section.next`, decided in `api.js`: whether this press
+  // adds the section to what is ticked or takes it back off, and in which order the ids end up,
+  // are pure decisions. Nothing is written -- the Director still has to press the button below,
+  // which is what makes the target set one they named and confirmed.
+  $("#effect-copy-section", inspector)?.addEventListener("click", () => {
+    effectCopy = { shotId, open: true, ids: currentEffectCopy(shot).section.next };
+    renderShotInspector();
+    // The rebuild replaced the button that was just pressed, so the focus is put back on its
+    // replacement -- the shape `moveEffectCard` uses for the grip, and for its reason: a keyboard
+    // Director must not be returned to the top of the workspace by their own press.
+    $("#effect-copy-section", $("#shot-inspector"))?.focus?.();
+  });
   $("#effect-copy-apply", inspector)?.addEventListener("click", () => {
     const chosen = effectCopy.shotId === shotId ? effectCopy.ids : [];
     // The button ships `disabled` with nothing ticked, so this is the belt to that brace and the

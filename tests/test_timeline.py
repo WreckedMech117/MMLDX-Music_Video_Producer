@@ -1699,6 +1699,81 @@ def test_song_section_maps_by_midpoint_and_absence_means_unknown():
     assert song_section(bare, Shot(start=1, duration=4, prompt="x")) is None
 
 
+def test_the_wire_map_and_song_section_answer_from_one_rule():
+    """One implementation, two readers — and the tie is exactly where a second one would drift.
+
+    `Project.shot_sections` exists so the browser can target a Section without owning a copy of
+    the midpoint rule; `timeline.song_section` is a one-line delegation to the same method. The
+    shot below starts at 18 and runs 12 seconds, so its midpoint is **24.0** — the boundary
+    between "Verse 1" and "Chorus" in this fixture, and the one input where `<=` and `<` give
+    different answers. Both readers are asserted on it, so a re-spelling of either fails here
+    rather than diverging silently on the one shot a Director would never think to check.
+
+    The second shot sits past the last section: it is **absent from the map**, never mapped to
+    `""`, because two shots in no section must not read as two shots sharing one.
+    """
+    project = sectioned_project()
+    project.shots = [
+        Shot(id="shot_edge", start=18, duration=12, prompt="x"),
+        Shot(id="shot_gap", start=120, duration=4, prompt="x"),
+    ]
+    edge, gap = project.shots
+
+    assert edge.start + edge.duration / 2 == 24.0
+    assert song_section(project, edge).label == "Chorus"
+    assert song_section(project, gap) is None
+    chorus = next(section for section in project.sections if section.label == "Chorus")
+    assert project.shot_sections == {"shot_edge": chorus.id}
+    # Not two implementations agreeing today: the same call, reached two ways.
+    assert project.section_of(edge) is song_section(project, edge)
+
+
+def test_a_shot_inside_two_overlapping_sections_reads_the_later_start_both_ways():
+    """The other half of the tie clause, and the other half a copy of the rule would drop.
+
+    Sections are hand-marked and may overlap; `section_of` gives the shot to the section that
+    *starts later*, matching the tiling grid's rule that a boundary belongs to the window it
+    opens. Asserted through both readers on one project, for the reason above.
+    """
+    project = Project(
+        name="Overlap",
+        sections=[
+            SongSection(id="section_early", label="Verse 1", start=0, duration=40),
+            SongSection(id="section_late", label="Chorus", start=20, duration=40),
+        ],
+        shots=[Shot(id="shot_both", start=28, duration=4, prompt="x")],
+    )
+
+    assert song_section(project, project.shots[0]).id == "section_late"
+    assert project.shot_sections == {"shot_both": "section_late"}
+
+
+def test_section_membership_is_spelled_once_in_the_whole_package():
+    """The guard that makes "one implementation" a fact about the source rather than a hope.
+
+    The tests above would both keep passing if someone wrote a second walk over the windows
+    somewhere else and it happened to agree; this fails the moment the comparison exists twice.
+    It is the same shape as the package's other single-writer scans — see `package_source`, and
+    note that comments and docstrings are stripped first, so the sentences explaining this rule
+    do not count as spellings of it.
+    """
+    import ast
+
+    from package_source import function_ast, modules_containing
+
+    assert modules_containing("section.start <= midpoint < section.end") == {"models.py": 1}
+    # And `song_section` is a delegation, not the second spelling that used to live there.
+    # Read off the parse tree rather than the text: its docstring explains the rule, and a
+    # guard that matched the explanation would be measuring itself.
+    node = function_ast("song_section")
+    statements = [
+        item
+        for item in node.body
+        if not (isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant))
+    ]
+    assert [ast.unparse(item) for item in statements] == ["return project.section_of(shot)"]
+
+
 def test_section_lyrics_pair_by_order_of_appearance_within_a_label_family():
     """The sheet's tags carry structure but no timing; the sections carry timing but no
     words; the Nth "Verse *" section takes the Nth [Verse] block. This is the fix for the

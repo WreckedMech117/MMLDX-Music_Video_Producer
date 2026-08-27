@@ -73,6 +73,7 @@ from music_video_producer.models import (
     Shot,
     SingingState,
     Song,
+    SongSection,
     TreatmentMessage,
     dangling_citations,
     mode_specification_problems,
@@ -19893,9 +19894,20 @@ def effects_shot(**overrides) -> str:
     return json.dumps(shot)
 
 
-def effects_project(shots: str, project_id: str = "p1") -> str:
+def effects_project(shots: str, project_id: str = "p1", sections: str = "",
+                    placed: str = "") -> str:
+    """One Project as the workspace holds it.
+
+    `sections` and `placed` are the Section target's two halves of the wire: the Director's own
+    marks, and `Project.shot_sections` — the server's answer about which section each Shot's
+    midpoint lands in. They are supplied separately *on purpose*. The browser is handed the map
+    and never the rule, so a fixture can hand it a map that contradicts the windows and the panel
+    still has to follow the map; `test_the_section_target_follows_the_map_and_never_the_windows`
+    is that fixture, and it is what fails if this client ever grows an opinion of its own.
+    """
     return (
-        f"{{ id: '{project_id}', jobs: [], song: null, assets: [], messages: [], sections: [], "
+        f"{{ id: '{project_id}', jobs: [], song: null, assets: [], messages: [], "
+        f"sections: [{sections}], shot_sections: {{{placed}}}, "
         f"shots: [{shots}] }}"
     )
 
@@ -21750,26 +21762,84 @@ def copy_exports() -> dict:
     return run_module("""
       import { EFFECT_COPY_CLEARS, EFFECT_COPY_FLAG, EFFECT_COPY_HELP, EFFECT_COPY_LABEL,
                EFFECT_COPY_LOCKED_MARK, EFFECT_COPY_PARTIAL_FLAG, EFFECT_COPY_REPLACES,
+               EFFECT_COPY_SECTION_ALONE, EFFECT_COPY_SECTION_HELP, EFFECT_COPY_SECTION_LABEL,
+               EFFECT_COPY_SECTION_OUTSIDE, EFFECT_COPY_SECTION_UNMARKED,
+               EFFECT_COPY_SECTION_UNTICK_LABEL,
                EFFECT_COPY_WITHOUT_OTHERS, EFFECT_COPY_WITHOUT_TARGETS, EFFECT_HANDLE_GLYPH }
         from './src/music_video_producer/web/assets/api.js';
       console.log(JSON.stringify({
         clears: EFFECT_COPY_CLEARS, flag: EFFECT_COPY_FLAG, help: EFFECT_COPY_HELP,
         label: EFFECT_COPY_LABEL, lockedMark: EFFECT_COPY_LOCKED_MARK,
         partial: EFFECT_COPY_PARTIAL_FLAG, replaces: EFFECT_COPY_REPLACES,
+        sectionAlone: EFFECT_COPY_SECTION_ALONE, sectionHelp: EFFECT_COPY_SECTION_HELP,
+        sectionLabel: EFFECT_COPY_SECTION_LABEL, sectionOutside: EFFECT_COPY_SECTION_OUTSIDE,
+        sectionUnmarked: EFFECT_COPY_SECTION_UNMARKED,
+        sectionUntick: EFFECT_COPY_SECTION_UNTICK_LABEL,
         withoutOthers: EFFECT_COPY_WITHOUT_OTHERS, withoutTargets: EFFECT_COPY_WITHOUT_TARGETS,
         handle: EFFECT_HANDLE_GLYPH,
       }));
     """)
 
 
-def copy_project(source_effects: list, others_locked: bool = False) -> str:
+#: Where `copy_project`'s three shots sit on the song. Four seconds each, back to back, so a
+#: section mark can hold one, two or all three of them and the fixtures below can reach every
+#: state the Section target has to answer for.
+COPY_SHOT_WINDOWS = (("shot_a", 0.0), ("shot_b", 4.0), ("shot_c", 8.0))
+
+#: The Director's marks those fixtures use, written as `SongSection` accepts them. Each is
+#: rendered onto the wire by `copy_sections` **and** fed to the real `Project.shot_sections` by
+#: `copy_section_map`, so the map the browser is handed is the map the server would have sent
+#: rather than one this file worked out for itself.
+COPY_SECTION_VERSE = {"id": "section_verse", "label": "Verse 1", "start": 0, "duration": 8}
+COPY_SECTION_CHORUS = {"id": "section_chorus", "label": "Chorus", "start": 8, "duration": 4}
+COPY_SECTION_ALL = {"id": "section_verse", "label": "Verse 1", "start": 0, "duration": 12}
+COPY_SECTION_FIRST_ONLY = {"id": "section_verse", "label": "Verse 1", "start": 0, "duration": 4}
+
+
+def copy_sections(*sections: dict) -> str:
+    """Those marks as the wire carries them — `end` included, as `SongSection` computes it."""
+    return ", ".join(
+        "{ " + ", ".join(
+            f"{key}: {json.dumps(value)}"
+            for key, value in {**section, "end": section["start"] + section["duration"]}.items()
+        ) + " }"
+        for section in sections
+    )
+
+
+def copy_section_map(*sections: dict) -> dict:
+    """`Project.shot_sections` for `copy_project`'s three shots under these marks.
+
+    **The server's answer, computed by the server's own code**, and then handed to the browser
+    fixture verbatim. Nothing in this file decides which shot is in which section — which is the
+    whole reason the field is on the wire, and which is why these fixtures cannot quietly agree
+    with a client-side re-derivation that has drifted.
+    """
+    project = Project(
+        name="Copy",
+        sections=[SongSection(**section) for section in sections],
+        shots=[
+            Shot(id=shot_id, start=start, duration=4, prompt="x")
+            for shot_id, start in COPY_SHOT_WINDOWS
+        ],
+    )
+    return project.shot_sections
+
+
+def copy_placed(mapping: dict) -> str:
+    """A shot-id to section-id map as a JavaScript object body."""
+    return ", ".join(f"{shot_id}: '{section_id}'" for shot_id, section_id in mapping.items())
+
+
+def copy_project(source_effects: list, others_locked: bool = False, sections: str = "",
+                 placed: str = "") -> str:
     """Three shots: the source, an ordinary target, and one that may be locked."""
     shots = ", ".join([
         effects_shot(id="shot_a", effects=source_effects, prompt="rooftop wide"),
-        effects_shot(id="shot_b", prompt="rooftop close"),
-        effects_shot(id="shot_c", prompt="the stairwell", locked=others_locked),
+        effects_shot(id="shot_b", start=4, prompt="rooftop close"),
+        effects_shot(id="shot_c", start=8, prompt="the stairwell", locked=others_locked),
     ])
-    return effects_project(shots)
+    return effects_project(shots, sections=sections, placed=placed)
 
 
 def element_text(html: str, element_id: str) -> str:
@@ -21786,8 +21856,8 @@ def opening_tag(html: str, element_id: str) -> str:
 
 
 def drawn_copy_panel(source_effects: list, extra: str = "", responses: dict | None = None,
-                     others_locked: bool = False) -> dict:
-    project = copy_project(source_effects, others_locked)
+                     others_locked: bool = False, sections: str = "", placed: str = "") -> dict:
+    project = copy_project(source_effects, others_locked, sections, placed)
     return run_effects_workspace(f"""
       const toasts = [];
       at('#toast-region').append = (item) => toasts.push(item.textContent);
@@ -21987,6 +22057,288 @@ def test_a_locked_target_is_offered_and_marked_rather_than_hidden():
     assert f'class="effect-copy-mark">{exports["lockedMark"]}<' in panel["html"]
     # Named as the rest of this application names a Shot, never by a bare id alone.
     assert "SHOT 03 (shot_c)" in panel["html"]
+
+
+# --- The Section target (Story 9.5's other half) ---------------------------------------------
+
+
+def test_the_section_target_ticks_the_shots_the_server_places_in_that_section():
+    """A look copied to "the current Section", as a set the Director sees before it is written.
+
+    The press is a *resolution*, not a write: it turns "this shot's section" into ticked boxes in
+    the list that was already there, so FX-6's "the target set is explicit, the Director names it"
+    is satisfied by them looking at the set rather than by the word "section" reaching the route.
+    The request that eventually leaves is the same explicit id list every copy has always sent —
+    which is why this story changed no route.
+
+    The map the fixture hands the browser is `Project.shot_sections` computed by the server's own
+    code (`copy_section_map`), so what is ticked here is what the server says the section holds.
+    """
+    exports = copy_exports()
+    placed = copy_section_map(COPY_SECTION_VERSE, COPY_SECTION_CHORUS)
+    # The server's answer, stated: two shots in the Verse, the third in the Chorus.
+    assert placed == {
+        "shot_a": "section_verse", "shot_b": "section_verse", "shot_c": "section_chorus",
+    }
+    panel = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        sections=copy_sections(COPY_SECTION_VERSE, COPY_SECTION_CHORUS),
+        placed=copy_placed(placed),
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-section:click', {});
+        """,
+    )
+    html = panel["html"]
+
+    # The section's other shot is ticked; the shot in the *other* section is not.
+    assert "checked" in opening_tag(html, "effect-copy-target-shot_b")
+    assert "checked" not in opening_tag(html, "effect-copy-target-shot_c")
+    # What the button said before it was pressed: by count, and by the section's own label, so
+    # the press is legible before it is made rather than explained afterwards.
+    unpressed = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        sections=copy_sections(COPY_SECTION_VERSE, COPY_SECTION_CHORUS),
+        placed=copy_placed(placed),
+        extra="fire('#effect-copy:click', {});",
+    )
+    assert element_text(unpressed["html"], "effect-copy-section") == escape_for_markup(
+        exports["sectionLabel"].replace("{count}", "1 other shot").replace("{section}", "Verse 1"))
+    assert "checked" not in opening_tag(unpressed["html"], "effect-copy-target-shot_b")
+    assert escape_for_markup(exports["sectionHelp"]) in html
+    # Read on the way to the choice: the button is above the list it ticks and above the write.
+    assert html.index('id="effect-copy-note"') < html.index('id="effect-copy-section"')
+    assert html.index('id="effect-copy-section"') < html.index('id="effect-copy-target-shot_b"')
+    assert html.index('id="effect-copy-target-shot_c"') < html.index('id="effect-copy-apply"')
+    # Nothing has been written, and the write is now reachable and says how much it will do.
+    assert panel["requests"] == []
+    assert "disabled" not in opening_tag(html, "effect-copy-apply")
+    assert element_text(html, "effect-copy-apply") == "Copy to 1 shot"
+
+
+def test_the_section_target_writes_the_ids_it_ticked_and_nothing_else():
+    """The set the Director confirmed is the set the route is given, one request, by name."""
+    placed = copy_section_map(COPY_SECTION_VERSE, COPY_SECTION_CHORUS)
+    copied = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        sections=copy_sections(COPY_SECTION_VERSE, COPY_SECTION_CHORUS),
+        placed=copy_placed(placed),
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-section:click', {});
+          requests.length = 0;
+          await fire('#effect-copy-apply:click', {});
+          await flush();
+        """,
+        responses={"/api/projects/p1/shots/shot_a/effects/copy": {"body": {
+            **COPY_REPLY, "applied": ["SHOT 02 (shot_b)"], "refused": [],
+        }}},
+    )
+
+    assert [(item["path"], item["method"]) for item in copied["requests"]] == [
+        ("/api/projects/p1/shots/shot_a/effects/copy", "POST")
+    ]
+    # The section is never a target *kind*: it resolved into ids, and ids are what travel.
+    assert json.loads(copied["requests"][0]["body"]) == {"targets": ["shot_b"]}
+
+
+def test_the_section_target_can_be_adjusted_and_taken_back_off_before_it_is_written():
+    """"The Director can see and adjust the set before it is written" — both directions.
+
+    A shot the section does not hold can be added to the ticks by hand, and the same button that
+    ticked the section takes it back off again. The second half is why the button never sits
+    inert: once everything it offers is ticked, a press that did nothing would be a control whose
+    only remaining state is refusal to respond.
+    """
+    exports = copy_exports()
+    placed = copy_section_map(COPY_SECTION_VERSE, COPY_SECTION_CHORUS)
+    added = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        sections=copy_sections(COPY_SECTION_VERSE, COPY_SECTION_CHORUS),
+        placed=copy_placed(placed),
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-section:click', {});
+          fire('#effect-copy-target-shot_c:change', { target: { checked: true } });
+          app.renderShotInspector();
+        """,
+    )
+    assert element_text(added["html"], "effect-copy-apply") == "Copy to 2 shots"
+    assert "checked" in opening_tag(added["html"], "effect-copy-target-shot_c")
+    # The button now offers to take its own shots back off, and says so.
+    assert element_text(added["html"], "effect-copy-section") == escape_for_markup(
+        exports["sectionUntick"].replace("{count}", "1 other shot").replace("{section}", "Verse 1"))
+
+    # The other order, and the one that says the press *adds*: a shot ticked by hand first is
+    # still ticked afterwards. A press that replaced the ticks would silently drop it, and the
+    # Director would confirm a set one shot smaller than the one they built.
+    onto = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        sections=copy_sections(COPY_SECTION_VERSE, COPY_SECTION_CHORUS),
+        placed=copy_placed(placed),
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-target-shot_c:change', { target: { checked: true } });
+          fire('#effect-copy-section:click', {});
+        """,
+    )
+    assert "checked" in opening_tag(onto["html"], "effect-copy-target-shot_b")
+    assert "checked" in opening_tag(onto["html"], "effect-copy-target-shot_c")
+    assert element_text(onto["html"], "effect-copy-apply") == "Copy to 2 shots"
+
+    removed = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        sections=copy_sections(COPY_SECTION_VERSE, COPY_SECTION_CHORUS),
+        placed=copy_placed(placed),
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-section:click', {});
+          fire('#effect-copy-target-shot_c:change', { target: { checked: true } });
+          fire('#effect-copy-section:click', {});
+        """,
+    )
+    # The section came off; the shot the Director ticked by hand was left exactly where it was.
+    assert "checked" not in opening_tag(removed["html"], "effect-copy-target-shot_b")
+    assert "checked" in opening_tag(removed["html"], "effect-copy-target-shot_c")
+    assert element_text(removed["html"], "effect-copy-apply") == "Copy to 1 shot"
+    assert removed["requests"] == []
+
+
+def test_a_locked_shot_in_the_section_is_ticked_and_left_to_the_route_to_refuse():
+    """FX-6's matrix, reached through the section rather than through a hand tick.
+
+    The section's set is what the section holds, lock and all: hiding a locked shot from it would
+    answer a question the Director never got to ask, and the route already refuses it **by name**
+    and reports it while the rest still land. That refusal is the guard; this only has to not
+    quietly drop the shot on the way to it.
+    """
+    exports = copy_exports()
+    placed = copy_section_map(COPY_SECTION_ALL)
+    assert placed == {
+        "shot_a": "section_verse", "shot_b": "section_verse", "shot_c": "section_verse",
+    }
+    panel = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        others_locked=True,
+        sections=copy_sections(COPY_SECTION_ALL),
+        placed=copy_placed(placed),
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-section:click', {});
+          requests.length = 0;
+          await fire('#effect-copy-apply:click', {});
+          await flush();
+          app.renderShotInspector();
+        """,
+        responses={"/api/projects/p1/shots/shot_a/effects/copy": {"body": COPY_REPLY}},
+    )
+
+    assert json.loads(panel["requests"][0]["body"]) == {"targets": ["shot_b", "shot_c"]}
+    # Named by the route's own sentence, whole, under the flag that says some of it did not land.
+    assert escape_for_markup(COPY_REPLY["refused"][0]["detail"]) in panel["html"]
+    assert escape_for_markup(exports["partial"]) in panel["html"]
+
+
+def test_the_section_target_says_which_absence_it_is_rather_than_offering_nothing():
+    """The three states with no section to offer, each said in its own words.
+
+    They are different facts with different remedies — mark some sections, or move this shot, or
+    nothing at all because a one-shot section is perfectly legitimate — so one greyed button
+    saying nothing would be the interface declining to answer. **Absence is never presented as an
+    error**, and no state here leaves a control sitting inert: in all three the button is not
+    drawn at all and a sentence stands in its place.
+    """
+    exports = copy_exports()
+    stack = [{"effect": "grain", "enabled": True, "parameters": {}}]
+    opened = "fire('#effect-copy:click', {});"
+
+    # 1. Nothing marked at all — the common case, because nothing infers sections.
+    unmarked = drawn_copy_panel(stack, extra=opened)
+    assert element_text(unmarked["html"], "effect-copy-section-note") == escape_for_markup(
+        exports["sectionUnmarked"])
+
+    # 2. Sections exist, and this shot's midpoint is in none of them.
+    outside_map = copy_section_map(COPY_SECTION_CHORUS)
+    assert "shot_a" not in outside_map
+    outside = drawn_copy_panel(
+        stack, sections=copy_sections(COPY_SECTION_CHORUS), placed=copy_placed(outside_map),
+        extra=opened)
+    assert element_text(outside["html"], "effect-copy-section-note") == escape_for_markup(
+        exports["sectionOutside"])
+
+    # 3. A real section that holds this shot and nothing else.
+    alone_map = copy_section_map(COPY_SECTION_FIRST_ONLY)
+    assert alone_map == {"shot_a": "section_verse"}
+    alone = drawn_copy_panel(
+        stack, sections=copy_sections(COPY_SECTION_FIRST_ONLY), placed=copy_placed(alone_map),
+        extra=opened)
+    assert element_text(alone["html"], "effect-copy-section-note") == escape_for_markup(
+        exports["sectionAlone"].replace("{section}", "Verse 1"))
+
+    for state in (unmarked, outside, alone):
+        # No button, and therefore nothing to press that could not act.
+        assert 'id="effect-copy-section"' not in state["html"]
+        # The per-shot ticks are untouched: the section half being unavailable takes nothing away.
+        assert 'id="effect-copy-target-shot_b"' in state["html"]
+        assert state["requests"] == []
+
+
+def test_the_section_target_follows_the_map_and_never_the_windows():
+    """The guard on the decision this story turned on: **the browser owns no copy of the rule.**
+
+    `song_section` decides membership by the midpoint of a Shot's window and breaks a tie in
+    favour of the later start. A second implementation of that in `api.js` would be the fourth
+    instance of this repository's oldest defect — `shotLabel` numbered two ways, the H3 adapter
+    mirroring the node's partition, the preview fingerprint hashing one thing while the picture
+    came from another — and the tie is exactly where two implementations part company, because a
+    `<` against a `<=` is invisible until a Shot starts precisely on a boundary.
+
+    So the map here is a **lie**: it says shot_c is in the Verse and shot_b is in nothing, which
+    is the opposite of what the windows say. The panel follows it anyway, because all it does is
+    look a shot id up. Re-derive membership in `api.js` from `sections` and this fails — which is
+    what "agrees by construction rather than by two implementations agreeing today" has to mean
+    on the side that does not own the rule.
+    """
+    honest = copy_section_map(COPY_SECTION_VERSE, COPY_SECTION_CHORUS)
+    assert honest == {
+        "shot_a": "section_verse", "shot_b": "section_verse", "shot_c": "section_chorus",
+    }
+    panel = drawn_copy_panel(
+        [{"effect": "grain", "enabled": True, "parameters": {}}],
+        sections=copy_sections(COPY_SECTION_VERSE, COPY_SECTION_CHORUS),
+        placed=copy_placed({"shot_a": "section_verse", "shot_c": "section_verse"}),
+        extra="""
+          fire('#effect-copy:click', {});
+          fire('#effect-copy-section:click', {});
+        """,
+    )
+    html = panel["html"]
+
+    assert "checked" in opening_tag(html, "effect-copy-target-shot_c")
+    assert "checked" not in opening_tag(html, "effect-copy-target-shot_b")
+
+
+def test_the_copy_panel_reads_the_section_map_and_compares_no_boundary_of_its_own():
+    """The same claim made about the source, so it cannot go quietly true-but-untested.
+
+    The behavioural guard above needs a fixture that lies; this needs only that `api.js` reach
+    for the served answer. Both are here because either alone is weak: a source read cannot tell
+    whether the answer is used, and the fixture cannot tell whether a *second* path re-derives it
+    for some other control tomorrow.
+    """
+    source = (PACKAGE / "web" / "assets" / "api.js").read_text(encoding="utf-8")
+    # Comments first, for `package_source`'s reason: the prose here quotes the rule it is about,
+    # and a guard that matched the explanation would be measuring itself.
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("//"))
+    # Read once, in one function, and nowhere else in this file.
+    assert code.count("shot_sections") == 1
+    body = code.split("function effectCopySection(", 1)[1].split("\n}\n", 1)[0]
+    assert "shot_sections" in body
+    # And the rule's own vocabulary is absent from it: nothing here computes a midpoint or
+    # compares one to a section's edge, because nothing here decides membership.
+    for absent in ("midpoint", ".start", ".end", "duration", "<=", "/ 2"):
+        assert absent not in body, absent
 
 
 def copy_client(tmp_path: Path):

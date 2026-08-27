@@ -48,3 +48,10 @@ Read **`docs/BUILD-HANDOFF.md`** before starting on Shot Effects and Transitions
 
 *(Outside the managed block above, so a `bmad-project-context` refresh does not remove it.)*
 
+## Commit subjects carry the story id
+
+Put the story id **in the subject line**, in parentheses at the end — `… and the frame it was quietly losing (9.7)`. The subject keeps its voice; the id rides along.
+
+It has to be the subject, not a trailer. `bmad-retrospective`'s `git_evidence.py` attributes a commit to a story with a word-boundary match against `subject` alone (`_parse_pass`), so a `Story:` line in the body is invisible to it — Epic 9's retrospective proposed exactly that trailer, and it would have attributed the same 0 of 13. Without the id in the subject, every retrospective from here on reads an epic whose commits belong to nothing.
+
+*(Outside the managed block above, for the same reason as the section before it.)*

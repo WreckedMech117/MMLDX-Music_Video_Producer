@@ -7315,6 +7315,120 @@ export const EFFECT_COPY_LOCKED_MARK = "LOCKED";
 export const EFFECT_COPY_FLAG = "COPIED";
 export const EFFECT_COPY_PARTIAL_FLAG = "PARTLY COPIED";
 
+//: ------------------------------------------------------------------------------------------
+//: The Section target -- Story 9.5's other half: a look copied to "named Shots **or the current
+//: Section**".
+//:
+//: **It resolves a section into ticks rather than sending "the section" to the route.** FX-6 --
+//: "the target set is explicit, the Director names it" -- is satisfied by the letter either way,
+//: and in spirit only by this one: the Director names the section, the set they just named
+//: appears as ticked boxes they can read and change, and what leaves the browser is the same
+//: explicit id list every copy has always sent. A `target: "section"` kind would have the
+//: Director confirm a set they never saw, and would put a second target mechanism on a route
+//: that already has one.
+//: ------------------------------------------------------------------------------------------
+
+//: The button, in both directions. `{count}` is "1 other shot" or "N other shots" and
+//: `{section}` is the section's own label, so the press is legible before it is made -- the rule
+//: the apply button already follows with "Copy to 3 shots".
+export const EFFECT_COPY_SECTION_LABEL = "Tick the {count} in \"{section}\"";
+//: The same press once every one of them is ticked. **A button whose only remaining effect is
+//: nothing is a control sitting inert**, which is the one thing none of this control's states may
+//: do; this way the press always has somewhere to go, and it is also the only way to take a whole
+//: section back off without unticking it shot by shot.
+export const EFFECT_COPY_SECTION_UNTICK_LABEL = "Untick the {count} in \"{section}\"";
+
+//: What the button is for. It states the rule it obeys, because which shots it will tick is
+//: otherwise unpredictable for a shot that straddles a boundary -- and it says the ticks are a
+//: proposal, because seeing and confirming the set is what makes the target explicit, rather than
+//: the word "section" reaching the route.
+export const EFFECT_COPY_SECTION_HELP =
+  "Ticks every other shot in this shot's section, so you can see and change the set before "
+  + "anything is written. A shot is in the section its window's midpoint falls in.";
+
+//: Where the button would be when the song carries no marks at all -- the common case, because
+//: nothing infers sections and a Director may never mark any. **Absence is never presented as an
+//: error**: this names what is missing and where it is made, rather than greying out a control
+//: whose reason is invisible.
+export const EFFECT_COPY_SECTION_UNMARKED =
+  "No sections are marked on this song, so there is no section to copy onto. Sections are the "
+  + "marks you make by ear on the timeline; nothing infers them.";
+
+//: Sections exist and this shot is in none of them. Sections need not tile the song, so a shot
+//: sitting in a gap is an ordinary state rather than a mistake -- and the sentence names the
+//: midpoint, because that is the part of the rule a Director cannot read off the boxes.
+export const EFFECT_COPY_SECTION_OUTSIDE =
+  "This shot's midpoint falls outside every marked section, so it belongs to none and there is "
+  + "no section to copy onto. Sections do not have to cover the whole song.";
+
+//: A section holding this shot and nothing else. Legitimate, so it is stated by name and by count
+//: rather than hidden or reported as a problem.
+export const EFFECT_COPY_SECTION_ALONE =
+  "\"{section}\" holds this shot and no other, so there is nothing in it to copy onto.";
+
+//: How the button counts what it will tick. Separate from the apply button's wording because they
+//: count different things -- the section's other shots, against whatever is ticked now.
+function effectCopySectionCount(count) {
+  return count === 1 ? "1 other shot" : `${count} other shots`;
+}
+
+// The Section target: which other Shots share this Shot's section, what the button says, and what
+// it says instead when there is no set to offer.
+//
+// **Membership is not decided here, and cannot be.** `project.shot_sections` is the server's own
+// `Project.section_of` answer -- shot id to section id -- recomputed on every reply that carries a
+// Project, and everything below is a dictionary lookup against it. The midpoint rule and its tie
+// clause therefore exist in exactly one place in this application, which is the whole reason that
+// field exists: a `<` here against a `<=` there is the defect that numbered `shotLabel` two ways,
+// that the H3 adapter re-derived out of the node's partition, and that the preview fingerprint hid
+// by hashing the stored stack while the picture came from the composed chain. It is not
+// expressible while this file never compares a second to a boundary.
+//
+// A Shot in no section is **absent** from that map rather than mapped to `""`, which is why the
+// lookup is required to be non-empty: two shots in no section must not come out as two shots
+// sharing a section.
+function effectCopySection(project, shot, targets) {
+  const sections = Array.isArray(project?.sections) ? project.sections : [];
+  const placed = project?.shot_sections || {};
+  const mine = String(placed[String(shot?.id ?? "")] ?? "");
+  const section = mine ? sections.find((item) => String(item?.id ?? "") === mine) || null : null;
+  const members = mine ? targets.filter((target) => String(placed[target.id] ?? "") === mine) : [];
+  const label = String(section?.label ?? "");
+  const held = new Set(members.map((target) => target.id));
+  // Already all ticked, so the press takes them off again rather than doing nothing.
+  const ticked = members.length > 0 && members.every((target) => target.checked);
+  return {
+    shown: members.length > 0,
+    // Named, so a caller can say which section without reading the map a second time.
+    section: label,
+    ids: members.map((target) => target.id),
+    ticked,
+    label: (ticked ? EFFECT_COPY_SECTION_UNTICK_LABEL : EFFECT_COPY_SECTION_LABEL)
+      .replace("{count}", effectCopySectionCount(members.length))
+      .replace("{section}", label),
+    title: EFFECT_COPY_SECTION_HELP,
+    // The three absences, in the order they have to be asked in: nothing marked at all is a
+    // different statement from marked-but-not-here, and both differ from a section that is real
+    // and holds only this shot.
+    note: members.length
+      ? ""
+      : !sections.length
+        ? EFFECT_COPY_SECTION_UNMARKED
+        : !section
+          ? EFFECT_COPY_SECTION_OUTSIDE
+          : EFFECT_COPY_SECTION_ALONE.replace("{section}", label),
+    // The whole tick set the press produces, in the panel's own order -- the rule the per-shot
+    // tick already follows, so the request names shots the way the list reads. Handed over
+    // ready-made because "does this press add the section or take it off" is a pure decision, and
+    // pure decisions do not live in `app.js`.
+    next: targets
+      .filter((target) => (ticked
+        ? target.checked && !held.has(target.id)
+        : target.checked || held.has(target.id)))
+      .map((target) => target.id),
+  };
+}
+
 // Everything the copy control draws, for one Shot, from the project it lives in and whatever the
 // Director has ticked so far.
 //
@@ -7349,6 +7463,10 @@ export function effectCopyPanel(project, shot, choice = null) {
     note: others.length ? "" : EFFECT_COPY_WITHOUT_OTHERS,
     targets,
     chosen: chosen.map((target) => target.id),
+    // Story 9.5's Section half. It is a *view over the same targets*, not a second list: the ids
+    // it offers are ids of rows already drawn above, so what the Director confirms is the set
+    // they can see, and the route keeps its one explicit target mechanism.
+    section: effectCopySection(project, shot, targets),
     // Said before the button that runs it is reachable, and said differently for an empty stack,
     // because clearing a shot is what a copy from nothing does and the word "copy" hides it.
     announcement: count
@@ -7445,7 +7563,7 @@ export function effectsPanelModel(shot, catalogue, { error = "", project = null,
     // hides it for the reason it hides everything else: a panel that cannot say what this stack
     // is must not offer to put it on another shot.
     copy: problem
-      ? { shown: false, targets: [], chosen: [] }
+      ? { shown: false, targets: [], chosen: [], section: { shown: false, note: "", ids: [], next: [] } }
       : effectCopyPanel(project, shot, copy),
     picker: {
       shown: !problem,

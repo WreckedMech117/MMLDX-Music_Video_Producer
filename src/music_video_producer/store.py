@@ -34,6 +34,20 @@ SONG_ENVELOPE_RELATIVE_PATH = "media/analysis/song-envelope.json"
 #: `_replace_atomically` for what covers handles this process does not own.
 _MANIFEST_LOCK = threading.RLock()
 
+#: Computed `Project` fields that answer a question rather than record one, and are therefore
+#: served and never saved. `Project.shot_sections` is `section_of`'s verdict about which section
+#: each Shot's midpoint lands in; it exists so the browser can target a Section without owning a
+#: second copy of that rule, and it is recomputed on every serialisation. Written into the
+#: manifest it would be a claim about the relationship between `shots` and `sections` that
+#: outlives either of them changing — the same reason no "this effect stack is valid" flag is
+#: stored (AD-21). `Shot.end` is stored and is not a counter-example: it restates two fields of
+#: the object it sits on.
+#:
+#: `test_the_steps_add_no_field_to_a_saved_manifest` asserts a saved manifest's keys are a subset
+#: of `Project.model_fields`, which computed fields are not in — so that test, not this comment,
+#: is what fails if a derived field is added and not listed here.
+DERIVED_NOT_STORED = {"shot_sections"}
+
 #: How the replace backoff waits. A plain `time.sleep` there ran *under* the lock above, so a
 #: foreign handle on one manifest stalled every unrelated request in the process — including the
 #: two-second `/render-status` poll the lock exists to keep working, and including it on the
@@ -207,7 +221,15 @@ class ProjectStore:
         self.media_dir(project.id).mkdir(parents=True, exist_ok=True)
         project.updated_at = now_utc()
         target = self.manifest_path(project.id)
-        payload = project.model_dump_json(indent=2)
+        # `shot_sections` is on the wire and never on the disk. It is `Project.section_of`'s
+        # answer recomputed on every serialisation, so storing it would put a derived answer in
+        # the file that is this application's source of truth, where it would survive a shot
+        # being dragged, a section being remarked, or the manifest being hand-edited, and go on
+        # saying what used to be true. `Shot.end` is stored and is not a counter-example: it is
+        # a restatement of two fields of the same object, not a claim about the relationship
+        # between two lists. `test_the_steps_add_no_field_to_a_saved_manifest` fails if this
+        # exclusion is dropped, which is the alarm rather than this comment.
+        payload = project.model_dump_json(indent=2, exclude=DERIVED_NOT_STORED)
         # The serialisation above is deliberately outside the lock — it touches no file and is
         # the expensive half. Only the bytes hitting the disk are serialised.
         with _MANIFEST_LOCK:
