@@ -1,9 +1,14 @@
 """Renders: what is submitted, what is queued, and what the machine will hold.
 
-The two job routes are not here. `cancel_open_jobs` is sliced out of `create_app`'s own source
-by a test and calls `cancel_job` by name, so both stay in `app.py`; and `read_job` stays with
-them because it shares `/jobs/{job_id}` with `cancel_job`, and whichever is registered first
-decides the `Allow` header a 405 answers with.
+The job routes are here. `cancel_open_jobs` is still read as source by a test -- but by name
+across the package rather than by slicing `create_app` between `async def` and the next
+`@app.` -- and it still delegates every settle to `cancel_job`, which is the point that test
+exists to hold.
+
+**`cancel_job` must stay registered before `read_job`.** They share `/jobs/{job_id}`, and the
+first route whose path matches decides the `Allow` header a 405 answers with; this application
+has always answered `Allow: DELETE`. Declaring `read_job` above `cancel_job` here would change
+that with nothing else moving.
 """
 
 from __future__ import annotations
@@ -13,28 +18,43 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from ..app import (
+    CANCEL_ALL_CONFIRM_REFUSAL,
+    CANCEL_ALL_NONE_OPEN,
+    CANCEL_JOB_NOTE,
+    CANCEL_JOB_SETTLED,
     RENDER_STATUS_SAVE_ATTEMPTS,
+    CancellationReport,
+    CancelledJob,
+    FluxRequest,
     MusicRequest,
     SamplingProfileRequest,
     SongPlannerRequest,
+    UncancelledJob,
     VramEjectRequest,
     _require_song_replacement_confirmation,
     _safe_filename,
+    job_label,
     logger,
     song_audio_path,
 )
 from ..batch import (
     PENDING_SUBMISSION_PROMPT_ID,
+    TERMINAL_JOB_STATUSES,
     RenderStatusReport,
     accept_submission,
+    apply_job_history,
+    reconcilable_jobs,
     reconcile_render_jobs,
     render_status_report,
+    shot_status_after_failed_render,
+    stamp_job_settled,
 )
 from ..comfy import ComfyError
-from ..models import Project, RenderJob, Song
+from ..models import Asset, Project, RenderJob, Song
 from ..preferences import EJECT_PREFERENCE_KEY
 from ..store import ProjectChangedDuringSave
 from ..workflows import (
+    build_flux_payload,
     build_music3_payload,
     build_songplanner_invented_payload,
     build_songplanner_known_lyrics_payload,
@@ -417,3 +437,198 @@ def register(ctx: RouterContext) -> None:
             comfy_online=outcome.comfy_online,
             progress=render_progress.snapshot(),
         )
+
+    @app.delete("/api/projects/{project_id}/jobs", response_model=CancellationReport)
+    async def cancel_open_jobs(
+        project_id: str, confirm_cancel: bool = False
+    ) -> CancellationReport:
+        """Stop every open render this project has on ComfyUI, in one confirmed act.
+
+        The Director's report, 2026-08-23: a Generate All at 20 steps that they changed their mind
+        about part-way through could only be stopped by clicking the per-job `×` twenty-six times,
+        so they cleared it from ComfyUI's own UI instead — the path that then left twenty-six
+        takeless shots reading `error`. The `×` was never wrong; twenty-six of it is not a control.
+
+        See `CANCEL_ALL_NONE_OPEN` above for the scope argument and for why local work is out of
+        it. **Nothing here is a second cancellation path**: each job is settled by `cancel_job`
+        itself, called in-closure exactly as `generate_batch` calls `generate_h3`, so the ComfyUI
+        dequeue, the record settle, the timing stamp, the note and the shot's release are the
+        per-job route's own and cannot come to differ from it.
+
+        Order of refusals: **empty before unconfirmed**. A click on a project with nothing running
+        should be told that, not asked to confirm stopping zero renders — and a confirmation
+        naming `0` is a dialog that teaches a Director to click through dialogs.
+
+        **A job that settles between the click and the loop reaching it is reported, not
+        double-handled.** The set is chosen once, from the read that produced the count the
+        Director confirmed, but every iteration re-reads the manifest inside `cancel_job` — so a
+        job a poll tick settled in the meantime is found terminal there and refused with
+        `CANCEL_JOB_SETTLED`. That refusal lands in `skipped` by name and stops nothing else, which
+        is `generate_batch`'s per-shot rule in the other direction. The same `except` catches a
+        ComfyUI that went down mid-loop (502) and a job whose record vanished (404); each is one
+        row in the report rather than a failure of the whole gesture, because a Director who
+        stopped nineteen of twenty-six renders needs to be told which seven are still running.
+        """
+        project = get_project(project_id)
+        open_jobs = reconcilable_jobs(project)
+        if not open_jobs:
+            raise HTTPException(status_code=422, detail=CANCEL_ALL_NONE_OPEN)
+        if not confirm_cancel:
+            # 409 rather than 422, matching `delete_project`'s confirmation flag: the request is
+            # well-formed and the state is real, and what is missing is consent to a destructive
+            # act. `generate_batch` answers 422 for its own confirmation because the thing it is
+            # about to do is *spend* rather than destroy.
+            raise HTTPException(
+                status_code=409,
+                detail=CANCEL_ALL_CONFIRM_REFUSAL.format(count=len(open_jobs)),
+            )
+        cancelled: list[CancelledJob] = []
+        skipped: list[UncancelledJob] = []
+        # The set and its labels are both fixed here, from the read that produced the count the
+        # Director confirmed — the labels especially, because `cancel_job` re-reads and re-saves
+        # the manifest under this loop and a name resolved later could describe a different plan.
+        for job_id, label in [(job.id, job_label(project, job)) for job in open_jobs]:
+            try:
+                await cancel_job(project_id, job_id)
+            except HTTPException as refusal:
+                skipped.append(
+                    UncancelledJob(job_id=job_id, label=label, reason=str(refusal.detail))
+                )
+                continue
+            cancelled.append(CancelledJob(job_id=job_id, label=label))
+        return CancellationReport(cancelled=cancelled, skipped=skipped)
+
+    @app.delete("/api/projects/{project_id}/jobs/{job_id}", response_model=Project)
+    async def cancel_job(project_id: str, job_id: str) -> Project:
+        """Cancel one open render job: dequeue (and interrupt, when running) on ComfyUI,
+        settle the record, release the shot.
+
+        The gap the analyst named (2026-08-20): a mistaken Generate All could only be
+        cleared from ComfyUI's own UI — and this same night proved what THAT leaves
+        behind: pulled queue entries orphan their job records, which is exactly the
+        stuck-"queued" state the reconciler's missing-ticks rule now cleans up. This
+        route does both halves in one act, so nothing is left for the strike counter.
+        """
+        project = get_project(project_id)
+        job = next((item for item in project.jobs if item.id == job_id), None)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status in TERMINAL_JOB_STATUSES:
+            raise HTTPException(
+                status_code=422, detail=CANCEL_JOB_SETTLED.format(status=job.status)
+            )
+        if job.prompt_id:
+            try:
+                await comfy.cancel(job.prompt_id)
+            except ComfyError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+        job.status = "cancelled"
+        job.error = CANCEL_JOB_NOTE
+        # Settled here, so stamped here. Deliberately no ComfyUI measurement: this route never
+        # reads `/history`, and a cancelled prompt's execution span is not this render's cost
+        # anyway. What is recorded is how long the record stood open, which is what
+        # `render_timing_summary` calls it.
+        stamp_job_settled(job)
+        if job.kind == "h3":
+            shot = next((item for item in project.shots if item.id == job.target_id), None)
+            if shot and shot.status in ("queued", "running"):
+                # "the shot released" is what the queue panel's × has always promised, and until
+                # 2026-08-23 this line wrote `error` instead — the same place the reconciler left
+                # a render killed outside the application. So the in-app cancel was **not** the
+                # correct half to copy: both paths wrote the same wrong status, and both now
+                # settle through the one rule in `shot_status_after_failed_render`.
+                shot.status = shot_status_after_failed_render(shot)
+        return store.save(project)
+
+    @app.post(
+        "/api/projects/{project_id}/generate/flux",
+        response_model=RenderJob,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def generate_flux(project_id: str, request: FluxRequest) -> RenderJob:
+        project = get_project(project_id)
+        asset = Asset(
+            name=request.name,
+            kind=request.kind,
+            path="",
+            source="flux-image-gen",
+            prompt=request.prompt,
+        )
+        prefix = f"music-video-producer/{project_id}/assets/{asset.id}"
+        payload = build_flux_payload(
+            prompt=request.prompt,
+            width=request.width,
+            height=request.height,
+            steps=request.steps,
+            guidance=request.guidance,
+            seed=request.seed,
+            prefix=prefix,
+        )
+        # The record first, then the graph (the Director's 2026-08-21 ruling): a save that
+        # loses a race refuses before any GPU time is spent. The Asset itself is appended only
+        # once the graph is accepted — an asset with no path and no prompt id renders as an
+        # empty library row, and a submission that failed must leave nothing behind for the
+        # Director to delete by hand.
+        job = RenderJob(
+            kind="flux",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id=asset.id,
+            seed=request.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project_id, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        asset.prompt_id = submission.prompt_id
+
+        # Onto a re-read, never onto `project`: that object was read before `comfy.submit` and
+        # writing it back would revert everything committed while `/prompt` answered. The Asset
+        # is new, so appending it to the fresh manifest is the whole of what this route owns
+        # besides the accepted prompt id. See `record_submission`.
+        def add_the_asset(fresh: Project) -> None:
+            fresh.assets.append(asset)
+
+        record_submission(project_id, job, patch=add_the_asset)
+        return job
+
+    @app.get("/api/projects/{project_id}/jobs/{job_id}", response_model=RenderJob)
+    async def read_job(project_id: str, job_id: str) -> RenderJob:
+        """One job, refreshed. Delegates its mutation to `batch.apply_job_history`.
+
+        The completion logic used to live inline here, which is exactly the double ownership
+        AD-1 forbids once a polling endpoint exists: two hand-written copies of "what does a
+        finished job do to the project" is how the manual refresh and the poll start telling
+        different stories about one Shot. This route keeps its own transport contract — a
+        dead ComfyUI is this caller's 502, where the poll degrades quietly — and its
+        history-first shape, which the smoke scripts drive one job at a time.
+        """
+        project = get_project(project_id)
+        job = next((item for item in project.jobs if item.id == job_id), None)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.prompt_id and job.status not in TERMINAL_JOB_STATUSES:
+            try:
+                history = await comfy.history(job.prompt_id)
+            except ComfyError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            # Captured before the adoption, because the adoption is the thing that changes it.
+            # See `analyze_a_landed_song`: a generated Song has no audio until a render lands, and
+            # this is one of the two places in the application where that happens.
+            landed_from = song_audio_path(project)
+            apply_job_history(project, job, history)
+            await analyze_a_landed_song(project_id, project, landed_from)
+            if job.status == "queued":
+                # History is empty for both waiting and executing prompts. Only the live
+                # queue distinguishes them, so a running render is not reported as queued.
+                try:
+                    located = await comfy.queue_state(job.prompt_id)
+                except ComfyError:
+                    located = "absent"
+                if located == "running":
+                    job.status = "running"
+            store.save(project)
+        return job

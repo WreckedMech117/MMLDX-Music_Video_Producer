@@ -67,4 +67,4 @@ extend-exclude = [".claude", "_bmad", "_bmad-output"]
 extend-select = ["C901"]
 
 [tool.ruff.lint.mccabe]
-max-complexity = 400
+max-complexity = 300

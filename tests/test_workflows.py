@@ -5315,7 +5315,10 @@ def test_nothing_in_the_enhancement_path_claims_the_frame_count_is_preserved():
     """
     sources = [
         REPO_ROOT / "src/music_video_producer/workflows.py",
-        REPO_ROOT / "src/music_video_producer/app.py",
+        # Widened 2026-08-26: this named `app.py` alone, and `enhance_with_ltx25` /
+        # `restore_song_audio` moved to `routes/shots.py` in `4a1a4f6` — so the guard
+        # was reading a file its subject had left. The rule is about the package.
+        *sorted((REPO_ROOT / "src/music_video_producer").rglob("*.py")),
         REPO_ROOT / "tests/preflight_ltx25_enhance.py",
         # The extension path inherits the same "Never": its output is *longer* than its input
         # and by how much is an ffprobe reading, so no file on either path may assert a frame
@@ -5913,7 +5916,10 @@ def test_nothing_on_the_restore_path_claims_the_frame_count_is_preserved():
     """
     sources = [
         REPO_ROOT / "src/music_video_producer/workflows.py",
-        REPO_ROOT / "src/music_video_producer/app.py",
+        # Widened 2026-08-26: this named `app.py` alone, and `enhance_with_ltx25` /
+        # `restore_song_audio` moved to `routes/shots.py` in `4a1a4f6` — so the guard
+        # was reading a file its subject had left. The rule is about the package.
+        *sorted((REPO_ROOT / "src/music_video_producer").rglob("*.py")),
         REPO_ROOT / "tests/preflight_audio_replace.py",
         REPO_ROOT / "tests/test_api.py",
         Path(__file__),

@@ -810,13 +810,19 @@ def test_the_export_reader_drains_stderr_concurrently_with_the_progress_stream()
     verbosity produces ~60 KB, which is the order of a pipe buffer — so a parent that reads
     stdout to exhaustion before touching stderr stops a long export dead, with neither side
     able to move. The drain task must therefore be created *before* the stdout loop, not
-    awaited after it as a second sequential read."""
-    import inspect
+    awaited after it as a second sequential read.
 
-    import music_video_producer.app as app_module
+    **The reader is found by name across the package, not sliced out of `create_app` between two
+    markers.** This used to cut from `    async def run_tool(` to the next `\\n    @app.`, which
+    made what got read depend on the file the helper sits in and on whichever route happened to
+    be declared after it; delete that neighbouring decorator and the slice grows to the end of
+    the factory, where `communicate()` and both of the calls indexed below appear in other
+    routes and this passes while proving nothing about the reader. `function_source` returns the
+    one definition of this name anywhere in `src/music_video_producer/`, and fails outright if
+    the package grows a second one."""
+    from package_source import function_source
 
-    source = inspect.getsource(app_module.create_app)
-    reader = source.split("    async def run_tool(", 1)[1].split("\n    @app.", 1)[0]
+    reader = function_source("run_tool")
 
     create = reader.index("asyncio.create_task(process.stderr.read())")
     loop = reader.index("await process.stdout.readline()")

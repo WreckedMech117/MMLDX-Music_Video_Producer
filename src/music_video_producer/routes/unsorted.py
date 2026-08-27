@@ -7,7 +7,9 @@ resource is this?") rather than a decision. It is called `unsorted` so that read
 import list is enough to see it growing; a comfortable name would let it accrete quietly.
 
 Five routes, and `assemble` and `readiness` would have been here too if tests were not holding
-them in `app.py` -- so the true size of this tail is seven, not five.
+them in `app.py` -- so the true size of this tail is seven, not five. `assemble` is held by
+`trim_args` and `concat_args` being patched in `music_video_producer.app`'s namespace, which is
+the class of pin no widened source guard can lift.
 """
 
 from __future__ import annotations

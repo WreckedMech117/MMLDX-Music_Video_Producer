@@ -10,6 +10,11 @@ from typing import get_args
 import pytest
 from fastapi import HTTPException
 
+# The source guards below used to read `src/music_video_producer/app.py`. The filename was an
+# accident of where the routes lived; every claim they make is about the application. See
+# `package_source` for the scan and for why comments and docstrings are stripped from it.
+from package_source import PACKAGE, module_code, modules_containing, package_code
+
 # One definition of "a count of panels", shared with the scan that forbids it in source, so
 # the guard the templates are executed against cannot drift from the guard the repo is
 # scanned with -- and neither can go inert while the other still passes.
@@ -4715,9 +4720,13 @@ def test_the_monitor_and_the_offset_rule_are_executed_for_every_state():
     }
     assert states["controlBare"]["shown"] is False
 
-    # The server's half of the contract: the route resolves the identical expression.
-    route_source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
-    assert "offset=shot.latest_take_lead + shot.trim_nudge" in route_source
+    # The server's half of the contract: the route resolves the identical expression. Scanned
+    # over the whole package rather than over `app.py`, because the claim is that this
+    # application computes the offset that way and not that one file does -- and a second,
+    # different spelling added in a sibling module is the drift this is here to catch.
+    assert "offset=shot.latest_take_lead + shot.trim_nudge" in package_code(), (
+        "no module in this application resolves the offset the way the client does"
+    )
 
     # And the Monitor is wired where every playhead move already passes: position changes
     # and transport changes both reach it, and the markup exists to receive it.
@@ -12444,13 +12453,21 @@ def test_there_is_one_client_path_to_the_measurement_and_it_is_never_on_a_timer(
     # The client's path and the server's route, read off both sides. `api.snapTargets` writes its
     # URL by hand, and a route that only this client names is a route nothing else checks.
     assert "/api/projects/${id}/timeline/snap-targets" in contract
-    server = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
-    assert '@app.get(' in server and '"/api/projects/{project_id}/timeline/snap-targets",' in server
+    # Which module declares the route is not the claim and is no longer written into the test:
+    # the path is looked for across the package, exactly one module may name it, and *that*
+    # module is the one required to declare it with a `GET` and the response model. Bound
+    # together rather than asserted separately, so a decorator sitting in one file and a path
+    # in another cannot satisfy this between them.
+    declaring = modules_containing('"/api/projects/{project_id}/timeline/snap-targets",')
+    assert list(declaring.values()) == [1], declaring
+    server = module_code(PACKAGE / next(iter(declaring)))
+    assert '@app.get(' in server
     assert "response_model=SnapTargetsResponse" in server, (
         "the declared shape is gone; the route can drop a field again without a test noticing"
     )
-    # ...and the full-measurement endpoint is still there, unchanged, for everyone else.
-    assert '@app.get("/api/projects/{project_id}/song/envelope")' in server
+    # ...and the full-measurement endpoint is still there, unchanged, for everyone else. The
+    # whole decorator is one literal, so this stays a decorator-and-all check wherever it lives.
+    assert '@app.get("/api/projects/{project_id}/song/envelope")' in package_code()
 
 
 def test_the_envelope_key_is_the_measurement_and_not_only_the_file():
@@ -15330,13 +15347,14 @@ def test_the_drag_resolves_its_targets_once_and_never_ports_the_gap_rule_into_ja
     for line in source.splitlines():
         if "setInterval" in line:
             assert "napTargets" not in line, line
-    # The client's path and the server's route, read off both sides.
+    # The client's path and the server's route, read off both sides -- the server's side over
+    # the whole package, and bound to the one module that names the path rather than to a
+    # filename. See the same pair in
+    # `test_there_is_one_client_path_to_the_measurement_and_it_is_never_on_a_timer`.
     assert "/api/projects/${id}/timeline/snap-targets" in contract
-    assert '@app.get(' in Path(
-        "src/music_video_producer/app.py"
-    ).read_text(encoding="utf-8") and '"/api/projects/{project_id}/timeline/snap-targets",' in Path(
-        "src/music_video_producer/app.py"
-    ).read_text(encoding="utf-8")
+    declaring = modules_containing('"/api/projects/{project_id}/timeline/snap-targets",')
+    assert list(declaring.values()) == [1], declaring
+    assert '@app.get(' in module_code(PACKAGE / next(iter(declaring)))
 
 
 def test_a_zoom_mid_drag_re_measures_the_pull_instead_of_inflating_it():

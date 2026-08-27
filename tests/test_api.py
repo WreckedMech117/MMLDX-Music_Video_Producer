@@ -15,6 +15,20 @@ from typing import get_args
 
 import pytest
 from fastapi.testclient import TestClient
+
+# The source guards below used to read `src/music_video_producer/app.py` and count in it. The
+# filename was an accident of where the routes lived; the claims were always about the whole
+# application. `package_source` is that scan, over every module in the package, with comments and
+# docstrings stripped so the prose that quotes a count cannot move it.
+from package_source import (
+    function_ast,
+    function_source,
+    module_code,
+    module_name,
+    modules_containing,
+    package_code,
+    package_modules,
+)
 from pydantic import ValidationError
 
 # The read-modify-write window, held open on purpose. Shared with `test_assembly_route`
@@ -14541,9 +14555,17 @@ def test_the_approve_route_is_the_one_writer_of_approval(tmp_path: Path):
     Behaviorally: a completion that lands a take — the likeliest place a second writer would
     creep in, because `apply_job_history` is already writing the Shot — moves `latest_output`
     and stops there. And in the source: exactly two assignments to `approved_output` exist in
-    the whole package, both in `app.py`'s approve/unapprove pair, and exactly one write of the
+    the whole package, both in the approve/unapprove pair, and exactly one write of the
     `approved` status. The scan is what fails when a well-meaning writer is added somewhere the
     behavioral half does not exercise.
+
+    **Keyed by each module's path within the package, not by its bare filename.** The walk was
+    always package-wide; the *answer* was written as a filename, and `Path.name` is not an
+    identity here. `timeline.py` and `routes/timeline.py` both exist, and two modules sharing a
+    filename collapse into one dict entry with the second silently overwriting the first — so a
+    second writer could sit in the sibling of whichever file this expects and never be seen.
+    Comments and docstrings are stripped before the scan, because these two routes explain the
+    single-writer rule in prose that names the field.
     """
     client, store, comfy = make_client(tmp_path)
     project_id, _, _ = rendered_shot(client, store, comfy, "Completed, not approved")
@@ -14555,16 +14577,16 @@ def test_the_approve_route_is_the_one_writer_of_approval(tmp_path: Path):
     package = Path("src/music_video_producer")
     assignments: dict[str, int] = {}
     status_writes: dict[str, int] = {}
-    for source in package.rglob("*.py"):
-        text = source.read_text(encoding="utf-8")
+    for source in package_modules():
+        text = module_code(source)
         wrote = len(re.findall(r"\.approved_output\s*=[^=]", text))
         if wrote:
-            assignments[source.name] = wrote
+            assignments[module_name(source)] = wrote
         wrote_status = len(re.findall(r"\.status\s*=\s*['\"]approved['\"]", text))
         if wrote_status:
-            status_writes[source.name] = wrote_status
-    assert assignments == {"app.py": 2}, assignments
-    assert status_writes == {"app.py": 1}, status_writes
+            status_writes[module_name(source)] = wrote_status
+    assert assignments == {"routes/shots.py": 2}, assignments
+    assert status_writes == {"routes/shots.py": 1}, status_writes
     # And the frontend never writes it either: the one assignment in the workspace is the empty
     # default a brand-new Shot is born with.
     workspace = (package / "web" / "assets" / "app.js").read_text(encoding="utf-8")
@@ -14659,15 +14681,15 @@ def test_approval_snapshots_the_window_and_unapproval_clears_it(tmp_path: Path):
     assert reapproved.approved_duration == 3.75
 
     # The one-writer scan, mirroring the `approved_output` scan: exactly one set and one
-    # clear of each snapshot field, both in app.py's approve/unapprove pair.
-    package = Path("src/music_video_producer")
+    # clear of each snapshot field, both in the approve/unapprove pair — and keyed by the
+    # module's path in the package for that scan's reason, because a bare filename is not an
+    # identity in a package that holds two `timeline.py`.
     writes: dict[str, int] = {}
-    for source in package.rglob("*.py"):
-        text = source.read_text(encoding="utf-8")
-        count = len(re.findall(r"\.approved_(?:start|duration)\s*=[^=]", text))
+    for source in package_modules():
+        count = len(re.findall(r"\.approved_(?:start|duration)\s*=[^=]", module_code(source)))
         if count:
-            writes[source.name] = count
-    assert writes == {"app.py": 4}, writes
+            writes[module_name(source)] = count
+    assert writes == {"routes/shots.py": 4}, writes
 
 
 def test_expansion_refuses_a_route_approved_shot(tmp_path: Path):
@@ -19647,38 +19669,45 @@ def test_every_writer_of_an_expansion_records_the_map_it_was_written_against():
     `h3_prompt` must also assign `h3_prompt_map`.** A third writer added later fails here.
 
     Parsed rather than grepped, and attributed to the *innermost* enclosing function, because
-    every route in this module is nested inside `create_app` and a scan that credited the outer
-    function would pass on any file that recorded a map anywhere at all.
+    a route nested inside `create_app` or inside a route module's `register` would otherwise be
+    credited to its enclosing function and pass on any file that recorded a map anywhere at all.
+
+    **Every module in the package, not `app.py` alone.** The rule is about writers of an
+    expansion, and a writer's file is not part of it. Parsing one file meant that moving a
+    writer out of it would not have failed this — it would have stopped covering it, silently,
+    which is worse than a failure and is the exact shape of the sibling gap this test was
+    written to close.
     """
-    import ast
-
-    source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    enclosing: dict[ast.AST, ast.AST] = {}
-    for parent in ast.walk(tree):
-        for child in ast.iter_child_nodes(parent):
-            enclosing[child] = parent
-
-    def innermost_function(node: ast.AST) -> str:
-        while node in enclosing:
-            node = enclosing[node]
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                return node.name
-        return "<module>"
-
     written: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Attribute) and target.attr in (
-                "h3_prompt", "h3_prompt_map"
-            ):
-                written.setdefault(innermost_function(node), set()).add(target.attr)
+    for path in package_modules():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        enclosing: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                enclosing[child] = parent
+
+        def innermost_function(node: ast.AST, enclosing=enclosing) -> str:
+            while node in enclosing:
+                node = enclosing[node]
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    return node.name
+            return "<module>"
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr in (
+                    "h3_prompt", "h3_prompt_map"
+                ):
+                    written.setdefault(innermost_function(node), set()).add(target.attr)
 
     expansion_writers = {name for name, fields in written.items() if "h3_prompt" in fields}
-    # The scan has to find the writers it is asserting over, or it asserts nothing.
-    assert expansion_writers >= {"apply_expansions", "refresh_reference_maps"}, expansion_writers
+    # The scan has to find the writers it is asserting over, or it asserts nothing. The route is
+    # named here too, now that the scan is package-wide and can no longer lose it by file.
+    assert expansion_writers >= {
+        "apply_expansions", "expand_shot_prompt", "refresh_reference_maps"
+    }, expansion_writers
     for name in sorted(expansion_writers):
         assert "h3_prompt_map" in written[name], (
             f"{name} writes an expansion without recording the reference map it was written "
@@ -20861,20 +20890,31 @@ def test_every_write_path_for_an_assets_name_is_enumerated():
     someone who did not read the route's docstring, or the generic `PUT` quietly becoming one
     again. Creation is listed by its own construction (`Asset(`), so a sixth creation route also
     fails here and has to be named deliberately.
+
+    **Scoped to the package, not to `app.py`.** This counted in one file for as long as every
+    route in this application was a nested function in one file, and the enumeration it claims to
+    be -- "every write path" -- was never true of a filename. A sixth creation added in
+    `routes/assets.py` sailed past it. The scan is `package_source.package_code`: every module
+    under `src/music_video_producer/`, comments and docstrings removed, because several of these
+    routes explain the rule in prose that quotes the very spellings counted below.
     """
-    source = Path("src/music_video_producer/app.py").read_text(encoding="utf-8")
+    source = package_code()
 
     # Exactly two assignments of the attribute anywhere: the rename route's own write, and the
     # generic full-project PUT re-adopting the stored value so it can never write one. A third is
     # a second door, which is the failure this pins.
-    assert source.count("asset.name = ") == 2
+    assert source.count("asset.name = ") == 2, modules_containing("asset.name = ")
     assert source.count("asset.name = name\n") == 1
     assert source.count("asset.name = stored_names.get(asset.id, asset.name)") == 1
     assert source.count("stored_names = {asset.id: asset.name for asset in current.assets}") == 1
 
     # The creation sites, named. Two of them derive a child's name from its source's, which is
-    # why a rename has to replace the whole string rather than edit around a suffix.
-    assert source.count("Asset(") == 5
+    # why a rename has to replace the whole string rather than edit around a suffix. Six, not
+    # five: package-wide the model's own `class Asset(BaseModel)` is in the text too, and it is
+    # subtracted by name rather than by exempting a file, so a construction that moved into
+    # `models.py` would still be counted.
+    assert source.count("class Asset(") == 1, modules_containing("class Asset(")
+    assert source.count("Asset(") - 1 == 5, modules_containing("Asset(")
     assert source.count('name=f"{source.name} · multiview"') == 1
     assert source.count('name=f"{source.name} · edit"') == 1
     assert source.count("name=name.strip() or target.stem") == 1  # upload
@@ -21398,9 +21438,17 @@ def test_the_whole_queue_cancel_is_the_per_job_route_and_not_a_second_settle_pat
     Two spellings of one cancellation rule is the recurring defect this delegation exists to
     avoid, and it is invisible in behaviour until the two drift -- so it is asserted about the
     source. The only writes the route makes are its two report lists.
+
+    **The body is found by name, not sliced between markers.** This used to take
+    `inspect.getsource(create_app)` and cut from `async def cancel_open_jobs` to the next
+    `\\n    @app.` -- so what got read depended on which file the route was in *and* on which
+    route happened to be declared after it. Delete the neighbouring decorator and the slice
+    silently grows to the end of the factory, where every banned spelling below appears in some
+    other route and this passes while proving nothing about this one. `function_source` walks
+    the package's parse trees for the one function with this name and returns that definition's
+    own segment, so the body ends where the body ends.
     """
-    source = inspect.getsource(create_app)
-    body = source.split("async def cancel_open_jobs", 1)[1].split("\n    @app.", 1)[0]
+    body = function_source("cancel_open_jobs")
     assert "await cancel_job(project_id, job_id)" in body
     for spelling in (
         'job.status = "cancelled"',
@@ -21669,9 +21717,9 @@ def test_the_analysed_flag_never_disagrees_with_the_beats_it_describes(tmp_path:
     assert broken["measured"] is False
     # The flag and the list are read from one expression, so neither can be true of a state the
     # other is not. Read rather than driven, because the shape it forbids is now unreachable.
-    route = Path("src/music_video_producer/app.py").read_text(encoding="utf-8").split(
-        'def read_timeline_snap_targets(', 1
-    )[1].split("\n    @app.", 1)[0]
+    # Found by name across the package rather than sliced out of one file between two markers:
+    # the handler's neighbours decide nothing about the handler.
+    route = function_source("read_timeline_snap_targets")
     assert "envelope = served if isinstance(served, dict) else None" in route
     assert '"analysed": envelope is not None' in route
 
@@ -21778,12 +21826,10 @@ def test_the_snap_targets_shape_is_declared_and_drops_nothing(tmp_path: Path):
 
     # The handler's `return {...}` keys, read off the source rather than off a response: a route
     # that stopped setting a field would otherwise look identical to a model that dropped it.
-    tree = ast.parse(Path("src/music_video_producer/app.py").read_text(encoding="utf-8"))
-    handler = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "read_timeline_snap_targets"
-    )
+    # The handler is located by name across the whole package -- `function_source` refuses a name
+    # the package declares zero times or twice -- so this does not quietly stop covering the
+    # route the day the route changes file.
+    handler = function_ast("read_timeline_snap_targets")
     returned = next(
         node.value
         for node in ast.walk(handler)

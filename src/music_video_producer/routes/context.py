@@ -28,11 +28,14 @@ chosen over the alternatives:
   `dependency_overrides` to keep those doubles apart. That is a behaviour change wearing a
   refactor's clothes.
 
-**Adding a field is the deliberate act.** Ten of the fields below are helpers `create_app`
+**Adding a field is the deliberate act.** Eleven of the fields below are helpers `create_app`
 builds once and shares; there is still exactly one of each, passed rather than rebuilt, which
 is the single-implementation rule this repository enforces everywhere else. A route that finds
-it needs an eleventh should ask whether the helper belongs to one resource -- in which case it
-belongs in that module, not here.
+it needs a twelfth should ask whether the helper belongs to one resource -- in which case it
+belongs in that module, not here. The eleventh, `song_envelope_report`, is the test of that
+question: it was added when the envelope route and the timeline's snap-targets read both left
+the factory, and it is here rather than in either module because *both* of them read it and
+neither owns it.
 
 Frozen, because none of it is state. The mutable state this application keeps lives on
 `app.state` -- the live-render progress map, the preview registry, the set of running exports
@@ -86,5 +89,9 @@ class RouterContext:
     resolve_song_path: Callable[..., Any]
     analyze_song_for_project: Callable[..., Any]
     analyze_a_landed_song: Callable[..., Any]
+    #: The song measurement's read-time report, shared by the envelope route and the
+    #: timeline's snap-targets read -- two resources, one computation, which is why it is
+    #: here and not private to either module.
+    song_envelope_report: Callable[..., Any]
     discovered_looks: Callable[..., Any]
     run_tool: Callable[..., Any]

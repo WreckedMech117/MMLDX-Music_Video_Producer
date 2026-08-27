@@ -1,22 +1,41 @@
 """Assets: the library's images and the files this application serves back.
 
-Five sibling routes are not here -- `upload`, `fill`, `multiview`, `edit` and `name` -- because
-`tests/test_api.py` counts `Asset(` constructions and `asset.name = ` assignments in `app.py`
-and would see a different number. `routes/__init__.py` names each one.
+`upload`, `fill`, `multiview`, `edit` and `name` are here too. They used to be held in `app.py`
+by the enumeration in `tests/test_api.py` that counts `Asset(` constructions and
+`asset.name = ` assignments -- five and two -- because it counted them in that one file. It
+counts them across `src/music_video_producer/` now, so a sixth construction or a third rename
+door fails it wherever it is added, including here.
 """
 
 from __future__ import annotations
 
-from fastapi import HTTPException
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from fastapi import File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
 from ..app import (
+    ASSET_FILL_CONFIRM_REFUSAL,
+    ASSET_FILL_NO_PROPOSALS_REFUSAL,
+    ASSET_FILL_RENDERS_OPEN_REFUSAL,
+    ASSET_NAME_EMPTY,
+    ASSET_NAME_LIMIT,
+    ASSET_NAME_TOO_LONG,
+    ASSET_RENAME_APPLIED,
+    ASSET_RENAME_CHILDREN,
+    ASSET_RENAME_MAPS,
+    ASSET_RENAME_OVER_MATCHES,
+    ASSET_RENAME_PROMPTS,
+    ASSET_RENAME_UNSCANNABLE,
     CHARACTER_SLOT_NOT_A_CHARACTER,
     CHARACTER_SLOT_TAKEN,
     CONSISTENCY_PROMPT_LIMIT,
     CONSISTENCY_PROMPT_TOO_LONG,
     DELETE_ASSET_CITED,
+    DIRECTOR_CONTEXT_EXCLUDE,
     EXPANSION_LOCKED_NOTICE,
+    MULTIVIEW_SUBJECTS,
     REPLACE_ASSET_APPROVED_NOTE,
     REPLACE_ASSET_FREED,
     REPLACE_ASSET_IN_FLIGHT,
@@ -29,21 +48,45 @@ from ..app import (
     REPLACE_ASSET_WITH_ITSELF,
     AssetCharacterSlotRequest,
     AssetConsistencyRequest,
+    AssetEditRequest,
+    AssetFillRequest,
+    AssetFillResponse,
+    AssetFillSubmission,
+    AssetNameRequest,
+    AssetRenameResponse,
     AssetReplacementRequest,
     AssetReplacementResponse,
     AssetReplacementSkip,
+    MultiviewRequest,
+    _copy_upload,
     _replacement_row,
+    _safe_filename,
     _vision_media,
+    multiview_refusal,
     refresh_reference_maps,
     shot_render_in_flight,
     shot_render_provenance,
 )
 from ..asset_replacement import asset_replacement_plan
-from ..batch import shot_label
+from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, reconcilable_jobs, shot_label
+from ..comfy import ComfyError
 from ..director import DirectorError, DirectorUnavailable
-from ..models import Project, VisionInspectionRecord, character_slot_assets
+from ..models import (
+    NAME_SCAN_MIN_LENGTH,
+    Asset,
+    Project,
+    RenderJob,
+    VisionInspectionRecord,
+    character_slot_assets,
+)
 from ..timeline import ordered_shots
-from ..workflows import H3_REFERENCE_LIMITS
+from ..workflows import (
+    H3_REFERENCE_LIMITS,
+    build_flux_payload,
+    build_h3_image_edit_payload,
+    build_multiview_payload,
+    image_edit_prompt,
+)
 from .context import RouterContext
 
 
@@ -56,10 +99,13 @@ def register(ctx: RouterContext) -> None:
     the whole diff.
     """
     app = ctx.app
+    comfy = ctx.comfy
     director = ctx.director
     get_project = ctx.get_project
+    record_submission = ctx.record_submission
     resolve_asset_path = ctx.resolve_asset_path
     settings = ctx.settings
+    settle_unsubmitted_jobs = ctx.settle_unsubmitted_jobs
     store = ctx.store
 
     @app.put(
@@ -473,3 +519,551 @@ def register(ctx: RouterContext) -> None:
             raise HTTPException(status_code=502, detail=str(error)) from error
         asset.vision = VisionInspectionRecord(model=settings.llm_model, **result.model_dump())
         return store.save(project)
+
+    @app.put(
+        "/api/projects/{project_id}/assets/{asset_id}/name",
+        response_model=AssetRenameResponse,
+    )
+    def rename_asset(
+        project_id: str, asset_id: str, request: AssetNameRequest
+    ) -> AssetRenameResponse:
+        """Rename one Asset — the whole display name, and the one route that edits it.
+
+        **The Director's chosen fix for the name leak (2026-08-22).** 9–10 prompts per populate
+        roll contained the literal internal label `HarderFaster · multiview` — *"HarderFaster ·
+        multiview screams into the polished metal stand."* The existing defence in
+        `lay_out_shots` ("A name never shown cannot be echoed") only applies once an identity
+        sheet is *promoted*, and nothing on the live project is. The Director ruled against
+        hiding names from the model: *"we dont want to lose the models ability to identify
+        assets its using or that could get bad. If the assets name is a problem then we could
+        rename it. Renaming assets may be useful anyway as the HarderFaster image is a picture
+        of a Woman named Lucy, the song i made the image for is Harder Faster."* Renaming that
+        asset to `Lucy` turns the leak into correct prose.
+
+        **The whole name, never an edit around the suffix.** ` · multiview` is appended by
+        `generate_multiview` when it mints the child, and ` · edit` by the image-edit route;
+        both are *derivations*, not decorations this route should preserve. A rename that kept
+        them would leave the Director unable to remove the very label they are renaming to get
+        rid of, which is the entire ask.
+
+        Three refusals, each before anything is assigned, so a refused rename leaves the asset
+        exactly as it was:
+
+        * the asset is not in this project — 404, `replace_consistency_prompt`'s wording;
+        * the name is empty after trimming (`ASSET_NAME_EMPTY`) — a name has no meaningful
+          blank, unlike an anchor or a slot;
+        * the name is longer than `ASSET_NAME_LIMIT`, measured after trimming
+          (`ASSET_NAME_TOO_LONG`), which is `replace_consistency_prompt`'s bound check verbatim.
+
+        **A duplicate name is not refused**, and that is a decision rather than an oversight.
+        `models.assets_for_proposal` already documents and resolves the case — first occurrence
+        in library order wins — so two assets sharing a name is a deterministic state this
+        application handles, not the ambiguity `CHARACTER_SLOT_TAKEN` refuses. A slot is a
+        *link* and two holders would make a tagged line point at two references; a name is a
+        label, and citations do not travel on it.
+
+        **What a rename does not touch, and it is said on the wire.** Citations resolve by id
+        (`AssetCitation.asset_id`), so no shot can lose its reference to a rename. Prose already
+        written — a shot's `prompt`, a reference label the Director typed per shot — keeps the
+        old spelling, because those are words a person or a model wrote and no route edits them
+        on a rename's behalf. `AssetRenameResponse.prompts` counts the shots in that state and
+        the message names it, so "the rename did not work" cannot be the reading.
+
+        Reference maps *are* re-derived, `replace_consistency_prompt`'s line and its argument:
+        the name is **in** the map — `timeline.anchored_label` composes it into every tag line —
+        so a rename changes what every citing shot's map says about this picture. Free to
+        re-derive for the prose shots, recorded as stale for the rest.
+
+        **Derived children keep their own names, and it is said on the wire (2026-08-23).** The
+        ` · multiview` and ` · edit` suffixes are composed once, at the moment the child is
+        minted, and stored — there is no live derivation to re-run. Renaming `HarderFaster` to
+        `Lucy` therefore leaves `HarderFaster · multiview` spelling the old name in the library
+        and, for an ` · edit` child, on the roster the model reads (`citable_assets` hides a
+        multiview behind its source; it does not hide an edit). The Director's own fix worked
+        because they renamed the *child*; the same gesture on the parent would not have. See
+        `ASSET_RENAME_CHILDREN` for why this is reported rather than propagated.
+
+        **The prose scan's length fence is named too**, both directions. Under
+        `NAME_SCAN_MIN_LENGTH` the substring fallback stops considering the name at all —
+        renaming to `Ora` quietly ends the prose half of `assets_for_proposal` for this picture.
+        At or over it, a name that is a substring of ordinary English starts matching them —
+        `Rain` is inside "grain" and "training". Neither breaks a plan, because citations resolve
+        by id; both change what a *future* fill cites, which is why the route says so rather than
+        refusing. `ASSET_RENAME_OVER_MATCHES`' count is measured against this plan's own prose:
+        evidence from the material at hand, not a dictionary.
+
+        Nothing renders, arms, queues or approves; `comfy` is not touched on any path.
+        """
+        project = get_project(project_id)
+        asset = next((item for item in project.assets if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        name = request.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail=ASSET_NAME_EMPTY)
+        if len(name) > ASSET_NAME_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSET_NAME_TOO_LONG.format(
+                    name=asset.name, length=len(name), limit=ASSET_NAME_LIMIT
+                ),
+            )
+        previous = asset.name
+        # Counted *before* the write, against the old spelling, because that is the question
+        # being answered: how much prose in this plan still says the word the Director is
+        # renaming away from. `NAME_SCAN_MIN_LENGTH` is not applied — this is a report about
+        # exact text, not the substring scan that has to defend itself against short names.
+        prompts = sum(1 for shot in project.shots if previous and previous in shot.prompt)
+        # Direct children only, and deliberately not the transitive tree: an edit of an edit is a
+        # child of the picture it was edited from, and its name was composed from *that* one's.
+        # Naming a grandchild here would claim this rename should have reached a string it was
+        # never composed from.
+        children = [item for item in project.assets if item.parent_id == asset.id]
+        children_stale = sum(1 for item in children if previous and previous in item.name)
+        # The prose scan's fence, measured on the name that is landing rather than the one
+        # leaving. `assets_for_proposal` lowercases both sides, so this does too; the over-match
+        # count excludes shots that already cite this asset, because those cite it *declared* and
+        # the fallback never runs for them.
+        scannable = len(name) >= NAME_SCAN_MIN_LENGTH
+        lowered = name.casefold()
+        prose_matches = (
+            sum(
+                1
+                for shot in project.shots
+                if lowered in shot.prompt.casefold()
+                and not any(
+                    citation.asset_id == asset.id for citation in shot.citations
+                )
+            )
+            if scannable
+            else 0
+        )
+        # Written onto the *stored* Asset rather than a rebuilt one, `replace_consistency_prompt`'s
+        # rule: there is no construction site here where `path`, `source`, `parent_id` or
+        # `prompt_id` could be defaulted away by an edit that was only ever about one string.
+        asset.name = name
+        maps = refresh_reference_maps(project)
+        return AssetRenameResponse(
+            project=store.save(project),
+            name=name,
+            previous=previous,
+            prompts=prompts,
+            maps=len(maps),
+            children=len(children),
+            children_stale=children_stale,
+            scannable=scannable,
+            prose_matches=prose_matches,
+            message=ASSET_RENAME_APPLIED.format(
+                previous=previous or "this asset",
+                name=name,
+                maps=ASSET_RENAME_MAPS.format(count=len(maps)) if maps else "",
+                prompts=(
+                    ASSET_RENAME_PROMPTS.format(count=prompts, previous=previous)
+                    if prompts
+                    else ""
+                ),
+                children=(
+                    ASSET_RENAME_CHILDREN.format(
+                        count=len(children),
+                        stale=children_stale,
+                        previous=previous or "the old name",
+                    )
+                    if children
+                    else ""
+                ),
+                # One sentence or the other, never both: a name the scan skips cannot over-match,
+                # and `prose_matches` is already zero in that case.
+                scan=(
+                    ASSET_RENAME_UNSCANNABLE.format(
+                        name=name, length=len(name), minimum=NAME_SCAN_MIN_LENGTH
+                    )
+                    if not scannable
+                    else ASSET_RENAME_OVER_MATCHES.format(
+                        count=prose_matches, name=name
+                    )
+                    if prose_matches
+                    else ""
+                ),
+            ),
+        )
+
+    @app.post("/api/projects/{project_id}/assets/upload", response_model=Project)
+    async def upload_asset(
+        project_id: str,
+        file: Annotated[UploadFile, File()],
+        name: Annotated[str, Form()],
+        kind: Annotated[Literal["character", "setting", "prop", "style", "image", "audio", "video"], Form()] = "image",
+    ) -> Project:
+        project = get_project(project_id)
+        suffix = Path(file.filename or "").suffix.lower()
+        allowed_extensions = {
+            "character": {".png", ".jpg", ".jpeg", ".webp"},
+            "setting": {".png", ".jpg", ".jpeg", ".webp"},
+            "prop": {".png", ".jpg", ".jpeg", ".webp"},
+            "style": {".png", ".jpg", ".jpeg", ".webp"},
+            "image": {".png", ".jpg", ".jpeg", ".webp"},
+            "audio": {".wav", ".mp3", ".flac"},
+            "video": {".mp4", ".mov", ".webm", ".mkv"},
+        }
+        if suffix not in allowed_extensions[kind]:
+            raise HTTPException(status_code=415, detail=f"Unsupported {kind} asset file type")
+        assets_dir = store.media_dir(project_id) / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        filename = _safe_filename(file.filename or "asset")
+        target = assets_dir / f"{len(project.assets):03d}-{filename}"
+        _copy_upload(file, target, settings.max_upload_bytes)
+        project.assets.append(
+            Asset(
+                name=name.strip() or target.stem,
+                kind=kind,
+                path=target.relative_to(store.project_dir(project_id)).as_posix(),
+            )
+        )
+        return store.save(project)
+
+    @app.post(
+        "/api/projects/{project_id}/assets/{asset_id}/multiview",
+        response_model=RenderJob,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def generate_multiview(
+        project_id: str, asset_id: str, request: MultiviewRequest
+    ) -> RenderJob:
+        project = get_project(project_id)
+        source = next((item for item in project.assets if item.id == asset_id), None)
+        if not source:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        if source.kind not in MULTIVIEW_SUBJECTS or not source.path:
+            raise HTTPException(status_code=422, detail=multiview_refusal())
+        source_root = (
+            store.media_dir(project_id).resolve()
+            if source.source == "upload"
+            else (settings.comfy_root / "output").resolve()
+        )
+        source_path = (
+            (store.project_dir(project_id) / source.path).resolve()
+            if source.source == "upload"
+            else (source_root / Path(source.path)).resolve()
+        )
+        if source_root not in source_path.parents or not source_path.is_file():
+            raise HTTPException(status_code=404, detail="Multiview source image was not found")
+        upload_name = f"mvp_{project_id}_{source.id}{source_path.suffix.lower()}"
+        content_type = "image/png" if source_path.suffix.lower() == ".png" else "image/jpeg"
+        try:
+            uploaded = await comfy.upload(upload_name, source_path.read_bytes(), content_type)
+            image_name = "/".join(
+                part for part in (uploaded.get("subfolder", ""), uploaded["name"]) if part
+            )
+            child = Asset(
+                name=f"{source.name} · multiview",
+                # The sheet is the same subject as what it was promoted from, so the child
+                # carries the source's kind. For a character that is exactly what this line
+                # said before — character in, character out — so no sheet already in a
+                # manifest means anything different than it did. For a ship it is the whole
+                # point: promotion must not be the step that files a prop as a person.
+                #
+                # Nothing downstream reads this for a decision that could change: the H3
+                # reference adapter buckets every non-audio, non-video kind to "picture",
+                # and shot attachment does not filter by kind at all.
+                kind=source.kind,
+                path="",
+                source="krea-multiview",
+                parent_id=source.id,
+                prompt=request.prompt,
+                # **The sheet inherits its source's appearance anchor.** A multiview
+                # promotion is the one child relationship in this application that promises
+                # the child depicts *the same subject unchanged* — that is what a turnaround
+                # sheet is, and `kind` is already inherited on that reasoning. The sheet is
+                # then the asset shots actually cite, so an anchor that stopped at the parent
+                # would be an anchor no render ever sees. It is a copy and not a link: the
+                # Director may correct one without the other, and a link would make editing
+                # a source silently rewrite what every shot citing the sheet is conditioned
+                # with.
+                #
+                # Contrast `edit_asset` below, which deliberately does not inherit.
+                #
+                # `character_slot` is deliberately **not** inherited, and that is the opposite
+                # call for the opposite reason. A slot is not a description of the subject, it is
+                # an identity the sheet would then hold *alongside* its source — two assets in
+                # one slot, which `replace_character_slot` refuses by name precisely because a
+                # tagged line pointing at two references renders by accident. Nothing is lost by
+                # leaving it: a citation of the source resolves to this sheet through
+                # `prefer_identity_sheets` anyway, so the slot goes on naming the subject and the
+                # substitution goes on naming the picture, which is the division those two rules
+                # already have.
+                consistency_prompt=source.consistency_prompt,
+            )
+            payload = build_multiview_payload(
+                image_name=image_name,
+                prompt=request.prompt,
+                seed=request.seed,
+                prefix=f"music-video-producer/{project_id}/assets/{child.id}-multiview",
+            )
+        except ComfyError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        # The record first, then the graph, for `generate_flux`'s reason. The upload above
+        # stays outside it: it puts a file in ComfyUI's input directory and costs no GPU
+        # time, and its own failure is the same 502 it always was, with nothing recorded.
+        job = RenderJob(
+            kind="multiview",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id=child.id,
+            seed=request.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project_id, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        child.prompt_id = submission.prompt_id
+
+        # Onto a re-read, for `generate_flux`'s reason and by the same rule: the child is new,
+        # so it is appended to whatever manifest is current rather than to the copy this route
+        # read before the submission. See `record_submission`.
+        def add_the_child(fresh: Project) -> None:
+            fresh.assets.append(child)
+
+        record_submission(project_id, job, patch=add_the_child)
+        return job
+
+    @app.post(
+        "/api/projects/{project_id}/assets/{asset_id}/edit",
+        response_model=RenderJob,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def edit_asset(
+        project_id: str, asset_id: str, request: AssetEditRequest
+    ) -> RenderJob:
+        """AI Mod: one image asset plus one instruction becomes a *new* asset beside it.
+
+        The Director's stage-3 ask, verbatim shape: prompt an edit, get a new image asset
+        to keep, delete (rejection is ordinary deletion), or modify further — a child of
+        an edit is an ordinary image asset, so edits chain. The source is never touched.
+
+        The instruction travels in the workflow's own prompting form via
+        `image_edit_prompt` — identity preserved, the edit stated, everything else kept —
+        unless it already carries the structured marker, in which case the Director wrote
+        the full form and it goes verbatim. The media reaches ComfyUI the reference
+        path's way: a resolved absolute file path through the H3 media loader, no upload.
+
+        `generate_multiview` is the template for everything else here: the child is
+        created before submission with an empty path, the job (kind `edit`) targets it,
+        and `apply_job_history` — the one completion writer — adopts the landed file.
+        """
+        project = get_project(project_id)
+        source = next((item for item in project.assets if item.id == asset_id), None)
+        if not source:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        if source.kind in ("audio", "video"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"AI Mod edits images, and {source.name} is {source.kind} media.",
+            )
+        if not source.path:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{source.name} has no image yet — render or upload it first.",
+            )
+        if not request.instruction.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="Describe the edit: what should change, and what must stay.",
+            )
+        source_path = resolve_asset_path(project_id, source)
+        prompt = image_edit_prompt(
+            request.instruction,
+            source_kind=source.kind,
+            source_label=source.name,
+        )
+        child = Asset(
+            name=f"{source.name} · edit",
+            # An edited character is still a character; an edited setting is still a
+            # setting. The multiview promotion's rule, for the multiview promotion's
+            # reason.
+            kind=source.kind,
+            path="",
+            source="h3-image-edit",
+            parent_id=source.id,
+            prompt=prompt,
+            # **An edit does NOT inherit the source's appearance anchor**, and that is the
+            # opposite decision to `generate_multiview` above on purpose. An anchor is an
+            # assertion about what a subject looks like; an AI Mod is the act of changing
+            # what it looks like ("put her in the black coat instead"). Copying the anchor
+            # onto the child would carry a description the edit was run to invalidate, and
+            # would carry it *silently* into every tag line and expansion citing the new
+            # asset — the exact "plausible and wrong" failure this codebase keeps refusing.
+            #
+            # So the child starts with no anchor, which means "no anchor stored" and produces
+            # the bare label everywhere, and the Director writes one for the edited look if
+            # they want one. Nothing is lost: the source keeps its own, and this route never
+            # touches the source.
+        )
+        try:
+            payload = build_h3_image_edit_payload(
+                prompt=prompt,
+                pictures=[{"file": str(source_path), "label": source.name}],
+                seed=request.seed,
+                profile=request.profile,
+                prefix=f"music-video-producer/{project_id}/assets/{child.id}-edit",
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        # The record first, then the graph, for `generate_flux`'s reason, and the child asset
+        # appended only once the graph is accepted for the same one.
+        job = RenderJob(
+            kind="edit",
+            prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+            target_id=child.id,
+            seed=request.seed,
+        )
+        project.jobs.append(job)
+        store.save(project)
+        try:
+            submission = await comfy.submit(payload)
+        except ComfyError as error:
+            settle_unsubmitted_jobs(project_id, job)
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        accept_submission(job, submission.prompt_id)
+        child.prompt_id = submission.prompt_id
+
+        # Onto a re-read, for `generate_flux`'s reason and by the same rule: the child is new,
+        # so it is appended to whatever manifest is current rather than to the copy this route
+        # read before the submission. See `record_submission`.
+        def add_the_child(fresh: Project) -> None:
+            fresh.assets.append(child)
+
+        record_submission(project_id, job, patch=add_the_child)
+        return job
+
+    @app.post(
+        "/api/projects/{project_id}/assets/fill",
+        response_model=AssetFillResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def fill_assets(project_id: str, request: AssetFillRequest) -> AssetFillResponse:
+        """The Stage Manager (stage 3 of the Director's user workflow): assess and create.
+
+        One model pass over the whole project proposes the supporting image assets the
+        library still lacks; each proposal queues an ordinary Flux render through the
+        exact asset shape `generate_flux` creates, so a landed proposal is
+        indistinguishable from a hand-generated asset — keep it, delete it to reject,
+        AI Mod it onward. The count is guidance to the model and a hard truncation here.
+
+        Refused while renders are open, deliberately and with FR-9's number: Flux
+        interleaved into an H3 batch evicts the resident stack at ~150 s per eviction.
+        The GPU acknowledgement is server-enforced like every expensive path's.
+        """
+        project = get_project(project_id)
+        if reconcilable_jobs(project):
+            raise HTTPException(status_code=409, detail=ASSET_FILL_RENDERS_OPEN_REFUSAL)
+        if not request.confirm_gpu:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSET_FILL_CONFIRM_REFUSAL.format(count=request.count),
+            )
+        context = project.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+        try:
+            result = await director.stage_manager(
+                project_context=context, count=request.count
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        proposals = [item for item in result.assets if item.prompt.strip()][: request.count]
+        if not proposals:
+            raise HTTPException(
+                status_code=502,
+                detail=ASSET_FILL_NO_PROPOSALS_REFUSAL.format(
+                    message=(result.message or "").strip()[:300] or "(empty)"
+                ),
+            )
+        # Re-read after the await, and re-check the eviction guard: an H3 batch submitted
+        # while the model thought must not get Flux interleaved into it.
+        project = get_project(project_id)
+        if reconcilable_jobs(project):
+            raise HTTPException(status_code=409, detail=ASSET_FILL_RENDERS_OPEN_REFUSAL)
+        submitted: list[AssetFillSubmission] = []
+        # What actually queued, in submission order, and the two things each one owns: the Asset
+        # it creates and the record that will answer for it. Kept apart from `project` because
+        # neither is written onto that object any more — every commit below lands on a re-read.
+        landed: list[tuple[Asset, RenderJob]] = []
+
+        def commit_the_accepted_assets(fresh: Project) -> None:
+            """The Assets of the graphs that went out, onto whatever manifest is current.
+
+            Used by both endings. A partial batch commits exactly this much and no more: the
+            proposals whose graphs ComfyUI took, with the records for the rest settled beside
+            them in the same write.
+            """
+            fresh.assets.extend(asset for asset, _record in landed)
+
+        # Every record first, then every graph (the Director's 2026-08-21 ruling). One save
+        # covers the whole batch rather than one per proposal: the property the ruling is
+        # about is that a save race is answered *before* any GPU time is spent, and a batch
+        # whose records could not be written spends none at all.
+        pending: list[tuple[Asset, dict[str, Any], RenderJob]] = []
+        for index, proposal in enumerate(proposals):
+            asset = Asset(
+                name=proposal.name,
+                kind=proposal.kind,
+                path="",
+                source="stage-manager",
+                prompt=proposal.prompt,
+            )
+            payload = build_flux_payload(
+                prompt=proposal.prompt,
+                width=1024,
+                height=1024,
+                steps=20,
+                guidance=4.0,
+                # Distinct seeds so two similar proposals cannot land the identical image.
+                seed=index,
+                prefix=f"music-video-producer/{project_id}/assets/{asset.id}",
+            )
+            job = RenderJob(
+                kind="flux",
+                prompt_id=PENDING_SUBMISSION_PROMPT_ID,
+                target_id=asset.id,
+                seed=index,
+            )
+            project.jobs.append(job)
+            pending.append((asset, payload, job))
+        store.save(project)
+        for index, (asset, payload, job) in enumerate(pending):
+            try:
+                submission = await comfy.submit(payload)
+            except ComfyError as error:
+                # Partial batches are reported honestly: what queued is queued, and the
+                # failure names itself; nothing already submitted is rolled back. The records
+                # for the graphs that never went out — this one and every one after it — are
+                # settled rather than left open, which is also what writes the accepted half
+                # of the batch to disk.
+                settle_unsubmitted_jobs(
+                    project_id,
+                    *(entry[2] for entry in pending[index:]),
+                    accepted=[record for _asset, record in landed],
+                    patch=commit_the_accepted_assets,
+                )
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            accept_submission(job, submission.prompt_id)
+            asset.prompt_id = submission.prompt_id
+            landed.append((asset, job))
+            submitted.append(
+                AssetFillSubmission(
+                    asset_id=asset.id, name=asset.name, kind=asset.kind, job_id=job.id
+                )
+            )
+        # The whole batch, onto a re-read. This loop holds the manifest across as many `/prompt`
+        # round trips as there are proposals, which is the widest submission window in the
+        # application; saving `project` at the end of it would revert every one of those
+        # seconds. See `record_submission`.
+        record_submission(
+            project_id,
+            *(record for _asset, record in landed),
+            patch=commit_the_accepted_assets,
+        )
+        return AssetFillResponse(message=result.message, submitted=submitted)

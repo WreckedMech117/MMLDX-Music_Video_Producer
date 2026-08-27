@@ -4,6 +4,12 @@ Not the two largest: `generate_h3` and `render_shot_preview` -- and, with them, 
 `render_again`, `mark-ready` and `mark-draft` -- are still in `app.py`, held there by tests that
 patch `build_h3_reference_payload`, `numbered_references`, `build_effect_stages` and their
 neighbours in `music_video_producer.app`'s namespace. `routes/__init__.py` names each one.
+
+`approve`, `unapprove` and `expand-prompt` are here. The first two are the whole of this
+application's approval writing: two assignments of `approved_output`, one write of the
+`approved` status and four of the window snapshot, and a test scans every module in the
+package -- keyed by each module's path, because `Path.name` is not an identity in a package
+holding two `timeline.py` -- to keep the count at exactly that.
 """
 
 from __future__ import annotations
@@ -15,14 +21,21 @@ from fastapi import HTTPException, status
 from fastapi.responses import FileResponse
 
 from ..app import (
+    APPROVE_IN_FLIGHT_REFUSAL,
+    APPROVE_NO_TAKE_REFUSAL,
     ENHANCE_IN_FLIGHT_REFUSAL,
     ENHANCE_MISSING_TAKE_REFUSAL,
     ENHANCE_NO_TAKE_REFUSAL,
     ENHANCE_PREFIX_SUFFIX,
     ENHANCE_SINGING_REFUSAL,
     ENHANCE_SINGING_UNKNOWN_REFUSAL,
+    EXPAND_PROMPT_LOCKED,
+    EXPAND_PROMPT_MALFORMED,
+    EXPAND_PROMPT_RENDERED,
+    EXPAND_PROMPT_WITHOUT_INTENT,
     EXPAND_PROMPTS_MESSAGE,
     EXPAND_PROMPTS_WITHOUT_SHOTS,
+    H3_KEYFRAME_MODES,
     PROJECT_CHANGED_REFUSAL,
     RESTORE_AUDIO_IN_FLIGHT_REFUSAL,
     RESTORE_AUDIO_LENGTH_TOLERANCE,
@@ -50,6 +63,7 @@ from ..app import (
     SHOT_EFFECTS_TOO_MANY_REFUSAL,
     TAKE_MISSING_FILE_REFUSAL,
     TAKE_NOT_RENDERED_REFUSAL,
+    UNAPPROVE_NOT_APPROVED_REFUSAL,
     AudioRestoreResponse,
     SelectTakeRequest,
     ShotEffectsCopyRefusal,
@@ -57,6 +71,7 @@ from ..app import (
     ShotEffectsCopyResponse,
     ShotEffectsRequest,
     ShotEffectsResponse,
+    ShotExpansionResult,
     ShotListRequest,
     _adopt_expansion_maps,
     _adopt_shot_effects,
@@ -66,19 +81,26 @@ from ..app import (
     _vision_media,
     apply_expansions,
     assistant_reply,
+    attempt_expansion,
     expand_shots,
     expansion_sweep_notices,
+    expansion_write_refusal,
+    reference_slot_counts,
     refresh_reference_maps,
     shot_audio_restore_in_flight,
     shot_enhancement_in_flight,
+    shot_is_approved,
     shot_render_in_flight,
     stored_effect_stack,
 )
-from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, shot_label
+from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, prompt_is_missing, shot_label
 from ..comfy import ComfyError
 from ..director import DirectorError, DirectorUnavailable
 from ..effects import EffectRefusal, validate_stack
-from ..models import Project, RenderJob, VisionInspectionRecord
+from ..h3_prompt import check as h3_check
+from ..h3_prompt import normalize_audio_fields
+from ..models import Project, RenderJob, VisionInspectionRecord, resolve_shot_mode, song_audio_tag
+from ..reference_map import reference_map_sentence, reference_map_tag_lines
 from ..timeline import ordered_shots
 from ..workflows import (
     LTX25_ENHANCE_SEED,
@@ -1088,3 +1110,216 @@ def register(ctx: RouterContext) -> None:
             )
         )
         return store.save(project)
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/approve", response_model=Project)
+    def approve_take(project_id: str, shot_id: str) -> Project:
+        """Approve one Shot's latest take. FR-21: explicit, reversible, never automatic. No body.
+
+        **This is the one writer of approval.** Nothing else in this application assigns
+        `approved_output` or the `approved` status — not job completion (`apply_job_history`
+        deliberately stops at `complete`), not the assistant, not expansion — and a test scans
+        the whole package to keep it that way. What is written is what the server resolved from
+        its own manifest: `approved_output := latest_output`, never a value from the wire.
+        `approved_output` is about to become assembly's input, and a path the server copied from
+        its own record of what rendered is evidence; a path accepted from a client would be a
+        claim. This route binds no body at all, so there is nothing on the wire to trust.
+
+        Both fields move together, and the pairing is what makes the un-approve path honest:
+        while the approval stands, render-again and mark-ready refuse this Shot, so
+        `latest_output` cannot move and `approved_output == latest_output` holds for the life of
+        the approval. A test pins that invariant end to end rather than trusting it.
+
+        The refusal order is the house order. In flight first, from the job records as well as
+        the status — `shot_render_in_flight` — because a status walked back by hand through the
+        generic shots write is exactly what hides a live render, and approving a take that is
+        about to be displaced attaches the decision to whichever file lands next; 409, because a
+        live render is a state conflict the same request survives. Then idempotence: an approved
+        Shot answers 200 and nothing is rewritten, not even `updated_at`. Then the take gate:
+        approval is a decision about a specific piece of media, so a Shot that never produced
+        one has nothing to approve, and that is a 422 fact no waiting changes.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if shot_render_in_flight(project, shot):
+            raise HTTPException(
+                status_code=409,
+                detail=APPROVE_IN_FLIGHT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # Idempotent, and genuinely a no-op: nothing is saved, so an unchanged manifest does not
+        # get a fresh `updated_at` to collide with the next optimistic-concurrency check.
+        if shot.approved_output:
+            return project
+        if not shot.latest_output:
+            raise HTTPException(
+                status_code=422,
+                detail=APPROVE_NO_TAKE_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        # The whole write, every half together. The value is the server's own resolution of
+        # what this Shot's take is; nothing from the request is on the right-hand side. The
+        # window snapshot (AD-13) rides in the same write: the approval is a decision about
+        # this take *in this window*, and assembly refuses the Shot if the window moves
+        # afterward — see `Shot.approved_start`.
+        shot.approved_output = shot.latest_output
+        shot.status = "approved"
+        shot.approved_start = shot.start
+        shot.approved_duration = shot.duration
+        return store.save(project)
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/unapprove", response_model=Project)
+    def unapprove_take(project_id: str, shot_id: str) -> Project:
+        """Clear one Shot's approval. The reversal FR-21 promises, and the one way back. No body.
+
+        Un-approval is what re-enables everything that keys on approval — render-again,
+        mark-ready, expansion and the assistant all refuse an approved Shot, and none of them
+        may be weakened instead — so this route accepts *either* approval signal through
+        `shot_is_approved`, the same definition render-again refuses by. A Shot with the
+        `approved` status and no `approved_output`, reachable only by hand through the generic
+        shots write, would otherwise be a Shot nothing can move: mark-ready disowns the status,
+        render-again says to clear the approval, and a route that only recognised
+        `approved_output` would refuse to.
+
+        Both fields are cleared together, `status` back to `complete` per the matrix — the Shot
+        had a take when it was approved, and a complete Shot is exactly what it goes back to
+        being, re-renderable through render-again like any other. Nothing else is touched:
+        `latest_output` stays, the take stays on disk, and the refusal for a Shot that is not
+        approved names what the Shot actually is rather than only refusing.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if not shot_is_approved(shot):
+            raise HTTPException(
+                status_code=422,
+                detail=UNAPPROVE_NOT_APPROVED_REFUSAL.format(
+                    shot=shot_label(project, shot), status=shot.status
+                ),
+            )
+        # The whole write: the decision is withdrawn, the record of what rendered is not.
+        # The window snapshot goes with it — it described the withdrawn approval, and a
+        # snapshot outliving its approval would make the *next* approval's staleness check
+        # read a window nobody decided about.
+        shot.approved_output = ""
+        shot.status = "complete"
+        shot.approved_start = 0
+        shot.approved_duration = 0
+        return store.save(project)
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/expand-prompt",
+        response_model=ShotExpansionResult,
+    )
+    async def expand_shot_prompt(project_id: str, shot_id: str) -> ShotExpansionResult:
+        """Turn one Shot's intent into an H3-format prompt. Pass two, one Shot at a time.
+
+        No body: everything this needs is already on the Shot and its project. The whole-plan
+        `director/expand` above is pass one and is untouched — it lays shots out so they flow
+        together, in one call, because cross-shot variance is a property of the plan. This is
+        the opposite shape for the opposite reason: one H3 prompt is long, and thirty of them
+        will not fit a single context.
+
+        Refusal order matters and is the same one every other automated writer uses: whether
+        this Shot may be written to at all comes before whether there is anything to write
+        from. A locked Shot with an empty intent should hear that it is locked — telling it to
+        write an intent first would send the Director to do work that would then be refused.
+
+        **A malformed answer is not stored.** The checker runs before the write, and a prompt
+        that fails it is retried — `attempt_expansion` owns the loop and its budget, shared
+        with the sweep so the two paths cannot drift — and only when every attempt fails is
+        the last one returned with its problems rather than saved. Storing it would put a
+        broken prompt in the manifest that the *next render* would submit, which is exactly the
+        outcome checking before a render exists to prevent — and the failure would surface as a
+        bad take rather than as a message.
+        """
+        project = get_project(project_id)
+        shot = next((held for held in project.shots if held.id == shot_id), None)
+        if shot is None:
+            raise HTTPException(status_code=404, detail="Shot not found")
+
+        label = shot_label(project, shot)
+        if reason := expansion_write_refusal(shot):
+            wording = (
+                EXPAND_PROMPT_LOCKED if reason == "locked" else EXPAND_PROMPT_RENDERED
+            )
+            raise HTTPException(status_code=422, detail=wording.format(shot=label))
+        if prompt_is_missing(shot):
+            raise HTTPException(
+                status_code=422, detail=EXPAND_PROMPT_WITHOUT_INTENT.format(shot=label)
+            )
+
+        mode = resolve_shot_mode(shot)
+        try:
+            outcome = await attempt_expansion(project, shot, director=director)
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        if outcome.kind == "failed":
+            raise HTTPException(status_code=502, detail=outcome.detail)
+        if outcome.kind == "malformed":
+            return ShotExpansionResult(
+                project=project,
+                applied=False,
+                problems=list(outcome.problems),
+                prompt=outcome.text,
+                note=EXPAND_PROMPT_MALFORMED,
+                attempts=outcome.attempts,
+            )
+
+        # Re-checked pure so the advisory problems ride along with an applied answer, exactly
+        # as they always have: `attempt_expansion` only reports problems for a refusal.
+        # A song-audio reference shot's outcome is deterministic prose, not a document —
+        # the H3 checker would only report the fields it deliberately does not have.
+        advisory: list[str] = []
+        if not (shot.use_song_audio and mode == "references"):
+            advisory = [
+                problem.message
+                for problem in h3_check(
+                    outcome.text,
+                    duration=shot.duration,
+                    expect_instruction=mode in H3_KEYFRAME_MODES,
+                    forbid_dialogue=shot.use_song_audio,
+                    # The under-citation half of the reference bounds surfaces here and only
+                    # here: it is advisory, so it rides along with an applied answer rather
+                    # than refusing one.
+                    reference_slots=reference_slot_counts(project, shot),
+                ).problems
+            ]
+
+        # Re-read after the await for the reason `director_chat` documents: the Shot may have
+        # been locked, rendered or deleted while the model was thinking, and the answer was
+        # written against a snapshot that no longer describes it.
+        project = get_project(project_id)
+        current = next((held for held in project.shots if held.id == shot_id), None)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if reason := expansion_write_refusal(current):
+            wording = (
+                EXPAND_PROMPT_LOCKED if reason == "locked" else EXPAND_PROMPT_RENDERED
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=wording.format(shot=shot_label(project, current)),
+            )
+
+        # The same song-audio field normalization the sweep applies; see
+        # `normalize_audio_fields`.
+        current.h3_prompt = (
+            normalize_audio_fields(outcome.text, audio_tag=song_audio_tag(project, current))
+            if current.use_song_audio
+            else outcome.text
+        )
+        # Beside it, `apply_expansions`' line and for its reason: the map this prompt was written
+        # against, so a citation moved afterwards is decidable rather than invisible. Taken off the
+        # re-read project, which is the one this write lands on.
+        current.h3_prompt_map = reference_map_sentence(
+            reference_map_tag_lines(project, current)
+        )
+        store.save(project)
+        return ShotExpansionResult(
+            project=project,
+            applied=True,
+            problems=advisory,
+            prompt=outcome.text,
+            attempts=outcome.attempts,
+        )

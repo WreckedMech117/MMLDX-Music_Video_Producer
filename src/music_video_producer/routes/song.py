@@ -1,13 +1,16 @@
 """The master song: its audio, the context written around it, and its measurement.
 
-`GET /song/envelope` is the exception and stays in `app.py`: a frontend-contract test asserts
-its `@app.get(...)` decorator line appears there verbatim.
+`GET /song/envelope` is here. The frontend-contract test that asserts its `@app.get(...)`
+decorator line appears verbatim now looks for that one literal across the package rather than
+in `app.py`, which is what the assertion always meant. The read-time report it serves,
+`song_envelope_report`, stays in `create_app` and reaches this module and the timeline's
+snap-targets read through `RouterContext` -- one computation, two resources.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -66,6 +69,7 @@ def register(ctx: RouterContext) -> None:
     get_project_for_update = ctx.get_project_for_update
     resolve_song_path = ctx.resolve_song_path
     settings = ctx.settings
+    song_envelope_report = ctx.song_envelope_report
     store = ctx.store
     transcriber = ctx.transcriber
 
@@ -435,3 +439,37 @@ def register(ctx: RouterContext) -> None:
         _require_song_replacement_confirmation(project, confirm_song_replacement)
         project.song = None
         return store.save(project, if_generation=generation)
+
+    @app.get("/api/projects/{project_id}/song/envelope")
+    def read_song_envelope(project_id: str) -> dict[str, Any]:
+        """The Song Envelope, on its own endpoint. Read-only, and never part of a Project.
+
+        **The whole measurement, for anyone who wants the whole thing — and the browser is no
+        longer one of them.** `GET /timeline/snap-targets` carries the part the timeline draws
+        beside the seconds a drag lands on, from one computation, because two client reads of one
+        measurement is what let the band and the drag describe different states. This route is
+        deliberately untouched by that change: it keeps its shape, its statuses and its
+        absence-is-a-200 contract, and it is the documented read-only resource for a consumer
+        outside this application. What it must not become again is a *second* path the browser
+        takes to the same measurement.
+
+        Its own endpoint because of the size: a three-minute envelope at 30 Hz with 8 bands is
+        hundreds of kilobytes against a whole manifest of 110–190 KB, and the manifest rides a
+        two-second poll. Embedding it in the Project response would multiply every poll by the
+        length of the song — so no Project response carries it, here or anywhere.
+
+        No `response_model`, deliberately: the envelope's arrays are the analysis's own recorded
+        shape, and re-declaring them as a pydantic model here would be a second definition of the
+        same thing to keep in step with `audio.py`, plus a validation pass over several thousand
+        floats on every read for no guarantee that is not already true of a file this application
+        wrote itself.
+
+        A sync `def`, so FastAPI runs it in the threadpool: it hashes the whole song file to
+        decide validity, and a multi-megabyte read has no business on the event loop.
+
+        **Absence is a 200.** A project with no song, no analysis, a replaced song or a deleted
+        sidecar all answer `{"present": false, "reason": …}`. None of those is an error and a 404
+        would make consumers draw one. The only 404 here is the project itself not existing.
+        """
+        project = get_project(project_id)
+        return song_envelope_report(project_id, project)

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import get_args
 
 import pytest
+from package_source import modules_containing
 
 from music_video_producer.batch import (
     JOB_LOST_WITH_QUEUE,
@@ -669,9 +670,18 @@ def test_a_long_window_warns_and_says_the_extender_is_out_of_reach():
     assert "def build_ltx25_extend_payload" in Path(
         "src/music_video_producer/workflows.py"
     ).read_text(encoding="utf-8")
-    assert "build_ltx25_extend_payload" not in Path(
-        "src/music_video_producer/app.py"
-    ).read_text(encoding="utf-8")
+    # Widened 2026-08-26: this read `app.py` alone, and the routes it was about moved to
+    # `routes/shots.py` in `4a1a4f6` — so it had been asserting the absence of a call from a
+    # file that could no longer contain one. "Nothing calls it" is a claim about the package.
+    # Counted over the package's *code*, comments and docstrings blanked — `batch.py` names the
+    # builder in a comment explaining why nothing calls it, and a raw text scan reads that as a
+    # caller. `package_source` exists for exactly this distinction.
+    callers = {
+        where: hits
+        for where, hits in modules_containing("build_ltx25_extend_payload").items()
+        if where != "workflows.py"
+    }
+    assert callers == {}, callers
     assert SHOT_MODE_SPECS["extend"].adapter == ""
 
 
